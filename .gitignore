@@ -1,1 +1,42 @@
+# Audit directory
 .diracrules/hooks/.audit/
+
+# Core dumps
+*.core
+node.core
+
+# Binary artifacts
+*.a
+*.dylib
+*.so
+*.dll
+*.lib
+*.exe
+
+# Rust build artifacts
+target/
+Cargo.lock
+!dirac-native/Cargo.lock
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test outputs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
