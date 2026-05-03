@@ -40,3 +40,6 @@ package-lock.json
 *.tmp
 *.temp
 .cache/
+
+# Dirac generated files
+.dirac-symbol-index/
