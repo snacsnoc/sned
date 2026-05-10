@@ -42,4 +42,4 @@ package-lock.json
 .cache/
 
 # Dirac generated files
-.dirac-symbol-index/
+.dirac-symbol-index/dirac/
