@@ -43,3 +43,4 @@ package-lock.json
 
 # Dirac generated files
 .dirac-symbol-index/dirac/
+dirac/
