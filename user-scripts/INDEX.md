@@ -2,6 +2,30 @@
 
 Helper scripts for development workflow, task management, and memory profiling.
 
+## For LLM Coding Agents: Quick Decision Guide
+
+**"Which script should I run?"** → Match your situation:
+
+| If you need to... | Run this script | See section |
+|-------------------|-----------------|-------------|
+| **Find my next task** | `list-open-todos.sh` | TODO Management |
+| **Understand a task** | `todo-section.sh <LINE>` | TODO Management |
+| **Build context before coding** | `pack-task-context.sh <files>` | Context Building |
+| **Profile memory usage** | `profile-memory.sh` | Memory Profiling |
+| **Analyze dhat output** | `analyze-dhat-heap.sh <json>` | Memory Profiling |
+| **Fix Zig build errors** | `setup-zig-0.15.sh` | Toolchain Setup |
+| **Regenerate repo overview** | `regen-infiniloom.sh` | Context Building |
+
+**Workflow Order:**
+1. `list-open-todos.sh` → Get task line number
+2. `todo-section.sh <LINE>` → Read task details
+3. `pack-task-context.sh <files>` → Build context
+4. **Implement the fix**
+5. `profile-memory.sh` → Verify no regressions (if performance-related)
+6. **Mark task DONE in TODO.md**
+
+---
+
 ## Quick Reference
 
 | Script | Purpose | When to Use |
@@ -38,11 +62,14 @@ cat target/memory-profiles/profile-*/summary.txt
 cat target/memory-profiles/profile-*/allocations.txt
 ```
 
-**When to Use:**
-- **Baseline profiling**: Establish memory usage baseline for comparison
-- **Regression testing**: After major changes, compare against baseline
-- **Leak investigation**: Automated workload + analysis in one command
-- **PR validation**: Verify no memory regressions introduced
+**When to Use (LLM Agent Decision Tree):**
+- ✅ **Just implemented a feature** → Run `--workload basic` to verify no memory regressions
+- ✅ **Modified file editing code** → Run `--workload edit` to check anchor reconciliation memory
+- ✅ **Changed symbol indexing** → Run `--workload search` to validate parser allocations
+- ✅ **Before marking task DONE** → Run `--workload all` if task is performance-related
+- ✅ **User reports high memory** → Run `--workload all --keep-json` for detailed analysis
+- ✅ **PR includes allocation changes** → Run and compare against `MEMORY_PROFILE_BASELINE.md`
+- ❌ **Not needed for**: Documentation changes, test-only changes, bug fixes unrelated to memory
 
 **Why Use It:**
 - **Fully automated**: Build → Run → Analyze → Report in one command
@@ -92,11 +119,13 @@ cargo run --features dhat-heap -- --task "count to 10"
 ./user-scripts/analyze-dhat-heap.sh dirac-native/dhat-heap.json
 ```
 
-**When to Use:**
-- After running a memory profiling session
-- Before marking performance-related tasks complete
-- When investigating slow shutdown or high memory usage
-- As part of PR review for performance-sensitive changes
+**When to Use (LLM Agent Decision Tree):**
+- ✅ **After `profile-memory.sh`** → Always run this to analyze the generated `dhat-heap.json`
+- ✅ **User provides `dhat-heap.json`** → Run this script to analyze it
+- ✅ **Investigating memory leak** → Run after manual `cargo run --features dhat-heap`
+- ✅ **Before marking DONE** → Run if task involves memory/performance optimizations
+- ❌ **Not needed if**: Already ran `profile-memory.sh` (it calls this automatically)
+- ❌ **Don't use alone**: Must have `dhat-heap.json` from profiling session first
 
 **Why Use It:**
 - **Filters noise**: Automatically categorizes standard library, profiler, and runtime allocations as "expected"
@@ -130,10 +159,12 @@ cargo run --features dhat-heap -- --task "count to 10"
 ./user-scripts/list-open-todos.sh
 ```
 
-**When to Use:**
-- **Cold start**: First thing when beginning a development session
-- **Task selection**: When looking for the next task to work on
-- **Progress review**: Checking what remains in the current phase
+**When to Use (LLM Agent Decision Tree):**
+- ✅ **Starting new task** → ALWAYS run first to find available `[NOT STARTED]` tasks
+- ✅ **User says "what's next"** → Run to list available work
+- ✅ **Beginning coding session** → Run to get task line number for `todo-section.sh`
+- ✅ **Claiming task** → Run to verify task is truly `NOT STARTED` (not `IN-PROGRESS`)
+- ❌ **Don't run if**: Already have a task line number from previous step
 
 **Why Use It:**
 - **Single source of truth**: Reads directly from `TODO.md` (the project ledger)
@@ -162,10 +193,12 @@ TODO.md:58:### Feature: Add CLI completions [INCOMPLETE]
 ./user-scripts/todo-section.sh 52
 ```
 
-**When to Use:**
-- **After `list-open-todos.sh`**: Read the full details of a selected task
-- **Before claiming**: Understand complete scope and requirements
-- **During implementation**: Reference acceptance criteria
+**When to Use (LLM Agent Decision Tree):**
+- ✅ **After `list-open-todos.sh`** → ALWAYS run with the line number to read full task details
+- ✅ **Before writing code** → Run to understand acceptance criteria and scope
+- ✅ **During implementation** → Re-read to verify you're meeting all criteria
+- ✅ **User provides TODO line number** → Run to get full task context
+- ❌ **Don't run without**: A line number from `list-open-todos.sh` output first
 
 **Why Use It:**
 - **Context preservation**: Shows the complete task definition including:
@@ -211,10 +244,13 @@ HashSet iteration order is non-deterministic...
 printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 ```
 
-**When to Use:**
-- **Before implementation**: After reading TODO section, before writing code
-- **During debugging**: When investigating a complex issue across multiple files
-- **For code review**: Creating context for explaining changes
+**When to Use (LLM Agent Decision Tree):**
+- ✅ **After `todo-section.sh`** → Run with files mentioned in task to build context
+- ✅ **Before writing code** → Run to pack relevant files into LLM-friendly format
+- ✅ **Debugging multi-file issue** → Run with all affected files to understand interactions
+- ✅ **User asks about specific files** → Run with those files to provide focused context
+- ❌ **Don't run for**: Single-file changes (just read the file directly)
+- ❌ **Don't run without**: Knowing which files are relevant to the task
 
 **Why Use It:**
 - **Token efficiency**: Compresses files to fit within LLM context limits (8K default)
@@ -239,11 +275,13 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 ./user-scripts/regen-infiniloom.sh
 ```
 
-**When to Use:**
-- **After major refactors**: File structure changed significantly
-- **New module added**: When new directories/files need indexing
-- **Cold start preparation**: Before a major development session
-- **Weekly maintenance**: Keep repo overview current
+**When to Use (LLM Agent Decision Tree):**
+- ✅ **User asks "what does this repo do"** → Run to generate fresh overview
+- ✅ **After adding new modules** → Run to update `.infiniloom/map.md` with new structure
+- ✅ **Starting work on unfamiliar codebase** → Run to get orientation materials
+- ✅ **Post-refactor** → Run when file structure changed significantly
+- ❌ **Don't run for**: Every task (only when structure changes or user explicitly asks)
+- ❌ **Not needed if**: `.infiniloom/` was regenerated recently (< 1 week ago)
 
 **Why Use It:**
 - **`map.md`**: Provides structural overview of `dirac-native/` for orientation
@@ -274,10 +312,13 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 source ./user-scripts/setup-zig-0.15.sh
 ```
 
-**When to Use:**
-- **First build**: Before building `libghostty-rs` for the first time
-- **Build errors**: When seeing Zig-related compilation failures
-- **Version conflicts**: If Zig version mismatches occur
+**When to Use (LLM Agent Decision Tree):**
+- ✅ **Build fails with Zig error** → Run to diagnose version issue
+- ✅ **User reports "zig not found"** → Run to provide installation instructions
+- ✅ **Before `cargo build` in libghostty-rs** → Run once to verify setup
+- ✅ **Seeing "Zig version mismatch"** → Run to get correct PATH instructions
+- ❌ **Don't run for**: Regular dirac-native builds (only needed for libghostty-rs)
+- ❌ **Not needed if**: User already has Zig 0.15.x in PATH (script will confirm)
 
 **Why Use It:**
 - **Specific version**: `libghostty-rs` requires Zig 0.15.x (not latest)
