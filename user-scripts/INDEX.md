@@ -8,21 +8,23 @@ Helper scripts for development workflow, task management, and memory profiling.
 
 | If you need to... | Run this script | See section |
 |-------------------|-----------------|-------------|
-| **Find my next task** | `list-open-todos.sh` | TODO Management |
-| **Understand a task** | `todo-section.sh <LINE>` | TODO Management |
+| **Check for open TODO tasks** | `list-open-todos.sh` | TODO Management |
+| **Understand a TODO task** | `todo-section.sh <LINE>` | TODO Management |
 | **Build context before coding** | `pack-task-context.sh <files>` | Context Building |
 | **Profile memory usage** | `profile-memory.sh` | Memory Profiling |
 | **Analyze dhat output** | `analyze-dhat-heap.sh <json>` | Memory Profiling |
 | **Fix Zig build errors** | `setup-zig-0.15.sh` | Toolchain Setup |
 | **Regenerate repo overview** | `regen-infiniloom.sh` | Context Building |
 
-**Workflow Order:**
-1. `list-open-todos.sh` → Get task line number
-2. `todo-section.sh <LINE>` → Read task details
-3. `pack-task-context.sh <files>` → Build context
-4. **Implement the fix**
-5. `profile-memory.sh` → Verify no regressions (if performance-related)
-6. **Mark task DONE in TODO.md**
+**Workflow** (per `AGENTS.md` two-path entry):
+- **User-directed (default)**: Load skills, implement, validate, commit.
+- **TODO-led** (when `list-open-todos.sh` shows open tasks):
+  1. `list-open-todos.sh` → Get task line number
+  2. `todo-section.sh <LINE>` → Read task details
+  3. `pack-task-context.sh <files>` → Build context
+  4. **Implement**
+  5. `profile-memory.sh` → Verify no regressions (if performance-related)
+  6. **Mark task DONE in TODO.md**
 
 ---
 
@@ -160,17 +162,17 @@ cargo run --features dhat-heap -- --task "count to 10"
 ```
 
 **When to Use (LLM Agent Decision Tree):**
-- ✅ **Starting new task** → ALWAYS run first to find available `[NOT STARTED]` tasks
+- ✅ **No user direction** → Run to check if open TODO tasks exist
 - ✅ **User says "what's next"** → Run to list available work
-- ✅ **Beginning coding session** → Run to get task line number for `todo-section.sh`
-- ✅ **Claiming task** → Run to verify task is truly `NOT STARTED` (not `IN-PROGRESS`)
+- ✅ **Multi-agent coordination** → Run to find unclaimed tasks
+- ✅ **Claiming task** → Run to verify task is truly `NOT STARTED`
+- ❌ **Don't run if**: User already gave you a task to do
 - ❌ **Don't run if**: Already have a task line number from previous step
 
 **Why Use It:**
-- **Single source of truth**: Reads directly from `TODO.md` (the project ledger)
+- **Single source of truth**: Reads directly from `TODO.md` (the coordination ledger)
 - **Filtered view**: Only shows actionable items (NOT STARTED, INCOMPLETE)
 - **Fast**: Uses ripgrep for instant results
-- **Workflow gate**: Ensures you claim a task before implementing
 
 **Example Output:**
 ```
@@ -194,8 +196,8 @@ TODO.md:58:### Feature: Add CLI completions [INCOMPLETE]
 ```
 
 **When to Use (LLM Agent Decision Tree):**
-- ✅ **After `list-open-todos.sh`** → ALWAYS run with the line number to read full task details
-- ✅ **Before writing code** → Run to understand acceptance criteria and scope
+- ✅ **After `list-open-todos.sh`** → Run with the line number to read full task details
+- ✅ **Before writing code for a TODO task** → Run to understand acceptance criteria and scope
 - ✅ **During implementation** → Re-read to verify you're meeting all criteria
 - ✅ **User provides TODO line number** → Run to get full task context
 - ❌ **Don't run without**: A line number from `list-open-todos.sh` output first
@@ -207,7 +209,6 @@ TODO.md:58:### Feature: Add CLI completions [INCOMPLETE]
   - Related files
   - Validation requirements
 - **Prevents scope creep**: Clear boundaries of what to implement
-- **Workflow compliance**: Required by `AGENTS.md` before implementation
 
 **Example:**
 ```bash
@@ -357,8 +358,17 @@ To add to PATH, run:
 
 ## Workflow Integration
 
-### Standard Development Flow
+### Development Flow
 
+**User-directed (default):**
+```bash
+# 1. Load relevant skills per AGENTS.md
+# 2. Implement the task
+# 3. Validate (cargo test / cargo check)
+# 4. Commit
+```
+
+**TODO-led (when open tasks exist):**
 ```bash
 # 1. Find available tasks
 ./user-scripts/list-open-todos.sh
@@ -369,7 +379,7 @@ To add to PATH, run:
 # 3. Build context for the task
 printf '%s\n' src/core/file_editor.rs | ./user-scripts/pack-task-context.sh
 
-# 4. Implement the fix...
+# 4. Implement...
 
 # 5. If performance-related, profile with dhat
 ./user-scripts/profile-memory.sh --workload basic
