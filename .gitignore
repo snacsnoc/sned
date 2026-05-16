@@ -44,3 +44,8 @@ package-lock.json
 # Dirac generated files
 .dirac-symbol-index/dirac/
 dirac/
+
+# Downloaded API docs (keep download script, ignore generated content)
+llm-openai-docs/html/
+llm-openai-docs/md/
+!llm-openai-docs/download_docs.py
