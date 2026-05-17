@@ -1,0 +1,58 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14      # macOS arm64
+          - macos-13      # macOS x86_64
+          - ubuntu-22.04  # Ubuntu 22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dirac-native
+
+      - name: Check compilation
+        working-directory: dirac-native
+        run: cargo check --lib
+
+      - name: Run library tests
+        working-directory: dirac-native
+        run: cargo test --lib
+
+      - name: Run CLI tests
+        working-directory: dirac-native
+        run: cargo test --test cli_tests
+
+      - name: Run AST fixture tests
+        working-directory: dirac-native
+        run: cargo test --test ast_fixtures
+
+      - name: Run clippy
+        working-directory: dirac-native
+        run: cargo clippy --lib -- -W warnings
+        # TODO: Upgrade to `-D warnings` after fixing 205 existing clippy violations
+
+      - name: Check formatting
+        working-directory: dirac-native
+        run: cargo fmt --check
