@@ -56,9 +56,6 @@ llm-openai-docs/md/
 # Prebuilt vendor binaries (regenerate with stage_libghostty_prebuilt.sh)
 dirac-native/vendor/
 
-# Infiniloom generated content
-dirac-native/.infiniloom/
-
 # Example terminals (large binaries)
 example_libghostty_terminals/
 
