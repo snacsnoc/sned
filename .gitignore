@@ -45,7 +45,38 @@ package-lock.json
 .dirac-symbol-index/dirac/
 dirac/
 
+# Secrets and local config
+opencode.json
+
 # Downloaded API docs (keep download script, ignore generated content)
 llm-openai-docs/html/
 llm-openai-docs/md/
 !llm-openai-docs/download_docs.py
+
+# Prebuilt vendor binaries (regenerate with stage_libghostty_prebuilt.sh)
+dirac-native/vendor/
+
+# Infiniloom generated content
+dirac-native/.infiniloom/
+
+# Example terminals (large binaries)
+example_libghostty_terminals/
+
+# Agent launcher prompts (internal, not for public tracking)
+USER_PROMPT*
+._USER_PROMPT*
+
+# Optimization notes (internal)
+LLM_AGENT_OPTIMIZATIONS.md
+
+# Profiling output
+dhat-heap.json
+
+# Backup files
+*.bak
+
+# Hooks (internal workflow, not for public tracking)
+.diracrules/hooks/
+
+# Submodule references (not used)
+libghostty-rs/
