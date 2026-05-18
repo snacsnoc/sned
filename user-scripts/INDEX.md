@@ -1,44 +1,26 @@
 # Dirac Native User Scripts
 
-Helper scripts for development workflow, task management, and memory profiling.
+Small helper scripts for task discovery, context packing, profiling, and a few repo setup checks.
 
-## For LLM Coding Agents: Quick Decision Guide
+## Quick Guide
 
-**"Which script should I run?"** → Match your situation:
+Use the script that matches the job:
 
-| If you need to... | Run this script | See section |
-|-------------------|-----------------|-------------|
-| **Check for open TODO tasks** | `list-open-todos.sh` | TODO Management |
-| **Understand a TODO task** | `todo-section.sh <LINE>` | TODO Management |
-| **Build context before coding** | `pack-task-context.sh <files>` | Context Building |
-| **Profile memory usage** | `profile-memory.sh` | Memory Profiling |
-| **Analyze dhat output** | `analyze-dhat-heap.sh <json>` | Memory Profiling |
-| **Fix Zig build errors** | `setup-zig-0.15.sh` | Toolchain Setup |
-| **Regenerate repo overview** | `regen-infiniloom.sh` | Context Building |
+| Need to... | Run | Notes |
+|---|---|---|
+| Find open work | `list-open-todos.sh` | Reads `TODO.md` and prints heading line numbers |
+| Read one task | `todo-section.sh <LINE>` | Pass the heading line from `list-open-todos.sh` |
+| Build task context | `pack-task-context.sh <files>` | Use after reading the task and picking files |
+| Profile memory | `profile-memory.sh` | Use for allocation or leak questions |
+| Analyze dhat output | `analyze-dhat-heap.sh <json>` | Use after profiling |
+| Regenerate repo map | `regen-infiniloom.sh` | Use after structural changes |
+| Check Zig setup | `setup-zig-0.15.sh` | Only for libghostty-rs / Zig issues |
 
-**Workflow** (per `AGENTS.md` two-path entry):
-- **User-directed (default)**: Load skills, implement, validate, commit.
-- **TODO-led** (when `list-open-todos.sh` shows open tasks):
-  1. `list-open-todos.sh` → Get task line number
-  2. `todo-section.sh <LINE>` → Read task details
-  3. `pack-task-context.sh <files>` → Build context
-  4. **Implement**
-  5. `profile-memory.sh` → Verify no regressions (if performance-related)
-  6. **Mark task DONE in TODO.md**
-
----
-
-## Quick Reference
-
-| Script | Purpose | When to Use |
-|--------|---------|-------------|
-| `profile-memory.sh` | Automated memory profiling | Baseline, regression testing |
-| `analyze-dhat-heap.sh` | Memory leak analysis | After profiling with dhat |
-| `list-open-todos.sh` | List open TODO tasks | Starting a new task |
-| `todo-section.sh` | Read specific TODO section | Understanding task scope |
-| `pack-task-context.sh` | Build task context | Before implementation |
-| `regen-infiniloom.sh` | Regenerate repo overview | After major refactors |
-| `setup-zig-0.15.sh` | Zig toolchain setup | Building libghostty-rs |
+**Default flow**
+1. If the user did not already name a task, run `list-open-todos.sh`.
+2. If the task is non-trivial, read it with `todo-section.sh <LINE>`.
+3. Build context with `pack-task-context.sh` when multiple files matter.
+4. Implement, validate, and update `TODO.md`.
 
 ---
 
@@ -154,7 +136,7 @@ cargo run --features dhat-heap -- --task "count to 10"
 
 ### `list-open-todos.sh`
 
-**What:** Lists all `[NOT STARTED]` and `[INCOMPLETE]` tasks from `TODO.md`.
+**What:** Lists all open tasks from `TODO.md`.
 
 **Usage:**
 ```bash
@@ -162,12 +144,12 @@ cargo run --features dhat-heap -- --task "count to 10"
 ```
 
 **When to Use (LLM Agent Decision Tree):**
-- ✅ **No user direction** → Run to check if open TODO tasks exist
+- ✅ **No user direction** → Run to check for open work
 - ✅ **User says "what's next"** → Run to list available work
 - ✅ **Multi-agent coordination** → Run to find unclaimed tasks
-- ✅ **Claiming task** → Run to verify task is truly `NOT STARTED`
+- ✅ **Claiming task** → Run to verify status before touching it
 - ❌ **Don't run if**: User already gave you a task to do
-- ❌ **Don't run if**: Already have a task line number from previous step
+- ❌ **Don't run if**: You already have the task heading line from a previous step
 
 **Why Use It:**
 - **Single source of truth**: Reads directly from `TODO.md` (the coordination ledger)
@@ -187,7 +169,7 @@ TODO.md:58:### Feature: Add CLI completions [INCOMPLETE]
 
 ### `todo-section.sh`
 
-**What:** Extracts a specific TODO section by line number.
+**What:** Prints the full TODO section for one task heading.
 
 **Usage:**
 ```bash
@@ -196,34 +178,22 @@ TODO.md:58:### Feature: Add CLI completions [INCOMPLETE]
 ```
 
 **When to Use (LLM Agent Decision Tree):**
-- ✅ **After `list-open-todos.sh`** → Run with the line number to read full task details
-- ✅ **Before writing code for a TODO task** → Run to understand acceptance criteria and scope
-- ✅ **During implementation** → Re-read to verify you're meeting all criteria
-- ✅ **User provides TODO line number** → Run to get full task context
-- ❌ **Don't run without**: A line number from `list-open-todos.sh` output first
+- ✅ **After `list-open-todos.sh`** → Run with the heading line number
+- ✅ **Before writing code for a TODO task** → Run to read scope, evidence, and acceptance criteria
+- ✅ **During implementation** → Re-read if you need to check remaining checkboxes
+- ✅ **User provides the line number** → Run to get the task context
+- ❌ **Don't run without**: A heading line number if you can avoid it
 
 **Why Use It:**
-- **Context preservation**: Shows the complete task definition including:
-  - Problem description
-  - Acceptance criteria
-  - Related files
-  - Validation requirements
-- **Prevents scope creep**: Clear boundaries of what to implement
+- **Context preservation**: Shows the full task definition, acceptance criteria, and validation notes
+- **Flexible input**: If given a body line by mistake, it walks up to the nearest heading and reports the correction
+- **Prevents scope creep**: Keeps implementation tied to the actual task section
 
 **Example:**
 ```bash
-$ ./user-scripts/todo-section.sh 52
-### Bug 26: Fix used_words truncation [NOT STARTED]
-**Priority:** LOW
-**Location:** dirac-native/src/core/file_editor.rs:384
-
-## Problem
-HashSet iteration order is non-deterministic...
-
-## Acceptance Criteria
-- [ ] Use BTreeSet for deterministic ordering
-- [ ] Add test for truncation behavior
-- [ ] Verify no active anchors removed
+$ ./user-scripts/todo-section.sh 1609
+### 6.4c Native skill activation prints broken supporting-file paths [DONE]
+...
 ```
 
 **Dependencies:** None (uses bash built-ins)
@@ -234,7 +204,7 @@ HashSet iteration order is non-deterministic...
 
 ### `pack-task-context.sh`
 
-**What:** Builds a compressed context packet from specified files for AI-assisted development.
+**What:** Packs selected files into a smaller context bundle for task work.
 
 **Usage:**
 ```bash
@@ -246,12 +216,11 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 ```
 
 **When to Use (LLM Agent Decision Tree):**
-- ✅ **After `todo-section.sh`** → Run with files mentioned in task to build context
-- ✅ **Before writing code** → Run to pack relevant files into LLM-friendly format
-- ✅ **Debugging multi-file issue** → Run with all affected files to understand interactions
-- ✅ **User asks about specific files** → Run with those files to provide focused context
-- ❌ **Don't run for**: Single-file changes (just read the file directly)
-- ❌ **Don't run without**: Knowing which files are relevant to the task
+- ✅ **After `todo-section.sh`** → Run with the files named in the task
+- ✅ **Before writing code** → Run when more than one file matters
+- ✅ **Debugging multi-file issues** → Run with the whole affected surface
+- ❌ **Don't run for**: Single-file changes unless you need a compact packet
+- ❌ **Don't run without**: Knowing which files are relevant
 
 **Why Use It:**
 - **Token efficiency**: Compresses files to fit within LLM context limits (8K default)
