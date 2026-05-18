@@ -48,10 +48,13 @@ jobs:
         working-directory: dirac-native
         run: cargo test --test ast_fixtures
 
-      - name: Run clippy
+      - name: Run clippy (lib)
         working-directory: dirac-native
-        run: cargo clippy --lib -- -W warnings
-        # TODO: Upgrade to `-D warnings` after fixing 205 existing clippy violations
+        run: cargo clippy --lib -- -D warnings
+
+      - name: Run clippy (tests)
+        working-directory: dirac-native
+        run: cargo clippy --tests -- -D warnings
 
       - name: Check formatting
         working-directory: dirac-native
