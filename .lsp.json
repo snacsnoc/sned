@@ -1,0 +1,14 @@
+{
+  "rust": {
+    "command": "rust-analyzer",
+    "args": [],
+    "extensionToLanguage": {
+      ".rs": "rust"
+    },
+    "workspaceFolder": "dirac-native",
+    "startupTimeout": 30000,
+    "shutdownTimeout": 5000,
+    "restartOnCrash": true,
+    "maxRestarts": 3
+  }
+}
