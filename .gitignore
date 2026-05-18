@@ -47,11 +47,15 @@ dirac/
 
 # Secrets and local config
 opencode.json
+.qwen/
 
-# Downloaded API docs (keep download script, ignore generated content)
-llm-openai-docs/html/
-llm-openai-docs/md/
-!llm-openai-docs/download_docs.py
+# Local/private docs removed from public history
+.agents/
+memory/
+BUILD_SPEC.md
+NEW_NAMES.md
+insight-2026-05-18.html
+llm-openai-docs/
 
 # Prebuilt vendor binaries (regenerate with stage_libghostty_prebuilt.sh)
 dirac-native/vendor/
