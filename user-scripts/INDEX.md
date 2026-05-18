@@ -1,4 +1,4 @@
-# Dirac Native User Scripts
+# Sned Native User Scripts
 
 Small helper scripts for task discovery, context packing, profiling, and a few repo setup checks.
 
@@ -81,7 +81,7 @@ target/memory-profiles/profile-YYYYMMDD-HHMMSS/
 
 **Dependencies:** Python 3, jq
 
-**Related:** See `dirac-native/MEMORY_PROFILE_BASELINE.md` for baseline results.
+**Related:** See `sned-native/MEMORY_PROFILE_BASELINE.md` for baseline results.
 
 ---
 
@@ -96,11 +96,11 @@ target/memory-profiles/profile-YYYYMMDD-HHMMSS/
 
 **Usage:**
 ```bash
-# 1. Run dirac-native with dhat feature
+# 1. Run sned-native with dhat feature
 cargo run --features dhat-heap -- --task "count to 10"
 
 # 2. Analyze the output (use .sh, not .py)
-./user-scripts/analyze-dhat-heap.sh dirac-native/dhat-heap.json
+./user-scripts/analyze-dhat-heap.sh sned-native/dhat-heap.json
 ```
 
 **When to Use (LLM Agent Decision Tree):**
@@ -230,7 +230,7 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 
 **Output:**
 - Default: `/tmp/dirac-task-context.md`
-- Custom: `DIRAC_TASK_CONTEXT_OUT=./my-context.md ./user-scripts/pack-task-context.sh ...`
+- Custom: `SNED_TASK_CONTEXT_OUT=./my-context.md ./user-scripts/pack-task-context.sh ...`
 
 **Dependencies:** `infiniloom` CLI tool
 
@@ -254,14 +254,14 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 - ❌ **Not needed if**: `.infiniloom/` was regenerated recently (< 1 week ago)
 
 **Why Use It:**
-- **`map.md`**: Provides structural overview of `dirac-native/` for orientation
+- **`map.md`**: Provides structural overview of `sned-native/` for orientation
 - **`context.md`**: Contains curated source code for common patterns
 - **AI assistance**: Used by agents to understand repo structure without reading everything
 - **Excludes noise**: Skips docs, benches, vendor, generated code
 
 **Generates:**
-- `dirac-native/.infiniloom/map.md` - Repository structure map
-- `dirac-native/.infiniloom/context.md` - Source code context (12K tokens)
+- `sned-native/.infiniloom/map.md` - Repository structure map
+- `sned-native/.infiniloom/context.md` - Source code context (12K tokens)
 
 **Dependencies:** `infiniloom` CLI tool
 
@@ -287,7 +287,7 @@ source ./user-scripts/setup-zig-0.15.sh
 - ✅ **User reports "zig not found"** → Run to provide installation instructions
 - ✅ **Before `cargo build` in libghostty-rs** → Run once to verify setup
 - ✅ **Seeing "Zig version mismatch"** → Run to get correct PATH instructions
-- ❌ **Don't run for**: Regular dirac-native builds (only needed for libghostty-rs)
+- ❌ **Don't run for**: Regular sned-native builds (only needed for libghostty-rs)
 - ❌ **Not needed if**: User already has Zig 0.15.x in PATH (script will confirm)
 
 **Why Use It:**
@@ -383,7 +383,7 @@ cat target/memory-profiles/profile-*/allocations.txt
 
 # Option B: Manual (for custom workloads)
 cargo run --features dhat-heap -- --task "reproduce issue"
-./user-scripts/analyze-dhat-heap.sh dirac-native/dhat-heap.json
+./user-scripts/analyze-dhat-heap.sh sned-native/dhat-heap.json
 
 # 3. If leaks detected, review "Application Code" section
 # 4. Fix identified issues
@@ -413,7 +413,7 @@ cargo run --features dhat-heap -- --task "reproduce issue"
 ./user-scripts/profile-memory.sh --workload all --keep-json
 
 # Or check if dhat feature is properly enabled:
-grep dhat-heap dirac-native/Cargo.toml
+grep dhat-heap sned-native/Cargo.toml
 ```
 
 ### "python3 not found"

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Automated Memory Profiling for Dirac Native
+# Automated Memory Profiling for Sned Native
 # 
 # This script:
-# 1. Builds dirac-native with dhat-heap feature
+# 1. Builds sned-native with dhat-heap feature
 # 2. Runs a realistic workload (or custom command)
 # 3. Analyzes heap allocations with categorization
 # 4. Generates a comprehensive report
@@ -34,7 +34,7 @@ NC='\033[0m'
 
 show_help() {
     cat << 'EOF'
-Automated Memory Profiling for Dirac Native
+Automated Memory Profiling for Sned Native
 
 Usage: ./profile-memory.sh [options]
 
@@ -106,7 +106,7 @@ RUN_DIR="$OUTPUT_DIR/profile-${TIMESTAMP}"
 mkdir -p "$RUN_DIR"
 
 echo "=============================================="
-echo "  Dirac Native Memory Profiling"
+echo "  Sned Native Memory Profiling"
 echo "=============================================="
 echo ""
 echo "  Workload:     $WORKLOAD"
@@ -115,8 +115,8 @@ echo "  Timestamp:    $TIMESTAMP"
 echo ""
 
 # Check for dhat-heap feature in Cargo.toml
-if ! grep -q 'dhat-heap' dirac-native/Cargo.toml; then
-    echo -e "${RED}Error: dhat-heap feature not found in dirac-native/Cargo.toml${NC}"
+if ! grep -q 'dhat-heap' sned-native/Cargo.toml; then
+    echo -e "${RED}Error: dhat-heap feature not found in sned-native/Cargo.toml${NC}"
     echo "Add this to Cargo.toml:"
     echo "  dhat = { version = \"0.3\", optional = true }"
     exit 1
@@ -124,7 +124,7 @@ fi
 
 # Build with dhat-heap
 echo -e "${BLUE}[1/4] Building with dhat-heap feature...${NC}"
-cd dirac-native
+cd sned-native
 BUILD_LOG="$RUN_DIR/build.log"
 mkdir -p "$RUN_DIR"  # Ensure directory exists before tee
 if cargo build --features dhat-heap --release > "$BUILD_LOG" 2>&1; then
@@ -145,7 +145,7 @@ echo ""
 
 run_basic_workload() {
     echo "  Running: --help (initialization only)"
-    ./dirac-native/target/release/dirac-native --help > /dev/null 2>&1 || true
+    ./sned-native/target/release/sned-native --help > /dev/null 2>&1 || true
 }
 
 run_edit_workload() {
@@ -166,7 +166,7 @@ TESTFILE
 
     # Run edit command (will fail but exercises the code paths)
     cd "$temp_workspace"
-    timeout 10s "$REPO_ROOT/dirac-native/target/release/dirac-native" \
+    timeout 10s "$REPO_ROOT/sned-native/target/release/sned-native" \
         "Edit line 3 to say 'MODIFIED LINE 3'" \
         2>&1 || true
     cd "$REPO_ROOT"
@@ -179,7 +179,7 @@ run_search_workload() {
     echo "  Running: File search and symbol indexing"
     
     # Run search command (will fail but exercises code paths)
-    timeout 10s ./dirac-native/target/release/dirac-native \
+    timeout 10s ./sned-native/target/release/sned-native \
         "Search for all Rust files in this project" \
         2>&1 || true
 }
@@ -216,8 +216,8 @@ echo ""
 Dhat_JSON="dhat-heap.json"
 if [ ! -f "$Dhat_JSON" ]; then
     # Try alternate location
-    if [ -f "dirac-native/$Dhat_JSON" ]; then
-        Dhat_JSON="dirac-native/$Dhat_JSON"
+    if [ -f "sned-native/$Dhat_JSON" ]; then
+        Dhat_JSON="sned-native/$Dhat_JSON"
     else
         echo -e "${YELLOW}Warning: dhat-heap.json not found${NC}"
         echo "The workload may not have triggered heap allocations."
@@ -293,7 +293,7 @@ leak_ratio = (final_live / total_allocated * 100) if total_allocated > 0 else 0
 sorted_pps = sorted(enumerate(pps), key=lambda x: x[1].get('gb', 0) + x[1].get('eb', 0), reverse=True)
 
 print("=" * 70)
-print("  Dirac Native Memory Profile Summary")
+print("  Sned Native Memory Profile Summary")
 print("=" * 70)
 print()
 print(f"  Timestamp:    $TIMESTAMP")
