@@ -1,0 +1,12 @@
+{
+  "is_new_user": false,
+  "terminal_reuse_enabled": true,
+  "mode": "act",
+  "plan_mode_api_provider": "anthropic",
+  "act_mode_api_provider": "anthropic",
+  "model_id": "claude-sonnet-4-20250514",
+  "reasoning_effort": "low",
+  "temperature": 0.7,
+  "max_tokens": 4096,
+  "custom_instructions": "Test custom instructions"
+}

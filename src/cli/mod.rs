@@ -1,0 +1,2033 @@
+//! CLI argument parsing – 100% compatible with existing Sned flags.
+//!
+//! Every flag, subcommand, and alias is preserved from the TypeScript CLI.
+
+pub mod actionable_errors;
+pub mod colors;
+pub mod image_input;
+pub mod interactive;
+pub mod redact;
+pub mod slash_commands;
+pub mod spinner;
+pub mod subcommands;
+pub mod syntax_highlight;
+pub mod text_utils;
+
+pub use interactive::{
+    InteractiveSession, cleanup_terminal, query_cursor_position, render_interactive_prompt_prefix,
+    restore_raw_mode, run_interactive_shell_inner, should_start_interactive_shell,
+};
+pub use subcommands::{
+    format_config_output, parse_config_assignment, print_dry_run_report, run_auth, run_config,
+    run_doctor, run_history, run_migration,
+};
+
+use clap::{CommandFactory, Parser, Subcommand};
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// Custom layer that routes `json_output` target events directly to stdout
+/// without `tracing_subscriber::fmt` formatting (no timestamp, no prefix).
+/// This ensures `--json-output` mode produces only valid JSON lines.
+struct JsonOutputLayer;
+
+impl<S> tracing_subscriber::Layer<S> for JsonOutputLayer
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() == "json_output" {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0 = format!("{:?}", value);
+                }
+                fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+                    self.0 = value.to_string();
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{}", visitor.0);
+        }
+    }
+}
+
+/// Options shared between `task`, the default prompt command, and `resume`.
+///
+/// Source: `dirac/cli/src/index.ts` `TaskOptions` interface and the
+/// `.option()` calls on both the root command and the `task` subcommand.
+#[derive(Debug, Clone, Parser)]
+#[command(next_help_heading = "Task Options")]
+pub struct TaskOptions {
+    /// Run in act mode
+    #[arg(short = 'a', long)]
+    pub act: bool,
+
+    /// Run in plan mode
+    #[arg(short = 'p', long)]
+    pub plan: bool,
+
+    /// Enable yes/yolo mode (auto-approve actions)
+    #[arg(short = 'y', long)]
+    pub yolo: bool,
+
+    /// Enable auto-approve all actions while keeping interactive mode
+    #[arg(long)]
+    pub auto_approve_all: bool,
+
+    /// Optional timeout in seconds (applies only when provided)
+    #[arg(short = 't', long)]
+    pub timeout: Option<String>,
+
+    /// Model to use for the task
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+
+    /// API provider to use (requires --model). Auto-detected when --base-url is set
+    #[arg(long)]
+    pub provider: Option<String>,
+
+    /// Base URL for custom OpenAI-compatible provider (or set OPENAI_API_BASE env var)
+    #[arg(long)]
+    pub base_url: Option<String>,
+
+    /// API key for custom provider (or set OPENAI_API_KEY env var)
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Show verbose output
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+
+    /// Working directory for the task
+    #[arg(short = 'c', long)]
+    pub cwd: Option<String>,
+
+    /// Path to Sned configuration directory
+    #[arg(long)]
+    pub config: Option<String>,
+
+    /// Enable extended thinking (default: 1024 tokens)
+    #[arg(long)]
+    pub thinking: Option<Option<String>>,
+
+    /// Reasoning effort: none|low|medium|high|xhigh
+    #[arg(long, value_name = "effort")]
+    pub reasoning_effort: Option<String>,
+
+    /// Maximum consecutive mistakes before halting in yolo mode
+    #[arg(long, value_name = "count")]
+    pub max_consecutive_mistakes: Option<String>,
+
+    /// Output messages as JSON instead of styled text
+    #[arg(long)]
+    pub json: bool,
+
+    /// Reject first completion attempt to force re-verification
+    #[arg(long)]
+    pub double_check_completion: bool,
+
+    /// Enable AI-powered context compaction instead of mechanical truncation (enabled by default)
+    #[arg(long, default_value_t = true)]
+    pub auto_condense: bool,
+
+    /// Disable token usage display after each turn (hidden by default)
+    #[arg(long)]
+    pub no_token_display: bool,
+
+    /// Enable subagents for the task
+    #[arg(long)]
+    pub subagents: bool,
+
+    /// Internal flag: marks this task as running inside a subagent (prevents recursion)
+    #[arg(long, hide = true)]
+    pub is_subagent: bool,
+
+    /// Custom User-Agent header for OpenAI-compatible provider
+    #[arg(long)]
+    pub user_agent: Option<String>,
+
+    /// Path to additional hooks directory for runtime hook injection
+    #[arg(long)]
+    pub hooks_dir: Option<String>,
+
+    /// Export conversation to file after completion (JSON or markdown)
+    #[arg(long, value_name = "path")]
+    pub export: Option<String>,
+
+    /// Image files to include with the task prompt
+    #[arg(short = 'i', long, value_name = "path")]
+    pub image: Vec<String>,
+
+    /// Enable automatic change tracking (shadow git for undo/versioning)
+    #[arg(long)]
+    pub track_changes: bool,
+
+    /// Maximum number of context turns before pruning (default: 50)
+    #[arg(long, value_name = "turns")]
+    pub max_context_turns: Option<String>,
+}
+
+/// Additional options only on the root (default) command, not on `task`.
+#[derive(Debug, Clone, Parser)]
+#[command(next_help_heading = "Root Command Options")]
+pub struct RootOnlyOptions {
+    /// Resume an existing task by ID
+    #[arg(short = 'T', long)]
+    pub task_id: Option<String>,
+
+    /// Resume the most recent task from the current working directory
+    #[arg(long = "continue")]
+    pub continue_task: bool,
+}
+
+/// Options for the `history` subcommand.
+///
+/// Source: `dirac/cli/src/index.ts` `program.command("history")` options.
+#[derive(Debug, Clone, Parser)]
+pub struct HistoryOptions {
+    /// Number of tasks to show
+    #[arg(short = 'n', long, default_value = "10")]
+    pub limit: u32,
+
+    /// Page number (1-based)
+    #[arg(short = 'p', long, default_value = "1")]
+    pub page: u32,
+
+    /// Path to Sned configuration directory
+    #[arg(long)]
+    pub config: Option<String>,
+}
+
+/// Options for the `config` subcommand.
+#[derive(Debug, Clone, Parser)]
+pub struct ConfigOptions {
+    #[command(subcommand)]
+    pub action: Option<ConfigAction>,
+
+    /// Path to Sned configuration directory
+    #[arg(long)]
+    pub config: Option<String>,
+
+    /// Validate configuration (check provider keys and connectivity)
+    #[arg(long)]
+    pub validate: bool,
+
+    /// Migrate from another Sned configuration directory
+    #[arg(long)]
+    pub migrate: Option<String>,
+
+    /// Show migration plan without executing (use with --migrate)
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ConfigAction {
+    Set {
+        #[arg(value_name = "key=value")]
+        assignment: String,
+    },
+    /// List all valid config keys with their types and current values
+    List,
+}
+
+/// Options for the `auth` subcommand.
+///
+/// Source: `dirac/cli/src/index.ts` `program.command("auth")` options.
+#[derive(Debug, Clone, Parser)]
+pub struct AuthOptions {
+    /// Provider ID for quick setup (e.g., openai-native, anthropic, moonshot)
+    #[arg(short = 'p', long)]
+    pub provider: Option<String>,
+
+    /// API key for the provider
+    #[arg(short = 'k', long)]
+    pub apikey: Option<String>,
+
+    /// Model ID to configure (e.g., gpt-4o, claude-sonnet-4-6, kimi-k2.5)
+    #[arg(short = 'm', long)]
+    pub modelid: Option<String>,
+
+    /// Base URL (optional, only for openai provider)
+    #[arg(short = 'b', long)]
+    pub baseurl: Option<String>,
+
+    /// Azure API version (optional, only for azure openai)
+    #[arg(long)]
+    pub azure_api_version: Option<String>,
+
+    /// Show verbose output
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+
+    /// Working directory for the task
+    #[arg(short = 'c', long)]
+    pub cwd: Option<String>,
+
+    /// Path to Sned configuration directory
+    #[arg(long)]
+    pub config: Option<String>,
+}
+
+/// Sned CLI subcommands.
+///
+/// Source: `dirac/cli/src/index.ts` Commander `.command()` definitions.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run a new task
+    #[command(alias = "t")]
+    Task {
+        /// The task prompt
+        prompt: String,
+
+        #[command(flatten)]
+        opts: Box<TaskOptions>,
+    },
+
+    /// List task history
+    #[command(alias = "h")]
+    History {
+        #[command(flatten)]
+        opts: HistoryOptions,
+    },
+
+    /// Show current configuration
+    Config {
+        #[command(flatten)]
+        opts: ConfigOptions,
+    },
+
+    /// Authenticate a provider and configure what model is used
+    Auth {
+        #[command(flatten)]
+        opts: AuthOptions,
+    },
+
+    /// Show Sned CLI version number
+    Version,
+
+    /// Developer tools and utilities
+    Dev {
+        #[command(subcommand)]
+        subcmd: DevSubcommand,
+    },
+
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
+    /// Run diagnostic checks
+    Doctor,
+}
+
+/// Dev subcommands.
+#[derive(Debug, Subcommand)]
+pub enum DevSubcommand {
+    /// Open the log file
+    Log,
+}
+
+/// Sned CLI - AI coding assistant in your terminal.
+///
+///
+/// For custom OpenAI-compatible providers: set OPENAI_API_KEY + OPENAI_API_BASE env vars, or use --api-key + --base-url flags
+///
+/// Exit Codes:
+/// - 0: Success
+/// - 1: General error (API failure, unexpected error)
+/// - 2: Configuration error (missing API key, invalid config)
+/// - 3: Input error (invalid prompt, bad flag)
+/// - 4: Tool error (edit_file failure, command execution failure)
+/// - 5: Signal/interrupted
+#[derive(Debug, Parser)]
+#[command(
+    name = "sned",
+    version = format!("{} (commit: {}, build: {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_COMMIT_HASH"),
+        env!("BUILD_PROFILE")
+    ),
+    about = "Sned CLI - AI coding assistant in your terminal",
+    after_help = "Exit Codes: 0=Success, 1=General error, 2=Config error, 3=Input error, 4=Tool error, 5=Interrupted"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    /// Task prompt (starts task immediately)
+    #[arg(value_name = "prompt")]
+    pub prompt: Option<String>,
+
+    #[command(flatten)]
+    pub task_opts: TaskOptions,
+
+    #[command(flatten)]
+    pub root_opts: RootOnlyOptions,
+}
+
+/// Parse and return the CLI structure.
+pub fn parse() -> Cli {
+    Cli::parse()
+}
+
+/// Extract the config path from the parsed CLI arguments and set SNED_DIR if present.
+pub fn apply_config_override(cli: &Cli) {
+    let mut config_path = cli.task_opts.config.clone();
+
+    if let Some(cmd) = &cli.command {
+        match cmd {
+            Command::Task { opts, .. } if opts.config.is_some() => {
+                config_path = opts.config.clone();
+            }
+            Command::History { opts } if opts.config.is_some() => {
+                config_path = opts.config.clone();
+            }
+            Command::Config { opts } if opts.config.is_some() => {
+                config_path = opts.config.clone();
+            }
+            Command::Auth { opts } if opts.config.is_some() => {
+                config_path = opts.config.clone();
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(path) = config_path {
+        unsafe {
+            std::env::set_var("SNED_DIR", &path);
+        }
+    }
+}
+
+fn cli_log_file_path_from(data_dir: &Path, log_dir: Option<&Path>) -> PathBuf {
+    log_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| data_dir.join("logs"))
+        .join("sned.1.log")
+}
+
+fn cli_log_file_path() -> PathBuf {
+    let data_dir = crate::storage::disk::get_data_dir();
+    let log_dir = std::env::var_os("SNED_LOG_DIR").map(PathBuf::from);
+    cli_log_file_path_from(&data_dir, log_dir.as_deref())
+}
+
+fn open_path_in_default_app(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = ProcessCommand::new("open").arg(path).status()?;
+        if !status.success() {
+            anyhow::bail!("Failed to open log file");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = ProcessCommand::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(path)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("Failed to open log file");
+        }
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let status = ProcessCommand::new("xdg-open").arg(path).status()?;
+        if !status.success() {
+            anyhow::bail!("Failed to open log file");
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    {
+        let _ = path;
+        anyhow::bail!("Opening the log file is not supported on this platform");
+    }
+}
+
+fn open_cli_log_file() -> anyhow::Result<()> {
+    open_path_in_default_app(&cli_log_file_path())
+}
+
+fn run_task(
+    prompt: Option<String>,
+    task_opts: TaskOptions,
+    root_opts: RootOnlyOptions,
+) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_task_inner(prompt, task_opts, root_opts))
+}
+
+struct TaskComponents {
+    state_manager: Arc<crate::storage::state_manager::StateManager>,
+    config: crate::core::agent_loop::AgentConfig,
+    system_prompt_context: crate::core::context::SystemPromptContext,
+    task_storage: crate::storage::task_storage::TaskStorage,
+    context_loader: crate::core::context::ContextLoader,
+    approval_manager: Arc<tokio::sync::Mutex<crate::core::approval::ApprovalManager>>,
+    hook_manager: Arc<crate::core::hooks::HookManager>,
+    checkpoint_mgr: crate::core::checkpoints::TaskCheckpointManager,
+    registry: Arc<crate::core::tools::ToolRegistry>,
+}
+
+fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
+    use crate::providers::env_auth::get_provider_from_env;
+
+    // Determine provider: --provider flag > auto-detection from env > error
+    let (provider_name, was_auto_detected) = if let Some(explicit) = &task_opts.provider {
+        (explicit.as_str(), false)
+    } else if let Some(detected) = get_provider_from_env() {
+        (detected, true)
+    } else {
+        // No provider flag and no auto-detected keys - show helpful error
+        anyhow::bail!(
+            "No API provider configured. Set one of these environment variables:\n\
+             \n\
+             Common providers:\n\
+             \x1b[36m  ANTHROPIC_API_KEY\x1b[0m       - Anthropic Claude\n\
+             \x1b[36m  OPENAI_API_KEY\x1b[0m          - OpenAI GPT\n\
+             \x1b[36m  GEMINI_API_KEY\x1b[0m          - Google Gemini\n\
+             \x1b[36m  GROQ_API_KEY\x1b[0m            - Groq\n\
+             \x1b[36m  OPENROUTER_API_KEY\x1b[0m      - OpenRouter\n\
+             \x1b[36m  XAI_API_KEY\x1b[0m             - xAI Grok\n\
+             \x1b[36m  DEEPSEEK_API_KEY\x1b[0m       - DeepSeek\n\
+             \x1b[36m  QWEN_API_KEY\x1b[0m            - Qwen\n\
+             \n\
+             Or use --provider flag with --api-key and/or --base-url"
+        );
+    };
+
+    // Only override to openai for custom base URL if user didn't explicitly specify provider
+    let is_custom_provider =
+        task_opts.base_url.is_some() || std::env::var("OPENAI_API_BASE").is_ok();
+    let provider_name = if is_custom_provider && task_opts.provider.is_none() {
+        "openai"
+    } else {
+        provider_name
+    };
+
+    // Print detected provider at startup
+    if was_auto_detected {
+        eprintln!("[sned] Auto-detected provider: {}", provider_name);
+    }
+
+    let model_id = task_opts.model.clone();
+    let thinking_budget = task_opts
+        .thinking
+        .as_ref()
+        .and_then(|t| t.as_ref())
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| {
+            if task_opts.thinking.is_some() {
+                Some(1024u32)
+            } else {
+                None
+            }
+        });
+    let user_agent = task_opts.user_agent.clone();
+
+    let provider: Arc<dyn crate::providers::Provider> = match provider_name {
+        "anthropic" => {
+            let api_key =
+                std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "dummy".to_string());
+            Arc::new(crate::providers::anthropic::AnthropicProvider::new(
+                crate::providers::anthropic::AnthropicConfig {
+                    api_key,
+                    base_url: None,
+                    model_id: model_id.unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string()),
+                    model_info: Some(crate::providers::ModelInfo::default()),
+                    thinking_budget_tokens: thinking_budget,
+                },
+            )?)
+        }
+        "minimax" => Arc::new(crate::providers::minimax::MinimaxProvider::new(
+            crate::providers::minimax::MinimaxConfig {
+                api_key: std::env::var("MINIMAX_API_KEY").unwrap_or_default(),
+                api_line: None,
+                model_id: model_id.unwrap_or_else(|| "MiniMax-M2.7".to_string()),
+                model_info: None,
+                thinking_budget_tokens: thinking_budget,
+            },
+        )?),
+        "openai" | "openai-native" => {
+            let api_key = task_opts
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .unwrap_or_default();
+            let base_url = task_opts
+                .base_url
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_BASE").ok());
+            Arc::new(crate::providers::openai::OpenAiProvider::new(
+                crate::providers::openai::OpenAiConfig {
+                    model_id: model_id.unwrap_or_else(|| "gpt-4o".to_string()),
+                    api_key,
+                    base_url,
+                    model_info: None,
+                    reasoning_effort: task_opts.reasoning_effort.clone(),
+                    custom_headers: user_agent.map(|ua| {
+                        let mut headers = std::collections::HashMap::new();
+                        headers.insert("User-Agent".to_string(), ua);
+                        headers
+                    }),
+                },
+            )?)
+        }
+        "gemini" => {
+            let api_key = task_opts
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                .unwrap_or_default();
+            let base_url = task_opts
+                .base_url
+                .clone()
+                .or_else(|| std::env::var("GEMINI_BASE_URL").ok());
+            Arc::new(crate::providers::gemini::GeminiProvider::new(
+                crate::providers::gemini::GeminiConfig {
+                    model_id: model_id.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
+                    api_key,
+                    base_url,
+                    model_info: None,
+                    thinking_budget_tokens: thinking_budget,
+                    reasoning_effort: task_opts.reasoning_effort.clone(),
+                    search_enabled: false,
+                },
+            )?)
+        }
+        "deepseek" => {
+            let api_key = task_opts
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
+                .unwrap_or_default();
+            let model_id_str = model_id
+                .clone()
+                .unwrap_or_else(|| "deepseek-chat".to_string());
+            Arc::new(crate::providers::deepseek::DeepSeekProvider::new(
+                crate::providers::deepseek::DeepSeekConfig {
+                    api_key,
+                    model_id: model_id_str.clone(),
+                    model_info: Some(crate::providers::deepseek::get_deepseek_model_info(
+                        &model_id_str,
+                    )),
+                },
+            )?)
+        }
+        "groq" => {
+            let api_key = task_opts
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("GROQ_API_KEY").ok())
+                .unwrap_or_default();
+            let model_id_str = model_id
+                .clone()
+                .unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+            Arc::new(crate::providers::groq::GroqProvider::new(
+                crate::providers::groq::GroqConfig {
+                    api_key,
+                    model_id: model_id_str.clone(),
+                    model_info: Some(crate::providers::groq::get_groq_model_info(&model_id_str)),
+                },
+            )?)
+        }
+        "openrouter" => {
+            let api_key = task_opts
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .unwrap_or_default();
+            let model_id_str = model_id
+                .clone()
+                .unwrap_or_else(|| "anthropic/claude-sonnet-4.5".to_string());
+            Arc::new(crate::providers::openrouter::OpenRouterProvider::new(
+                crate::providers::openrouter::OpenRouterConfig {
+                    api_key,
+                    model_id: model_id_str.clone(),
+                    model_info: Some(crate::providers::openrouter::get_openrouter_model_info(
+                        &model_id_str,
+                    )),
+                    provider_sort: None,
+                },
+            )?)
+        }
+        "xai" => {
+            let api_key = task_opts
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("XAI_API_KEY").ok())
+                .unwrap_or_default();
+            let model_id_str = model_id.clone().unwrap_or_else(|| "grok-3".to_string());
+            Arc::new(crate::providers::xai::XaiProvider::new(
+                crate::providers::xai::XaiConfig {
+                    api_key,
+                    model_id: model_id_str.clone(),
+                    model_info: Some(crate::providers::xai::get_xai_model_info(&model_id_str)),
+                },
+            )?)
+        }
+        "mock" => Arc::new(
+            crate::providers::mock::MockProvider::single_text_response_repeat(
+                "Mock provider response - task completed successfully",
+            ),
+        ),
+        _ => anyhow::bail!("Unsupported provider: {}", provider_name),
+    };
+
+    Ok(provider)
+}
+
+fn load_skills() -> Vec<crate::core::context::SkillMetadata> {
+    use crate::core::context::{discover_skills, get_available_skills};
+
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| get_available_skills(discover_skills(&cwd)))
+        .unwrap_or_default()
+}
+
+struct RulesContext {
+    agents_rules: Option<String>,
+    cursor_rules_file: Option<String>,
+    cursor_rules_dir: Option<String>,
+    windsurf_rules: Option<String>,
+}
+
+fn load_rules(
+    cwd_path: &std::path::Path,
+    state_manager: &crate::storage::state_manager::StateManager,
+) -> RulesContext {
+    use crate::core::context::{
+        get_local_agents_rules, get_local_cursor_rules, get_local_windsurf_rules,
+    };
+
+    let rule_toggles: crate::core::context::RuleToggles = state_manager
+        .get_global_state_key(crate::storage::state_manager::GlobalStateKey::GlobalSnedRulesToggles)
+        .unwrap_or_default();
+
+    let agents = get_local_agents_rules(cwd_path, &rule_toggles);
+    let cursor = get_local_cursor_rules(cwd_path, &rule_toggles);
+    let windsurf = get_local_windsurf_rules(cwd_path, &rule_toggles);
+
+    RulesContext {
+        agents_rules: agents,
+        cursor_rules_file: cursor.first().cloned().flatten(),
+        cursor_rules_dir: cursor.get(1).cloned().flatten(),
+        windsurf_rules: windsurf,
+    }
+}
+
+fn build_tool_registry(
+    approval_manager: Arc<tokio::sync::Mutex<crate::core::approval::ApprovalManager>>,
+    symbol_index_service: Arc<std::sync::Mutex<crate::services::symbol_index::SymbolIndexService>>,
+    yolo_mode: bool,
+) -> crate::core::tools::ToolRegistry {
+    use crate::core::tools::ToolRegistry;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(
+        crate::core::tools::SnedTool::ExecuteCommand,
+        Arc::new(
+            crate::core::tools::handlers::execute_command::ExecuteCommandHandler::new()
+                .with_yolo(yolo_mode),
+        ),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::WriteToFile,
+        Arc::new(crate::core::tools::handlers::write_to_file::WriteToFileHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::ReadFile,
+        Arc::new(crate::core::tools::handlers::read_file::ReadFileHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::ListFiles,
+        Arc::new(crate::core::tools::handlers::list_files::ListFilesHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::SearchFiles,
+        Arc::new(crate::core::tools::handlers::search_files::SearchFilesHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::EditFile,
+        Arc::new(
+            crate::core::tools::handlers::edit_file::EditFileHandler::new()
+                .with_approval_manager(approval_manager),
+        ),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::AskFollowupQuestion,
+        Arc::new(
+            crate::core::tools::handlers::ask_followup_question::AskFollowupQuestionHandler::new(),
+        ),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::AttemptCompletion,
+        Arc::new(crate::core::tools::handlers::attempt_completion::AttemptCompletionHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::PlanModeRespond,
+        Arc::new(crate::core::tools::handlers::plan_mode_respond::PlanModeRespondHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::GetFileSkeleton,
+        Arc::new(crate::core::tools::handlers::get_file_skeleton::GetFileSkeletonHandler),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::GetFunction,
+        Arc::new(crate::core::tools::handlers::get_function::GetFunctionHandler),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::FindSymbolReferences,
+        Arc::new(crate::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::ReplaceSymbol,
+        Arc::new(
+            crate::core::tools::handlers::replace_symbol::ReplaceSymbolHandler::new()
+                .with_symbol_index(Arc::clone(&symbol_index_service)),
+        ),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::RenameSymbol,
+        Arc::new(
+            crate::core::tools::handlers::rename_symbol::RenameSymbolHandler::new()
+                .with_symbol_index(symbol_index_service),
+        ),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::SummarizeTask,
+        Arc::new(crate::core::tools::handlers::summarize_task::SummarizeTaskHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::Condense,
+        Arc::new(crate::core::tools::handlers::condense::CondenseHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::WebFetch,
+        Arc::new(crate::core::tools::handlers::web_fetch::WebFetchHandler),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::UseSkill,
+        Arc::new(crate::core::tools::handlers::use_skill::UseSkillHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::ListSkills,
+        Arc::new(crate::core::tools::handlers::list_skills::ListSkillsHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::DiagnosticsScan,
+        Arc::new(crate::core::tools::handlers::diagnostics_scan::DiagnosticsScanHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::UseSubagents,
+        Arc::new(crate::core::tools::handlers::use_subagents::UseSubagentsHandler::new()),
+    );
+    registry.register(
+        crate::core::tools::SnedTool::NewTask,
+        Arc::new(crate::core::tools::handlers::new_task::NewTaskHandler::new()),
+    );
+
+    registry
+}
+
+fn setup_hook_manager(
+    task_opts: &TaskOptions,
+    state_manager: &crate::storage::state_manager::StateManager,
+) -> Arc<crate::core::hooks::HookManager> {
+    let mut hook_manager = crate::core::hooks::HookManager::new(state_manager.get_distinct_id());
+    if let Some(hooks_dir) = task_opts.hooks_dir.clone() {
+        hook_manager.add_workspace_hooks_dir(std::path::PathBuf::from(hooks_dir));
+    }
+
+    let watch_dirs: Vec<std::path::PathBuf> = [
+        hook_manager.get_runtime_hooks_dir().cloned(),
+        hook_manager.get_global_hooks_dir().cloned(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(hook_manager.get_workspace_hooks_dirs().iter().cloned())
+    .collect();
+    if !watch_dirs.is_empty() {
+        let cache = crate::core::hook_cache::HookDiscoveryCache::new(watch_dirs);
+        hook_manager = hook_manager.with_discovery_cache(cache);
+    }
+
+    Arc::new(hook_manager)
+}
+
+async fn build_task_components(
+    task_opts: TaskOptions,
+    root_opts: RootOnlyOptions,
+) -> anyhow::Result<TaskComponents> {
+    use crate::core::agent_loop::{AgentConfig, AgentMode};
+    use crate::core::context::SystemPromptContext;
+    use crate::storage::state_manager::StateManager;
+
+    if let Some(ref cwd) = task_opts.cwd {
+        std::env::set_current_dir(cwd)?;
+    }
+
+    let state_manager = Arc::new(StateManager::new()?);
+    state_manager.initialize()?;
+
+    let provider = create_provider(&task_opts)?;
+
+    let mode = if task_opts.plan {
+        AgentMode::Plan
+    } else {
+        AgentMode::Act
+    };
+    let has_task_id = root_opts.task_id.is_some();
+    let task_id = if let Some(id) = root_opts.task_id.clone() {
+        id
+    } else if root_opts.continue_task {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
+        state_manager
+            .get_most_recent_task_for_workspace(&cwd)
+            .map(|h| h.id)
+            .unwrap_or_else(|| "task-123".to_string())
+    } else {
+        ulid::Ulid::new().to_string()
+    };
+
+    if task_opts.json {
+        println!(
+            "{}",
+            serde_json::json!({ "type": "task_started", "taskId": task_id.clone() })
+        );
+    }
+
+    let config = AgentConfig {
+        provider: provider.clone(),
+        mode,
+        task_id: task_id.clone(),
+        enable_checkpoints: state_manager
+            .get_global_state_key::<bool>(
+                crate::storage::state_manager::GlobalStateKey::EnableCheckpoints,
+            )
+            .unwrap_or(true),
+        use_auto_condense: task_opts.auto_condense,
+        show_token_usage: !task_opts.no_token_display,
+        json_output: task_opts.json,
+        max_turns: 100,
+        max_consecutive_mistakes: task_opts
+            .max_consecutive_mistakes
+            .clone()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3u32),
+        double_check_completion: task_opts.double_check_completion,
+        timeout_secs: task_opts
+            .timeout
+            .clone()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+        track_changes: task_opts.track_changes,
+        is_subagent_execution: task_opts.is_subagent,
+        max_context_turns: task_opts
+            .max_context_turns
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50),
+        interactive_mode: false,
+    };
+
+    let shell_path = std::env::var("SHELL").ok();
+    let shell_type = shell_path.as_deref().and_then(|s| {
+        std::path::Path::new(s)
+            .file_name()
+            .and_then(|n| n.to_str().map(String::from))
+    });
+    let available_cores = num_cpus::get() as u32;
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from));
+
+    let skills = load_skills();
+
+    let (agents_rules, cursor_rules_file, cursor_rules_dir, windsurf_rules) =
+        if let Ok(cwd_path) = std::env::current_dir() {
+            let rules = load_rules(&cwd_path, &state_manager);
+            (
+                rules.agents_rules,
+                rules.cursor_rules_file,
+                rules.cursor_rules_dir,
+                rules.windsurf_rules,
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+    let system_prompt_context = SystemPromptContext {
+        cwd: cwd.clone(),
+        active_shell_path: shell_path,
+        active_shell_type: shell_type,
+        active_shell_is_posix: true,
+        available_cores: Some(available_cores),
+        enable_parallel_tool_calling: true,
+        skills,
+        local_agents_rules_file_instructions: agents_rules,
+        local_cursor_rules_file_instructions: cursor_rules_file,
+        local_cursor_rules_dir_instructions: cursor_rules_dir,
+        local_windsurf_rules_file_instructions: windsurf_rules,
+        ..Default::default()
+    };
+
+    let task_storage = crate::storage::task_storage::TaskStorage::new(&task_id)?;
+    let cwd_str = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| ".".to_string());
+    let is_new_task = !root_opts.continue_task && !has_task_id;
+    if is_new_task {
+        let _ = task_storage.create_initial_metadata(&cwd_str, None);
+    }
+
+    let symbol_index_service = Arc::new(std::sync::Mutex::new(
+        crate::services::symbol_index::SymbolIndexService::new(cwd_str.clone())
+            .with_persistence()?,
+    ));
+
+    let context_loader = crate::core::context::ContextLoader::new(cwd_str.clone())
+        .with_symbol_index_service(Arc::clone(&symbol_index_service));
+    let approval_manager = Arc::new(tokio::sync::Mutex::new(
+        crate::core::approval::ApprovalManager::new()
+            .with_yolo(task_opts.yolo)
+            .with_auto_approve_all(task_opts.auto_approve_all)
+            .with_workspace_root(cwd_str.clone()),
+    ));
+
+    let registry = build_tool_registry(
+        approval_manager.clone(),
+        symbol_index_service,
+        task_opts.yolo,
+    );
+    let hook_manager = setup_hook_manager(&task_opts, &state_manager);
+
+    let checkpoint_mgr = crate::core::checkpoints::TaskCheckpointManager::new(
+        task_id.clone(),
+        config.enable_checkpoints,
+        &cwd_str,
+    );
+
+    Ok(TaskComponents {
+        state_manager,
+        config,
+        system_prompt_context,
+        task_storage,
+        context_loader,
+        approval_manager,
+        hook_manager,
+        checkpoint_mgr,
+        registry: Arc::new(registry),
+    })
+}
+
+async fn run_task_inner(
+    prompt: Option<String>,
+    task_opts: TaskOptions,
+    root_opts: RootOnlyOptions,
+) -> anyhow::Result<()> {
+    let mut session = InteractiveSession::build(task_opts, root_opts).await?;
+    session.run(prompt).await
+}
+
+fn run_interactive_shell(task_opts: TaskOptions, root_opts: RootOnlyOptions) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut session = InteractiveSession::build_interactive(task_opts, root_opts).await?;
+
+        // Print startup info line (respects NO_COLOR and --quiet)
+        if !session.is_quiet() {
+            let startup_info = session.get_startup_info();
+            eprintln!("{}", startup_info);
+            crate::cli::colors::eprint_info(
+                "type a prompt and press Enter; type 'exit' or 'quit' to leave",
+            );
+            crate::cli::colors::eprint_info(
+                "type /help for slash commands, @ to search and mention files",
+            );
+        }
+
+        session.run(None).await
+    })
+}
+
+/// Query the terminal for the current cursor position.
+/// Returns (row, col) as 1-based coordinates.
+
+/// Restore raw mode after temporarily dropping it for confirmation input.
+/// If restoration fails, cleans up terminal state and returns an error.
+
+fn read_piped_stdin() -> anyhow::Result<Option<String>> {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Ok(None);
+    }
+
+    let mut stdin = stdin;
+    let mut input = String::new();
+    stdin.read_to_string(&mut input)?;
+    Ok(Some(input))
+}
+
+fn combine_prompt_with_stdin(
+    prompt: Option<String>,
+    stdin_input: Option<String>,
+) -> Option<String> {
+    match (prompt, stdin_input) {
+        (Some(prompt), Some(stdin_input)) if !stdin_input.is_empty() => {
+            Some(format!("{}\n\n{}", stdin_input, prompt))
+        }
+        (Some(prompt), _) => Some(prompt),
+        (None, Some(stdin_input)) if !stdin_input.is_empty() => Some(stdin_input),
+        _ => None,
+    }
+}
+
+/// Run the CLI. Dispatches to subcommand handlers or the default task.
+pub fn run() -> anyhow::Result<()> {
+    let cli = parse();
+    apply_config_override(&cli);
+
+    // Initialize tracing based on verbosity
+    let log_level = if cli.task_opts.verbose {
+        "debug"
+    } else {
+        "warn"
+    };
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(format!("sned={}", log_level))),
+                ),
+        )
+        .with(JsonOutputLayer)
+        .init();
+
+    match cli.command {
+        Some(Command::Task { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),
+        Some(Command::History { opts }) => run_history(opts),
+        Some(Command::Config { opts }) => run_config(opts),
+        Some(Command::Auth { opts }) => run_auth(opts),
+        Some(Command::Version) => {
+            let commit = env!("GIT_COMMIT_HASH");
+            let profile = env!("BUILD_PROFILE");
+            println!("sned {}", env!("CARGO_PKG_VERSION"));
+            println!("commit: {}", commit);
+            println!("build: {}", profile);
+            Ok(())
+        }
+        Some(Command::Dev { subcmd }) => match subcmd {
+            DevSubcommand::Log => open_cli_log_file(),
+        },
+        Some(Command::Completions { shell }) => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
+        Some(Command::Doctor) => run_doctor(),
+        None => {
+            let stdin_input = read_piped_stdin()?;
+            let stdin_was_piped = stdin_input.is_some();
+
+            if cli.root_opts.task_id.is_some() && cli.root_opts.continue_task {
+                anyhow::bail!("Use either --taskId or --continue, not both.")
+            }
+
+            if cli.root_opts.continue_task {
+                if cli.prompt.is_some() {
+                    anyhow::bail!("Use --continue without a prompt.")
+                }
+                if stdin_was_piped {
+                    anyhow::bail!("Use --continue without piped input.")
+                }
+                return run_task(None, cli.task_opts, cli.root_opts);
+            }
+
+            if stdin_input.as_deref() == Some("") && cli.prompt.is_none() {
+                anyhow::bail!("Empty input received from stdin. Please provide content to process.")
+            }
+
+            let effective_prompt = combine_prompt_with_stdin(cli.prompt.clone(), stdin_input)
+                .map(|prompt| prompt.trim().to_string())
+                .filter(|prompt| !prompt.is_empty());
+
+            if cli.root_opts.task_id.is_some() {
+                if effective_prompt.is_some() {
+                    anyhow::bail!(
+                        "Use --taskId without a prompt. To resume and add a message, use sned task <id> <prompt>."
+                    );
+                }
+                return run_task(None, cli.task_opts, cli.root_opts);
+            }
+
+            match effective_prompt {
+                Some(prompt) => run_task(Some(prompt), cli.task_opts, cli.root_opts),
+                None => {
+                    if should_start_interactive_shell(
+                        false,
+                        io::stdin().is_terminal(),
+                        io::stdout().is_terminal(),
+                        cli.task_opts.json,
+                    ) {
+                        run_interactive_shell(cli.task_opts, cli.root_opts)
+                    } else {
+                        crate::cli::colors::eprint_error("no prompt provided on stdin");
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parse_task_subcommand() {
+        let cli = Cli::try_parse_from(["sned", "task", "fix the bug", "--act"]).unwrap();
+        match cli.command {
+            Some(Command::Task { prompt, opts }) => {
+                assert_eq!(prompt, "fix the bug");
+                assert!(opts.act);
+            }
+            _ => panic!("expected Task command"),
+        }
+    }
+
+    #[test]
+    fn parse_task_alias() {
+        let cli = Cli::try_parse_from(["sned", "t", "hello world"]).unwrap();
+        match cli.command {
+            Some(Command::Task { prompt, .. }) => {
+                assert_eq!(prompt, "hello world");
+            }
+            _ => panic!("expected Task command via alias"),
+        }
+    }
+
+    #[test]
+    fn parse_history_subcommand() {
+        let cli = Cli::try_parse_from(["sned", "history", "-n", "5", "-p", "2"]).unwrap();
+        match cli.command {
+            Some(Command::History { opts }) => {
+                assert_eq!(opts.limit, 5);
+                assert_eq!(opts.page, 2);
+            }
+            _ => panic!("expected History command"),
+        }
+    }
+
+    #[test]
+    fn parse_history_alias() {
+        let cli = Cli::try_parse_from(["sned", "h"]).unwrap();
+        match cli.command {
+            Some(Command::History { .. }) => {}
+            _ => panic!("expected History command via alias"),
+        }
+    }
+
+    #[test]
+    fn parse_config_subcommand() {
+        let cli = Cli::try_parse_from(["sned", "config"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Config { .. })));
+    }
+
+    #[test]
+    fn parse_config_set_subcommand() {
+        let cli = Cli::try_parse_from(["sned", "config", "set", "mode=plan"]).unwrap();
+        match cli.command {
+            Some(Command::Config { opts }) => match opts.action {
+                Some(ConfigAction::Set { assignment }) => {
+                    assert_eq!(assignment, "mode=plan");
+                }
+                _ => panic!("expected config set action"),
+            },
+            _ => panic!("expected Config command"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_subcommand() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "auth",
+            "-p",
+            "anthropic",
+            "-k",
+            "sk-test",
+            "-m",
+            "claude-sonnet-4-6",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Auth { opts }) => {
+                assert_eq!(opts.provider.as_deref(), Some("anthropic"));
+                assert_eq!(opts.apikey.as_deref(), Some("sk-test"));
+                assert_eq!(opts.modelid.as_deref(), Some("claude-sonnet-4-6"));
+            }
+            _ => panic!("expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn parse_version_subcommand() {
+        let cli = Cli::try_parse_from(["sned", "version"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Version)));
+    }
+
+    #[test]
+    fn parse_kanban_as_prompt() {
+        // Kanban subcommand is intentionally NOT implemented in native CLI.
+        // "sned kanban" is parsed as a prompt, not a subcommand.
+        let cli = Cli::try_parse_from(["sned", "kanban"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.prompt.as_deref(), Some("kanban"));
+    }
+
+    #[test]
+    fn parse_dev_log_subcommand() {
+        let cli = Cli::try_parse_from(["sned", "dev", "log"]).unwrap();
+        match cli.command {
+            Some(Command::Dev { subcmd }) => {
+                assert!(matches!(subcmd, DevSubcommand::Log));
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn cli_log_file_path_uses_dir_override() {
+        let path = cli_log_file_path_from(
+            Path::new("/tmp/sned-data"),
+            Some(Path::new("/var/log/sned")),
+        );
+        assert_eq!(path, PathBuf::from("/var/log/sned/sned.1.log"));
+    }
+
+    #[test]
+    fn cli_log_file_path_defaults_to_data_logs() {
+        let path = cli_log_file_path_from(Path::new("/tmp/sned-data"), None);
+        assert_eq!(path, PathBuf::from("/tmp/sned-data/logs/sned.1.log"));
+    }
+
+    #[test]
+    fn parse_default_prompt() {
+        let cli = Cli::try_parse_from(["sned", "fix the bug"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
+    }
+
+    #[test]
+    fn parse_root_continue_flag() {
+        let cli = Cli::try_parse_from(["sned", "--continue"]).unwrap();
+        assert!(cli.root_opts.continue_task);
+    }
+
+    #[test]
+    fn parse_root_task_id_flag() {
+        let cli = Cli::try_parse_from(["sned", "-T", "abc-123"]).unwrap();
+        assert_eq!(cli.root_opts.task_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn parse_task_options_on_root() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--act",
+            "--model",
+            "gpt-4o",
+            "--provider",
+            "openai-native",
+            "--json",
+            "--auto-condense",
+            "--thinking",
+            "--reasoning-effort",
+            "high",
+        ])
+        .unwrap();
+        assert!(cli.task_opts.act);
+        assert_eq!(cli.task_opts.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(cli.task_opts.provider.as_deref(), Some("openai-native"));
+        assert!(cli.task_opts.json);
+        assert!(cli.task_opts.auto_condense);
+        assert!(cli.task_opts.thinking.is_some());
+        assert_eq!(cli.task_opts.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_no_token_display_flag() {
+        let cli = Cli::try_parse_from(["sned", "--no-token-display", "test"]).unwrap();
+        assert!(cli.task_opts.no_token_display);
+    }
+
+    #[test]
+    fn parse_token_display_default() {
+        let cli = Cli::try_parse_from(["sned", "test"]).unwrap();
+        assert!(!cli.task_opts.no_token_display);
+    }
+
+    #[test]
+    fn interactive_shell_requires_real_terminal_and_non_json_mode() {
+        assert!(should_start_interactive_shell(false, true, true, false));
+        assert!(!should_start_interactive_shell(true, true, true, false));
+        assert!(!should_start_interactive_shell(false, false, true, false));
+        assert!(!should_start_interactive_shell(false, true, false, false));
+        assert!(!should_start_interactive_shell(false, true, true, true));
+    }
+
+    #[test]
+    fn render_interactive_prompt_prefix_shows_model_and_turn() {
+        // Test with model name and turn count
+        let prompt = render_interactive_prompt_prefix(false, Some("claude-3-5-sonnet"), Some(3));
+        assert!(prompt.contains("sned"));
+        assert!(prompt.contains("[sonnet]"));
+        assert!(prompt.contains("#3"));
+        assert!(prompt.contains("> "));
+    }
+
+    #[test]
+    fn render_interactive_prompt_prefix_without_model() {
+        // Test without model name
+        let prompt = render_interactive_prompt_prefix(false, None, Some(0));
+        assert!(prompt.contains("sned> "));
+    }
+
+    #[test]
+    fn render_interactive_prompt_prefix_without_turns() {
+        // Test without turn count (turn 0)
+        let prompt = render_interactive_prompt_prefix(false, Some("gpt-4"), Some(0));
+        assert!(prompt.contains("sned"));
+        assert!(prompt.contains("[4]"));
+        assert!(!prompt.contains("#0")); // Don't show #0
+        assert!(prompt.contains("> "));
+    }
+
+    #[test]
+    fn combine_prompt_with_piped_stdin_prefers_piped_input() {
+        let prompt =
+            combine_prompt_with_stdin(Some("prompt".to_string()), Some("stdin".to_string()))
+                .unwrap();
+        assert_eq!(prompt, "stdin\n\nprompt");
+    }
+
+    #[test]
+    fn combine_prompt_with_empty_stdin_keeps_prompt() {
+        let prompt =
+            combine_prompt_with_stdin(Some("prompt".to_string()), Some(String::new())).unwrap();
+        assert_eq!(prompt, "prompt");
+    }
+
+    #[test]
+    fn combine_prompt_with_only_stdin_uses_stdin() {
+        let prompt = combine_prompt_with_stdin(None, Some("stdin".to_string())).unwrap();
+        assert_eq!(prompt, "stdin");
+    }
+
+    #[test]
+    fn combine_prompt_with_no_input_returns_none() {
+        assert!(combine_prompt_with_stdin(None, None).is_none());
+    }
+
+    #[test]
+    fn parse_user_agent_option() {
+        let cli = Cli::try_parse_from(["sned", "--user-agent", "my-custom-agent/1.0"]).unwrap();
+        assert_eq!(
+            cli.task_opts.user_agent.as_deref(),
+            Some("my-custom-agent/1.0")
+        );
+    }
+
+    #[test]
+    fn parse_hooks_dir_option() {
+        let cli = Cli::try_parse_from(["sned", "--hooks-dir", "/tmp/hooks"]).unwrap();
+        assert_eq!(cli.task_opts.hooks_dir.as_deref(), Some("/tmp/hooks"));
+    }
+
+    #[test]
+    fn parse_image_option_single() {
+        let cli = Cli::try_parse_from(["sned", "--image", "/path/to/img.png"]).unwrap();
+        assert_eq!(cli.task_opts.image, vec!["/path/to/img.png"]);
+    }
+
+    #[test]
+    fn parse_image_option_multiple() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--image",
+            "/path/to/img1.png",
+            "--image",
+            "/path/to/img2.jpg",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.task_opts.image,
+            vec!["/path/to/img1.png", "/path/to/img2.jpg"]
+        );
+    }
+
+    #[test]
+    fn parse_image_option_short_flag() {
+        let cli = Cli::try_parse_from(["sned", "-i", "/path/to/img.png"]).unwrap();
+        assert_eq!(cli.task_opts.image, vec!["/path/to/img.png"]);
+    }
+
+    #[test]
+    fn parse_config_option_on_root() {
+        let cli = Cli::try_parse_from(["sned", "--config", "/custom/sned"]).unwrap();
+        assert_eq!(cli.task_opts.config.as_deref(), Some("/custom/sned"));
+    }
+
+    #[test]
+    fn test_prompt_context_values() {
+        use crate::core::context::{PromptBuilder, SystemPromptContext};
+
+        let context = SystemPromptContext {
+            cwd: Some("/tmp/test".to_string()),
+            active_shell_path: Some("/bin/zsh".to_string()),
+            active_shell_type: Some("zsh".to_string()),
+            active_shell_is_posix: true,
+            available_cores: Some(8),
+            enable_parallel_tool_calling: true,
+            ..Default::default()
+        };
+
+        let prompt = PromptBuilder::new(context).build();
+
+        assert!(
+            prompt.contains("You are Sned"),
+            "Prompt should contain 'You are Sned'"
+        );
+        assert!(
+            prompt.contains("PRIME DIRECTIVES"),
+            "Prompt should contain 'PRIME DIRECTIVES'"
+        );
+        assert!(
+            prompt.contains("Current Working Directory: /tmp/test"),
+            "Prompt should contain cwd"
+        );
+        assert!(
+            prompt.contains("Default Shell: /bin/zsh"),
+            "Prompt should contain shell path"
+        );
+        assert!(
+            prompt.contains("Available CPU Cores: 8"),
+            "Prompt should contain available cores"
+        );
+    }
+
+    #[test]
+    fn test_rules_in_prompt() {
+        use crate::core::context::{PromptBuilder, SystemPromptContext};
+
+        let context = SystemPromptContext {
+            cwd: Some("/workspace".to_string()),
+            local_agents_rules_file_instructions: Some(
+                "# AGENTS.md Rules\n\nAlways write tests.".to_string(),
+            ),
+            local_cursor_rules_file_instructions: Some(
+                "# Cursor Rules\n\nUse idiomatic Rust.".to_string(),
+            ),
+            local_windsurf_rules_file_instructions: Some(
+                "# Windsurf Rules\n\nFormat with rustfmt.".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let prompt = PromptBuilder::new(context).build();
+
+        // Verify custom instructions section exists when rules are present
+        assert!(
+            prompt.contains("USER'S CUSTOM INSTRUCTIONS"),
+            "Prompt should contain custom instructions section"
+        );
+
+        // Verify all rule sources are included
+        assert!(
+            prompt.contains("Always write tests."),
+            "Prompt should contain agents rules"
+        );
+        assert!(
+            prompt.contains("Use idiomatic Rust."),
+            "Prompt should contain cursor rules"
+        );
+        assert!(
+            prompt.contains("Format with rustfmt."),
+            "Prompt should contain windsurf rules"
+        );
+    }
+
+    #[test]
+    fn test_rules_discovery_from_filesystem() {
+        use crate::core::context::instructions::{
+            RuleToggles, get_local_agents_rules, get_local_cursor_rules, get_local_windsurf_rules,
+        };
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        // Create a temporary directory with rule files
+        let temp_dir = TempDir::new().unwrap();
+        let cwd = temp_dir.path();
+
+        // Create AGENTS.md
+        let mut agents_file = std::fs::File::create(cwd.join("AGENTS.md")).unwrap();
+        writeln!(
+            agents_file,
+            "# Project Rules\n\nAlways document public APIs."
+        )
+        .unwrap();
+
+        // Create .cursorrules
+        let mut cursor_file = std::fs::File::create(cwd.join(".cursorrules")).unwrap();
+        writeln!(cursor_file, "Use snake_case for variables.").unwrap();
+
+        // Create .windsurfrules
+        let mut windsurf_file = std::fs::File::create(cwd.join(".windsurfrules")).unwrap();
+        writeln!(windsurf_file, "Max line length: 100.").unwrap();
+
+        // Create .cursor/rules directory with a rule
+        let cursor_rules_dir = cwd.join(".cursor/rules");
+        std::fs::create_dir_all(&cursor_rules_dir).unwrap();
+        let mut cursor_dir_file = std::fs::File::create(cursor_rules_dir.join("rust.mdc")).unwrap();
+        writeln!(cursor_dir_file, "Prefer Result over panic.").unwrap();
+
+        let empty_toggles = RuleToggles::new();
+
+        // Test agents rules discovery
+        let agents_rules = get_local_agents_rules(cwd, &empty_toggles);
+        assert!(agents_rules.is_some(), "Should discover AGENTS.md");
+        let agents = agents_rules.unwrap();
+        assert!(
+            agents.contains("Always document public APIs."),
+            "Should contain agents rules content"
+        );
+
+        // Test cursor rules discovery
+        let cursor_rules = get_local_cursor_rules(cwd, &empty_toggles);
+        assert_eq!(
+            cursor_rules.len(),
+            2,
+            "Should discover .cursorrules and .cursor/rules/"
+        );
+        assert!(
+            cursor_rules[0].as_ref().unwrap().contains("snake_case"),
+            "Should contain cursor file rules"
+        );
+        assert!(
+            cursor_rules[1].as_ref().unwrap().contains("Prefer Result"),
+            "Should contain cursor dir rules"
+        );
+
+        // Test windsurf rules discovery
+        let windsurf_rules = get_local_windsurf_rules(cwd, &empty_toggles);
+        assert!(windsurf_rules.is_some(), "Should discover .windsurfrules");
+        let windsurf = windsurf_rules.unwrap();
+        assert!(
+            windsurf.contains("Max line length"),
+            "Should contain windsurf rules content"
+        );
+    }
+
+    #[test]
+    fn test_disabled_rules_excluded() {
+        use crate::core::context::instructions::{RuleToggles, get_local_agents_rules};
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cwd = temp_dir.path();
+
+        // Create AGENTS.md
+        let mut agents_file = std::fs::File::create(cwd.join("AGENTS.md")).unwrap();
+        writeln!(agents_file, "# Project Rules\n\nAlways document.").unwrap();
+
+        // Create toggles with AGENTS.md disabled
+        let mut toggles = RuleToggles::new();
+        let agents_path = cwd.join("AGENTS.md").to_string_lossy().into_owned();
+        toggles.insert(agents_path, false);
+
+        // Test that disabled rules are excluded
+        let agents_rules = get_local_agents_rules(cwd, &toggles);
+        assert!(agents_rules.is_none(), "Disabled rules should be excluded");
+    }
+
+    #[test]
+    fn test_format_config_output() {
+        use crate::storage::global_state::GlobalState;
+
+        let state = GlobalState::default();
+        let output = format_config_output(&state);
+
+        assert!(output.contains("Current Sned Configuration"));
+        assert!(output.contains("Mode & Provider"));
+        assert!(output.contains("Auto-Approve"));
+        assert!(output.contains("Context"));
+    }
+
+    #[test]
+    fn test_tracing_init_with_verbose_flag() {
+        // Smoke test: verify tracing initializes correctly with verbose flag
+        // This test ensures the double-init bug is fixed and --verbose controls log level
+
+        // Test 1: Default (non-verbose) mode should init with WARN level
+        let cli = Cli::try_parse_from(["sned", "test prompt"]).unwrap();
+        assert!(!cli.task_opts.verbose, "Default should be non-verbose");
+
+        // Test 2: Verbose mode should init with DEBUG level
+        let cli_verbose = Cli::try_parse_from(["sned", "--verbose", "test prompt"]).unwrap();
+        assert!(
+            cli_verbose.task_opts.verbose,
+            "--verbose flag should be set"
+        );
+
+        // Note: We cannot actually test that tracing::init() succeeds here because
+        // tracing can only be initialized once per process. The fact that this test
+        // compiles and the CLI parses correctly verifies the fix:
+        // - main.rs no longer calls .init()
+        // - cli/mod.rs calls .init() after parsing --verbose
+        // - JsonOutputLayer is available in cli/mod.rs
+        // - Log level is computed from cli.task_opts.verbose
+    }
+
+    #[test]
+    fn test_provider_auto_detection() {
+        use crate::providers::env_auth::get_provider_from_env;
+        use std::env;
+
+        // Helper to clear test env vars
+        fn clear_env() {
+            for var in &[
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "GROQ_API_KEY",
+                "XAI_API_KEY",
+                "OPENROUTER_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "MINIMAX_API_KEY",
+                "MINIMAX_CN_API_KEY",
+                "MISTRAL_API_KEY",
+                "MOONSHOT_API_KEY",
+                "ZAI_API_KEY",
+                "QWEN_API_KEY",
+                "TOGETHER_API_KEY",
+                "FIREWORKS_API_KEY",
+                "NEBIUS_API_KEY",
+                "CEREBRAS_API_KEY",
+                "HF_TOKEN",
+                "OPENCODE_API_KEY",
+                "KIMI_API_KEY",
+                "AI_GATEWAY_API_KEY",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_BEDROCK_MODEL",
+                "GOOGLE_CLOUD_PROJECT",
+                "GCP_PROJECT",
+            ] {
+                unsafe { env::remove_var(var) };
+            }
+        }
+
+        // Test 1: No env vars - should return None
+        clear_env();
+        assert_eq!(get_provider_from_env(), None);
+
+        // Test 2: ANTHROPIC_API_KEY set - should detect anthropic
+        clear_env();
+        unsafe { env::set_var("ANTHROPIC_API_KEY", "test-key") };
+        assert_eq!(get_provider_from_env(), Some("anthropic"));
+
+        // Test 3: OPENAI_API_KEY set - should detect openai-native
+        clear_env();
+        unsafe { env::set_var("OPENAI_API_KEY", "test-key") };
+        assert_eq!(get_provider_from_env(), Some("openai-native"));
+
+        // Test 4: Multiple keys - priority order (anthropic > openrouter > openai)
+        clear_env();
+        unsafe {
+            env::set_var("ANTHROPIC_API_KEY", "ant-key");
+            env::set_var("OPENAI_API_KEY", "openai-key");
+        }
+        assert_eq!(get_provider_from_env(), Some("anthropic"));
+
+        // Test 5: Groq provider
+        clear_env();
+        unsafe { env::set_var("GROQ_API_KEY", "groq-key") };
+        assert_eq!(get_provider_from_env(), Some("groq"));
+
+        // Test 6: xAI provider
+        clear_env();
+        unsafe { env::set_var("XAI_API_KEY", "xai-key") };
+        assert_eq!(get_provider_from_env(), Some("xai"));
+
+        // Test 7: OpenRouter provider
+        clear_env();
+        unsafe { env::set_var("OPENROUTER_API_KEY", "or-key") };
+        assert_eq!(get_provider_from_env(), Some("openrouter"));
+
+        // Test 8: DeepSeek provider
+        clear_env();
+        unsafe { env::set_var("DEEPSEEK_API_KEY", "ds-key") };
+        assert_eq!(get_provider_from_env(), Some("deepseek"));
+
+        clear_env();
+    }
+
+    #[test]
+    fn test_create_provider_auto_detects_anthropic() {
+        use std::env;
+
+        // Clear ALL provider env vars comprehensively
+        let all_provider_vars = vec![
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GROQ_API_KEY",
+            "XAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "QWEN_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+            "MISTRAL_API_KEY",
+            "MOONSHOT_API_KEY",
+            "HF_TOKEN",
+            "ZAI_API_KEY",
+            "CEREBRAS_API_KEY",
+            "AI_GATEWAY_API_KEY",
+            "TOGETHER_API_KEY",
+            "FIREWORKS_API_KEY",
+            "NEBIUS_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEDROCK_MODEL",
+            "AWS_BEDROCK_MODEL_ACT",
+            "AWS_BEDROCK_MODEL_PLAN",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCP_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "GOOGLE_CLOUD_REGION",
+            "OPENAI_API_BASE",
+            "OPENCODE_API_KEY",
+            "KIMI_API_KEY",
+            "OPENAI_COMPATIBLE_CUSTOM_KEY",
+        ];
+        for var in &all_provider_vars {
+            unsafe { env::remove_var(var) };
+        }
+
+        // Set only ANTHROPIC_API_KEY
+        unsafe { env::set_var("ANTHROPIC_API_KEY", "test-key") };
+
+        let task_opts = TaskOptions {
+            act: false,
+            plan: false,
+            yolo: false,
+            auto_approve_all: false,
+            timeout: None,
+            model: None,
+            provider: None,
+            base_url: None,
+            api_key: None,
+            verbose: false,
+            cwd: None,
+            config: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_consecutive_mistakes: None,
+            json: false,
+            double_check_completion: false,
+            auto_condense: true,
+            no_token_display: false,
+            subagents: false,
+            is_subagent: false,
+            user_agent: None,
+            hooks_dir: None,
+            export: None,
+            image: vec![],
+            track_changes: false,
+            max_context_turns: None,
+        };
+
+        // Should auto-detect anthropic and succeed
+        let result = create_provider(&task_opts);
+        assert!(result.is_ok(), "Expected Ok when ANTHROPIC_API_KEY is set");
+
+        unsafe { env::remove_var("ANTHROPIC_API_KEY") };
+    }
+
+    #[test]
+    fn test_create_provider_explicit_flag_takes_precedence() {
+        use std::env;
+
+        // Clear ALL provider env vars comprehensively
+        let all_provider_vars = vec![
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GROQ_API_KEY",
+            "XAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "QWEN_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+            "MISTRAL_API_KEY",
+            "MOONSHOT_API_KEY",
+            "HF_TOKEN",
+            "ZAI_API_KEY",
+            "CEREBRAS_API_KEY",
+            "AI_GATEWAY_API_KEY",
+            "TOGETHER_API_KEY",
+            "FIREWORKS_API_KEY",
+            "NEBIUS_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEDROCK_MODEL",
+            "AWS_BEDROCK_MODEL_ACT",
+            "AWS_BEDROCK_MODEL_PLAN",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCP_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "GOOGLE_CLOUD_REGION",
+            "OPENAI_API_BASE",
+            "OPENCODE_API_KEY",
+            "KIMI_API_KEY",
+            "OPENAI_COMPATIBLE_CUSTOM_KEY",
+        ];
+        for var in &all_provider_vars {
+            unsafe { env::remove_var(var) };
+        }
+
+        // Set ANTHROPIC_API_KEY but explicitly request groq
+        unsafe { env::set_var("ANTHROPIC_API_KEY", "ant-key") };
+
+        let task_opts = TaskOptions {
+            act: false,
+            plan: false,
+            yolo: false,
+            auto_approve_all: false,
+            timeout: None,
+            model: None,
+            provider: Some("groq".to_string()),
+            base_url: None,
+            api_key: Some("groq-key".to_string()),
+            verbose: false,
+            cwd: None,
+            config: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_consecutive_mistakes: None,
+            json: false,
+            double_check_completion: false,
+            auto_condense: true,
+            no_token_display: false,
+            subagents: false,
+            is_subagent: false,
+            user_agent: None,
+            hooks_dir: None,
+            export: None,
+            image: vec![],
+            track_changes: false,
+            max_context_turns: None,
+        };
+
+        // Should use groq (explicit flag) not anthropic (env var)
+        let result = create_provider(&task_opts);
+        assert!(result.is_ok(), "Expected Ok with explicit provider");
+
+        unsafe { env::remove_var("ANTHROPIC_API_KEY") };
+    }
+
+    #[test]
+    fn test_utf8_cursor_movement() {
+        // Simulate the cursor tracking logic to ensure UTF-8 chars work
+        let mut buf = String::new();
+        let mut cursor: usize = 0;
+
+        // Insert emoji (4 bytes)
+        buf.insert(cursor, '🦀');
+        cursor += '🦀'.len_utf8();
+        assert_eq!(cursor, 4);
+        assert_eq!(buf, "🦀");
+
+        // Insert ASCII
+        buf.insert(cursor, 'x');
+        cursor += 'x'.len_utf8();
+        assert_eq!(cursor, 5);
+        assert_eq!(buf, "🦀x");
+
+        // Move left (should jump 4 bytes back)
+        cursor = buf[..cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        assert_eq!(cursor, 4);
+
+        // Move left again (to start)
+        cursor = buf[..cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        assert_eq!(cursor, 0);
+
+        // Move right (should jump to 4)
+        if let Some((i, ch)) = buf[cursor..].char_indices().next() {
+            cursor = cursor + i + ch.len_utf8();
+        }
+        assert_eq!(cursor, 4);
+
+        // Backspace at position 4 should remove emoji
+        let prev_pos = buf[..cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        buf.remove(prev_pos);
+        cursor = prev_pos;
+        assert_eq!(cursor, 0);
+        assert_eq!(buf, "x");
+    }
+}

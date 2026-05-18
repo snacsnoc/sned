@@ -1,0 +1,26 @@
+[
+  {
+    "id": "task-001",
+    "ulid": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "task": "Test task 1",
+    "status": "completed",
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T01:00:00Z"
+  },
+  {
+    "id": "task-002",
+    "ulid": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+    "task": "Test task 2",
+    "status": "in_progress",
+    "created_at": "2025-01-02T00:00:00Z",
+    "updated_at": "2025-01-02T01:00:00Z"
+  },
+  {
+    "id": "task-003",
+    "ulid": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+    "task": "Test task 3",
+    "status": "cancelled",
+    "created_at": "2025-01-03T00:00:00Z",
+    "updated_at": "2025-01-03T01:00:00Z"
+  }
+]

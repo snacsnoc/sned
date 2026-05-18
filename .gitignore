@@ -16,7 +16,14 @@ node.core
 # Rust build artifacts
 target/
 Cargo.lock
-!dirac-native/Cargo.lock
+!Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Build artifacts
+/build/
+/dist/
+/out/
 
 # Node.js
 node_modules/
@@ -32,6 +39,7 @@ package-lock.json
 *.swo
 *~
 .DS_Store
+._*
 
 # Test outputs
 *.log
@@ -41,8 +49,12 @@ package-lock.json
 *.temp
 .cache/
 
-# Dirac generated files
-.dirac-symbol-index/dirac/
+# Sned generated files
+.sned-symbol-index/
+.sned/
+
+# Legacy generated files
+.dirac-symbol-index/
 dirac/
 
 # Secrets and local config
@@ -57,8 +69,8 @@ NEW_NAMES.md
 insight-2026-05-18.html
 llm-openai-docs/
 
-# Prebuilt vendor binaries (regenerate with stage_libghostty_prebuilt.sh)
-dirac-native/vendor/
+# Prebuilt vendor binaries
+vendor/
 
 # Example terminals (large binaries)
 example_libghostty_terminals/
@@ -84,6 +96,7 @@ dhat-heap.json
 
 # Hooks (internal workflow, not for public tracking)
 .diracrules/hooks/
+.snedrules/hooks/
 
 # Submodule references (not used)
 libghostty-rs/

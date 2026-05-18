@@ -1,0 +1,13 @@
+{
+  "anthropic": {
+    "apiKey": "sk-ant-full-test",
+    "baseURL": "https://api.anthropic.com"
+  },
+  "openai": {
+    "apiKey": "sk-openai-full-test"
+  },
+  "custom": {
+    "baseURL": "https://custom.api.com/v1",
+    "apiKey": "sk-custom-test"
+  }
+}

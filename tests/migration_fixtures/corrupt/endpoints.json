@@ -1,0 +1,8 @@
+{
+  "anthropic": {
+    "apiKey": "sk-ant-corrupt"
+  }
+  "openai": {
+    "apiKey": "sk-openai-corrupt"
+  }
+}

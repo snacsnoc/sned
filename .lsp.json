@@ -5,7 +5,7 @@
     "extensionToLanguage": {
       ".rs": "rust"
     },
-    "workspaceFolder": "dirac-native",
+    "workspaceFolder": ".",
     "startupTimeout": 30000,
     "shutdownTimeout": 5000,
     "restartOnCrash": true,

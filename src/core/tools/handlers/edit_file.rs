@@ -1,0 +1,1566 @@
+//! Edit file tool handler for sned CLI.
+//!
+//!
+//! Core behavior:
+//! - Parse files parameter (array of {path, edits})
+//! - Read file content and compute line hashes via AnchorStateManager
+//! - Validate edits using BatchProcessor
+//! - Check combined approval before applying edits
+//! - Apply edits and write updated content back
+//! - Return formatted diff result
+
+use crate::core::agent_loop::TaskState;
+use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
+use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits};
+use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard};
+use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes};
+use crate::core::tools::handlers::diagnostics_scan::DiagnosticsScanHandler;
+use crate::core::tools::{SnedTool, ToolContext, ToolError, ToolHandler};
+use crate::services::symbol_index::SymbolIndexService;
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
+
+/// Edit file tool handler.
+#[derive(Debug, Clone)]
+pub struct EditFileHandler {
+    /// Optional approval manager for combined edit approval.
+    approval_manager: Option<Arc<Mutex<ApprovalManager>>>,
+    /// Optional symbol index service for cache refresh after edits.
+    symbol_index_service: Option<Arc<std::sync::Mutex<SymbolIndexService>>>,
+}
+
+impl EditFileHandler {
+    pub fn new() -> Self {
+        Self {
+            approval_manager: None,
+            symbol_index_service: None,
+        }
+    }
+}
+
+impl Default for EditFileHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EditFileHandler {
+    /// Set the approval manager for combined approval checks.
+    pub fn with_approval_manager(mut self, approval_manager: Arc<Mutex<ApprovalManager>>) -> Self {
+        self.approval_manager = Some(approval_manager);
+        self
+    }
+
+    /// Set the symbol index service for cache refresh after edits.
+    pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
+        self.symbol_index_service = Some(service);
+        self
+    }
+
+    /// Parse edits from JSON params.
+    fn parse_edits(
+        &self,
+        files: &[serde_json::Value],
+    ) -> Result<Vec<(String, Vec<Edit>)>, ToolError> {
+        let mut result = Vec::new();
+
+        for file in files {
+            let path = file.get("path").and_then(|p| p.as_str()).ok_or_else(|| {
+                ToolError::InvalidInput("Missing required parameter: path".to_string())
+            })?;
+
+            let edits_raw = file
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .ok_or_else(|| {
+                    ToolError::InvalidInput(format!("Missing edits for file: {}", path))
+                })?;
+
+            let mut edits = Vec::new();
+            for edit_raw in edits_raw {
+                let anchor = edit_raw
+                    .get("anchor")
+                    .and_then(|a| a.as_str())
+                    .ok_or_else(|| {
+                        ToolError::InvalidInput("Missing required parameter: anchor".to_string())
+                    })?;
+
+                let edit_type = edit_raw
+                    .get("edit_type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("replace");
+
+                let end_anchor = edit_raw.get("end_anchor").and_then(|e| e.as_str());
+
+                let text = edit_raw.get("text").and_then(|t| t.as_str()).unwrap_or("");
+
+                edits.push(Edit {
+                    anchor: anchor.to_string(),
+                    end_anchor: end_anchor.map(|s| s.to_string()),
+                    edit_type: edit_type.to_string(),
+                    text: text.to_string(),
+                });
+            }
+
+            result.push((path.to_string(), edits));
+        }
+
+        Ok(result)
+    }
+
+    /// Resolve a relative path to absolute path with sanitization.
+    fn resolve_path(&self, workspace_root: &Path, path: &str) -> Result<String, ToolError> {
+        let resolved = crate::core::tools::resolve_sanitized_path(workspace_root, path)?;
+        Ok(resolved.to_string_lossy().to_string())
+    }
+
+    /// Validate that all anchors contain the hash delimiter.
+    ///
+    /// This is a pre-validation check that runs BEFORE sending to the LLM.
+    /// It catches the common mistake of calling edit_file without read_file first.
+    fn validate_anchors(&self, files: &[serde_json::Value]) -> Result<(), ToolError> {
+        let mut invalid_anchors = Vec::new();
+
+        for file in files {
+            let path = file
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("unknown");
+
+            let edits = file
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[]);
+
+            for edit in edits {
+                let anchor = edit.get("anchor").and_then(|a| a.as_str()).unwrap_or("");
+
+                // Check if anchor contains the delimiter
+                if !anchor.contains(ANCHOR_DELIMITER) {
+                    invalid_anchors.push(format!(
+                        "  - File '{}': anchor '{}' is missing the '{}' delimiter",
+                        path,
+                        if anchor.len() > 50 {
+                            format!("{}...", &anchor[..50])
+                        } else {
+                            anchor.to_string()
+                        },
+                        ANCHOR_DELIMITER
+                    ));
+                }
+
+                // Also check end_anchor if present
+                if let Some(end_anchor) = edit.get("end_anchor").and_then(|a| a.as_str())
+                    && !end_anchor.contains(ANCHOR_DELIMITER)
+                {
+                    invalid_anchors.push(format!(
+                        "  - File '{}': end_anchor '{}' is missing the '{}' delimiter",
+                        path,
+                        if end_anchor.len() > 50 {
+                            format!("{}...", &end_anchor[..50])
+                        } else {
+                            end_anchor.to_string()
+                        },
+                        ANCHOR_DELIMITER
+                    ));
+                }
+            }
+        }
+
+        if !invalid_anchors.is_empty() {
+            let mut message = String::from(
+                "Hash anchor validation failed. You must call read_file before edit_file to get hash-anchored lines.\n\n",
+            );
+            message.push_str("Anchors must be copied EXACTLY from read_file output (format: Word§line content).\n\n");
+            message.push_str("Invalid anchors detected:\n");
+            message.push_str(&invalid_anchors.join("\n"));
+            message.push_str("\n\nExample of CORRECT anchor: \"Crawler§void draw_game_over() {\"");
+            message.push_str("\nExample of WRONG anchor: \"void draw_game_over() {\"");
+            return Err(ToolError::InvalidInput(message));
+        }
+
+        Ok(())
+    }
+}
+
+impl EditFileHandler {
+    async fn execute_with_workspace_root(
+        &self,
+        state: &mut TaskState,
+        params: serde_json::Value,
+        workspace_root: &Path,
+        anchor_mgr: &AnchorStateManager,
+        task_id: Option<&str>,
+        explicitly_approved: bool,
+    ) -> Result<String, ToolError> {
+        // Parse files parameter
+        let files = params
+            .get("files")
+            .and_then(|f| f.as_array())
+            .ok_or_else(|| {
+                ToolError::InvalidInput("Missing required parameter: files".to_string())
+            })?;
+
+        if files.is_empty() {
+            return Err(ToolError::InvalidInput("No files provided".to_string()));
+        }
+
+        // Pre-validate anchors BEFORE any processing
+        // This catches the common mistake of calling edit_file without read_file first
+        self.validate_anchors(files)?;
+
+        let parsed = self.parse_edits(files)?;
+        let processor = BatchProcessor::new(DiffMode::Full);
+
+        // Check for silent mode (skip diff preview and approval)
+        let silent = params
+            .get("silent")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+
+        // Group edits by resolved absolute path
+        let file_edits: Result<Vec<(String, Vec<Edit>)>, ToolError> = parsed
+            .into_iter()
+            .map(|(path, edits)| {
+                let abs_path = self.resolve_path(workspace_root, &path)?;
+                Ok((abs_path, edits))
+            })
+            .collect();
+        let file_edits = file_edits?;
+
+        let batches = processor.group_edits_by_path(&file_edits, &|path| Some(path.to_string()));
+
+        let mut all_results: Vec<String> = Vec::new();
+        let mut total_applied = 0usize;
+        let mut total_failed = 0usize;
+        let mut total_edits = 0usize;
+        let mut diff_previews: Vec<String> = Vec::new();
+        let mut prepared_batches: Vec<(crate::core::edit_batch::FileEditBatch, PreparedEdits)> =
+            Vec::new();
+
+        // Phase 1: Prepare all batches and collect diff previews
+        for batch in batches {
+            // Acquire exclusive file lock to prevent concurrent edits
+            let _file_guard = FileEditGuard::acquire(&batch.absolute_path).await;
+
+            // Mark file as edited by Sned to suppress false positives
+            state
+                .file_context_tracker
+                .mark_file_as_edited_by_sned(Path::new(&batch.absolute_path));
+
+            // Check for stale context before editing
+            let stale_warning = state
+                .file_context_tracker
+                .check_stale(Path::new(&batch.absolute_path))
+                .await;
+            if let Some(warning) = &stale_warning {
+                all_results.push(warning.clone());
+            }
+
+            if stale_warning.is_some() {
+                state.file_content_cache.remove(&batch.absolute_path);
+            }
+
+            // Warn if editing a file not read this session
+            if !state
+                .file_context_tracker
+                .was_read_this_session(&batch.display_path)
+            {
+                eprintln!(
+                    "{}",
+                    crate::cli::colors::colorize(
+                        &format!(
+                            "⚠ editing {} (not read this session — may have stale assumptions)",
+                            batch.display_path
+                        ),
+                        crate::cli::colors::style::YELLOW
+                    )
+                );
+            }
+
+            // Read file content and capture mtime (check cache first for cross-call coordination)
+            let (content, initial_mtime) =
+                if let Some(cached_content) = state.file_content_cache.get(&batch.absolute_path) {
+                    tracing::debug!("Using cached content for {}", batch.display_path);
+                    (cached_content.clone(), None)
+                } else {
+                    match tokio::fs::metadata(&batch.absolute_path).await {
+                        Ok(metadata) => {
+                            let mtime = metadata.modified().ok();
+                            match tokio::fs::read_to_string(&batch.absolute_path).await {
+                                Ok(c) => (c, mtime),
+                                Err(e) => {
+                                    all_results.push(format!(
+                                        "Error reading file {}: {}",
+                                        batch.display_path, e
+                                    ));
+                                    total_failed += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            // If metadata fails, continue without mtime tracking
+                            match tokio::fs::read_to_string(&batch.absolute_path).await {
+                                Ok(c) => (c, None),
+                                Err(e) => {
+                                    all_results.push(format!(
+                                        "Error reading file {}: {}",
+                                        batch.display_path, e
+                                    ));
+                                    total_failed += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                };
+
+            // Track file read for stale context detection
+            state
+                .file_context_tracker
+                .track_file_read(Path::new(&batch.absolute_path));
+
+            // Compute line hashes via AnchorStateManager
+            let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            let anchors = anchor_mgr.reconcile(&batch.absolute_path, &lines, task_id);
+
+            // Prepare edits
+            let mut prepared = match processor.prepare_edits(
+                &batch.absolute_path,
+                &batch.display_path,
+                &content,
+                &batch.edits,
+                &anchors,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    all_results.push(format!(
+                        "Error preparing edits for {}: {}",
+                        batch.display_path, e
+                    ));
+                    continue;
+                }
+            };
+
+            // Store initial mtime for external modification detection
+            prepared.initial_mtime = initial_mtime;
+
+            total_edits += batch.edits.len();
+            // Generate diff preview without modifying prepared (skip in silent mode)
+            if !silent {
+                let diff_preview = processor.generate_diff(&batch.display_path, &prepared);
+                diff_previews.push(diff_preview);
+            }
+
+            // Store for later (after approval)
+            prepared_batches.push((batch, prepared));
+        }
+
+        // Phase 2: Combined approval check (skip in silent mode or when explicitly approved)
+        if !prepared_batches.is_empty() && !silent && !explicitly_approved {
+            let should_prompt = if let Some(ref am) = self.approval_manager {
+                let mgr = am.lock().await;
+                mgr.should_prompt(SnedTool::EditFile)
+            } else {
+                // No approval manager configured; skip approval
+                false
+            };
+
+            if should_prompt {
+                let diff_text = diff_previews.join("\n\n");
+                match prompt_for_combined_approval(prepared_batches.len(), total_edits, &diff_text)
+                    .await
+                {
+                    Ok(crate::core::approval::ApprovalResult::Denied) => {
+                        return Ok(format!(
+                            "Tool '{}' was denied by user.",
+                            SnedTool::EditFile.name()
+                        ));
+                    }
+                    Ok(crate::core::approval::ApprovalResult::Always) => {
+                        if let Some(ref am) = self.approval_manager {
+                            let mut mgr = am.lock().await;
+                            mgr.auto_approve(SnedTool::EditFile);
+                        }
+                    }
+                    Ok(crate::core::approval::ApprovalResult::Approved) => {
+                        // Proceed with edits
+                    }
+                    Err(e) => {
+                        return Err(ToolError::ExecutionFailed(format!("Approval error: {}", e)));
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Capture pre-save diagnostics for all files being edited
+        // Group files by project root to run diagnostics once per project (not per file)
+        let mut files_by_project: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        for (batch, _) in &prepared_batches {
+            let path = PathBuf::from(&batch.absolute_path);
+            let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
+                &path,
+                if DiagnosticsScanHandler::detect_project_type(&path)
+                    == crate::core::tools::handlers::diagnostics_scan::ProjectType::Rust
+                {
+                    "Cargo.toml"
+                } else {
+                    "package.json"
+                },
+            )
+            .unwrap_or_else(|| {
+                path.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or(PathBuf::from("."))
+            });
+            files_by_project.entry(project_root).or_default().push(path);
+        }
+
+        // Run diagnostics in parallel across project roots
+        let batch_diag_outputs =
+            DiagnosticsScanHandler::run_diagnostics_batch(&files_by_project).await;
+
+        // Parse diagnostics for each file
+        let mut pre_diagnostics: std::collections::HashMap<
+            String,
+            Vec<crate::core::tools::handlers::diagnostics_scan::Diagnostic>,
+        > = std::collections::HashMap::new();
+        for (batch, _) in &prepared_batches {
+            let diag_output = batch_diag_outputs
+                .get(&PathBuf::from(&batch.absolute_path))
+                .cloned()
+                .unwrap_or_default();
+            let diagnostics =
+                DiagnosticsScanHandler::parse_diagnostics(&diag_output, &batch.display_path);
+            pre_diagnostics.insert(batch.absolute_path.clone(), diagnostics);
+        }
+
+        // Track if any file had pre-existing errors (to decide whether to run post-diagnostics)
+        let any_pre_errors = pre_diagnostics.values().any(|diags| {
+            diags.iter().any(|d| {
+                matches!(
+                    d.severity,
+                    crate::core::tools::handlers::diagnostics_scan::Severity::Error
+                )
+            })
+        });
+
+        // Phase 4: Apply and save all approved edits
+        for (batch, mut prepared) in prepared_batches {
+            let result =
+                processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
+
+            total_applied += result.resolved_count;
+            total_failed += result.failed_count;
+
+            // Record file change for session summary
+            if result.success && result.resolved_count > 0 {
+                let entry = state
+                    .session_file_changes
+                    .entry(batch.absolute_path.clone())
+                    .or_insert_with(|| crate::core::agent_types::FileChangeStats {
+                        lines_added: 0,
+                        lines_removed: 0,
+                        action: "edited".to_string(),
+                    });
+                entry.lines_added = entry.lines_added.saturating_add(result.lines_added);
+                entry.lines_removed = entry.lines_removed.saturating_add(result.lines_removed);
+            }
+
+            if result.success {
+                // Write updated content back to file atomically
+                if let Some(final_content) = &result.final_content {
+                    // Acquire OS-level file lock to serialize writes with external
+                    // processes. This prevents TOCTOU races where an external process
+                    // modifies the file between our mtime check and write.
+                    let std_file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&batch.absolute_path)
+                        .map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "Failed to open file {} for locking: {}",
+                                batch.display_path, e
+                            ))
+                        })?;
+
+                    // Try to acquire exclusive lock (non-blocking)
+                    let lock_result = fs2::FileExt::try_lock_exclusive(&std_file);
+
+                    if lock_result.is_err() {
+                        // File is locked by another process - proceed without mtime check.
+                        // The atomic write (rename) is still safe.
+                        tracing::debug!(
+                            "File {} locked by another process, skipping mtime check",
+                            batch.display_path
+                        );
+
+                        // Update cache and write anyway
+                        state.insert_file_content(
+                            batch.absolute_path.clone(),
+                            final_content.clone(),
+                        );
+
+                        match crate::storage::disk::atomic_write_file_async(
+                            &batch.absolute_path,
+                            final_content,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                all_results.push(format!(
+                                    "Error writing file {}: {}",
+                                    batch.display_path, e
+                                ));
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Lock acquired - check mtime BEFORE write to detect modifications
+                        // that occurred while we were preparing the edit.
+                        if let Some(initial_mtime) = &prepared.initial_mtime
+                            && let Ok(current_metadata) =
+                                tokio::fs::metadata(&batch.absolute_path).await
+                            && let Ok(current_mtime) = current_metadata.modified()
+                            && &current_mtime != initial_mtime
+                        {
+                            // Release lock before returning error
+                            let _ = fs2::FileExt::unlock(&std_file);
+                            return Err(ToolError::ExecutionFailed(format!(
+                                "File {} was modified externally during edit operation. \
+                                 Aborting write to prevent data loss. Re-read the file and retry.",
+                                batch.display_path
+                            )));
+                        }
+
+                        // Update cache for cross-call coordination
+                        state.insert_file_content(
+                            batch.absolute_path.clone(),
+                            final_content.clone(),
+                        );
+
+                        // Perform atomic write WHILE HOLDING LOCK. The rename operation
+                        // inside atomic_write_file_async is atomic on POSIX, and holding
+                        // the lock ensures no other process can interfere.
+                        let write_result = crate::storage::disk::atomic_write_file_async(
+                            &batch.absolute_path,
+                            final_content,
+                        )
+                        .await;
+
+                        // Release lock after write completes
+                        let _ = fs2::FileExt::unlock(&std_file);
+
+                        match write_result {
+                            Ok(()) => {}
+                            Err(e) => {
+                                all_results.push(format!(
+                                    "Error writing file {}: {}",
+                                    batch.display_path, e
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Format result
+            let final_lines: Vec<String> = result
+                .final_content
+                .as_ref()
+                .map(|c| c.lines().map(|s| s.to_string()).collect())
+                .unwrap_or_default();
+
+            let final_hashes = compute_hashes(&final_lines)
+                .iter()
+                .map(|h| format!("{:08x}", h))
+                .collect::<Vec<_>>();
+
+            // Post-save diagnostics: compare with pre-save state
+            // Skip if no pre-existing errors (edits unlikely to introduce new errors)
+            let diagnostics = if result.success && any_pre_errors {
+                let path = Path::new(&batch.absolute_path);
+                let project_type = DiagnosticsScanHandler::detect_project_type(path);
+                let post_diag_output = match timeout(
+                    Duration::from_secs(30),
+                    DiagnosticsScanHandler::run_diagnostics(project_type, path),
+                )
+                .await
+                {
+                    Ok(Ok(output)) => output,
+                    _ => String::new(),
+                };
+                let post_diagnostics = DiagnosticsScanHandler::parse_diagnostics(
+                    &post_diag_output,
+                    &batch.display_path,
+                );
+                let pre = pre_diagnostics
+                    .get(&batch.absolute_path)
+                    .cloned()
+                    .unwrap_or_default();
+
+                // Count pre/post errors
+                let pre_errors = pre
+                    .iter()
+                    .filter(|d| {
+                        matches!(
+                            d.severity,
+                            crate::core::tools::handlers::diagnostics_scan::Severity::Error
+                        )
+                    })
+                    .count();
+                let post_errors = post_diagnostics
+                    .iter()
+                    .filter(|d| {
+                        matches!(
+                            d.severity,
+                            crate::core::tools::handlers::diagnostics_scan::Severity::Error
+                        )
+                    })
+                    .count();
+
+                let fixed_count = pre_errors.saturating_sub(post_errors);
+
+                // Find new problems (post diagnostics not in pre)
+                let new_problems: Vec<_> = post_diagnostics
+                    .iter()
+                    .filter(|pd| {
+                        !pre.iter()
+                            .any(|pre_d| pre_d.message == pd.message && pre_d.line == pd.line)
+                    })
+                    .cloned()
+                    .collect();
+
+                let new_problems_message = if !new_problems.is_empty() {
+                    DiagnosticsScanHandler::format_diagnostics(
+                        &batch.display_path,
+                        &new_problems,
+                        None,
+                    )
+                } else {
+                    String::new()
+                };
+
+                Some(DiagnosticsResult {
+                    fixed_count,
+                    new_problems_message,
+                })
+            } else if result.success {
+                // No pre-errors, so no diagnostics needed
+                None
+            } else {
+                None
+            };
+
+            let formatted = processor.format_result(
+                &prepared,
+                &final_lines,
+                &final_hashes,
+                false,
+                diagnostics.as_ref(),
+                None, // auto_formatting_edits - VS Code-specific, not implemented in CLI
+                None, // user_edits - VS Code-specific, not implemented in CLI
+            );
+            all_results.push(formatted);
+        }
+
+        // Track consecutive mistakes: increment when any edits failed,
+        // only reset when ALL edits succeeded (no failures at all).
+        if total_failed > 0 {
+            state.consecutive_mistakes += 1;
+            eprintln!(
+                "[edit_file] {} edit(s) failed (consecutive_mistakes={})",
+                total_failed, state.consecutive_mistakes
+            );
+        } else if total_applied > 0 {
+            state.consecutive_mistakes = 0;
+        }
+
+        let summary = format!(
+            "Edited {} file(s): {} edit(s) applied, {} edit(s) failed.",
+            files.len(),
+            total_applied,
+            total_failed
+        );
+
+        Ok(format!(
+            "{}\n\n{}",
+            summary,
+            all_results.join("\n\n---\n\n")
+        ))
+    }
+
+    pub fn description(&self, params: &serde_json::Value) -> String {
+        let path = params
+            .get("files")
+            .and_then(|f| f.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|f| f.get("path"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("?");
+        format!("[edit_file for '{}']", path)
+    }
+}
+
+#[async_trait]
+impl ToolHandler for EditFileHandler {
+    async fn execute(
+        &self,
+        ctx: &ToolContext,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        let mut state = ctx.state.lock().await;
+        let result = self
+            .execute_with_workspace_root(
+                &mut state,
+                params,
+                ctx.workspace_root.as_path(),
+                &ctx.anchor_mgr,
+                Some(ctx.task_id.as_str()),
+                ctx.explicitly_approved,
+            )
+            .await;
+
+        if result.is_err() {
+            state.consecutive_mistakes += 1;
+            eprintln!(
+                "[edit_file] Handler error, incrementing consecutive_mistakes={}",
+                state.consecutive_mistakes
+            );
+        }
+
+        result.map(serde_json::Value::String)
+    }
+
+    fn description(&self, params: &serde_json::Value) -> String {
+        EditFileHandler::description(self, params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::tools::{ToolContext, ToolHandler};
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+
+    // Tests that use AnchorStateManager must run serially because it uses global state
+    static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[test]
+    fn test_edit_file_handler_creation() {
+        let handler = EditFileHandler::new();
+        assert!(format!("{:?}", handler).starts_with("EditFileHandler"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_missing_files() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("files"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_empty_files() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No files"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_validates_anchors_before_processing() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        // Test with anchors missing the § delimiter (simulating edit_file called without read_file first)
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.rs",
+                "edits": [{
+                    "anchor": "fn main() {",
+                    "text": "fn main() { println!(\"hello\"); }"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("read_file"),
+            "Error should mention read_file"
+        );
+        assert!(err_msg.contains("§"), "Error should show the delimiter");
+        assert!(
+            err_msg.contains("missing"),
+            "Error should indicate what's wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_validates_end_anchor() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        // Test with valid anchor but invalid end_anchor
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.rs",
+                "edits": [{
+                    "anchor": "Apple§fn main() {",
+                    "end_anchor": "fn main() {",
+                    "text": "replacement"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("end_anchor"),
+            "Error should mention end_anchor"
+        );
+        assert!(
+            err_msg.contains("missing"),
+            "Error should indicate what's wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_mistakes_increments_on_handler_error() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "nonexistent_xyz.txt",
+                "edits": [{
+                    "anchor": "Test§some line",
+                    "text": "replacement"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        let mistakes = state.lock().await.consecutive_mistakes;
+        assert!(
+            mistakes >= 1,
+            "consecutive_mistakes should increment on file-not-found edit failure, got {}, result: {:?}",
+            mistakes,
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_mistakes_increments_on_failure() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        // Use proper anchor format (with §) but file doesn't exist, so edit will fail
+        let params = serde_json::json!({
+            "files": [{
+                "path": "nonexistent_file_xyz.txt",
+                "edits": [{
+                    "anchor": "Apple§this anchor does not exist in the file",
+                    "text": "replacement text"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            state.lock().await.consecutive_mistakes,
+            1,
+            "consecutive_mistakes should increment when edits fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_mistakes_resets_on_success() {
+        let _guard = TEST_MUTEX.lock().await;
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        state.lock().await.consecutive_mistakes = 5;
+
+        let temp_dir = std::env::temp_dir();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_edit_success_{}.txt", rand_suffix));
+        let raw_content = "Hello World\nThis is a test\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        // Canonicalize paths to match handler's resolve_sanitized_path behavior
+        let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
+        let file_path = file_path.canonicalize().unwrap_or(file_path);
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        // Use relative path from workspace root to match handler's path resolution
+        let relative_path = file_path
+            .strip_prefix(&temp_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let params = serde_json::json!({
+            "files": [{
+                "path": relative_path,
+                "edits": [{
+                    "anchor": format!("{}§Hello World", anchors[0]),
+                    "end_anchor": format!("{}§Hello World", anchors[0]),
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok());
+        let result_str = result.unwrap().as_str().unwrap().to_string();
+        println!("Edit result: {}", result_str);
+        assert_eq!(
+            state.lock().await.consecutive_mistakes,
+            0,
+            "consecutive_mistakes should reset on successful edit. Result: {}",
+            result_str
+        );
+
+        // Cleanup
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_mistakes_unchanged_when_no_edits() {
+        let _guard = TEST_MUTEX.lock().await;
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        state.lock().await.consecutive_mistakes = 3;
+
+        let temp_dir = std::env::temp_dir();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_edit_empty_{}.txt", rand_suffix));
+        tokio::fs::write(&file_path, "content").await.unwrap();
+
+        // Use relative path from workspace root to match handler's path resolution
+        let relative_path = file_path
+            .strip_prefix(&temp_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let params = serde_json::json!({
+            "files": [{
+                "path": relative_path,
+                "edits": []
+            }]
+        });
+
+        let anchor_mgr = AnchorStateManager::new();
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            state.lock().await.consecutive_mistakes,
+            3,
+            "consecutive_mistakes should not change when no edits are applied"
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_with_yolo_skips_approval() {
+        let _guard = TEST_MUTEX.lock().await;
+        let approval_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::core::approval::ApprovalManager::new().with_yolo(true),
+        ));
+        let handler = EditFileHandler::new().with_approval_manager(approval_mgr.clone());
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_yolo_edit_{}.txt", rand_suffix));
+        let raw_content = "Hello World\nThis is a test\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        // Canonicalize paths to match handler's resolve_sanitized_path behavior
+        let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
+        let file_path = file_path.canonicalize().unwrap_or(file_path);
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path.to_string_lossy().to_string(),
+                "edits": [{
+                    "anchor": format!("{}§Hello World", anchors[0]),
+                    "end_anchor": format!("{}§Hello World", anchors[0]),
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            Some(approval_mgr),
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "Edit should succeed in yolo mode without prompting: {:?}",
+            result.err()
+        );
+        let result_text = result.unwrap();
+        let result_str = result_text.as_str().unwrap();
+        eprintln!("Result: {}", result_str);
+        assert!(
+            result_str.contains("Goodbye World"),
+            "Edit should be applied in yolo mode. Result: {}",
+            result_str
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_without_approval_manager_proceeds() {
+        let _guard = TEST_MUTEX.lock().await;
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_no_mgr_edit_{}.txt", rand_suffix));
+        let raw_content = "Hello World\nThis is a test\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        // Use relative path from workspace root to match handler's path resolution
+        let relative_path = file_path
+            .strip_prefix(&temp_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let params = serde_json::json!({
+            "files": [{
+                "path": relative_path,
+                "edits": [{
+                    "anchor": format!("{}§Hello World", anchors[0]),
+                    "end_anchor": format!("{}§Hello World", anchors[0]),
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "Edit should succeed without approval manager"
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_with_approval_manager_non_interactive_auto_approves() {
+        let _guard = TEST_MUTEX.lock().await;
+        let approval_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::core::approval::ApprovalManager::new(),
+        ));
+        let handler = EditFileHandler::new().with_approval_manager(approval_mgr.clone());
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_non_interactive_edit_{}.txt", rand_suffix));
+        let raw_content = "Hello World\nThis is a test\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        // Canonicalize paths to match handler's resolve_sanitized_path behavior
+        let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
+        let file_path = file_path.canonicalize().unwrap_or(file_path);
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        // Use relative path from workspace root to match handler's path resolution
+        let relative_path = file_path
+            .strip_prefix(&temp_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let params = serde_json::json!({
+            "files": [{
+                "path": relative_path,
+                "edits": [{
+                    "anchor": format!("{}§Hello World", anchors[0]),
+                    "end_anchor": format!("{}§Hello World", anchors[0]),
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            Some(approval_mgr),
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "Edit should auto-approve in non-interactive mode"
+        );
+        let result_text = result.unwrap();
+        let result_str = result_text.as_str().unwrap();
+        assert!(
+            result_str.contains("Goodbye World"),
+            "Edit should be applied after auto-approval"
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejected_skips_write() {
+        let _guard = TEST_MUTEX.lock().await;
+        let approval_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::core::approval::ApprovalManager::new().with_yolo(false),
+        ));
+        let handler = EditFileHandler::new().with_approval_manager(approval_mgr.clone());
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_rejected_edit_{}.txt", rand_suffix));
+        let raw_content = "Original content\nShould not change\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        // Use relative path from workspace root to match handler's path resolution
+        let relative_path = file_path
+            .strip_prefix(&temp_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let params = serde_json::json!({
+            "files": [{
+                "path": relative_path,
+                "edits": [{
+                    "anchor": format!("{}§Hello World", anchors[0]),
+                    "end_anchor": format!("{}§Hello World", anchors[0]),
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            Some(approval_mgr),
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok());
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_silent_mode_skips_approval_and_applies_edits() {
+        let _guard = TEST_MUTEX.lock().await;
+        let approval_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::core::approval::ApprovalManager::new().with_yolo(false),
+        ));
+        let handler = EditFileHandler::new().with_approval_manager(approval_mgr.clone());
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_silent_edit_{}.txt", rand_suffix));
+        let raw_content = "Line 1\nLine 2\nLine 3\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        // Canonicalize paths to match handler's resolve_sanitized_path behavior
+        let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
+        let file_path = file_path.canonicalize().unwrap_or(file_path);
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        // Use relative path from workspace root to match handler's path resolution
+        let relative_path = file_path
+            .strip_prefix(&temp_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let params = serde_json::json!({
+            "silent": true,
+            "files": [{
+                "path": relative_path,
+                "edits": [{
+                    "anchor": format!("{}§Line 2", anchors[1]),
+                    "end_anchor": format!("{}§Line 2", anchors[1]),
+                    "text": "Modified Line 2"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            Some(approval_mgr),
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "Silent mode should succeed: {:?}",
+            result.err()
+        );
+        let result_text = result.unwrap().as_str().unwrap().to_string();
+
+        let final_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert!(
+            final_content.contains("Modified Line 2"),
+            "File should be modified in silent mode"
+        );
+
+        assert!(
+            !result_text.contains("<<<<<<< SEARCH"),
+            "Silent mode should not include diff preview"
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_edits_to_same_file_serialize() {
+        let _guard = TEST_MUTEX.lock().await;
+        let handler = EditFileHandler::new();
+
+        // Use workspace temp directory to avoid path validation errors
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let file_path = workspace_root.path().join("test_concurrent_edit.txt");
+        let raw_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        // Create anchor manager and get anchors for the file
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        // Spawn 5 concurrent edit tasks, each editing a different line
+        let mut handles = Vec::new();
+        for (i, anchor) in anchors.iter().enumerate().take(5) {
+            let handler = handler.clone();
+            let path = file_path.to_str().unwrap().to_string();
+            let anchor = anchor.clone();
+            let line_content = format!("Modified Line {}", i + 1);
+            let workspace = workspace_root.path().to_path_buf();
+
+            let handle = tokio::spawn(async move {
+                let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+                let ctx = ToolContext::new(
+                    state,
+                    None,
+                    workspace,
+                    AnchorStateManager::new(),
+                    false,
+                    format!("test-task-{}", i),
+                    None,
+                    false,
+                );
+
+                let params = serde_json::json!({
+                    "files": [{
+                        "path": path,
+                        "edits": [{
+                            "anchor": format!("{}§{}", anchor, line_content.replace("Modified ", "")),
+                            "text": line_content
+                        }]
+                    }]
+                });
+
+                ToolHandler::execute(&handler, &ctx, params).await
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        let results = futures::future::join_all(handles).await;
+
+        // All tasks should complete (some may fail due to anchor mismatch, which is expected)
+        // The key is that the file should not be corrupted
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(Ok(_)) => println!("Task {} succeeded", i),
+                Ok(Err(e)) => println!("Task {} failed (expected): {}", i, e),
+                Err(e) => println!("Task {} panicked: {}", i, e),
+            }
+        }
+
+        // Verify file content is valid (not corrupted)
+        let final_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        let final_lines: Vec<&str> = final_content.lines().collect();
+
+        // Should have exactly 5 lines (not corrupted)
+        assert_eq!(
+            final_lines.len(),
+            5,
+            "File should have exactly 5 lines, got: {}",
+            final_content
+        );
+
+        // Each line should be either original or modified (not garbled)
+        for (i, line) in final_lines.iter().enumerate() {
+            assert!(
+                line.starts_with("Line") || line.starts_with("Modified"),
+                "Line {} has invalid content: {}",
+                i,
+                line
+            );
+        }
+
+        // TempDir auto-cleans on drop
+    }
+
+    /// Test that file locking prevents TOCTOU race during external modification
+    #[tokio::test]
+    async fn test_external_modification_detected_with_lock() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a temp file with initial content
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "Line 1").unwrap();
+        writeln!(temp_file, "Line 2").unwrap();
+        writeln!(temp_file, "Line 3").unwrap();
+        temp_file.flush().unwrap();
+
+        let file_path = temp_file.path().to_str().unwrap().to_string();
+        let workspace_root = temp_file.path().parent().unwrap().to_path_buf();
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace_root,
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        // Get the initial anchor from the file
+        let initial_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        let lines: Vec<&str> = initial_content.lines().collect();
+        let anchor = format!("{}§Line 2", crate::core::hash_utils::content_hash(lines[1]));
+
+        // Simulate external modification by modifying file between mtime check and write
+        // This is a race condition test - we modify the file immediately after
+        // the handler reads it but before it writes
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path,
+                "edits": [{
+                    "anchor": anchor,
+                    "text": "Modified Line 2"
+                }]
+            }]
+        });
+
+        // Spawn a task that modifies the file right after a short delay
+        // to simulate external modification during the edit operation
+        let file_path_clone = file_path.clone();
+        let modifier_handle = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            // Modify the file externally
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&file_path_clone)
+                .unwrap();
+            writeln!(file, "Line 1").unwrap();
+            writeln!(file, "EXTERNALLY MODIFIED").unwrap();
+            writeln!(file, "Line 3").unwrap();
+        });
+
+        // Execute the edit
+        let result = EditFileHandler::execute(&handler, &ctx, params).await;
+
+        // Wait for modifier to complete
+        modifier_handle.await.unwrap();
+
+        // The edit should either:
+        // 1. Succeed (if modification happened after our write)
+        // 2. Fail with external modification error (if detected)
+        match result {
+            Ok(_output) => {
+                // If it succeeded, verify the file is not corrupted
+                let final_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+                assert!(
+                    final_content.contains("Modified Line 2")
+                        || final_content.contains("EXTERNALLY MODIFIED"),
+                    "File should contain either our edit or external edit, got: {}",
+                    final_content
+                );
+            }
+            Err(e) => {
+                // If it failed, it should be due to external modification detection
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("modified externally") || err_msg.contains("Error"),
+                    "Expected external modification error, got: {}",
+                    err_msg
+                );
+            }
+        }
+    }
+}

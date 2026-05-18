@@ -23,32 +23,25 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: dirac-native
+          workspaces: .
 
       - name: Check compilation
-        working-directory: dirac-native
         run: cargo check --lib
 
       - name: Run library tests
-        working-directory: dirac-native
         run: cargo test --lib
 
       - name: Run CLI tests
-        working-directory: dirac-native
         run: cargo test --test cli_tests
 
       - name: Run AST fixture tests
-        working-directory: dirac-native
         run: cargo test --test ast_fixtures
 
       - name: Run clippy (lib)
-        working-directory: dirac-native
         run: cargo clippy --lib -- -D warnings
 
       - name: Run clippy (tests)
-        working-directory: dirac-native
         run: cargo clippy --tests -- -D warnings
 
       - name: Check formatting
-        working-directory: dirac-native
         run: cargo fmt --check

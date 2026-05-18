@@ -1,0 +1,30 @@
+I need to refactor the following Python code to use async/await patterns. The current code makes sequential API calls that could be parallelized:
+
+```python
+import requests
+
+def fetch_user_data(user_ids):
+    """Fetch user data for multiple users sequentially."""
+    results = []
+    for user_id in user_ids:
+        response = requests.get(f"https://api.example.com/users/{user_id}")
+        results.append(response.json())
+    return results
+
+def process_users(user_ids):
+    """Process multiple users."""
+    users = fetch_user_data(user_ids)
+    for user in users:
+        print(f"Processing {user['name']}")
+    return users
+
+if __name__ == "__main__":
+    user_ids = [1, 2, 3, 4, 5]
+    process_users(user_ids)
+```
+
+Please:
+1. Convert this to use asyncio and aiohttp for parallel API calls
+2. Add proper error handling with retries
+3. Add type hints
+4. Include tests that mock the API calls

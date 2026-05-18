@@ -1,0 +1,1 @@
+Write a Rust function that takes a Vec<i32> and returns the sum of all even numbers. Include a test that verifies the function works correctly with the input [1, 2, 3, 4, 5, 6].

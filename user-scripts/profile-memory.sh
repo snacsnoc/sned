@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Automated Memory Profiling for Sned Native
+# Automated Memory Profiling for sned
 # 
 # This script:
-# 1. Builds sned-native with dhat-heap feature
+# 1. Builds sned with dhat-heap feature
 # 2. Runs a realistic workload (or custom command)
 # 3. Analyzes heap allocations with categorization
 # 4. Generates a comprehensive report
@@ -34,7 +34,7 @@ NC='\033[0m'
 
 show_help() {
     cat << 'EOF'
-Automated Memory Profiling for Sned Native
+Automated Memory Profiling for sned
 
 Usage: ./profile-memory.sh [options]
 
@@ -106,7 +106,7 @@ RUN_DIR="$OUTPUT_DIR/profile-${TIMESTAMP}"
 mkdir -p "$RUN_DIR"
 
 echo "=============================================="
-echo "  Sned Native Memory Profiling"
+echo "  sned Memory Profiling"
 echo "=============================================="
 echo ""
 echo "  Workload:     $WORKLOAD"
@@ -115,8 +115,8 @@ echo "  Timestamp:    $TIMESTAMP"
 echo ""
 
 # Check for dhat-heap feature in Cargo.toml
-if ! grep -q 'dhat-heap' sned-native/Cargo.toml; then
-    echo -e "${RED}Error: dhat-heap feature not found in sned-native/Cargo.toml${NC}"
+if ! grep -q 'dhat-heap' Cargo.toml; then
+    echo -e "${RED}Error: dhat-heap feature not found in Cargo.toml${NC}"
     echo "Add this to Cargo.toml:"
     echo "  dhat = { version = \"0.3\", optional = true }"
     exit 1
@@ -124,17 +124,14 @@ fi
 
 # Build with dhat-heap
 echo -e "${BLUE}[1/4] Building with dhat-heap feature...${NC}"
-cd sned-native
 BUILD_LOG="$RUN_DIR/build.log"
 mkdir -p "$RUN_DIR"  # Ensure directory exists before tee
 if cargo build --features dhat-heap --release > "$BUILD_LOG" 2>&1; then
     echo -e "${GREEN}✓ Build complete${NC}"
 else
     echo -e "${RED}Build failed! Check $BUILD_LOG${NC}"
-    cd ..
     exit 1
 fi
-cd ..
 
 echo -e "${GREEN}✓ Build complete${NC}"
 echo ""
@@ -145,7 +142,7 @@ echo ""
 
 run_basic_workload() {
     echo "  Running: --help (initialization only)"
-    ./sned-native/target/release/sned-native --help > /dev/null 2>&1 || true
+    ./target/release/sned --help > /dev/null 2>&1 || true
 }
 
 run_edit_workload() {
@@ -166,7 +163,7 @@ TESTFILE
 
     # Run edit command (will fail but exercises the code paths)
     cd "$temp_workspace"
-    timeout 10s "$REPO_ROOT/sned-native/target/release/sned-native" \
+    timeout 10s "$REPO_ROOT/target/release/sned" \
         "Edit line 3 to say 'MODIFIED LINE 3'" \
         2>&1 || true
     cd "$REPO_ROOT"
@@ -179,7 +176,7 @@ run_search_workload() {
     echo "  Running: File search and symbol indexing"
     
     # Run search command (will fail but exercises code paths)
-    timeout 10s ./sned-native/target/release/sned-native \
+    timeout 10s ./target/release/sned \
         "Search for all Rust files in this project" \
         2>&1 || true
 }
@@ -215,13 +212,9 @@ echo ""
 # Check for dhat output
 Dhat_JSON="dhat-heap.json"
 if [ ! -f "$Dhat_JSON" ]; then
-    # Try alternate location
-    if [ -f "sned-native/$Dhat_JSON" ]; then
-        Dhat_JSON="sned-native/$Dhat_JSON"
-    else
-        echo -e "${YELLOW}Warning: dhat-heap.json not found${NC}"
-        echo "The workload may not have triggered heap allocations."
-        echo "Creating empty report..."
+    echo -e "${YELLOW}Warning: dhat-heap.json not found${NC}"
+    echo "The workload may not have triggered heap allocations."
+    echo "Creating empty report..."
         
         cat > "$RUN_DIR/summary.txt" << EOF
 Memory Profile Summary
@@ -237,8 +230,7 @@ dhat-heap.json was not generated. This could mean:
 
 Try running with --workload all for more comprehensive profiling.
 EOF
-        exit 0
-    fi
+    exit 0
 fi
 
 # Copy dhat output
@@ -293,7 +285,7 @@ leak_ratio = (final_live / total_allocated * 100) if total_allocated > 0 else 0
 sorted_pps = sorted(enumerate(pps), key=lambda x: x[1].get('gb', 0) + x[1].get('eb', 0), reverse=True)
 
 print("=" * 70)
-print("  Sned Native Memory Profile Summary")
+print("  sned Memory Profile Summary")
 print("=" * 70)
 print()
 print(f"  Timestamp:    $TIMESTAMP")

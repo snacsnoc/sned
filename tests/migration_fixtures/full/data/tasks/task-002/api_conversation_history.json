@@ -1,0 +1,7 @@
+{
+  "task_id": "task-002",
+  "messages": [
+    {"role": "user", "content": "How are you?"},
+    {"role": "assistant", "content": "I'm doing well!"}
+  ]
+}
