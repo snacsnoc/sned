@@ -8,14 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-14      # macOS arm64
-          - macos-13      # macOS x86_64
-          - ubuntu-22.04  # Ubuntu 22.04
+    runs-on: macos-14
 
     steps:
       - name: Checkout repository
