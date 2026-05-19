@@ -26,27 +26,26 @@ impl ModelContextTracker {
         mode: &str,
     ) -> std::io::Result<()> {
         let storage = TaskStorage::new(&self.task_id)?;
-        let mut metadata = storage.read_task_metadata();
 
-        // Check if last entry is the same
-        if let Some(last) = metadata.model_usage.last()
-            && last.model_id == model_id
-            && last.model_provider_id == api_provider_id
-            && last.mode == mode
-        {
-            return Ok(());
-        }
+        storage.update_metadata(|metadata| {
+            // Check if last entry is the same
+            if let Some(last) = metadata.model_usage.last()
+                && last.model_id == model_id
+                && last.model_provider_id == api_provider_id
+                && last.mode == mode
+            {
+                return;
+            }
 
-        metadata
-            .model_usage
-            .push(crate::storage::task_storage::ModelUsageEntry {
-                ts: current_timestamp(),
-                model_id: model_id.to_string(),
-                model_provider_id: api_provider_id.to_string(),
-                mode: mode.to_string(),
-            });
-
-        storage.write_task_metadata(&metadata)
+            metadata
+                .model_usage
+                .push(crate::storage::task_storage::ModelUsageEntry {
+                    ts: current_timestamp(),
+                    model_id: model_id.to_string(),
+                    model_provider_id: api_provider_id.to_string(),
+                    mode: mode.to_string(),
+                });
+        })
     }
 }
 
@@ -66,19 +65,19 @@ impl EnvironmentContextTracker {
     /// Record environment snapshot, avoiding duplicate consecutive entries.
     pub async fn record_environment(&self) -> std::io::Result<()> {
         let storage = TaskStorage::new(&self.task_id)?;
-        let mut metadata = storage.read_task_metadata();
 
-        let current_env = collect_environment_metadata();
+        storage.update_metadata(|metadata| {
+            let current_env = collect_environment_metadata();
 
-        // Check if last entry is the same
-        if let Some(last) = metadata.environment_history.last()
-            && self.is_same_environment(last, &current_env)
-        {
-            return Ok(());
-        }
+            // Check if last entry is the same
+            if let Some(last) = metadata.environment_history.last()
+                && self.is_same_environment(last, &current_env)
+            {
+                return;
+            }
 
-        metadata.environment_history.push(current_env);
-        storage.write_task_metadata(&metadata)
+            metadata.environment_history.push(current_env);
+        })
     }
 
     fn is_same_environment(
@@ -158,6 +157,82 @@ mod tests {
         assert_eq!(metadata.model_usage[0].model_id, "claude-sonnet-4-5");
         assert_eq!(metadata.model_usage[0].model_provider_id, "anthropic");
         assert_eq!(metadata.model_usage[0].mode, "act");
+
+        // Restore original env var
+        if let Some(val) = original_data_dir {
+            unsafe {
+                std::env::set_var("SNED_DATA_DIR", val);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("SNED_DATA_DIR");
+            }
+        }
+    }
+
+    /// Regression test: concurrent model_usage and environment updates do not clobber.
+    #[tokio::test]
+    async fn test_concurrent_tracker_updates_not_clobbered() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp = TempDir::new().unwrap();
+        let task_id = format!("test-concurrent-{}", std::process::id());
+
+        // Override SNED_DATA_DIR for this test
+        let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        unsafe {
+            std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
+        }
+
+        // Create task directory (SNED_DATA_DIR/tasks/{task_id})
+        let tasks_dir = temp.path().join("tasks");
+        let task_dir = tasks_dir.join(&task_id);
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let model_tracker = Arc::new(ModelContextTracker::new(&task_id));
+        let env_tracker = Arc::new(EnvironmentContextTracker::new(&task_id));
+
+        // Run both trackers concurrently using threads
+        let mt1 = Arc::clone(&model_tracker);
+        let model_handle = thread::spawn(move || {
+            // Use block_on to run async in thread
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                mt1.record_model_usage("anthropic", "claude-3-5-sonnet", "act")
+                    .await
+                    .unwrap();
+            });
+        });
+
+        let et1 = Arc::clone(&env_tracker);
+        let env_handle = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                et1.record_environment().await.unwrap();
+            });
+        });
+
+        // Wait for both
+        model_handle.join().unwrap();
+        env_handle.join().unwrap();
+
+        // Verify both updates were preserved
+        let storage = TaskStorage::new(&task_id).unwrap();
+        let metadata = storage.read_task_metadata();
+
+        assert_eq!(
+            metadata.model_usage.len(),
+            1,
+            "model_usage update should be preserved"
+        );
+        assert_eq!(metadata.model_usage[0].model_id, "claude-3-5-sonnet");
+
+        assert_eq!(
+            metadata.environment_history.len(),
+            1,
+            "environment_history update should be preserved"
+        );
 
         // Restore original env var
         if let Some(val) = original_data_dir {

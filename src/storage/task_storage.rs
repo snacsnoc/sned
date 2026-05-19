@@ -235,12 +235,34 @@ impl TaskStorage {
 
     /// Write task metadata
     pub fn write_task_metadata(&self, metadata: &TaskMetadata) -> io::Result<()> {
-        self.with_lock(|| {
-            let data = serde_json::to_string(metadata)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let file_path = self.task_dir.join(GlobalFileNames::TASK_METADATA);
-            crate::storage::disk::atomic_write_file(&file_path, &data)
-        })
+        self.with_lock(|| self.write_task_metadata_unlocked(metadata))
+    }
+
+    /// Write task metadata without acquiring lock (caller must hold lock).
+    fn write_task_metadata_unlocked(&self, metadata: &TaskMetadata) -> io::Result<()> {
+        let data = serde_json::to_string(metadata)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let file_path = self.task_dir.join(GlobalFileNames::TASK_METADATA);
+        crate::storage::disk::atomic_write_file(&file_path, &data)
+    }
+
+    /// Read task metadata without acquiring lock (caller must hold lock).
+    fn read_task_metadata_unlocked(&self) -> TaskMetadata {
+        let file_path = self.task_dir.join(GlobalFileNames::TASK_METADATA);
+        match fs::read_to_string(&file_path) {
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        file_path = %file_path.display(),
+                        error = %e,
+                        "Failed to parse task metadata JSON"
+                    );
+                    TaskMetadata::default()
+                }
+            },
+            Err(_) => TaskMetadata::default(),
+        }
     }
 
     /// Create initial task metadata for a new task
@@ -362,6 +384,28 @@ impl TaskStorage {
         Ok(LockGuard { _file: file })
     }
 
+    /// Acquire an exclusive lock on the task directory, blocking until available.
+    ///
+    /// Returns a LockGuard that automatically releases the lock when dropped.
+    fn acquire_lock_blocking(&self) -> io::Result<LockGuard> {
+        let lock_path = self.task_dir.join(".lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        file.lock_exclusive().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to acquire lock: {}", e),
+            )
+        })?;
+
+        Ok(LockGuard { _file: file })
+    }
+
     /// Execute a closure while holding an exclusive lock on the task directory.
     ///
     /// The lock is automatically released when the closure returns.
@@ -369,22 +413,37 @@ impl TaskStorage {
     where
         F: FnOnce() -> io::Result<T>,
     {
-        let _guard = self.acquire_lock()?;
+        let _guard = self.acquire_lock_blocking()?;
         f()
     }
 }
 
 impl TaskStorage {
+    /// Atomically update task metadata with a closure.
+    ///
+    /// Holds the lock across the entire read-modify-write operation to prevent
+    /// concurrent updates from clobbering each other.
+    pub fn update_metadata<F>(&self, f: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut TaskMetadata),
+    {
+        self.with_lock(|| {
+            let mut metadata = self.read_task_metadata_unlocked();
+            f(&mut metadata);
+            self.write_task_metadata_unlocked(&metadata)
+        })
+    }
+
     /// Save file context metadata (files_in_context) to task metadata.
     ///
-    /// Reads existing metadata, updates files_in_context, and writes back.
+    /// Uses atomic update to prevent concurrent tracker updates from clobbering each other.
     pub fn save_file_context_metadata(
         &self,
         entries: &[crate::core::context::trackers::FileMetadataEntry],
     ) -> io::Result<()> {
-        let mut metadata = self.read_task_metadata();
-        metadata.files_in_context = entries.to_vec();
-        self.write_task_metadata(&metadata)
+        self.update_metadata(|metadata| {
+            metadata.files_in_context = entries.to_vec();
+        })
     }
 
     /// Load file context metadata (files_in_context) from task metadata.
@@ -678,5 +737,115 @@ mod tests {
 
         handle1.join().unwrap();
         handle2.join().unwrap();
+    }
+
+    /// Regression test: concurrent metadata updates do not clobber each other.
+    ///
+    /// Simulates two threads updating different fields of task metadata.
+    /// The lock serializes access, ensuring both updates are preserved.
+    #[test]
+    fn test_concurrent_metadata_updates_not_clobbered() {
+        use crate::core::context::trackers::{FileMetadataEntry, FileRecordSource};
+        use crate::core::context::trackers::FileRecordState;
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-concurrent-metadata");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = Arc::new(TaskStorage {
+            task_dir: task_dir.clone(),
+        });
+
+        // Thread 1: Update files_in_context (holds lock briefly)
+        let storage1 = Arc::clone(&storage);
+        let handle1 = thread::spawn(move || {
+            let entries = vec![FileMetadataEntry {
+                path: "/tmp/file1.rs".to_string(),
+                record_state: FileRecordState::Active,
+                record_source: FileRecordSource::SnedEdited,
+                sned_read_date: Some(1000),
+                sned_edit_date: Some(1000),
+                user_edit_date: None,
+            }];
+            storage1.update_metadata(|metadata| {
+                metadata.files_in_context = entries;
+            }).unwrap();
+        });
+
+        // Thread 2: Update model_usage (may need to wait for lock)
+        let storage2 = Arc::clone(&storage);
+        let handle2 = thread::spawn(move || {
+            // Small delay to increase chance of contention
+            thread::sleep(Duration::from_millis(5));
+            storage2.update_metadata(|metadata| {
+                metadata.model_usage.push(ModelUsageEntry {
+                    ts: 2000,
+                    model_id: "test-model".to_string(),
+                    model_provider_id: "test-provider".to_string(),
+                    mode: "test".to_string(),
+                });
+            }).unwrap();
+        });
+
+        // Wait for both threads
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+
+        // Verify both updates were preserved (lock serialized them)
+        let final_metadata = storage.read_task_metadata();
+        assert_eq!(
+            final_metadata.files_in_context.len(),
+            1,
+            "files_in_context update should be preserved"
+        );
+        assert_eq!(
+            final_metadata.files_in_context[0].path,
+            "/tmp/file1.rs"
+        );
+        assert_eq!(
+            final_metadata.model_usage.len(),
+            1,
+            "model_usage update should be preserved"
+        );
+        assert_eq!(
+            final_metadata.model_usage[0].model_id,
+            "test-model"
+        );
+    }
+
+    /// Regression test: rapid successive updates to same field do not lose data.
+    #[test]
+    fn test_rapid_successive_metadata_updates() {
+        use crate::core::context::trackers::{FileMetadataEntry, FileRecordSource};
+        use crate::core::context::trackers::FileRecordState;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-rapid-updates");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Perform 10 rapid successive updates to files_in_context
+        for i in 0..10 {
+            let entries = vec![FileMetadataEntry {
+                path: format!("/tmp/file{}.rs", i),
+                record_state: FileRecordState::Active,
+                record_source: FileRecordSource::SnedEdited,
+                sned_read_date: Some(i * 100),
+                sned_edit_date: Some(i * 100),
+                user_edit_date: None,
+            }];
+            storage.save_file_context_metadata(&entries).unwrap();
+        }
+
+        // Verify the last update is present
+        let final_metadata = storage.read_task_metadata();
+        assert_eq!(final_metadata.files_in_context.len(), 1);
+        assert_eq!(final_metadata.files_in_context[0].path, "/tmp/file9.rs");
     }
 }
