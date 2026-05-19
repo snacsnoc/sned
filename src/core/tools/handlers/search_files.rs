@@ -15,6 +15,10 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default max lines to return from search (rg --max-count)
+const DEFAULT_SEARCH_MAX_LINES: u32 = 100;
+/// Environment variable to configure search result limit
+const SEARCH_MAX_LINES_ENV: &str = "SNED_SEARCH_MAX_LINES";
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilesHandler;
@@ -39,8 +43,16 @@ impl SearchFilesHandler {
             // -n: line number
             // --color: never (we handle highlighting)
             // -H: print filename (always, even for single file)
+            // --max-count: limit matches per file (prevents huge single-file results)
             let mut c = Command::new("rg");
             c.args(["--line-number", "--color=never", "--with-filename"]);
+            
+            // Limit per-file to prevent huge results from single files
+            let max_per_file = std::env::var(SEARCH_MAX_LINES_ENV)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(DEFAULT_SEARCH_MAX_LINES);
+            c.arg("--max-count").arg(max_per_file.to_string());
             c
         } else {
             // grep flags:
@@ -81,19 +93,28 @@ impl SearchFilesHandler {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut lines: Vec<&str> = stdout.lines().collect();
+        let lines: Vec<&str> = stdout.lines().collect();
 
-        if lines.len() > 100 {
-            lines.truncate(100);
-            let mut result = lines.join("\n");
-            result
-                .push_str("\n\n(Too many matches, showing first 100. Please refine your search.)");
-            Ok(result)
-        } else if lines.is_empty() {
+        if lines.is_empty() {
             let err = crate::cli::actionable_errors::search_no_results(regex);
             Ok(err.display())
         } else {
-            Ok(lines.join("\n"))
+            // rg already limited results via --max-count
+            let max_lines = std::env::var(SEARCH_MAX_LINES_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_SEARCH_MAX_LINES as usize);
+            
+            if lines.len() >= max_lines {
+                let mut result = lines.join("\n");
+                result.push_str(&format!(
+                    "\n\n(Too many matches, showing first {}. Please refine your search.)",
+                    lines.len()
+                ));
+                Ok(result)
+            } else {
+                Ok(lines.join("\n"))
+            }
         }
     }
 
@@ -262,6 +283,62 @@ mod tests {
 
         assert!(result.contains("file1.rs:1:hello rust"));
         assert!(!result.contains("file1.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_search_files_respects_max_count_per_file() {
+        // Create a file with more matches than the default limit (100)
+        let temp_dir = TempDir::new().unwrap();
+        let content = (0..150).map(|i| format!("match {}", i)).collect::<Vec<_>>().join("\n");
+        fs::write(temp_dir.path().join("large_file.txt"), content).unwrap();
+
+        let handler = SearchFilesHandler::new();
+        let result = handler
+            .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
+            .await
+            .unwrap();
+
+        // Should be limited to DEFAULT_SEARCH_MAX_LINES (100) per file
+        // Count only lines with filename:linenum: pattern (actual rg output)
+        let line_count = result
+            .lines()
+            .filter(|l| l.contains("large_file.txt:"))
+            .count();
+        assert!(line_count <= 100, "expected <= 100 match lines, got {}", line_count);
+        assert!(result.contains("Too many matches"));
+    }
+
+    #[tokio::test]
+    async fn test_search_files_custom_max_count_via_env() {
+        // Test with custom limit via environment variable
+        // Use a unique value to avoid interference from other tests
+        unsafe {
+            std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        // Create a single file with more matches than the limit
+        let content = (0..50).map(|i| format!("match {}", i)).collect::<Vec<_>>().join("\n");
+        fs::write(temp_dir.path().join("large_file.txt"), content).unwrap();
+
+        let handler = SearchFilesHandler::new();
+        let result = handler
+            .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
+            .await
+            .unwrap();
+
+        // Should be limited to 10 per file (plus "Too many matches" message)
+        // Count only lines with filename:linenum: pattern (actual rg output)
+        let line_count = result
+            .lines()
+            .filter(|l| l.contains("large_file.txt:"))
+            .count();
+        assert!(line_count <= 10, "expected <= 10 match lines, got {}", line_count);
+        assert!(result.contains("Too many matches"));
+
+        unsafe {
+            std::env::remove_var(SEARCH_MAX_LINES_ENV);
+        }
     }
 
     #[tokio::test]
