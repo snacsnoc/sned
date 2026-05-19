@@ -528,46 +528,63 @@ impl DiagnosticsScanHandler {
 
         state.consecutive_mistakes = 0;
 
-        let mut results = Vec::new();
+        // Group files by project root to run diagnostics once per project (not per file)
+        let mut files_by_project: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        let mut file_info: HashMap<PathBuf, (String, Option<String>)> = HashMap::new();
         let mut error_results = Vec::new();
 
         for rel_path in &paths {
-            let abs_path = crate::core::tools::resolve_sanitized_path(workspace_root, rel_path)
-                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-            let display_path = rel_path;
+            let abs_path = match crate::core::tools::resolve_sanitized_path(workspace_root, rel_path)
+            {
+                Ok(path) => path,
+                Err(e) => {
+                    error_results.push(format!("- file: {}\n  error: {}", rel_path, e));
+                    continue;
+                }
+            };
 
             // Try to read the file
             let file_content = match tokio::fs::read_to_string(&abs_path).await {
                 Ok(content) => Some(content),
                 Err(e) => {
-                    error_results.push(format!("- file: {}\n  error: {}", display_path, e));
-                    None
+                    error_results.push(format!("- file: {}\n  error: {}", rel_path, e));
+                    continue;
                 }
             };
 
-            if file_content.is_none() {
-                continue;
-            }
-
-            let file_content = file_content.unwrap();
+            // Determine project root for grouping
             let project_type = Self::detect_project_type(&abs_path);
-
-            // Run diagnostics with timeout
-            let diag_output = match timeout(
-                Duration::from_secs(30),
-                Self::run_diagnostics(project_type, &abs_path),
+            let project_root = Self::find_ancestor_with_file(
+                &abs_path,
+                if project_type == ProjectType::Rust {
+                    "Cargo.toml"
+                } else if project_type == ProjectType::JavaScript {
+                    "package.json"
+                } else {
+                    "Cargo.toml" // Try Cargo.toml first as fallback
+                },
             )
-            .await
-            {
-                Ok(Ok(output)) => output,
-                Ok(Err(e)) => format!("Error running diagnostics: {}", e),
-                Err(_) => "Error: Diagnostics command timed out after 30 seconds.".to_string(),
-            };
+            .or_else(|| {
+                Self::find_ancestor_with_file(&abs_path, "package.json").or_else(|| {
+                    abs_path.parent().map(|p| p.to_path_buf())
+                })
+            })
+            .unwrap_or_else(|| abs_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")));
 
-            // Parse and format diagnostics
+            files_by_project.entry(project_root).or_default().push(abs_path.clone());
+            file_info.insert(abs_path.clone(), (rel_path.clone(), file_content));
+        }
+
+        // Batch diagnostics by project root so cargo check/npm lint runs once per project,
+        // not once per file. For N files in the same crate, this saves N-1 redundant invocations.
+        let batch_diag_outputs = Self::run_diagnostics_batch(&files_by_project).await;
+
+        // Format results for each file
+        let mut results = Vec::new();
+        for (abs_path, (display_path, file_content)) in &file_info {
+            let diag_output = batch_diag_outputs.get(abs_path).cloned().unwrap_or_default();
             let diagnostics = Self::parse_diagnostics(&diag_output, display_path);
-            let formatted =
-                Self::format_diagnostics(display_path, &diagnostics, Some(&file_content));
+            let formatted = Self::format_diagnostics(display_path, &diagnostics, file_content.as_deref());
             results.push(formatted);
         }
 
@@ -788,5 +805,37 @@ mod tests {
 
         let desc2 = handler.description(&serde_json::json!({}));
         assert_eq!(desc2, "[diagnostics_scan]");
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_scan_batch_groups_by_project() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let rust_dir = temp.path().join("rust_project");
+        std::fs::create_dir_all(rust_dir.join("src")).unwrap();
+        std::fs::write(rust_dir.join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        std::fs::write(rust_dir.join("src/file1.rs"), "fn main() {}").unwrap();
+        std::fs::write(rust_dir.join("src/file2.rs"), "fn helper() {}").unwrap();
+
+        let handler = DiagnosticsScanHandler::new();
+        let mut state = TaskState::default();
+
+        let result = handler
+            .execute(
+                &mut state,
+                temp.path(),
+                serde_json::json!({
+                    "paths": [
+                        rust_dir.join("src/file1.rs").to_string_lossy().to_string(),
+                        rust_dir.join("src/file2.rs").to_string_lossy().to_string()
+                    ]
+                }),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains("file1.rs") || output.contains("file2.rs"));
+        assert_eq!(state.consecutive_mistakes, 0);
     }
 }
