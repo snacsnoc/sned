@@ -250,6 +250,22 @@ pub struct HistoryOptions {
     #[arg(short = 'p', long, default_value = "1")]
     pub page: u32,
 
+    /// Show only favorited tasks
+    #[arg(long)]
+    pub favorites_only: bool,
+
+    /// Show only tasks from current workspace
+    #[arg(long)]
+    pub workspace_only: bool,
+
+    /// Search query to filter tasks by prompt text
+    #[arg(short = 's', long)]
+    pub search: Option<String>,
+
+    /// Sort order: newest (default), oldest, or alphabetical
+    #[arg(long, default_value = "newest", value_parser = ["newest", "oldest", "alphabetical"])]
+    pub sort: String,
+
     /// Path to Sned configuration directory
     #[arg(long)]
     pub config: Option<String>,
@@ -1358,6 +1374,50 @@ mod tests {
         match cli.command {
             Some(Command::History { .. }) => {}
             _ => panic!("expected History command via alias"),
+        }
+    }
+
+    #[test]
+    fn parse_history_favorites_only() {
+        let cli = Cli::try_parse_from(["sned", "history", "--favorites-only"]).unwrap();
+        match cli.command {
+            Some(Command::History { opts }) => {
+                assert!(opts.favorites_only);
+            }
+            _ => panic!("expected History command"),
+        }
+    }
+
+    #[test]
+    fn parse_history_workspace_only() {
+        let cli = Cli::try_parse_from(["sned", "history", "--workspace-only"]).unwrap();
+        match cli.command {
+            Some(Command::History { opts }) => {
+                assert!(opts.workspace_only);
+            }
+            _ => panic!("expected History command"),
+        }
+    }
+
+    #[test]
+    fn parse_history_search() {
+        let cli = Cli::try_parse_from(["sned", "history", "-s", "auth"]).unwrap();
+        match cli.command {
+            Some(Command::History { opts }) => {
+                assert_eq!(opts.search, Some("auth".to_string()));
+            }
+            _ => panic!("expected History command"),
+        }
+    }
+
+    #[test]
+    fn parse_history_sort() {
+        let cli = Cli::try_parse_from(["sned", "history", "--sort", "alphabetical"]).unwrap();
+        match cli.command {
+            Some(Command::History { opts }) => {
+                assert_eq!(opts.sort, "alphabetical");
+            }
+            _ => panic!("expected History command"),
         }
     }
 

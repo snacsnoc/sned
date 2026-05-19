@@ -797,6 +797,10 @@ pub async fn run_interactive_shell_inner(
                                 let _ = crate::cli::subcommands::run_history(HistoryOptions {
                                     limit: 10,
                                     page: 1,
+                                    favorites_only: false,
+                                    workspace_only: false,
+                                    search: None,
+                                    sort: "newest".to_string(),
                                     config: task_opts.config.clone(),
                                 });
                                 restore_raw_mode(&mut raw_guard)?;

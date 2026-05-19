@@ -9,19 +9,52 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
     use crate::storage::state_manager::StateManager;
     use crate::storage::state_manager::{list_tasks, sort_by_timestamp, total_pages};
     use chrono::{DateTime, Local};
+    use std::env;
 
     let state_manager = StateManager::new()?;
     state_manager.initialize()?;
 
     let mut history = state_manager.get_task_history();
 
+    // Apply favorites filter
+    if opts.favorites_only {
+        history.retain(|item| item.is_favorited.unwrap_or(false));
+    }
+
+    // Apply workspace filter (compare task workspace with current directory)
+    if opts.workspace_only {
+        let cwd = env::current_dir()?.to_string_lossy().to_string();
+        history.retain(|item| {
+            item.workspace_root_path
+                .as_ref()
+                .map(|w| cwd.starts_with(w))
+                .unwrap_or(false)
+        });
+    }
+
+    // Apply search filter
+    if let Some(ref query) = opts.search {
+        let query_lower = query.to_lowercase();
+        history.retain(|item| item.task.to_lowercase().contains(&query_lower));
+    }
+
     if history.is_empty() {
-        println!("No task history found.");
+        println!("No task history found matching the specified filters.");
         return Ok(());
     }
 
-    // Sort by timestamp (newest first)
-    sort_by_timestamp(&mut history);
+    // Apply sorting
+    match opts.sort.as_str() {
+        "oldest" => {
+            history.sort_by(|a, b| a.ts.cmp(&b.ts));
+        }
+        "alphabetical" => {
+            history.sort_by(|a, b| a.task.cmp(&b.task));
+        }
+        "newest" | _ => {
+            sort_by_timestamp(&mut history);
+        }
+    }
 
     let page = opts.page.max(1) as usize;
     let limit = opts.limit.max(1) as usize;
@@ -34,10 +67,31 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
         .unwrap_or(80);
     let separator_width = term_width.saturating_sub(4).min(100);
 
+    // Build filter summary for header
+    let mut filter_parts = Vec::new();
+    if opts.favorites_only {
+        filter_parts.push("favorites");
+    }
+    if opts.workspace_only {
+        filter_parts.push("workspace");
+    }
+    if opts.search.is_some() {
+        filter_parts.push("search");
+    }
+    if opts.sort != "newest" {
+        filter_parts.push(&opts.sort);
+    }
+
+    let filter_summary = if filter_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", filter_parts.join(", "))
+    };
+
     // Header
     println!(
-        " Task History (page {} of {}, {} total)",
-        page, total_pages, total
+        " Task History{} (page {} of {}, {} total)",
+        filter_summary, page, total_pages, total
     );
     println!("{}", "─".repeat(separator_width));
 
@@ -60,7 +114,13 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
             String::new()
         };
 
-        println!("  {:>4}  {:16}  {}{}", item.number, dt, preview, tokens);
+        let favorite_marker = if item.is_favorited.unwrap_or(false) {
+            "★ "
+        } else {
+            "  "
+        };
+
+        println!("  {}{:>4}  {:16}  {}{}", favorite_marker, item.number, dt, preview, tokens);
     }
 
     println!("{}", "─".repeat(separator_width));
@@ -68,6 +128,9 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
         " Showing {} tasks per page. Use -n <limit> and -p <page> to navigate.",
         limit
     );
+    if !filter_parts.is_empty() {
+        println!(" Active filters: {}. Use --help to see filter options.", filter_parts.join(", "));
+    }
 
     Ok(())
 }
