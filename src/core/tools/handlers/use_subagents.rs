@@ -177,6 +177,7 @@ impl UseSubagentsHandler {
         state: &mut TaskState,
         params: serde_json::Value,
         workspace_root: &Path,
+        json_output: bool,
     ) -> Result<String, ToolError> {
         // Prevent subagent recursion (matches TypeScript SubagentToolHandler.ts:96-98)
         if state.is_subagent_execution {
@@ -283,13 +284,15 @@ impl UseSubagentsHandler {
 
         let cwd = workspace_root.to_path_buf();
 
-        eprintln!(
-            "{}",
-            crate::cli::colors::info(&format!(
-                "Running {} subagent(s) in parallel...",
-                prompts.len()
-            ))
-        );
+        if !json_output {
+            eprintln!(
+                "{}",
+                crate::cli::colors::info(&format!(
+                    "Running {} subagent(s) in parallel...",
+                    prompts.len()
+                ))
+            );
+        }
 
         let mut handles = Vec::new();
         for (i, prompt) in prompts.iter().enumerate() {
@@ -407,13 +410,15 @@ impl UseSubagentsHandler {
         ));
 
         let summary = summary_lines.join("\n");
-        eprintln!(
-            "{}",
-            crate::cli::colors::info(&format!(
-                "Subagent batch complete: {} succeeded, {} failed",
-                successes, failures
-            ))
-        );
+        if !json_output {
+            eprintln!(
+                "{}",
+                crate::cli::colors::info(&format!(
+                    "Subagent batch complete: {} succeeded, {} failed",
+                    successes, failures
+                ))
+            );
+        }
 
         Ok(summary)
     }
@@ -426,7 +431,7 @@ impl UseSubagentsHandler {
         let workspace_root = std::env::current_dir()
             .ok()
             .unwrap_or_else(|| Path::new(".").to_path_buf());
-        self.execute_with_workspace_root(state, params, workspace_root.as_path())
+        self.execute_with_workspace_root(state, params, workspace_root.as_path(), false)
             .await
     }
 }
@@ -453,9 +458,14 @@ impl ToolHandler for UseSubagentsHandler {
         }
 
         let mut state = ctx.state.lock().await;
-        self.execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
-            .await
-            .map(serde_json::Value::String)
+        self.execute_with_workspace_root(
+            &mut state,
+            params,
+            ctx.workspace_root.as_path(),
+            ctx.json_output,
+        )
+        .await
+        .map(serde_json::Value::String)
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

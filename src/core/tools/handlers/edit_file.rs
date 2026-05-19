@@ -197,6 +197,7 @@ impl EditFileHandler {
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
         explicitly_approved: bool,
+        json_output: bool,
     ) -> Result<String, ToolError> {
         // Parse files parameter
         let files = params
@@ -267,9 +268,10 @@ impl EditFileHandler {
             }
 
             // Warn if editing a file not read this session
-            if !state
-                .file_context_tracker
-                .was_read_this_session(&batch.display_path)
+            if !json_output
+                && !state
+                    .file_context_tracker
+                    .was_read_this_session(&batch.display_path)
             {
                 eprintln!(
                     "{}",
@@ -675,10 +677,12 @@ impl EditFileHandler {
         // only reset when ALL edits succeeded (no failures at all).
         if total_failed > 0 {
             state.consecutive_mistakes += 1;
-            eprintln!(
-                "[edit_file] {} edit(s) failed (consecutive_mistakes={})",
-                total_failed, state.consecutive_mistakes
-            );
+            if !json_output {
+                eprintln!(
+                    "[edit_file] {} edit(s) failed (consecutive_mistakes={})",
+                    total_failed, state.consecutive_mistakes
+                );
+            }
         } else if total_applied > 0 {
             state.consecutive_mistakes = 0;
         }
@@ -725,15 +729,18 @@ impl ToolHandler for EditFileHandler {
                 &ctx.anchor_mgr,
                 Some(ctx.task_id.as_str()),
                 ctx.explicitly_approved,
+                ctx.json_output,
             )
             .await;
 
         if result.is_err() {
             state.consecutive_mistakes += 1;
-            eprintln!(
-                "[edit_file] Handler error, incrementing consecutive_mistakes={}",
-                state.consecutive_mistakes
-            );
+            if !ctx.json_output {
+                eprintln!(
+                    "[edit_file] Handler error, incrementing consecutive_mistakes={}",
+                    state.consecutive_mistakes
+                );
+            }
         }
 
         result.map(serde_json::Value::String)

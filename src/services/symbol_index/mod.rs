@@ -136,7 +136,7 @@ impl SymbolIndexService {
         if let Some(ref mut db) = self.db
             && let Err(e) = db.remove_file(rel_path)
         {
-            eprintln!("[symbol_index] Failed to remove file from DB: {}", e);
+            tracing::warn!(error = %e, "symbol_index failed to remove file from DB");
         }
         self.files.remove(rel_path);
     }
@@ -328,7 +328,7 @@ impl SymbolIndexService {
         if let Some(ref mut db) = self.db
             && let Err(e) = db.update_files_symbols_batch(&entries)
         {
-            eprintln!("[symbol_index] Failed to batch update symbols: {}", e);
+            tracing::warn!(error = %e, "symbol_index failed to batch update symbols");
         }
 
         for (rel_path, mtime, size, symbols) in entries {

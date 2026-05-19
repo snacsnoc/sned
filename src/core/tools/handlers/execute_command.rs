@@ -93,7 +93,7 @@ impl ExecuteCommandHandler {
         cwd: Option<&Path>,
     ) -> anyhow::Result<String> {
         // Default: apply safety checks (not explicitly approved)
-        self.execute_commands_with_timeout(commands, cwd, None, false, None, false)
+        self.execute_commands_with_timeout(commands, cwd, None, false, None, false, false)
             .await
     }
 
@@ -109,6 +109,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         raw_output: bool,
+        json_output: bool,
     ) -> anyhow::Result<String> {
         self.execute_commands_with_timeout(
             commands,
@@ -117,6 +118,7 @@ impl ExecuteCommandHandler {
             explicitly_approved,
             task_state,
             raw_output,
+            json_output,
         )
         .await
     }
@@ -129,6 +131,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         _raw_output: bool,
+        json_output: bool,
     ) -> anyhow::Result<String> {
         #[cfg(feature = "terminal")]
         {
@@ -139,6 +142,7 @@ impl ExecuteCommandHandler {
                 explicitly_approved,
                 task_state,
                 _raw_output,
+                json_output,
             )
             .await
         }
@@ -150,6 +154,7 @@ impl ExecuteCommandHandler {
                 timeout_override,
                 explicitly_approved,
                 task_state,
+                json_output,
             )
             .await
         }
@@ -164,6 +169,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         raw_output: bool,
+        json_output: bool,
     ) -> anyhow::Result<String> {
         use crate::terminal::command_pty::{CommandOutput, run_command_in_pty};
         use crate::terminal::vt_renderer::{VtRenderer, strip_progress_artifacts};
@@ -181,10 +187,12 @@ impl ExecuteCommandHandler {
             }
             tracing::debug!(command = %cmd_str, cwd = ?cwd, "executing command (PTY)");
 
-            eprintln!(
-                "{}",
-                crate::cli::colors::info(&format!("Running: {}", cmd_str))
-            );
+            if !json_output {
+                eprintln!(
+                    "{}",
+                    crate::cli::colors::info(&format!("Running: {}", cmd_str))
+                );
+            }
 
             // Validate working directory
             if let Some(dir) = cwd {
@@ -286,6 +294,7 @@ impl ExecuteCommandHandler {
         timeout_override: Option<Duration>,
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        json_output: bool,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -305,10 +314,12 @@ impl ExecuteCommandHandler {
             }
             tracing::debug!(command = %cmd_str, cwd = ?cwd, "executing command");
 
-            eprintln!(
-                "{}",
-                crate::cli::colors::info(&format!("Running: {}", cmd_str))
-            );
+            if !json_output {
+                eprintln!(
+                    "{}",
+                    crate::cli::colors::info(&format!("Running: {}", cmd_str))
+                );
+            }
 
             // Execute via shell for portability and shell feature support
             let mut cmd = if cfg!(target_os = "windows") {
@@ -373,7 +384,9 @@ impl ExecuteCommandHandler {
                     result = stdout_reader.next_line() => {
                         match result {
                             Ok(Some(line)) => {
-                                eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                if !json_output {
+                                    eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                }
                                 stdout_collected.push_str(&line);
                                 stdout_collected.push('\n');
                             }
@@ -384,7 +397,9 @@ impl ExecuteCommandHandler {
                     result = stderr_reader.next_line() => {
                         match result {
                             Ok(Some(line)) => {
-                                eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                if !json_output {
+                                    eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                }
                                 stderr_collected.push_str(&line);
                                 stderr_collected.push('\n');
                             }
@@ -396,12 +411,16 @@ impl ExecuteCommandHandler {
                         break match result {
                             Ok(Ok(status)) => {
                                 while let Ok(Some(line)) = stdout_reader.next_line().await {
-                                    eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                    if !json_output {
+                                        eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                    }
                                     stdout_collected.push_str(&line);
                                     stdout_collected.push('\n');
                                 }
                                 while let Ok(Some(line)) = stderr_reader.next_line().await {
-                                    eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                    if !json_output {
+                                        eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                    }
                                     stderr_collected.push_str(&line);
                                     stderr_collected.push('\n');
                                 }
@@ -701,7 +720,7 @@ impl ExecuteCommandHandler {
         _state: &mut TaskState,
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
-        self.execute_without_state(None, params, None, false, None)
+        self.execute_without_state(None, params, None, false, None, false)
             .await
     }
 
@@ -712,6 +731,7 @@ impl ExecuteCommandHandler {
         _task_id: Option<&str>,
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        json_output: bool,
     ) -> Result<String, ToolError> {
         let commands = coerce_string_array(&params, "commands", "command");
         let commands = if commands.is_empty() {
@@ -731,6 +751,7 @@ impl ExecuteCommandHandler {
                 explicitly_approved,
                 task_state,
                 raw_output,
+                json_output,
             )
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
@@ -761,6 +782,7 @@ impl ToolHandler for ExecuteCommandHandler {
             Some(&ctx.task_id),
             ctx.explicitly_approved,
             Some(ctx.state.clone()),
+            ctx.json_output,
         )
         .await
         .map(serde_json::Value::String)
@@ -829,6 +851,7 @@ mod tests {
                 Some(Duration::from_millis(100)),
                 false,
                 None,
+                false,
                 false,
             )
             .await;
@@ -1013,6 +1036,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
             )
             .await;
 
@@ -1067,6 +1091,7 @@ mod tests {
                     Some(Duration::from_millis(100)),
                     false,
                     None,
+                    false,
                     false,
                 )
                 .await;

@@ -13,7 +13,16 @@ use tokio::time::sleep;
 use tracing::warn;
 
 /// Print a user-visible retry status message (P8)
-fn print_retry_status(retry_attempt: usize, delay: Duration, error: &ProviderError) {
+fn print_retry_status(
+    retry_attempt: usize,
+    delay: Duration,
+    error: &ProviderError,
+    json_output: bool,
+) {
+    if json_output {
+        return;
+    }
+
     let delay_secs = delay.as_secs_f64();
     let error_summary = match error {
         ProviderError::NetworkError(_) => "network error",
@@ -70,6 +79,7 @@ pub async fn create_message_with_retry(
     request: ProviderRequest,
     task_state: Arc<Mutex<TaskState>>,
     retry_config: RetryConfig,
+    json_output: bool,
 ) -> Result<ApiStream, ProviderError> {
     // Validate context window before sending request
     if let Err(msg) = context_window::validate_context_window(&request, provider.as_ref()) {
@@ -101,7 +111,7 @@ pub async fn create_message_with_retry(
                     error = %error,
                     "provider request failed; retrying"
                 );
-                print_retry_status(retry_attempt, delay, &error);
+                print_retry_status(retry_attempt, delay, &error, json_output);
                 sleep(delay).await;
                 retry_attempt += 1;
             }
@@ -359,10 +369,15 @@ mod tests {
             max_tokens: None,
         };
 
-        let stream =
-            create_message_with_retry(provider, request, state.clone(), RetryConfig::default())
-                .await
-                .unwrap();
+        let stream = create_message_with_retry(
+            provider,
+            request,
+            state.clone(),
+            RetryConfig::default(),
+            false,
+        )
+        .await
+        .unwrap();
         let items: Vec<ApiStreamChunk> = stream.collect().await;
 
         assert_eq!(items.len(), 1);

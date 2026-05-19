@@ -68,6 +68,42 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TracingMode {
+    JsonOnly,
+    Human { verbose: bool },
+}
+
+fn tracing_mode(json_output: bool, verbose: bool) -> TracingMode {
+    if json_output {
+        TracingMode::JsonOnly
+    } else {
+        TracingMode::Human { verbose }
+    }
+}
+
+fn init_tracing(mode: TracingMode) {
+    match mode {
+        TracingMode::JsonOnly => {
+            tracing_subscriber::registry().with(JsonOutputLayer).init();
+        }
+        TracingMode::Human { verbose } => {
+            let log_level = if verbose { "debug" } else { "warn" };
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_filter(
+                            EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| EnvFilter::new(format!("sned={}", log_level))),
+                        ),
+                )
+                .with(JsonOutputLayer)
+                .init();
+        }
+    }
+}
+
 /// Options shared between `task`, the default prompt command, and `resume`.
 ///
 /// Source: `dirac/cli/src/index.ts` `TaskOptions` interface and the
@@ -538,7 +574,7 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
     };
 
     // Print detected provider at startup
-    if was_auto_detected {
+    if was_auto_detected && !task_opts.json {
         eprintln!("[sned] Auto-detected provider: {}", provider_name);
     }
 
@@ -1126,23 +1162,7 @@ pub fn run() -> anyhow::Result<()> {
     let cli = parse();
     apply_config_override(&cli);
 
-    // Initialize tracing based on verbosity
-    let log_level = if cli.task_opts.verbose {
-        "debug"
-    } else {
-        "warn"
-    };
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(format!("sned={}", log_level))),
-                ),
-        )
-        .with(JsonOutputLayer)
-        .init();
+    init_tracing(tracing_mode(cli.task_opts.json, cli.task_opts.verbose));
 
     match cli.command {
         Some(Command::Task { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),
@@ -1213,7 +1233,9 @@ pub fn run() -> anyhow::Result<()> {
                     ) {
                         run_interactive_shell(cli.task_opts, cli.root_opts)
                     } else {
-                        crate::cli::colors::eprint_error("no prompt provided on stdin");
+                        if !cli.task_opts.json {
+                            crate::cli::colors::eprint_error("no prompt provided on stdin");
+                        }
                         Ok(())
                     }
                 }
@@ -2042,5 +2064,15 @@ mod tests {
         cursor = prev_pos;
         assert_eq!(cursor, 0);
         assert_eq!(buf, "x");
+    }
+
+    #[test]
+    fn json_mode_uses_json_only_tracing() {
+        assert_eq!(tracing_mode(true, false), TracingMode::JsonOnly);
+        assert_eq!(tracing_mode(true, true), TracingMode::JsonOnly);
+        assert_eq!(
+            tracing_mode(false, true),
+            TracingMode::Human { verbose: true }
+        );
     }
 }

@@ -1023,6 +1023,7 @@ impl AgentLoop {
             request,
             state_clone.clone(),
             retry_config,
+            self.config.json_output,
         )
         .await
         {

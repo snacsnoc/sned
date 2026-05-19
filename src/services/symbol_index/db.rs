@@ -180,7 +180,7 @@ impl SymbolIndexDatabase {
         let mut stmt = match self.conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[symbol_index] Failed to prepare query: {}", e);
+                tracing::warn!(error = %e, "symbol_index failed to prepare query");
                 return Vec::new();
             }
         };
@@ -195,7 +195,7 @@ impl SymbolIndexDatabase {
                 match $query {
                     Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                     Err(e) => {
-                        eprintln!("[symbol_index] Query failed: {}", e);
+                        tracing::warn!(error = %e, "symbol_index query failed");
                         Vec::new()
                     }
                 }
@@ -227,14 +227,14 @@ impl SymbolIndexDatabase {
         ) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[symbol_index] Failed to prepare file symbols query: {}", e);
+                tracing::warn!(error = %e, "symbol_index failed to prepare file symbols query");
                 return Vec::new();
             }
         };
         match stmt.query_map(params![rel_path], row_to_symbol_location) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
             Err(e) => {
-                eprintln!("[symbol_index] File symbols query failed: {}", e);
+                tracing::warn!(error = %e, "symbol_index file symbols query failed");
                 Vec::new()
             }
         }
