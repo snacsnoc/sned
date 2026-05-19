@@ -9,6 +9,7 @@ use std::path::Path;
 use std::io;
 use std::process::Output;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -19,6 +20,9 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SEARCH_MAX_LINES: u32 = 100;
 /// Environment variable to configure search result limit
 const SEARCH_MAX_LINES_ENV: &str = "SNED_SEARCH_MAX_LINES";
+
+/// Cached ripgrep availability check (checked once per process lifetime)
+static RIPGREP_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilesHandler;
@@ -34,9 +38,13 @@ impl SearchFilesHandler {
     ) -> anyhow::Result<String> {
         let search_path = path.unwrap_or(".");
 
-        // Prefer ripgrep (rg) for better performance on large repos (5-10x faster than grep)
-        // Fall back to grep if rg is not available
-        let use_ripgrep = Command::new("rg").arg("--version").output().await.is_ok();
+        // Check ripgrep availability once per process lifetime
+        let use_ripgrep = *RIPGREP_AVAILABLE.get_or_init(|| {
+            std::process::Command::new("rg")
+                .arg("--version")
+                .output()
+                .is_ok()
+        });
 
         let mut cmd = if use_ripgrep {
             // ripgrep flags:
@@ -354,5 +362,47 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_ripgrep_availability_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Create a fresh OnceLock for testing by using a separate static
+        static TEST_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        // Reset counter
+        TEST_CALL_COUNT.store(0, Ordering::Relaxed);
+
+        // Simulate the caching logic
+        let check_availability = || {
+            TEST_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+            std::process::Command::new("rg")
+                .arg("--version")
+                .output()
+                .is_ok()
+        };
+
+        // First call initializes
+        let result1 = *RIPGREP_AVAILABLE.get_or_init(&check_availability);
+
+        // Verify cache is initialized
+        assert!(RIPGREP_AVAILABLE.get().is_some());
+        let calls_after_first = TEST_CALL_COUNT.load(Ordering::Relaxed);
+
+        // Second call should use cached value
+        let result2 = *RIPGREP_AVAILABLE.get_or_init(&check_availability);
+        let calls_after_second = TEST_CALL_COUNT.load(Ordering::Relaxed);
+
+        // Results should be consistent
+        assert_eq!(result1, result2);
+
+        // Call count should not increase on second call
+        assert_eq!(
+            calls_after_first, calls_after_second,
+            "ripgrep availability was checked twice ({} vs {})",
+            calls_after_first, calls_after_second
+        );
+        assert_eq!(calls_after_first, 1, "expected exactly one availability check");
     }
 }
