@@ -408,6 +408,7 @@ pub struct ProviderRequest {
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
     pub use_response_api: Option<bool>,
+    pub max_tokens: Option<u32>,
 }
 
 /// HTTP error returned by a provider after the remote API responded with a non-success status.

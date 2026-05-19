@@ -982,6 +982,7 @@ impl AgentLoop {
             tools,
             tool_choice: Some(crate::providers::ToolChoice::Auto),
             use_response_api: None,
+            max_tokens: self.config.max_tokens,
         };
 
         // Create channel for stream chunks with large buffer to prevent
@@ -1626,6 +1627,7 @@ impl AgentLoop {
         // If tools were called, the handlers will reset on success.
 
         // 6. Add assistant message to history
+        let mut text_only_completes_task = false;
         {
             let mut history = history_clone.lock().await;
             let mut blocks: Vec<AssistantContentBlock> = Vec::new();
@@ -1752,18 +1754,37 @@ impl AgentLoop {
                 ts: Some(chrono::Utc::now().timestamp_millis() as u64),
             });
 
-            // If model output response text but no tool calls, remind it to use tools
-            if response_text.as_ref().is_some_and(|t| !t.is_empty()) && tool_calls_map.is_empty() {
-                history.push(StorageMessage {
-                    id: None,
-                    role: MessageRole::User,
-                    content: MessageContent::Text(
-                        String::from("You said you would take action but didn't use any tools. Remember: you MUST use tools (write_to_file, edit_file, etc.) to actually make changes. Don't just describe what you'll do - do it with tools.")
-                    ),
-                    model_info: None,
-                    metrics: None,
-                    ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-                });
+            let text_without_tools =
+                response_text.as_ref().is_some_and(|t| !t.is_empty()) && tool_calls_map.is_empty();
+
+            if !tool_calls_map.is_empty() {
+                let mut state = state_clone.lock().await;
+                state.text_only_turns = 0;
+            } else if text_without_tools {
+                let mut state = state_clone.lock().await;
+                let first_task_turn = state.turns_completed == 0;
+                state.text_only_turns = state.text_only_turns.saturating_add(1);
+                let text_only_turns = state.text_only_turns;
+                drop(state);
+
+                let first_turn_direct_answer = first_task_turn
+                    && self.config.mode == AgentMode::Act
+                    && !self.config.interactive_mode;
+
+                if first_turn_direct_answer || text_only_turns > 1 {
+                    text_only_completes_task = true;
+                } else {
+                    history.push(StorageMessage {
+                        id: None,
+                        role: MessageRole::User,
+                        content: MessageContent::Text(
+                            String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
+                        ),
+                        model_info: None,
+                        metrics: None,
+                        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                    });
+                }
             }
         }
 
@@ -2464,13 +2485,14 @@ impl AgentLoop {
         self.save_conversation_history().await;
 
         // 9. Check for completion
-        let is_completion = tool_calls_vec.iter().any(|tc| {
-            let name = tc.function.name.as_deref().unwrap_or_default();
-            matches!(
-                SnedTool::from_name(name),
-                Some(SnedTool::AttemptCompletion) | Some(SnedTool::PlanModeRespond)
-            )
-        });
+        let is_completion = text_only_completes_task
+            || tool_calls_vec.iter().any(|tc| {
+                let name = tc.function.name.as_deref().unwrap_or_default();
+                matches!(
+                    SnedTool::from_name(name),
+                    Some(SnedTool::AttemptCompletion) | Some(SnedTool::PlanModeRespond)
+                )
+            });
 
         // Clear file content cache after each turn (cross-call coordination within a single turn)
         {
@@ -3271,6 +3293,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: true,
         };
 
@@ -3311,15 +3334,106 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
         let mut agent = AgentLoop::new(config);
         let result = agent.execute_turn().await;
-        assert!(matches!(result, TurnResult::Continue));
+        assert!(matches!(result, TurnResult::Complete));
 
         let state = agent.state.lock().await;
         assert!(state.snipped_code_blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_one_shot_text_only_response_completes_without_tool_nudge() {
+        let config = AgentConfig {
+            provider: Arc::new(crate::providers::mock::MockProvider::single_text_response(
+                "4",
+            )),
+            mode: AgentMode::Act,
+            task_id: "test-one-shot-text-only".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 1,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: false,
+        };
+
+        let mut agent = AgentLoop::new(config);
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Complete));
+
+        let history = agent.conversation_history.lock().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, MessageRole::Assistant);
+    }
+
+    #[tokio::test]
+    async fn test_later_text_only_response_gets_one_bounded_nudge() {
+        let config = AgentConfig {
+            provider: Arc::new(
+                crate::providers::mock::MockProvider::single_text_response_repeat("I checked it."),
+            ),
+            mode: AgentMode::Act,
+            task_id: "test-text-only-nudge".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 2,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: false,
+        };
+
+        let mut agent = AgentLoop::new(config);
+        {
+            let mut state = agent.state.lock().await;
+            state.turns_completed = 1;
+        }
+
+        let first_result = agent.execute_turn().await;
+        assert!(matches!(first_result, TurnResult::Continue));
+
+        {
+            let history = agent.conversation_history.lock().await;
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[1].role, MessageRole::User);
+            match &history[1].content {
+                MessageContent::Text(text) => assert!(text.contains("use the required tool")),
+                other => panic!("expected text nudge, got {other:?}"),
+            }
+        }
+
+        let second_result = agent.execute_turn().await;
+        assert!(matches!(second_result, TurnResult::Complete));
+
+        let history = agent.conversation_history.lock().await;
+        let nudge_count = history
+            .iter()
+            .filter(|message| {
+                matches!(
+                    &message.content,
+                    MessageContent::Text(text) if text.contains("use the required tool")
+                )
+            })
+            .count();
+        assert_eq!(nudge_count, 1);
     }
 
     #[test]
@@ -3467,6 +3581,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -3589,6 +3704,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -3621,6 +3737,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         })
         .with_task_storage(task_storage_empty);
@@ -3650,6 +3767,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -3685,6 +3803,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -3769,6 +3888,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -3806,6 +3926,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -3842,6 +3963,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -3884,6 +4006,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -3948,6 +4071,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -4030,6 +4154,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -4091,6 +4216,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -4125,6 +4251,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -4158,6 +4285,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -4364,6 +4492,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -4406,6 +4535,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 
@@ -4470,6 +4600,7 @@ mod tests {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         };
 

@@ -71,6 +71,8 @@ pub struct TaskState {
     pub double_check_completion_enabled: bool,
     /// Whether a double-check completion is currently pending (waiting for re-verification).
     pub double_check_completion_pending: bool,
+    /// Consecutive assistant turns that returned text without tool calls.
+    pub text_only_turns: u32,
     /// Whether strict plan mode is enabled (default: true).
     pub strict_plan_mode_enabled: bool,
     /// File context tracker for stale context warnings.
@@ -144,6 +146,7 @@ impl Default for TaskState {
             conversation_history_deleted_range: None,
             double_check_completion_enabled: true,
             double_check_completion_pending: false,
+            text_only_turns: 0,
             strict_plan_mode_enabled: true,
             file_context_tracker: crate::core::context::trackers::FileContextTracker::new(),
             last_api_req_info: None,
@@ -198,6 +201,7 @@ impl Default for AgentConfig {
             track_changes: false,
             is_subagent_execution: false,
             max_context_turns: 50,
+            max_tokens: None,
             interactive_mode: false,
         }
     }
@@ -234,6 +238,8 @@ pub struct AgentConfig {
     pub is_subagent_execution: bool,
     /// Maximum number of conversation turns to keep in context (default: 50).
     pub max_context_turns: usize,
+    /// Optional per-request cap for provider output tokens.
+    pub max_tokens: Option<u32>,
     /// Whether running in interactive shell mode (affects display behavior).
     pub interactive_mode: bool,
 }

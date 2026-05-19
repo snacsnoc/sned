@@ -201,11 +201,14 @@ impl OpenAiProvider {
         }
 
         // Max tokens — reasoning models use max_completion_tokens, others use max_tokens
-        if let Some(max_tokens) = self
-            .config
-            .model_info
-            .as_ref()
-            .and_then(|i| i.base.max_tokens)
+        if let Some(max_tokens) = request
+            .max_tokens
+            .or_else(|| {
+                self.config
+                    .model_info
+                    .as_ref()
+                    .and_then(|i| i.base.max_tokens)
+            })
             .filter(|m| *m > 0)
         {
             if is_reasoning_family {
@@ -1066,6 +1069,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1104,6 +1108,7 @@ mod tests {
             }]),
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1141,6 +1146,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1242,6 +1248,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1299,6 +1306,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1356,6 +1364,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1389,6 +1398,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1442,6 +1452,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1495,6 +1506,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1548,6 +1560,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();

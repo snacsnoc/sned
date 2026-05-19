@@ -119,15 +119,26 @@ impl MinimaxProvider {
             "stream": true,
         });
 
-        // Tools in MiniMax format (no "type": "function" wrapper per API docs)
+        if let Some(max_tokens) = request
+            .max_tokens
+            .or_else(|| self.get_model_info().max_tokens)
+            .filter(|m| *m > 0)
+        {
+            body["max_tokens"] = json!(max_tokens);
+        }
+
+        // Tools in MiniMax OpenAI-compatible format (requires "type": "function")
         if native_tools_on && let Some(tools) = request.tools.as_ref() {
             let tools_json: Vec<serde_json::Value> = tools
                 .iter()
                 .map(|t| {
                     json!({
-                        "name": t.function.name,
-                        "description": t.function.description,
-                        "parameters": t.function.parameters,
+                        "type": "function",
+                        "function": {
+                            "name": t.function.name,
+                            "description": t.function.description,
+                            "parameters": t.function.parameters,
+                        },
                     })
                 })
                 .collect();
@@ -992,6 +1003,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1047,16 +1059,17 @@ mod tests {
             tools: Some(tools),
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
         assert!(body["tools"].is_array());
         let tools_arr = body["tools"].as_array().unwrap();
         assert_eq!(tools_arr.len(), 1);
-        // MiniMax API format: no "type": "function" wrapper
-        assert_eq!(tools_arr[0]["type"], serde_json::Value::Null);
-        assert_eq!(tools_arr[0]["name"], "read_file");
-        assert_eq!(tools_arr[0]["description"], "Read a file");
+        // MiniMax OpenAI-compatible API requires nested "function" object with "type": "function"
+        assert_eq!(tools_arr[0]["type"], "function");
+        assert_eq!(tools_arr[0]["function"]["name"], "read_file");
+        assert_eq!(tools_arr[0]["function"]["description"], "Read a file");
     }
 
     #[test]
@@ -1080,10 +1093,35 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_build_request_body_uses_request_max_tokens_override() {
+        let config = MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "MiniMax-M2.7".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+        };
+        let provider = MinimaxProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: Some(2048),
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        assert_eq!(body["max_tokens"], 2048);
     }
 
     #[test]
@@ -1110,6 +1148,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();

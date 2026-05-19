@@ -121,7 +121,11 @@ impl AnthropicProvider {
             .unwrap_or(false);
         let supports_cache = model_info.supports_prompt_cache;
 
-        let max_tokens = model_info.max_tokens.unwrap_or(8192);
+        let max_tokens = request
+            .max_tokens
+            .filter(|m| *m > 0)
+            .or(model_info.max_tokens)
+            .unwrap_or(8192);
 
         // Convert messages to Anthropic format
         let messages: Vec<serde_json::Value> = request
@@ -1048,6 +1052,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
         let body = provider.build_request_body(&request).unwrap();
         assert_eq!(
@@ -1084,6 +1089,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
         let body = provider.build_request_body(&request).unwrap();
         assert_eq!(
@@ -1120,6 +1126,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1165,6 +1172,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1202,6 +1210,7 @@ mod tests {
             }]),
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1232,6 +1241,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         // Should not panic even with native_tools_on and tools: None

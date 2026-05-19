@@ -130,7 +130,11 @@ impl GeminiProvider {
         });
 
         // Max output tokens
-        if let Some(max_tokens) = info.and_then(|i| i.max_tokens).filter(|m| *m > 0) {
+        if let Some(max_tokens) = request
+            .max_tokens
+            .or_else(|| info.and_then(|i| i.max_tokens))
+            .filter(|m| *m > 0)
+        {
             // Gemini caps at 32768 for older models, 65536 for Gemini 3
             let max_output = if self.config.model_id.contains("gemini-3") {
                 65536
@@ -964,6 +968,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1007,6 +1012,7 @@ mod tests {
             }]),
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();

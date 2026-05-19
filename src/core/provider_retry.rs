@@ -356,6 +356,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             use_response_api: None,
+            max_tokens: None,
         };
 
         let stream =

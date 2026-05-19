@@ -182,6 +182,10 @@ pub struct TaskOptions {
     /// Maximum number of context turns before pruning (default: 50)
     #[arg(long, value_name = "turns")]
     pub max_context_turns: Option<String>,
+
+    /// Maximum provider output tokens for this task
+    #[arg(long, value_name = "tokens")]
+    pub max_tokens: Option<u32>,
 }
 
 /// Additional options only on the root (default) command, not on `task`.
@@ -960,6 +964,7 @@ async fn build_task_components(
             .as_ref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(50),
+        max_tokens: task_opts.max_tokens,
         interactive_mode: false,
     };
 
@@ -1404,6 +1409,12 @@ mod tests {
     fn parse_token_display_default() {
         let cli = Cli::try_parse_from(["sned", "test"]).unwrap();
         assert!(!cli.task_opts.no_token_display);
+    }
+
+    #[test]
+    fn parse_max_tokens_flag() {
+        let cli = Cli::try_parse_from(["sned", "--max-tokens", "2048", "test"]).unwrap();
+        assert_eq!(cli.task_opts.max_tokens, Some(2048));
     }
 
     #[test]
@@ -1886,6 +1897,7 @@ mod tests {
             image: vec![],
             track_changes: false,
             max_context_turns: None,
+            max_tokens: None,
         };
 
         // Should auto-detect anthropic and succeed
@@ -1970,6 +1982,7 @@ mod tests {
             image: vec![],
             track_changes: false,
             max_context_turns: None,
+            max_tokens: None,
         };
 
         // Should use groq (explicit flag) not anthropic (env var)

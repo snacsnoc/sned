@@ -3,6 +3,7 @@
 //! Runs on a background tokio task, writes frames to stderr via `\r` overwrites.
 //! Respects NO_COLOR and TTY detection via `cli::colors`.
 
+use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,10 +15,15 @@ pub struct Spinner {
     cancel: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    enabled: bool,
 }
 
 impl Spinner {
     pub fn start(label: &str) -> Self {
+        if !io::stderr().is_terminal() {
+            return Self::disabled();
+        }
+
         let cancel = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
@@ -69,6 +75,16 @@ impl Spinner {
             cancel,
             stopped,
             handle: Some(handle),
+            enabled: true,
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(true)),
+            stopped: Arc::new(AtomicBool::new(true)),
+            handle: None,
+            enabled: false,
         }
     }
 
@@ -78,8 +94,10 @@ impl Spinner {
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
-        eprint!("\r\x1b[K");
-        let _ = io::stderr().flush();
+        if self.enabled {
+            eprint!("\r\x1b[K");
+            let _ = io::stderr().flush();
+        }
     }
 
     pub fn stop_with_message(self, message: &str) {
@@ -97,8 +115,10 @@ impl Drop for Spinner {
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
-        eprint!("\r\x1b[K");
-        let _ = io::stderr().flush();
+        if self.enabled {
+            eprint!("\r\x1b[K");
+            let _ = io::stderr().flush();
+        }
     }
 }
 
