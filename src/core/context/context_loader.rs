@@ -243,16 +243,39 @@ impl ContextLoader {
             return Vec::new();
         }
 
-        let project_root = {
+        // Single lock acquisition: batch all symbol queries together
+        let (project_root, all_definitions, all_references) = {
             let service = symbol_index_service
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let root = service.get_project_root();
-            if root.is_empty() {
+            let project_root = if root.is_empty() {
                 self.cwd.clone()
             } else {
                 root.to_string()
+            };
+            
+            // Batch query all definitions in one lock hold
+            let mut definitions = HashMap::new();
+            for symbol in &symbols {
+                let defs = service.get_definitions(symbol, Some(MAX_AUTO_SYMBOL_TOTAL_LINES));
+                definitions.insert(symbol.clone(), defs);
             }
+            
+            // Batch query all references in one lock hold
+            let mut references = HashMap::new();
+            for symbol in &symbols {
+                let remaining_limit = MAX_AUTO_SYMBOL_TOTAL_LINES.saturating_sub(
+                    definitions
+                        .get(symbol)
+                        .map(|d| d.len())
+                        .unwrap_or(0),
+                );
+                let refs = service.get_references(symbol, Some(remaining_limit));
+                references.insert(symbol.clone(), refs);
+            }
+            
+            (project_root, definitions, references)
         };
         let project_root = PathBuf::from(project_root);
         let cwd_path = PathBuf::from(&self.cwd);
@@ -263,124 +286,117 @@ impl ContextLoader {
             .collect();
 
         for symbol in &symbols {
-            let definitions = {
-                let service = symbol_index_service
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                service.get_definitions(symbol, Some(MAX_AUTO_SYMBOL_TOTAL_LINES))
-            };
-            let data = symbol_results
-                .get_mut(symbol)
-                .expect("symbol accumulator should exist");
-            data.all_locations.extend(definitions.iter().cloned());
+            if let Some(definitions) = all_definitions.get(symbol) {
+                let data = symbol_results
+                    .get_mut(symbol)
+                    .expect("symbol accumulator should exist");
+                data.all_locations.extend(definitions.iter().cloned());
+            }
         }
 
         for symbol in &symbols {
-            let remaining_limit = MAX_AUTO_SYMBOL_TOTAL_LINES.saturating_sub(
-                symbol_results
-                    .values()
-                    .map(|d| d.added_lines.len())
-                    .sum::<usize>(),
-            );
-            let references = {
-                let service = symbol_index_service
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                service.get_references(symbol, Some(remaining_limit))
-            };
-            let data = symbol_results
-                .get_mut(symbol)
-                .expect("symbol accumulator should exist");
-            data.all_locations.extend(references.iter().cloned());
+            if let Some(references) = all_references.get(symbol) {
+                let data = symbol_results
+                    .get_mut(symbol)
+                    .expect("symbol accumulator should exist");
+                data.all_locations.extend(references.iter().cloned());
+            }
         }
 
-        // Collect all unique locations to read
-        let mut all_locations: Vec<(String, SymbolLocation)> = Vec::new();
+        // Collect all unique locations, grouped by file path for efficient reading
+        let mut file_locations: HashMap<String, Vec<(String, SymbolLocation)>> = HashMap::new();
         for (symbol, data) in &symbol_results {
             for loc in &data.all_locations {
-                let loc_key = format!(
-                    "{}:{}:{}",
-                    symbol,
-                    loc.path.as_deref().unwrap_or(""),
-                    loc.start_line
-                );
-                if !all_locations.iter().any(|(k, l)| {
-                    k == &loc_key && l.path == loc.path && l.start_line == loc.start_line
-                }) {
-                    all_locations.push((symbol.clone(), loc.clone()));
+                let Some(loc_path_str) = &loc.path else {
+                    continue;
+                };
+                
+                // Check if we already have this exact location
+                let existing = file_locations
+                    .get(loc_path_str)
+                    .map(|locs| locs.iter().any(|(s, l)| {
+                        l.path.as_deref() == Some(loc_path_str.as_str()) 
+                            && l.start_line == loc.start_line 
+                            && s == symbol
+                    }))
+                    .unwrap_or(false);
+                
+                if !existing {
+                    file_locations
+                        .entry(loc_path_str.clone())
+                        .or_default()
+                        .push((symbol.clone(), loc.clone()));
                 }
             }
         }
 
-        // Read all files in parallel using tokio::join
-        let read_futures: Vec<_> = all_locations
-            .iter()
-            .map(|(symbol, loc)| {
-                let loc_path = loc.path.clone();
-                let project_root = project_root.clone();
+        // Read each file once, then extract all needed lines from cached content
+        let mut file_contents: HashMap<String, Vec<String>> = HashMap::new();
+        for (loc_path_str, _locations) in &file_locations {
+            let abs_loc_path = if Path::new(loc_path_str).is_absolute() {
+                PathBuf::from(loc_path_str)
+            } else {
+                project_root.join(loc_path_str)
+            };
+
+            if let Ok(content) = tokio::fs::read_to_string(&abs_loc_path).await {
+                file_contents.insert(loc_path_str.clone(), content.lines().map(String::from).collect());
+            }
+        }
+
+        // Process all locations using cached file contents
+        let mut read_results: Vec<(String, String, String)> = Vec::new();
+        for (loc_path_str, locations) in &file_locations {
+            let Some(lines) = file_contents.get(loc_path_str) else {
+                continue;
+            };
+
+            let abs_loc_path = if Path::new(loc_path_str).is_absolute() {
+                PathBuf::from(loc_path_str)
+            } else {
+                project_root.join(loc_path_str)
+            };
+            let display_path = abs_loc_path
+                .strip_prefix(&cwd_path)
+                .map_or(abs_loc_path.clone(), PathBuf::from)
+                .display()
+                .to_string();
+
+            for (symbol_name, loc) in locations {
                 let line_num = loc.start_line;
-                let symbol_type = loc.symbol_type;
-                let symbol_name = symbol.clone();
-                let cwd_path = cwd_path.clone();
-
-                async move {
-                    let Some(loc_path_str) = &loc_path else {
-                        return None;
-                    };
-
-                    let abs_loc_path = if Path::new(loc_path_str).is_absolute() {
-                        PathBuf::from(loc_path_str)
-                    } else {
-                        project_root.join(loc_path_str)
-                    };
-
-                    let file_content = match tokio::fs::read_to_string(&abs_loc_path).await {
-                        Ok(content) => content,
-                        Err(_) => return None,
-                    };
-
-                    let lines: Vec<&str> = file_content.lines().collect();
-                    if line_num >= lines.len() {
-                        return None;
-                    }
-
-                    let mut line_content = lines[line_num].trim().to_string();
-                    if line_content.len() > MAX_AUTO_SYMBOL_LINE_LENGTH_BYTES {
-                        line_content = "(line too long, skipped)".to_string();
-                    }
-
-                    let display_path = abs_loc_path
-                        .strip_prefix(&cwd_path)
-                        .map_or(abs_loc_path.clone(), PathBuf::from)
-                        .display()
-                        .to_string();
-                    let kind = match symbol_type {
-                        SymbolType::Definition => "definition",
-                        SymbolType::Reference => "reference",
-                    };
-
-                    Some((
-                        symbol_name,
-                        format!(
-                            "    - {}:{} [{}] `{}`",
-                            display_path,
-                            line_num + 1,
-                            kind,
-                            line_content,
-                        ),
-                        format!("{}:{}", loc_path_str, line_num),
-                    ))
+                if line_num >= lines.len() {
+                    continue;
                 }
-            })
-            .collect();
 
-        let read_results = futures::future::join_all(read_futures).await;
+                let mut line_content = lines[line_num].trim().to_string();
+                if line_content.len() > MAX_AUTO_SYMBOL_LINE_LENGTH_BYTES {
+                    line_content = "(line too long, skipped)".to_string();
+                }
+
+                let kind = match loc.symbol_type {
+                    SymbolType::Definition => "definition",
+                    SymbolType::Reference => "reference",
+                };
+
+                read_results.push((
+                    symbol_name.clone(),
+                    format!(
+                        "    - {}:{} [{}] `{}`",
+                        display_path,
+                        line_num + 1,
+                        kind,
+                        line_content,
+                    ),
+                    format!("{}:{}", loc_path_str, line_num),
+                ));
+            }
+        }
 
         // Process results and populate accumulators with limit enforcement
         let mut total_lines_added = 0usize;
         let mut seen_keys: HashSet<String> = HashSet::new();
 
-        for (symbol_name, line, loc_key) in read_results.into_iter().flatten() {
+        for (symbol_name, line, loc_key) in read_results {
             if total_lines_added >= MAX_AUTO_SYMBOL_TOTAL_LINES {
                 break;
             }
@@ -547,5 +563,88 @@ mod tests {
         assert!(enriched.contains("symbol_context:"));
         assert!(enriched.contains("fooBar"));
         assert!(enriched.contains("src/lib.rs:1"));
+    }
+
+    #[tokio::test]
+    async fn test_load_initial_context_batches_symbol_queries() {
+        // Regression test: verify that multiple symbols in a prompt are batched
+        // efficiently (single lock acquisition, no repeated file reads)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+        let lib_path = root.join("src/lib.rs");
+        let utils_path = root.join("src/utils.rs");
+        tokio::fs::create_dir_all(lib_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(utils_path.parent().unwrap())
+            .await
+            .unwrap();
+        
+        // Create two files with different symbols
+        tokio::fs::write(&lib_path, "fn fooBar() {}\nfn bazQux() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&utils_path, "fn helper() {}\n")
+            .await
+            .unwrap();
+
+        let mut service = SymbolIndexService::new(root.to_string_lossy().to_string());
+        // Index both files
+        service.index_file(
+            "src/lib.rs".to_string(),
+            1,
+            1,
+            vec![
+                SymbolLocation {
+                    path: Some("src/lib.rs".to_string()),
+                    name: "fooBar".to_string(),
+                    start_line: 0,
+                    start_column: 0,
+                    end_line: 0,
+                    end_column: 6,
+                    symbol_type: SymbolType::Definition,
+                    kind: Some("function".to_string()),
+                },
+                SymbolLocation {
+                    path: Some("src/lib.rs".to_string()),
+                    name: "bazQux".to_string(),
+                    start_line: 1,
+                    start_column: 0,
+                    end_line: 1,
+                    end_column: 6,
+                    symbol_type: SymbolType::Definition,
+                    kind: Some("function".to_string()),
+                },
+            ],
+        );
+        service.index_file(
+            "src/utils.rs".to_string(),
+            1,
+            1,
+            vec![SymbolLocation {
+                path: Some("src/utils.rs".to_string()),
+                name: "helper".to_string(),
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 7,
+                symbol_type: SymbolType::Definition,
+                kind: Some("function".to_string()),
+            }],
+        );
+
+        let loader = ContextLoader::new(root.to_string_lossy().to_string())
+            .with_symbol_index_service(Arc::new(Mutex::new(service)));
+        
+        // Prompt with multiple camelCase symbols should trigger batching
+        let (enriched, _) = loader
+            .load_initial_context("Please inspect fooBar and bazQux in the codebase")
+            .await;
+
+        // Both symbols should be included in context
+        assert!(enriched.contains("fooBar"));
+        assert!(enriched.contains("bazQux"));
+        assert!(enriched.contains("src/lib.rs:1"));
+        assert!(enriched.contains("src/lib.rs:2"));
     }
 }
