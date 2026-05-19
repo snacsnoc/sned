@@ -215,7 +215,7 @@ impl RenameSymbolHandler {
 
             if replacement_count > 0 {
                 let final_content = current_lines.join("\n");
-                match crate::storage::disk::atomic_write_file(&abs_path, &final_content) {
+                match crate::storage::disk::atomic_write_file_async(&abs_path, &final_content).await {
                     Ok(_) => {}
                     Err(e) => {
                         return Err(ToolError::ExecutionFailed(format!(
