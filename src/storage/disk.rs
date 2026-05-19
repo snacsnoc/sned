@@ -97,6 +97,14 @@ pub fn get_settings_dir() -> PathBuf {
     get_data_dir().join("settings")
 }
 
+/// Returns true if fsync should be performed during atomic writes.
+/// Controlled by SNED_FSYNC env var (default: false).
+/// Enable for crash-safety in production environments where data integrity
+/// outweighs the 5-50ms latency cost per write.
+fn should_fsync() -> bool {
+    env::var("SNED_FSYNC").map(|v| v == "1" || v == "on" || v == "true").unwrap_or(false)
+}
+
 /// Atomically write data to a file using temp file + rename pattern.
 ///
 /// Uses the POSIX atomic rename semantics: if rename() succeeds, the file is
@@ -138,8 +146,9 @@ pub fn atomic_write_file<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result
             .mode(0o600)
             .open(&tmp_path)?;
         file.write_all(data.as_bytes())?;
-        // Sync data to disk before rename to ensure durability across crashes
-        file.sync_data()?;
+        if should_fsync() {
+            file.sync_data()?;
+        }
     }
 
     #[cfg(windows)]
@@ -151,7 +160,9 @@ pub fn atomic_write_file<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result
             .create_new(true)
             .open(&tmp_path)?;
         file.write_all(data.as_bytes())?;
-        file.sync_data()?;
+        if should_fsync() {
+            file.sync_data()?;
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -162,7 +173,9 @@ pub fn atomic_write_file<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result
             .create_new(true)
             .open(&tmp_path)?;
         file.write_all(data.as_bytes())?;
-        file.sync_data()?;
+        if should_fsync() {
+            file.sync_data()?;
+        }
     }
 
     match fs::rename(&tmp_path, file_path) {
@@ -217,8 +230,9 @@ pub async fn atomic_write_file_async<P: AsRef<Path>>(file_path: P, data: &str) -
             .open(&tmp_path)
             .await?;
         file.write_all(data.as_bytes()).await?;
-        // Sync data to disk before rename to ensure durability across crashes
-        file.sync_all().await?;
+        if should_fsync() {
+            file.sync_all().await?;
+        }
     }
 
     #[cfg(windows)]
@@ -231,7 +245,9 @@ pub async fn atomic_write_file_async<P: AsRef<Path>>(file_path: P, data: &str) -
             .open(&tmp_path)
             .await?;
         file.write_all(data.as_bytes()).await?;
-        file.sync_all().await?;
+        if should_fsync() {
+            file.sync_all().await?;
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -242,7 +258,9 @@ pub async fn atomic_write_file_async<P: AsRef<Path>>(file_path: P, data: &str) -
             .open(&tmp_path)
             .await?;
         file.write_all(data.as_bytes()).await?;
-        file.sync_all().await?;
+        if should_fsync() {
+            file.sync_all().await?;
+        }
     }
 
     match tokio_fs::rename(&tmp_path, file_path).await {
@@ -371,5 +389,51 @@ mod tests {
 
         assert!(waiter.await);
         assert_eq!(active_atomic_write_count_on(&tracker), 0);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_file_async_content_correct() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_atomic_write.json");
+        let content = r#"{"key": "value", "number": 42}"#;
+
+        let result = atomic_write_file_async(&file_path, content).await;
+        assert!(result.is_ok());
+
+        let written = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(written, content);
+    }
+
+    #[test]
+    fn test_atomic_write_file_content_correct() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_atomic_write_sync.json");
+        let content = r#"{"key": "value", "number": 42}"#;
+
+        let result = atomic_write_file(&file_path, content);
+        assert!(result.is_ok());
+
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(written, content);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_respects_fsync_env() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_fsync.json");
+        let content = r#"{"test": "fsync"}"#;
+
+        // Default (no env var) - should not fsync
+        unsafe { std::env::remove_var("SNED_FSYNC") };
+        let result = atomic_write_file_async(&file_path, content).await;
+        assert!(result.is_ok());
+
+        // With SNED_FSYNC=on - should fsync
+        unsafe { std::env::set_var("SNED_FSYNC", "on") };
+        let result = atomic_write_file_async(&file_path, content).await;
+        assert!(result.is_ok());
+
+        // Clean up
+        unsafe { std::env::remove_var("SNED_FSYNC") };
     }
 }
