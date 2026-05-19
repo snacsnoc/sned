@@ -47,6 +47,11 @@ const DEFAULT_TOOL_RESULT_HISTORY_LIMIT: usize = 20_000;
 /// Environment variable to configure tool result history limit
 const TOOL_RESULT_HISTORY_LIMIT_ENV: &str = "SNED_TOOL_RESULT_HISTORY_LIMIT";
 
+/// Default token limit for thinking blocks in old history entries (~2000 tokens)
+const DEFAULT_THINKING_HISTORY_LIMIT: usize = 2_000;
+/// Environment variable to configure thinking block history limit
+const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
+
 pub use crate::cli::spinner::Spinner;
 use crate::cli::spinner::multi_tool_label;
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
@@ -1837,6 +1842,10 @@ impl AgentLoop {
                 }));
             }
 
+            // Truncate thinking blocks in older history entries before adding new message.
+            // This prevents token bloat from extended-thinking models (Claude, DeepSeek).
+            truncate_old_thinking_blocks(&mut history);
+
             history.push(StorageMessage {
                 id: None,
                 role: MessageRole::Assistant,
@@ -3355,6 +3364,56 @@ impl AgentLoop {
     }
 }
 
+/// Truncates thinking blocks in all assistant messages except the most recent one.
+///
+/// This prevents token bloat from extended-thinking models (Claude, DeepSeek)
+/// that emit 5,000-20,000 tokens of thinking per turn. Old thinking blocks are
+/// truncated to the first N tokens (configurable via `SNED_THINKING_HISTORY_LIMIT`,
+/// default: 2000) with a `[truncated]` marker.
+///
+/// The most recent assistant message's thinking is preserved in full to maintain
+/// context for the current turn.
+fn truncate_old_thinking_blocks(history: &mut Vec<StorageMessage>) {
+    let limit = std::env::var(THINKING_HISTORY_LIMIT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_THINKING_HISTORY_LIMIT);
+
+    // Find the index of the most recent assistant message (if any)
+    let most_recent_assistant_idx = history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, msg)| (msg.role == MessageRole::Assistant).then_some(i));
+
+    for (i, message) in history.iter_mut().enumerate() {
+        // Skip the most recent assistant message - preserve its thinking in full
+        if Some(i) == most_recent_assistant_idx {
+            continue;
+        }
+
+        if message.role != MessageRole::Assistant {
+            continue;
+        }
+
+        let MessageContent::AssistantBlocks(blocks) = &mut message.content else {
+            continue;
+        };
+
+        for block in blocks {
+            if let AssistantContentBlock::Thinking(thinking_block) = block {
+                // Truncate by character count (approximate token proxy)
+                // 1 token ≈ 4 chars for English text
+                let char_limit = limit * 4;
+                if thinking_block.thinking.len() > char_limit {
+                    thinking_block.thinking.truncate(char_limit);
+                    thinking_block.thinking.push_str("\n\n[truncated]");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3687,13 +3746,19 @@ mod tests {
             prompt.contains("PRIME DIRECTIVES"),
             "Prompt should contain 'PRIME DIRECTIVES'"
         );
+        // Environment info (OS, shell, CWD, CPU) is now provided by context_loader in <environment_details>
+        // to avoid duplication. System prompt focuses on instructions and tool usage.
         assert!(
-            prompt.contains("Current Working Directory: /tmp/test"),
-            "Prompt should contain cwd"
+            !prompt.contains("Operating System:"),
+            "System prompt should not contain OS info (provided by context_loader)"
         );
         assert!(
-            prompt.contains("Default Shell: /bin/zsh"),
-            "Prompt should contain shell"
+            !prompt.contains("Default Shell:"),
+            "System prompt should not contain shell info (provided by context_loader)"
+        );
+        assert!(
+            !prompt.contains("Available CPU Cores:"),
+            "System prompt should not contain CPU info (provided by context_loader)"
         );
     }
 
@@ -3733,8 +3798,10 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
-        assert!(requests[0].system_prompt.contains("/tmp/cache-first"));
-        assert!(!requests[1].system_prompt.contains("/tmp/cache-second"));
+        // Verify system prompt is cached (doesn't change between turns)
+        // Environment info like CWD is now in context_loader, not system prompt
+        assert!(requests[0].system_prompt.contains("You are Sned"));
+        assert!(requests[0].system_prompt.contains("PRIME DIRECTIVES"));
     }
 
     #[test]
@@ -5251,5 +5318,134 @@ mod tests {
         assert!(!result.ends_with("🌍"));
         // Should have truncation marker
         assert!(result.contains("lines truncated"));
+    }
+
+    #[test]
+    fn test_truncate_old_thinking_blocks() {
+        // Test that old thinking blocks are truncated while recent ones are preserved
+        let mut history = vec![
+            // First assistant message with long thinking - should be truncated
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    AssistantContentBlock::Thinking(ThinkingBlock {
+                        thinking: "x".repeat(10000), // 10000 chars, well over limit
+                        signature: "sig1".to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        summary: None,
+                    }),
+                    AssistantContentBlock::Text(TextContentBlock {
+                        text: "Response 1".to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: Some(1000),
+            },
+            // Second assistant message with long thinking - should be preserved (most recent)
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    AssistantContentBlock::Thinking(ThinkingBlock {
+                        thinking: "y".repeat(10000), // 10000 chars, should NOT be truncated
+                        signature: "sig2".to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        summary: None,
+                    }),
+                    AssistantContentBlock::Text(TextContentBlock {
+                        text: "Response 2".to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: Some(2000),
+            },
+        ];
+
+        truncate_old_thinking_blocks(&mut history);
+
+        // First message thinking should be truncated
+        if let MessageContent::AssistantBlocks(blocks) = &history[0].content {
+            if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
+                assert!(tb.thinking.len() < 10000, "Old thinking should be truncated");
+                assert!(tb.thinking.contains("[truncated]"), "Should have truncation marker");
+            } else {
+                panic!("First block should be Thinking");
+            }
+        } else {
+            panic!("First message should have AssistantBlocks");
+        }
+
+        // Second message thinking should NOT be truncated (most recent)
+        if let MessageContent::AssistantBlocks(blocks) = &history[1].content {
+            if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
+                assert_eq!(tb.thinking.len(), 10000, "Recent thinking should NOT be truncated");
+                assert!(!tb.thinking.contains("[truncated]"), "Should NOT have truncation marker");
+            } else {
+                panic!("First block should be Thinking");
+            }
+        } else {
+            panic!("Second message should have AssistantBlocks");
+        }
+    }
+
+    #[test]
+    fn test_truncate_old_thinking_blocks_respects_env_var() {
+        // Test with custom limit via environment variable
+        unsafe {
+            std::env::set_var(THINKING_HISTORY_LIMIT_ENV, "100");
+        }
+
+        let mut history = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    AssistantContentBlock::Thinking(ThinkingBlock {
+                        thinking: "z".repeat(2000),
+                        signature: "sig".to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        summary: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: Some(1000),
+            },
+        ];
+
+        truncate_old_thinking_blocks(&mut history);
+
+        // With 100 token limit (400 chars), 2000 chars should be truncated
+        if let MessageContent::AssistantBlocks(blocks) = &history[0].content {
+            if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
+                assert!(tb.thinking.len() < 2000, "Should be truncated with custom limit");
+            }
+        }
+
+        unsafe {
+            std::env::remove_var(THINKING_HISTORY_LIMIT_ENV);
+        }
     }
 }

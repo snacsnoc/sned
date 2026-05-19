@@ -41,7 +41,7 @@ pub struct ReasoningDetailParam {
 }
 
 /// Shared fields across all content blocks.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SharedContentFields {
     /// The call ID associated with this content block.
     pub call_id: Option<String>,

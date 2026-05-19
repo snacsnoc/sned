@@ -66,20 +66,20 @@ impl PromptBuilder {
     }
 
     fn render_template(&self) -> String {
-        let current_cwd = self.context.cwd.as_deref().unwrap_or("/");
-        let os = std::env::consts::OS;
+        let _current_cwd = self.context.cwd.as_deref().unwrap_or("/");
+        let _os = std::env::consts::OS;
 
-        let shell_env = std::env::var("SHELL").ok();
-        let shell = self
+        let _shell_env = std::env::var("SHELL").ok();
+        let _shell = self
             .context
             .active_shell_path
             .as_deref()
-            .or(shell_env.as_deref())
+            .or(_shell_env.as_deref())
             .unwrap_or("bash");
 
-        let shell_type = self.context.active_shell_type.as_deref().unwrap_or("bash");
+        let _shell_type = self.context.active_shell_type.as_deref().unwrap_or("bash");
 
-        let available_cores = self.context.available_cores.unwrap_or(1);
+        let _available_cores = self.context.available_cores.unwrap_or(1);
 
         let skills_section = self.format_skills_section();
 
@@ -141,34 +141,8 @@ impl PromptBuilder {
               - In PLAN MODE, start by getting precise understanding of what the user wants in this task.\n\
               - In PLAN MODE, the goal is to gather information and get context to create a detailed plan for accomplishing the task, which the user will review and approve before they switch you to ACT MODE to implement the solution.\n\
              \n\
-             SYSTEM INFO\n\
-             \n"
+             IMPORTANT PATH RULES\n\n",
         );
-
-        prompt.push_str(&format!("- Operating System: {}\n", os));
-        prompt.push_str(&format!("- Default Shell: {}\n", shell));
-
-        if self.context.active_shell_is_posix {
-            prompt.push_str("- You are running in a full-featured shell environment. You have access to standard Unix tools (`grep`, `sed`, `awk`, `find`, `xargs`, etc.).\n");
-        } else if os == "windows" {
-            prompt.push_str("- You are in a limited Windows shell environment. Standard Unix tools are NOT available. You MUST use PowerShell cmdlets or standard cmd commands.\n");
-        }
-
-        if shell_type == "git-bash" {
-            prompt.push_str("- Note: Use Git Bash path formatting (e.g., `/c/Users/...`) and account for Windows CRLF line endings.\n");
-        }
-
-        if shell_type == "wsl" {
-            prompt.push_str("- Note: Windows drives are mounted at `/mnt/c/`.\n");
-        }
-
-        prompt.push_str(&format!(
-            "- Current Working Directory: {} (this is where all the tools will be executed from)\n",
-            current_cwd
-        ));
-        prompt.push_str(&format!("- Available CPU Cores: {} (Use this value for parallel jobs like 'make -j' instead of 'nproc')\n", available_cores));
-
-        prompt.push_str("\nIMPORTANT PATH RULES\n\n");
         prompt.push_str("When using tools that accept file paths (read_file, write_to_file, edit_file, list_files, etc.), ALWAYS use relative paths from the current working directory.\n");
         prompt.push_str("- CORRECT: path: \"src/main.rs\"\n");
         prompt.push_str("- WRONG: path: \"/Users/easto/project/src/main.rs\"\n");
@@ -347,7 +321,8 @@ mod tests {
         assert!(prompt.contains("PRIME DIRECTIVES"));
         assert!(prompt.contains("TOOL USE"));
         assert!(prompt.contains("batch them into a single response"));
-        assert!(prompt.contains("Current Working Directory: /tmp/test"));
+        // Environment info is now provided by context_loader, not in system prompt
+        assert!(!prompt.contains("Current Working Directory:"));
     }
 
     #[test]
