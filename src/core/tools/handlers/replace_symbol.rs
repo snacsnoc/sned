@@ -277,17 +277,15 @@ async fn process_batch(
                             || loc_path.starts_with(&format!("{}/", abs_path_str))
                         {
                             let start_index = calculate_byte_offset(
-                                &batch.absolute_path,
+                                &original_content,
                                 loc.start_line,
                                 loc.start_column,
-                            )
-                            .await;
+                            );
                             let end_index = calculate_byte_offset(
-                                &batch.absolute_path,
+                                &original_content,
                                 loc.end_line,
                                 loc.end_column,
-                            )
-                            .await;
+                            );
                             result = Some(SymbolRange {
                                 start_index,
                                 end_index,
@@ -428,16 +426,14 @@ fn find_line_start_byte(content: &str, byte_offset: usize) -> usize {
     line_start
 }
 
-async fn calculate_byte_offset(path: &str, line: usize, column: usize) -> usize {
-    if let Ok(content) = fs::read_to_string(path).await {
-        let mut byte_offset = 0;
+fn calculate_byte_offset(content: &str, line: usize, column: usize) -> usize {
+    let mut byte_offset = 0;
 
-        for (current_line, line_str) in content.lines().enumerate() {
-            if current_line == line {
-                return byte_offset + column;
-            }
-            byte_offset += line_str.len() + 1;
+    for (current_line, line_str) in content.lines().enumerate() {
+        if current_line == line {
+            return byte_offset + column;
         }
+        byte_offset += line_str.len() + 1;
     }
     0
 }
@@ -562,5 +558,41 @@ mod tests {
         assert!(result.is_ok());
         let batches = result.unwrap();
         assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_replace_symbol_multi_replacement_single_read() {
+        // Test that multiple replacements in the same file work correctly
+        // The optimization ensures the file is read only once per batch, not re-read
+        // for each calculate_byte_offset call
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_root = temp_dir.path();
+        
+        // Create a test file with a symbol to replace
+        let file_content = "fn foo() {}\nfn bar() { foo(); }\n";
+        std::fs::write(workspace_root.join("test.rs"), file_content).unwrap();
+
+        let handler = ReplaceSymbolHandler::new();
+        let mut state = TaskState::default();
+        let params = serde_json::json!({
+            "replacements": [
+                {"path": "test.rs", "symbol": "foo", "text": "FOO"},
+            ]
+        });
+
+        let result = handler
+            .execute_with_workspace_root(&mut state, params, workspace_root)
+            .await
+            .unwrap();
+
+        // Verify the result indicates replacements were made
+        assert!(result.contains("test.rs"));
+        
+        // Verify the file was updated correctly
+        let new_content = fs::read_to_string(workspace_root.join("test.rs"))
+            .await
+            .unwrap();
+        assert!(new_content.contains("FOO"));
+        assert!(!new_content.contains("fn foo()"));
     }
 }

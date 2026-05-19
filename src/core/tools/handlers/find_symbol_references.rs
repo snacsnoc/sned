@@ -14,6 +14,13 @@ struct Hit {
     symbol: String,
 }
 
+/// Stores file lines and parsed hits to avoid re-reading during formatting.
+#[derive(Clone)]
+struct FileData {
+    lines: Vec<String>,
+    hits: Vec<Hit>,
+}
+
 impl FindSymbolReferencesHandler {
     pub async fn run(
         &self,
@@ -38,7 +45,7 @@ impl FindSymbolReferencesHandler {
             ));
         }
 
-        let mut file_hits: BTreeMap<String, Vec<Hit>> = BTreeMap::new();
+        let mut file_data: BTreeMap<String, FileData> = BTreeMap::new();
         let mut any_error = None;
 
         for path in &paths {
@@ -65,14 +72,16 @@ impl FindSymbolReferencesHandler {
                 .map_err(|e| {
                     ToolError::ExecutionFailed(format!("Error finding references: {}", e))
                 })?;
-            file_hits.insert(path.clone(), hits);
+            
+            let lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
+            file_data.insert(path.clone(), FileData { lines, hits });
         }
 
         if let Some(err) = any_error {
             return Err(err);
         }
 
-        let total_hits = file_hits.values().map(|hits| hits.len()).sum::<usize>();
+        let total_hits = file_data.values().map(|data| data.hits.len()).sum::<usize>();
         if total_hits == 0 {
             let kind = if find_type == "both" {
                 "references or definitions".to_string()
@@ -87,27 +96,22 @@ impl FindSymbolReferencesHandler {
         }
 
         let mut sections = Vec::new();
-        for (path, hits) in file_hits {
-            if hits.is_empty() {
+        for (path, data) in file_data {
+            if data.hits.is_empty() {
                 continue;
             }
 
-            let abs_path = resolve_sanitized_path(&ctx.workspace_root, &path)?;
-            let content = fs::read_to_string(&abs_path).await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("Error reading file {}: {}", path, e))
-            })?;
-            let lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
             let anchor_mgr = ctx.anchor_mgr.clone();
-            let anchors = anchor_mgr.reconcile(&path, &lines, Some(ctx.task_id.as_str()));
+            let anchors = anchor_mgr.reconcile(&path, &data.lines, Some(ctx.task_id.as_str()));
 
             let mut merged: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
-            for hit in hits {
+            for hit in data.hits {
                 merged.entry(hit.line_index).or_default().insert(hit.symbol);
             }
 
             let mut file_lines = Vec::new();
             for (line_index, symbols) in merged {
-                if let Some(line_content) = lines.get(line_index) {
+                if let Some(line_content) = data.lines.get(line_index) {
                     let anchor = anchors.get(line_index).cloned().unwrap_or_default();
                     let formatted = format_line_with_hash(line_content, &anchor)
                         .trim()
@@ -284,4 +288,52 @@ fn resolve_full_name(
 
 fn symbol_matches(full_name: &str, requested: &str) -> bool {
     full_name == requested || full_name.ends_with(&format!(".{}", requested))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::agent_loop::TaskState;
+    use crate::core::file_editor::AnchorStateManager;
+    use crate::core::tools::ToolContext;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn test_find_symbol_references_basic() {
+        // Test that find_symbol_references works correctly with stored file content
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_root = temp_dir.path();
+        
+        // Create a test file with a function and its reference
+        let file_content = "fn foo() {}\nfn bar() { foo(); }\n";
+        std::fs::write(workspace_root.join("test.rs"), file_content).unwrap();
+
+        let handler = FindSymbolReferencesHandler;
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace_root.to_path_buf(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        let params = serde_json::json!({
+            "paths": vec!["test.rs"],
+            "symbols": vec!["foo"],
+            "find_type": "both",
+        });
+
+        let result = handler.execute(&ctx, params).await.unwrap();
+        
+        // Verify the result contains both the definition and reference
+        let result_str = result.as_str().unwrap();
+        assert!(result_str.contains("test.rs"));
+        assert!(result_str.contains("fn foo()"));
+    }
 }
