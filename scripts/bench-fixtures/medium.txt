@@ -1,1 +1,7 @@
-Write a Rust function that takes a Vec<i32> and returns the sum of all even numbers. Include a test that verifies the function works correctly with the input [1, 2, 3, 4, 5, 6].
+Create a Rust source file named `even_sum.rs`.
+
+The file must contain:
+1. A function that takes a `Vec<i32>` and returns the sum of all even numbers.
+2. A Rust test that verifies the function works correctly with the input `[1, 2, 3, 4, 5, 6]`.
+
+Do not create a Cargo project. Do not run cargo. Do not answer only in prose.

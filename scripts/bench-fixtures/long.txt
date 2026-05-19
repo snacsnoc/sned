@@ -28,3 +28,9 @@ Please:
 2. Add proper error handling with retries
 3. Add type hints
 4. Include tests that mock the API calls
+
+Create exactly these source files in the current directory:
+- `async_user_api.py`
+- `test_async_user_api.py`
+
+Do not create a virtual environment. Do not install packages. Do not run pytest. Do not create project scaffolding or dependency caches. Do not answer only in prose.

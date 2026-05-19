@@ -38,6 +38,17 @@ ITERATIONS=3
 OUTPUT_FILE=""
 KEEP_ARTIFACTS_DIR=""
 ARTIFACT_RUN_DIR=""
+BENCHMARK_INSTRUCTIONS=$(cat <<'EOF'
+Benchmark instructions:
+- Produce only the requested answer or source/test files for this fixture.
+- If the fixture requests source code or tests, create those files in the current directory. Do not answer only in prose.
+- Do not create a full project scaffold unless the fixture explicitly asks for one.
+- Do not create a virtual environment, install packages, run package managers, run pytest, or run cargo build/test/check/run.
+- Do not create dependency/build caches such as target, venv, .venv, __pycache__, or .pytest_cache.
+- Do not validate by executing commands. Produce the source files only.
+- For simple answer-only questions, answer concisely and do not create files.
+EOF
+)
 while [[ $# -gt 0 ]]; do
     case $1 in
         --fixture)
@@ -147,17 +158,25 @@ measure_command() {
     stderr_bytes=$(wc -c <"$stderr_file" | tr -d ' ')
     combined_bytes=$((stdout_bytes + stderr_bytes))
 
-    local final_answer final_answer_source
+    local final_answer final_answer_source final_answer_preview opencode_event_types
     final_answer_json=$(extract_final_answer "${BENCH_TOOL_KIND:-generic}" "$stdout_file" "$stderr_file")
     final_answer=$(echo "$final_answer_json" | jq -r '.text')
     final_answer_source=$(echo "$final_answer_json" | jq -r '.source')
     final_answer_bytes=$(printf '%s' "$final_answer" | wc -c | tr -d ' ')
+    final_answer_preview="${final_answer:0:240}"
+    opencode_event_types='[]'
+    if [[ "${BENCH_TOOL_KIND:-generic}" == "opencode" ]]; then
+        opencode_event_types=$(extract_json_event_types "$stdout_file")
+    fi
 
-    local inventory_json files_created file_bytes_created top_level_file_preview
+    local inventory_json files_created file_bytes_created top_level_file_preview raw_files_created raw_file_bytes_created raw_top_level_file_preview
     inventory_json=$(artifact_inventory)
     files_created=$(echo "$inventory_json" | jq '.files_created')
     file_bytes_created=$(echo "$inventory_json" | jq '.file_bytes_created')
     top_level_file_preview=$(echo "$inventory_json" | jq '.top_level_file_preview')
+    raw_files_created=$(echo "$inventory_json" | jq '.raw_files_created')
+    raw_file_bytes_created=$(echo "$inventory_json" | jq '.raw_file_bytes_created')
+    raw_top_level_file_preview=$(echo "$inventory_json" | jq '.raw_top_level_file_preview')
 
     local real_ms user_ms sys_ms max_rss_kb
     real_ms=$(grep "Elapsed (wall clock) time" "$time_file" | awk '{print $NF}' | { read -r t; parse_time_to_ms "$t"; })
@@ -190,9 +209,14 @@ measure_command() {
         --argjson combined_bytes "$combined_bytes" \
         --argjson final_answer_bytes "$final_answer_bytes" \
         --arg final_answer_source "$final_answer_source" \
+        --arg final_answer_preview "$final_answer_preview" \
+        --argjson opencode_event_types "$opencode_event_types" \
         --argjson files_created "$files_created" \
         --argjson file_bytes_created "$file_bytes_created" \
         --argjson top_level_file_preview "$top_level_file_preview" \
+        --argjson raw_files_created "$raw_files_created" \
+        --argjson raw_file_bytes_created "$raw_file_bytes_created" \
+        --argjson raw_top_level_file_preview "$raw_top_level_file_preview" \
         --arg output_preview "$output_preview" \
         '{
           real_ms: $real_ms,
@@ -207,15 +231,25 @@ measure_command() {
           combined_bytes: $combined_bytes,
           final_answer_bytes: $final_answer_bytes,
           final_answer_source: $final_answer_source,
+          final_answer_preview: $final_answer_preview,
+          opencode_event_types: $opencode_event_types,
           files_created: $files_created,
           file_bytes_created: $file_bytes_created,
           top_level_file_preview: $top_level_file_preview,
+          raw_files_created: $raw_files_created,
+          raw_file_bytes_created: $raw_file_bytes_created,
+          raw_top_level_file_preview: $raw_top_level_file_preview,
           output_preview: $output_preview
         }'
 }
 
 trim_file() {
     perl -0pe 's/[\r\n]+\z//' "$1"
+}
+
+build_benchmark_prompt() {
+    local fixture_prompt="$1"
+    printf '%s\n\nFixture task:\n%s\n' "$BENCHMARK_INSTRUCTIONS" "$fixture_prompt"
 }
 
 extract_final_answer() {
@@ -265,6 +299,11 @@ extract_final_answer() {
     jq -n --arg text "$text" --arg source "$source" '{text: $text, source: $source}'
 }
 
+extract_json_event_types() {
+    local stdout_file="$1"
+    jq -rs '[.[] | select(type == "object") | (.type? // .event? // .kind? // empty) | select(type == "string")] | unique' "$stdout_file" 2>/dev/null || printf '[]\n'
+}
+
 file_size_bytes() {
     if stat -f %z "$1" >/dev/null 2>&1; then
         stat -f %z "$1"
@@ -274,38 +313,49 @@ file_size_bytes() {
 }
 
 artifact_inventory() {
-    local files_created=0
-    local file_bytes_created=0
+    local files_created=0 raw_files_created=0
+    local file_bytes_created=0 raw_file_bytes_created=0
     local file size
 
     while IFS= read -r -d '' file; do
+        if is_measurement_file "$file"; then
+            continue
+        fi
+
         size=$(file_size_bytes "$file")
-        files_created=$((files_created + 1))
-        file_bytes_created=$((file_bytes_created + size))
-    done < <(
-        find . -type f \
-            ! -path './stdout.txt' \
-            ! -path './stderr.txt' \
-            ! -path './time.txt' \
-            ! -path './.sned' \
-            ! -path './.sned/*' \
-            ! -path './.dirac' \
-            ! -path './.dirac/*' \
-            ! -path './sned-home-*' \
-            ! -path './sned-home-*/*' \
-            -print0
-    )
+        raw_files_created=$((raw_files_created + 1))
+        raw_file_bytes_created=$((raw_file_bytes_created + size))
+
+        if is_clean_task_artifact "$file"; then
+            files_created=$((files_created + 1))
+            file_bytes_created=$((file_bytes_created + size))
+        fi
+    done < <(find . -type f -print0)
 
     local top_level_file_preview
     top_level_file_preview=$(
         find . -maxdepth 1 -mindepth 1 \
-            ! -name 'stdout.txt' \
-            ! -name 'stderr.txt' \
-            ! -name 'time.txt' \
-            ! -name '.sned' \
-            ! -name '.dirac' \
-            ! -name 'sned-home-*' \
             -print |
+            while IFS= read -r file; do
+                if is_clean_task_artifact "$file"; then
+                    printf '%s\n' "$file"
+                fi
+            done |
+            sed 's#^\./##' |
+            sort |
+            head -20 |
+            jq -R . |
+            jq -s .
+    )
+    local raw_top_level_file_preview
+    raw_top_level_file_preview=$(
+        find . -maxdepth 1 -mindepth 1 \
+            -print |
+            while IFS= read -r file; do
+                if ! is_measurement_file "$file"; then
+                    printf '%s\n' "$file"
+                fi
+            done |
             sed 's#^\./##' |
             sort |
             head -20 |
@@ -317,7 +367,63 @@ artifact_inventory() {
         --argjson files_created "$files_created" \
         --argjson file_bytes_created "$file_bytes_created" \
         --argjson top_level_file_preview "$top_level_file_preview" \
-        '{files_created: $files_created, file_bytes_created: $file_bytes_created, top_level_file_preview: $top_level_file_preview}'
+        --argjson raw_files_created "$raw_files_created" \
+        --argjson raw_file_bytes_created "$raw_file_bytes_created" \
+        --argjson raw_top_level_file_preview "$raw_top_level_file_preview" \
+        '{
+          files_created: $files_created,
+          file_bytes_created: $file_bytes_created,
+          top_level_file_preview: $top_level_file_preview,
+          raw_files_created: $raw_files_created,
+          raw_file_bytes_created: $raw_file_bytes_created,
+          raw_top_level_file_preview: $raw_top_level_file_preview
+        }'
+}
+
+is_measurement_file() {
+    case "$1" in
+        ./stdout.txt|./stderr.txt|./time.txt)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_clean_task_artifact() {
+    local path="$1"
+
+    if is_measurement_file "$path"; then
+        return 1
+    fi
+
+    case "$path" in
+        ./.sned|./.sned/*|./.sned-*|./.sned-*/*|./.dirac|./.dirac/*|./.dirac-*|./.dirac-*/*)
+            return 1
+            ;;
+        ./.git|./.git/*|./target|./target/*|./venv|./venv/*|./.venv|./.venv/*)
+            return 1
+            ;;
+        ./__pycache__|./__pycache__/*|./.pytest_cache|./.pytest_cache/*|./.mypy_cache|./.mypy_cache/*|./.ruff_cache|./.ruff_cache/*)
+            return 1
+            ;;
+        ./.tox|./.tox/*|./.nox|./.nox/*|./node_modules|./node_modules/*|./dist|./dist/*|./build|./build/*|./.cache|./.cache/*)
+            return 1
+            ;;
+        */__pycache__|*/__pycache__/*|*/.pytest_cache|*/.pytest_cache/*|*/.mypy_cache|*/.mypy_cache/*|*/.ruff_cache|*/.ruff_cache/*)
+            return 1
+            ;;
+        */target|*/target/*|*/venv|*/venv/*|*/.venv|*/.venv/*|*/node_modules|*/node_modules/*)
+            return 1
+            ;;
+        */dist|*/dist/*|*/build|*/build/*|*/.cache|*/.cache/*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
 }
 
 parse_time_to_ms() {
@@ -382,14 +488,35 @@ run_self_tests() {
     _r "nested answer" "$(echo "$extracted" | jq -r '.text')" "opencode json extraction"
     _r "opencode_json_field" "$(echo "$extracted" | jq -r '.source')" "opencode json source"
 
+    printf '%s\n' '{"type":"message"}' '{"type":"tool"}' '{"type":"message"}' >"${tmp}/opencode-events.jsonl"
+    _r '["message","tool"]' "$(extract_json_event_types "${tmp}/opencode-events.jsonl" | jq -c '.')" "opencode event types"
+
     mkdir -p "${tmp}/inventory/.sned"
     printf 'abc' >"${tmp}/inventory/result.rs"
     printf 'ignore' >"${tmp}/inventory/stdout.txt"
     printf 'state' >"${tmp}/inventory/.sned/state.json"
+    mkdir -p "${tmp}/inventory/.sned-symbol-index" "${tmp}/inventory/target" "${tmp}/inventory/venv" "${tmp}/inventory/__pycache__" "${tmp}/inventory/.pytest_cache"
+    printf 'state' >"${tmp}/inventory/.sned-symbol-index/symbols.db"
+    printf 'build' >"${tmp}/inventory/target/output"
+    printf 'deps' >"${tmp}/inventory/venv/package.py"
+    printf 'bytecode' >"${tmp}/inventory/__pycache__/result.pyc"
+    printf 'cache' >"${tmp}/inventory/.pytest_cache/state"
     local inventory
     inventory=$(cd "${tmp}/inventory" && artifact_inventory)
     _r "1" "$(echo "$inventory" | jq -r '.files_created')" "artifact file count"
     _r "3" "$(echo "$inventory" | jq -r '.file_bytes_created')" "artifact byte count"
+    _r "7" "$(echo "$inventory" | jq -r '.raw_files_created')" "raw artifact file count"
+
+    local prompt
+    prompt=$(build_benchmark_prompt "Create hello.py.")
+    if ! grep -q "Do not create a full project scaffold" <<<"$prompt"; then
+        echo "FAIL benchmark prompt includes scaffold limit" >&2
+        exit 1
+    fi
+    if ! grep -q "Fixture task:" <<<"$prompt"; then
+        echo "FAIL benchmark prompt includes fixture section" >&2
+        exit 1
+    fi
 
     rm -rf "$tmp"
 }
@@ -422,7 +549,7 @@ run_fixture() {
         fixture_tmp=$(mktemp -d "${TMPDIR:-/tmp}/sned-opencode-bench-${fixture_name}.XXXXXX")
     fi
     local prompt
-    prompt=$(<"$prompt_file")
+    prompt=$(build_benchmark_prompt "$(<"$prompt_file")")
 
     echo "Running fixture: $fixture_name ($ITERATIONS iterations)" >&2
 
@@ -498,9 +625,11 @@ run_fixture() {
     local sned_avg_real=0 sned_avg_user=0 sned_avg_sys=0 sned_avg_rss=0
     local sned_avg_stdout_bytes=0 sned_avg_stderr_bytes=0 sned_avg_combined_bytes=0 sned_avg_final_answer_bytes=0
     local sned_avg_files_created=0 sned_avg_file_bytes_created=0
+    local sned_avg_raw_files_created=0 sned_avg_raw_file_bytes_created=0
     local opencode_avg_real=0 opencode_avg_user=0 opencode_avg_sys=0 opencode_avg_rss=0
     local opencode_avg_stdout_bytes=0 opencode_avg_stderr_bytes=0 opencode_avg_combined_bytes=0 opencode_avg_final_answer_bytes=0
     local opencode_avg_files_created=0 opencode_avg_file_bytes_created=0
+    local opencode_avg_raw_files_created=0 opencode_avg_raw_file_bytes_created=0
 
     for result in "${sned_results[@]}"; do
         sned_avg_real=$((sned_avg_real + $(echo "$result" | jq '.real_ms')))
@@ -513,6 +642,8 @@ run_fixture() {
         sned_avg_final_answer_bytes=$((sned_avg_final_answer_bytes + $(echo "$result" | jq '.final_answer_bytes')))
         sned_avg_files_created=$((sned_avg_files_created + $(echo "$result" | jq '.files_created')))
         sned_avg_file_bytes_created=$((sned_avg_file_bytes_created + $(echo "$result" | jq '.file_bytes_created')))
+        sned_avg_raw_files_created=$((sned_avg_raw_files_created + $(echo "$result" | jq '.raw_files_created')))
+        sned_avg_raw_file_bytes_created=$((sned_avg_raw_file_bytes_created + $(echo "$result" | jq '.raw_file_bytes_created')))
     done
     sned_avg_real=$((sned_avg_real / ITERATIONS))
     sned_avg_user=$((sned_avg_user / ITERATIONS))
@@ -524,6 +655,8 @@ run_fixture() {
     sned_avg_final_answer_bytes=$((sned_avg_final_answer_bytes / ITERATIONS))
     sned_avg_files_created=$((sned_avg_files_created / ITERATIONS))
     sned_avg_file_bytes_created=$((sned_avg_file_bytes_created / ITERATIONS))
+    sned_avg_raw_files_created=$((sned_avg_raw_files_created / ITERATIONS))
+    sned_avg_raw_file_bytes_created=$((sned_avg_raw_file_bytes_created / ITERATIONS))
 
     if [[ ${#opencode_results[@]} -gt 0 ]]; then
         for result in "${opencode_results[@]}"; do
@@ -537,6 +670,8 @@ run_fixture() {
             opencode_avg_final_answer_bytes=$((opencode_avg_final_answer_bytes + $(echo "$result" | jq '.final_answer_bytes')))
             opencode_avg_files_created=$((opencode_avg_files_created + $(echo "$result" | jq '.files_created')))
             opencode_avg_file_bytes_created=$((opencode_avg_file_bytes_created + $(echo "$result" | jq '.file_bytes_created')))
+            opencode_avg_raw_files_created=$((opencode_avg_raw_files_created + $(echo "$result" | jq '.raw_files_created')))
+            opencode_avg_raw_file_bytes_created=$((opencode_avg_raw_file_bytes_created + $(echo "$result" | jq '.raw_file_bytes_created')))
         done
         opencode_avg_real=$((opencode_avg_real / ITERATIONS))
         opencode_avg_user=$((opencode_avg_user / ITERATIONS))
@@ -548,6 +683,8 @@ run_fixture() {
         opencode_avg_final_answer_bytes=$((opencode_avg_final_answer_bytes / ITERATIONS))
         opencode_avg_files_created=$((opencode_avg_files_created / ITERATIONS))
         opencode_avg_file_bytes_created=$((opencode_avg_file_bytes_created / ITERATIONS))
+        opencode_avg_raw_files_created=$((opencode_avg_raw_files_created / ITERATIONS))
+        opencode_avg_raw_file_bytes_created=$((opencode_avg_raw_file_bytes_created / ITERATIONS))
     fi
 
     local sned_runs sned_final_answer_sources opencode_runs opencode_final_answer_sources
@@ -596,6 +733,8 @@ run_fixture() {
             --argjson sned_avg_final_answer_bytes "$sned_avg_final_answer_bytes" \
             --argjson sned_avg_files_created "$sned_avg_files_created" \
             --argjson sned_avg_file_bytes_created "$sned_avg_file_bytes_created" \
+            --argjson sned_avg_raw_files_created "$sned_avg_raw_files_created" \
+            --argjson sned_avg_raw_file_bytes_created "$sned_avg_raw_file_bytes_created" \
             --argjson sned_runs "$sned_runs" \
             --argjson sned_final_answer_sources "$sned_final_answer_sources" \
             --argjson opencode_avg_real "$opencode_avg_real" \
@@ -608,6 +747,8 @@ run_fixture() {
             --argjson opencode_avg_final_answer_bytes "$opencode_avg_final_answer_bytes" \
             --argjson opencode_avg_files_created "$opencode_avg_files_created" \
             --argjson opencode_avg_file_bytes_created "$opencode_avg_file_bytes_created" \
+            --argjson opencode_avg_raw_files_created "$opencode_avg_raw_files_created" \
+            --argjson opencode_avg_raw_file_bytes_created "$opencode_avg_raw_file_bytes_created" \
             --argjson opencode_runs "$opencode_runs" \
             --argjson opencode_final_answer_sources "$opencode_final_answer_sources" \
             --argjson artifacts_kept "$artifacts_kept" \
@@ -634,6 +775,8 @@ run_fixture() {
                 avg_final_answer_bytes: $sned_avg_final_answer_bytes,
                 avg_files_created: $sned_avg_files_created,
                 avg_file_bytes_created: $sned_avg_file_bytes_created,
+                avg_raw_files_created: $sned_avg_raw_files_created,
+                avg_raw_file_bytes_created: $sned_avg_raw_file_bytes_created,
                 final_answer_source: (if ($sned_final_answer_sources | unique | length) == 1 then $sned_final_answer_sources[0] else "mixed" end),
                 final_answer_sources: $sned_final_answer_sources,
                 runs: $sned_runs
@@ -651,6 +794,8 @@ run_fixture() {
                 avg_final_answer_bytes: $opencode_avg_final_answer_bytes,
                 avg_files_created: $opencode_avg_files_created,
                 avg_file_bytes_created: $opencode_avg_file_bytes_created,
+                avg_raw_files_created: $opencode_avg_raw_files_created,
+                avg_raw_file_bytes_created: $opencode_avg_raw_file_bytes_created,
                 final_answer_source: (if ($opencode_final_answer_sources | unique | length) == 1 then $opencode_final_answer_sources[0] else "mixed" end),
                 final_answer_sources: $opencode_final_answer_sources,
                 runs: $opencode_runs
@@ -678,6 +823,8 @@ run_fixture() {
             --argjson sned_avg_final_answer_bytes "$sned_avg_final_answer_bytes" \
             --argjson sned_avg_files_created "$sned_avg_files_created" \
             --argjson sned_avg_file_bytes_created "$sned_avg_file_bytes_created" \
+            --argjson sned_avg_raw_files_created "$sned_avg_raw_files_created" \
+            --argjson sned_avg_raw_file_bytes_created "$sned_avg_raw_file_bytes_created" \
             --argjson sned_runs "$sned_runs" \
             --argjson sned_final_answer_sources "$sned_final_answer_sources" \
             --argjson artifacts_kept "$artifacts_kept" \
@@ -701,6 +848,8 @@ run_fixture() {
                 avg_final_answer_bytes: $sned_avg_final_answer_bytes,
                 avg_files_created: $sned_avg_files_created,
                 avg_file_bytes_created: $sned_avg_file_bytes_created,
+                avg_raw_files_created: $sned_avg_raw_files_created,
+                avg_raw_file_bytes_created: $sned_avg_raw_file_bytes_created,
                 final_answer_source: (if ($sned_final_answer_sources | unique | length) == 1 then $sned_final_answer_sources[0] else "mixed" end),
                 final_answer_sources: $sned_final_answer_sources,
                 runs: $sned_runs
