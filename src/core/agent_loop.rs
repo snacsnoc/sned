@@ -176,6 +176,7 @@ async fn enqueue_message_with_limit(
 struct AgentLoopDeps {
     registry: Option<Arc<ToolRegistry>>,
     system_prompt_context: Option<SystemPromptContext>,
+    cached_system_prompt: Option<String>,
     context_loader: Option<crate::core::context::ContextLoader>,
     task_storage: Option<TaskStorage>,
     hook_manager: Option<Arc<crate::core::hooks::HookManager>>,
@@ -188,6 +189,7 @@ impl AgentLoopDeps {
         Self {
             registry: None,
             system_prompt_context: None,
+            cached_system_prompt: None,
             context_loader: None,
             task_storage: None,
             hook_manager: None,
@@ -201,6 +203,13 @@ impl AgentLoopDeps {
             .as_ref()
             .expect("AgentLoopDeps: registry not initialized. Call with_tools() before run().")
     }
+}
+
+struct PreparedToolCall {
+    tool_call: ApiStreamToolCall,
+    tool_id: String,
+    tool_name: String,
+    parsed_args: Result<serde_json::Value, String>,
 }
 
 /// A clonable handle for enqueuing messages into an AgentLoop from any task.
@@ -297,6 +306,71 @@ impl AgentLoop {
                     tool_name, tool_id
                 ))
             }
+        }
+    }
+
+    fn prepare_tool_calls(
+        tool_call_order: &[String],
+        tool_calls_map: &mut HashMap<String, ApiStreamToolCall>,
+    ) -> Vec<PreparedToolCall> {
+        let mut prepared = Vec::with_capacity(tool_call_order.len());
+
+        for key in tool_call_order {
+            let Some(tool_call) = tool_calls_map.get_mut(key) else {
+                error!(
+                    "Tool call order mismatch: key '{}' not found in tool_calls_map. \
+                     This indicates a stream parsing bug.",
+                    key
+                );
+                continue;
+            };
+
+            if tool_call
+                .function
+                .id
+                .as_ref()
+                .is_none_or(|id| id.is_empty())
+            {
+                let generated = ulid::Ulid::new().to_string();
+                tool_call.function.id = Some(generated);
+            }
+
+            let tool_id = tool_call.function.id.clone().unwrap_or_else(|| {
+                error!("Tool call ID is None after initialization, generating fallback");
+                ulid::Ulid::new().to_string()
+            });
+            let tool_name = tool_call.function.name.clone().unwrap_or_else(|| {
+                warn!("Tool call missing name, using 'unknown_tool'");
+                "unknown_tool".to_string()
+            });
+            let parsed_args = Self::parse_tool_arguments(
+                &tool_name,
+                &tool_id,
+                tool_call.function.arguments.as_ref(),
+            );
+
+            prepared.push(PreparedToolCall {
+                tool_call: tool_call.clone(),
+                tool_id,
+                tool_name,
+                parsed_args,
+            });
+        }
+
+        prepared
+    }
+
+    fn assistant_tool_input(prepared: &PreparedToolCall) -> serde_json::Value {
+        match &prepared.parsed_args {
+            Ok(value) => value.clone(),
+            Err(_) => serde_json::json!({
+                "_raw_arguments": prepared
+                    .tool_call
+                    .function
+                    .arguments
+                    .as_deref()
+                    .unwrap_or("")
+            }),
         }
     }
 
@@ -409,6 +483,7 @@ impl AgentLoop {
     /// Set the system prompt context.
     pub fn with_system_prompt_context(mut self, context: SystemPromptContext) -> Self {
         self.deps.system_prompt_context = Some(context);
+        self.deps.cached_system_prompt = None;
         self
     }
 
@@ -975,7 +1050,13 @@ impl AgentLoop {
             self.deps.hook_manager.clone(),
             false, // Initial context: not explicitly approved (approval happens per-tool)
         ));
-        let system_prompt = PromptBuilder::new(context).build();
+        let system_prompt = if let Some(prompt) = self.deps.cached_system_prompt.clone() {
+            prompt
+        } else {
+            let prompt = PromptBuilder::new(context).build();
+            self.deps.cached_system_prompt = Some(prompt.clone());
+            prompt
+        };
 
         // 2.5 Execute TaskStart hook
         // (TaskStart hook is executed in run() before the first turn)
@@ -1616,16 +1697,18 @@ impl AgentLoop {
             tracing::debug!("");
         }
 
+        let prepared_tool_calls = Self::prepare_tool_calls(&tool_call_order, &mut tool_calls_map);
+
         // 5. Check for empty response
         // Log what we received from the model
         tracing::info!(
             text_len = accumulated_text.len(),
             reasoning_len = accumulated_reasoning.len(),
-            tool_call_count = tool_calls_map.len(),
+            tool_call_count = prepared_tool_calls.len(),
             "stream complete"
         );
 
-        if accumulated_text.is_empty() && tool_calls_map.is_empty() {
+        if accumulated_text.is_empty() && prepared_tool_calls.is_empty() {
             let mut state = state_clone.lock().await;
             state.consecutive_mistakes += 1;
             tracing::warn!(
@@ -1706,59 +1789,15 @@ impl AgentLoop {
                 ));
             }
 
-            for key in &tool_call_order {
-                let Some(tool_call) = tool_calls_map.get_mut(key) else {
-                    error!(
-                        "Tool call order mismatch: key '{}' not found in tool_calls_map. \
-                         This indicates a stream parsing bug.",
-                        key
-                    );
-                    continue;
-                };
-                // Assign a stable tool_id once: use the provider's ID if present,
-                // otherwise generate a ULID and patch it into the map so the
-                // dispatch loop (step 8) reuses the same ID.
-                if tool_call
-                    .function
-                    .id
-                    .as_ref()
-                    .is_none_or(|id| id.is_empty())
-                {
-                    let generated = ulid::Ulid::new().to_string();
-                    tool_call.function.id = Some(generated);
-                }
-                let tool_id = tool_call.function.id.clone().unwrap_or_else(|| {
-                    // This should never happen after the initialization above,
-                    // but handle gracefully to avoid panic
-                    error!("Tool call ID is None after initialization, generating fallback");
-                    ulid::Ulid::new().to_string()
-                });
-                let tool_name = tool_call.function.name.clone().unwrap_or_else(|| {
-                    warn!("Tool call missing name, using 'unknown_tool'");
-                    "unknown_tool".to_string()
-                });
-                // Parse arguments for history, but preserve original raw string on parse failure
-                // so the model can see what it actually sent (helps with debugging/retry)
-                let tool_input = match Self::parse_tool_arguments(
-                    &tool_name,
-                    &tool_id,
-                    tool_call.function.arguments.as_ref(),
-                ) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        // Preserve original raw arguments even on parse failure
-                        tool_call.function.arguments.as_ref()
-                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                            .unwrap_or_else(|| serde_json::json!({ "_raw_arguments": tool_call.function.arguments.as_ref().unwrap_or(&String::new()) }))
-                    }
-                };
+            for prepared in &prepared_tool_calls {
+                let tool_input = Self::assistant_tool_input(prepared);
                 blocks.push(AssistantContentBlock::ToolUse(ToolUseBlock {
-                    id: tool_id,
-                    name: tool_name,
+                    id: prepared.tool_id.clone(),
+                    name: prepared.tool_name.clone(),
                     input: tool_input,
                     shared: SharedContentFields {
-                        call_id: tool_call.call_id.clone(),
-                        signature: tool_call.signature.clone(),
+                        call_id: prepared.tool_call.call_id.clone(),
+                        signature: prepared.tool_call.signature.clone(),
                     },
                     reasoning_details: None,
                 }));
@@ -1773,10 +1812,10 @@ impl AgentLoop {
                 ts: Some(chrono::Utc::now().timestamp_millis() as u64),
             });
 
-            let text_without_tools =
-                response_text.as_ref().is_some_and(|t| !t.is_empty()) && tool_calls_map.is_empty();
+            let text_without_tools = response_text.as_ref().is_some_and(|t| !t.is_empty())
+                && prepared_tool_calls.is_empty();
 
-            if !tool_calls_map.is_empty() {
+            if !prepared_tool_calls.is_empty() {
                 let mut state = state_clone.lock().await;
                 state.text_only_turns = 0;
             } else if text_without_tools {
@@ -1808,34 +1847,30 @@ impl AgentLoop {
         }
 
         // 7. Save checkpoint before executing tools (if checkpoint manager is configured)
-        if !tool_calls_map.is_empty()
+        if !prepared_tool_calls.is_empty()
             && let Some(ref mut checkpoint_mgr) = self.deps.checkpoint_manager
         {
             checkpoint_mgr.save_checkpoint().await;
         }
 
         // 8. Dispatch tools (parallel execution for independent tools)
-        // Preserve insertion order by iterating tool_call_order
-        let tool_calls_vec: Vec<ApiStreamToolCall> = tool_call_order
-            .into_iter()
-            .filter_map(|k| tool_calls_map.remove(&k))
-            .collect();
-        if !tool_calls_vec.is_empty() {
+        if !prepared_tool_calls.is_empty() {
             let mut edit_files: Vec<(String, i32, i32)> = Vec::new();
 
             // Print compact tool call summaries (skip malformed tool calls with empty names)
             if !self.config.json_output {
-                for tc in &tool_calls_vec {
-                    let tool_name = tc.function.name.as_deref().unwrap_or_default();
+                for prepared in &prepared_tool_calls {
+                    let tool_name = prepared.tool_name.as_str();
 
                     // Skip malformed tool calls with empty names
                     if tool_name.is_empty() {
                         continue;
                     }
 
-                    let tool_params =
-                        Self::parse_tool_arguments(tool_name, "", tc.function.arguments.as_ref())
-                            .unwrap_or(serde_json::Value::Null);
+                    let tool_params = prepared
+                        .parsed_args
+                        .as_ref()
+                        .unwrap_or(&serde_json::Value::Null);
                     let summary = format_tool_summary(tool_name, &tool_params);
                     eprintln!(
                         "{}",
@@ -1857,10 +1892,10 @@ impl AgentLoop {
                 Option<futures::future::BoxFuture<'static, String>>,
                 Vec<String>,
             );
-            let mut tool_tasks: Vec<ToolTask> = Vec::with_capacity(tool_calls_vec.len());
+            let mut tool_tasks: Vec<ToolTask> = Vec::with_capacity(prepared_tool_calls.len());
 
-            for tool_call in &tool_calls_vec {
-                let tool_name = tool_call.function.name.clone().unwrap_or_default();
+            for prepared in &prepared_tool_calls {
+                let tool_name = prepared.tool_name.clone();
 
                 // Skip tool calls with empty names (malformed provider response)
                 if tool_name.is_empty() {
@@ -1868,22 +1903,17 @@ impl AgentLoop {
                     continue;
                 }
 
-                let tool_id = tool_call
-                    .function
-                    .id
-                    .clone()
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| ulid::Ulid::new().to_string());
-                // tool_id was already stabilized in step 6 (history construction),
-                // so this fallback should never fire. It exists as a safety net.
-                let tool_params = match Self::parse_tool_arguments(
-                    &tool_name,
-                    &tool_id,
-                    tool_call.function.arguments.as_ref(),
-                ) {
-                    Ok(params) => params,
+                let tool_id = prepared.tool_id.clone();
+                let tool_params = match &prepared.parsed_args {
+                    Ok(params) => params.clone(),
                     Err(parse_error) => {
-                        tool_tasks.push((tool_id, tool_name, Some(parse_error), None, vec![]));
+                        tool_tasks.push((
+                            tool_id,
+                            tool_name,
+                            Some(parse_error.clone()),
+                            None,
+                            vec![],
+                        ));
                         continue;
                     }
                 };
@@ -2451,18 +2481,18 @@ impl AgentLoop {
             }
 
             // Print action digest summarizing what happened in this turn
-            if !self.config.json_output && !tool_calls_vec.is_empty() {
-                let files_created = tool_calls_vec
+            if !self.config.json_output && !prepared_tool_calls.is_empty() {
+                let files_created = prepared_tool_calls
                     .iter()
-                    .filter(|tc| tc.function.name.as_deref() == Some("write_to_file"))
+                    .filter(|prepared| prepared.tool_name == "write_to_file")
                     .count();
                 let files_edited = edit_files
                     .iter()
                     .filter(|(_, added, removed)| *added > 0 || *removed > 0)
                     .count();
-                let commands_run = tool_calls_vec
+                let commands_run = prepared_tool_calls
                     .iter()
-                    .filter(|tc| tc.function.name.as_deref() == Some("execute_command"))
+                    .filter(|prepared| prepared.tool_name == "execute_command")
                     .count();
 
                 let mut parts = Vec::new();
@@ -2504,15 +2534,16 @@ impl AgentLoop {
         self.save_conversation_history().await;
 
         // 9. Check for completion
-        let completion_tool_emitted = tool_calls_vec.iter().any(|tc| {
-            let name = tc.function.name.as_deref().unwrap_or_default();
-            matches!(SnedTool::from_name(name), Some(SnedTool::AttemptCompletion))
+        let completion_tool_emitted = prepared_tool_calls.iter().any(|prepared| {
+            matches!(
+                SnedTool::from_name(&prepared.tool_name),
+                Some(SnedTool::AttemptCompletion)
+            )
         });
         let is_completion = text_only_completes_task
-            || tool_calls_vec.iter().any(|tc| {
-                let name = tc.function.name.as_deref().unwrap_or_default();
+            || prepared_tool_calls.iter().any(|prepared| {
                 matches!(
-                    SnedTool::from_name(name),
+                    SnedTool::from_name(&prepared.tool_name),
                     Some(SnedTool::AttemptCompletion) | Some(SnedTool::PlanModeRespond)
                 )
             });
@@ -3291,6 +3322,80 @@ impl AgentLoop {
 mod tests {
     use super::*;
     use crate::core::tool_output::summarize_single_section;
+    use crate::providers::{ApiStream, ApiStreamTextChunk, ApiStreamToolCallsChunk, ProviderError};
+
+    struct RecordingChunkProvider {
+        responses: Vec<Vec<ApiStreamChunk>>,
+        response_index: std::sync::Mutex<usize>,
+        requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+    }
+
+    impl RecordingChunkProvider {
+        fn new(
+            responses: Vec<Vec<ApiStreamChunk>>,
+            requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+        ) -> Self {
+            Self {
+                responses,
+                response_index: std::sync::Mutex::new(0),
+                requests,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingChunkProvider {
+        async fn create_message(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ApiStream, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            let response = {
+                let mut idx = self.response_index.lock().unwrap();
+                let response = self.responses.get(*idx).cloned().unwrap_or_default();
+                *idx += 1;
+                response
+            };
+            Ok(Box::pin(tokio_stream::iter(response)))
+        }
+
+        fn get_model(&self) -> crate::providers::ProviderModel {
+            crate::providers::ProviderModel {
+                id: "recording-model".to_string(),
+                info: crate::providers::ModelInfo {
+                    name: Some("Recording Model".to_string()),
+                    max_tokens: Some(4096),
+                    context_window: Some(8192),
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    fn test_agent_config(provider: Arc<dyn Provider>, task_id: &str) -> AgentConfig {
+        AgentConfig {
+            provider,
+            mode: AgentMode::Act,
+            task_id: task_id.to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+        }
+    }
 
     #[test]
     fn test_task_state_default() {
@@ -3553,6 +3658,46 @@ mod tests {
             prompt.contains("Default Shell: /bin/zsh"),
             "Prompt should contain shell"
         );
+    }
+
+    #[tokio::test]
+    async fn test_system_prompt_is_cached_across_turns() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = vec![
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "first response".to_string(),
+                id: None,
+                signature: None,
+            })],
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "second response".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-system-prompt-cache"))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some("/tmp/cache-first".to_string()),
+                active_shell_is_posix: true,
+                enable_parallel_tool_calling: true,
+                ..Default::default()
+            });
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        agent.deps.system_prompt_context = Some(SystemPromptContext {
+            cwd: Some("/tmp/cache-second".to_string()),
+            active_shell_is_posix: true,
+            enable_parallel_tool_calling: true,
+            ..Default::default()
+        });
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
+        assert!(requests[0].system_prompt.contains("/tmp/cache-first"));
+        assert!(!requests[1].system_prompt.contains("/tmp/cache-second"));
     }
 
     #[test]
@@ -4421,6 +4566,103 @@ mod tests {
         let invalid = "{\"path\":\"src/main.rs\",\"content\":\"unterminated".to_string();
         let parsed = AgentLoop::parse_tool_arguments("write_to_file", "abc123", Some(&invalid));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_prepared_tool_call_parses_args_once_for_display_summary() {
+        let mut tool_calls = HashMap::new();
+        tool_calls.insert(
+            "0".to_string(),
+            ApiStreamToolCall {
+                call_id: Some("call_valid".to_string()),
+                function: crate::providers::ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("read_file".to_string()),
+                    arguments: Some(r#"{"paths":["src/main.rs","src/lib.rs"]}"#.to_string()),
+                },
+                signature: None,
+            },
+        );
+        let prepared = AgentLoop::prepare_tool_calls(&["0".to_string()], &mut tool_calls);
+
+        assert_eq!(prepared.len(), 1);
+        assert!(!prepared[0].tool_id.is_empty());
+        assert_eq!(prepared[0].tool_name, "read_file");
+        let parsed_args = prepared[0].parsed_args.as_ref().unwrap();
+        let expected_args = serde_json::json!({"paths":["src/main.rs","src/lib.rs"]});
+        assert_eq!(parsed_args, &expected_args);
+        assert_eq!(
+            format_tool_summary("read_file", parsed_args),
+            format_tool_summary("read_file", &expected_args)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepared_tool_call_parse_error_history_and_dispatch_result() {
+        let raw_args = "{\"path\":\"unterminated".to_string();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(
+            vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_bad".to_string()),
+                    function: crate::providers::ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("read_file".to_string()),
+                        arguments: Some(raw_args.clone()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            })]],
+            requests,
+        ));
+
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-invalid-tool-call"));
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+
+        let history = agent.conversation_history.lock().await;
+        let assistant = history
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant tool-use message should be recorded");
+        match &assistant.content {
+            MessageContent::AssistantBlocks(blocks) => {
+                let tool_use = blocks
+                    .iter()
+                    .find_map(|block| match block {
+                        AssistantContentBlock::ToolUse(tool_use) => Some(tool_use),
+                        _ => None,
+                    })
+                    .expect("assistant message should include tool use");
+                assert_eq!(tool_use.name, "read_file");
+                assert_eq!(
+                    tool_use.input["_raw_arguments"].as_str(),
+                    Some(raw_args.as_str())
+                );
+            }
+            other => panic!("expected assistant blocks, got {other:?}"),
+        }
+
+        let tool_result = history
+            .iter()
+            .rev()
+            .find_map(|message| match &message.content {
+                MessageContent::UserBlocks(blocks) => blocks.iter().find_map(|block| match block {
+                    UserContentBlock::ToolResult(result) => Some(result),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("parse failure should be returned as a tool result");
+        match &tool_result.content {
+            ToolResultContent::Text(text) => {
+                assert!(text.contains("arguments were invalid JSON"));
+                assert!(text.contains("read_file"));
+            }
+            other => panic!("expected text tool result, got {other:?}"),
+        }
     }
 
     #[test]

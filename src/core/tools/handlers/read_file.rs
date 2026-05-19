@@ -14,7 +14,6 @@ use crate::core::file_editor::AnchorStateManager;
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 const MAX_FILE_READ_SIZE: usize = 100 * 1024; // 100KB limit
 
@@ -48,16 +47,12 @@ impl ReadFileHandler {
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
     ) -> Vec<FileReadResult> {
-        let mut results = Vec::with_capacity(paths.len());
+        let read_futures = paths.into_iter().map(|path| async move {
+            self.read_file(&path, start_line, end_line, anchor_mgr, task_id)
+                .await
+        });
 
-        for path in paths {
-            let result = self
-                .read_file(&path, start_line, end_line, anchor_mgr, task_id)
-                .await;
-            results.push(result);
-        }
-
-        results
+        futures::future::join_all(read_futures).await
     }
 
     /// Read a single file with optional line range.
@@ -192,18 +187,15 @@ impl ReadFileHandler {
         }
     }
 
-    /// Stream-read only the requested line range using BufReader.
-    ///
-    /// Avoids loading the entire file into memory when only a subset is needed.
-    /// Skips lines before start_line without allocating Strings for them.
+    /// Read the file once, then slice the requested line range.
     async fn read_lines_range(
         &self,
         path: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
     ) -> Result<(String, Vec<String>, Option<String>), FileReadResult> {
-        let file = match tokio::fs::File::open(path).await {
-            Ok(f) => f,
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(c) => c,
             Err(e) => {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return Err(FileReadResult {
@@ -215,28 +207,12 @@ impl ReadFileHandler {
                 });
             }
         };
-        let mut reader = BufReader::new(file);
 
-        // First pass: count total lines for clamping logic
-        let mut total_lines: usize = 0;
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => total_lines += 1,
-                Err(e) => {
-                    let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
-                    return Err(FileReadResult {
-                        path: path.to_string(),
-                        content: String::new(),
-                        hash: String::new(),
-                        success: false,
-                        error: Some(err.display()),
-                    });
-                }
-            }
-        }
+        let all_lines: Vec<String> = content
+            .split_terminator('\n')
+            .map(|line| line.to_string())
+            .collect();
+        let total_lines = all_lines.len();
 
         // Calculate the actual range (with clamping)
         let original_start = start_line.unwrap_or(1);
@@ -255,53 +231,12 @@ impl ReadFileHandler {
         let start_idx = clamped_start.saturating_sub(1);
         let end_exclusive = clamped_end.unwrap_or(total_lines);
 
-        // Second pass: re-open file and read only the lines we need
-        let file = tokio::fs::File::open(path)
-            .await
-            .map_err(|e| FileReadResult {
-                path: path.to_string(),
-                content: String::new(),
-                hash: String::new(),
-                success: false,
-                error: Some(format!("Failed to re-open file: {}", e)),
-            })?;
-        let mut reader = BufReader::new(file);
-
-        let mut collected_lines: Vec<String> = Vec::new();
-        let mut current_line: usize = 0;
-        let mut buf = String::new();
-
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if current_line >= start_idx && current_line < end_exclusive {
-                        let line_content = if buf.ends_with('\n') {
-                            buf[..buf.len() - 1].to_string()
-                        } else {
-                            buf.clone()
-                        };
-                        collected_lines.push(line_content);
-                    }
-                    current_line += 1;
-                    // Early exit if we've read past the end of our range
-                    if current_line >= end_exclusive {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
-                    return Err(FileReadResult {
-                        path: path.to_string(),
-                        content: String::new(),
-                        hash: String::new(),
-                        success: false,
-                        error: Some(err.display()),
-                    });
-                }
-            }
-        }
+        let collected_lines: Vec<String> = if start_idx >= end_exclusive || start_idx >= total_lines
+        {
+            Vec::new()
+        } else {
+            all_lines[start_idx..end_exclusive.min(total_lines)].to_vec()
+        };
 
         let clamping_note = if clamped_start != original_start {
             Some(format!(
@@ -669,6 +604,70 @@ mod tests {
         assert!(results[1].success);
         assert!(results[0].content.contains("content 1"));
         assert!(results[1].content.contains("content 2"));
+    }
+
+    #[tokio::test]
+    async fn test_read_multi_files_format_preserves_order_and_separators() {
+        let mut file1 = NamedTempFile::new().unwrap();
+        writeln!(file1, "first file").unwrap();
+
+        let mut file2 = NamedTempFile::new().unwrap();
+        writeln!(file2, "second file").unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let paths = vec![
+            file1.path().to_str().unwrap().to_string(),
+            file2.path().to_str().unwrap().to_string(),
+        ];
+
+        let results = handler
+            .read_files(paths, None, None, &anchor_mgr, Some("test-task"))
+            .await;
+        let output = ReadFileHandler::format_results(results);
+
+        let first_pos = output.find("first file").unwrap();
+        let second_pos = output.find("second file").unwrap();
+        assert!(first_pos < second_pos);
+        assert_eq!(output.matches("\n---\n").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_multi_files_missing_file_stays_in_input_position() {
+        let mut file1 = NamedTempFile::new().unwrap();
+        writeln!(file1, "before missing").unwrap();
+
+        let mut file2 = NamedTempFile::new().unwrap();
+        writeln!(file2, "after missing").unwrap();
+
+        let missing_path = file1
+            .path()
+            .parent()
+            .unwrap()
+            .join("missing-input-position.txt");
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let paths = vec![
+            file1.path().to_str().unwrap().to_string(),
+            missing_path.to_str().unwrap().to_string(),
+            file2.path().to_str().unwrap().to_string(),
+        ];
+
+        let results = handler
+            .read_files(paths, None, None, &anchor_mgr, Some("test-task"))
+            .await;
+        assert_eq!(results.len(), 3);
+        assert!(results[0].success);
+        assert!(!results[1].success);
+        assert!(results[2].success);
+
+        let output = ReadFileHandler::format_results(results);
+        let before_pos = output.find("before missing").unwrap();
+        let error_pos = output.find("Error reading").unwrap();
+        let after_pos = output.find("after missing").unwrap();
+        assert!(before_pos < error_pos);
+        assert!(error_pos < after_pos);
+        assert_eq!(output.matches("\n---\n").count(), 2);
     }
 
     #[tokio::test]

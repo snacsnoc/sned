@@ -237,15 +237,6 @@ impl PromptBuilder {
             if let Some(instructions) = &self.context.preferred_language_instructions {
                 prompt.push_str(&format!("\n{}\n", instructions));
             }
-            if let Some(instructions) = &self.context.sned_ignore_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.global_sned_rules_file_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.local_sned_rules_file_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
             if let Some(instructions) = &self.context.local_cursor_rules_file_instructions {
                 prompt.push_str(&format!("\n{}\n", instructions));
             }
@@ -401,6 +392,44 @@ mod tests {
         assert!(prompt.contains("USER'S CUSTOM INSTRUCTIONS"));
         assert!(prompt.contains("Always use TypeScript."));
         assert!(prompt.contains("Follow the style guide."));
+    }
+
+    #[test]
+    fn test_prompt_builder_does_not_duplicate_custom_instruction_sources() {
+        let context = SystemPromptContext {
+            user_instructions: Some("MARKER_ALPHA_USER".to_string()),
+            sned_rules: Some("MARKER_BRAVO_RULE".to_string()),
+            sned_ignore_instructions: Some("MARKER_CHARLIE_IGNORE".to_string()),
+            global_sned_rules_file_instructions: Some("MARKER_DELTA_GLOBAL".to_string()),
+            local_sned_rules_file_instructions: Some("MARKER_ECHO_LOCAL".to_string()),
+            preferred_language_instructions: Some("MARKER_FOXTROT_LANGUAGE".to_string()),
+            local_cursor_rules_file_instructions: Some("MARKER_GOLF_CURSOR_FILE".to_string()),
+            local_cursor_rules_dir_instructions: Some("MARKER_HOTEL_CURSOR_DIR".to_string()),
+            local_windsurf_rules_file_instructions: Some("MARKER_INDIA_WINDSURF".to_string()),
+            local_agents_rules_file_instructions: Some("MARKER_JULIET_AGENTS".to_string()),
+            ..Default::default()
+        };
+
+        let prompt = PromptBuilder::new(context).build();
+
+        for marker in [
+            "MARKER_ALPHA_USER",
+            "MARKER_BRAVO_RULE",
+            "MARKER_CHARLIE_IGNORE",
+            "MARKER_DELTA_GLOBAL",
+            "MARKER_ECHO_LOCAL",
+            "MARKER_FOXTROT_LANGUAGE",
+            "MARKER_GOLF_CURSOR_FILE",
+            "MARKER_HOTEL_CURSOR_DIR",
+            "MARKER_INDIA_WINDSURF",
+            "MARKER_JULIET_AGENTS",
+        ] {
+            assert_eq!(
+                prompt.matches(marker).count(),
+                1,
+                "expected {marker} to be emitted once"
+            );
+        }
     }
 
     #[test]
