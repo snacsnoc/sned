@@ -174,6 +174,20 @@ fn test_exit_code_config_error() {
 }
 
 #[test]
+fn test_invalid_symbol_index_env_exits_with_config_error() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("sned").unwrap();
+    cmd.env("SNED_DIR", temp_dir.path());
+    cmd.env("SNED_SYMBOL_INDEX", "sqlite");
+    cmd.arg("--provider").arg("mock").arg("test");
+    cmd.assert()
+        .failure()
+        .code(2)
+        .stderr(contains("Invalid SNED_SYMBOL_INDEX value 'sqlite'"))
+        .stderr(contains("off, memory, persisted"));
+}
+
+#[test]
 fn test_exit_code_input_error() {
     let mut cmd = Command::cargo_bin("sned").unwrap();
     cmd.arg("--invalid-flag");

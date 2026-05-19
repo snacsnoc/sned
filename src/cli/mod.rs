@@ -537,6 +537,50 @@ struct TaskComponents {
     registry: Arc<crate::core::tools::ToolRegistry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolIndexMode {
+    Off,
+    Memory,
+    Persisted,
+}
+
+const SYMBOL_INDEX_ENV: &str = "SNED_SYMBOL_INDEX";
+
+fn parse_symbol_index_mode_value(value: &str) -> anyhow::Result<SymbolIndexMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(SymbolIndexMode::Off),
+        "memory" => Ok(SymbolIndexMode::Memory),
+        "persisted" => Ok(SymbolIndexMode::Persisted),
+        other => Err(crate::error::CliError::config(format!(
+            "Invalid {SYMBOL_INDEX_ENV} value '{other}'. Expected one of: off, memory, persisted."
+        ))
+        .into()),
+    }
+}
+
+fn symbol_index_mode_from_env() -> anyhow::Result<SymbolIndexMode> {
+    match std::env::var(SYMBOL_INDEX_ENV) {
+        Ok(value) => parse_symbol_index_mode_value(&value),
+        Err(std::env::VarError::NotPresent) => Ok(SymbolIndexMode::Persisted),
+        Err(std::env::VarError::NotUnicode(_)) => Err(crate::error::CliError::config(format!(
+            "{SYMBOL_INDEX_ENV} must be valid UTF-8. Expected one of: off, memory, persisted."
+        ))
+        .into()),
+    }
+}
+
+fn build_symbol_index_service(
+    cwd_str: String,
+    mode: SymbolIndexMode,
+) -> anyhow::Result<crate::services::symbol_index::SymbolIndexService> {
+    let service = crate::services::symbol_index::SymbolIndexService::new(cwd_str);
+    match mode {
+        SymbolIndexMode::Off => Ok(service.disabled()),
+        SymbolIndexMode::Memory => Ok(service),
+        SymbolIndexMode::Persisted => service.with_persistence(),
+    }
+}
+
 fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
     use crate::providers::env_auth::get_provider_from_env;
 
@@ -936,6 +980,8 @@ async fn build_task_components(
         std::env::set_current_dir(cwd)?;
     }
 
+    let symbol_index_mode = symbol_index_mode_from_env()?;
+
     let state_manager = Arc::new(StateManager::new()?);
     state_manager.initialize()?;
 
@@ -1055,10 +1101,10 @@ async fn build_task_components(
         let _ = task_storage.create_initial_metadata(&cwd_str, None);
     }
 
-    let symbol_index_service = Arc::new(std::sync::Mutex::new(
-        crate::services::symbol_index::SymbolIndexService::new(cwd_str.clone())
-            .with_persistence()?,
-    ));
+    let symbol_index_service = Arc::new(std::sync::Mutex::new(build_symbol_index_service(
+        cwd_str.clone(),
+        symbol_index_mode,
+    )?));
 
     let context_loader = crate::core::context::ContextLoader::new(cwd_str.clone())
         .with_symbol_index_service(Arc::clone(&symbol_index_service));
@@ -1759,6 +1805,30 @@ mod tests {
         // - cli/mod.rs calls .init() after parsing --verbose
         // - JsonOutputLayer is available in cli/mod.rs
         // - Log level is computed from cli.task_opts.verbose
+    }
+
+    #[test]
+    fn test_parse_symbol_index_mode_value() {
+        assert_eq!(
+            parse_symbol_index_mode_value("off").unwrap(),
+            SymbolIndexMode::Off
+        );
+        assert_eq!(
+            parse_symbol_index_mode_value("memory").unwrap(),
+            SymbolIndexMode::Memory
+        );
+        assert_eq!(
+            parse_symbol_index_mode_value("persisted").unwrap(),
+            SymbolIndexMode::Persisted
+        );
+        assert_eq!(
+            parse_symbol_index_mode_value(" PERSISTED ").unwrap(),
+            SymbolIndexMode::Persisted
+        );
+
+        let err = parse_symbol_index_mode_value("sqlite").unwrap_err();
+        assert!(err.to_string().contains("Invalid SNED_SYMBOL_INDEX value"));
+        assert!(err.to_string().contains("off, memory, persisted"));
     }
 
     #[test]

@@ -300,6 +300,26 @@ impl AgentLoop {
         }
     }
 
+    fn synthetic_json_completion_event(
+        text_only_completes_task: bool,
+        completion_tool_emitted: bool,
+        response_text: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        if !text_only_completes_task || completion_tool_emitted {
+            return None;
+        }
+
+        let result = response_text?;
+        if result.is_empty() {
+            return None;
+        }
+
+        Some(serde_json::json!({
+            "type": "completion",
+            "result": result,
+        }))
+    }
+
     pub fn new(config: AgentConfig) -> Self {
         let is_subagent = config.is_subagent_execution;
         let state = TaskState {
@@ -1629,15 +1649,13 @@ impl AgentLoop {
 
         // 6. Add assistant message to history
         let mut text_only_completes_task = false;
+        // Split raw model text into thinking + response.
+        // DeepSeek/Wafer embed thinking tags in delta.content; use the
+        // response part for completion output so hidden thinking stays hidden.
+        let (extracted_thinking, response_text) = split_model_output(&accumulated_text);
         {
             let mut history = history_clone.lock().await;
             let mut blocks: Vec<AssistantContentBlock> = Vec::new();
-
-            // Split raw model text into thinking + response.
-            // DeepSeek/Wafer embed thinking tags in delta.content;
-            // without splitting, the model sees its own thinking tags
-            // in conversation history, corrupting subsequent turns.
-            let (extracted_thinking, response_text) = split_model_output(&accumulated_text);
 
             if let Some(ref text) = response_text
                 && !text.is_empty()
@@ -2486,6 +2504,10 @@ impl AgentLoop {
         self.save_conversation_history().await;
 
         // 9. Check for completion
+        let completion_tool_emitted = tool_calls_vec.iter().any(|tc| {
+            let name = tc.function.name.as_deref().unwrap_or_default();
+            matches!(SnedTool::from_name(name), Some(SnedTool::AttemptCompletion))
+        });
         let is_completion = text_only_completes_task
             || tool_calls_vec.iter().any(|tc| {
                 let name = tc.function.name.as_deref().unwrap_or_default();
@@ -2494,6 +2516,16 @@ impl AgentLoop {
                     Some(SnedTool::AttemptCompletion) | Some(SnedTool::PlanModeRespond)
                 )
             });
+
+        if self.config.json_output
+            && let Some(event) = Self::synthetic_json_completion_event(
+                text_only_completes_task,
+                completion_tool_emitted,
+                response_text.as_deref(),
+            )
+        {
+            tracing::info!(target: "json_output", "{}", event);
+        }
 
         // Clear file content cache after each turn (cross-call coordination within a single turn)
         {
@@ -3377,6 +3409,31 @@ mod tests {
         let history = agent.conversation_history.lock().await;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn test_synthetic_json_completion_uses_response_text_without_thinking() {
+        let (_thinking, response_text) =
+            split_model_output("<think>\nhidden work\n</think>\nVisible result");
+
+        let event =
+            AgentLoop::synthetic_json_completion_event(true, false, response_text.as_deref())
+                .unwrap();
+
+        assert_eq!(event["type"], "completion");
+        assert_eq!(event["result"], "Visible result");
+    }
+
+    #[test]
+    fn test_synthetic_json_completion_skips_attempt_completion_path() {
+        assert!(
+            AgentLoop::synthetic_json_completion_event(true, true, Some("Done")).is_none(),
+            "attempt_completion already emits a completion event"
+        );
+        assert!(
+            AgentLoop::synthetic_json_completion_event(false, false, Some("Done")).is_none(),
+            "non-completing text turns should not emit completion"
+        );
     }
 
     #[tokio::test]

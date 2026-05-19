@@ -41,6 +41,7 @@ pub struct SymbolIndexService {
     files: HashMap<String, FileIndexEntry>,
     project_root: String,
     db: Option<db::SymbolIndexDatabase>,
+    disabled: bool,
 }
 
 const INDEX_DIR: &str = ".sned-symbol-index";
@@ -53,10 +54,26 @@ impl SymbolIndexService {
             files: HashMap::new(),
             project_root,
             db: None,
+            disabled: false,
         }
     }
 
+    pub fn disabled(mut self) -> Self {
+        self.disabled = true;
+        self.db = None;
+        self.files.clear();
+        self
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
     pub fn with_persistence(mut self) -> anyhow::Result<Self> {
+        if self.disabled {
+            return Ok(self);
+        }
+
         let db_dir = std::path::Path::new(&self.project_root).join(INDEX_DIR);
         std::fs::create_dir_all(&db_dir)?;
 
@@ -87,6 +104,10 @@ impl SymbolIndexService {
         size: u64,
         symbols: Vec<SymbolLocation>,
     ) {
+        if self.disabled {
+            return;
+        }
+
         self.store_indexed_files(vec![(rel_path, mtime, size, symbols)]);
     }
 
@@ -96,6 +117,10 @@ impl SymbolIndexService {
         symbol_type: Option<SymbolType>,
         limit: Option<usize>,
     ) -> Vec<SymbolLocation> {
+        if self.disabled {
+            return Vec::new();
+        }
+
         if let Some(ref db) = self.db {
             return db.get_symbols_by_name(symbol, symbol_type, limit);
         }
@@ -133,6 +158,10 @@ impl SymbolIndexService {
     }
 
     pub fn remove_file(&mut self, rel_path: &str) {
+        if self.disabled {
+            return;
+        }
+
         if let Some(ref mut db) = self.db
             && let Err(e) = db.remove_file(rel_path)
         {
@@ -146,6 +175,10 @@ impl SymbolIndexService {
     }
 
     pub fn get_file_metadata(&self, rel_path: &str) -> Option<(u64, u64)> {
+        if self.disabled {
+            return None;
+        }
+
         if let Some(ref db) = self.db {
             return db.get_file_metadata(rel_path);
         }
@@ -153,6 +186,10 @@ impl SymbolIndexService {
     }
 
     pub fn symbol_count(&self) -> usize {
+        if self.disabled {
+            return 0;
+        }
+
         if let Some(ref db) = self.db {
             return db.symbol_count();
         }
@@ -160,6 +197,10 @@ impl SymbolIndexService {
     }
 
     pub fn get_file_symbols(&self, rel_path: &str) -> Vec<SymbolLocation> {
+        if self.disabled {
+            return Vec::new();
+        }
+
         if let Some(ref db) = self.db {
             return db.get_file_symbols(rel_path);
         }
@@ -170,6 +211,10 @@ impl SymbolIndexService {
     }
 
     pub fn file_count(&self) -> usize {
+        if self.disabled {
+            return 0;
+        }
+
         if let Some(ref db) = self.db {
             return db.file_count();
         }
@@ -177,12 +222,20 @@ impl SymbolIndexService {
     }
 
     pub fn vacuum(&self) {
+        if self.disabled {
+            return;
+        }
+
         if let Some(ref db) = self.db {
             db.vacuum();
         }
     }
 
     pub fn initialize(&mut self) -> anyhow::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+
         if self.db.is_none() {
             return Ok(());
         }
@@ -268,6 +321,10 @@ impl SymbolIndexService {
         &mut self,
         files_to_update: &[(std::path::PathBuf, String)],
     ) -> anyhow::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+
         if files_to_update.is_empty() {
             return Ok(());
         }
@@ -321,6 +378,10 @@ impl SymbolIndexService {
     }
 
     fn store_indexed_files(&mut self, entries: Vec<(String, u64, u64, Vec<SymbolLocation>)>) {
+        if self.disabled {
+            return;
+        }
+
         if entries.is_empty() {
             return;
         }
@@ -344,6 +405,10 @@ impl SymbolIndexService {
     }
 
     pub fn update_file(&mut self, absolute_path: &str) -> anyhow::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+
         let root = std::path::Path::new(&self.project_root);
         let abs_path = std::path::Path::new(absolute_path);
         let rel = abs_path.strip_prefix(root).unwrap_or(abs_path);
@@ -603,6 +668,67 @@ mod tests {
         let results = service.get_symbols("persisted", None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_disabled_mode_never_indexes_or_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let file_path = src_dir.join("lib.rs");
+        std::fs::write(&file_path, "fn should_not_be_indexed() {}\n").unwrap();
+
+        let mut service = SymbolIndexService::new(root.to_string_lossy().to_string()).disabled();
+        assert!(service.is_disabled());
+
+        service = service.with_persistence().unwrap();
+        assert!(!root.join(INDEX_DIR).exists());
+
+        service.initialize().unwrap();
+        assert_eq!(service.file_count(), 0);
+        assert_eq!(service.symbol_count(), 0);
+        assert!(
+            service
+                .get_definitions("should_not_be_indexed", None)
+                .is_empty()
+        );
+        assert!(service.get_file_symbols("src/lib.rs").is_empty());
+        assert_eq!(service.get_file_metadata("src/lib.rs"), None);
+
+        service.index_file(
+            "src/manual.rs".to_string(),
+            1,
+            10,
+            vec![make_symbol("manual", 1, SymbolType::Definition)],
+        );
+        service.update_file("/path/that/does/not/exist.rs").unwrap();
+        service.remove_file("src/manual.rs");
+
+        assert_eq!(service.file_count(), 0);
+        assert_eq!(service.symbol_count(), 0);
+        assert!(service.get_symbols("manual", None, None).is_empty());
+        assert!(!root.join(INDEX_DIR).exists());
+    }
+
+    #[test]
+    fn test_memory_mode_indexes_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let file_path = src_dir.join("lib.rs");
+        std::fs::write(&file_path, "fn in_memory_symbol() {}\n").unwrap();
+
+        let mut service = SymbolIndexService::new(root.to_string_lossy().to_string());
+        service.update_file(file_path.to_str().unwrap()).unwrap();
+
+        let defs = service.get_definitions("in_memory_symbol", None);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(service.file_count(), 1);
+        assert!(service.symbol_count() >= 1);
+        assert!(!root.join(INDEX_DIR).exists());
     }
 
     #[test]
