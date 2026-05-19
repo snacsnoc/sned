@@ -124,7 +124,8 @@ impl MinimaxProvider {
             .or_else(|| self.get_model_info().max_tokens)
             .filter(|m| *m > 0)
         {
-            body["max_tokens"] = json!(max_tokens);
+            // MiniMax uses max_completion_tokens (OpenAI-compatible API)
+            body["max_completion_tokens"] = json!(max_tokens);
         }
 
         // Tools in MiniMax OpenAI-compatible format (requires "type": "function")
@@ -145,10 +146,10 @@ impl MinimaxProvider {
             body["tools"] = json!(tools_json);
         }
 
-        // Reasoning config via extra_body (always enable for M2.7)
-        body["extra_body"] = json!({
-            "reasoning_split": true,
-        });
+        // Reasoning config (always enable for M2.7)
+        // reasoning_split must be a top-level parameter, not nested in extra_body
+        // (extra_body is an OpenAI Python SDK convenience that merges into the request body)
+        body["reasoning_split"] = json!(true);
 
         Ok(body)
     }
@@ -422,14 +423,15 @@ fn convert_assistant_blocks_to_openai(
         "role": role,
     });
 
-    // Content: null if there are tool calls, otherwise the text
+    // Content: empty string if there are tool calls but no text
+    // MiniMax requires content to be a non-null string (not nullable)
     if tool_calls.is_empty() {
         msg["content"] = json!(text_content);
     } else {
         msg["content"] = json!(if text_content.is_empty() {
-            None::<String>
+            "".to_string()
         } else {
-            Some(text_content)
+            text_content
         });
         msg["tool_calls"] = json!(tool_calls);
     }
@@ -1121,7 +1123,8 @@ mod tests {
         };
 
         let body = provider.build_request_body(&request).unwrap();
-        assert_eq!(body["max_tokens"], 2048);
+        // MiniMax uses max_completion_tokens (not max_tokens)
+        assert_eq!(body["max_completion_tokens"], 2048);
     }
 
     #[test]
@@ -1230,6 +1233,65 @@ mod tests {
         assert_eq!(openai_msg["role"], "tool");
         assert_eq!(openai_msg["tool_call_id"], "call_abc");
         assert_eq!(openai_msg["content"], "[package]\nname = \"test\"");
+    }
+
+    #[test]
+    fn test_build_request_body_includes_reasoning_split() {
+        let config = MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "MiniMax-M2.7".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+        };
+        let provider = MinimaxProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        // reasoning_split must be a top-level parameter (not nested in extra_body)
+        assert_eq!(body["reasoning_split"], true);
+        assert!(body.get("extra_body").is_none());
+    }
+
+    #[test]
+    fn test_convert_assistant_tool_calls_only_empty_content_string() {
+        // MiniMax requires content to be a non-null string
+        // When assistant has tool calls but no text, content should be "" not null
+        let msg = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![
+                AssistantContentBlock::ToolUse(crate::providers::ToolUseBlock {
+                    id: "call_abc".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "Cargo.toml"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                }),
+            ]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+
+        let openai_msgs = convert_message_to_openai(&msg);
+        assert_eq!(openai_msgs.len(), 1);
+        let openai_msg = &openai_msgs[0];
+        assert_eq!(openai_msg["role"], "assistant");
+        // content must be a string (not null) for MiniMax API
+        assert_eq!(openai_msg["content"], "");
+        assert!(openai_msg["tool_calls"].is_array());
     }
 
     #[tokio::test]
