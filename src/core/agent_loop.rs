@@ -42,6 +42,11 @@ use tracing::{error, info, warn};
 const DEFAULT_MESSAGE_QUEUE_MAX_LEN: usize = 1000;
 const MESSAGE_QUEUE_MAX_LEN_ENV: &str = "SNED_AGENT_MAX_QUEUED_MESSAGES";
 
+/// Default token limit for tool results stored in history (~5000 tokens / ~20KB)
+const DEFAULT_TOOL_RESULT_HISTORY_LIMIT: usize = 20_000;
+/// Environment variable to configure tool result history limit
+const TOOL_RESULT_HISTORY_LIMIT_ENV: &str = "SNED_TOOL_RESULT_HISTORY_LIMIT";
+
 pub use crate::cli::spinner::Spinner;
 use crate::cli::spinner::multi_tool_label;
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
@@ -54,6 +59,35 @@ const MAX_TOOL_RESULT_DISPLAY_LINES: usize = 5;
 const MAX_COMMAND_RESULT_DISPLAY_LINES: usize = 8;
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
+
+/// Truncate tool result text to fit within the configured history limit.
+/// Returns the truncated text with a marker if truncation occurred.
+fn truncate_tool_result(result: &str) -> String {
+    let limit = std::env::var(TOOL_RESULT_HISTORY_LIMIT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TOOL_RESULT_HISTORY_LIMIT);
+
+    if result.len() <= limit {
+        return result.to_string();
+    }
+
+    // Truncate at byte boundary and add marker
+    let truncated_len = limit.saturating_sub(50); // Reserve space for marker
+    let boundary = result
+        .floor_char_boundary(truncated_len.min(result.len()))
+        .min(result.len());
+
+    let truncated = &result[..boundary];
+    let original_lines = result.lines().count();
+    let truncated_lines = truncated.lines().count();
+    let remaining_lines = original_lines - truncated_lines;
+
+    format!(
+        "{}\n\n[{} lines truncated, use read_file to see full content]",
+        truncated, remaining_lines
+    )
+}
 
 fn code_fence_language(line: &str) -> &str {
     line.trim_start()
@@ -2348,10 +2382,13 @@ impl AgentLoop {
                     "tool result paired with ID"
                 );
 
+                // Truncate tool result before storing in history to prevent context bloat
+                let truncated_text = truncate_tool_result(&result_text);
+
                 tool_result_blocks.push(UserContentBlock::ToolResult(
                     crate::providers::ToolResultBlock {
                         tool_use_id: tool_id,
-                        content: ToolResultContent::Text(result_text),
+                        content: ToolResultContent::Text(truncated_text),
                         shared: SharedContentFields {
                             call_id: None,
                             signature: None,
@@ -5165,5 +5202,54 @@ mod tests {
         assert!(header.contains("Turn 3"));
         assert!(header.contains("45% context"));
         assert!(header.contains("═══"));
+    }
+
+    #[test]
+    fn test_truncate_tool_result_small() {
+        // Small results should pass through unchanged
+        let small = "Hello, world!";
+        let result = truncate_tool_result(small);
+        assert_eq!(result, small);
+    }
+
+    #[test]
+    fn test_truncate_tool_result_large() {
+        // Large results should be truncated with marker
+        let large = "line 1\n".repeat(10000); // ~70KB
+        let result = truncate_tool_result(&large);
+
+        // Should be truncated
+        assert!(result.len() < large.len());
+        // Should have truncation marker
+        assert!(result.contains("lines truncated"));
+        assert!(result.contains("use read_file to see full content"));
+        // Should still have some content (at least 100 bytes)
+        assert!(result.len() > 100);
+    }
+
+    #[test]
+    fn test_truncate_tool_result_respects_env_var() {
+        // Test with custom limit via environment variable
+        unsafe {
+            std::env::set_var(TOOL_RESULT_HISTORY_LIMIT_ENV, "100");
+        }
+        let large = "x".repeat(500);
+        let result = truncate_tool_result(&large);
+        assert!(result.len() < 150); // 100 limit + marker
+        unsafe {
+            std::env::remove_var(TOOL_RESULT_HISTORY_LIMIT_ENV);
+        }
+    }
+
+    #[test]
+    fn test_truncate_tool_result_preserves_unicode() {
+        // Truncation should preserve Unicode boundaries
+        let large = "Hello 🌍 ".repeat(5000);
+        let result = truncate_tool_result(&large);
+        // Should not end with a partial emoji (which is 4 bytes)
+        assert!(!result.ends_with("�"));
+        assert!(!result.ends_with("🌍"));
+        // Should have truncation marker
+        assert!(result.contains("lines truncated"));
     }
 }
