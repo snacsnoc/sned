@@ -1,6 +1,24 @@
 //! MiniMax provider implementation for sned CLI.
 //!
-//! Ports behavior from MiniMax API documentation and Anthropic-compatible endpoint.
+//! Uses MiniMax OpenAI-compatible API endpoint:
+//! - International: https://api.minimax.io/v1 (default)
+//! - China: https://api.minimaxi.com/v1 (requires api_line="china")
+//!
+//! ## API Format Constraints (critical - do not change without verifying against MiniMax docs)
+//!
+//! 1. **Tools**: Must use nested format `{"type":"function","function":{...}}`
+//!    - Flat format `{"name":...,"parameters":...}` causes API errors
+//!    - See: MiniMax OpenAI API docs (llm-openai-docs/md/minimax/)
+//!
+//! 2. **reasoning_split**: Must be top-level parameter, NOT nested in `extra_body`
+//!    - `extra_body` is an OpenAI Python SDK convenience that merges into the request body
+//!    - Sending `{"extra_body":{"reasoning_split":true}}` causes error 2013 "chat content is empty"
+//!
+//! 3. **max_completion_tokens**: MiniMax uses this parameter name, not `max_tokens`
+//!
+//! 4. **Message content**: Must be non-null string
+//!    - `content: null` causes error 2013
+//!    - Use `content: ""` for assistant messages with tool calls but no text
 
 use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
@@ -59,6 +77,9 @@ impl MinimaxProvider {
     }
 
     fn base_url(&self) -> String {
+        // Default to international endpoint (.io) - this is the correct production endpoint
+        // China endpoint (.com) only used when explicitly configured via api_line="china"
+        // See: llm-openai-docs/md/minimax/platform.minimax.io_docs_api-reference_text-openai-api.md
         if self.config.api_line.as_deref() == Some("china") {
             "https://api.minimaxi.com/v1".to_string()
         } else {
@@ -1292,6 +1313,83 @@ mod tests {
         // content must be a string (not null) for MiniMax API
         assert_eq!(openai_msg["content"], "");
         assert!(openai_msg["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn test_request_body_schema_invariants() {
+        // Validates critical MiniMax API format constraints.
+        // If this test fails after a "fix", read the MINIMAX_API_GOTCHAS doc comment
+        // at the top of this file before proceeding.
+        let config = MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "MiniMax-M2.7".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+        };
+        let provider = MinimaxProvider::new(config).unwrap();
+
+        let tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: crate::providers::FunctionDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            },
+        }];
+
+        let request = ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: vec![StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: crate::providers::MessageContent::Text("Read Cargo.toml".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }],
+            tools: Some(tools),
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: Some(1024),
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+
+        // 1. reasoning_split must be top-level (not nested in extra_body)
+        assert_eq!(body["reasoning_split"], true, "reasoning_split must be top-level");
+        assert!(body.get("extra_body").is_none(), "extra_body should not exist in request body");
+
+        // 2. Tools must use nested format with "type":"function"
+        let tools_arr = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools_arr.len(), 1);
+        let tool = &tools_arr[0];
+        assert_eq!(tool["type"], "function", "tool must have type='function'");
+        assert!(tool["function"].is_object(), "tool must have nested 'function' object");
+        assert_eq!(tool["function"]["name"], "read_file");
+
+        // 3. Must use max_completion_tokens (not max_tokens)
+        assert_eq!(body["max_completion_tokens"], 1024, "must use max_completion_tokens");
+        assert!(body.get("max_tokens").is_none(), "max_tokens should not exist in request body");
+
+        // 4. Messages must have non-null content
+        let messages = body["messages"].as_array().expect("messages should be array");
+        for (i, msg) in messages.iter().enumerate() {
+            assert!(
+                msg.get("content").is_some(),
+                "message[{i}] must have 'content' field"
+            );
+            if let Some(content) = msg.get("content") {
+                assert!(
+                    !content.is_null(),
+                    "message[{i}] content must not be null (use empty string if no text)"
+                );
+            }
+        }
     }
 
     #[tokio::test]
