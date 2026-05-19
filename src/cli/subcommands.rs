@@ -691,6 +691,38 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
     state_manager.set_secret(secret_key, api_key.clone());
     println!("Stored API key for {}", provider);
 
+    // Persist model ID if provided (applies to both act and plan modes)
+    if let Some(model_id) = &opts.modelid {
+        state_manager.set_global_state_string_field("act_mode_api_model_id", model_id.clone())?;
+        state_manager.set_global_state_string_field("plan_mode_api_model_id", model_id.clone())?;
+        println!("Stored model ID: {}", model_id);
+    }
+
+    // Persist base URL if provided (provider-specific)
+    if let Some(base_url) = &opts.baseurl {
+        let base_url_key = match provider.as_str() {
+            "anthropic" => "anthropic_base_url",
+            "openai" | "openai-native" => "open_ai_base_url",
+            "openrouter" => "open_router_base_url",
+            "gemini" => "gemini_base_url",
+            "lite_llm" => "lite_llm_base_url",
+            _ => {
+                // For other providers, use open_ai_base_url as fallback
+                "open_ai_base_url"
+            }
+        };
+        state_manager.set_global_state_string_field(base_url_key, base_url.clone())?;
+        println!("Stored base URL for {}: {}", provider, base_url);
+    }
+
+    // Persist Azure API version if provided (stored for Azure OpenAI provider)
+    if let Some(azure_version) = &opts.azure_api_version {
+        // Azure API version is typically used with Azure OpenAI
+        // Store it as a setting that can be referenced later
+        state_manager.set_global_state_string_field("azure_api_version", azure_version.clone())?;
+        println!("Stored Azure API version: {}", azure_version);
+    }
+
     if opts.verbose {
         use crate::storage::global_state::load_global_state;
         let state = load_global_state();
@@ -868,5 +900,103 @@ pub fn run_doctor() -> anyhow::Result<()> {
     } else {
         println!("Status: OK (all checks passed)");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Test that run_auth accepts and processes modelid flag without error.
+    /// 
+    /// Note: This test verifies the flag is accepted and processed.
+    /// Persistence to disk happens asynchronously via StateManager's background persist.
+    #[test]
+    fn test_run_auth_accepts_model_id_flag() {
+        let temp = TempDir::new().unwrap();
+        let tasks_dir = temp.path().join("tasks");
+        let settings_dir = temp.path().join("settings");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        // Override SNED_DATA_DIR for this test
+        let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        unsafe {
+            std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
+        }
+
+        let opts = AuthOptions {
+            provider: Some("anthropic".to_string()),
+            apikey: Some("test-api-key".to_string()),
+            modelid: Some("claude-sonnet-4-20250514".to_string()),
+            baseurl: None,
+            azure_api_version: None,
+            verbose: false,
+            cwd: None,
+            config: Some(temp.path().to_str().unwrap().to_string()),
+        };
+
+        // Should complete without error
+        let result = run_auth(opts);
+        assert!(result.is_ok(), "run_auth should succeed with modelid flag");
+
+        // Restore original env var
+        if let Some(val) = original_data_dir {
+            unsafe {
+                std::env::set_var("SNED_DATA_DIR", val);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("SNED_DATA_DIR");
+            }
+        }
+    }
+
+    /// Test that run_auth accepts and processes baseurl flag without error.
+    #[test]
+    fn test_run_auth_accepts_baseurl_flag() {
+        let temp = TempDir::new().unwrap();
+        let tasks_dir = temp.path().join("tasks");
+        let settings_dir = temp.path().join("settings");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        // Override SNED_DATA_DIR for this test
+        let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        unsafe {
+            std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
+        }
+
+        let opts = AuthOptions {
+            provider: Some("anthropic".to_string()),
+            apikey: Some("test-api-key".to_string()),
+            modelid: None,
+            baseurl: Some("https://custom.anthropic.com".to_string()),
+            azure_api_version: None,
+            verbose: false,
+            cwd: None,
+            config: Some(temp.path().to_str().unwrap().to_string()),
+        };
+
+        // Should complete without error
+        let result = run_auth(opts);
+        assert!(result.is_ok(), "run_auth should succeed with baseurl flag");
+
+        // Restore original env var
+        if let Some(val) = original_data_dir {
+            unsafe {
+                std::env::set_var("SNED_DATA_DIR", val);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("SNED_DATA_DIR");
+            }
+        }
     }
 }

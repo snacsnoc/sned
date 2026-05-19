@@ -39,6 +39,21 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "API provider for plan mode",
     },
     ConfigKeyInfo {
+        name: "act_mode_api_model_id",
+        key_type: "string",
+        description: "Model ID for act mode",
+    },
+    ConfigKeyInfo {
+        name: "plan_mode_api_model_id",
+        key_type: "string",
+        description: "Model ID for plan mode",
+    },
+    ConfigKeyInfo {
+        name: "azure_api_version",
+        key_type: "string",
+        description: "Azure OpenAI API version",
+    },
+    ConfigKeyInfo {
         name: "preferred_language",
         key_type: "string",
         description: "Preferred language for responses",
@@ -87,6 +102,11 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         name: "open_ai_base_url",
         key_type: "string",
         description: "OpenAI API base URL",
+    },
+    ConfigKeyInfo {
+        name: "open_router_base_url",
+        key_type: "string",
+        description: "OpenRouter API base URL",
     },
     ConfigKeyInfo {
         name: "gemini_base_url",
@@ -295,6 +315,9 @@ pub enum GlobalStateKey {
     // Config fields (expanded to match VALID_CONFIG_KEYS)
     ActModeApiProvider,
     PlanModeApiProvider,
+    ActModeApiModelId,
+    PlanModeApiModelId,
+    AzureApiVersion,
     PreferredLanguage,
     TelemetrySetting,
     DefaultTerminalProfile,
@@ -305,6 +328,7 @@ pub enum GlobalStateKey {
     LiteLlmBaseUrl,
     AnthropicBaseUrl,
     OpenAiBaseUrl,
+    OpenRouterBaseUrl,
     GeminiBaseUrl,
     AwsRegion,
     OpenTelemetryMetricsExporter,
@@ -346,6 +370,9 @@ impl GlobalStateKey {
             GlobalStateKey::Mode => Some(state.mode.clone()),
             GlobalStateKey::ActModeApiProvider => Some(state.act_mode_api_provider.clone()),
             GlobalStateKey::PlanModeApiProvider => Some(state.plan_mode_api_provider.clone()),
+            GlobalStateKey::ActModeApiModelId => state.act_mode_api_model_id.clone(),
+            GlobalStateKey::PlanModeApiModelId => state.plan_mode_api_model_id.clone(),
+            GlobalStateKey::AzureApiVersion => state.azure_api_version.clone(),
             GlobalStateKey::PreferredLanguage => Some(state.preferred_language.clone()),
             GlobalStateKey::TelemetrySetting => Some(state.telemetry_setting.clone()),
             GlobalStateKey::DefaultTerminalProfile => Some(state.default_terminal_profile.clone()),
@@ -358,6 +385,7 @@ impl GlobalStateKey {
             GlobalStateKey::LiteLlmBaseUrl => state.lite_llm_base_url.clone(),
             GlobalStateKey::AnthropicBaseUrl => state.anthropic_base_url.clone(),
             GlobalStateKey::OpenAiBaseUrl => state.open_ai_base_url.clone(),
+            GlobalStateKey::OpenRouterBaseUrl => state.open_router_base_url.clone(),
             GlobalStateKey::GeminiBaseUrl => state.gemini_base_url.clone(),
             GlobalStateKey::AwsRegion => state.aws_region.clone(),
             GlobalStateKey::OpenTelemetryMetricsExporter => {
@@ -471,6 +499,15 @@ impl GlobalStateKey {
             GlobalStateKey::PlanModeApiProvider => {
                 serde_json::to_value(&state.plan_mode_api_provider).ok()
             }
+            GlobalStateKey::ActModeApiModelId => {
+                serde_json::to_value(&state.act_mode_api_model_id).ok()
+            }
+            GlobalStateKey::PlanModeApiModelId => {
+                serde_json::to_value(&state.plan_mode_api_model_id).ok()
+            }
+            GlobalStateKey::AzureApiVersion => {
+                serde_json::to_value(&state.azure_api_version).ok()
+            }
             GlobalStateKey::PreferredLanguage => {
                 serde_json::to_value(&state.preferred_language).ok()
             }
@@ -504,6 +541,10 @@ impl GlobalStateKey {
                 .map(|v| serde_json::to_value(v).unwrap()),
             GlobalStateKey::OpenAiBaseUrl => state
                 .open_ai_base_url
+                .as_ref()
+                .map(|v| serde_json::to_value(v).unwrap()),
+            GlobalStateKey::OpenRouterBaseUrl => state
+                .open_router_base_url
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
             GlobalStateKey::GeminiBaseUrl => state
@@ -660,6 +701,15 @@ impl GlobalStateKey {
                     state.plan_mode_api_provider = v;
                 }
             }
+            GlobalStateKey::ActModeApiModelId => {
+                state.act_mode_api_model_id = serde_json::from_value(value).ok()
+            }
+            GlobalStateKey::PlanModeApiModelId => {
+                state.plan_mode_api_model_id = serde_json::from_value(value).ok()
+            }
+            GlobalStateKey::AzureApiVersion => {
+                state.azure_api_version = serde_json::from_value(value).ok()
+            }
             GlobalStateKey::PreferredLanguage => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.preferred_language = v;
@@ -695,6 +745,9 @@ impl GlobalStateKey {
             }
             GlobalStateKey::OpenAiBaseUrl => {
                 state.open_ai_base_url = serde_json::from_value(value).ok()
+            }
+            GlobalStateKey::OpenRouterBaseUrl => {
+                state.open_router_base_url = serde_json::from_value(value).ok()
             }
             GlobalStateKey::GeminiBaseUrl => {
                 state.gemini_base_url = serde_json::from_value(value).ok()
@@ -875,6 +928,18 @@ impl std::str::FromStr for GlobalStateKey {
             "planModeApiProvider" | "plan_mode_api_provider" => {
                 Ok(GlobalStateKey::PlanModeApiProvider)
             }
+            // actModeApiModelId
+            "actModeApiModelId" | "act_mode_api_model_id" => {
+                Ok(GlobalStateKey::ActModeApiModelId)
+            }
+            // planModeApiModelId
+            "planModeApiModelId" | "plan_mode_api_model_id" => {
+                Ok(GlobalStateKey::PlanModeApiModelId)
+            }
+            // azureApiVersion
+            "azureApiVersion" | "azure_api_version" => {
+                Ok(GlobalStateKey::AzureApiVersion)
+            }
             // preferredLanguage
             "preferredLanguage" | "preferred_language" => Ok(GlobalStateKey::PreferredLanguage),
             // telemetrySetting
@@ -903,6 +968,8 @@ impl std::str::FromStr for GlobalStateKey {
             "anthropicBaseUrl" | "anthropic_base_url" => Ok(GlobalStateKey::AnthropicBaseUrl),
             // openAiBaseUrl
             "openAiBaseUrl" | "open_ai_base_url" => Ok(GlobalStateKey::OpenAiBaseUrl),
+            // openRouterBaseUrl
+            "openRouterBaseUrl" | "open_router_base_url" => Ok(GlobalStateKey::OpenRouterBaseUrl),
             // geminiBaseUrl
             "geminiBaseUrl" | "gemini_base_url" => Ok(GlobalStateKey::GeminiBaseUrl),
             // awsRegion
@@ -1036,6 +1103,9 @@ impl std::fmt::Display for GlobalStateKey {
             GlobalStateKey::EnableCheckpoints => write!(f, "enableCheckpoints"),
             GlobalStateKey::ActModeApiProvider => write!(f, "actModeApiProvider"),
             GlobalStateKey::PlanModeApiProvider => write!(f, "planModeApiProvider"),
+            GlobalStateKey::ActModeApiModelId => write!(f, "actModeApiModelId"),
+            GlobalStateKey::PlanModeApiModelId => write!(f, "planModeApiModelId"),
+            GlobalStateKey::AzureApiVersion => write!(f, "azureApiVersion"),
             GlobalStateKey::PreferredLanguage => write!(f, "preferredLanguage"),
             GlobalStateKey::TelemetrySetting => write!(f, "telemetrySetting"),
             GlobalStateKey::DefaultTerminalProfile => write!(f, "defaultTerminalProfile"),
@@ -1048,6 +1118,7 @@ impl std::fmt::Display for GlobalStateKey {
             GlobalStateKey::LiteLlmBaseUrl => write!(f, "liteLlmBaseUrl"),
             GlobalStateKey::AnthropicBaseUrl => write!(f, "anthropicBaseUrl"),
             GlobalStateKey::OpenAiBaseUrl => write!(f, "openAiBaseUrl"),
+            GlobalStateKey::OpenRouterBaseUrl => write!(f, "openRouterBaseUrl"),
             GlobalStateKey::GeminiBaseUrl => write!(f, "geminiBaseUrl"),
             GlobalStateKey::AwsRegion => write!(f, "awsRegion"),
             GlobalStateKey::OpenTelemetryMetricsExporter => {
@@ -1427,6 +1498,18 @@ impl StateManager {
                 state.plan_mode_api_provider = value;
                 true
             }
+            "act_mode_api_model_id" => {
+                state.act_mode_api_model_id = Some(value);
+                true
+            }
+            "plan_mode_api_model_id" => {
+                state.plan_mode_api_model_id = Some(value);
+                true
+            }
+            "azure_api_version" => {
+                state.azure_api_version = Some(value);
+                true
+            }
             "preferred_language" => {
                 state.preferred_language = value;
                 true
@@ -1465,6 +1548,10 @@ impl StateManager {
             }
             "open_ai_base_url" => {
                 state.open_ai_base_url = Some(value);
+                true
+            }
+            "open_router_base_url" => {
+                state.open_router_base_url = Some(value);
                 true
             }
             "gemini_base_url" => {

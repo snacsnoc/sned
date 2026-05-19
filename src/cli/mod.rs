@@ -641,25 +641,37 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
         "anthropic" => {
             let api_key =
                 std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "dummy".to_string());
+            // Use stored model ID default if not specified
+            let default_model = model_id.or_else(|| {
+                let state = crate::storage::global_state::load_global_state();
+                state.act_mode_api_model_id
+            }).unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string());
             Arc::new(crate::providers::anthropic::AnthropicProvider::new(
                 crate::providers::anthropic::AnthropicConfig {
                     api_key,
                     base_url: None,
-                    model_id: model_id.unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string()),
+                    model_id: default_model,
                     model_info: Some(crate::providers::ModelInfo::default()),
                     thinking_budget_tokens: thinking_budget,
                 },
             )?)
         }
-        "minimax" => Arc::new(crate::providers::minimax::MinimaxProvider::new(
-            crate::providers::minimax::MinimaxConfig {
-                api_key: std::env::var("MINIMAX_API_KEY").unwrap_or_default(),
-                api_line: None,
-                model_id: model_id.unwrap_or_else(|| "MiniMax-M2.7".to_string()),
-                model_info: None,
-                thinking_budget_tokens: thinking_budget,
-            },
-        )?),
+        "minimax" => {
+            // Use stored model ID default if not specified
+            let default_model = model_id.or_else(|| {
+                let state = crate::storage::global_state::load_global_state();
+                state.act_mode_api_model_id
+            }).unwrap_or_else(|| "MiniMax-M2.7".to_string());
+            Arc::new(crate::providers::minimax::MinimaxProvider::new(
+                crate::providers::minimax::MinimaxConfig {
+                    api_key: std::env::var("MINIMAX_API_KEY").unwrap_or_default(),
+                    api_line: None,
+                    model_id: default_model,
+                    model_info: None,
+                    thinking_budget_tokens: thinking_budget,
+                },
+            )?)
+        }
         "openai" | "openai-native" => {
             let api_key = task_opts
                 .api_key
@@ -670,9 +682,14 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 .base_url
                 .clone()
                 .or_else(|| std::env::var("OPENAI_API_BASE").ok());
+            // Use stored model ID default if not specified
+            let default_model = model_id.or_else(|| {
+                let state = crate::storage::global_state::load_global_state();
+                state.act_mode_api_model_id
+            }).unwrap_or_else(|| "gpt-4o".to_string());
             Arc::new(crate::providers::openai::OpenAiProvider::new(
                 crate::providers::openai::OpenAiConfig {
-                    model_id: model_id.unwrap_or_else(|| "gpt-4o".to_string()),
+                    model_id: default_model,
                     api_key,
                     base_url,
                     model_info: None,
@@ -695,9 +712,14 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 .base_url
                 .clone()
                 .or_else(|| std::env::var("GEMINI_BASE_URL").ok());
+            // Use stored model ID default if not specified
+            let default_model = model_id.or_else(|| {
+                let state = crate::storage::global_state::load_global_state();
+                state.act_mode_api_model_id
+            }).unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
             Arc::new(crate::providers::gemini::GeminiProvider::new(
                 crate::providers::gemini::GeminiConfig {
-                    model_id: model_id.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
+                    model_id: default_model,
                     api_key,
                     base_url,
                     model_info: None,

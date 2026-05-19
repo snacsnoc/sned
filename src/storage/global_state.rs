@@ -147,6 +147,8 @@ pub struct GlobalState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_ai_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_router_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws_region: Option<String>,
@@ -154,6 +156,12 @@ pub struct GlobalState {
     pub plan_mode_api_provider: String,
     #[serde(default = "default_anthropic")]
     pub act_mode_api_provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act_mode_api_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_mode_api_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_api_version: Option<String>,
     #[serde(default)]
     pub enable_parallel_tool_calling: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
