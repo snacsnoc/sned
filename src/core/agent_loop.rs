@@ -5415,6 +5415,7 @@ mod tests {
         }
 
         let mut history = vec![
+            // First message - should be truncated (not most recent)
             StorageMessage {
                 id: None,
                 role: MessageRole::Assistant,
@@ -5433,14 +5434,41 @@ mod tests {
                 metrics: None,
                 ts: Some(1000),
             },
+            // Second message - most recent, should NOT be truncated
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    AssistantContentBlock::Thinking(ThinkingBlock {
+                        thinking: "w".repeat(2000),
+                        signature: "sig2".to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        summary: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: Some(2000),
+            },
         ];
 
         truncate_old_thinking_blocks(&mut history);
 
-        // With 100 token limit (400 chars), 2000 chars should be truncated
+        // With 100 token limit (400 chars), first message's 2000 chars should be truncated
         if let MessageContent::AssistantBlocks(blocks) = &history[0].content {
             if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
                 assert!(tb.thinking.len() < 2000, "Should be truncated with custom limit");
+                assert!(tb.thinking.contains("[truncated]"), "Should have truncation marker");
+            }
+        }
+
+        // Second message (most recent) should NOT be truncated
+        if let MessageContent::AssistantBlocks(blocks) = &history[1].content {
+            if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
+                assert_eq!(tb.thinking.len(), 2000, "Most recent thinking should NOT be truncated");
             }
         }
 
