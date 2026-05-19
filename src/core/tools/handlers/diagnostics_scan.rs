@@ -8,12 +8,26 @@ use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
+
+/// Pre-compiled regex for ESLint-style diagnostics.
+/// Matches: `/path/to/file.js: line 10, col 5, Error - Expected ';'`
+static ESLINT_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r":\s*(\d+)\s*,?\s*(?:col\s*(\d+)\s*,?\s*)?\s*(Error|Warning|Info)\s*-\s*(.+)$")
+        .unwrap()
+});
+
+/// Pre-compiled regex for Python-style diagnostics.
+/// Matches: `File "...", line N`
+static PYTHON_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"File\s+"([^"]+)",\s*line\s*(\d+)"#).unwrap()
+});
 
 /// Diagnostics scan tool handler.
 #[derive(Debug, Clone, Default)]
@@ -372,11 +386,7 @@ impl DiagnosticsScanHandler {
     fn parse_eslint_style(line: &str, _display_path: &str) -> Option<Diagnostic> {
         // Match patterns like:
         // /path/to/file.js: line 10, col 5, Error - Expected ';'
-        let re = regex::Regex::new(
-            r":\s*(\d+)\s*,?\s*(?:col\s*(\d+)\s*,?\s*)?\s*(Error|Warning|Info)\s*-\s*(.+)$",
-        )
-        .ok()?;
-        let caps = re.captures(line)?;
+        let caps = ESLINT_REGEX.captures(line)?;
 
         let line_num = caps.get(1)?.as_str().parse::<u32>().ok()?;
         let severity_str = caps.get(3)?.as_str();
@@ -401,8 +411,7 @@ impl DiagnosticsScanHandler {
             return None;
         }
 
-        let re = regex::Regex::new(r#"File\s+\"([^\"]+)\",\s*line\s*(\d+)"#).ok()?;
-        let caps = re.captures(line)?;
+        let caps = PYTHON_REGEX.captures(line)?;
         let line_num = caps.get(2)?.as_str().parse::<u32>().ok()?;
 
         // The actual error message is usually on the next line(s)
