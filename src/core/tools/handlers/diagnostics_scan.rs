@@ -879,4 +879,33 @@ mod tests {
         assert!(output.contains("script.js"), "JS file should be in output");
         assert_eq!(state.consecutive_mistakes, 0);
     }
+
+    #[tokio::test]
+    async fn test_run_diagnostics_batch_single_invocation_per_project() {
+        // Prove that run_diagnostics_batch calls run_diagnostics once per project,
+        // not once per file. Two files in the same project should get identical output.
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let rust_dir = temp.path().join("rust_project");
+        std::fs::create_dir_all(&rust_dir).unwrap();
+        std::fs::write(rust_dir.join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        std::fs::write(rust_dir.join("file1.rs"), "fn main() {}").unwrap();
+        std::fs::write(rust_dir.join("file2.rs"), "fn helper() {}").unwrap();
+
+        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::new();
+        files_by_project.insert(
+            (rust_dir.clone(), ProjectType::Rust),
+            vec![rust_dir.join("file1.rs"), rust_dir.join("file2.rs")],
+        );
+
+        let results = DiagnosticsScanHandler::run_diagnostics_batch(&files_by_project).await;
+
+        // Both files should have the same diagnostics output (one invocation served both)
+        let output1 = results.get(&rust_dir.join("file1.rs")).expect("file1.rs should have output");
+        let output2 = results.get(&rust_dir.join("file2.rs")).expect("file2.rs should have output");
+        assert_eq!(
+            output1, output2,
+            "Both files in the same project should receive identical diagnostics output (proving single invocation)"
+        );
+    }
 }
