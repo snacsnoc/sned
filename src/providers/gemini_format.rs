@@ -523,4 +523,128 @@ mod tests {
             Some("sig_first".to_string())
         );
     }
+
+    #[test]
+    fn test_tool_use_with_thought_signature() {
+        // Test that tool use blocks preserve thought signatures
+        // Critical for Gemini 3 function calling validation
+        let tool_use = AssistantContentBlock::ToolUse(ToolUseBlock {
+            id: "call_abc123".to_string(),
+            name: "check_flight".to_string(),
+            input: serde_json::json!({"flight_number": "AA100"}),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: Some("sig_flight_check".to_string()),
+            },
+            reasoning_details: None,
+        });
+
+        let messages = vec![StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![tool_use]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+
+        let gemini = convert_to_gemini_contents(&messages);
+        assert_eq!(gemini.len(), 1);
+        assert_eq!(gemini[0].role, "model");
+
+        let part = &gemini[0].parts[0];
+        assert!(part.function_call.is_some());
+        let fc = part.function_call.as_ref().unwrap();
+        assert_eq!(fc.name, "check_flight");
+        assert_eq!(fc.id, Some("call_abc123".to_string()));
+
+        // Critical: thought signature must be preserved for Gemini 3 validation
+        assert_eq!(
+            part.thought_signature,
+            Some("sig_flight_check".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parallel_tool_calls_signature_handling() {
+        // Test parallel function calls - only first FC has signature
+        // Per Gemini 3 docs: "thought_signature is attached only to the first functionCall"
+        let tool_use_1 = AssistantContentBlock::ToolUse(ToolUseBlock {
+            id: "call_001".to_string(),
+            name: "check_flight".to_string(),
+            input: serde_json::json!({"flight_number": "AA100"}),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: Some("sig_first".to_string()),
+            },
+            reasoning_details: None,
+        });
+
+        let tool_use_2 = AssistantContentBlock::ToolUse(ToolUseBlock {
+            id: "call_002".to_string(),
+            name: "book_taxi".to_string(),
+            input: serde_json::json!({"pickup": "airport"}),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: None, // Second FC has no signature
+            },
+            reasoning_details: None,
+        });
+
+        let messages = vec![StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![tool_use_1, tool_use_2]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+
+        let gemini = convert_to_gemini_contents(&messages);
+        assert_eq!(gemini.len(), 1);
+        assert_eq!(gemini[0].parts.len(), 2);
+
+        // First FC must have signature
+        assert_eq!(
+            gemini[0].parts[0].thought_signature,
+            Some("sig_first".to_string())
+        );
+        assert_eq!(gemini[0].parts[0].function_call.as_ref().unwrap().name, "check_flight");
+
+        // Second FC must NOT have signature (parallel FCs don't inherit)
+        assert_eq!(gemini[0].parts[1].thought_signature, None);
+        assert_eq!(gemini[0].parts[1].function_call.as_ref().unwrap().name, "book_taxi");
+    }
+
+    #[test]
+    fn test_tool_response_no_signature() {
+        // Tool responses (functionResponse) should NOT have signatures
+        // Signatures are only on functionCall from the model
+        let tool_result = UserContentBlock::ToolResult(ToolResultBlock {
+            tool_use_id: "call_abc123".to_string(),
+            content: ToolResultContent::Text("Flight AA100 is delayed".to_string()),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: None, // Tool results don't have signatures
+            },
+        });
+
+        let messages = vec![StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![tool_result]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+
+        let gemini = convert_to_gemini_contents(&messages);
+        assert_eq!(gemini.len(), 1);
+        assert_eq!(gemini[0].role, "user");
+
+        let part = &gemini[0].parts[0];
+        assert!(part.function_response.is_some());
+        // Tool response should not have thought_signature
+        assert_eq!(part.thought_signature, None);
+    }
 }

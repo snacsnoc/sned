@@ -148,7 +148,10 @@ impl GeminiProvider {
         // Thinking config
         if let Some(thinking_config) = info.and_then(|i| i.thinking_config.as_ref()) {
             let thinking_budget = self.config.thinking_budget_tokens.unwrap_or(0);
-            let default_effort = if self.config.model_id.contains("gemini-3") {
+            // Gemini 3 Flash defaults to minimal, other Gemini 3 models default to high
+            let default_effort = if self.config.model_id.contains("gemini-3-flash") {
+                "minimal"
+            } else if self.config.model_id.contains("gemini-3") {
                 "high"
             } else {
                 "low"
@@ -866,6 +869,14 @@ fn get_gemini_model_info(model_id: &str) -> ModelInfo {
         info.output_price = Some(3.00);
         info.cache_reads_price = Some(0.05);
         info.temperature = Some(1.0);
+        // Gemini 3 Flash defaults to minimal thinking level per docs
+        info.thinking_config = Some(ThinkingConfig {
+            max_budget: None,
+            output_price: None,
+            output_price_tiers: None,
+            gemini_thinking_level: Some("minimal".to_string()),
+            supports_thinking_level: Some(true),
+        });
     } else if model_id.contains("gemini-2.5-pro") {
         info.context_window = Some(1048576);
         info.input_price = Some(2.5);
@@ -1055,9 +1066,18 @@ mod tests {
         let info_pro = get_gemini_model_info("gemini-3.1-pro-preview");
         assert_eq!(info_pro.context_window, Some(1048576));
         assert_eq!(info_pro.temperature, Some(1.0));
+        assert_eq!(
+            info_pro.thinking_config.as_ref().unwrap().gemini_thinking_level,
+            Some("high".to_string())
+        );
 
         let info_flash = get_gemini_model_info("gemini-3-flash-preview");
         assert_eq!(info_flash.temperature, Some(1.0));
+        // Gemini 3 Flash should default to minimal thinking level
+        assert_eq!(
+            info_flash.thinking_config.as_ref().unwrap().gemini_thinking_level,
+            Some("minimal".to_string())
+        );
 
         let info_25_pro = get_gemini_model_info("gemini-2.5-pro");
         assert_eq!(
