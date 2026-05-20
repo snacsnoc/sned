@@ -397,10 +397,7 @@ impl TaskStorage {
             .open(&lock_path)?;
 
         file.try_lock_exclusive().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("Task is locked by another process: {}", e),
-            )
+            io::Error::other(format!("Task is locked by another process: {}", e))
         })?;
 
         Ok(LockGuard { _file: file })
@@ -419,10 +416,7 @@ impl TaskStorage {
             .open(&lock_path)?;
 
         file.lock_exclusive().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to acquire lock: {}", e),
-            )
+            io::Error::other(format!("Failed to acquire lock: {}", e))
         })?;
 
         Ok(LockGuard { _file: file })

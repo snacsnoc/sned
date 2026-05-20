@@ -332,7 +332,7 @@ impl ContextLoader {
 
         // Read each file once, then extract all needed lines from cached content
         let mut file_contents: HashMap<String, Vec<String>> = HashMap::new();
-        for (loc_path_str, _locations) in &file_locations {
+        for loc_path_str in file_locations.keys() {
             let abs_loc_path = if Path::new(loc_path_str).is_absolute() {
                 PathBuf::from(loc_path_str)
             } else {

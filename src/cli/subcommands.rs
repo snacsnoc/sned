@@ -46,12 +46,12 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
     // Apply sorting
     match opts.sort.as_str() {
         "oldest" => {
-            history.sort_by(|a, b| a.ts.cmp(&b.ts));
+            history.sort_by_key(|a| a.ts);
         }
         "alphabetical" => {
             history.sort_by(|a, b| a.task.cmp(&b.task));
         }
-        "newest" | _ => {
+        _ => {
             sort_by_timestamp(&mut history);
         }
     }

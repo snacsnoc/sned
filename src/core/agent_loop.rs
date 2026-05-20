@@ -1914,7 +1914,7 @@ impl AgentLoop {
                         .parsed_args
                         .as_ref()
                         .unwrap_or(&serde_json::Value::Null);
-                    let summary = format_tool_summary(tool_name, &tool_params);
+                    let summary = format_tool_summary(tool_name, tool_params);
                     eprintln!(
                         "{}",
                         crate::cli::colors::colorize(&summary, crate::cli::colors::style::DIM)
@@ -3373,7 +3373,7 @@ impl AgentLoop {
 ///
 /// The most recent assistant message's thinking is preserved in full to maintain
 /// context for the current turn.
-fn truncate_old_thinking_blocks(history: &mut Vec<StorageMessage>) {
+fn truncate_old_thinking_blocks(history: &mut [StorageMessage]) {
     let limit = std::env::var(THINKING_HISTORY_LIMIT_ENV)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
