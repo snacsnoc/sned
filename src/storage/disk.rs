@@ -2,15 +2,14 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use once_cell::sync::Lazy;
 use std::env;
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-static ATOMIC_WRITES: Lazy<AtomicWriteTracker> = Lazy::new(AtomicWriteTracker::default);
+static ATOMIC_WRITES: LazyLock<AtomicWriteTracker> = LazyLock::new(AtomicWriteTracker::default);
 
 /// Creates a backup of a corrupted file by copying it to a `.bak` sidecar.
 /// Returns the path to the backup file if successful.

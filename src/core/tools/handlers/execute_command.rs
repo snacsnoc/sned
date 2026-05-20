@@ -25,10 +25,10 @@ impl ExecuteCommandHandler {
     /// Resolve command timeout based on command patterns.
     ///
     fn resolve_timeout(cmd_str: &str) -> std::time::Duration {
-        use once_cell::sync::Lazy;
+        use std::sync::LazyLock;
         use std::time::Duration;
 
-        static LONG_RUNNING_PATTERNS: Lazy<Vec<regex::Regex>> = Lazy::new(|| {
+        static LONG_RUNNING_PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
             let patterns = [
                 r"\b(?:npm|pnpm|yarn|bun)\s+(?:install|ci|build|test)\b",
                 r"\b(?:npm|pnpm|yarn|bun)\s+run\s+(?:build|test|lint|typecheck|check)\b",

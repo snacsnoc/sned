@@ -1,15 +1,15 @@
 //! Simple secret redaction for exports and logs.
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
 /// Redact API keys and secrets from text.
 pub fn redact_secrets(text: &str) -> Cow<'_, str> {
     API_KEY_PATTERN.replace_all(text, "[REDACTED]")
 }
 
-static API_KEY_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static API_KEY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Matches sk-..., key-..., bearer tokens, and common API key patterns
     Regex::new(r"(sk-[a-zA-Z0-9]{20,}|key-[a-zA-Z0-9]{20,}|Bearer [a-zA-Z0-9\-_\.]{20,}|x-api-key:\s*[a-zA-Z0-9\-_]{20,})").unwrap()
 });

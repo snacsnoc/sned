@@ -4,23 +4,22 @@
 //! Prepares rich initial user message with environment details and context mentions.
 
 use crate::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 const MAX_AUTO_SYMBOL_MATCHES: usize = 3;
 const MAX_AUTO_SYMBOL_TOTAL_LINES: usize = 20;
 const MAX_AUTO_SYMBOL_LINE_LENGTH_BYTES: usize = 200;
 
-static CODE_FENCE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"```[\s\S]*?```").unwrap());
-static URL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\w+:\/\/[^\s]+").unwrap());
-static MENTION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"@([A-Za-z0-9_./\-]+)").unwrap());
-static SLASH_COMMAND_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(^|\s)/([A-Za-z0-9_.:@-]+)").unwrap());
-static SYMBOL_TOKEN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b").unwrap());
+static CODE_FENCE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"```[\s\S]*?```").unwrap());
+static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\w+:\/\/[^\s]+").unwrap());
+static MENTION_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@([A-Za-z0-9_./\-]+)").unwrap());
+static SLASH_COMMAND_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^|\s)/([A-Za-z0-9_.:@-]+)").unwrap());
+static SYMBOL_TOKEN_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b").unwrap());
 
 const STOP_WORDS: &[&str] = &[
     "if",

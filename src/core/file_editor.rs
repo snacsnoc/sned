@@ -10,11 +10,10 @@
 //! CRITICAL: The hash-anchored edit system is Sned's single most important
 //! feature. Port the exact algorithm from TypeScript, do not change it.
 
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::anchor_dictionary::ANCHOR_DICTIONARY;
@@ -94,7 +93,7 @@ impl FileEditorError {
 // Constants
 // ============================================================================
 
-static ANCHOR_NAME_REGEX: Lazy<Regex> = Lazy::new(|| {
+static ANCHOR_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Allow word anchors (Apple) and line-number anchors (L1, L2, etc.) for large-file fallback
     Regex::new(r"^[A-Z][a-zA-Z0-9]*$").unwrap()
 });
@@ -228,7 +227,7 @@ impl FileLockManager {
     }
 }
 
-static FILE_LOCK_MANAGER: Lazy<FileLockManager> = Lazy::new(FileLockManager::new);
+static FILE_LOCK_MANAGER: LazyLock<FileLockManager> = LazyLock::new(FileLockManager::new);
 
 /// RAII guard for file editing. Holds lock for path duration.
 pub struct FileEditGuard {

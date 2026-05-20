@@ -28,7 +28,6 @@ use crate::providers::{
 };
 use async_trait::async_trait;
 use futures::StreamExt;
-use regex::Regex;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
@@ -580,11 +579,12 @@ fn extract_and_emit_xml_tool_calls(
 }
 
 fn parse_minimax_xml_tool_call(xml: &str) -> Option<(String, serde_json::Value)> {
-    use once_cell::sync::Lazy;
+    use regex::Regex;
+    use std::sync::LazyLock;
 
-    static NAME_RE: Lazy<regex::Regex> =
-        Lazy::new(|| Regex::new(r#"<invoke\s+name=["']([^"']+)["']>"#).expect("valid regex"));
-    static PARAM_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    static NAME_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| Regex::new(r#"<invoke\s+name=["']([^"']+)["']>"#).expect("valid regex"));
+    static PARAM_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         Regex::new(r#"(?s)<parameter\s+name=["']([^"']+)["']>(.*?)</parameter>"#)
             .expect("valid regex")
     });

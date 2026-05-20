@@ -7,25 +7,24 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
 /// Pre-compiled regex for ESLint-style diagnostics.
 /// Matches: `/path/to/file.js: line 10, col 5, Error - Expected ';'`
-static ESLINT_REGEX: Lazy<Regex> = Lazy::new(|| {
+static ESLINT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r":\s*(\d+)\s*,?\s*(?:col\s*(\d+)\s*,?\s*)?\s*(Error|Warning|Info)\s*-\s*(.+)$")
         .unwrap()
 });
 
 /// Pre-compiled regex for Python-style diagnostics.
 /// Matches: `File "...", line N`
-static PYTHON_REGEX: Lazy<Regex> = Lazy::new(|| {
+static PYTHON_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"File\s+"([^"]+)",\s*line\s*(\d+)"#).unwrap()
 });
 
@@ -35,8 +34,8 @@ pub struct DiagnosticsScanHandler;
 
 /// Cache for detect_project_type results to avoid redundant filesystem walks.
 /// Keyed by (parent directory, file extension) to handle mixed file types in same dir.
-static PROJECT_TYPE_CACHE: Lazy<Mutex<HashMap<(PathBuf, String), ProjectType>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static PROJECT_TYPE_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), ProjectType>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl DiagnosticsScanHandler {
     pub fn new() -> Self {

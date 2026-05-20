@@ -362,10 +362,10 @@ impl fmt::Display for VtRenderer {
 /// - Spinner characters: `|`, `/`, `-`, `\` alone or with text
 /// - Download/upload/extract progress: `Downloading...`, `Uploading...`, `Extracting...`
 pub fn strip_progress_artifacts(text: &str) -> String {
-    use once_cell::sync::Lazy;
     use regex::Regex;
+    use std::sync::LazyLock;
 
-    static PROGRESS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    static PROGRESS_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         vec![
             // Progress bar with equals/dashes: "===   |", "[====    ]", etc.
             Regex::new(r"^[\[\(]?[=\-|#.]+\s*\]?\s*\|?\s*$").unwrap(),

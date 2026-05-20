@@ -1,8 +1,7 @@
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use tree_sitter::{Language, Query};
 
 use crate::services::tree_sitter::queries::*;
@@ -28,8 +27,8 @@ pub struct LanguageParserEntry {
 /// Global cache for language parsers keyed by extension.
 /// Avoids recompiling tree-sitter queries on every handler invocation.
 /// Entries are Arc'd since Query is not Clone but can be shared.
-static PARSER_CACHE: Lazy<Mutex<HashMap<String, Arc<LanguageParserEntry>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static PARSER_CACHE: LazyLock<Mutex<HashMap<String, Arc<LanguageParserEntry>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Maps file extensions to loaded language parsers.
 pub type LanguageParserMap = HashMap<String, LanguageParserEntry>;

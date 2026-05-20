@@ -6,8 +6,8 @@
 //!
 //! Deduplicated from `file_editor.rs` and `read_file.rs` to prevent drift.
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 // ============================================================================
 // Constants
@@ -16,7 +16,7 @@ use regex::Regex;
 /// Delimiter between anchor word and content.
 pub const ANCHOR_DELIMITER: &str = "§";
 
-static ANCHOR_STRIP_REGEX: Lazy<Regex> = Lazy::new(|| {
+static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r"\b[A-Z][a-zA-Z]*?{}",
         regex::escape(ANCHOR_DELIMITER)
