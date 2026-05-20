@@ -141,7 +141,9 @@ fn bench_request_serialization(c: &mut Criterion) {
             },
         ],
         tools: None,
+        tool_choice: None,
         use_response_api: Some(false),
+        max_tokens: None,
     };
 
     c.bench_function("provider_request_serialize", |b| {
