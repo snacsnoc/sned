@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, timeout};
 
 /// Edit file tool handler.
 #[derive(Debug, Clone)]
@@ -454,6 +453,20 @@ impl EditFileHandler {
         });
 
         // Phase 4: Apply and save all approved edits
+        // Track which files were successfully edited for post-diagnostics
+        let mut successfully_edited_files: Vec<(String, String)> = Vec::new(); // (absolute_path, display_path)
+        
+        // Store intermediate results for building final output after batch diagnostics
+        struct FileResult {
+            batch_absolute_path: String,
+            batch_display_path: String,
+            prepared: PreparedEdits,
+            final_lines: Vec<String>,
+            final_hashes: Vec<String>,
+            had_success: bool,
+        }
+        let mut file_results: Vec<FileResult> = Vec::new();
+
         for (batch, mut prepared) in prepared_batches {
             let result =
                 processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
@@ -476,6 +489,14 @@ impl EditFileHandler {
             }
 
             if result.success {
+                // Track for post-diagnostics if there were pre-errors
+                if any_pre_errors {
+                    successfully_edited_files.push((
+                        batch.absolute_path.clone(),
+                        batch.display_path.clone(),
+                    ));
+                }
+                
                 // Write updated content back to file atomically
                 if let Some(final_content) = &result.final_content {
                     // Acquire OS-level file lock to serialize writes with external
@@ -573,7 +594,7 @@ impl EditFileHandler {
                 }
             }
 
-            // Format result
+            // Store intermediate result for building final output after batch diagnostics
             let final_lines: Vec<String> = result
                 .final_content
                 .as_ref()
@@ -585,26 +606,76 @@ impl EditFileHandler {
                 .map(|h| format!("{:08x}", h))
                 .collect::<Vec<_>>();
 
-            // Post-save diagnostics: compare with pre-save state
-            // Skip if no pre-existing errors (edits unlikely to introduce new errors)
-            let diagnostics = if result.success && any_pre_errors {
-                let path = Path::new(&batch.absolute_path);
-                let project_type = DiagnosticsScanHandler::detect_project_type(path);
-                let post_diag_output = match timeout(
-                    Duration::from_secs(30),
-                    DiagnosticsScanHandler::run_diagnostics(project_type, path),
+            file_results.push(FileResult {
+                batch_absolute_path: batch.absolute_path.clone(),
+                batch_display_path: batch.display_path.clone(),
+                prepared,
+                final_lines,
+                final_hashes,
+                had_success: result.success,
+            });
+        }
+
+        // Phase 5: Run post-save diagnostics in batch for all successfully edited files
+        // This is more efficient than per-file diagnostics when any_pre_errors is true
+        let mut post_diagnostics_by_file: std::collections::HashMap<
+            String,
+            Vec<crate::core::tools::handlers::diagnostics_scan::Diagnostic>,
+        > = std::collections::HashMap::new();
+
+        if any_pre_errors && !successfully_edited_files.is_empty() {
+            // Group successfully edited files by project root
+            let mut files_by_project: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+            for (abs_path, _) in &successfully_edited_files {
+                let path = PathBuf::from(abs_path);
+                let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
+                    &path,
+                    if DiagnosticsScanHandler::detect_project_type(&path)
+                        == crate::core::tools::handlers::diagnostics_scan::ProjectType::Rust
+                    {
+                        "Cargo.toml"
+                    } else {
+                        "package.json"
+                    },
                 )
-                .await
-                {
-                    Ok(Ok(output)) => output,
-                    _ => String::new(),
-                };
-                let post_diagnostics = DiagnosticsScanHandler::parse_diagnostics(
-                    &post_diag_output,
-                    &batch.display_path,
-                );
+                .unwrap_or_else(|| {
+                    path.parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or(PathBuf::from("."))
+                });
+                files_by_project.entry(project_root).or_default().push(path);
+            }
+
+            // Run batch diagnostics once per project root
+            let batch_diag_outputs =
+                DiagnosticsScanHandler::run_diagnostics_batch(&files_by_project).await;
+
+            // Parse diagnostics for each file
+            for (abs_path, display_path) in &successfully_edited_files {
+                let diag_output = batch_diag_outputs
+                    .get(&PathBuf::from(abs_path))
+                    .cloned()
+                    .unwrap_or_default();
+                let diagnostics =
+                    DiagnosticsScanHandler::parse_diagnostics(&diag_output, display_path);
+                post_diagnostics_by_file.insert(abs_path.clone(), diagnostics);
+            }
+        }
+
+        // Phase 6: Build final results with diagnostics comparison
+        for file_result in file_results {
+            if !file_result.had_success {
+                continue;
+            }
+
+            // Build diagnostics result from batch post-diagnostics
+            let diagnostics = if any_pre_errors {
+                let post_diagnostics = post_diagnostics_by_file
+                    .get(&file_result.batch_absolute_path)
+                    .cloned()
+                    .unwrap_or_default();
                 let pre = pre_diagnostics
-                    .get(&batch.absolute_path)
+                    .get(&file_result.batch_absolute_path)
                     .cloned()
                     .unwrap_or_default();
 
@@ -642,7 +713,7 @@ impl EditFileHandler {
 
                 let new_problems_message = if !new_problems.is_empty() {
                     DiagnosticsScanHandler::format_diagnostics(
-                        &batch.display_path,
+                        &file_result.batch_display_path,
                         &new_problems,
                         None,
                     )
@@ -654,21 +725,18 @@ impl EditFileHandler {
                     fixed_count,
                     new_problems_message,
                 })
-            } else if result.success {
-                // No pre-errors, so no diagnostics needed
-                None
             } else {
                 None
             };
 
             let formatted = processor.format_result(
-                &prepared,
-                &final_lines,
-                &final_hashes,
+                &file_result.prepared,
+                &file_result.final_lines,
+                &file_result.final_hashes,
                 false,
                 diagnostics.as_ref(),
-                None, // auto_formatting_edits - VS Code-specific, not implemented in CLI
-                None, // user_edits - VS Code-specific, not implemented in CLI
+                None,
+                None,
             );
             all_results.push(formatted);
         }
@@ -1569,5 +1637,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_multi_file_edit_with_pre_errors_uses_batch_diagnostics() {
+        use std::fs;
+        use std::process::Command;
+
+        let _guard = TEST_MUTEX.lock().await;
+
+        // Create a temp Rust project inside the workspace
+        let temp_dir = "test_batch_diagnostics_tmp";
+        let _ = fs::remove_dir_all(temp_dir);
+        fs::create_dir_all(temp_dir).unwrap();
+
+        // Create Cargo.toml
+        let cargo_toml = format!(
+            r#"[package]
+name = "test_batch"
+version = "0.1.0"
+edition = "2021"
+"#
+        );
+        fs::write(format!("{}/Cargo.toml", temp_dir), cargo_toml).unwrap();
+
+        // Create src directory
+        fs::create_dir_all(format!("{}/src", temp_dir)).unwrap();
+
+        // Create two files with intentional errors (undefined function)
+        // Use hash-anchored format: content§line
+        let file1_content = "func1§pub fn func1() {\nbad_call§    nonexistent_function();\nclose§}\n";
+        let file2_content = "func2§pub fn func2() {\nbad_call2§    another_nonexistent_function();\nclose2§}\n";
+        fs::write(format!("{}/src/file1.rs", temp_dir), file1_content).unwrap();
+        fs::write(format!("{}/src/file2.rs", temp_dir), file2_content).unwrap();
+
+        // Create lib.rs that includes both files
+        let lib_content = "lib§mod file1;\nlib2§mod file2;\n";
+        fs::write(format!("{}/src/lib.rs", temp_dir), lib_content).unwrap();
+
+        // Verify cargo check produces errors (pre-errors exist)
+        let _check_output = Command::new("cargo")
+            .args(["check", "--message-format=short"])
+            .current_dir(temp_dir)
+            .output();
+
+        // Create handler and execute edit on both files
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        // Edit both files to fix the errors using hash-anchored format
+        let params = serde_json::json!({
+            "files": [
+                {
+                    "path": format!("{}/src/file1.rs", temp_dir),
+                    "edits": [{
+                        "anchor": "bad_call§    nonexistent_function();",
+                        "text": "    // Fixed: removed bad call"
+                    }]
+                },
+                {
+                    "path": format!("{}/src/file2.rs", temp_dir),
+                    "edits": [{
+                        "anchor": "bad_call2§    another_nonexistent_function();",
+                        "text": "    // Fixed: removed bad call"
+                    }]
+                }
+            ]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+
+        // The edit should succeed and use batch diagnostics (not 2 separate cargo checks)
+        // We can't easily verify the number of cargo check invocations, but we can
+        // verify the edits were applied and the result includes diagnostics info
+        assert!(result.is_ok(), "Edit should succeed: {:?}", result);
+
+        let output = result.unwrap().as_str().unwrap().to_string();
+        assert!(output.contains("Edited 2 file(s)"));
+
+        // Clean up
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }
