@@ -1,5 +1,4 @@
 # Audit directory
-.diracrules/hooks/.audit/
 
 # Core dumps
 *.core
@@ -53,10 +52,6 @@ package-lock.json
 .sned-symbol-index/
 .sned/
 
-# Legacy generated files
-.dirac-symbol-index/
-dirac/
-
 # Secrets and local config
 opencode.json
 .qwen/
@@ -95,7 +90,6 @@ dhat-heap.json
 *.bak
 
 # Hooks (internal workflow, not for public tracking)
-.diracrules/hooks/
 .snedrules/hooks/
 
 # Submodule references (not used)
