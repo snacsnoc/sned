@@ -574,11 +574,8 @@ pub async fn run_interactive_shell_inner(
     'main: loop {
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-        // Get model name for prompt (turn count tracked in agent loop, not exposed here yet)
-        let model_name = task_opts.model.as_deref();
-
         let prompt_prefix =
-            render_interactive_prompt_prefix(agent_busy.load(Ordering::Relaxed), model_name, None);
+            render_interactive_prompt_prefix();
 
         // Check if re-render is necessary (skip if nothing changed and picker state unchanged)
         let current_snapshot = format!(
@@ -1617,37 +1614,9 @@ pub fn should_start_interactive_shell(
     !has_prompt && stdin_is_tty && stdout_is_tty && !json
 }
 
-pub fn render_interactive_prompt_prefix(
-    _agent_busy: bool,
-    model_name: Option<&str>,
-    turn_count: Option<u32>,
-) -> String {
-    // Build prompt with optional model name and turn count
-    // Format: "sned> " or "sned [model]> " or "sned [model] #3> "
-    let mut prompt = String::from("sned");
-
-    if let Some(model) = model_name {
-        // Show short model name (last part after slash or dash)
-        let short_model = model
-            .split('/')
-            .next_back()
-            .unwrap_or(model)
-            .split('-')
-            .next_back()
-            .unwrap_or(model);
-        prompt.push_str(&format!(" [{}]", short_model));
-    }
-
-    if let Some(turns) = turn_count
-        && turns > 0
-    {
-        prompt.push_str(&format!(" #{}", turns));
-    }
-
-    prompt.push_str("> ");
-
+pub fn render_interactive_prompt_prefix() -> String {
     crate::cli::colors::colorize(
-        &prompt,
+        "❯ ",
         &format!(
             "{}{}",
             crate::cli::colors::style::BOLD,
@@ -1751,7 +1720,7 @@ mod tests {
     #[test]
     fn test_input_lines_calculation_cjk() {
         let term_cols: u16 = 80;
-        let prompt_prefix = "sned ❯ ";
+        let prompt_prefix = "❯ ";
         let input_buf = "你好 hello";
         let full_input = format!("{}{}", prompt_prefix, input_buf);
         let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
@@ -1765,7 +1734,7 @@ mod tests {
         assert_eq!(input_lines, 1);
 
         let very_long_cjk =
-            "你好世界 hello world test 你好世界 hello world test 你好世界 hello world test";
+            "你好世界 hello world test 你好世界 hello world test 你好世界 hello world test 你好";
         let full_input = format!("{}{}", prompt_prefix, very_long_cjk);
         let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
         let input_lines = input_lines.max(1);

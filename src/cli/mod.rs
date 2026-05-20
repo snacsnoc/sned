@@ -1597,30 +1597,21 @@ mod tests {
     }
 
     #[test]
-    fn render_interactive_prompt_prefix_shows_model_and_turn() {
-        // Test with model name and turn count
-        let prompt = render_interactive_prompt_prefix(false, Some("claude-3-5-sonnet"), Some(3));
-        assert!(prompt.contains("sned"));
-        assert!(prompt.contains("[sonnet]"));
-        assert!(prompt.contains("#3"));
-        assert!(prompt.contains("> "));
+    fn render_interactive_prompt_prefix_returns_chevron() {
+        let prompt = render_interactive_prompt_prefix();
+        assert!(prompt.contains("❯"));
     }
 
     #[test]
-    fn render_interactive_prompt_prefix_without_model() {
-        // Test without model name
-        let prompt = render_interactive_prompt_prefix(false, None, Some(0));
-        assert!(prompt.contains("sned> "));
+    fn render_interactive_prompt_prefix_no_model() {
+        let prompt = render_interactive_prompt_prefix();
+        assert!(prompt.contains("❯"));
     }
 
     #[test]
-    fn render_interactive_prompt_prefix_without_turns() {
-        // Test without turn count (turn 0)
-        let prompt = render_interactive_prompt_prefix(false, Some("gpt-4"), Some(0));
-        assert!(prompt.contains("sned"));
-        assert!(prompt.contains("[4]"));
-        assert!(!prompt.contains("#0")); // Don't show #0
-        assert!(prompt.contains("> "));
+    fn render_interactive_prompt_prefix_no_turns() {
+        let prompt = render_interactive_prompt_prefix();
+        assert!(prompt.contains("❯"));
     }
 
     #[test]
