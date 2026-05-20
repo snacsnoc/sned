@@ -44,8 +44,8 @@ pub struct SymbolIndexService {
     disabled: bool,
 }
 
-const INDEX_DIR: &str = ".sned-symbol-index";
-const DB_FILENAME: &str = "data.db";
+pub const INDEX_DIR: &str = ".sned-symbol-index";
+pub const DB_FILENAME: &str = "data.db";
 const FILES_PER_BATCH: usize = 50;
 
 impl SymbolIndexService {
@@ -931,6 +931,40 @@ mod tests {
             "File with different mtime should need update"
         );
 
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_with_persistence_fallback_on_corrupted_db() {
+        use std::fs;
+        use std::io::Write;
+
+        let temp_dir = "/tmp/test_corrupted_db_fallback";
+        let _ = fs::remove_dir_all(temp_dir);
+        fs::create_dir_all(temp_dir).unwrap();
+
+        // Create corrupted DB file (invalid SQLite header)
+        let db_dir = std::path::Path::new(temp_dir).join(INDEX_DIR);
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join(DB_FILENAME);
+        {
+            let mut f = fs::File::create(&db_path).unwrap();
+            // Write garbage that is not a valid SQLite database
+            f.write_all(b"This is not a valid SQLite database file").unwrap();
+        }
+
+        // Create service and attempt to open with persistence
+        // This should fail and we would normally fall back to memory mode
+        let service = SymbolIndexService::new(temp_dir.to_string());
+        let result = service.with_persistence();
+
+        // The result should be an error due to corrupted DB
+        assert!(
+            result.is_err(),
+            "with_persistence() should fail on corrupted DB"
+        );
+
+        // Clean up
         let _ = fs::remove_dir_all(temp_dir);
     }
 }

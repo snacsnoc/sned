@@ -589,11 +589,31 @@ fn build_symbol_index_service(
     cwd_str: String,
     mode: SymbolIndexMode,
 ) -> anyhow::Result<crate::services::symbol_index::SymbolIndexService> {
-    let service = crate::services::symbol_index::SymbolIndexService::new(cwd_str);
+    let service = crate::services::symbol_index::SymbolIndexService::new(cwd_str.clone());
     match mode {
         SymbolIndexMode::Off => Ok(service.disabled()),
         SymbolIndexMode::Memory => Ok(service),
-        SymbolIndexMode::Persisted => service.with_persistence(),
+        SymbolIndexMode::Persisted => {
+            match service.with_persistence() {
+                Ok(svc) => Ok(svc),
+                Err(e) => {
+                    // Log warning about DB corruption
+                    eprintln!(
+                        "\x1b[33mWarning: Symbol index DB corruption detected, falling back to memory mode: {}\x1b[0m",
+                        e
+                    );
+                    // Delete corrupted DB file so next session can start fresh
+                    let db_dir = std::path::Path::new(&cwd_str)
+                        .join(crate::services::symbol_index::INDEX_DIR);
+                    let db_path = db_dir.join(crate::services::symbol_index::DB_FILENAME);
+                    if db_path.exists() {
+                        let _ = std::fs::remove_file(&db_path);
+                    }
+                    // Return in-memory service (service was moved into with_persistence, so create new one)
+                    Ok(crate::services::symbol_index::SymbolIndexService::new(cwd_str))
+                }
+            }
+        }
     }
 }
 
@@ -1911,6 +1931,43 @@ mod tests {
         let err = parse_symbol_index_mode_value("sqlite").unwrap_err();
         assert!(err.to_string().contains("Invalid SNED_SYMBOL_INDEX value"));
         assert!(err.to_string().contains("off, memory, persisted"));
+    }
+
+    #[test]
+    fn test_build_symbol_index_service_fallback_on_corrupted_db() {
+        use std::fs;
+        use std::io::Write;
+
+        let temp_dir = "/tmp/test_cli_symbol_fallback";
+        let _ = fs::remove_dir_all(temp_dir);
+        fs::create_dir_all(temp_dir).unwrap();
+
+        // Create corrupted DB file
+        let db_dir = std::path::Path::new(temp_dir)
+            .join(crate::services::symbol_index::INDEX_DIR);
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join(crate::services::symbol_index::DB_FILENAME);
+        {
+            let mut f = fs::File::create(&db_path).unwrap();
+            f.write_all(b"This is not a valid SQLite database file").unwrap();
+        }
+
+        // Build service with persisted mode - should fallback to memory
+        let service = build_symbol_index_service(temp_dir.to_string(), SymbolIndexMode::Persisted);
+        assert!(service.is_ok(), "Service should fallback to memory mode on corrupted DB");
+
+        // Verify service is functional (not disabled)
+        let svc = service.unwrap();
+        assert!(!svc.is_disabled(), "Service should be functional after fallback");
+
+        // Verify corrupted DB file was deleted
+        assert!(
+            !db_path.exists(),
+            "Corrupted DB file should be deleted after fallback"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
