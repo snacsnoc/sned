@@ -10,6 +10,7 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
 use async_trait::async_trait;
+use futures::future::join_all;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use std::path::Path;
@@ -137,8 +138,13 @@ impl ListFilesHandler {
             Err(_) => return,
         };
 
+        // Collect file paths first, respecting limit and filters
+        let mut file_paths: Vec<(usize, std::path::PathBuf, bool)> = Vec::new();
+        let mut dir_entries: Vec<FileInfo> = Vec::new();
+        let mut file_index = 0;
+
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if files.len() >= MAX_FILES_LIMIT {
+            if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
                 *hit_limit = true;
                 break;
             }
@@ -163,18 +169,37 @@ impl ListFilesHandler {
                 continue;
             }
 
-            let line_count = if !is_directory && include_line_counts {
-                count_lines_fast(&path).await
+            if is_directory {
+                dir_entries.push(FileInfo {
+                    path: path.to_string_lossy().to_string(),
+                    is_directory: true,
+                    line_count: None,
+                });
             } else {
-                None
-            };
+                file_paths.push((file_index, path, include_line_counts));
+                file_index += 1;
+            }
+        }
 
+        // Parallel line counting for files
+        let mut file_line_counts: Vec<Option<usize>> = vec![None; file_paths.len()];
+        if include_line_counts {
+            let count_futures: Vec<_> = file_paths
+                .iter()
+                .map(|(_, path, _)| count_lines_fast(path))
+                .collect();
+            file_line_counts = join_all(count_futures).await;
+        }
+
+        // Build file infos with line counts in original order
+        for ((_, path, _), line_count) in file_paths.into_iter().zip(file_line_counts) {
             files.push(FileInfo {
                 path: path.to_string_lossy().to_string(),
-                is_directory,
+                is_directory: false,
                 line_count,
             });
         }
+        files.extend(dir_entries);
 
         // Sort: directories first, then files alphabetically
         files.sort_by(|a, b| match (a.is_directory, b.is_directory) {
@@ -193,8 +218,13 @@ impl ListFilesHandler {
     ) {
         let walker = walkdir::WalkDir::new(dir).follow_links(false).into_iter();
 
+        // Collect file paths first, respecting limit and filters
+        let mut file_paths: Vec<(usize, std::path::PathBuf)> = Vec::new();
+        let mut dir_entries: Vec<FileInfo> = Vec::new();
+        let mut file_index = 0;
+
         for entry in walker {
-            if files.len() >= MAX_FILES_LIMIT {
+            if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
                 *hit_limit = true;
                 break;
             }
@@ -230,19 +260,37 @@ impl ListFilesHandler {
                 continue;
             }
 
-            let is_directory = entry.file_type().is_dir();
-            let line_count = if entry.file_type().is_file() && include_line_counts {
-                count_lines_fast(path).await
+            if entry.file_type().is_dir() {
+                dir_entries.push(FileInfo {
+                    path: path.to_string_lossy().to_string(),
+                    is_directory: true,
+                    line_count: None,
+                });
             } else {
-                None
-            };
+                file_paths.push((file_index, path.to_path_buf()));
+                file_index += 1;
+            }
+        }
 
+        // Parallel line counting for files
+        let mut file_line_counts: Vec<Option<usize>> = vec![None; file_paths.len()];
+        if include_line_counts {
+            let count_futures: Vec<_> = file_paths
+                .iter()
+                .map(|(_, path)| count_lines_fast(path))
+                .collect();
+            file_line_counts = join_all(count_futures).await;
+        }
+
+        // Build file infos with line counts in original order
+        for ((_, path), line_count) in file_paths.into_iter().zip(file_line_counts) {
             files.push(FileInfo {
                 path: path.to_string_lossy().to_string(),
-                is_directory,
+                is_directory: false,
                 line_count,
             });
         }
+        files.extend(dir_entries);
 
         // Sort: directories first, then files alphabetically
         files.sort_by(|a, b| match (a.is_directory, b.is_directory) {
@@ -553,5 +601,74 @@ mod tests {
                 .iter()
                 .all(|f| f.path.ends_with("file1.txt") || f.path.ends_with("subdir"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_line_counting_top_level() {
+        let temp_dir = TempDir::new().unwrap();
+        // Create multiple files with known line counts
+        fs::write(temp_dir.path().join("file1.txt"), "line1\nline2\nline3\n").unwrap();
+        fs::write(temp_dir.path().join("file2.txt"), "line1\nline2\n").unwrap();
+        fs::write(temp_dir.path().join("file3.txt"), "single line").unwrap();
+        fs::write(temp_dir.path().join("file4.txt"), "").unwrap();
+        fs::write(temp_dir.path().join("file5.txt"), "line1\nline2\nline3\nline4\nline5\n").unwrap();
+
+        let handler = ListFilesHandler::new();
+        let result = handler
+            .list_directory_with_line_counts(temp_dir.path().to_str().unwrap(), false, true)
+            .await;
+
+        assert!(result.success);
+        // 5 files, no directories
+        assert_eq!(result.files.len(), 5);
+
+        // Verify line counts are correct (order may vary due to sorting)
+        let mut file_counts: std::collections::HashMap<String, Option<usize>> = result
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.line_count))
+            .collect();
+
+        assert_eq!(file_counts.remove(&format!("{}/file1.txt", temp_dir.path().display())), Some(Some(3)));
+        assert_eq!(file_counts.remove(&format!("{}/file2.txt", temp_dir.path().display())), Some(Some(2)));
+        assert_eq!(file_counts.remove(&format!("{}/file3.txt", temp_dir.path().display())), Some(Some(1)));
+        assert_eq!(file_counts.remove(&format!("{}/file4.txt", temp_dir.path().display())), Some(Some(0)));
+        assert_eq!(file_counts.remove(&format!("{}/file5.txt", temp_dir.path().display())), Some(Some(5)));
+        assert!(file_counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parallel_line_counting_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        // Create files in nested structure
+        fs::write(temp_dir.path().join("root.txt"), "line1\nline2\n").unwrap();
+        fs::create_dir(temp_dir.path().join("subdir")).unwrap();
+        fs::write(temp_dir.path().join("subdir/nested1.txt"), "a\nb\nc\nd\n").unwrap();
+        fs::write(temp_dir.path().join("subdir/nested2.txt"), "x\n").unwrap();
+        fs::create_dir(temp_dir.path().join("subdir/deeper")).unwrap();
+        fs::write(temp_dir.path().join("subdir/deeper/deep.txt"), "1\n2\n3\n4\n5\n6\n").unwrap();
+
+        let handler = ListFilesHandler::new();
+        let result = handler
+            .list_directory_with_line_counts(temp_dir.path().to_str().unwrap(), true, true)
+            .await;
+
+        assert!(result.success);
+        // 4 files + 2 directories (subdir, deeper) = 6 items
+        assert_eq!(result.files.len(), 6);
+
+        // Verify line counts are correct
+        let mut file_counts: std::collections::HashMap<String, Option<usize>> = result
+            .files
+            .iter()
+            .filter(|f| !f.is_directory)
+            .map(|f| (f.path.clone(), f.line_count))
+            .collect();
+
+        assert_eq!(file_counts.remove(&format!("{}/root.txt", temp_dir.path().display())), Some(Some(2)));
+        assert_eq!(file_counts.remove(&format!("{}/subdir/nested1.txt", temp_dir.path().display())), Some(Some(4)));
+        assert_eq!(file_counts.remove(&format!("{}/subdir/nested2.txt", temp_dir.path().display())), Some(Some(1)));
+        assert_eq!(file_counts.remove(&format!("{}/subdir/deeper/deep.txt", temp_dir.path().display())), Some(Some(6)));
+        assert!(file_counts.is_empty());
     }
 }
