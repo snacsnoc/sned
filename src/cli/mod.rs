@@ -1713,17 +1713,18 @@ mod tests {
             prompt.contains("PRIME DIRECTIVES"),
             "Prompt should contain 'PRIME DIRECTIVES'"
         );
+        // Environment info (CWD, shell, CPU) is now provided by context_loader, not in system prompt
         assert!(
-            prompt.contains("Current Working Directory: /tmp/test"),
-            "Prompt should contain cwd"
+            !prompt.contains("Current Working Directory:"),
+            "System prompt should NOT contain CWD (moved to context_loader)"
         );
         assert!(
-            prompt.contains("Default Shell: /bin/zsh"),
-            "Prompt should contain shell path"
+            !prompt.contains("Default Shell:"),
+            "System prompt should NOT contain shell path (moved to context_loader)"
         );
         assert!(
-            prompt.contains("Available CPU Cores: 8"),
-            "Prompt should contain available cores"
+            !prompt.contains("Available CPU Cores:"),
+            "System prompt should NOT contain CPU cores (moved to context_loader)"
         );
     }
 
