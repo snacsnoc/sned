@@ -12,6 +12,26 @@ use tokio::sync::Notify;
 
 static ATOMIC_WRITES: Lazy<AtomicWriteTracker> = Lazy::new(AtomicWriteTracker::default);
 
+/// Creates a backup of a corrupted file by copying it to a `.bak` sidecar.
+/// Returns the path to the backup file if successful.
+///
+/// This is used when JSON parsing fails to preserve the corrupted data
+/// for potential manual recovery while allowing the application to continue
+/// with defaults.
+pub fn create_backup<P: AsRef<Path>>(original_path: P) -> io::Result<PathBuf> {
+    let original = original_path.as_ref();
+    let backup_path = original.with_extension(format!(
+        "{}.bak",
+        original
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default()
+    ));
+
+    fs::copy(original, &backup_path)?;
+    Ok(backup_path)
+}
+
 #[derive(Default)]
 struct AtomicWriteTracker {
     active: AtomicUsize,
@@ -435,5 +455,36 @@ mod tests {
 
         // Clean up
         unsafe { std::env::remove_var("SNED_FSYNC") };
+    }
+
+    #[test]
+    fn test_create_backup_creates_sidecar() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let original_path = temp_dir.path().join("test_corrupted.json");
+        let original_content = r#"{"corrupted": "data", "invalid": json}"#;
+
+        // Write original file
+        std::fs::write(&original_path, original_content).unwrap();
+
+        // Create backup
+        let backup_path = create_backup(&original_path).unwrap();
+
+        // Verify backup exists and has correct content
+        assert!(backup_path.exists());
+        assert!(backup_path.to_string_lossy().ends_with(".json.bak"));
+        let backup_content = std::fs::read_to_string(&backup_path).unwrap();
+        assert_eq!(backup_content, original_content);
+
+        // Original file is unchanged
+        assert!(original_path.exists());
+    }
+
+    #[test]
+    fn test_create_backup_returns_error_for_missing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("nonexistent.json");
+
+        let result = create_backup(&missing_path);
+        assert!(result.is_err());
     }
 }

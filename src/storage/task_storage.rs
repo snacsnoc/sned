@@ -90,11 +90,33 @@ impl TaskStorage {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::warn!(
-                        file_path = %file_path.display(),
-                        error = %e,
-                        "Failed to parse API conversation history JSON"
-                    );
+                    // Create backup of corrupted file before discarding
+                    if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
+                        eprintln!(
+                            "WARNING: Corrupted API conversation history at '{}'. \
+                             Backed up to '{}' for potential recovery. \
+                             Starting with empty history.",
+                            file_path.display(),
+                            backup_path.display()
+                        );
+                        tracing::warn!(
+                            file_path = %file_path.display(),
+                            backup_path = %backup_path.display(),
+                            error = %e,
+                            "Created backup of corrupted API conversation history JSON"
+                        );
+                    } else {
+                        eprintln!(
+                            "WARNING: Corrupted API conversation history at '{}'. \
+                             Failed to create backup. Starting with empty history.",
+                            file_path.display()
+                        );
+                        tracing::warn!(
+                            file_path = %file_path.display(),
+                            error = %e,
+                            "Failed to parse API conversation history JSON and backup failed"
+                        );
+                    }
                     Vec::new()
                 }
             },
@@ -847,5 +869,48 @@ mod tests {
         let final_metadata = storage.read_task_metadata();
         assert_eq!(final_metadata.files_in_context.len(), 1);
         assert_eq!(final_metadata.files_in_context[0].path, "/tmp/file9.rs");
+    }
+
+    #[test]
+    fn test_read_api_conversation_history_creates_backup_on_corruption() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Write corrupted JSON to api_conversation_history.json
+        let history_path = storage
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY);
+
+        let corrupted_content = r#"[{"role": "user", "corrupted": json"#;
+        fs::write(&history_path, corrupted_content).unwrap();
+
+        // Read API conversation history - should create backup and return empty
+        let result = storage.read_api_conversation_history();
+        assert!(
+            result.is_empty(),
+            "Should return empty vec with corrupted file"
+        );
+
+        // Verify backup was created
+        let backup_path = history_path.with_extension("json.bak");
+        assert!(
+            backup_path.exists(),
+            "Backup file should be created for corrupted JSON"
+        );
+
+        // Verify backup contains original corrupted content
+        let backup_content = fs::read_to_string(&backup_path).unwrap();
+        assert_eq!(
+            backup_content, corrupted_content,
+            "Backup should contain original corrupted content"
+        );
     }
 }

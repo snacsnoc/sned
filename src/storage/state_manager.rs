@@ -1787,13 +1787,33 @@ impl StateManager {
         match serde_json::from_str(&contents) {
             Ok(state) => Ok(state),
             Err(e) => {
-                // Return default with warning on parse error (SM2 fix)
-                // Matches behavior of global_state::load_global_state()
-                tracing::warn!(
-                    file_path = %file_path.display(),
-                    error = %e,
-                    "Failed to parse global state JSON, using defaults"
-                );
+                // Create backup of corrupted file before discarding
+                if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
+                    eprintln!(
+                        "WARNING: Corrupted global settings at '{}'. \
+                         Backed up to '{}' for potential recovery. \
+                         Starting with default settings.",
+                        file_path.display(),
+                        backup_path.display()
+                    );
+                    tracing::warn!(
+                        file_path = %file_path.display(),
+                        backup_path = %backup_path.display(),
+                        error = %e,
+                        "Created backup of corrupted global settings JSON"
+                    );
+                } else {
+                    eprintln!(
+                        "WARNING: Corrupted global settings at '{}'. \
+                         Failed to create backup. Starting with default settings.",
+                        file_path.display()
+                    );
+                    tracing::warn!(
+                        file_path = %file_path.display(),
+                        error = %e,
+                        "Failed to parse global settings JSON and backup failed"
+                    );
+                }
                 Ok(GlobalState::default())
             }
         }
@@ -2428,6 +2448,50 @@ mod tests {
             assert_eq!(
                 first_id, second_id,
                 "Machine ID should be reused across runs"
+            );
+        });
+    }
+
+    #[test]
+    fn test_load_global_state_creates_backup_on_corruption() {
+        use std::fs;
+
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+
+            // Write corrupted JSON to global_settings.json
+            let settings_path = manager
+                .state_dir
+                .join("..")
+                .join("settings")
+                .join("global_settings.json");
+
+            let corrupted_content = r#"{"machine_id": "invalid json here"#;
+            fs::write(&settings_path, corrupted_content).unwrap();
+
+            // Load global state - should create backup and return defaults
+            let result = manager.load_global_state();
+            assert!(result.is_ok(), "Should return Ok even with corrupted file");
+
+            let state = result.unwrap();
+            assert!(
+                state.sned_generated_machine_id.is_none(),
+                "Should return default state with no machine_id"
+            );
+
+            // Verify backup was created
+            let backup_path = settings_path.with_extension("json.bak");
+            assert!(
+                backup_path.exists(),
+                "Backup file should be created for corrupted JSON"
+            );
+
+            // Verify backup contains original corrupted content
+            let backup_content = fs::read_to_string(&backup_path).unwrap();
+            assert_eq!(
+                backup_content, corrupted_content,
+                "Backup should contain original corrupted content"
             );
         });
     }
