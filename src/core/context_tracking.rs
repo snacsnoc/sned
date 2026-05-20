@@ -171,10 +171,20 @@ mod tests {
     }
 
     /// Regression test: concurrent model_usage and environment updates do not clobber.
+    /// Uses a static mutex to serialize with other tests that modify SNED_DATA_DIR.
     #[tokio::test]
     async fn test_concurrent_tracker_updates_not_clobbered() {
         use std::sync::Arc;
         use std::thread;
+        use std::sync::OnceLock;
+        use std::sync::Mutex;
+
+        // Static mutex to serialize tests that modify SNED_DATA_DIR
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        let mutex = TEST_MUTEX.get_or_init(|| Mutex::new(()));
+
+        // Acquire the mutex to prevent concurrent access with other tests
+        let _guard = mutex.lock().unwrap();
 
         let temp = TempDir::new().unwrap();
         let task_id = format!("test-concurrent-{}", std::process::id());
