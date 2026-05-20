@@ -14,7 +14,7 @@ use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
 use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits};
 use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard};
 use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes};
-use crate::core::tools::handlers::diagnostics_scan::DiagnosticsScanHandler;
+use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
 use crate::core::tools::{SnedTool, ToolContext, ToolError, ToolHandler};
 use crate::services::symbol_index::SymbolIndexService;
 use async_trait::async_trait;
@@ -401,13 +401,14 @@ impl EditFileHandler {
         }
 
         // Phase 3: Capture pre-save diagnostics for all files being edited
-        // Group files by project root to run diagnostics once per project (not per file)
-        let mut files_by_project: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        // Group files by (project_root, project_type) to handle mixed-language projects
+        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::new();
         for (batch, _) in &prepared_batches {
             let path = PathBuf::from(&batch.absolute_path);
+            let project_type = DiagnosticsScanHandler::detect_project_type(&path);
             let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
                 &path,
-                if DiagnosticsScanHandler::detect_project_type(&path)
+                if project_type
                     == crate::core::tools::handlers::diagnostics_scan::ProjectType::Rust
                 {
                     "Cargo.toml"
@@ -420,10 +421,13 @@ impl EditFileHandler {
                     .map(|p| p.to_path_buf())
                     .unwrap_or(PathBuf::from("."))
             });
-            files_by_project.entry(project_root).or_default().push(path);
+            files_by_project
+                .entry((project_root, project_type))
+                .or_default()
+                .push(path);
         }
 
-        // Run diagnostics in parallel across project roots
+        // Run diagnostics in parallel across (project_root, project_type) groups
         let batch_diag_outputs =
             DiagnosticsScanHandler::run_diagnostics_batch(&files_by_project).await;
 
@@ -624,13 +628,14 @@ impl EditFileHandler {
         > = std::collections::HashMap::new();
 
         if any_pre_errors && !successfully_edited_files.is_empty() {
-            // Group successfully edited files by project root
-            let mut files_by_project: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+            // Group successfully edited files by (project_root, project_type)
+            let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::new();
             for (abs_path, _) in &successfully_edited_files {
                 let path = PathBuf::from(abs_path);
+                let project_type = DiagnosticsScanHandler::detect_project_type(&path);
                 let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
                     &path,
-                    if DiagnosticsScanHandler::detect_project_type(&path)
+                    if project_type
                         == crate::core::tools::handlers::diagnostics_scan::ProjectType::Rust
                     {
                         "Cargo.toml"
@@ -643,10 +648,13 @@ impl EditFileHandler {
                         .map(|p| p.to_path_buf())
                         .unwrap_or(PathBuf::from("."))
                 });
-                files_by_project.entry(project_root).or_default().push(path);
+                files_by_project
+                    .entry((project_root, project_type))
+                    .or_default()
+                    .push(path);
             }
 
-            // Run batch diagnostics once per project root
+            // Run batch diagnostics once per (project_root, project_type) group
             let batch_diag_outputs =
                 DiagnosticsScanHandler::run_diagnostics_batch(&files_by_project).await;
 

@@ -228,33 +228,27 @@ impl DiagnosticsScanHandler {
         }
     }
 
-    /// Run diagnostics for multiple files grouped by project root.
+    /// Run diagnostics for multiple files grouped by (project_root, project_type).
     /// Returns a map of file path -> diagnostics output.
     /// This is more efficient than running diagnostics per-file because:
-    /// - cargo check / npm lint run once per project root, not per file
-    /// - Parallel execution across different project roots
+    /// - cargo check / npm lint run once per project root per language, not per file
+    /// - Parallel execution across different project roots and languages
+    /// - Mixed-language projects get correct diagnostics for each language
     pub async fn run_diagnostics_batch(
-        files_by_project: &HashMap<PathBuf, Vec<PathBuf>>,
+        files_by_project: &HashMap<(PathBuf, ProjectType), Vec<PathBuf>>,
     ) -> HashMap<PathBuf, String> {
         use futures::future::join_all;
 
         let mut results: HashMap<PathBuf, String> = HashMap::new();
 
-        // Run diagnostics for each project root in parallel
+        // Run diagnostics for each (project_root, project_type) group in parallel
         let futures: Vec<_> = files_by_project
             .iter()
-            .map(|(project_root, files)| async move {
-                // Determine project type from first file
-                let project_type = if files.is_empty() {
-                    ProjectType::Generic
-                } else {
-                    Self::detect_project_type(&files[0])
-                };
-
-                // Run diagnostics once for the project root
+            .map(|((project_root, project_type), files)| async move {
+                // Run diagnostics once for the project root with the known project type
                 let diag_output = match timeout(
                     Duration::from_secs(30),
-                    Self::run_diagnostics(project_type, project_root),
+                    Self::run_diagnostics(*project_type, project_root),
                 )
                 .await
                 {
@@ -262,19 +256,17 @@ impl DiagnosticsScanHandler {
                     _ => String::new(),
                 };
 
-                // Associate the same output with all files in this project
-                (project_root.clone(), diag_output)
+                // Associate the same output with all files in this group
+                (project_root.clone(), files.clone(), diag_output)
             })
             .collect();
 
         let project_results = join_all(futures).await;
 
         // Distribute results to individual files
-        for (project_root, diag_output) in project_results {
-            if let Some(files) = files_by_project.get(&project_root) {
-                for file in files {
-                    results.insert(file.clone(), diag_output.clone());
-                }
+        for (_project_root, files, diag_output) in project_results {
+            for file in files {
+                results.insert(file, diag_output.clone());
             }
         }
 
@@ -495,7 +487,7 @@ impl DiagnosticsScanHandler {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProjectType {
     Rust,
     JavaScript,
@@ -537,8 +529,9 @@ impl DiagnosticsScanHandler {
 
         state.consecutive_mistakes = 0;
 
-        // Group files by project root to run diagnostics once per project (not per file)
-        let mut files_by_project: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        // Group files by (project_root, project_type) to handle mixed-language projects.
+        // This ensures Rust and JS files at the same root both get their respective diagnostics.
+        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::new();
         let mut file_info: HashMap<PathBuf, (String, Option<String>)> = HashMap::new();
         let mut error_results = Vec::new();
 
@@ -561,7 +554,7 @@ impl DiagnosticsScanHandler {
                 }
             };
 
-            // Determine project root for grouping
+            // Determine project type and root for grouping
             let project_type = Self::detect_project_type(&abs_path);
             let project_root = Self::find_ancestor_with_file(
                 &abs_path,
@@ -580,12 +573,16 @@ impl DiagnosticsScanHandler {
             })
             .unwrap_or_else(|| abs_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")));
 
-            files_by_project.entry(project_root).or_default().push(abs_path.clone());
+            files_by_project
+                .entry((project_root, project_type))
+                .or_default()
+                .push(abs_path.clone());
             file_info.insert(abs_path.clone(), (rel_path.clone(), file_content));
         }
 
-        // Batch diagnostics by project root so cargo check/npm lint runs once per project,
-        // not once per file. For N files in the same crate, this saves N-1 redundant invocations.
+        // Batch diagnostics by (project_root, project_type) so cargo check/npm lint runs once
+        // per project per language. For mixed-language projects, this ensures all files get
+        // their correct diagnostics instead of only the first detected language.
         let batch_diag_outputs = Self::run_diagnostics_batch(&files_by_project).await;
 
         // Format results for each file
@@ -845,6 +842,41 @@ mod tests {
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.contains("file1.rs") || output.contains("file2.rs"));
+        assert_eq!(state.consecutive_mistakes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_scan_mixed_language_same_root() {
+        // Test that mixed-language files at the same root both get diagnostics
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // Create a mixed-language project with both Rust and JS files at the same root
+        std::fs::write(temp.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        std::fs::write(temp.path().join("package.json"), r#"{"name": "test"}"#).unwrap();
+        std::fs::write(temp.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(temp.path().join("script.js"), "console.log('hello');").unwrap();
+
+        let handler = DiagnosticsScanHandler::new();
+        let mut state = TaskState::default();
+
+        let result = handler
+            .execute(
+                &mut state,
+                temp.path(),
+                serde_json::json!({
+                    "paths": [
+                        temp.path().join("main.rs").to_string_lossy().to_string(),
+                        temp.path().join("script.js").to_string_lossy().to_string()
+                    ]
+                }),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        // Both files should appear in the output (each getting their respective diagnostics)
+        assert!(output.contains("main.rs"), "Rust file should be in output");
+        assert!(output.contains("script.js"), "JS file should be in output");
         assert_eq!(state.consecutive_mistakes, 0);
     }
 }
