@@ -133,160 +133,17 @@ impl ExecuteCommandHandler {
         _raw_output: bool,
         json_output: bool,
     ) -> anyhow::Result<String> {
-        #[cfg(feature = "terminal")]
-        {
-            self.execute_commands_pty(
-                commands,
-                cwd,
-                timeout_override,
-                explicitly_approved,
-                task_state,
-                _raw_output,
-                json_output,
-            )
-            .await
-        }
-        #[cfg(not(feature = "terminal"))]
-        {
-            self.execute_commands_tokio(
-                commands,
-                cwd,
-                timeout_override,
-                explicitly_approved,
-                task_state,
-                json_output,
-            )
-            .await
-        }
+        self.execute_commands_tokio(
+            commands,
+            cwd,
+            timeout_override,
+            explicitly_approved,
+            task_state,
+            json_output,
+        )
+        .await
     }
 
-    #[cfg(feature = "terminal")]
-    async fn execute_commands_pty(
-        &self,
-        commands: Vec<String>,
-        cwd: Option<&Path>,
-        timeout_override: Option<Duration>,
-        explicitly_approved: bool,
-        task_state: Option<Arc<Mutex<TaskState>>>,
-        raw_output: bool,
-        json_output: bool,
-    ) -> anyhow::Result<String> {
-        use crate::terminal::command_pty::{CommandOutput, run_command_in_pty};
-        use crate::terminal::vt_renderer::{VtRenderer, strip_progress_artifacts};
-
-        let mut combined_output = String::new();
-
-        // Get terminal dimensions for PTY
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-
-        for cmd_str in commands {
-            // Safety check: validate command against safe list and patterns
-            if !explicitly_approved && let Err(e) = self.safety_checker.is_safe(&cmd_str) {
-                tracing::warn!(command = %cmd_str, reason = %e, "command rejected by safety checker");
-                return Err(anyhow::anyhow!("{}", e));
-            }
-            tracing::debug!(command = %cmd_str, cwd = ?cwd, "executing command (PTY)");
-
-            if !json_output {
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::info(&format!("Running: {}", cmd_str))
-                );
-            }
-
-            // Validate working directory
-            if let Some(dir) = cwd {
-                if !dir.exists() || !dir.is_dir() {
-                    let err = crate::cli::actionable_errors::directory_not_found(
-                        &dir.display().to_string(),
-                    );
-                    return Err(anyhow::anyhow!("{}", err.display()));
-                }
-            }
-
-            let timeout_duration =
-                timeout_override.unwrap_or_else(|| Self::resolve_timeout(&cmd_str));
-
-            let result =
-                run_command_in_pty(&cmd_str, cwd, rows as u16, cols as u16, timeout_duration);
-
-            let output = match result {
-                Ok(cmd_output) => cmd_output,
-                Err(e) => {
-                    return Err(anyhow::anyhow!("PTY command failed: {}", e));
-                }
-            };
-
-            // VT-render the output to strip ANSI escape sequences
-            let mut renderer = VtRenderer::new(rows as usize, cols as usize);
-            renderer.parse_bytes(output.stdout.as_bytes());
-            let mut clean_stdout = renderer.screen_text();
-
-            // Strip progress bar artifacts unless raw_output is requested
-            if !raw_output {
-                clean_stdout = strip_progress_artifacts(&clean_stdout);
-            }
-
-            // Increment commands_executed counter for session summary
-            if let Some(ref state) = task_state {
-                let mut state = state.lock().await;
-                state.commands_executed = state.commands_executed.saturating_add(1);
-                state.last_executed_command = Some(cmd_str.clone());
-            }
-
-            if !combined_output.is_empty() {
-                combined_output.push_str("\n---\n");
-            }
-
-            if !clean_stdout.is_empty() {
-                combined_output.push_str(&clean_stdout);
-            }
-
-            if output.timed_out {
-                let err = crate::cli::actionable_errors::command_timeout(
-                    &cmd_str,
-                    timeout_duration.as_secs(),
-                );
-                return Err(anyhow::anyhow!("{}", err.display()));
-            }
-
-            if output.exit_code != 0 {
-                let err = crate::cli::actionable_errors::command_exit_code(
-                    &cmd_str,
-                    Some(output.exit_code),
-                );
-                combined_output.push_str(&format!("\n{}", err.display()));
-                break;
-            }
-        }
-
-        let truncated = combined_output.len() > 10 * 1024;
-        tracing::info!(
-            output_len = combined_output.len(),
-            truncated,
-            "execute_command result assembled (PTY)"
-        );
-
-        if combined_output.is_empty() {
-            Ok("Command executed successfully with no output.".to_string())
-        } else {
-            let limit_bytes = std::env::var("SNED_COMMAND_OUTPUT_LIMIT")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&v| v > 0)
-                .unwrap_or(10 * 1024);
-
-            if combined_output.len() > limit_bytes {
-                let mut truncated = combined_output[..limit_bytes].to_string();
-                truncated.push_str("\n\n(Output truncated due to size limit.)");
-                Ok(truncated)
-            } else {
-                Ok(combined_output)
-            }
-        }
-    }
-
-    #[cfg(not(feature = "terminal"))]
     async fn execute_commands_tokio(
         &self,
         commands: Vec<String>,

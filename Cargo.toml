@@ -15,7 +15,6 @@ license = "MIT OR Apache-2.0"
 ignored = ["tree-sitter-rust", "tree-sitter-javascript", "tree-sitter-python", "tree-sitter-typescript", "tree-sitter-go", "tree-sitter-c", "tree-sitter-cpp", "tree-sitter-c-sharp", "tree-sitter-ruby", "tree-sitter-java", "tree-sitter-php", "tree-sitter-swift"]
 
 [features]
-terminal = []  # libghostty-vt removed (unused)
 default = ["lang-rust", "lang-javascript", "lang-python", "lang-typescript", "lang-go"]
 dhat-heap = ["dep:dhat"]
 lang-rust = ["dep:tree-sitter-rust"]
