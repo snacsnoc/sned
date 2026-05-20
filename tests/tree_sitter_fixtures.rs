@@ -4,8 +4,7 @@ use std::path::PathBuf;
 
 fn get_fixtures_dir() -> Option<PathBuf> {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.push("dirac/src/services/tree-sitter/__tests__/fixtures");
+    path.push("tests/fixtures");
     path.exists().then_some(path)
 }
 

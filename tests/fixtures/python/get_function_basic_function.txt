@@ -1,0 +1,11 @@
+sample.py::top_level_func
+[Function Hash: 14609a6f]
+All Hash Anchors provided below are stable and can be used with edit_file directly.
+def top_level_func():
+    """A top-level function."""
+    return "hello"
+--- Symbol Context ---
+### Methods
+def top_level_func():
+    """A top-level function."""
+    return "hello"

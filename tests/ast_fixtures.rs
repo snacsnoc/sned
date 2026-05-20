@@ -36,7 +36,9 @@ struct ReplaceSymbolTest {
 }
 
 fn run_language_fixtures(lang: &str, extension: &str) {
-    let fixture_dir = Path::new("../dirac/src/services/tree-sitter/__tests__/fixtures").join(lang);
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(lang);
     let fixture_dir = match fs::canonicalize(&fixture_dir) {
         Ok(path) => path,
         Err(_) => {

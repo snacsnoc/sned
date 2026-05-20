@@ -1,0 +1,7 @@
+sample.rs::rust_main
+[Function Hash: a40f610d]
+All Hash Anchors provided below are stable and can be used with edit_file directly.
+pub fn rust_main() {
+    let s = RustStruct { value: 42 };
+    println!("{}", s.get_value());
+}

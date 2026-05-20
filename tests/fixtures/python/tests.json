@@ -1,0 +1,22 @@
+{
+  "get_function": [
+    {
+      "name": "basic_function",
+      "symbols": ["top_level_func"]
+    }
+  ],
+  "find_symbol_references": [
+    {
+      "name": "class_reference",
+      "symbols": ["PythonClass"],
+      "find_type": "symbol"
+    }
+  ],
+  "replace_symbol": [
+    {
+      "name": "replace_function_body",
+      "symbol": "top_level_func",
+      "text": "def top_level_func():\n    \"\"\"Updated function.\"\"\"\n    return \"world\""
+    }
+  ]
+}

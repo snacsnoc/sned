@@ -1,0 +1,2 @@
+sample.py:
+  (PythonClass) class PythonClass:

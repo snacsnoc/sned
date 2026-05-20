@@ -1,0 +1,22 @@
+{
+  "get_function": [
+    {
+      "name": "basic_function",
+      "symbols": ["rust_main"]
+    }
+  ],
+  "find_symbol_references": [
+    {
+      "name": "struct_reference",
+      "symbols": ["RustStruct"],
+      "find_type": "symbol"
+    }
+  ],
+  "replace_symbol": [
+    {
+      "name": "replace_function_body",
+      "symbol": "rust_main",
+      "text": "pub fn rust_main() {\n    let s = RustStruct { value: 100 };\n    println!(\"{}\", s.get_value());\n}"
+    }
+  ]
+}
