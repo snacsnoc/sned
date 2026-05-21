@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -707,12 +707,55 @@ pub fn prompt_for_approval(
     let (sender, receiver) = std::sync::mpsc::channel();
     // RAII guard ensures cleanup even on panic/cancellation
     let _guard = set_approval_sender(sender);
+    // Set flag BEFORE storing sender to avoid race condition with TUI loop
     set_approval_prompt_active(true);
 
     // Block until the CLI loop sends the user's response.
-    let input = match receiver.recv() {
+    // Use recv_timeout to detect when no TUI is running (one-shot mode with prompt)
+    // Timeout is set high (2000ms) to give TUI loop time to forward keystrokes
+    let input = match receiver.recv_timeout(std::time::Duration::from_millis(2000)) {
         Ok(c) => c,
-        Err(_) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // No TUI loop forwarding input - fall back to direct stdin reading
+            // This happens when running with a prompt in one-shot mode (no TUI loop)
+            set_approval_prompt_active(false);
+            
+            // Use raw mode to read single character without requiring Enter
+            use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+            
+            let _ = enable_raw_mode();
+            
+            // Read single character
+            let mut buf = [0u8; 1];
+            let result = if let Ok(n) = std::io::stdin().read(&mut buf) {
+                if n > 0 {
+                    let c = buf[0] as char;
+                    // Echo the character so user sees their choice
+                    print!("{}", c);
+                    let _ = std::io::stdout().flush();
+                    // Consume rest of line (Enter key if pressed)
+                    let mut _rest = [0u8; 16];
+                    let _ = std::io::stdin().read(&mut _rest);
+                    Ok(match c {
+                        'y' | 'Y' => ApprovalResult::Approved,
+                        'n' | 'N' => ApprovalResult::Denied,
+                        'a' | 'A' => ApprovalResult::Always,
+                        _ => ApprovalResult::Denied,
+                    })
+                } else {
+                    Ok(ApprovalResult::Denied)
+                }
+            } else {
+                Ok(ApprovalResult::Denied)
+            };
+            
+            // Restore terminal
+            let _ = disable_raw_mode();
+            println!(); // Newline after response
+            
+            return result;
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             // Channel closed (e.g. agent cancelled via Ctrl+C)
             // Guard will clean up on drop
             return Ok(ApprovalResult::Denied);
@@ -768,6 +811,20 @@ pub(crate) fn set_approval_sender(sender: std::sync::mpsc::Sender<char>) -> Appr
     let mut guard = APPROVAL_SENDER.lock();
     *guard = Some(sender);
     ApprovalChannelGuard
+}
+
+/// Try to send an approval response directly (for TUI loop).
+/// Returns true if the sender was present and the send succeeded.
+pub fn try_send_approval_response(c: char) -> bool {
+    let mut guard = APPROVAL_SENDER.lock();
+    if let Some(ref sender) = *guard {
+        let _ = sender.send(c);
+        *guard = None; // Consume sender after sending
+        set_approval_prompt_active(false);
+        true
+    } else {
+        false
+    }
 }
 
 /// Take the stored approval sender (if any).
@@ -876,7 +933,37 @@ pub async fn prompt_for_combined_approval(
     set_approval_prompt_active(true);
 
     // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
-    let input_result = tokio::task::spawn_blocking(move || receiver.recv()).await;
+    // Use recv_timeout to detect when no TUI is running (one-shot mode)
+    let input_result = tokio::task::spawn_blocking(move || {
+        match receiver.recv_timeout(std::time::Duration::from_millis(2000)) {
+            Ok(c) => Ok(c),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // No TUI loop - fall back to direct stdin reading with raw mode
+                set_approval_prompt_active(false);
+                use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+                
+                let _ = enable_raw_mode();
+                let mut buf = [0u8; 1];
+                let result = if let Ok(n) = std::io::stdin().read(&mut buf) {
+                    if n > 0 {
+                        let c = buf[0] as char;
+                        print!("{}", c);
+                        let _ = std::io::stdout().flush();
+                        Ok(c)
+                    } else {
+                        Ok('n')
+                    }
+                } else {
+                    Ok('n')
+                };
+                let _ = disable_raw_mode();
+                println!();
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(()),
+        }
+    })
+    .await;
 
     let input = match input_result {
         Ok(Ok(c)) => c,

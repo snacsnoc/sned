@@ -1431,18 +1431,14 @@ pub async fn run_interactive_shell_inner(
                 TerminalEvent::Char(c) => {
                     // If an approval prompt is active, forward single-char responses
                     // immediately without adding to the input buffer or waiting for Enter.
-                    if crate::core::approval::is_approval_prompt_active() {
-                        let lower = c.to_ascii_lowercase();
-                        if (lower == 'y' || lower == 'n' || lower == 'a')
-                            && let Some(sender) = crate::core::approval::take_approval_sender()
-                        {
-                            let _ = sender.send(lower);
+                    let lower = c.to_ascii_lowercase();
+                    if lower == 'y' || lower == 'n' || lower == 'a' {
+                        if crate::core::approval::try_send_approval_response(lower) {
                             // Echo the character so the user sees their choice
                             write!(stdout, "{}", c)?;
                             stdout.flush()?;
+                            continue;
                         }
-                        // Ignore any other character while an approval prompt is active
-                        continue;
                     }
 
                     // If a followup question is active, forward the full line response
