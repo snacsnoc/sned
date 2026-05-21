@@ -31,6 +31,7 @@ impl XaiProvider {
             model_info: config.model_info,
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: Some("xai".to_string()),
         };
 
         let inner = OpenAiProvider::new(openai_config)?;

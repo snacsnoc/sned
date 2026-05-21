@@ -744,6 +744,7 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                         headers.insert("User-Agent".to_string(), ua);
                         headers
                     }),
+                    provider_name: None, // Use default "OpenAI"
                 },
             )?)
         }
@@ -827,6 +828,7 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                         &model_id_str,
                     )),
                     provider_sort: None,
+                    provider_name: None, // Use default "openrouter"
                 },
             )?)
         }

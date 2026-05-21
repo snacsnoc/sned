@@ -25,12 +25,17 @@ pub struct OpenAiConfig {
     pub model_info: Option<OpenAiCompatibleModelInfo>,
     pub reasoning_effort: Option<String>,
     pub custom_headers: Option<std::collections::HashMap<String, String>>,
+    /// Provider name for error messages (defaults to "OpenAI" if not set).
+    /// Used by OpenAI-compatible providers (OpenRouter, DeepSeek, Groq, xAI) to identify themselves in errors.
+    pub provider_name: Option<String>,
 }
 
 /// OpenAI-compatible provider (covers generic OpenAI, Azure, and custom base URL).
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     client: reqwest::Client,
+    /// Provider name for error messages (defaults to "OpenAI").
+    provider_name: &'static str,
 }
 
 impl OpenAiProvider {
@@ -41,7 +46,14 @@ impl OpenAiProvider {
             .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
             .pool_max_idle_per_host(10)
             .build()?;
-        Ok(Self { config, client })
+        // Provider name must be 'static str for error handling.
+        // We leak the String to get a 'static reference if a custom name was provided.
+        let provider_name = if let Some(name) = config.provider_name.clone() {
+            Box::leak(name.into_boxed_str())
+        } else {
+            "OpenAI"
+        };
+        Ok(Self { config, client, provider_name })
     }
 
     fn build_headers(&self) -> anyhow::Result<HeaderMap> {
@@ -812,7 +824,7 @@ impl Provider for OpenAiProvider {
             let status = response.status();
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderHttpError::new("OpenAI", url, status, text, headers).into());
+            return Err(ProviderHttpError::new(self.provider_name, url, status, text, headers).into());
         }
 
         let stream = response.bytes_stream();
@@ -1080,6 +1092,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
         assert_eq!(provider.base_url(), "https://api.openai.com/v1");
@@ -1094,6 +1107,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
         assert_eq!(provider.base_url(), "https://custom.example.com/v1");
@@ -1108,6 +1122,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
         assert_eq!(provider.base_url(), "https://custom.example.com/v1");
@@ -1122,6 +1137,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1156,6 +1172,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1206,6 +1223,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1310,6 +1328,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1368,6 +1387,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1426,6 +1446,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1460,6 +1481,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1514,6 +1536,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1568,6 +1591,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1622,6 +1646,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
 
@@ -1690,6 +1715,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
         let model = provider.get_model();
@@ -1736,6 +1762,7 @@ mod tests {
             model_info: Some(custom_info.clone()),
             reasoning_effort: None,
             custom_headers: None,
+            provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
         let model = provider.get_model();

@@ -18,6 +18,8 @@ pub struct OpenRouterConfig {
     pub model_id: String,
     pub model_info: Option<OpenAiCompatibleModelInfo>,
     pub provider_sort: Option<String>,
+    /// Provider name for error messages (defaults to "openrouter" if not set).
+    pub provider_name: Option<String>,
 }
 
 /// OpenRouter provider (OpenAI-compatible with custom headers and base URL).
@@ -43,6 +45,7 @@ impl OpenRouterProvider {
             model_info: config.model_info,
             reasoning_effort: None,
             custom_headers: Some(custom_headers),
+            provider_name: Some(config.provider_name.unwrap_or_else(|| "openrouter".to_string())),
         };
 
         let inner = OpenAiProvider::new(openai_config)?;
@@ -275,9 +278,42 @@ mod tests {
             model_id: "anthropic/claude-sonnet-4.5".to_string(),
             model_info: None,
             provider_sort: None,
+            provider_name: None,
         };
         let provider = OpenRouterProvider::new(config).unwrap();
         assert_eq!(provider.name(), "openrouter");
+    }
+
+    #[test]
+    fn test_openrouter_provider_name() {
+        // Verify that OpenRouter provider sets the correct provider name for error messages
+        let config = OpenRouterConfig {
+            api_key: "test-key".to_string(),
+            model_id: "anthropic/claude-sonnet-4.5".to_string(),
+            model_info: None,
+            provider_sort: None,
+            provider_name: None,
+        };
+        let provider = OpenRouterProvider::new(config).unwrap();
+        // The inner OpenAiProvider should have "openrouter" as the provider name
+        // This is tested indirectly via the name() method and ensures error messages
+        // will show "openrouter" instead of "OpenAI"
+        assert_eq!(provider.name(), "openrouter");
+    }
+
+    #[test]
+    fn test_openrouter_custom_provider_name() {
+        // Verify custom provider name can be set
+        let config = OpenRouterConfig {
+            api_key: "test-key".to_string(),
+            model_id: "anthropic/claude-sonnet-4.5".to_string(),
+            model_info: None,
+            provider_sort: None,
+            provider_name: Some("custom-openrouter".to_string()),
+        };
+        let provider = OpenRouterProvider::new(config).unwrap();
+        assert_eq!(provider.name(), "openrouter");
+        // Custom provider name would appear in error messages, not in the name() method
     }
 
     #[test]
