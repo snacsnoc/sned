@@ -495,6 +495,7 @@ async fn process_openai_sse_line(
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
+    model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
 ) {
     let line = line.trim();
     if line.is_empty() || line == "data: [DONE]" {
@@ -652,16 +653,50 @@ async fn process_openai_sse_line(
         }
 
         if let Some(usage) = chunk.usage {
+            // Calculate cache tokens and avoid double-counting in input_tokens
+            let cached_tokens = usage.prompt_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
+            let cache_write_tokens = usage.prompt_cache_miss_tokens.unwrap_or(0);
+            // OpenAI counts cached tokens in prompt_tokens, so subtract to get uncached input
+            let uncached_input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
+
+            // Calculate total cost using model pricing
+            let total_cost = model_info.as_ref().and_then(|info| {
+                let input_price = info.base.input_price?;
+                let output_price = info.base.output_price?;
+                let cache_reads_price = info.base.cache_reads_price.unwrap_or(0.0);
+                let cache_writes_price = info.base.cache_writes_price.unwrap_or(0.0);
+
+                // Cost for uncached input tokens
+                let input_cost = input_price * (uncached_input_tokens as f64 / 1_000_000.0);
+                // Cost for output tokens (including reasoning)
+                let reasoning_tokens = usage.completion_tokens_details.as_ref().and_then(|d| d.reasoning_tokens).unwrap_or(0);
+                let output_cost = output_price * ((usage.completion_tokens + reasoning_tokens) as f64 / 1_000_000.0);
+                // Cost for cache reads (discounted)
+                let cache_read_cost = if cached_tokens > 0 {
+                    cache_reads_price * (cached_tokens as f64 / 1_000_000.0)
+                } else {
+                    0.0
+                };
+                // Cost for cache writes
+                let cache_write_cost = if cache_write_tokens > 0 {
+                    cache_writes_price * (cache_write_tokens as f64 / 1_000_000.0)
+                } else {
+                    0.0
+                };
+
+                Some(input_cost + output_cost + cache_read_cost + cache_write_cost)
+            });
+
             try_send_chunk(
                 tx,
                 ApiStreamChunk::Usage(ApiStreamUsageChunk {
-                    input_tokens: usage.prompt_tokens,
+                    input_tokens: uncached_input_tokens,
                     output_tokens: usage.completion_tokens,
                     cache_write_tokens: usage.prompt_cache_miss_tokens,
-                    cache_read_tokens: usage.prompt_tokens_details.map(|d| d.cached_tokens),
+                    cache_read_tokens: Some(cached_tokens),
                     reasoning_tokens: usage.completion_tokens_details.and_then(|d| d.reasoning_tokens),
                     thoughts_token_count: None,
-                    total_cost: None,
+                    total_cost,
                     stop_reason: last_stop_reason.clone(),
                     id: Some(chunk.id.clone()),
                 }),
@@ -679,6 +714,7 @@ pub async fn parse_openai_sse_to_chunks(
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
+    model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
 ) {
     for line in buffer.push_chunk(chunk) {
         process_openai_sse_line(
@@ -687,6 +723,7 @@ pub async fn parse_openai_sse_to_chunks(
             accumulated_tool_calls,
             completed_tool_call_indices,
             last_stop_reason,
+            model_info,
         )
         .await;
     }
@@ -701,6 +738,7 @@ pub async fn finish_openai_sse_to_chunks(
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
+    model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
 ) {
     if let Some(line) = buffer.finish() {
         process_openai_sse_line(
@@ -709,6 +747,7 @@ pub async fn finish_openai_sse_to_chunks(
             accumulated_tool_calls,
             completed_tool_call_indices,
             last_stop_reason,
+            model_info,
         )
         .await;
     }
@@ -781,6 +820,9 @@ impl Provider for OpenAiProvider {
         // when the consumer is slow (same pattern as agent_loop.rs:726)
         let (tx, rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(10_000);
 
+        // Capture model_info for cost calculation in the spawned task
+        let model_info = self.config.model_info.clone();
+
         tokio::spawn(async move {
             let mut stream = stream;
             let mut sse_buffer = crate::providers::SseLineBuffer::default();
@@ -806,6 +848,7 @@ impl Provider for OpenAiProvider {
                             &mut accumulated_tool_calls,
                             &mut completed_tool_call_indices,
                             &mut last_stop_reason,
+                            &model_info,
                         )
                         .await;
                     }
@@ -837,6 +880,7 @@ impl Provider for OpenAiProvider {
                     &mut accumulated_tool_calls,
                     &mut completed_tool_call_indices,
                     &mut last_stop_reason,
+                    &model_info,
                 )
                 .await;
             }
@@ -1214,6 +1258,7 @@ mod tests {
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
+        let model_info: Option<crate::providers::OpenAiCompatibleModelInfo> = None;
 
         process_openai_sse_line(
             r#"data: {"id":"chatcmpl_123","choices":[{"delta":{},"finish_reason":"stop"}]}"#,
@@ -1221,6 +1266,7 @@ mod tests {
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
+            &model_info,
         )
         .await;
 
@@ -1721,6 +1767,7 @@ data: [DONE]
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
+        let model_info: Option<crate::providers::OpenAiCompatibleModelInfo> = None;
         parse_openai_sse_to_chunks(
             sse.as_bytes(),
             &mut buffer,
@@ -1728,6 +1775,7 @@ data: [DONE]
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
+            &model_info,
         )
         .await;
         finish_openai_sse_to_chunks(
@@ -1736,6 +1784,7 @@ data: [DONE]
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
+            &model_info,
         )
         .await;
         drop(tx);
@@ -1747,5 +1796,95 @@ data: [DONE]
         }
 
         println!("Total chunks: {}", chunks.len());
+    }
+
+    #[tokio::test]
+    async fn test_cache_tokens_not_double_counted_in_cost() {
+        // Test that cached tokens are subtracted from input_tokens and cost is calculated correctly
+        let sse = r#"
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":800}}}
+"#;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(100);
+        let mut buffer = SseLineBuffer::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        
+        // Use model info with pricing
+        let model_info = Some(crate::providers::OpenAiCompatibleModelInfo {
+            base: crate::providers::ModelInfo {
+                name: Some("gpt-4".to_string()),
+                max_tokens: Some(8192),
+                context_window: Some(128_000),
+                supports_images: Some(true),
+                supports_prompt_cache: true,
+                supports_reasoning: Some(false),
+                input_price: Some(10.0), // $10 per 1M tokens
+                output_price: Some(30.0), // $30 per 1M tokens
+                image_output_price: None,
+                thinking_config: None,
+                supports_global_endpoint: None,
+                cache_writes_price: Some(5.0), // $5 per 1M tokens
+                cache_reads_price: Some(0.5), // $0.50 per 1M tokens (discounted)
+                description: None,
+                tiers: None,
+                temperature: None,
+                supports_tools: None,
+                api_format: None,
+            },
+            temperature: None,
+            is_r1_format_required: None,
+            system_role: None,
+            supports_reasoning_effort: None,
+            supports_streaming: None,
+        });
+
+        parse_openai_sse_to_chunks(
+            sse.as_bytes(),
+            &mut buffer,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            &model_info,
+        )
+        .await;
+        finish_openai_sse_to_chunks(
+            &mut buffer,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            &model_info,
+        )
+        .await;
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk);
+        }
+
+        // Find the usage chunk
+        let usage_chunk = chunks.iter().find_map(|c| match c {
+            ApiStreamChunk::Usage(u) => Some(u),
+            _ => None,
+        }).expect("Should have usage chunk");
+
+        // Verify input_tokens excludes cached tokens (1000 - 800 = 200)
+        assert_eq!(usage_chunk.input_tokens, 200, "input_tokens should exclude cached tokens");
+        
+        // Verify cache_read_tokens is reported separately
+        assert_eq!(usage_chunk.cache_read_tokens, Some(800), "cache_read_tokens should be 800");
+        
+        // Verify cost calculation:
+        // input_cost = 200 * $10 / 1M = $0.002
+        // output_cost = 100 * $30 / 1M = $0.003
+        // cache_read_cost = 800 * $0.50 / 1M = $0.0004
+        // total = $0.0054
+        let expected_cost = (200.0 * 10.0 / 1_000_000.0) + (100.0 * 30.0 / 1_000_000.0) + (800.0 * 0.5 / 1_000_000.0);
+        assert!(usage_chunk.total_cost.is_some(), "total_cost should be calculated");
+        assert!((usage_chunk.total_cost.unwrap() - expected_cost).abs() < 0.0001, "cost should be correct");
     }
 }
