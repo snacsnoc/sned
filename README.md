@@ -21,9 +21,6 @@ Language parsers included by default: rust, javascript, python, typescript, go.
 # add more
 cargo build --features "lang-c,lang-cpp,lang-ruby,lang-java,lang-php,lang-swift"
 
-# terminal UI (needs zig)
-cargo build --features terminal
-
 # faster compiles
 cargo install sccache && export RUSTC_WRAPPER=sccache
 ```
@@ -66,7 +63,7 @@ sned --continue
 sned --task-id <id>
 ```
 
-Other flags: `--yolo`, `--plan`, `--subagents`, `--json`, `--export <path>`, `--double-check-completion`, `--track-changes`, `--verbose`, `--no-token-display`, `--thinking <budget>`.
+Other flags (examples, not exhaustive): `--yolo`, `--plan`, `--subagents`, `--json`, `--export <path>`, `--double-check-completion`, `--track-changes`, `--verbose`, `--no-token-display`, `--thinking <budget>`.
 
 ## what this does differently
 
