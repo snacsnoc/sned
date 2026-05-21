@@ -174,21 +174,48 @@ pub async fn list_workspace_files(
 fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
     let query_bytes = query.to_lowercase().into_bytes();
     let target_bytes = target.to_lowercase().into_bytes();
+    
+    if query_bytes.is_empty() {
+        return Some(0);
+    }
+
     let mut qi = 0;
-    let mut last_match = true;
+    let mut last_match_idx: isize = -1;
     let mut score = 0usize;
+    let mut first_match_idx: Option<usize> = None;
 
     for (ti, tb) in target_bytes.iter().enumerate() {
         if qi < query_bytes.len() && *tb == query_bytes[qi] {
-            score += if last_match && ti > 0 { 1 } else { 3 };
+            let ti_usize = ti as isize;
+            
+            if qi == 0 {
+                first_match_idx = Some(ti);
+            }
+
+            if ti_usize == last_match_idx + 1 {
+                score += 5;
+            } else if ti == 0 || (ti > 0 && target_bytes[ti - 1] == b'/' || target_bytes[ti - 1] == b'_') {
+                score += 4;
+            } else {
+                score += 1;
+            }
+            
+            last_match_idx = ti_usize;
             qi += 1;
-            last_match = true;
-        } else {
-            last_match = false;
         }
     }
 
     if qi == query_bytes.len() {
+        if let Some(first_idx) = first_match_idx {
+            if first_idx == 0 {
+                score += 10;
+            }
+        }
+        let target_len = target_bytes.len();
+        let query_len = query_bytes.len();
+        if target_len > 0 {
+            score = score * 100 / (target_len - query_len + 100);
+        }
         Some(score)
     } else {
         None
@@ -355,6 +382,42 @@ mod tests {
         assert!(fuzzy_score("abc", "axbc").is_some());
         assert!(fuzzy_score("abc", "ab").is_none());
         assert!(fuzzy_score("abc", "xyz").is_none());
+    }
+
+    #[test]
+    fn test_fuzzy_score_prefix_bonus() {
+        let score1 = fuzzy_score("age", "AGENTS.md").unwrap();
+        let score2 = fuzzy_score("age", "src/agents.rs").unwrap();
+        assert!(
+            score1 > score2,
+            "AGENTS.md (prefix match) should score higher than src/agents.rs, got {} vs {}",
+            score1,
+            score2
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_score_shorter_target_bonus() {
+        let score1 = fuzzy_score("main", "main.rs").unwrap();
+        let score2 = fuzzy_score("main", "src/main.rs").unwrap();
+        assert!(
+            score1 > score2,
+            "main.rs should score higher than src/main.rs, got {} vs {}",
+            score1,
+            score2
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_score_consecutive_bonus() {
+        let score1 = fuzzy_score("abc", "abc.rs").unwrap();
+        let score2 = fuzzy_score("abc", "a_b_c.rs").unwrap();
+        assert!(
+            score1 > score2,
+            "Consecutive match should score higher than scattered, got {} vs {}",
+            score1,
+            score2
+        );
     }
 
     #[test]
