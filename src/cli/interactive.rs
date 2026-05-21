@@ -1733,11 +1733,20 @@ pub async fn run_interactive_shell_inner(
                         };
                         // Cancel any pending approval prompt so its receiver wakes up
                         crate::core::approval::clear_approval_sender();
-                        // Also abort the task as a fallback
+                        // Abort the agent task and wait for it to fully unwind (including Drop handlers)
+                        // to prevent Spinner::Drop from clearing the prompt line after we re-render.
+                        // Spinner::Drop writes \r\x1b[K asynchronously after abort() returns — if we
+                        // continue immediately and re-draw the prompt, the late Drop clears it, leaving
+                        // the user with an invisible prompt until they type.
                         {
                             let mut task = agent_task.lock().await;
                             if let Some(t) = task.take() {
                                 t.abort();
+                                // Wait briefly for task to fully unwind (Drop handlers run after abort)
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(100),
+                                    t
+                                ).await;
                             }
                         }
                         // Ensure busy flag is cleared even if abort skipped cleanup
