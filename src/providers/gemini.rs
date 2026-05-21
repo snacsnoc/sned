@@ -207,10 +207,9 @@ impl GeminiProvider {
         }
 
         // Google Search grounding (if enabled and not Vertex)
+        // includeServerSideToolInvocations must be in generationConfig, not toolConfig
         if self.config.search_enabled {
-            tools.push(json!({
-                "googleSearch": {},
-            }));
+            generation_config["includeServerSideToolInvocations"] = json!(true);
         }
 
         let mut body = json!({
@@ -236,12 +235,9 @@ impl GeminiProvider {
                 crate::providers::ToolChoice::Named(name) => json!({"mode": "ANY", "allowedFunctionNames": [name]}),
             };
 
-            let mut tool_config = json!({
+            let tool_config = json!({
                 "functionCallingConfig": function_calling_config,
             });
-            if self.config.search_enabled {
-                tool_config["includeServerSideToolInvocations"] = json!(true);
-            }
             body["tools"] = json!(tools);
             body["toolConfig"] = tool_config;
         }
