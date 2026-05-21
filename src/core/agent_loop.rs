@@ -1767,6 +1767,11 @@ impl AgentLoop {
         // based on execution success/failure, so we only reset here
         // when the model returned a valid response with no tool failures.
         // If tools were called, the handlers will reset on success.
+        // CRITICAL: Reset for text-only responses too, not just tool success.
+        {
+            let mut state = state_clone.lock().await;
+            state.consecutive_mistakes = 0;
+        }
 
         // 6. Add assistant message to history
         let mut text_only_completes_task = false;
