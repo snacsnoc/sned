@@ -52,8 +52,8 @@ const DEFAULT_THINKING_HISTORY_LIMIT: usize = 2_000;
 /// Environment variable to configure thinking block history limit
 const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 
-pub use crate::cli::spinner::Spinner;
-use crate::cli::spinner::multi_tool_label;
+
+
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
 use crate::core::tool_output::{
     extract_edit_stats_detailed, format_heat_map, format_tool_result, format_tool_summary,
@@ -980,13 +980,7 @@ impl AgentLoop {
 
     /// Executes a single turn of the agent loop.
     async fn execute_turn(&mut self) -> TurnResult {
-        // Start progress indicator covering the quiet period between turns
-        let show_progress = !self.config.json_output;
-        let spinner = if show_progress {
-            Some(Spinner::start("Processing..."))
-        } else {
-            None
-        };
+  
 
         // 1. Prepare conversation history (possibly truncated by context manager)
         let truncated_history = {
@@ -1152,11 +1146,6 @@ impl AgentLoop {
         {
             Ok(stream) => stream,
             Err(e) => {
-                drop(spinner);
-                if show_progress {
-                    eprint!("\r\x1b[K");
-                    let _ = io::stderr().flush();
-                }
                 error!(error = %e, "provider request failed");
                 let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
                 return TurnResult::Error(actionable.display());
@@ -1184,7 +1173,6 @@ impl AgentLoop {
         let mut tool_calls_map: HashMap<String, ApiStreamToolCall> = HashMap::new();
         let mut tool_call_order: Vec<String> = Vec::new();
         let mut tool_call_detected = false;
-        let mut spinner = spinner;
         let mut display_buffer = String::new();
         let mut in_code_block = false;
         let mut code_block_lang = String::new();
@@ -1215,7 +1203,6 @@ impl AgentLoop {
             // Uses lock-free AtomicBool to avoid mutex contention on every chunk.
             if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 tracing::info!("cancellation detected during stream processing, aborting turn");
-                drop(spinner.take());
                 return TurnResult::Cancelled;
             }
 
@@ -1238,12 +1225,8 @@ impl AgentLoop {
                 );
             }
 
-            // Stop spinner on first chunk received
             if !first_chunk_received {
                 first_chunk_received = true;
-                if let Some(s) = spinner.take() {
-                    s.stop();
-                }
             }
 
             match chunk {
@@ -2162,19 +2145,6 @@ impl AgentLoop {
                 tool_tasks.push((tool_id, tool_name, Some(result_text), None, vec![]));
             }
 
-            // Phase 2: Execute approved tools in parallel
-            // BUT: serialize edit_file calls to the same file to avoid anchor mismatch
-            let tool_spinner = if show_progress && !tool_tasks.is_empty() {
-                let label = {
-                    let names: Vec<String> =
-                        tool_tasks.iter().map(|(_, n, _, _, _)| n.clone()).collect();
-                    multi_tool_label(&names)
-                };
-                Some(Spinner::start(&label))
-            } else {
-                None
-            };
-
             // Execute with serialization only for same-file edit_file calls
             let mut non_edit_executed = std::collections::HashSet::new();
 
@@ -2221,18 +2191,6 @@ impl AgentLoop {
                 })
                 .collect();
 
-            // Pause spinner while executing tools with live stderr output (e.g., execute_command).
-            // This prevents the spinner's \r cursor repositioning from interleaving with command
-            // output lines, which would cause horizontal gaps in the terminal.
-            let has_live_output_tools = tool_tasks
-                .iter()
-                .any(|(_, name, _, _, _)| name == "execute_command" || name == "execute_script");
-            if has_live_output_tools {
-                if let Some(ref spinner) = tool_spinner {
-                    spinner.pause();
-                }
-            }
-
             let non_edit_results = futures::future::join_all(non_edit_futures).await;
 
             // Execute edit_file groups in parallel, but calls within each group sequentially
@@ -2252,13 +2210,6 @@ impl AgentLoop {
                 .collect();
 
             let edit_group_results = futures::future::join_all(edit_group_futures).await;
-
-            // Resume spinner after live-output tools complete
-            if has_live_output_tools {
-                if let Some(ref spinner) = tool_spinner {
-                    spinner.resume();
-                }
-            }
 
             // Map results back to original indices
             let mut result_map: std::collections::HashMap<usize, String> =
@@ -2291,9 +2242,6 @@ impl AgentLoop {
             let parallel_results: Vec<String> = (0..tool_tasks.len())
                 .filter_map(|i| result_map.remove(&i))
                 .collect();
-
-            // Stop tool spinner BEFORE displaying results to prevent cursor misalignment
-            drop(tool_spinner);
 
             // Phase 3: Collect results in order, then push as ONE StorageMessage
             let mut parallel_results_iter = parallel_results.into_iter();

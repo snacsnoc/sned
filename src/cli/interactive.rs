@@ -683,8 +683,9 @@ pub async fn run_interactive_shell_inner(
         }
 
         let n = loop {
-            // Re-render prompt periodically while agent is busy to prevent it from
-            // being overwritten by agent output to stderr
+            // Poll with shorter delay while agent is busy for responsive UI after completion.
+            // Note: TUI rendering is disabled during agent execution (raw_mode exited) to prevent
+            // cursor races with agent stderr output — see agent spawn comment above.
             let reprompt_delay = if agent_busy.load(Ordering::Relaxed) {
                 tokio::time::Duration::from_millis(100)
             } else {
@@ -705,6 +706,11 @@ pub async fn run_interactive_shell_inner(
                     };
                 }
                 _ = agent_done.notified() => {
+                    // Re-enter raw mode after agent completes — pairs with raw_guard = None before agent spawn.
+                    // Ensures TUI input handling resumes correctly after agent stderr output finishes.
+                    if raw_guard.is_none() {
+                        raw_guard = Some(enter_raw_mode()?);
+                    }
                     continue 'main;
                 }
                 _ = tokio::time::sleep(reprompt_delay) => {
@@ -1479,6 +1485,13 @@ pub async fn run_interactive_shell_inner(
                         }
                         raw_guard = Some(enter_raw_mode()?);
                     } else {
+                        // Exit raw mode before running agent to prevent TUI cursor races with stderr output.
+                        // The TUI renders to stdout using ANSI cursor positioning, while agent outputs to stderr.
+                        // Both share the terminal cursor state — if raw mode is active, TUI re-renders during
+                        // agent execution will overwrite or misalign agent output, causing horizontal whitespace
+                        // and garbled display. Raw mode is re-entered when agent completes (agent_done notification).
+                        raw_guard = None;
+                        
                         agent_busy.store(true, Ordering::Relaxed);
                         let busy = agent_busy.clone();
                         let sess = session.clone();
@@ -1507,8 +1520,6 @@ pub async fn run_interactive_shell_inner(
                             let mut task = agent_task.lock().await;
                             *task = Some(handle);
                         }
-
-                        raw_guard = Some(enter_raw_mode()?);
                     }
 
                     input_buf.clear();
