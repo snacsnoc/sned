@@ -140,6 +140,7 @@ fn max_paste_size() -> usize {
         std::env::var("SNED_MAX_PASTE_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
             .unwrap_or(MAX_PASTE_SIZE_DEFAULT)
     })
 }
