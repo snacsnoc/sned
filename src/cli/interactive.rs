@@ -931,7 +931,7 @@ pub async fn run_interactive_shell_inner(
                                     let checkpoint_mgr = checkpoint_mgr.unwrap();
 
                                 // Get the most recent checkpoint
-                                let checkpoints = match checkpoint_mgr.list_checkpoints() {
+                                let checkpoints = match checkpoint_mgr.list_checkpoints().await {
                                     Ok(cps) => cps,
                                     Err(e) => {
                                         eprintln!("Failed to list checkpoints: {}", e);
@@ -955,6 +955,7 @@ pub async fn run_interactive_shell_inner(
                                 let changed_files = if let Some(current) = current_hash {
                                     checkpoint_mgr
                                         .get_changed_files(&most_recent.hash, Some(current))
+                                        .await
                                         .unwrap_or_else(|_| vec![])
                                 } else {
                                     vec![]
@@ -984,7 +985,7 @@ pub async fn run_interactive_shell_inner(
                                 }
 
                                 // Restore to the most recent checkpoint
-                                match checkpoint_mgr.restore_checkpoint(&most_recent.hash) {
+                                match checkpoint_mgr.restore_checkpoint(&most_recent.hash).await {
                                     Ok(()) => {
                                         eprintln!(
                                             "Restored to checkpoint {} — {} file(s) reverted",
@@ -1154,7 +1155,7 @@ pub async fn run_interactive_shell_inner(
 
                                     let checkpoint_mgr = checkpoint_mgr.unwrap();
 
-                                    match checkpoint_mgr.list_checkpoints() {
+                                    match checkpoint_mgr.list_checkpoints().await {
                                     Ok(checkpoints) => {
                                         if checkpoints.is_empty() {
                                             eprintln!("No checkpoints found.");
@@ -1202,7 +1203,7 @@ pub async fn run_interactive_shell_inner(
 
                                 let checkpoint_mgr = checkpoint_mgr.unwrap();
 
-                                match checkpoint_mgr.list_checkpoints() {
+                                match checkpoint_mgr.list_checkpoints().await {
                                     Ok(checkpoints) => {
                                         if checkpoints.is_empty() {
                                             eprintln!("No checkpoints to restore.");
@@ -1264,7 +1265,9 @@ pub async fn run_interactive_shell_inner(
                                                 match checkpoint_mgr.get_changed_files(
                                                     &checkpoint.hash,
                                                     Some(current_hash),
-                                                ) {
+                                                )
+                                                .await
+                                                {
                                                     Ok(changed_files) => {
                                                         if !changed_files.is_empty() {
                                                             println!(
@@ -1304,7 +1307,7 @@ pub async fn run_interactive_shell_inner(
                                                     }
                                                 }
 
-                                                match checkpoint_mgr.restore_by_number(num) {
+                                                match checkpoint_mgr.restore_by_number(num).await {
                                                     Ok(()) => {
                                                         println!(
                                                             "Checkpoint {} ({}) restored successfully.",

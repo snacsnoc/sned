@@ -220,6 +220,46 @@ impl CheckpointTracker {
         Ok(Some(hash))
     }
 
+    /// List all checkpoint commits (newest first).
+    pub fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, CheckpointError> {
+        let output = Command::new("git")
+            .args([
+                "--git-dir",
+                self.shadow_git_path.to_str().unwrap_or("."),
+                "--work-tree",
+                self.cwd.to_str().unwrap_or("."),
+                "log",
+                "--oneline",
+                "-n",
+                "50",
+            ])
+            .output()
+            .map_err(|e| CheckpointError::CommandFailed(format!("git log failed: {}", e)))?;
+
+        if !output.status.success() {
+            return Err(CheckpointError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        let commits: Vec<CheckpointInfo> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                let parts: Vec<&str> = line.splitn(2, ' ').collect();
+                let hash = parts.first().unwrap_or(&"").to_string();
+                let message = parts.get(1).unwrap_or(&"").to_string();
+                CheckpointInfo {
+                    number: i + 1,
+                    hash,
+                    message,
+                }
+            })
+            .collect();
+
+        Ok(commits)
+    }
+
     /// Get the list of changed files between two commits.
     ///
     /// If `rhs_hash` is `None`, compares `lhs_hash` to the working directory.
@@ -401,26 +441,55 @@ impl TaskCheckpointManager {
     }
 
     /// Restore the workspace to a specific checkpoint.
-    pub fn restore_checkpoint(&self, commit_hash: &str) -> Result<(), CheckpointError> {
-        match &self.tracker {
-            Some(tracker) => tracker.restore(commit_hash),
-            None => Err(CheckpointError::CommandFailed(
-                "No checkpoint tracker available".to_string(),
-            )),
+    /// Runs git commands in a blocking thread to avoid stalling the async runtime.
+    pub async fn restore_checkpoint(&self, commit_hash: &str) -> Result<(), CheckpointError> {
+        let tracker = match &self.tracker {
+            Some(t) => t.clone(),
+            None => {
+                return Err(CheckpointError::CommandFailed(
+                    "No checkpoint tracker available".to_string(),
+                ));
+            }
+        };
+
+        let commit_hash = commit_hash.to_string();
+        match tokio::task::spawn_blocking(move || tracker.restore(&commit_hash)).await {
+            Ok(result) => result,
+            Err(e) => Err(CheckpointError::CommandFailed(format!(
+                "Checkpoint restore task panicked: {}",
+                e
+            ))),
         }
     }
 
     /// Get the list of changed files between two checkpoints.
-    pub fn get_changed_files(
+    /// Runs git commands in a blocking thread to avoid stalling the async runtime.
+    pub async fn get_changed_files(
         &self,
         lhs_hash: &str,
         rhs_hash: Option<&str>,
     ) -> Result<Vec<String>, CheckpointError> {
-        match &self.tracker {
-            Some(tracker) => tracker.get_changed_files(lhs_hash, rhs_hash),
-            None => Err(CheckpointError::CommandFailed(
-                "No checkpoint tracker available".to_string(),
-            )),
+        let tracker = match &self.tracker {
+            Some(t) => t.clone(),
+            None => {
+                return Err(CheckpointError::CommandFailed(
+                    "No checkpoint tracker available".to_string(),
+                ));
+            }
+        };
+
+        let lhs_hash = lhs_hash.to_string();
+        let rhs_hash = rhs_hash.map(|s| s.to_string());
+        match tokio::task::spawn_blocking(move || {
+            tracker.get_changed_files(&lhs_hash, rhs_hash.as_deref())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => Err(CheckpointError::CommandFailed(format!(
+                "Checkpoint get_changed_files task panicked: {}",
+                e
+            ))),
         }
     }
 
@@ -435,9 +504,10 @@ impl TaskCheckpointManager {
     }
 
     /// List all checkpoint commits (newest first).
-    pub fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, CheckpointError> {
+    /// Runs git commands in a blocking thread to avoid stalling the async runtime.
+    pub async fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, CheckpointError> {
         let tracker = match &self.tracker {
-            Some(t) => t,
+            Some(t) => t.clone(),
             None => {
                 return Err(CheckpointError::CommandFailed(
                     "No checkpoint tracker available".to_string(),
@@ -445,47 +515,18 @@ impl TaskCheckpointManager {
             }
         };
 
-        let output = Command::new("git")
-            .args([
-                "--git-dir",
-                tracker.shadow_git_path.to_str().unwrap_or("."),
-                "--work-tree",
-                tracker.cwd.to_str().unwrap_or("."),
-                "log",
-                "--oneline",
-                "-n",
-                "50",
-            ])
-            .output()
-            .map_err(|e| CheckpointError::CommandFailed(format!("git log failed: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(CheckpointError::CommandFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+        match tokio::task::spawn_blocking(move || tracker.list_checkpoints()).await {
+            Ok(result) => result,
+            Err(e) => Err(CheckpointError::CommandFailed(format!(
+                "Checkpoint list_checkpoints task panicked: {}",
+                e
+            ))),
         }
-
-        let commits: Vec<CheckpointInfo> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .enumerate()
-            .map(|(i, line)| {
-                let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                let hash = parts.first().unwrap_or(&"").to_string();
-                let message = parts.get(1).unwrap_or(&"").to_string();
-                CheckpointInfo {
-                    number: i + 1,
-                    hash,
-                    message,
-                }
-            })
-            .collect();
-
-        Ok(commits)
     }
 
     /// Restore workspace to checkpoint by number (1 = oldest, N = newest).
-    pub fn restore_by_number(&self, number: usize) -> Result<(), CheckpointError> {
-        let checkpoints = self.list_checkpoints()?;
+    pub async fn restore_by_number(&self, number: usize) -> Result<(), CheckpointError> {
+        let checkpoints = self.list_checkpoints().await?;
 
         if number == 0 || number > checkpoints.len() {
             return Err(CheckpointError::CommandFailed(format!(
@@ -497,7 +538,7 @@ impl TaskCheckpointManager {
 
         // Convert 1-based number to index (1 = oldest = first in log)
         let checkpoint = &checkpoints[checkpoints.len() - number];
-        self.restore_checkpoint(&checkpoint.hash)
+        self.restore_checkpoint(&checkpoint.hash).await
     }
 }
 
