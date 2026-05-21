@@ -24,6 +24,21 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(unix)]
+struct TermiosGuard {
+    fd: std::os::unix::io::RawFd,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original);
+        }
+    }
+}
+
 const SAFE_BASE_COMMANDS: &[&str] = &[
     "ls", "pwd", "date", "whoami", "uname", "cat", "grep", "find", "head", "tail", "cd", "clear",
     "echo", "hostname", "df", "du", "ps", "free", "uptime", "wc", "sort", "uniq", "file", "stat",
@@ -940,24 +955,75 @@ pub async fn prompt_for_combined_approval(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // No TUI loop - fall back to direct stdin reading with raw mode
                 set_approval_prompt_active(false);
-                use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
                 
-                let _ = enable_raw_mode();
-                let mut buf = [0u8; 1];
-                let result = if let Ok(n) = std::io::stdin().read(&mut buf) {
-                    if n > 0 {
-                        let c = buf[0] as char;
-                        print!("{}", c);
-                        let _ = std::io::stdout().flush();
-                        Ok(c)
-                    } else {
-                        Ok('n')
-                    }
-                } else {
-                    Ok('n')
-                };
-                let _ = disable_raw_mode();
-                println!();
+                let result: Result<char, ()>;
+                
+                #[cfg(unix)]
+                {
+                    use std::io::{Read, Write};
+                    use std::os::unix::io::AsRawFd;
+                    
+                    // Save original terminal settings
+                    let stdin_fd = std::io::stdin().as_raw_fd();
+                    let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
+                    let _restore_guard = unsafe {
+                        if libc::tcgetattr(stdin_fd, &mut original_termios) == 0 {
+                            Some(TermiosGuard {
+                                fd: stdin_fd,
+                                original: original_termios,
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    
+                    // Set raw mode: disable canonical mode, echo, and signal generation
+                    let mut raw_termios = original_termios;
+                    raw_termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+                    raw_termios.c_cc[libc::VMIN as usize] = 1; // Read at least 1 byte
+                    raw_termios.c_cc[libc::VTIME as usize] = 0; // No timeout
+                    
+                    unsafe {
+                        if libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_termios) != 0 {
+                            result = Ok('n');
+                        } else {
+                            // Read single character
+                            let mut buf = [0u8; 1];
+                            result = match std::io::stdin().read_exact(&mut buf) {
+                                Ok(()) => {
+                                    let c = buf[0] as char;
+                                    // Echo the character so user sees their choice
+                                    let _ = print!("{}", c);
+                                    let _ = std::io::stdout().flush();
+                                    Ok(c)
+                                }
+                                Err(_) => Ok('n'),
+                            };
+                            // Terminal restored by TermiosGuard drop
+                            println!(); // Newline after response
+                        }
+                    };
+                }
+                
+                #[cfg(not(unix))]
+                {
+                    // Fallback for non-Unix systems
+                    use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+                    let _ = enable_raw_mode();
+                    let mut buf = [0u8; 1];
+                    result = match std::io::stdin().read_exact(&mut buf) {
+                        Ok(()) => {
+                            let c = buf[0] as char;
+                            print!("{}", c);
+                            let _ = std::io::stdout().flush();
+                            Ok(c)
+                        }
+                        Err(_) => Ok('n'),
+                    };
+                    let _ = disable_raw_mode();
+                    println!();
+                }
+                
                 result
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(()),

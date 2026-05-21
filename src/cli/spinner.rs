@@ -48,7 +48,7 @@ impl Spinner {
                 let elapsed_str = if elapsed.as_secs() >= 60 {
                     format!("{}m {}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
                 } else {
-                    format!("{}s", elapsed.as_secs())
+                    format!("{}ms", elapsed.as_millis())
                 };
                 let label_with_time = format!("{} ({})", label, elapsed_str);
                 let styled_label = crate::cli::colors::colorize(
