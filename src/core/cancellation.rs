@@ -79,7 +79,7 @@ impl CancellationHandler {
                     }
 
                     // Wait briefly for graceful shutdown
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                     // Send SIGKILL to any remaining processes
                     for pid in &pids_to_kill {
