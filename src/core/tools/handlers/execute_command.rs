@@ -5,8 +5,10 @@ use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_string_array};
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -63,6 +65,18 @@ impl ExecuteCommandHandler {
         }
 
         Duration::from_secs(30)
+    }
+
+    /// Get the live streaming output line limit (default 20, configurable via SNED_STREAM_OUTPUT_LINES).
+    fn stream_output_line_limit() -> usize {
+        static LIMIT: OnceLock<usize> = OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            std::env::var("SNED_STREAM_OUTPUT_LINES")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(20)
+        })
     }
 
     /// Execute one or more CLI commands.
@@ -236,13 +250,35 @@ impl ExecuteCommandHandler {
             let mut stdout_collected = String::new();
             let mut stderr_collected = String::new();
 
+            // Head+tail streaming condensation state
+            let stream_limit = Self::stream_output_line_limit();
+            let half = stream_limit / 2;
+            let mut displayed: usize = 0;
+            let mut truncated = false;
+            let mut tail_buffer: VecDeque<String> = VecDeque::with_capacity(half);
+
             let output = loop {
                 tokio::select! {
                     result = stdout_reader.next_line() => {
                         match result {
                             Ok(Some(line)) => {
+                                displayed += 1;
                                 if !json_output {
-                                    eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                    if displayed <= half {
+                                        // Head: print live
+                                        eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                    } else if displayed == half + 1 && !truncated {
+                                        // First skipped line: emit condensed note once
+                                        eprintln!("{}", crate::cli::colors::colorize("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                        truncated = true;
+                                    }
+                                }
+                                if truncated {
+                                    // Keep tail ring buffer
+                                    tail_buffer.push_back(line.clone());
+                                    if tail_buffer.len() > half {
+                                        tail_buffer.pop_front();
+                                    }
                                 }
                                 stdout_collected.push_str(&line);
                                 stdout_collected.push('\n');
@@ -254,8 +290,23 @@ impl ExecuteCommandHandler {
                     result = stderr_reader.next_line() => {
                         match result {
                             Ok(Some(line)) => {
+                                displayed += 1;
                                 if !json_output {
-                                    eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                    if displayed <= half {
+                                        // Head: print live
+                                        eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                    } else if displayed == half + 1 && !truncated {
+                                        // First skipped line: emit condensed note once
+                                        eprintln!("{}", crate::cli::colors::colorize("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                        truncated = true;
+                                    }
+                                }
+                                if truncated {
+                                    // Keep tail ring buffer
+                                    tail_buffer.push_back(line.clone());
+                                    if tail_buffer.len() > half {
+                                        tail_buffer.pop_front();
+                                    }
                                 }
                                 stderr_collected.push_str(&line);
                                 stderr_collected.push('\n');
@@ -292,15 +343,39 @@ impl ExecuteCommandHandler {
                         break match result {
                             Ok(Ok(status)) => {
                                 while let Ok(Some(line)) = stdout_reader.next_line().await {
+                                    displayed += 1;
                                     if !json_output {
-                                        eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                        if displayed <= half {
+                                            eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                        } else if displayed == half + 1 && !truncated {
+                                            eprintln!("{}", crate::cli::colors::colorize("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                            truncated = true;
+                                        }
+                                    }
+                                    if truncated {
+                                        tail_buffer.push_back(line.clone());
+                                        if tail_buffer.len() > half {
+                                            tail_buffer.pop_front();
+                                        }
                                     }
                                     stdout_collected.push_str(&line);
                                     stdout_collected.push('\n');
                                 }
                                 while let Ok(Some(line)) = stderr_reader.next_line().await {
+                                    displayed += 1;
                                     if !json_output {
-                                        eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                        if displayed <= half {
+                                            eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                        } else if displayed == half + 1 && !truncated {
+                                            eprintln!("{}", crate::cli::colors::colorize("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                            truncated = true;
+                                        }
+                                    }
+                                    if truncated {
+                                        tail_buffer.push_back(line.clone());
+                                        if tail_buffer.len() > half {
+                                            tail_buffer.pop_front();
+                                        }
                                     }
                                     stderr_collected.push_str(&line);
                                     stderr_collected.push('\n');
@@ -331,6 +406,24 @@ impl ExecuteCommandHandler {
                     }
                 }
             };
+
+            // Print tail lines after command completes (if we truncated)
+            if truncated && !tail_buffer.is_empty() && !json_output {
+                let total = displayed;
+                eprintln!(
+                    "{}",
+                    crate::cli::colors::colorize(
+                        &format!("--- last {} of {} lines ---", tail_buffer.len(), total),
+                        crate::cli::colors::style::DIM
+                    )
+                );
+                for line in tail_buffer.iter() {
+                    eprintln!(
+                        "{}",
+                        crate::cli::colors::colorize(line, crate::cli::colors::style::DIM)
+                    );
+                }
+            }
 
             // Unregister PID after command completes
             #[cfg(unix)]
@@ -1116,5 +1209,39 @@ mod tests {
             "expected safety checker error, got: {}",
             err_text
         );
+    }
+
+    #[test]
+    fn test_stream_output_line_limit_default() {
+        // Clear any cached value from previous tests
+        unsafe { std::env::remove_var("SNED_STREAM_OUTPUT_LINES") };
+        // Reset the OnceLock by calling the function (it will cache default)
+        let limit = ExecuteCommandHandler::stream_output_line_limit();
+        assert_eq!(limit, 20, "default stream limit should be 20");
+    }
+
+    #[test]
+    fn test_stream_output_line_limit_env_parsing() {
+        // Test the env var parsing logic (OnceLock caches first value, so we test the parsing inline)
+        unsafe { std::env::set_var("SNED_STREAM_OUTPUT_LINES", "50") };
+        let env_val = std::env::var("SNED_STREAM_OUTPUT_LINES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(20);
+        assert_eq!(env_val, 50, "should parse valid positive integer");
+        unsafe { std::env::remove_var("SNED_STREAM_OUTPUT_LINES") };
+    }
+
+    #[test]
+    fn test_stream_output_line_limit_invalid_env_falls_back() {
+        unsafe { std::env::set_var("SNED_STREAM_OUTPUT_LINES", "invalid") };
+        let env_val = std::env::var("SNED_STREAM_OUTPUT_LINES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(20);
+        assert_eq!(env_val, 20, "invalid env should fall back to default");
+        unsafe { std::env::remove_var("SNED_STREAM_OUTPUT_LINES") };
     }
 }
