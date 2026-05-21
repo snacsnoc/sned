@@ -533,9 +533,16 @@ pub async fn run_interactive_shell_inner(
 
     let mut stdout = io::stdout();
 
-    // Enable bracketed paste mode so pasted multi-line text is treated as a single input
+    // Enable bracketed paste mode so pasted multi-line text is treated as a single input.
+    // Flush immediately to ensure the terminal processes this before we start reading.
     write!(stdout, "\x1b[?2004h")?;
     stdout.flush()?;
+
+    // Give the terminal a moment to process the bracketed paste enable sequence.
+    // Without this, rapid pastes immediately after startup might arrive before the
+    // terminal has processed the escape sequence.
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
     let mut input_row: u16 = 0;
     let mut last_picker_row: Option<usize> = None;
     let mut last_picker_height: usize = 0;
