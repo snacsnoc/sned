@@ -175,10 +175,12 @@ impl MinimaxProvider {
             };
         }
 
-        // Reasoning config (always enable for M2.7)
+        // Reasoning config: only enable for models that support reasoning
         // reasoning_split must be a top-level parameter, not nested in extra_body
         // (extra_body is an OpenAI Python SDK convenience that merges into the request body)
-        body["reasoning_split"] = json!(true);
+        if self.get_model_info().supports_reasoning.unwrap_or(false) {
+            body["reasoning_split"] = json!(true);
+        }
 
         Ok(body)
     }
