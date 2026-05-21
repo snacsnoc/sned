@@ -74,9 +74,42 @@ impl ToolHandler for ListSkillsHandler {
         ctx: &ToolContext,
         _params: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
-        let mut state = ctx.state.lock().await;
-        Self::build_response(&mut state, ctx.workspace_root.as_path(), _params)
-            .map(serde_json::Value::String)
+        // Discover skills outside the state lock to avoid holding lock across sync I/O
+        let workspace_root = ctx.workspace_root.as_path();
+        let skills = {
+            let state = ctx.state.lock().await;
+            if state.available_skills.is_empty() {
+                // Release lock before discovering skills
+                drop(state);
+                let project_skills = discover_skills(workspace_root);
+                get_available_skills(project_skills)
+            } else {
+                state.available_skills.clone()
+            }
+        };
+
+        // Build response without holding any lock
+        let project_skills: Vec<&SkillMetadata> = skills
+            .iter()
+            .filter(|s| matches!(s.source, SkillSource::Project))
+            .collect();
+        let global_skills: Vec<&SkillMetadata> = skills
+            .iter()
+            .filter(|s| matches!(s.source, SkillSource::Global))
+            .collect();
+
+        let response = if skills.is_empty() {
+            "No skills are currently available.".to_string()
+        } else {
+            let mut response = "# AVAILABLE SKILLS\n\n".to_string();
+            for skill in project_skills.iter().chain(global_skills.iter()) {
+                response.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            }
+            response.push_str("\nUse the 'use_skill' tool to activate a skill.");
+            response
+        };
+
+        Ok(serde_json::Value::String(response))
     }
 
     fn description(&self, _params: &serde_json::Value) -> String {

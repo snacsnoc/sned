@@ -130,6 +130,96 @@ impl UseSkillHandler {
         })?;
         self.execute_with_workspace_root(state, params, &workspace_root)
     }
+
+    /// Execute with pre-discovered skills (avoids holding lock across I/O).
+    fn execute_with_skills(
+        &self,
+        state: &mut TaskState,
+        params: serde_json::Value,
+        _workspace_root: &Path,
+        available_skills: Vec<SkillMetadata>,
+    ) -> Result<String, ToolError> {
+        let skill_name = params
+            .get("skill_name")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| {
+                state.consecutive_mistakes += 1;
+                tracing::warn!(
+                    consecutive_mistakes = state.consecutive_mistakes,
+                    "use_skill: missing skill_name parameter"
+                );
+                ToolError::InvalidInput(
+                    "Missing required parameter 'skill_name'. Please provide the name of the skill to activate.".to_string(),
+                )
+            })?;
+
+        state.consecutive_mistakes = 0;
+
+        if available_skills.is_empty() {
+            return Ok(
+                "Error: No skills are available. Skills may be disabled or not configured."
+                    .to_string(),
+            );
+        }
+
+        let skill_content = get_skill_content(skill_name, &available_skills);
+
+        if skill_content.is_none() {
+            let available_names: Vec<String> =
+                available_skills.iter().map(|s| s.name.clone()).collect();
+            return Ok(format!(
+                "Error: Skill \"{}\" not found. Available skills: {}",
+                skill_name,
+                if available_names.is_empty() {
+                    "none".to_string()
+                } else {
+                    available_names.join(", ")
+                }
+            ));
+        }
+
+        let skill_content = skill_content.unwrap();
+        let skill_md_path = std::path::Path::new(&skill_content.path);
+        let supporting = list_supporting_files(skill_md_path);
+        let skill_dir = skill_md_path
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or(".");
+
+        let mut activation_message = format!(
+            "# Skill \"{}\" is now active\n\n{}\n\n---\n",
+            skill_content.name, skill_content.instructions
+        );
+        activation_message.push_str(
+            "IMPORTANT: The skill is now loaded. Do NOT call use_skill again for this task. Simply follow the instructions above to complete the user's request.\n",
+        );
+
+        if !supporting.docs.is_empty() || !supporting.scripts.is_empty() {
+            activation_message.push_str(&format!(
+                "\nYou may access supporting files in the skill directory: {}/\n",
+                skill_dir
+            ));
+            if !supporting.docs.is_empty() {
+                activation_message.push_str("\nDocumentation available:\n");
+                for doc in &supporting.docs {
+                    activation_message.push_str(&format!("- {}/docs/{}\n", skill_dir, doc));
+                }
+            }
+            if !supporting.scripts.is_empty() {
+                activation_message.push_str("\nScripts available (run via execute_command):\n");
+                for script in &supporting.scripts {
+                    activation_message.push_str(&format!("- {}/scripts/{}\n", skill_dir, script));
+                }
+            }
+        } else {
+            activation_message.push_str(&format!(
+                "\nYou may access other files in the skill directory at: {}",
+                skill_dir
+            ));
+        }
+
+        Ok(activation_message)
+    }
 }
 
 #[async_trait]
@@ -139,9 +229,22 @@ impl ToolHandler for UseSkillHandler {
         ctx: &ToolContext,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
+        // Discover skills outside the state lock to avoid holding lock across sync I/O
+        let workspace_root = ctx.workspace_root.as_path();
+        let skills_to_use = {
+            let state = ctx.state.lock().await;
+            if state.available_skills.is_empty() {
+                // Release lock before discovering skills
+                drop(state);
+                Self::discover_available_skills(workspace_root)
+            } else {
+                state.available_skills.clone()
+            }
+        };
+
+        // Re-acquire lock only for state mutation
         let mut state = ctx.state.lock().await;
-        let result =
-            self.execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())?;
+        let result = self.execute_with_skills(&mut state, params, workspace_root, skills_to_use)?;
         Ok(serde_json::Value::String(result))
     }
 
