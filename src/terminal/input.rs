@@ -128,8 +128,21 @@ pub struct InputParser {
     paste_buffer: Vec<u8>,
 }
 
-/// Maximum paste size to prevent memory exhaustion (10KB)
-const MAX_PASTE_SIZE: usize = 10_000;
+/// Maximum paste size to prevent memory exhaustion (200KB default, configurable via SNED_MAX_PASTE_SIZE)
+const MAX_PASTE_SIZE_DEFAULT: usize = 200_000;
+
+/// Get the maximum paste size from environment or default.
+/// Uses OnceLock for lazy initialization without global mutable state.
+fn max_paste_size() -> usize {
+    use std::sync::OnceLock;
+    static MAX_SIZE: OnceLock<usize> = OnceLock::new();
+    *MAX_SIZE.get_or_init(|| {
+        std::env::var("SNED_MAX_PASTE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(MAX_PASTE_SIZE_DEFAULT)
+    })
+}
 
 impl Default for InputParser {
     fn default() -> Self {
@@ -160,9 +173,9 @@ impl InputParser {
             return None;
         }
 
-        // In paste mode, check for paste end marker first
+        // In paste mode, accumulate bytes and check for end marker
         if self.paste_mode {
-            // Check for paste end marker
+            // Check for paste end marker at the start of input buffer
             let is_paste_end =
                 self.buf.len() >= 6 && self.buf.iter().take(6).eq(b"\x1b[201~".iter());
             if is_paste_end {
@@ -172,8 +185,30 @@ impl InputParser {
                 self.paste_buffer.clear();
                 return Some(TerminalEvent::Paste(paste_content));
             }
+            // Check if paste_buffer ends with partial end marker and input buffer completes it
+            // This handles the case where \x1b[201~ is split across multiple stdin reads
+            let paste_end_prefix = b"\x1b[201~";
+            for prefix_len in 1..6 {
+                if self.paste_buffer.len() >= prefix_len
+                    && &self.paste_buffer[self.paste_buffer.len() - prefix_len..]
+                        == &paste_end_prefix[..prefix_len]
+                    && self.buf.len() >= 6 - prefix_len
+                    && self.buf.iter().take(6 - prefix_len).eq(
+                        paste_end_prefix[prefix_len..].iter()
+                    )
+                {
+                    // Found split end marker
+                    self.paste_buffer.truncate(self.paste_buffer.len() - prefix_len);
+                    self.buf.drain(..6 - prefix_len);
+                    self.paste_mode = false;
+                    let paste_content =
+                        String::from_utf8_lossy(&self.paste_buffer).to_string();
+                    self.paste_buffer.clear();
+                    return Some(TerminalEvent::Paste(paste_content));
+                }
+            }
             // Enforce maximum paste size to prevent memory exhaustion
-            if self.paste_buffer.len() >= MAX_PASTE_SIZE {
+            if self.paste_buffer.len() >= max_paste_size() {
                 // Truncate paste - user pasted too much
                 self.paste_mode = false;
                 self.paste_buffer.clear();
@@ -185,10 +220,11 @@ impl InputParser {
                     self.buf.drain(..6);
                 }
                 return Some(TerminalEvent::Paste(
-                    "[paste truncated - exceeded 10KB limit]".to_string(),
+                    format!("[paste truncated - exceeded {} byte limit]", max_paste_size())
                 ));
             }
             // Buffer content during paste (O(1) with VecDeque)
+            // Bytes are buffered one at a time, checking for end marker after each
             if let Some(byte) = self.buf.pop_front() {
                 self.paste_buffer.push(byte);
             }
@@ -788,5 +824,51 @@ mod tests {
         let evs = p.drain_events();
         assert!(!p.paste_mode);
         assert!(matches!(evs[0], TerminalEvent::Paste(_)));
+    }
+
+    #[test]
+    fn test_paste_end_marker_split_across_reads() {
+        // Simulate end marker split across two stdin reads
+        // The parser buffers bytes one at a time, so split markers are handled correctly
+        let mut p = InputParser::new();
+
+        // Start paste with content
+        p.feed(b"\x1b[200~test content");
+        p.drain_events();
+        assert!(p.paste_mode);
+
+        // Feed ESC (first byte of end marker) - gets buffered
+        p.feed(b"\x1b");
+        assert_eq!(p.next_event(), None); // Still waiting for more bytes
+
+        // Feed rest of marker - should complete and emit Paste
+        p.feed(b"[201~");
+        let evs = p.drain_events();
+        assert!(!p.paste_mode);
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], TerminalEvent::Paste(ref s) if s == "test content"));
+    }
+
+    #[test]
+    fn test_paste_truncation_with_env_var() {
+        // Set a small limit for testing
+        unsafe {
+            std::env::set_var("SNED_MAX_PASTE_SIZE", "50");
+        }
+
+        let mut p = InputParser::new();
+        // Start paste with content exceeding limit
+        let large_content = "x".repeat(100);
+        p.feed(b"\x1b[200~");
+        p.feed(large_content.as_bytes());
+        p.feed(b"\x1b[201~");
+
+        let evs = p.drain_events();
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], TerminalEvent::Paste(ref s) if s.contains("truncated")));
+
+        unsafe {
+            std::env::remove_var("SNED_MAX_PASTE_SIZE");
+        }
     }
 }

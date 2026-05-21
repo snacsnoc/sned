@@ -535,11 +535,12 @@ pub async fn run_interactive_shell_inner(
 
     // Enable bracketed paste mode so pasted multi-line text is treated as a single input
     write!(stdout, "\x1b[?2004h")?;
+    stdout.flush()?;
     let mut input_row: u16 = 0;
     let mut last_picker_row: Option<usize> = None;
     let mut last_picker_height: usize = 0;
     let mut stdin = tokio::io::stdin();
-    let mut byte_buf = [0u8; 64];
+    let mut byte_buf = [0u8; 4096];
 
     let agent_busy = Arc::new(AtomicBool::new(false));
     let agent_done = Arc::new(tokio::sync::Notify::new());
@@ -715,8 +716,18 @@ pub async fn run_interactive_shell_inner(
             match event {
                 TerminalEvent::Paste(content) => {
                     // Append pasted content as a single block
+                    let line_count = content.lines().count();
                     input_buf.push_str(&content);
                     cursor_pos = input_buf.len();
+                    // Show feedback for multi-line pastes
+                    if line_count > 1 {
+                        writeln!(
+                            stdout,
+                            "\r\n📋 Pasted {} lines (use Enter to submit)",
+                            line_count
+                        )?;
+                        stdout.flush()?;
+                    }
                     continue;
                 }
                 TerminalEvent::Return => {

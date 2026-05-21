@@ -644,7 +644,7 @@ mod tests {
         let content = std::fs::read_to_string(&test_file).unwrap();
         assert_eq!(content, "modified content");
 
-        let result = manager.restore_checkpoint(checkpoint1.as_ref().unwrap());
+        let result = manager.restore_checkpoint(checkpoint1.as_ref().unwrap()).await;
         assert!(result.is_ok(), "Restore should succeed: {:?}", result);
 
         let content = std::fs::read_to_string(&test_file).unwrap();
@@ -654,7 +654,7 @@ mod tests {
         );
 
         let changed_files =
-            manager.get_changed_files(checkpoint1.as_ref().unwrap(), checkpoint2.as_deref());
+            manager.get_changed_files(checkpoint1.as_ref().unwrap(), checkpoint2.as_deref()).await;
         assert!(changed_files.is_ok());
         let files = changed_files.unwrap();
         assert!(

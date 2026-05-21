@@ -58,7 +58,6 @@ opencode.json
 
 # Local/private docs removed from public history
 .agents/
-memory/
 BUILD_SPEC.md
 NEW_NAMES.md
 insight-2026-05-18.html
