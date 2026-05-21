@@ -252,7 +252,14 @@ impl DiagnosticsScanHandler {
                 .await
                 {
                     Ok(Ok(output)) => output,
-                    _ => String::new(),
+                    Ok(Err(e)) => {
+                        tracing::warn!("diagnostics failed for {:?}: {}", project_root, e);
+                        String::new()
+                    }
+                    Err(_) => {
+                        tracing::warn!("diagnostics timed out for {:?}", project_root);
+                        String::new()
+                    }
                 };
 
                 // Associate the same output with all files in this group
