@@ -71,6 +71,11 @@ impl ReplaceSymbolHandler {
         let mut any_error = None;
 
         for batch in batches.values() {
+            // Mark file as edited by Sned to suppress stale mtime detection
+            state
+                .file_context_tracker
+                .mark_file_as_edited_by_sned(std::path::Path::new(&batch.absolute_path));
+
             match process_batch(batch, self.symbol_index_service.as_ref()).await {
                 Ok(result) => file_results.push(result),
                 Err(e) => {

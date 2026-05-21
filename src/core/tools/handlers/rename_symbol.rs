@@ -238,7 +238,12 @@ impl RenameSymbolHandler {
             if replacement_count > 0 {
                 let final_content = current_lines.join("\n");
                 match crate::storage::disk::atomic_write_file_async(&abs_path, &final_content).await {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // Mark file as edited by Sned to suppress stale mtime detection
+                        state
+                            .file_context_tracker
+                            .mark_file_as_edited_by_sned(std::path::Path::new(&abs_path));
+                    }
                     Err(e) => {
                         state.consecutive_mistakes += 1;
                         tracing::warn!(
