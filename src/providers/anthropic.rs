@@ -310,8 +310,15 @@ fn convert_user_blocks(
                     json!({"type": "text", "text": text})
                 }
                 crate::providers::DocumentSource::Base64 { media_type, data } => {
+                    // Detect content type: image/* → "image", else → "document"
+                    // Anthropic API requires "type": "document" for PDFs and other non-image files
+                    let content_type = if media_type.starts_with("image/") {
+                        "image"
+                    } else {
+                        "document"
+                    };
                     json!({
-                        "type": "image",
+                        "type": content_type,
                         "source": {
                             "type": "base64",
                             "media_type": media_type,
@@ -320,8 +327,9 @@ fn convert_user_blocks(
                     })
                 }
                 crate::providers::DocumentSource::Url { url } => {
+                    // For URL sources, assume document type (images should use Image block)
                     json!({
-                        "type": "image",
+                        "type": "document",
                         "source": {
                             "type": "url",
                             "url": url,
