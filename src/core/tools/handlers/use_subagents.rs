@@ -118,42 +118,43 @@ impl UseSubagentsHandler {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.stdin(Stdio::null());
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         if let Some(turns) = max_turns {
             cmd.arg("--max-turns");
             cmd.arg(turns.to_string());
         }
 
-        let child_result = timeout(Duration::from_secs(timeout_secs), async {
-            let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let child_result = timeout(
+            Duration::from_secs(timeout_secs),
+            async move {
+                let mut child = match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e) => return Err(format!("spawn failed: {}", e)),
+                };
 
-            // Concurrent stdout/stderr draining to prevent pipe buffer deadlock
-            // If we read stdout to completion before stderr, a subagent writing lots
-            // of stderr can fill the pipe buffer and stall.
-            let stdout_future = async {
-                let mut buf = String::new();
-                if let Some(mut fd) = child.stdout.take() {
-                    let _ = fd.read_to_string(&mut buf).await;
+                let mut stdout_buf = String::new();
+                let mut stderr_buf = String::new();
+
+                if let Some(ref mut fd) = child.stdout {
+                    let _ = fd.read_to_string(&mut stdout_buf).await;
                 }
-                buf
-            };
-            let stderr_future = async {
-                let mut buf = String::new();
-                if let Some(mut fd) = child.stderr.take() {
-                    let _ = fd.read_to_string(&mut buf).await;
+                if let Some(ref mut fd) = child.stderr {
+                    let _ = fd.read_to_string(&mut stderr_buf).await;
                 }
-                buf
-            };
 
-            let (stdout, stderr) = tokio::join!(stdout_future, stderr_future);
-
-            let status = child.wait().await.map_err(|e| e.to_string())?;
-            Ok((status.success(), stdout, stderr))
-        })
+                let status = match child.wait().await {
+                    Ok(s) => s,
+                    Err(e) => return Err(format!("wait failed: {}", e)),
+                };
+                Ok((child, status.success(), stdout_buf, stderr_buf))
+            },
+        )
         .await;
 
         match child_result {
-            Ok(Ok((success, stdout, stderr))) => {
+            Ok(Ok((_child, success, stdout, stderr))) => {
                 if success {
                     SubagentResult {
                         status: "completed".to_string(),
@@ -175,11 +176,15 @@ impl UseSubagentsHandler {
                 error: Some(e),
                 ..Default::default()
             },
-            Err(_) => SubagentResult {
-                status: "failed".to_string(),
-                error: Some(format!("Subagent timed out after {} seconds", timeout_secs)),
-                ..Default::default()
-            },
+            Err(_) => {
+                // Timeout — process_group(0) ensures the entire process tree is killed
+                // by the OS when the inner future is dropped. No manual kill needed.
+                SubagentResult {
+                    status: "failed".to_string(),
+                    error: Some(format!("Subagent timed out after {} seconds", timeout_secs)),
+                    ..Default::default()
+                }
+            }
         }
     }
 
