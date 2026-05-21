@@ -3166,6 +3166,11 @@ impl AgentLoop {
 
         // Scan the kept region for tool_results whose tool_use was pruned
         // For each orphan, extend keep_from backwards to include the tool_use
+        // NOTE: Single-pass fix handles the common case (sequential tool_use→result pairs).
+        // Edge case: If pulling in a tool_use message brings in tool_results that reference
+        // even earlier tool_uses, those could also become orphans. A fully robust fix would
+        // iterate until keep_from stabilizes. In practice, tool_use→result pairs are sequential,
+        // so this cascade is unlikely. — TODO: add iteration if real-world cases emerge.
         let mut keep_from = keep_from_base;
         for msg in history.iter().skip(keep_from_base) {
             if let MessageContent::UserBlocks(blocks) = &msg.content {
