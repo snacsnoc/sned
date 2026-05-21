@@ -1227,7 +1227,7 @@ impl AgentLoop {
                 slow_connection_warned = true;
                 eprintln!(
                     "{}",
-                    crate::cli::colors::colorize(
+                    crate::cli::colors::colorize_stderr(
                         "⏳ Waiting for API response (slow connection?)...",
                         &format!(
                             "{}{}",
@@ -1329,7 +1329,7 @@ impl AgentLoop {
                                             };
                                             eprintln!(
                                                 "{}",
-                                                crate::cli::colors::colorize(
+                                                crate::cli::colors::colorize_stderr(
                                                     &snipped_code_block_hint(index),
                                                     crate::cli::colors::style::DIM
                                                 )
@@ -1422,7 +1422,7 @@ impl AgentLoop {
 
                                 eprintln!(
                                     "{}",
-                                    crate::cli::colors::colorize(
+                                    crate::cli::colors::colorize_stderr(
                                         &format!("  Ɵ {}", truncated),
                                         crate::cli::colors::style::DIM
                                     )
@@ -1530,7 +1530,7 @@ impl AgentLoop {
                         let cost = usage_chunk.total_cost.unwrap_or(0.0);
                         eprintln!(
                             "{}",
-                            crate::cli::colors::colorize(
+                            crate::cli::colors::colorize_stderr(
                                 &format!(
                                     "  📊 {} tokens{} | ${:.4} | {:.0}% context",
                                     if total_tokens >= 1000 {
@@ -1714,7 +1714,7 @@ impl AgentLoop {
                 };
                 eprintln!(
                     "{}",
-                    crate::cli::colors::colorize(
+                    crate::cli::colors::colorize_stderr(
                         &snipped_code_block_hint(index),
                         crate::cli::colors::style::DIM
                     )
@@ -1932,7 +1932,7 @@ impl AgentLoop {
                     let summary = format_tool_summary(tool_name, tool_params);
                     eprintln!(
                         "{}",
-                        crate::cli::colors::colorize(&summary, crate::cli::colors::style::DIM)
+                        crate::cli::colors::colorize_stderr(&summary, crate::cli::colors::style::DIM)
                     );
                 }
                 let _ = io::stderr().flush();
@@ -2221,6 +2221,18 @@ impl AgentLoop {
                 })
                 .collect();
 
+            // Pause spinner while executing tools with live stderr output (e.g., execute_command).
+            // This prevents the spinner's \r cursor repositioning from interleaving with command
+            // output lines, which would cause horizontal gaps in the terminal.
+            let has_live_output_tools = tool_tasks
+                .iter()
+                .any(|(_, name, _, _, _)| name == "execute_command" || name == "execute_script");
+            if has_live_output_tools {
+                if let Some(ref spinner) = tool_spinner {
+                    spinner.pause();
+                }
+            }
+
             let non_edit_results = futures::future::join_all(non_edit_futures).await;
 
             // Execute edit_file groups in parallel, but calls within each group sequentially
@@ -2240,6 +2252,13 @@ impl AgentLoop {
                 .collect();
 
             let edit_group_results = futures::future::join_all(edit_group_futures).await;
+
+            // Resume spinner after live-output tools complete
+            if has_live_output_tools {
+                if let Some(ref spinner) = tool_spinner {
+                    spinner.resume();
+                }
+            }
 
             // Map results back to original indices
             let mut result_map: std::collections::HashMap<usize, String> =
@@ -2312,7 +2331,7 @@ impl AgentLoop {
                         let status = if is_error { "✗" } else { "✓" };
                         eprintln!(
                             "{}",
-                            crate::cli::colors::colorize(
+                            crate::cli::colors::colorize_stderr(
                                 &format!("  {} {}", status, stats),
                                 if is_error {
                                     crate::cli::colors::style::RED
@@ -2324,7 +2343,7 @@ impl AgentLoop {
                         if is_error && added == 0 && removed == 0 {
                             eprintln!(
                                 "{}",
-                                crate::cli::colors::colorize(
+                                crate::cli::colors::colorize_stderr(
                                     "  💡 Hint: If edit_file keeps failing, use write_to_file to rewrite the entire file instead.",
                                     crate::cli::colors::style::DIM
                                 )
@@ -2338,7 +2357,7 @@ impl AgentLoop {
                         // Consistent 2-space indent for all tool results
                         eprintln!(
                             "{}",
-                            crate::cli::colors::colorize(
+                            crate::cli::colors::colorize_stderr(
                                 &format!("  {} {}", status, first_line),
                                 if is_error {
                                     crate::cli::colors::style::RED
@@ -2356,7 +2375,7 @@ impl AgentLoop {
                         // Consistent 2-space indent for all tool results
                         eprintln!(
                             "{}",
-                            crate::cli::colors::colorize(
+                            crate::cli::colors::colorize_stderr(
                                 &format!("  {} {}", status, first),
                                 if is_error {
                                     crate::cli::colors::style::RED
@@ -2368,7 +2387,7 @@ impl AgentLoop {
                         for line in display_lines.take(2) {
                             eprintln!(
                                 "{}",
-                                crate::cli::colors::colorize(
+                                crate::cli::colors::colorize_stderr(
                                     &format!("    {}", line),
                                     crate::cli::colors::style::DIM
                                 )
@@ -2378,7 +2397,7 @@ impl AgentLoop {
                         if total_lines > 3 {
                             eprintln!(
                                 "{}",
-                                crate::cli::colors::colorize(
+                                crate::cli::colors::colorize_stderr(
                                     &format!("    ... {} more lines", total_lines - 3),
                                     crate::cli::colors::style::DIM
                                 )
@@ -2516,7 +2535,7 @@ impl AgentLoop {
             if !edit_files.is_empty() && !self.config.json_output {
                 eprintln!(
                     "{}",
-                    crate::cli::colors::colorize(
+                    crate::cli::colors::colorize_stderr(
                         &format_heat_map(&edit_files),
                         crate::cli::colors::style::DIM
                     )
@@ -2582,7 +2601,7 @@ impl AgentLoop {
                 if !parts.is_empty() {
                     eprintln!(
                         "{}",
-                        crate::cli::colors::colorize(
+                        crate::cli::colors::colorize_stderr(
                             &format!("  📝 {}", parts.join(", ")),
                             crate::cli::colors::style::DIM
                         )
@@ -2645,7 +2664,7 @@ impl AgentLoop {
 
                 eprintln!(
                     "{}",
-                    crate::cli::colors::colorize(
+                    crate::cli::colors::colorize_stderr(
                         &format!(
                             "  📊 Tokens: {} in / {} out{}{}{} | Context: {:.1}%",
                             tokens_in,
@@ -2673,7 +2692,7 @@ impl AgentLoop {
                 if context_pct >= 95.0 {
                     eprintln!(
                         "{}",
-                        crate::cli::colors::colorize(
+                        crate::cli::colors::colorize_stderr(
                             "⚠ 95% context window — /compact or start new session",
                             crate::cli::colors::style::YELLOW
                         )
@@ -2681,7 +2700,7 @@ impl AgentLoop {
                 } else if context_pct >= 80.0 {
                     eprintln!(
                         "{}",
-                        crate::cli::colors::colorize(
+                        crate::cli::colors::colorize_stderr(
                             "⚠ 80% context window used — consider /compact",
                             crate::cli::colors::style::YELLOW
                         )
@@ -2689,7 +2708,7 @@ impl AgentLoop {
                 } else if context_pct >= 50.0 {
                     eprintln!(
                         "{}",
-                        crate::cli::colors::colorize(
+                        crate::cli::colors::colorize_stderr(
                             "ℹ 50% context window used — use /compact to free space before starting new topics",
                             crate::cli::colors::style::DIM
                         )
@@ -2703,7 +2722,7 @@ impl AgentLoop {
                 if cost >= cost_warn_threshold {
                     eprintln!(
                         "{}",
-                        crate::cli::colors::colorize(
+                        crate::cli::colors::colorize_stderr(
                             &format!(
                                 "⚠ Session cost ${:.2} (threshold: ${:.2})",
                                 cost, cost_warn_threshold
@@ -3011,7 +3030,7 @@ impl AgentLoop {
         crate::cli::colors::print_horizontal_rule();
         eprintln!(
             "{}",
-            crate::cli::colors::colorize("  Session", crate::cli::colors::style::BOLD)
+            crate::cli::colors::colorize_stderr("  Session", crate::cli::colors::style::BOLD)
         );
         eprintln!("  {}", summary_line);
 
@@ -3023,7 +3042,7 @@ impl AgentLoop {
                 .unwrap_or_else(|| path.to_string());
             eprintln!(
                 "{}",
-                crate::cli::colors::colorize(
+                crate::cli::colors::colorize_stderr(
                     &format!(
                         "  {:17} +{} -{}\t({})",
                         filename, stats.lines_added, stats.lines_removed, stats.action
@@ -3039,7 +3058,7 @@ impl AgentLoop {
             if !cmd.is_empty() {
                 eprintln!(
                     "{}",
-                    crate::cli::colors::colorize(
+                    crate::cli::colors::colorize_stderr(
                         &format!("  ⚙ {}", cmd),
                         crate::cli::colors::style::DIM
                     )
@@ -3061,7 +3080,7 @@ impl AgentLoop {
         };
         eprintln!(
             "{}",
-            crate::cli::colors::colorize(
+            crate::cli::colors::colorize_stderr(
                 &format!(
                     "  📊 {} tokens | {} | {} turn{} | {}",
                     tokens_str,
@@ -5320,7 +5339,7 @@ mod tests {
     #[test]
     fn test_token_usage_display_format() {
         // Verify token usage display format (shown after each model response)
-        let usage_line = crate::cli::colors::colorize(
+        let usage_line = crate::cli::colors::colorize_stderr(
             "  📊 150 tokens | $0.0015 | 2% context",
             crate::cli::colors::style::DIM,
         );

@@ -266,10 +266,10 @@ impl ExecuteCommandHandler {
                                 if !json_output {
                                     if displayed <= half {
                                         // Head: print live
-                                        eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                        eprintln!("{}", crate::cli::colors::colorize_stderr(&line, crate::cli::colors::style::DIM));
                                     } else if displayed == half + 1 && !truncated {
                                         // First skipped line: emit condensed note once
-                                        eprintln!("{}", crate::cli::colors::colorize("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                        eprintln!("{}", crate::cli::colors::colorize_stderr("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
                                         truncated = true;
                                     }
                                 }
@@ -294,10 +294,10 @@ impl ExecuteCommandHandler {
                                 if !json_output {
                                     if displayed <= half {
                                         // Head: print live
-                                        eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                        eprintln!("{}", crate::cli::colors::colorize_stderr(&line, crate::cli::colors::style::YELLOW));
                                     } else if displayed == half + 1 && !truncated {
                                         // First skipped line: emit condensed note once
-                                        eprintln!("{}", crate::cli::colors::colorize("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                        eprintln!("{}", crate::cli::colors::colorize_stderr("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
                                         truncated = true;
                                     }
                                 }
@@ -346,9 +346,9 @@ impl ExecuteCommandHandler {
                                     displayed += 1;
                                     if !json_output {
                                         if displayed <= half {
-                                            eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::DIM));
+                                            eprintln!("{}", crate::cli::colors::colorize_stderr(&line, crate::cli::colors::style::DIM));
                                         } else if displayed == half + 1 && !truncated {
-                                            eprintln!("{}", crate::cli::colors::colorize("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                            eprintln!("{}", crate::cli::colors::colorize_stderr("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
                                             truncated = true;
                                         }
                                     }
@@ -365,9 +365,9 @@ impl ExecuteCommandHandler {
                                     displayed += 1;
                                     if !json_output {
                                         if displayed <= half {
-                                            eprintln!("{}", crate::cli::colors::colorize(&line, crate::cli::colors::style::YELLOW));
+                                            eprintln!("{}", crate::cli::colors::colorize_stderr(&line, crate::cli::colors::style::YELLOW));
                                         } else if displayed == half + 1 && !truncated {
-                                            eprintln!("{}", crate::cli::colors::colorize("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                            eprintln!("{}", crate::cli::colors::colorize_stderr("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
                                             truncated = true;
                                         }
                                     }
@@ -412,7 +412,7 @@ impl ExecuteCommandHandler {
                 let total = displayed;
                 eprintln!(
                     "{}",
-                    crate::cli::colors::colorize(
+                    crate::cli::colors::colorize_stderr(
                         &format!("--- last {} of {} lines ---", tail_buffer.len(), total),
                         crate::cli::colors::style::DIM
                     )
@@ -420,7 +420,7 @@ impl ExecuteCommandHandler {
                 for line in tail_buffer.iter() {
                     eprintln!(
                         "{}",
-                        crate::cli::colors::colorize(line, crate::cli::colors::style::DIM)
+                        crate::cli::colors::colorize_stderr(line, crate::cli::colors::style::DIM)
                     );
                 }
             }

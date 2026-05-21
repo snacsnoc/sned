@@ -11,9 +11,14 @@ use std::time::Instant;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Animated spinner for progress indication during long-running operations.
+///
+/// Runs on a background tokio::task, writes frames to stderr via `\r` overwrites.
+/// Supports pause/resume for coordinating with other stderr output (e.g., live command output).
 pub struct Spinner {
     cancel: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     handle: Option<tokio::task::JoinHandle<()>>,
     enabled: bool,
 }
@@ -26,8 +31,10 @@ impl Spinner {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
         let stopped_clone = stopped.clone();
+        let paused_clone = paused.clone();
         let label = label.to_string();
         let start = Instant::now();
 
@@ -43,6 +50,24 @@ impl Spinner {
                 if cancel_clone.load(Ordering::Relaxed) {
                     break;
                 }
+
+                // Check if paused - if so, clear line and wait without writing frames
+                if paused_clone.load(Ordering::Relaxed) {
+                    // Clear the spinner line while paused
+                    eprint!("\r\x1b[K");
+                    let _ = io::stderr().flush();
+                    // Wait while paused, checking for cancel
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        if cancel_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if !paused_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                }
+
                 let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
                 let elapsed = start.elapsed();
                 let elapsed_str = if elapsed.as_secs() >= 60 {
@@ -51,7 +76,7 @@ impl Spinner {
                     format!("{}ms", elapsed.as_millis())
                 };
                 let label_with_time = format!("{} ({})", label, elapsed_str);
-                let styled_label = crate::cli::colors::colorize(
+                let styled_label = crate::cli::colors::colorize_stderr(
                     &label_with_time,
                     &format!(
                         "{}{}",
@@ -74,6 +99,7 @@ impl Spinner {
         Self {
             cancel,
             stopped,
+            paused,
             handle: Some(handle),
             enabled: true,
         }
@@ -83,6 +109,7 @@ impl Spinner {
         Self {
             cancel: Arc::new(AtomicBool::new(true)),
             stopped: Arc::new(AtomicBool::new(true)),
+            paused: Arc::new(AtomicBool::new(true)),
             handle: None,
             enabled: false,
         }
@@ -105,6 +132,35 @@ impl Spinner {
         if !message.is_empty() {
             eprintln!("\r{}", message);
         }
+    }
+
+    /// Pause the spinner animation. Clears the spinner line and suspends frame updates.
+    /// Use this before writing other output to stderr to prevent cursor misalignment.
+    pub fn pause(&self) {
+        if self.enabled {
+            self.paused.store(true, Ordering::Relaxed);
+            // Clear the spinner line immediately
+            eprint!("\r\x1b[K");
+            let _ = io::stderr().flush();
+        }
+    }
+
+    /// Resume the spinner animation after a pause.
+    pub fn resume(&self) {
+        if self.enabled {
+            self.paused.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns true if the spinner is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Returns a clone of the internal pause flag.
+    /// Use this to coordinate spinner pause/resume from outside the Spinner.
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        self.paused.clone()
     }
 }
 
