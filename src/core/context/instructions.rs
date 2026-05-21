@@ -52,7 +52,7 @@ pub struct SkillSupportingFiles {
 
 /// Scan directory for AGENTS.md files recursively.
 /// Only searches if a top-level AGENTS.md file exists.
-/// No depth limit - matches source behavior in external-rules.ts
+/// Uses ignore::WalkBuilder for .gitignore-aware filtering and skips common heavy directories.
 pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
     let top_level = cwd.join("AGENTS.md");
     if !top_level.exists() {
@@ -60,15 +60,20 @@ pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
     }
 
     let mut results = Vec::new();
-    for entry in walkdir::WalkDir::new(cwd)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file()
-            && let Some(name) = entry.file_name().to_str()
-            && name.eq_ignore_ascii_case("AGENTS.md")
-        {
-            results.push(entry.path().to_path_buf());
+    
+    // Use ignore::WalkBuilder for .gitignore-aware filtering
+    // This automatically respects .gitignore and skips .git/, node_modules/, target/, etc.
+    let walker = ignore::WalkBuilder::new(cwd)
+        .standard_filters(true)  // Enable standard .gitignore filters
+        .build();
+    
+    for entry in walker.flatten() {
+        if entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.eq_ignore_ascii_case("AGENTS.md") {
+                    results.push(entry.path().to_path_buf());
+                }
+            }
         }
     }
     results
