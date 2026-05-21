@@ -15,7 +15,16 @@ use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
 
-const MAX_FILE_READ_SIZE: usize = 100 * 1024; // 100KB limit
+fn max_file_read_size() -> usize {
+    use std::sync::OnceLock;
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("SNED_MAX_FILE_READ_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(100 * 1024)
+    })
+}
 
 /// Result of reading a single file.
 #[derive(Debug, Clone)]
@@ -116,25 +125,22 @@ impl ReadFileHandler {
             };
         }
 
-        // Check file size limit for full reads
-        let is_full_read = start_line.is_none() && end_line.is_none();
-        if is_full_read && metadata.len() > MAX_FILE_READ_SIZE as u64 {
-            let size_kb = metadata.len() / 1024;
-            let max_kb = MAX_FILE_READ_SIZE as u64 / 1024;
-            let err = crate::cli::actionable_errors::file_too_large(size_kb, max_kb);
-            return FileReadResult {
-                path: path.to_string(),
-                content: String::new(),
-                hash: String::new(),
-                success: false,
-                error: Some(err.display()),
-            };
-        }
-
         let (content_for_hash, lines, clamping_note) = if start_line.is_some() || end_line.is_some()
         {
             match self.read_lines_range(path, start_line, end_line).await {
                 Ok(v) => v,
+                Err(e) => return e,
+            }
+        } else if metadata.len() > max_file_read_size() as u64 {
+            match self.read_truncated(path, max_file_read_size()).await {
+                Ok((content, lines)) => {
+                    let size_kb = metadata.len() / 1024;
+                    let max_kb = max_file_read_size() as u64 / 1024;
+                    (content.clone(), lines, Some(format!(
+                        "[Note: File truncated to {}KB (file is {}KB). Use start_line and end_line parameters to read specific sections.]",
+                        max_kb, size_kb
+                    )))
+                }
                 Err(e) => return e,
             }
         } else {
@@ -277,6 +283,55 @@ impl ReadFileHandler {
                 });
             }
         };
+        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        Ok((content, lines))
+    }
+
+    /// Read the first `max_bytes` of a file, handling UTF-8 boundary at truncation point.
+    async fn read_truncated(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<(String, Vec<String>), FileReadResult> {
+        use tokio::io::AsyncReadExt;
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(e) => {
+                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                return Err(FileReadResult {
+                    path: path.to_string(),
+                    content: String::new(),
+                    hash: String::new(),
+                    success: false,
+                    error: Some(err.display()),
+                });
+            }
+        };
+        let mut buffer = vec![0u8; max_bytes];
+        let n = match file.read(&mut buffer).await {
+            Ok(n) => n,
+            Err(e) => {
+                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                return Err(FileReadResult {
+                    path: path.to_string(),
+                    content: String::new(),
+                    hash: String::new(),
+                    success: false,
+                    error: Some(err.display()),
+                });
+            }
+        };
+        buffer.truncate(n);
+
+        let content = match std::str::from_utf8(&buffer) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                buffer.truncate(valid_up_to);
+                String::from_utf8(buffer).expect("truncated at valid UTF-8 boundary")
+            }
+        };
+
         let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
         Ok((content, lines))
     }
@@ -538,7 +593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_too_large() {
+    async fn test_read_file_truncated_when_too_large() {
         let mut temp_file = NamedTempFile::new().unwrap();
         let data = "x".repeat(101 * 1024);
         temp_file.write_all(data.as_bytes()).unwrap();
@@ -555,9 +610,39 @@ mod tests {
             )
             .await;
 
-        assert!(!result.success);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("exceeds the 100KB limit"));
+        assert!(result.success, "large file should auto-truncate, not error");
+        assert!(result.error.is_none());
+        assert!(result.content.contains("truncated to 100KB"));
+        assert!(result.content.contains("Hash:"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_truncated_utf8_boundary() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        // Fill with 2-byte UTF-8 characters (e.g. ¢ = U+00A2 = 2 bytes in UTF-8)
+        // Use a 3-byte character to make the boundary issue more likely
+        let ch: char = '€'; // U+20AC = 3 bytes in UTF-8
+        let ch_str: String = ch.to_string();
+        // Create content where truncation at 100KB boundary will split a 3-byte char
+        let repeat_count = (101 * 1024) / ch_str.len() + 1;
+        let data: String = ch_str.repeat(repeat_count);
+        temp_file.write_all(data.as_bytes()).unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let result = handler
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                None,
+                None,
+                &anchor_mgr,
+                Some("test-task"),
+            )
+            .await;
+
+        assert!(result.success, "UTF-8 boundary should not cause error");
+        // Content must be valid UTF-8 (no replacement characters from broken multi-byte sequence)
+        assert!(!result.content.contains('\u{FFFD}'), "no replacement characters allowed");
     }
 
     #[tokio::test]
