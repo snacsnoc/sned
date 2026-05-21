@@ -219,7 +219,7 @@ impl MinimaxProvider {
             "MiniMax-M2.5" => ModelInfo {
                 name: Some("MiniMax-M2.5".to_string()),
                 max_tokens: Some(16384),
-                context_window: Some(196608),
+                context_window: Some(204800),
                 supports_images: Some(true),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -248,7 +248,7 @@ impl MinimaxProvider {
             "MiniMax-M2.1" => ModelInfo {
                 name: Some("MiniMax-M2.1".to_string()),
                 max_tokens: Some(16384),
-                context_window: Some(196608),
+                context_window: Some(204800),
                 supports_images: Some(true),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -267,6 +267,35 @@ impl MinimaxProvider {
                 cache_reads_price: Some(0.03),
                 description: Some(
                     "MiniMax M2.1 is built for state-of-the-art coding, agentic tool use."
+                        .to_string(),
+                ),
+                tiers: None,
+                temperature: Some(1.0),
+                supports_tools: Some(true),
+                api_format: None,
+            },
+            "MiniMax-M2" => ModelInfo {
+                name: Some("MiniMax-M2".to_string()),
+                max_tokens: Some(16384),
+                context_window: Some(204800),
+                supports_images: Some(true),
+                supports_prompt_cache: true,
+                supports_reasoning: Some(true),
+                input_price: Some(0.0),
+                output_price: Some(0.0),
+                image_output_price: None,
+                thinking_config: Some(crate::providers::ThinkingConfig {
+                    max_budget: Some(1024),
+                    output_price: None,
+                    output_price_tiers: None,
+                    gemini_thinking_level: None,
+                    supports_thinking_level: None,
+                }),
+                supports_global_endpoint: None,
+                cache_writes_price: Some(0.0),
+                cache_reads_price: Some(0.03),
+                description: Some(
+                    "MiniMax M2 - Agentic capabilities, Advanced reasoning."
                         .to_string(),
                 ),
                 tiers: None,
