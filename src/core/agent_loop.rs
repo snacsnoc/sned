@@ -978,6 +978,14 @@ impl AgentLoop {
 
     /// Executes a single turn of the agent loop.
     async fn execute_turn(&mut self) -> TurnResult {
+        // Start progress indicator covering the quiet period between turns
+        let show_progress = !self.config.json_output;
+        let spinner = if show_progress {
+            Some(Spinner::start("Processing..."))
+        } else {
+            None
+        };
+
         // 1. Prepare conversation history (possibly truncated by context manager)
         let truncated_history = {
             // Read api_req_info + deleted_range BEFORE locking history,
@@ -1114,14 +1122,6 @@ impl AgentLoop {
         let state_clone = self.state.clone();
         let history_clone = self.conversation_history.clone();
         let provider = self.config.provider.clone();
-
-        // Start animated spinner while waiting for provider response
-        let show_progress = !self.config.json_output;
-        let spinner = if show_progress {
-            Some(Spinner::start("Thinking..."))
-        } else {
-            None
-        };
 
         tracing::debug!(
             message_count = request.messages.len(),
