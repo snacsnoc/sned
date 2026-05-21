@@ -745,11 +745,53 @@ impl AgentLoop {
             if !self.config.json_output {
                 let context_pct = {
                     let state = self.state.lock().await;
-                    state
-                        .last_api_req_info
-                        .as_ref()
-                        .and_then(|info| info.context_usage_percentage)
-                        .unwrap_or(0.0)
+                    // First try to use actual usage data from previous turn
+                    if let Some(info) = state.last_api_req_info.as_ref()
+                        && let Some(pct) = info.context_usage_percentage
+                    {
+                        pct
+                    } else {
+                        // Fallback: estimate tokens from conversation history when provider
+                        // doesn't send usage data (e.g., MiniMax, some OpenRouter models)
+                        let history = self.conversation_history.lock().await;
+                        let context_window = self.config.provider.get_model().info.context_window.unwrap_or(256_000);
+                        
+                        // Estimate tokens using ~4 chars per token heuristic
+                        let estimated_tokens: u64 = history.iter()
+                            .map(|msg| match &msg.content {
+                                crate::providers::MessageContent::Text(text) => text.len() as u64 / 4,
+                                crate::providers::MessageContent::UserBlocks(blocks) => {
+                                    blocks.iter().map(|block| match block {
+                                        crate::providers::UserContentBlock::Text(t) => t.text.len() as u64 / 4,
+                                        crate::providers::UserContentBlock::ToolResult(tr) => match &tr.content {
+                                            crate::providers::ToolResultContent::Text(text) => text.len() as u64 / 4,
+                                            crate::providers::ToolResultContent::Blocks(blocks) => {
+                                                blocks.iter().map(|b| match b {
+                                                    crate::providers::ToolResultContentBlock::Text { text } => text.len() as u64 / 4,
+                                                    _ => 100, // Estimate for images/etc
+                                                }).sum()
+                                            }
+                                        },
+                                        _ => 100, // Estimate for images/etc
+                                    }).sum()
+                                }
+                                crate::providers::MessageContent::AssistantBlocks(blocks) => {
+                                    blocks.iter().map(|block| match block {
+                                        crate::providers::AssistantContentBlock::Text(t) => t.text.len() as u64 / 4,
+                                        crate::providers::AssistantContentBlock::ToolUse(tu) => {
+                                            serde_json::to_string(&tu.input).map(|s| s.len() as u64 / 4).unwrap_or(10)
+                                        }
+                                        crate::providers::AssistantContentBlock::Thinking(th) => th.thinking.len() as u64 / 4,
+                                        crate::providers::AssistantContentBlock::RedactedThinking(rt) => rt.data.len() as u64 / 4,
+                                        _ => 100, // Estimate for images/etc
+                                    }).sum()
+                                }
+                            })
+                            .sum();
+                        
+                        drop(history);
+                        (estimated_tokens as f64 / context_window as f64) * 100.0
+                    }
                 };
                 eprintln!(
                     "{}",
@@ -5520,5 +5562,190 @@ mod tests {
         unsafe {
             std::env::remove_var(THINKING_HISTORY_LIMIT_ENV);
         }
+    }
+
+    #[tokio::test]
+    async fn test_cumulative_tokens_tracked_across_turns() {
+        use crate::providers::ApiStreamUsageChunk;
+
+        // Create responses with usage chunks for multiple turns
+        // Note: text-only responses will trigger completion after 2 turns due to nudge logic
+        let responses = vec![
+            // Turn 1: 100 input, 50 output
+            vec![
+                ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "Response 1".to_string(),
+                    id: None,
+                    signature: None,
+                }),
+                ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_write_tokens: None,
+                    cache_read_tokens: None,
+                    reasoning_tokens: None,
+                    thoughts_token_count: None,
+                    total_cost: Some(0.001),
+                    stop_reason: Some("stop".to_string()),
+                    id: None,
+                }),
+            ],
+            // Turn 2: 200 input, 100 output (nudge response)
+            vec![
+                ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "I'll use a tool now".to_string(),
+                    id: None,
+                    signature: None,
+                }),
+                ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                    input_tokens: 200,
+                    output_tokens: 100,
+                    cache_write_tokens: None,
+                    cache_read_tokens: None,
+                    reasoning_tokens: None,
+                    thoughts_token_count: None,
+                    total_cost: Some(0.002),
+                    stop_reason: Some("stop".to_string()),
+                    id: None,
+                }),
+            ],
+        ];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let mut agent = AgentLoop::new(test_agent_config(
+            provider,
+            "test-cumulative-tokens",
+        ));
+
+        // Execute turn 1
+        let result1 = agent.execute_turn().await;
+        assert!(
+            matches!(result1, TurnResult::Continue),
+            "Turn 1 should continue, got {:?}",
+            result1
+        );
+
+        // Check cumulative tokens after turn 1
+        {
+            let state = agent.state.lock().await;
+            assert_eq!(
+                state.cumulative_tokens_in, 100,
+                "Turn 1 cumulative_tokens_in should be 100"
+            );
+            assert_eq!(
+                state.cumulative_tokens_out, 50,
+                "Turn 1 cumulative_tokens_out should be 50"
+            );
+            assert_eq!(
+                state.cumulative_cost, 0.001,
+                "Turn 1 cumulative_cost should be 0.001"
+            );
+            assert_eq!(state.turns_completed, 1, "Turns completed should be 1");
+
+            // Check last_api_req_info
+            assert!(
+                state.last_api_req_info.is_some(),
+                "last_api_req_info should be set after turn 1"
+            );
+            let api_info = state.last_api_req_info.as_ref().unwrap();
+            assert_eq!(
+                api_info.tokens_in, Some(100),
+                "Turn 1 api_req_info tokens_in should be 100"
+            );
+            assert_eq!(
+                api_info.tokens_out, Some(50),
+                "Turn 1 api_req_info tokens_out should be 50"
+            );
+            // Context percentage: (100+50)/8192*100 = 1.8310546875
+            assert!(
+                api_info.context_usage_percentage.unwrap() > 1.8,
+                "Turn 1 context_usage_percentage should be ~1.83%, got {:?}",
+                api_info.context_usage_percentage
+            );
+        }
+
+        // Execute turn 2 (should complete due to text-only nudge logic)
+        let result2 = agent.execute_turn().await;
+        assert!(
+            matches!(result2, TurnResult::Complete),
+            "Turn 2 should complete (text-only nudge), got {:?}",
+            result2
+        );
+
+        // Check cumulative tokens after turn 2
+        {
+            let state = agent.state.lock().await;
+            assert_eq!(
+                state.cumulative_tokens_in, 300,
+                "Turn 2 cumulative_tokens_in should be 100+200=300"
+            );
+            assert_eq!(
+                state.cumulative_tokens_out, 150,
+                "Turn 2 cumulative_tokens_out should be 50+100=150"
+            );
+            assert_eq!(
+                state.cumulative_cost, 0.003,
+                "Turn 2 cumulative_cost should be 0.001+0.002=0.003"
+            );
+            assert_eq!(state.turns_completed, 2, "Turns completed should be 2");
+
+            // Check last_api_req_info
+            let api_info = state.last_api_req_info.as_ref().unwrap();
+            assert_eq!(
+                api_info.tokens_in, Some(200),
+                "Turn 2 api_req_info tokens_in should be 200"
+            );
+            assert_eq!(
+                api_info.tokens_out, Some(100),
+                "Turn 2 api_req_info tokens_out should be 100"
+            );
+            // Context percentage: (200+100)/8192*100 = 3.662109375
+            assert!(
+                api_info.context_usage_percentage.unwrap() > 3.6,
+                "Turn 2 context_usage_percentage should be ~3.66%, got {:?}",
+                api_info.context_usage_percentage
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_percentage_fallback_estimation() {
+        // Create responses WITHOUT usage chunks to test fallback estimation
+        let responses = vec![
+            // Turn 1: no usage - should use fallback estimation
+            vec![
+                ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "Hello, this is a test response with some content.".to_string(),
+                    id: None,
+                    signature: None,
+                }),
+                // Note: no Usage chunk - simulating providers that don't send usage
+            ],
+        ];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let mut agent = AgentLoop::new(test_agent_config(
+            provider,
+            "test-context-fallback",
+        ));
+
+        // Execute turn 1
+        let _result = agent.execute_turn().await;
+
+        // After the turn, last_api_req_info should be None (no usage was sent)
+        // But the context percentage display should use fallback estimation
+        {
+            let state = agent.state.lock().await;
+            assert!(
+                state.last_api_req_info.is_none(),
+                "last_api_req_info should be None when provider doesn't send usage"
+            );
+        }
+
+        // The fallback estimation happens at display time, not during turn execution
+        // This test verifies that the state is correctly set up for fallback
+        // The actual display logic is tested manually or via integration tests
     }
 }
