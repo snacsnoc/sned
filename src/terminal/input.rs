@@ -174,69 +174,60 @@ impl InputParser {
             return None;
         }
 
-        // In paste mode, accumulate bytes and check for end marker
         if self.paste_mode {
-            // Check for paste end marker at the start of input buffer
-            let is_paste_end =
-                self.buf.len() >= 6 && self.buf.iter().take(6).eq(b"\x1b[201~".iter());
-            if is_paste_end {
-                self.paste_mode = false;
-                self.buf.drain(..6);
-                let paste_content = String::from_utf8_lossy(&self.paste_buffer).to_string();
-                let paste_len = paste_content.len();
-                let line_count = paste_content.lines().count();
-                self.paste_buffer.clear();
-                tracing::debug!(target: "sned::input", "PASTE ENDED: {} bytes, {} lines", paste_len, line_count);
-                return Some(TerminalEvent::Paste(paste_content));
-            }
-            // Check if paste_buffer ends with partial end marker and input buffer completes it
-            // This handles the case where \x1b[201~ is split across multiple stdin reads
-            let paste_end_prefix = b"\x1b[201~";
-            for prefix_len in 1..6 {
-                if self.paste_buffer.len() >= prefix_len
-                    && &self.paste_buffer[self.paste_buffer.len() - prefix_len..]
-                        == &paste_end_prefix[..prefix_len]
-                    && self.buf.len() >= 6 - prefix_len
-                    && self.buf.iter().take(6 - prefix_len).eq(
-                        paste_end_prefix[prefix_len..].iter()
-                    )
-                {
-                    // Found split end marker
-                    self.paste_buffer.truncate(self.paste_buffer.len() - prefix_len);
-                    self.buf.drain(..6 - prefix_len);
+            loop {
+                if self.buf.is_empty() {
+                    return None;
+                }
+
+                let is_paste_end =
+                    self.buf.len() >= 6 && self.buf.iter().take(6).eq(b"\x1b[201~".iter());
+                if is_paste_end {
                     self.paste_mode = false;
-                    let paste_content =
-                        String::from_utf8_lossy(&self.paste_buffer).to_string();
+                    self.buf.drain(..6);
+                    let paste_content = String::from_utf8_lossy(&self.paste_buffer).to_string();
+                    let paste_len = paste_content.len();
+                    let line_count = paste_content.lines().count();
                     self.paste_buffer.clear();
+                    tracing::debug!(target: "sned::input", "PASTE ENDED: {} bytes, {} lines", paste_len, line_count);
                     return Some(TerminalEvent::Paste(paste_content));
                 }
-            }
-            // Enforce maximum paste size to prevent memory exhaustion
-            if self.paste_buffer.len() >= max_paste_size() {
-                // Truncate paste - user pasted too much
-                self.paste_mode = false;
-                self.paste_buffer.clear();
-                // Skip remaining paste content (O(n) but only happens once on truncation)
-                while self.buf.len() >= 6 && !self.buf.iter().take(6).eq(b"\x1b[201~".iter()) {
-                    self.buf.pop_front();
+                let paste_end_prefix = b"\x1b[201~";
+                for prefix_len in 1..6 {
+                    if self.paste_buffer.len() >= prefix_len
+                        && &self.paste_buffer[self.paste_buffer.len() - prefix_len..]
+                            == &paste_end_prefix[..prefix_len]
+                        && self.buf.len() >= 6 - prefix_len
+                        && self.buf.iter().take(6 - prefix_len).eq(
+                            paste_end_prefix[prefix_len..].iter()
+                        )
+                    {
+                        self.paste_buffer.truncate(self.paste_buffer.len() - prefix_len);
+                        self.buf.drain(..6 - prefix_len);
+                        self.paste_mode = false;
+                        let paste_content =
+                            String::from_utf8_lossy(&self.paste_buffer).to_string();
+                        self.paste_buffer.clear();
+                        return Some(TerminalEvent::Paste(paste_content));
+                    }
                 }
-                if self.buf.len() >= 6 && self.buf.iter().take(6).eq(b"\x1b[201~".iter()) {
-                    self.buf.drain(..6);
+                if self.paste_buffer.len() >= max_paste_size() {
+                    self.paste_mode = false;
+                    self.paste_buffer.clear();
+                    while self.buf.len() >= 6 && !self.buf.iter().take(6).eq(b"\x1b[201~".iter()) {
+                        self.buf.pop_front();
+                    }
+                    if self.buf.len() >= 6 && self.buf.iter().take(6).eq(b"\x1b[201~".iter()) {
+                        self.buf.drain(..6);
+                    }
+                    return Some(TerminalEvent::Paste(
+                        format!("[paste truncated - exceeded {} byte limit]", max_paste_size())
+                    ));
                 }
-                return Some(TerminalEvent::Paste(
-                    format!("[paste truncated - exceeded {} byte limit]", max_paste_size())
-                ));
+                if let Some(byte) = self.buf.pop_front() {
+                    self.paste_buffer.push(byte);
+                }
             }
-            // Buffer content during paste (O(1) with VecDeque)
-            // Bytes are buffered one at a time, checking for end marker after each
-            if let Some(byte) = self.buf.pop_front() {
-                self.paste_buffer.push(byte);
-            }
-            // Keep processing to find paste end
-            if self.buf.is_empty() {
-                return None;
-            }
-            return self.next_event();
         }
 
         // Fast path: single-byte control characters.

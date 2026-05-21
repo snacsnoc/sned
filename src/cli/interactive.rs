@@ -780,24 +780,28 @@ pub async fn run_interactive_shell_inner(
 
                     let prompt = input_buf.trim().to_string();
                     tracing::debug!(target: "sned::input", "Submitting prompt: {} chars", prompt.len());
-                    // Clear all lines the input spans (multi-line input wraps)
+
                     {
                         let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
                         let full = format!("{}{}", prompt_prefix, &input_buf);
-                        let span = (display_width(&full) as u16).div_ceil(cols.max(1));
+                        let dw = display_width(&full);
+                        let span = (dw as u16).div_ceil(cols.max(1));
+                        tracing::debug!(target: "sned::input", "display_width={} cols={} span={} term_rows={}", dw, cols, span, term_rows);
                         for i in 0..span.max(1) {
-                            let row = term_rows - i;
+                            let row = term_rows.saturating_sub(i);
                             if row > 0 {
                                 write!(stdout, "\x1b[{};1H\x1b[K", row)?;
                             }
                         }
                     }
+                    tracing::debug!(target: "sned::input", "Echoing prompt to stdout");
                     if !prompt.is_empty() {
                         // Echo the prompt to stdout (same stream as live prompt rendering)
                         writeln!(stdout, "{}{}", prompt_prefix, &prompt)?;
                     } else {
                         writeln!(stdout)?;
                     }
+                    tracing::debug!(target: "sned::input", "Checking if prompt is empty");
 
                     if prompt.is_empty() {
                         input_buf.clear();
@@ -806,10 +810,12 @@ pub async fn run_interactive_shell_inner(
                         continue;
                     }
 
+                    tracing::debug!(target: "sned::input", "Saving to history");
                     // Save non-empty prompt to history
                     append_to_history(&prompt);
                     // Reset history index when submitting a new command
                     history_index = None;
+                    tracing::debug!(target: "sned::input", "Processing slash commands");
 
                     // Check for slash commands
                     let processed_prompt =

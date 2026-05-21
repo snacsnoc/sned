@@ -104,6 +104,7 @@ fn init_tracing(mode: TracingMode, debug: bool) {
             if debug {
                 let log_file = std::fs::File::create("/tmp/sned-debug.log")
                     .expect("Failed to create debug log file");
+                let log_file = std::sync::Arc::new(log_file);
                 let file_layer = tracing_subscriber::fmt::layer()
                     .with_writer(log_file)
                     .with_thread_ids(true)
@@ -2146,6 +2147,7 @@ mod tests {
             track_changes: false,
             max_context_turns: None,
             max_tokens: None,
+            debug: false,
         };
 
         // Should auto-detect anthropic and succeed
@@ -2231,6 +2233,7 @@ mod tests {
             track_changes: false,
             max_context_turns: None,
             max_tokens: None,
+            debug: false,
         };
 
         // Should use groq (explicit flag) not anthropic (env var)
