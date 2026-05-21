@@ -89,8 +89,9 @@ impl ToolHandler for AskFollowupQuestionHandler {
         ctx: &ToolContext,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
-        let mut state = ctx.state.lock().await;
-        Self::execute(self, &mut state, params, ctx.json_output)
+        // Don't acquire state lock - ask_followup_question doesn't use state
+        // and holding the lock across user input delays Ctrl+C cancellation
+        Self::execute(self, &mut TaskState::default(), params, ctx.json_output)
             .await
             .map(serde_json::Value::String)
     }

@@ -220,11 +220,12 @@ impl WebFetchHandler {
 impl ToolHandler for WebFetchHandler {
     async fn execute(
         &self,
-        ctx: &ToolContext,
+        _ctx: &ToolContext,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
-        let mut state = ctx.state.lock().await;
-        Self::execute(self, &mut state, params)
+        // Don't acquire state lock - web_fetch doesn't use state and holding the lock
+        // across HTTP requests blocks Ctrl+C cancellation handler
+        Self::execute(self, &mut TaskState::default(), params)
             .await
             .map(serde_json::Value::String)
     }
