@@ -216,60 +216,72 @@ impl ListFilesHandler {
         hit_limit: &mut bool,
         include_line_counts: bool,
     ) {
-        let walker = walkdir::WalkDir::new(dir).follow_links(false).into_iter();
+        // Wrap blocking walkdir traversal in spawn_blocking to avoid blocking tokio worker
+        let walk_result = tokio::task::spawn_blocking({
+            let dir = dir.to_path_buf();
+            move || {
+                let walker = walkdir::WalkDir::new(&dir).follow_links(false).into_iter();
+                let mut file_paths: Vec<(usize, std::path::PathBuf)> = Vec::new();
+                let mut dir_entries: Vec<FileInfo> = Vec::new();
+                let mut file_index = 0;
 
-        // Collect file paths first, respecting limit and filters
-        let mut file_paths: Vec<(usize, std::path::PathBuf)> = Vec::new();
-        let mut dir_entries: Vec<FileInfo> = Vec::new();
-        let mut file_index = 0;
+                for entry in walker {
+                    if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
+                        return (file_paths, dir_entries, true);
+                    }
 
-        for entry in walker {
-            if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
-                *hit_limit = true;
-                break;
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    let path = entry.path();
+
+                    // Skip the root directory itself
+                    if path == dir {
+                        continue;
+                    }
+
+                    // Skip hidden files/directories
+                    if let Some(name) = path.file_name()
+                        && name.to_string_lossy().starts_with(".")
+                        && entry.file_type().is_dir()
+                    {
+                        continue; // Skip hidden directories
+                    }
+                    // For hidden files, still include them if not in a hidden dir
+
+                    // Skip common ignored directories
+                    if entry.file_type().is_dir() && should_ignore_directory(path) {
+                        continue;
+                    }
+
+                    // Skip common ignored files
+                    if entry.file_type().is_file() && should_ignore_file(path) {
+                        continue;
+                    }
+
+                    if entry.file_type().is_dir() {
+                        dir_entries.push(FileInfo {
+                            path: path.to_string_lossy().to_string(),
+                            is_directory: true,
+                            line_count: None,
+                        });
+                    } else {
+                        file_paths.push((file_index, path.to_path_buf()));
+                        file_index += 1;
+                    }
+                }
+
+                (file_paths, dir_entries, false)
             }
+        })
+        .await
+        .unwrap_or_default();
 
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-
-            // Skip the root directory itself
-            if path == dir {
-                continue;
-            }
-
-            // Skip hidden files/directories
-            if let Some(name) = path.file_name()
-                && name.to_string_lossy().starts_with(".")
-                && entry.file_type().is_dir()
-            {
-                continue; // Skip hidden directories
-            }
-            // For hidden files, still include them if not in a hidden dir
-
-            // Skip common ignored directories
-            if entry.file_type().is_dir() && should_ignore_directory(path) {
-                continue;
-            }
-
-            // Skip common ignored files
-            if entry.file_type().is_file() && should_ignore_file(path) {
-                continue;
-            }
-
-            if entry.file_type().is_dir() {
-                dir_entries.push(FileInfo {
-                    path: path.to_string_lossy().to_string(),
-                    is_directory: true,
-                    line_count: None,
-                });
-            } else {
-                file_paths.push((file_index, path.to_path_buf()));
-                file_index += 1;
-            }
+        let (file_paths, dir_entries, hit_limit_walk) = walk_result;
+        if hit_limit_walk {
+            *hit_limit = true;
         }
 
         // Parallel line counting for files
