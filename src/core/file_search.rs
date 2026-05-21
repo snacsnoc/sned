@@ -192,11 +192,15 @@ fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
                 first_match_idx = Some(ti);
             }
 
+            // Score: consecutive > word boundary > scattered
             if ti_usize == last_match_idx + 1 {
+                // Consecutive match (e.g., "main" in "main.rs")
                 score += 5;
             } else if ti == 0 || (ti > 0 && target_bytes[ti - 1] == b'/' || target_bytes[ti - 1] == b'_') {
+                // Word boundary (e.g., "AGE" at start of "AGENTS" or after "/")
                 score += 4;
             } else {
+                // Scattered match
                 score += 1;
             }
             
@@ -206,11 +210,13 @@ fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
     }
 
     if qi == query_bytes.len() {
+        // Prefix bonus: matches starting at position 0 rank higher
         if let Some(first_idx) = first_match_idx {
             if first_idx == 0 {
                 score += 10;
             }
         }
+        // Length normalization: shorter targets rank higher for same query
         let target_len = target_bytes.len();
         let query_len = query_bytes.len();
         if target_len > 0 {
