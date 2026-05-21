@@ -553,6 +553,7 @@ impl AgentLoop {
         initial_messages: Vec<StorageMessage>,
         state_manager: Arc<crate::storage::state_manager::StateManager>,
     ) -> Result<(), AgentError> {
+        tracing::debug!(target: "sned::agent_loop", "AgentLoop::run() called with {} initial messages", initial_messages.len());
         // Store state_manager for use during execution
         self.state_manager = Some(state_manager.clone());
 

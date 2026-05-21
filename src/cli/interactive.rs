@@ -334,6 +334,7 @@ impl InteractiveSession {
     }
 
     pub async fn run(&mut self, prompt: Option<String>) -> anyhow::Result<()> {
+        tracing::debug!(target: "sned::session", "InteractiveSession::run() called, prompt={}", prompt.as_ref().map(|s| format!("{} chars", s.len())).unwrap_or("None".to_string()));
         let agent = &mut self.agent_loop;
         let state_manager = self.state_manager.clone();
 
@@ -724,6 +725,7 @@ pub async fn run_interactive_shell_inner(
                 TerminalEvent::Paste(content) => {
                     // Append pasted content as a single block
                     let line_count = content.lines().count();
+                    tracing::debug!(target: "sned::input", "Handling paste: {} bytes, {} lines", content.len(), line_count);
                     input_buf.push_str(&content);
                     cursor_pos = input_buf.len();
                     // Show feedback for multi-line pastes
@@ -738,6 +740,7 @@ pub async fn run_interactive_shell_inner(
                     continue;
                 }
                 TerminalEvent::Return => {
+                    tracing::debug!(target: "sned::input", "Return event: input_buf length={} chars", input_buf.len());
                     if picker_active {
                         if let Some(selected) = picker.selected() {
                             let mq = extract_mention_query(&input_buf);
@@ -776,6 +779,7 @@ pub async fn run_interactive_shell_inner(
                     }
 
                     let prompt = input_buf.trim().to_string();
+                    tracing::debug!(target: "sned::input", "Submitting prompt: {} chars", prompt.len());
                     // Clear all lines the input spans (multi-line input wraps)
                     {
                         let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -810,10 +814,12 @@ pub async fn run_interactive_shell_inner(
                     // Check for slash commands
                     let processed_prompt =
                         crate::cli::slash_commands::process_slash_command(&prompt);
+                    tracing::debug!(target: "sned::input", "Processed slash command: {} -> {}", prompt.escape_debug(), processed_prompt.escape_debug());
 
                     // Handle CLI-only commands locally
                     if let Some(cli_cmd) = crate::cli::slash_commands::get_cli_only_command(&prompt)
                     {
+                        tracing::debug!(target: "sned::input", "CLI command: {:?}", cli_cmd);
                         match cli_cmd {
                             crate::cli::slash_commands::CliOnlyCommand::Exit
                             | crate::cli::slash_commands::CliOnlyCommand::Quit => {
@@ -1402,6 +1408,8 @@ pub async fn run_interactive_shell_inner(
 
                     drop(raw_guard.take());
 
+                    tracing::debug!(target: "sned::input", "After drop(raw_guard), agent_busy={}", agent_busy.load(Ordering::Relaxed));
+
                     if agent_busy.load(Ordering::Relaxed) {
                         let qh = queue_handle.lock().await;
                         if let Some(handle) = qh.as_ref() {
@@ -1422,10 +1430,15 @@ pub async fn run_interactive_shell_inner(
                         let sess = session.clone();
                         let at = agent_task.clone();
 
+                        tracing::debug!(target: "sned::agent", "Spawning agent task, prompt length={}", effective_prompt.as_ref().map(|s| s.len()).unwrap_or(0));
+
                         let agent_done_clone = agent_done.clone();
                         let handle = tokio::spawn(async move {
+                            tracing::debug!(target: "sned::agent", "Inside spawned task, acquiring session lock");
                             let mut s = sess.lock().await;
+                            tracing::debug!(target: "sned::agent", "Session lock acquired, calling run()");
                             let result = s.run(effective_prompt).await;
+                            tracing::debug!(target: "sned::agent", "session.run() returned: {:?}", result.as_ref().map(|_| "Ok").unwrap_or("Err"));
                             if let Err(e) = result {
                                 crate::cli::colors::eprint_error(&e.to_string());
                             }

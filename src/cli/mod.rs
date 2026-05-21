@@ -82,14 +82,14 @@ fn tracing_mode(json_output: bool, verbose: bool) -> TracingMode {
     }
 }
 
-fn init_tracing(mode: TracingMode) {
+fn init_tracing(mode: TracingMode, debug: bool) {
     match mode {
         TracingMode::JsonOnly => {
             tracing_subscriber::registry().with(JsonOutputLayer).init();
         }
         TracingMode::Human { verbose } => {
-            let log_level = if verbose { "debug" } else { "warn" };
-            tracing_subscriber::registry()
+            let log_level = if verbose || debug { "debug" } else { "warn" };
+            let registry = tracing_subscriber::registry()
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_writer(std::io::stderr)
@@ -98,8 +98,24 @@ fn init_tracing(mode: TracingMode) {
                                 .unwrap_or_else(|_| EnvFilter::new(format!("sned={}", log_level))),
                         ),
                 )
-                .with(JsonOutputLayer)
-                .init();
+                .with(JsonOutputLayer);
+
+            // Add file logging when debug mode is enabled
+            if debug {
+                let log_file = std::fs::File::create("/tmp/sned-debug.log")
+                    .expect("Failed to create debug log file");
+                let file_layer = tracing_subscriber::fmt::layer()
+                    .with_writer(log_file)
+                    .with_thread_ids(true)
+                    .with_thread_names(true)
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_filter(EnvFilter::new("debug"));
+                registry.with(file_layer).init();
+            } else {
+                registry.init();
+            }
         }
     }
 }
@@ -222,6 +238,10 @@ pub struct TaskOptions {
     /// Maximum provider output tokens for this task
     #[arg(long, value_name = "tokens")]
     pub max_tokens: Option<u32>,
+
+    /// Enable debug logging to /tmp/sned-debug.log
+    #[arg(long)]
+    pub debug: bool,
 }
 
 /// Additional options only on the root (default) command, not on `task`.
@@ -1264,7 +1284,7 @@ pub fn run() -> anyhow::Result<()> {
     let cli = parse();
     apply_config_override(&cli);
 
-    init_tracing(tracing_mode(cli.task_opts.json, cli.task_opts.verbose));
+    init_tracing(tracing_mode(cli.task_opts.json, cli.task_opts.verbose), cli.task_opts.debug);
 
     match cli.command {
         Some(Command::Task { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),

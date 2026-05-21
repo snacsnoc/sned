@@ -183,7 +183,10 @@ impl InputParser {
                 self.paste_mode = false;
                 self.buf.drain(..6);
                 let paste_content = String::from_utf8_lossy(&self.paste_buffer).to_string();
+                let paste_len = paste_content.len();
+                let line_count = paste_content.lines().count();
                 self.paste_buffer.clear();
+                tracing::debug!(target: "sned::input", "PASTE ENDED: {} bytes, {} lines", paste_len, line_count);
                 return Some(TerminalEvent::Paste(paste_content));
             }
             // Check if paste_buffer ends with partial end marker and input buffer completes it
@@ -322,6 +325,7 @@ impl InputParser {
             self.paste_mode = true;
             self.paste_buffer.clear();
             self.buf.drain(..6);
+            tracing::debug!(target: "sned::input", "PASTE STARTED");
             return None; // Wait for paste content
         }
 
