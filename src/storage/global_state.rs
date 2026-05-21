@@ -288,11 +288,33 @@ pub fn load_global_state() -> GlobalState {
         Ok(contents) => match serde_json::from_str(&contents) {
             Ok(state) => state,
             Err(error) => {
-                tracing::warn!(
-                    file_path = %path.display(),
-                    error = %error,
-                    "Failed to parse global state JSON"
-                );
+                // Create backup of corrupted file before discarding
+                if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
+                    eprintln!(
+                        "WARNING: Corrupted global state at '{}'. \
+                         Backed up to '{}' for potential recovery. \
+                         Starting with default settings.",
+                        path.display(),
+                        backup_path.display()
+                    );
+                    tracing::warn!(
+                        file_path = %path.display(),
+                        backup_path = %backup_path.display(),
+                        error = %error,
+                        "Created backup of corrupted global state JSON"
+                    );
+                } else {
+                    eprintln!(
+                        "WARNING: Corrupted global state at '{}'. \
+                         Failed to create backup. Starting with default settings.",
+                        path.display()
+                    );
+                    tracing::warn!(
+                        file_path = %path.display(),
+                        error = %error,
+                        "Failed to parse global state JSON and backup failed"
+                    );
+                }
                 GlobalState::default()
             }
         },
