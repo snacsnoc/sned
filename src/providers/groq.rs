@@ -1,7 +1,7 @@
 //! Groq provider implementation for sned CLI.
 //!
 //! Groq provides an OpenAI-compatible API with ultra-low-latency inference.
-//! Models: llama-3.3-70b-versatile, mixtral-8x7b-32768, and more.
+//! Models: llama-3.3-70b-versatile, llama-3.1-8b-instant.
 
 use crate::providers::{
     ModelInfo, OpenAiCompatibleModelInfo, Provider,
@@ -81,6 +81,7 @@ pub fn get_groq_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     };
 
     // Model-specific overrides
+    // Note: mixtral-8x7b-32768 and gemma2-9b-it were removed from Groq API (dead models)
     if model_id == "llama-3.3-70b-versatile" {
         info.max_tokens = Some(8192);
         info.context_window = Some(128_000);
@@ -96,22 +97,6 @@ pub fn get_groq_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         info.supports_reasoning = Some(false);
         info.input_price = Some(0.05); // $0.05 / 1M tokens
         info.output_price = Some(0.08); // $0.08 / 1M tokens
-        info.temperature = Some(0.7);
-    } else if model_id == "mixtral-8x7b-32768" {
-        info.max_tokens = Some(32_768);
-        info.context_window = Some(32_768);
-        info.supports_images = Some(false);
-        info.supports_reasoning = Some(false);
-        info.input_price = Some(0.27); // $0.27 / 1M tokens
-        info.output_price = Some(0.27); // $0.27 / 1M tokens
-        info.temperature = Some(0.7);
-    } else if model_id == "gemma2-9b-it" {
-        info.max_tokens = Some(8192);
-        info.context_window = Some(8192);
-        info.supports_images = Some(false);
-        info.supports_reasoning = Some(false);
-        info.input_price = Some(0.20); // $0.20 / 1M tokens
-        info.output_price = Some(0.20); // $0.20 / 1M tokens
         info.temperature = Some(0.7);
     }
 
@@ -161,16 +146,6 @@ mod tests {
         assert_eq!(info.base.supports_images, Some(false));
         assert_eq!(info.base.input_price, Some(0.05));
         assert_eq!(info.base.output_price, Some(0.08));
-    }
-
-    #[test]
-    fn test_groq_model_info_mixtral() {
-        let info = get_groq_model_info("mixtral-8x7b-32768");
-        assert_eq!(info.base.max_tokens, Some(32_768));
-        assert_eq!(info.base.context_window, Some(32_768));
-        assert_eq!(info.base.supports_images, Some(false));
-        assert_eq!(info.base.input_price, Some(0.27));
-        assert_eq!(info.base.output_price, Some(0.27));
     }
 
     #[test]
