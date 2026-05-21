@@ -28,6 +28,16 @@ pub struct TaskMetadata {
     pub model_usage: Vec<ModelUsageEntry>,
     #[serde(default)]
     pub environment_history: Vec<EnvironmentMetadataEntry>,
+    /// Initial task creation info (preserved from create_initial_metadata)
+    #[serde(default)]
+    pub initial_info: Option<TaskInitialInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInitialInfo {
+    pub created_at: i64,
+    pub cwd: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,11 +302,17 @@ impl TaskStorage {
         use chrono::Utc;
 
         self.with_lock(|| {
-            let metadata = serde_json::json!({
-                "created_at": Utc::now().timestamp_millis(),
-                "cwd": cwd,
-                "model": model.unwrap_or("default"),
-            });
+            // Write TaskMetadata-compatible JSON to preserve created_at/cwd/model
+            let metadata = TaskMetadata {
+                files_in_context: Vec::new(),
+                model_usage: Vec::new(),
+                environment_history: Vec::new(),
+                initial_info: Some(TaskInitialInfo {
+                    created_at: Utc::now().timestamp_millis(),
+                    cwd: cwd.to_string(),
+                    model: model.unwrap_or("default").to_string(),
+                }),
+            };
 
             let data = serde_json::to_string(&metadata)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
