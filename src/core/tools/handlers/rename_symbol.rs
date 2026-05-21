@@ -55,7 +55,7 @@ struct FileData {
 impl RenameSymbolHandler {
     async fn execute_with_workspace_root(
         &self,
-        _state: &mut TaskState,
+        state: &mut TaskState,
         params: serde_json::Value,
         workspace_root: &Path,
     ) -> Result<String, ToolError> {
@@ -72,16 +72,31 @@ impl RenameSymbolHandler {
             .unwrap_or("");
 
         if paths.is_empty() {
+            state.consecutive_mistakes += 1;
+            tracing::warn!(
+                consecutive_mistakes = state.consecutive_mistakes,
+                "rename_symbol: missing required parameter 'paths'"
+            );
             return Err(ToolError::InvalidInput(
                 "Missing required parameter: paths".to_string(),
             ));
         }
         if existing_symbol.is_empty() {
+            state.consecutive_mistakes += 1;
+            tracing::warn!(
+                consecutive_mistakes = state.consecutive_mistakes,
+                "rename_symbol: missing required parameter 'existing_symbol'"
+            );
             return Err(ToolError::InvalidInput(
                 "Missing required parameter: existing_symbol".to_string(),
             ));
         }
         if new_symbol.is_empty() {
+            state.consecutive_mistakes += 1;
+            tracing::warn!(
+                consecutive_mistakes = state.consecutive_mistakes,
+                "rename_symbol: missing required parameter 'new_symbol'"
+            );
             return Err(ToolError::InvalidInput(
                 "Missing required parameter: new_symbol".to_string(),
             ));
@@ -114,6 +129,12 @@ impl RenameSymbolHandler {
             let content = match fs::read_to_string(abs_path).await {
                 Ok(c) => c,
                 Err(e) => {
+                    state.consecutive_mistakes += 1;
+                    tracing::warn!(
+                        consecutive_mistakes = state.consecutive_mistakes,
+                        error = %e,
+                        "rename_symbol: failed to read file"
+                    );
                     return Err(ToolError::ExecutionFailed(format!(
                         "Error reading file {}: {}",
                         abs_path, e
@@ -169,6 +190,7 @@ impl RenameSymbolHandler {
         }
 
         if locations_by_file.is_empty() {
+            state.consecutive_mistakes = 0;
             return Ok(format!(
                 "No occurrences of symbol '{}' found in the specified paths.",
                 existing_symbol,
@@ -218,6 +240,12 @@ impl RenameSymbolHandler {
                 match crate::storage::disk::atomic_write_file_async(&abs_path, &final_content).await {
                     Ok(_) => {}
                     Err(e) => {
+                        state.consecutive_mistakes += 1;
+                        tracing::warn!(
+                            consecutive_mistakes = state.consecutive_mistakes,
+                            error = %e,
+                            "rename_symbol: failed to write file"
+                        );
                         return Err(ToolError::ExecutionFailed(format!(
                             "Failed to write file {}: {}",
                             abs_path, e
@@ -240,6 +268,7 @@ impl RenameSymbolHandler {
             ));
         }
 
+        state.consecutive_mistakes = 0;
         Ok(format!(
             "Successfully renamed symbol '{}' to '{}' ({} occurrences in {} files).\n\n{}",
             existing_symbol,
