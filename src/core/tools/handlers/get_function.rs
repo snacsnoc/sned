@@ -12,16 +12,19 @@ impl GetFunctionHandler {
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
         let path = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        let names = params
-            .get("names")
-            .and_then(|n| n.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        
+        // Schema declares "name" as string, but support "names" array for backwards compatibility
+        let names = if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
+            vec![name.to_string()]
+        } else if let Some(names_arr) = params.get("names").and_then(|n| n.as_array()) {
+            names_arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         if path.is_empty() {
             return Err(ToolError::InvalidInput(
@@ -31,7 +34,7 @@ impl GetFunctionHandler {
 
         if names.is_empty() {
             return Err(ToolError::InvalidInput(
-                "Missing required parameter: names".to_string(),
+                "Missing required parameter: name".to_string(),
             ));
         }
 
