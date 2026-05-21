@@ -1,5 +1,30 @@
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use std::collections::HashMap;
+
+/// Cache entry with timestamp for TTL-based invalidation
+#[derive(Debug, Clone)]
+struct FileSearchCacheEntry {
+    results: Vec<FileSearchResult>,
+    timestamp: std::time::Instant,
+}
+
+/// Global cache for workspace file listings, keyed by workspace path
+/// TTL: 5 seconds - balances freshness vs performance for @-mention autocomplete
+static FILE_SEARCH_CACHE: once_cell::sync::Lazy<
+    Arc<RwLock<HashMap<String, FileSearchCacheEntry>>>,
+> = once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Clear the file search cache - used for testing
+#[cfg(test)]
+pub async fn clear_file_search_cache() {
+    let mut cache = FILE_SEARCH_CACHE.write().await;
+    cache.clear();
+}
 
 #[derive(Debug, Clone)]
 pub struct FileSearchResult {
@@ -111,64 +136,97 @@ pub async fn list_workspace_files(
     workspace_path: &str,
     limit: usize,
 ) -> std::io::Result<Vec<FileSearchResult>> {
-    let workspace = PathBuf::from(workspace_path);
-    let mut files = Vec::new();
-    let mut dir_set = std::collections::HashSet::new();
-
-    let walker = WalkBuilder::new(&workspace)
-        .hidden(false)
-        .follow_links(false)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            if name.starts_with('.') && !name.starts_with(".sned") {
-                return false;
+    let workspace_path_str = workspace_path.to_string();
+    
+    // Check cache first
+    {
+        let cache = FILE_SEARCH_CACHE.read().await;
+        if let Some(entry) = cache.get(&workspace_path_str) {
+            if entry.timestamp.elapsed() < CACHE_TTL {
+                // Cache hit - return cached results (filtered by limit)
+                return Ok(entry.results.iter().take(limit).cloned().collect());
             }
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                return !is_excluded_dir(&name);
-            }
-            // Filter out database files
-            if name.ends_with(".db") || name.ends_with(".sqlite") || name.ends_with(".sqlite3") {
-                return false;
-            }
-            true
-        })
-        .build();
-
-    for entry in walker.flatten() {
-        if files.len() >= limit {
-            break;
-        }
-
-        let file_type = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            FileType::Folder
-        } else {
-            FileType::File
-        };
-
-        let relative = entry
-            .path()
-            .strip_prefix(&workspace)
-            .map(|p: &std::path::Path| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| entry.path().to_string_lossy().to_string());
-
-        if file_type == FileType::File {
-            let label = Path::new(&relative)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| relative.clone());
-            files.push(FileSearchResult {
-                path: relative.clone(),
-                file_type: FileType::File,
-                label,
-            });
-            add_parent_dirs(&relative, &mut dir_set);
-        } else {
-            dir_set.insert(relative);
         }
     }
 
-    files.extend(dirs_to_results(&dir_set));
-    Ok(files)
+    // Cache miss or expired - run blocking WalkBuilder iteration
+    let workspace = PathBuf::from(workspace_path);
+    let results = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        let mut dir_set = std::collections::HashSet::new();
+
+        let walker = WalkBuilder::new(&workspace)
+            .hidden(false)
+            .follow_links(false)
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                if name.starts_with('.') && !name.starts_with(".sned") {
+                    return false;
+                }
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    return !is_excluded_dir(&name);
+                }
+                // Filter out database files
+                if name.ends_with(".db") || name.ends_with(".sqlite") || name.ends_with(".sqlite3") {
+                    return false;
+                }
+                true
+            })
+            .build();
+
+        for entry in walker.flatten() {
+            if files.len() >= limit {
+                break;
+            }
+
+            let file_type = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                FileType::Folder
+            } else {
+                FileType::File
+            };
+
+            let relative = entry
+                .path()
+                .strip_prefix(&workspace)
+                .map(|p: &std::path::Path| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| entry.path().to_string_lossy().to_string());
+
+            if file_type == FileType::File {
+                let label = Path::new(&relative)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| relative.clone());
+                files.push(FileSearchResult {
+                    path: relative.clone(),
+                    file_type: FileType::File,
+                    label,
+                });
+                add_parent_dirs(&relative, &mut dir_set);
+            } else {
+                dir_set.insert(relative);
+            }
+        }
+
+        let mut all_results = files;
+        all_results.extend(dirs_to_results(&dir_set));
+        all_results
+    })
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    // Update cache with full results (before limit applied)
+    {
+        let mut cache = FILE_SEARCH_CACHE.write().await;
+        cache.insert(
+            workspace_path_str,
+            FileSearchCacheEntry {
+                results: results.clone(),
+                timestamp: std::time::Instant::now(),
+            },
+        );
+    }
+
+    Ok(results.into_iter().take(limit).collect())
 }
 
 fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
@@ -466,6 +524,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
 
@@ -492,6 +551,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
 
@@ -523,6 +583,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
 
@@ -553,6 +614,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
 
@@ -575,6 +637,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
 
@@ -601,6 +664,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
 
@@ -617,6 +681,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
 
