@@ -1826,11 +1826,40 @@ impl StateManager {
             return Ok(HashMap::new());
         }
 
-        let contents = fs::read_to_string(file_path)?;
-        let state: WorkspaceState = serde_json::from_str(&contents)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        Ok(state)
+        let contents = fs::read_to_string(&file_path)?;
+        match serde_json::from_str(&contents) {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                // Create backup of corrupted file before discarding
+                if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
+                    eprintln!(
+                        "WARNING: Corrupted workspace state at '{}'. \
+                         Backed up to '{}' for potential recovery. \
+                         Starting with empty state.",
+                        file_path.display(),
+                        backup_path.display()
+                    );
+                    tracing::warn!(
+                        file_path = %file_path.display(),
+                        backup_path = %backup_path.display(),
+                        error = %e,
+                        "Created backup of corrupted workspace state JSON"
+                    );
+                } else {
+                    eprintln!(
+                        "WARNING: Corrupted workspace state at '{}'. \
+                         Failed to create backup. Starting with empty state.",
+                        file_path.display()
+                    );
+                    tracing::warn!(
+                        file_path = %file_path.display(),
+                        error = %e,
+                        "Failed to parse workspace state JSON and backup failed"
+                    );
+                }
+                Ok(HashMap::new())
+            }
+        }
     }
 
     /// Mark a global key as pending persistence
