@@ -338,6 +338,7 @@ pub fn get_skills_directories_for_scan(cwd: &Path) -> Vec<(PathBuf, SkillSource)
 }
 
 /// Scan a directory for skill subdirectories containing SKILL.md files
+/// Also supports .md files directly in the skills directory (e.g., .agents/skills/*.md)
 pub fn scan_skills_directory(dir_path: &Path, source: SkillSource) -> Vec<SkillMetadata> {
     let mut skills = Vec::new();
 
@@ -360,25 +361,41 @@ pub fn scan_skills_directory(dir_path: &Path, source: SkillSource) -> Vec<SkillM
 
     for entry in entries.filter_map(|e| e.ok()) {
         let entry_path = entry.path();
-        if !entry_path.is_dir() {
-            continue;
+        
+        // Support subdirectories with SKILL.md inside
+        if entry_path.is_dir() {
+            let skill_name = entry_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            if let Some(skill) = load_skill_metadata(&entry_path, source.clone(), &skill_name) {
+                skills.push(skill);
+            }
         }
+        // Support .md files directly in the skills directory
+        else if entry_path.is_file() {
+            if let Some(ext) = entry_path.extension() {
+                if ext == "md" {
+                    let skill_name = entry_path
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
 
-        let skill_name = entry_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        if let Some(skill) = load_skill_metadata(&entry_path, source.clone(), &skill_name) {
-            skills.push(skill);
+                    if let Some(skill) = load_skill_from_md_file(&entry_path, source.clone(), &skill_name) {
+                        skills.push(skill);
+                    }
+                }
+            }
         }
     }
 
     skills
 }
 
-/// Load skill metadata from a skill directory
+/// Load skill metadata from a skill directory (containing SKILL.md)
 fn load_skill_metadata(
     skill_dir: &Path,
     source: SkillSource,
@@ -424,6 +441,59 @@ fn load_skill_metadata(
             name,
             skill_name,
             skill_dir.display()
+        );
+        return None;
+    }
+
+    Some(SkillMetadata {
+        name: skill_name.to_string(),
+        description: description.to_string(),
+        path: skill_md_path.to_string_lossy().to_string(),
+        source,
+    })
+}
+
+/// Load skill metadata from a .md file directly in the skills directory
+fn load_skill_from_md_file(
+    skill_md_path: &Path,
+    source: SkillSource,
+    skill_name: &str,
+) -> Option<SkillMetadata> {
+    let file_content = match fs::read_to_string(skill_md_path) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!("Failed to load skill file {}: {}", skill_md_path.display(), e);
+            return None;
+        }
+    };
+
+    // Parse YAML frontmatter
+    let (frontmatter, _body, had_frontmatter, parse_error) = parse_yaml_frontmatter(&file_content);
+
+    if parse_error.is_some() {
+        tracing::warn!(
+            "Failed to parse YAML frontmatter for skill {}: {:?}",
+            skill_md_path.display(),
+            parse_error
+        );
+        return None;
+    }
+
+    if !had_frontmatter {
+        tracing::warn!("Skill file {} missing YAML frontmatter", skill_md_path.display());
+        return None;
+    }
+
+    let name = frontmatter.get("name")?.as_str()?;
+    let description = frontmatter.get("description")?.as_str()?;
+
+    // Name must match filename (without .md extension)
+    if name != skill_name {
+        tracing::warn!(
+            "Skill name \"{}\" in frontmatter doesn't match filename \"{}\" at {}",
+            name,
+            skill_name,
+            skill_md_path.display()
         );
         return None;
     }
@@ -678,6 +748,71 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "test-skill");
         assert_eq!(skills[0].description, "A test skill");
+    }
+
+    #[test]
+    fn test_discover_skills_from_md_files() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path();
+
+        // Create skills directory with .md files directly (like .agents/skills/)
+        let skills_dir = cwd.join(".agents/skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        
+        // Create skill as .md file with frontmatter
+        fs::write(
+            skills_dir.join("outcome-replay.md"),
+            "---\nname: outcome-replay\ndescription: Replay and analyze trading outcomes\n---\n\nSkill instructions here.",
+        )
+        .unwrap();
+        
+        fs::write(
+            skills_dir.join("runtime-operations.md"),
+            "---\nname: runtime-operations\ndescription: Manage runtime trading operations\n---\n\nMore instructions.",
+        )
+        .unwrap();
+
+        // Use scan_skills_directory directly for isolated test
+        let skills = scan_skills_directory(&skills_dir, SkillSource::Project);
+        assert_eq!(skills.len(), 2);
+        
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"outcome-replay"));
+        assert!(names.contains(&"runtime-operations"));
+    }
+
+    #[test]
+    fn test_discover_skills_mixed_formats() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path();
+
+        // Create skills directory with both formats
+        let skills_dir = cwd.join("mixed-skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        
+        // Subdirectory with SKILL.md
+        let subdir_skill = skills_dir.join("dir-skill");
+        fs::create_dir_all(&subdir_skill).unwrap();
+        fs::write(
+            subdir_skill.join("SKILL.md"),
+            "---\nname: dir-skill\ndescription: Directory-based skill\n---\n\nInstructions.",
+        )
+        .unwrap();
+        
+        // .md file directly
+        fs::write(
+            skills_dir.join("file-skill.md"),
+            "---\nname: file-skill\ndescription: File-based skill\n---\n\nInstructions.",
+        )
+        .unwrap();
+
+        // Use scan_skills_directory directly for isolated test
+        let skills = scan_skills_directory(&skills_dir, SkillSource::Project);
+        assert_eq!(skills.len(), 2);
+        
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"dir-skill"));
+        assert!(names.contains(&"file-skill"));
     }
 
     #[test]
