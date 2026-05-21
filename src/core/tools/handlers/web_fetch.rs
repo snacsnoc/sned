@@ -12,8 +12,31 @@ use url::Url;
 /// Maximum redirect count to prevent redirect loops and open redirect attacks
 const MAX_REDIRECTS: u32 = 5;
 
-/// Maximum response body size (1MB) to prevent memory exhaustion
-const MAX_RESPONSE_SIZE: usize = 1_048_576;
+/// Default maximum response body size (1MB) to prevent memory exhaustion
+/// Configurable via SNED_MAX_FETCH_RESPONSE_SIZE env var.
+fn max_response_size() -> usize {
+    use std::sync::OnceLock;
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("SNED_MAX_FETCH_RESPONSE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1_048_576)
+    })
+}
+
+/// Default fetch timeout (30s), configurable via SNED_FETCH_TIMEOUT_SECS env var.
+fn fetch_timeout() -> std::time::Duration {
+    use std::sync::OnceLock;
+    static TIMEOUT: OnceLock<std::time::Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let secs = std::env::var("SNED_FETCH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+        std::time::Duration::from_secs(secs)
+    })
+}
 
 /// Web fetch handler for fetching URLs and returning page content as text.
 #[derive(Debug, Clone, Default)]
@@ -33,7 +56,6 @@ impl WebFetchHandler {
         let url = Url::parse(url_str)
             .map_err(|e| ToolError::InvalidInput(format!("Invalid URL format: {}", e)))?;
 
-        // Only allow HTTP and HTTPS schemes
         if url.scheme() != "http" && url.scheme() != "https" {
             return Err(ToolError::InvalidInput(format!(
                 "URL scheme '{}' is not allowed. Only http:// and https:// are permitted.",
@@ -41,7 +63,7 @@ impl WebFetchHandler {
             )));
         }
 
-        // Block URLs with user info (user:pass@host) to prevent credential leakage
+        // Block URLs with user info to prevent credential leakage via URL
         if url.username().is_empty() && url.password().is_some() {
             return Err(ToolError::InvalidInput(
                 "URLs with passwords are not allowed".to_string(),
@@ -53,27 +75,22 @@ impl WebFetchHandler {
             ));
         }
 
-        // Resolve hostname and check for blocked IPs
         let host = url
             .host_str()
             .ok_or_else(|| ToolError::InvalidInput("URL must have a valid hostname".to_string()))?;
 
-        // Check if host is an IP address and validate it
         // For IPv6, host_str() includes brackets, so we need to strip them
         let ip_str = host.trim_start_matches('[').trim_end_matches(']');
         if let Ok(ip) = ip_str.parse::<IpAddr>() {
             Self::validate_ip(&ip)?;
-        } else {
-            // For hostnames, block obvious metadata endpoints
-            if host == "metadata.google.internal"
-                || host == "169.254.169.254"
-                || host.ends_with(".compute.internal")
-                || host.ends_with(".internal")
-            {
-                return Err(ToolError::InvalidInput(
-                    "Access to internal cloud metadata endpoints is not allowed".to_string(),
-                ));
-            }
+        } else if host == "metadata.google.internal"
+            || host == "169.254.169.254"
+            || host.ends_with(".compute.internal")
+            || host.ends_with(".internal")
+        {
+            return Err(ToolError::InvalidInput(
+                "Access to internal cloud metadata endpoints is not allowed".to_string(),
+            ));
         }
 
         Ok(url)
@@ -83,21 +100,19 @@ impl WebFetchHandler {
     fn validate_ip(ip: &IpAddr) -> Result<(), ToolError> {
         match ip {
             IpAddr::V4(ipv4) => {
-                // Block private ranges
+                // is_private covers 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
                 if ipv4.is_private() || ipv4.is_loopback() || ipv4.is_link_local() {
                     return Err(ToolError::InvalidInput(format!(
                         "Access to private IP address {} is not allowed",
                         ip
                     )));
                 }
-                // Block cloud metadata endpoints
                 if ipv4.octets() == [169, 254, 169, 254] {
                     return Err(ToolError::InvalidInput(
                         "Access to cloud metadata endpoint 169.254.169.254 is not allowed"
                             .to_string(),
                     ));
                 }
-                // Block 0.0.0.0
                 if ipv4.octets() == [0, 0, 0, 0] {
                     return Err(ToolError::InvalidInput(
                         "Access to 0.0.0.0 is not allowed".to_string(),
@@ -105,14 +120,12 @@ impl WebFetchHandler {
                 }
             }
             IpAddr::V6(ipv6) => {
-                // Block loopback
                 if ipv6.is_loopback() {
                     return Err(ToolError::InvalidInput(format!(
                         "Access to loopback address {} is not allowed",
                         ip
                     )));
                 }
-                // Block link-local (fe80::/10)
                 if ipv6.is_unicast_link_local() {
                     return Err(ToolError::InvalidInput(format!(
                         "Access to link-local address {} is not allowed",
@@ -126,7 +139,6 @@ impl WebFetchHandler {
 
     /// Fetch a URL and convert HTML to plain text.
     async fn fetch_url(&self, url: &str) -> Result<String, ToolError> {
-        // Validate URL to prevent SSRF attacks
         let validated_url = Self::validate_url(url)?;
 
         let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
@@ -144,7 +156,7 @@ impl WebFetchHandler {
         });
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(fetch_timeout())
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
             .redirect(redirect_policy)
             .build()
@@ -164,28 +176,31 @@ impl WebFetchHandler {
             )));
         }
 
-        // Read response with size limit to prevent memory exhaustion
-        let bytes = response.bytes().await.map_err(|e| {
+        let mut bytes = response.bytes().await.map_err(|e| {
             ToolError::ExecutionFailed(format!("Failed to read response body: {}", e))
         })?;
 
-        if bytes.len() > MAX_RESPONSE_SIZE {
-            return Err(ToolError::ExecutionFailed(format!(
-                "Response size ({} bytes) exceeds maximum allowed size ({} bytes)",
-                bytes.len(),
-                MAX_RESPONSE_SIZE
-            )));
+        let max_size = max_response_size();
+        let original_len = bytes.len();
+        let truncated = original_len > max_size;
+        if truncated {
+            bytes.truncate(max_size);
         }
 
         let html = String::from_utf8_lossy(&bytes).to_string();
-
-        // Convert HTML to plain text
         let text = html_to_text(&html);
 
-        Ok(format!(
-            "Successfully fetched {}. Content:\n\n{}",
-            url, text
-        ))
+        if truncated {
+            Ok(format!(
+                "Successfully fetched {} (response truncated at {} bytes, full size was {} bytes). Content:\n\n{}",
+                url, max_size, original_len, text
+            ))
+        } else {
+            Ok(format!(
+                "Successfully fetched {}. Content:\n\n{}",
+                url, text
+            ))
+        }
     }
 
     pub async fn execute(
@@ -244,7 +259,6 @@ fn html_to_text(html: &str) -> String {
         let ch = chars[i];
 
         if ch == '<' {
-            // Look ahead to check for script/style tags
             let rest: String = chars[i + 1..].iter().take(20).collect();
             let tag_start = rest.to_lowercase();
 
@@ -265,7 +279,6 @@ fn html_to_text(html: &str) -> String {
 
         if in_script || in_style {
             if ch == '>' {
-                // Check if this closes the script/style tag
                 let rest: String = chars[i + 1..].iter().take(10).collect();
                 if rest.to_lowercase().starts_with("</script") {
                     in_script = false;
@@ -288,8 +301,7 @@ fn html_to_text(html: &str) -> String {
             continue;
         }
 
-        // Handle whitespace
-        if ch.is_whitespace() {
+            if ch.is_whitespace() {
             if !prev_was_space {
                 text.push(' ');
                 prev_was_space = true;
@@ -302,7 +314,6 @@ fn html_to_text(html: &str) -> String {
         i += 1;
     }
 
-    // Trim and limit length
     let text = text.trim();
 
     // Limit to reasonable size for LLM context

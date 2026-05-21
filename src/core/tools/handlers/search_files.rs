@@ -15,7 +15,18 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default max search timeout (30s), configurable via SNED_SEARCH_TIMEOUT_SECS env var.
+fn search_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let secs = std::env::var("SNED_SEARCH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+        Duration::from_secs(secs)
+    })
+}
+
 /// Default max lines to return from search (rg --max-count)
 const DEFAULT_SEARCH_MAX_LINES: u32 = 100;
 /// Environment variable to configure search result limit
@@ -85,7 +96,7 @@ impl SearchFilesHandler {
         cmd.arg(regex).arg(search_path);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = run_with_timeout(cmd, SEARCH_TIMEOUT).await?;
+        let output = run_with_timeout(cmd, search_timeout()).await?;
 
         if !output.status.success() && output.stdout.is_empty() {
             if output.status.code() == Some(1) {
