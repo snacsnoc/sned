@@ -679,7 +679,7 @@ fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
             context_window: Some(200000),
             supports_images: Some(true),
             supports_prompt_cache: true,
-            supports_reasoning: Some(true),
+            supports_reasoning: Some(false),
             input_price: Some(1.0),
             output_price: Some(5.0),
             image_output_price: None,
