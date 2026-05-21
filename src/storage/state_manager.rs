@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use ulid::Ulid;
 
 use std::time::Instant;
@@ -1950,6 +1950,15 @@ impl StateManager {
         *self.last_persist.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 
         Ok(())
+    }
+
+    /// Persist all pending changes to disk asynchronously.
+    /// Wraps sync `persist()` in spawn_blocking to avoid blocking tokio workers.
+    /// Call with Arc::clone(&state_manager) to avoid borrowing issues.
+    pub async fn persist_async(this: Arc<Self>) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || this.persist())
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
     }
 
     /// Persist global state to disk, writing only the specified keys.

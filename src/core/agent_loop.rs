@@ -29,6 +29,7 @@ use crate::providers::{
     TextContentBlock, ThinkingBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
 };
 use crate::storage::global_state::HistoryItem;
+use crate::storage::state_manager::StateManager;
 use crate::storage::task_storage::TaskStorage;
 use futures::future::FutureExt;
 use std::collections::{HashMap, VecDeque};
@@ -713,7 +714,7 @@ impl AgentLoop {
                 }
                 if output.cancel == Some(true) {
                     // Persist state on hook cancellation
-                    if let Err(e) = state_manager.persist() {
+                    if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                         error!("Failed to persist state manager on hook cancel: {}", e);
                     }
                     return Err(AgentError::Cancelled);
@@ -726,7 +727,7 @@ impl AgentLoop {
         loop {
             if turn_count >= self.config.max_turns {
                 // Persist state on max turns exceeded
-                if let Err(e) = state_manager.persist() {
+                if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                     error!("Failed to persist state manager on max turns: {}", e);
                 }
                 // Force-save conversation history to preserve final turns
@@ -764,7 +765,7 @@ impl AgentLoop {
                             e
                         );
                         // Fallback: at least save state to prevent data loss
-                        if let Err(save_e) = state_manager.persist() {
+                        if let Err(save_e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                             error!("Fallback state persist failed: {}", save_e);
                         }
                     }
@@ -919,7 +920,7 @@ impl AgentLoop {
                     }
 
                     // Persist state to disk before exiting
-                    if let Err(e) = state_manager.persist() {
+                    if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                         error!("Failed to persist state manager: {}", e);
                     }
 
@@ -961,14 +962,14 @@ impl AgentLoop {
                     }
 
                     // Persist state manager (global state, task states, secrets)
-                    if let Err(e) = state_manager.persist() {
+                    if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                         error!("Failed to persist state manager on cancel: {}", e);
                     }
                     return Ok(());
                 }
                 TurnResult::Error(e) => {
                     // Persist state on error
-                    if let Err(e_persist) = state_manager.persist() {
+                    if let Err(e_persist) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                         error!("Failed to persist state manager on error: {}", e_persist);
                     }
                     return Err(AgentError::ExecutionError(e));
@@ -1029,7 +1030,7 @@ impl AgentLoop {
                     history_item.conversation_history_deleted_range =
                         Some(vec![start as i32, end as i32]);
                     state_manager.add_task_to_history(history_item);
-                    if let Err(e) = state_manager.persist() {
+                    if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                         eprintln!(
                             "[agent_loop] Failed to persist state after compaction: {}",
                             e
