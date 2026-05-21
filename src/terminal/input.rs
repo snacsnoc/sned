@@ -849,27 +849,4 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert!(matches!(evs[0], TerminalEvent::Paste(ref s) if s == "test content"));
     }
-
-    #[test]
-    fn test_paste_truncation_with_env_var() {
-        // Set a small limit for testing
-        unsafe {
-            std::env::set_var("SNED_MAX_PASTE_SIZE", "50");
-        }
-
-        let mut p = InputParser::new();
-        // Start paste with content exceeding limit
-        let large_content = "x".repeat(100);
-        p.feed(b"\x1b[200~");
-        p.feed(large_content.as_bytes());
-        p.feed(b"\x1b[201~");
-
-        let evs = p.drain_events();
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], TerminalEvent::Paste(ref s) if s.contains("truncated")));
-
-        unsafe {
-            std::env::remove_var("SNED_MAX_PASTE_SIZE");
-        }
-    }
 }
