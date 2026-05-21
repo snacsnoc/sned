@@ -1600,11 +1600,11 @@ impl StateManager {
                 true
             }
             "terminal_output_line_limit" => {
-                state.terminal_output_line_limit = value.parse::<i32>().unwrap_or(1000);
+                state.terminal_output_line_limit = value.parse::<i32>().unwrap_or(500);
                 true
             }
             "max_consecutive_mistakes" => {
-                state.max_consecutive_mistakes = value.parse::<i32>().unwrap_or(3);
+                state.max_consecutive_mistakes = value.parse::<i32>().unwrap_or(5);
                 true
             }
             "open_telemetry_metric_export_interval" => {
@@ -1616,7 +1616,7 @@ impl StateManager {
                 true
             }
             "open_telemetry_log_batch_timeout" => {
-                state.open_telemetry_log_batch_timeout = value.parse::<i32>().unwrap_or(1000);
+                state.open_telemetry_log_batch_timeout = value.parse::<i32>().unwrap_or(5000);
                 true
             }
             "open_telemetry_log_max_queue_size" => {
