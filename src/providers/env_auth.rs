@@ -54,8 +54,12 @@ pub fn get_provider_from_env() -> Option<&'static str> {
     if std::env::var("AI_GATEWAY_API_KEY").is_ok() {
         return Some("vercel-ai-gateway");
     }
-    if std::env::var("OPENCODE_API_KEY").is_ok() || std::env::var("KIMI_API_KEY").is_ok() {
+    // KIMI_API_KEY is Moonshot AI's API key (Kimi is their product)
+    if std::env::var("OPENCODE_API_KEY").is_ok() {
         return Some("openai-native");
+    }
+    if std::env::var("KIMI_API_KEY").is_ok() {
+        return Some("moonshot");
     }
     if std::env::var("DEEPSEEK_API_KEY").is_ok() {
         return Some("deepseek");

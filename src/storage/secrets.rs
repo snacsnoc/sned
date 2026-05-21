@@ -66,7 +66,7 @@ pub fn env_var_to_secret_key() -> HashMap<&'static str, &'static str> {
     map.insert("MINIMAX_CN_API_KEY", "minimaxApiKey");
     map.insert("HF_TOKEN", "huggingFaceApiKey");
     map.insert("OPENCODE_API_KEY", "openAiNativeApiKey");
-    map.insert("KIMI_API_KEY", "openAiNativeApiKey");
+    map.insert("KIMI_API_KEY", "moonshotApiKey");
     map.insert("DEEPSEEK_API_KEY", "deepSeekApiKey");
     map.insert("QWEN_API_KEY", "qwenApiKey");
     map.insert("TOGETHER_API_KEY", "togetherApiKey");
