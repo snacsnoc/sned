@@ -739,24 +739,6 @@ impl AgentLoop {
                 }
                 return Err(AgentError::MaxTurnsExceeded);
             }
-
-            // Check if we have any messages to process. In interactive mode,
-            // wait for messages instead of executing turns with empty history.
-            let has_messages = {
-                let history = self.conversation_history.lock().await;
-                !history.is_empty()
-            };
-            let has_queued = {
-                let mq = self.message_queue.lock().await;
-                !mq.is_empty()
-            };
-            
-            if !has_messages && !has_queued && self.config.interactive_mode {
-                // Interactive mode with no messages: wait for user input
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            }
-            
             turn_count += 1;
 
             // Print turn separator (visual break between agent turns)

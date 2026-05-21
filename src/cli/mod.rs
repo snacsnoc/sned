@@ -1219,23 +1219,7 @@ async fn run_task_inner(
 
 fn run_interactive_shell(task_opts: TaskOptions, root_opts: RootOnlyOptions) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let mut session = InteractiveSession::build_interactive(task_opts, root_opts).await?;
-
-        // Print startup info line (respects NO_COLOR and --quiet)
-        if !session.is_quiet() {
-            let startup_info = session.get_startup_info();
-            eprintln!("{}", startup_info);
-            crate::cli::colors::eprint_info(
-                "type a prompt and press Enter; type 'exit' or 'quit' to leave",
-            );
-            crate::cli::colors::eprint_info(
-                "type /help for slash commands, @ to search and mention files",
-            );
-        }
-
-        session.run(None).await
-    })
+    rt.block_on(run_interactive_shell_inner(task_opts, root_opts))
 }
 
 /// Query the terminal for the current cursor position.

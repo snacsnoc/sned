@@ -554,6 +554,21 @@ pub async fn run_interactive_shell_inner(
         InteractiveSession::build_interactive(task_opts.clone(), root_opts.clone()).await?,
     ));
 
+    // Print startup info line (respects NO_COLOR and --quiet)
+    {
+        let sess = session.lock().await;
+        if !sess.is_quiet() {
+            let startup_info = sess.get_startup_info();
+            eprintln!("{}", startup_info);
+            crate::cli::colors::eprint_info(
+                "type a prompt and press Enter; type 'exit' or 'quit' to leave",
+            );
+            crate::cli::colors::eprint_info(
+                "type /help for slash commands, @ to search and mention files",
+            );
+        }
+    }
+
     // Load command history for up/down arrow navigation
     let command_history = load_command_history();
     let mut history_index: Option<usize> = None;
