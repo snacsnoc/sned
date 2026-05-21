@@ -28,7 +28,8 @@ impl FindSymbolReferencesHandler {
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
         let paths = read_string_list(&params, "paths", "path");
-        let symbols = read_string_list(&params, "symbols", "symbol");
+        // Schema declares "name" (string), but support array form for multiple symbols
+        let symbols = read_string_list(&params, "names", "name");
         let find_type = params
             .get("find_type")
             .and_then(|v| v.as_str())
@@ -41,7 +42,7 @@ impl FindSymbolReferencesHandler {
         }
         if symbols.is_empty() {
             return Err(ToolError::InvalidInput(
-                "Missing required parameter: symbols".to_string(),
+                "Missing required parameter: names".to_string(),
             ));
         }
 
