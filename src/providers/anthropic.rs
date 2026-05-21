@@ -128,10 +128,12 @@ impl AnthropicProvider {
             .unwrap_or(8192);
 
         // Convert messages to Anthropic format
+        let total_messages = request.messages.len();
         let messages: Vec<serde_json::Value> = request
             .messages
             .iter()
-            .map(|msg| {
+            .enumerate()
+            .map(|(msg_index, msg)| {
                 let role = match msg.role {
                     MessageRole::User => "user",
                     MessageRole::Assistant => "assistant",
@@ -145,11 +147,11 @@ impl AnthropicProvider {
                         })
                     }
                     crate::providers::MessageContent::UserBlocks(blocks) => {
-                        let content = convert_user_blocks(blocks, supports_cache);
+                        let content = convert_user_blocks(blocks, supports_cache, msg_index, total_messages);
                         json!({"role": role, "content": content})
                     }
                     crate::providers::MessageContent::AssistantBlocks(blocks) => {
-                        let content = convert_assistant_blocks(blocks, supports_cache);
+                        let content = convert_assistant_blocks(blocks, supports_cache, msg_index, total_messages);
                         json!({"role": role, "content": content})
                     }
                 }
@@ -224,6 +226,8 @@ impl AnthropicProvider {
 fn convert_user_blocks(
     blocks: &[crate::providers::UserContentBlock],
     supports_cache: bool,
+    msg_index: usize,
+    total_messages: usize,
 ) -> Vec<serde_json::Value> {
     let mut content = vec![];
     for (i, block) in blocks.iter().enumerate() {
@@ -327,8 +331,9 @@ fn convert_user_blocks(
             },
         };
 
-        // Add cache_control to last block if caching is supported
-        if supports_cache && i == blocks.len() - 1 {
+        // Add cache_control to last block of last 2 messages only (Anthropic limit: 4 breakpoints)
+        // Budget: 1 for system + 2 for last messages = 3 breakpoints (1 under limit)
+        if supports_cache && i == blocks.len() - 1 && msg_index >= total_messages.saturating_sub(2) {
             item["cache_control"] = json!({"type": "ephemeral"});
         }
 
@@ -340,6 +345,8 @@ fn convert_user_blocks(
 fn convert_assistant_blocks(
     blocks: &[crate::providers::AssistantContentBlock],
     supports_cache: bool,
+    msg_index: usize,
+    total_messages: usize,
 ) -> Vec<serde_json::Value> {
     let mut content = vec![];
     for (i, block) in blocks.iter().enumerate() {
@@ -415,7 +422,7 @@ fn convert_assistant_blocks(
             },
         };
 
-        if supports_cache && i == blocks.len() - 1 {
+        if supports_cache && i == blocks.len() - 1 && msg_index >= total_messages.saturating_sub(2) {
             item["cache_control"] = json!({"type": "ephemeral"});
         }
 
@@ -454,6 +461,8 @@ enum AnthropicStreamEvent {
 #[derive(Debug, Deserialize)]
 struct AnthropicError {
     #[serde(rename = "type")]
+    error_type: String,
+    #[serde(rename = "message")]
     message: String,
 }
 
@@ -803,7 +812,7 @@ async fn process_anthropic_event(
         AnthropicStreamEvent::Error { error } => {
             try_send_chunk(
                 tx,
-                ApiStreamChunk::Error(format!("Anthropic API error: {}", error.message)),
+                ApiStreamChunk::Error(format!("Anthropic API error ({}): {}", error.error_type, error.message)),
                 "error",
             );
         }
