@@ -164,6 +164,15 @@ impl MinimaxProvider {
                 })
                 .collect();
             body["tools"] = json!(tools_json);
+            // Tool choice: respect request.tool_choice if provided
+            // MiniMax uses OpenAI-compatible format: "auto"|"required"|"none" or {"type": "function", ...}
+            let tool_choice = request.tool_choice.as_ref().unwrap_or(&crate::providers::ToolChoice::Auto);
+            body["tool_choice"] = match tool_choice {
+                crate::providers::ToolChoice::Auto => json!("auto"),
+                crate::providers::ToolChoice::Required => json!("required"),
+                crate::providers::ToolChoice::None => json!("none"),
+                crate::providers::ToolChoice::Named(name) => json!({"type": "function", "function": {"name": name}}),
+            };
         }
 
         // Reasoning config (always enable for M2.7)

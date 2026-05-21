@@ -226,12 +226,18 @@ impl GeminiProvider {
         }
 
         if !tools.is_empty() {
+            // Tool choice: respect request.tool_choice if provided
+            // Gemini format: functionCallingConfig.mode = "AUTO"|"ANY"|"NONE" or "ANY" with allowedFunctionNames
+            let tool_choice = request.tool_choice.as_ref().unwrap_or(&crate::providers::ToolChoice::Auto);
+            let function_calling_config = match tool_choice {
+                crate::providers::ToolChoice::Auto => json!({"mode": "AUTO"}),
+                crate::providers::ToolChoice::Required => json!({"mode": "ANY"}),
+                crate::providers::ToolChoice::None => json!({"mode": "NONE"}),
+                crate::providers::ToolChoice::Named(name) => json!({"mode": "ANY", "allowedFunctionNames": [name]}),
+            };
+
             let mut tool_config = json!({
-                // Use "AUTO" to let model decide when to call tools
-                // "ANY" forces tool calls which breaks text-only responses
-                "functionCallingConfig": {
-                    "mode": "AUTO",
-                },
+                "functionCallingConfig": function_calling_config,
             });
             if self.config.search_enabled {
                 tool_config["includeServerSideToolInvocations"] = json!(true);

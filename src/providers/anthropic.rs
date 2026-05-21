@@ -212,10 +212,20 @@ impl AnthropicProvider {
                 .collect();
             body["tools"] = json!(tools_json);
 
-            // Tool choice: "any" forces tool use when reasoning is off.
-            // When reasoning is on, omit tool_choice to let the model decide.
+            // Tool choice: respect request.tool_choice if provided
+            // Anthropic API: "auto" (default), "any" (force tool use), "none" (no tools), "tool" (specific tool)
             if !reasoning_on {
-                body["tool_choice"] = json!({"type": "any"});
+                if let Some(tool_choice) = &request.tool_choice {
+                    body["tool_choice"] = match tool_choice {
+                        crate::providers::ToolChoice::Auto => json!({"type": "auto"}),
+                        crate::providers::ToolChoice::Required => json!({"type": "any"}),
+                        crate::providers::ToolChoice::None => json!({"type": "none"}),
+                        crate::providers::ToolChoice::Named(name) => json!({"type": "tool", "name": name}),
+                    };
+                } else {
+                    // Default: force tool use when tools are available
+                    body["tool_choice"] = json!({"type": "any"});
+                }
             }
         }
 
@@ -409,8 +419,15 @@ fn convert_assistant_blocks(
                     json!({"type": "text", "text": text})
                 }
                 crate::providers::DocumentSource::Base64 { media_type, data } => {
+                    // Detect content type: image/* → "image", else → "document"
+                    // Anthropic API requires "type": "document" for PDFs and other non-image files
+                    let content_type = if media_type.starts_with("image/") {
+                        "image"
+                    } else {
+                        "document"
+                    };
                     json!({
-                        "type": "image",
+                        "type": content_type,
                         "source": {
                             "type": "base64",
                             "media_type": media_type,
@@ -419,8 +436,9 @@ fn convert_assistant_blocks(
                     })
                 }
                 crate::providers::DocumentSource::Url { url } => {
+                    // For URL sources, assume document type (images should use Image block)
                     json!({
-                        "type": "image",
+                        "type": "document",
                         "source": {
                             "type": "url",
                             "url": url,

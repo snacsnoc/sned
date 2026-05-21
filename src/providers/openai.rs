@@ -241,8 +241,15 @@ impl OpenAiProvider {
                 })
                 .collect();
             body["tools"] = json!(openai_tools);
-            // Explicitly set tool_choice to auto so models know tools are available
-            body["tool_choice"] = json!("auto");
+            // Tool choice: respect request.tool_choice if provided
+            // OpenAI format: "auto"|"required"|"none" or {"type": "function", "function": {"name": "..."}}
+            let tool_choice = request.tool_choice.as_ref().unwrap_or(&crate::providers::ToolChoice::Auto);
+            body["tool_choice"] = match tool_choice {
+                crate::providers::ToolChoice::Auto => json!("auto"),
+                crate::providers::ToolChoice::Required => json!("required"),
+                crate::providers::ToolChoice::None => json!("none"),
+                crate::providers::ToolChoice::Named(name) => json!({"type": "function", "function": {"name": name}}),
+            };
         }
 
         Ok(body)
@@ -440,6 +447,7 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     prompt_tokens_details: Option<OpenAiPromptTokenDetails>,
+    completion_tokens_details: Option<OpenAiCompletionTokenDetails>,
     #[serde(rename = "prompt_cache_miss_tokens")]
     prompt_cache_miss_tokens: Option<u32>,
 }
@@ -447,6 +455,11 @@ struct OpenAiUsage {
 #[derive(Debug, Deserialize)]
 struct OpenAiPromptTokenDetails {
     cached_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompletionTokenDetails {
+    reasoning_tokens: Option<u32>,
 }
 
 /// Send a stream chunk via try_send to avoid blocking on full channel.
@@ -634,7 +647,7 @@ async fn process_openai_sse_line(
                     output_tokens: usage.completion_tokens,
                     cache_write_tokens: usage.prompt_cache_miss_tokens,
                     cache_read_tokens: usage.prompt_tokens_details.map(|d| d.cached_tokens),
-                    reasoning_tokens: None,
+                    reasoning_tokens: usage.completion_tokens_details.and_then(|d| d.reasoning_tokens),
                     thoughts_token_count: None,
                     total_cost: None,
                     stop_reason: last_stop_reason.clone(),
