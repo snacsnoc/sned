@@ -741,67 +741,6 @@ impl AgentLoop {
             }
             turn_count += 1;
 
-            // Print turn separator (visual break between agent turns)
-            if !self.config.json_output {
-                let context_pct = {
-                    let state = self.state.lock().await;
-                    // First try to use actual usage data from previous turn
-                    if let Some(info) = state.last_api_req_info.as_ref()
-                        && let Some(pct) = info.context_usage_percentage
-                    {
-                        pct
-                    } else {
-                        // Fallback: estimate tokens from conversation history when provider
-                        // doesn't send usage data (e.g., MiniMax, some OpenRouter models)
-                        let history = self.conversation_history.lock().await;
-                        let context_window = self.config.provider.get_model().info.context_window.unwrap_or(256_000);
-                        
-                        // Estimate tokens using ~4 chars per token heuristic
-                        let estimated_tokens: u64 = history.iter()
-                            .map(|msg| match &msg.content {
-                                crate::providers::MessageContent::Text(text) => text.len() as u64 / 4,
-                                crate::providers::MessageContent::UserBlocks(blocks) => {
-                                    blocks.iter().map(|block| match block {
-                                        crate::providers::UserContentBlock::Text(t) => t.text.len() as u64 / 4,
-                                        crate::providers::UserContentBlock::ToolResult(tr) => match &tr.content {
-                                            crate::providers::ToolResultContent::Text(text) => text.len() as u64 / 4,
-                                            crate::providers::ToolResultContent::Blocks(blocks) => {
-                                                blocks.iter().map(|b| match b {
-                                                    crate::providers::ToolResultContentBlock::Text { text } => text.len() as u64 / 4,
-                                                    _ => 100, // Estimate for images/etc
-                                                }).sum()
-                                            }
-                                        },
-                                        _ => 100, // Estimate for images/etc
-                                    }).sum()
-                                }
-                                crate::providers::MessageContent::AssistantBlocks(blocks) => {
-                                    blocks.iter().map(|block| match block {
-                                        crate::providers::AssistantContentBlock::Text(t) => t.text.len() as u64 / 4,
-                                        crate::providers::AssistantContentBlock::ToolUse(tu) => {
-                                            serde_json::to_string(&tu.input).map(|s| s.len() as u64 / 4).unwrap_or(10)
-                                        }
-                                        crate::providers::AssistantContentBlock::Thinking(th) => th.thinking.len() as u64 / 4,
-                                        crate::providers::AssistantContentBlock::RedactedThinking(rt) => rt.data.len() as u64 / 4,
-                                        _ => 100, // Estimate for images/etc
-                                    }).sum()
-                                }
-                            })
-                            .sum();
-                        
-                        drop(history);
-                        (estimated_tokens as f64 / context_window as f64) * 100.0
-                    }
-                };
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::section_header(&format!(
-                        "Turn {} · {:.0}% context",
-                        turn_count, context_pct
-                    ))
-                );
-            }
-
             // Check if cancelled
             {
                 let state = self.state.lock().await;
@@ -1582,6 +1521,33 @@ impl AgentLoop {
                         .cumulative_reasoning_tokens
                         .saturating_add(usage_chunk.reasoning_tokens.unwrap_or(0));
                     state.cumulative_cost += usage_chunk.total_cost.unwrap_or(0.0);
+
+                    // Display compact token usage after receiving usage data
+                    if !self.config.json_output {
+                        let total_tokens = tokens_in + tokens_out;
+                        let cost = usage_chunk.total_cost.unwrap_or(0.0);
+                        eprintln!(
+                            "{}",
+                            crate::cli::colors::colorize(
+                                &format!(
+                                    "  📊 {} tokens{} | ${:.4} | {:.0}% context",
+                                    if total_tokens >= 1000 {
+                                        format!("{:.1}K", total_tokens as f64 / 1000.0)
+                                    } else {
+                                        total_tokens.to_string()
+                                    },
+                                    if usage_chunk.reasoning_tokens.unwrap_or(0) > 0 {
+                                        format!(" ({} reasoning)", usage_chunk.reasoning_tokens.unwrap())
+                                    } else {
+                                        String::new()
+                                    },
+                                    cost,
+                                    context_usage_pct
+                                ),
+                                crate::cli::colors::style::DIM
+                            )
+                        );
+                    }
                 }
                 ApiStreamChunk::ToolCalls(tool_chunk) => {
                     // Print separator when first tool call is detected
@@ -5350,12 +5316,15 @@ mod tests {
     }
 
     #[test]
-    fn test_turn_separator_includes_context_percentage() {
-        // Verify section_header format for turn separator
-        let header = crate::cli::colors::section_header("Turn 3 · 45% context");
-        assert!(header.contains("Turn 3"));
-        assert!(header.contains("45% context"));
-        assert!(header.contains("═══"));
+    fn test_token_usage_display_format() {
+        // Verify token usage display format (shown after each model response)
+        let usage_line = crate::cli::colors::colorize(
+            "  📊 150 tokens | $0.0015 | 2% context",
+            crate::cli::colors::style::DIM,
+        );
+        assert!(usage_line.contains("📊"));
+        assert!(usage_line.contains("tokens"));
+        assert!(usage_line.contains("context"));
     }
 
     #[test]
