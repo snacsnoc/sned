@@ -3131,11 +3131,12 @@ impl AgentLoop {
         }
     }
 
-    /// Prune oldest conversation turns when history exceeds max_context_turns.
+    /// Prune oldest conversation history when it exceeds max_context_turns.
     /// Keeps system prompt (first message if present) + most recent N turns.
     /// A "turn" is counted as a user-assistant pair (2 messages).
     /// CRITICAL: Preserves tool_use/tool_result pairs — never splits a tool result
-    /// from its corresponding tool use.
+    /// from its corresponding tool use. If a tool_result would be kept but its
+    /// tool_use was pruned, we extend the keep region backwards to include the tool_use.
     fn prune_conversation_history(&self, history: Vec<StorageMessage>) -> Vec<StorageMessage> {
         let max_turns = self.config.max_context_turns;
         let max_messages = max_turns * 2; // Each turn = user + assistant
@@ -3148,45 +3149,42 @@ impl AgentLoop {
             return history;
         }
 
-        // Build a set of tool_use_ids that appear in the kept region
-        // so we can ensure their corresponding tool results are also kept
-        let keep_from_base = history.len().saturating_sub(max_messages);
-
-        // First pass: collect all tool_use_ids in the region we plan to keep
-        let mut kept_tool_use_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for msg in history.iter().skip(keep_from_base) {
+        // Build a map of tool_use_id → message index for all tool_uses in history
+        let mut tool_use_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (idx, msg) in history.iter().enumerate() {
             if let MessageContent::AssistantBlocks(blocks) = &msg.content {
                 for block in blocks {
                     if let AssistantContentBlock::ToolUse(tu) = block {
-                        kept_tool_use_ids.insert(tu.id.clone());
+                        tool_use_index.insert(tu.id.clone(), idx);
                     }
                 }
             }
         }
 
-        // Second pass: find any tool_result messages before keep_from_base that reference
-        // tool_uses in the kept region — we must keep those tool results too
-        let mut min_keep = keep_from_base;
-        for (idx, msg) in history.iter().take(keep_from_base).enumerate() {
+        // Start with the most recent N messages
+        let keep_from_base = history.len().saturating_sub(max_messages);
+
+        // Scan the kept region for tool_results whose tool_use was pruned
+        // For each orphan, extend keep_from backwards to include the tool_use
+        let mut keep_from = keep_from_base;
+        for msg in history.iter().skip(keep_from_base) {
             if let MessageContent::UserBlocks(blocks) = &msg.content {
                 for block in blocks {
                     if let UserContentBlock::ToolResult(tr) = block {
-                        if kept_tool_use_ids.contains(&tr.tool_use_id) {
-                            // This tool result references a tool_use in the kept region
-                            // We must keep this message to avoid orphan tool results
-                            min_keep = min_keep.min(idx);
+                        // Check if this tool_result's tool_use exists and is before keep_from
+                        if let Some(&tool_use_idx) = tool_use_index.get(&tr.tool_use_id) {
+                            if tool_use_idx < keep_from {
+                                // This tool_use would be pruned but its result is kept — orphan!
+                                // Extend keep_from backwards to include the tool_use
+                                keep_from = keep_from.min(tool_use_idx);
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Also ensure we don't split a tool_use from its result:
-        // If we're keeping a tool_result, ensure the corresponding tool_use is also kept
-        // (This is naturally handled by the pair structure, but let's be explicit)
-        let keep_from = min_keep;
-
-        // Preserve system prompt if it exists (first message with role=assistant and no tool_call_id)
+        // Preserve system prompt if it exists (first message with role=assistant)
         let has_system_prompt = history
             .first()
             .map(|m| matches!(m.role, MessageRole::Assistant))
