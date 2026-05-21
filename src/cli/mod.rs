@@ -698,10 +698,19 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 let state = crate::storage::global_state::load_global_state();
                 state.act_mode_api_model_id
             }).unwrap_or_else(|| "MiniMax-M2.7".to_string());
+            // Determine api_line: "china" if MINIMAX_CN_API_KEY is set, otherwise default
+            let api_line = if std::env::var("MINIMAX_CN_API_KEY").is_ok() {
+                Some("china".to_string())
+            } else {
+                std::env::var("MINIMAX_API_LINE").ok()
+            };
+            let api_key = std::env::var("MINIMAX_CN_API_KEY")
+                .or_else(|_| std::env::var("MINIMAX_API_KEY"))
+                .unwrap_or_default();
             Arc::new(crate::providers::minimax::MinimaxProvider::new(
                 crate::providers::minimax::MinimaxConfig {
-                    api_key: std::env::var("MINIMAX_API_KEY").unwrap_or_default(),
-                    api_line: None,
+                    api_key,
+                    api_line,
                     model_id: default_model,
                     model_info: None,
                     thinking_budget_tokens: thinking_budget,
