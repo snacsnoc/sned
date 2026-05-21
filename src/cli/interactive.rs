@@ -1000,12 +1000,25 @@ pub async fn run_interactive_shell_inner(
                                     }
                                     eprintln!("Continue? (y/n): ");
 
-                                    drop(raw_guard.take());
+                                    // Use channel-based input to avoid stdin race with TUI async reader
+                                    // Same pattern as condense tool (A9/A18 fix)
+                                    let (sender, receiver) = std::sync::mpsc::channel();
+                                    crate::core::approval::set_followup_question_active(true);
+                                    crate::core::approval::set_followup_sender(sender);
 
-                                    let mut confirm = String::new();
-                                    let _ = std::io::stdin().read_line(&mut confirm);
+                                    // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                    let response_result = tokio::task::spawn_blocking(move || {
+                                        receiver.recv()
+                                    }).await;
 
-                                    restore_raw_mode(&mut raw_guard)?;
+                                    // Clean up regardless of result
+                                    crate::core::approval::clear_followup_sender();
+                                    crate::core::approval::set_followup_question_active(false);
+
+                                    let confirm = match response_result {
+                                        Ok(Ok(r)) => r,
+                                        Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
+                                    };
 
                                     if confirm.trim().to_lowercase() != "y" {
                                         eprintln!("Undo cancelled.");
@@ -1133,15 +1146,25 @@ pub async fn run_interactive_shell_inner(
                                                             "Commit to your git repo? (y/n): "
                                                         );
 
-                                                        // Temporarily drop raw mode for confirmation input
-                                                        drop(raw_guard.take());
+                                                        // Use channel-based input to avoid stdin race with TUI async reader
+                                                        // Same pattern as condense tool (A9/A18 fix)
+                                                        let (sender, receiver) = std::sync::mpsc::channel();
+                                                        crate::core::approval::set_followup_question_active(true);
+                                                        crate::core::approval::set_followup_sender(sender);
 
-                                                        // Read confirmation
-                                                        let mut confirm = String::new();
-                                                        let _ = std::io::stdin()
-                                                            .read_line(&mut confirm);
+                                                        // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                                        let response_result = tokio::task::spawn_blocking(move || {
+                                                            receiver.recv()
+                                                        }).await;
 
-                                                        restore_raw_mode(&mut raw_guard)?;
+                                                        // Clean up regardless of result
+                                                        crate::core::approval::clear_followup_sender();
+                                                        crate::core::approval::set_followup_question_active(false);
+
+                                                        let confirm = match response_result {
+                                                            Ok(Ok(r)) => r,
+                                                            Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
+                                                        };
 
                                                         if confirm.trim().to_lowercase() == "y" {
                                                             match crate::core::shadow_git::commit_to_real_git(&workspace_root, &msg) {
@@ -1265,12 +1288,25 @@ pub async fn run_interactive_shell_inner(
                                                 println!();
                                                 println!("Enter checkpoint number to restore:");
 
-                                                drop(raw_guard.take());
+                                                // Use channel-based input to avoid stdin race with TUI async reader
+                                                // Same pattern as condense tool (A9/A18 fix)
+                                                let (sender, receiver) = std::sync::mpsc::channel();
+                                                crate::core::approval::set_followup_question_active(true);
+                                                crate::core::approval::set_followup_sender(sender);
 
-                                                let mut input = String::new();
-                                                let _ = std::io::stdin().read_line(&mut input);
+                                                // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                                let response_result = tokio::task::spawn_blocking(move || {
+                                                    receiver.recv()
+                                                }).await;
 
-                                                restore_raw_mode(&mut raw_guard)?;
+                                                // Clean up regardless of result
+                                                crate::core::approval::clear_followup_sender();
+                                                crate::core::approval::set_followup_question_active(false);
+
+                                                let input = match response_result {
+                                                    Ok(Ok(r)) => r,
+                                                    Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
+                                                };
 
                                                 input.trim().parse::<usize>().unwrap_or(0)
                                             };
@@ -1309,13 +1345,25 @@ pub async fn run_interactive_shell_inner(
                                                             println!();
                                                             println!("Continue? (y/n): ");
 
-                                                            drop(raw_guard.take());
+                                                            // Use channel-based input to avoid stdin race with TUI async reader
+                                                            // Same pattern as condense tool (A9/A18 fix)
+                                                            let (sender, receiver) = std::sync::mpsc::channel();
+                                                            crate::core::approval::set_followup_question_active(true);
+                                                            crate::core::approval::set_followup_sender(sender);
 
-                                                            let mut confirm = String::new();
-                                                            let _ = std::io::stdin()
-                                                                .read_line(&mut confirm);
+                                                            // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                                            let response_result = tokio::task::spawn_blocking(move || {
+                                                                receiver.recv()
+                                                            }).await;
 
-                                                            restore_raw_mode(&mut raw_guard)?;
+                                                            // Clean up regardless of result
+                                                            crate::core::approval::clear_followup_sender();
+                                                            crate::core::approval::set_followup_question_active(false);
+
+                                                            let confirm = match response_result {
+                                                                Ok(Ok(r)) => r,
+                                                                Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
+                                                            };
 
                                                             if confirm.trim().to_lowercase() != "y"
                                                             {
@@ -1649,15 +1697,21 @@ pub async fn run_interactive_shell_inner(
                                 if !pids.is_empty() {
                                     #[cfg(unix)]
                                     {
-                                        for pid in &pids {
-                                            let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
-                                        }
-                                        // Brief pause for SIGTERM to take effect
-                                        std::thread::sleep(std::time::Duration::from_millis(50));
-                                        // Force kill any survivors
-                                        for pid in &pids {
-                                            let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
-                                        }
+                                        // Spawn a task to handle SIGTERM→sleep→SIGKILL asynchronously
+                                        // to avoid blocking the tokio event loop
+                                        let pids_clone = pids.clone();
+                                        tokio::spawn(async move {
+                                            // Send SIGTERM
+                                            for pid in &pids_clone {
+                                                let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+                                            }
+                                            // Async pause for SIGTERM to take effect
+                                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                            // Force kill any survivors
+                                            for pid in &pids_clone {
+                                                let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+                                            }
+                                        });
                                     }
                                     crate::cli::colors::eprint_info(&format!(
                                         "Killing {} running command(s)...",
