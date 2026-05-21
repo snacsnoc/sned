@@ -99,12 +99,24 @@ impl CondenseHandler {
                 ToolError::ExecutionFailed(format!("Failed to flush stderr: {}", e))
             })?;
 
-            let mut user_response = String::new();
-            io::stdin()
-                .read_line(&mut user_response)
-                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read stdin: {}", e)))?;
+            // Use channel-based input to avoid blocking tokio worker and fighting TUI stdin
+            // Same pattern as ask_followup_question and prompt_for_approval
+            let (sender, receiver) = std::sync::mpsc::channel();
+            crate::core::approval::set_followup_question_active(true);
+            crate::core::approval::set_followup_sender(sender);
 
-            let user_response = user_response.trim();
+            // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
+            let response_result = tokio::task::spawn_blocking(move || receiver.recv())
+                .await;
+
+            // Clean up regardless of result
+            crate::core::approval::clear_followup_sender();
+            crate::core::approval::set_followup_question_active(false);
+
+            let user_response = match response_result {
+                Ok(Ok(r)) => r.trim().to_string(),
+                Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
+            };
 
             // If user provided feedback, do NOT compact - return feedback as result
             if !user_response.is_empty() {
