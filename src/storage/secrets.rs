@@ -199,8 +199,11 @@ pub fn get_provider_from_env() -> Option<String> {
     if env::var("AI_GATEWAY_API_KEY").is_ok() {
         return Some("vercel-ai-gateway".to_string());
     }
-    if env::var("OPENCODE_API_KEY").is_ok() || env::var("KIMI_API_KEY").is_ok() {
+    if env::var("OPENCODE_API_KEY").is_ok() {
         return Some("openai-native".to_string());
+    }
+    if env::var("KIMI_API_KEY").is_ok() {
+        return Some("moonshot".to_string());
     }
     if env::var("DEEPSEEK_API_KEY").is_ok() {
         return Some("deepseek".to_string());

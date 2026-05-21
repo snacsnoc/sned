@@ -187,9 +187,9 @@ mod tests {
 
         clear_test_env_vars();
 
-        // KIMI_API_KEY maps to openai-native
+        // KIMI_API_KEY maps to moonshot (Kimi is Moonshot AI's product)
         unsafe { env::set_var("KIMI_API_KEY", "test-key") };
-        assert_eq!(get_provider_from_env(), Some("openai-native"));
+        assert_eq!(get_provider_from_env(), Some("moonshot"));
 
         clear_test_env_vars();
 

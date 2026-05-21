@@ -62,12 +62,12 @@ pub fn get_xai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     let mut info = ModelInfo {
         name: Some(model_id.to_string()),
         max_tokens: Some(8192),
-        context_window: Some(32_768),
-        supports_images: Some(false),
+        context_window: Some(1_000_000),
+        supports_images: Some(true),
         supports_prompt_cache: false,
         supports_reasoning: Some(false),
-        input_price: Some(0.0),
-        output_price: Some(0.0),
+        input_price: Some(1.25), // $1.25 / 1M tokens
+        output_price: Some(2.50), // $2.50 / 1M tokens
         image_output_price: None,
         thinking_config: None,
         supports_global_endpoint: None,
@@ -80,48 +80,87 @@ pub fn get_xai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         api_format: None,
     };
 
-    // Model-specific overrides based on xAI pricing
-    // https://x.ai/api for latest pricing
-    if model_id == "grok-3" || model_id == "grok-3-latest" {
+    // Model-specific overrides based on xAI pricing (https://docs.x.ai/developers/pricing)
+    // grok-4.3 is the latest and recommended model
+    if model_id == "grok-4.3" || model_id == "grok-4.3-latest" {
         info.max_tokens = Some(8192);
-        info.context_window = Some(128_000);
+        info.context_window = Some(1_000_000);
         info.supports_images = Some(true);
         info.supports_reasoning = Some(false);
-        info.input_price = Some(3.0); // $3 / 1M tokens
-        info.output_price = Some(15.0); // $15 / 1M tokens
-        info.temperature = Some(0.7);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
+    // grok-4.20 variants (reasoning and non-reasoning)
+    } else if model_id == "grok-4.20-0309-reasoning" {
+        info.max_tokens = Some(8192);
+        info.context_window = Some(1_000_000);
+        info.supports_images = Some(true);
+        info.supports_reasoning = Some(true);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
+    } else if model_id == "grok-4.20-0309-non-reasoning" {
+        info.max_tokens = Some(8192);
+        info.context_window = Some(1_000_000);
+        info.supports_images = Some(true);
+        info.supports_reasoning = Some(false);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
+    // grok-4.20-multi-agent with 2M context
+    } else if model_id == "grok-4.20-multi-agent-0309" {
+        info.max_tokens = Some(8192);
+        info.context_window = Some(2_000_000);
+        info.supports_images = Some(true);
+        info.supports_reasoning = Some(false);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
+    // grok-build-0.1 with 256k context
+    } else if model_id == "grok-build-0.1" {
+        info.max_tokens = Some(8192);
+        info.context_window = Some(256_000);
+        info.supports_images = Some(true);
+        info.supports_reasoning = Some(false);
+        info.input_price = Some(1.00);
+        info.output_price = Some(2.00);
+    // Legacy model aliases - map to grok-4.3
+    } else if model_id == "grok-3" || model_id == "grok-3-latest" {
+        // grok-3 is aliased to grok-4.3
+        info.name = Some("grok-4.3".to_string());
+        info.max_tokens = Some(8192);
+        info.context_window = Some(1_000_000);
+        info.supports_images = Some(true);
+        info.supports_reasoning = Some(false);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
     } else if model_id == "grok-3-mini" || model_id == "grok-3-mini-latest" {
+        // grok-3-mini is aliased to grok-4.3
+        info.name = Some("grok-4.3".to_string());
         info.max_tokens = Some(8192);
-        info.context_window = Some(128_000);
+        info.context_window = Some(1_000_000);
         info.supports_images = Some(true);
         info.supports_reasoning = Some(false);
-        info.input_price = Some(0.3); // $0.3 / 1M tokens
-        info.output_price = Some(0.5); // $0.5 / 1M tokens
-        info.temperature = Some(0.7);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
+    // Deprecated models (grok-2, grok-beta) - use grok-4.3 pricing/context
     } else if model_id == "grok-2" || model_id == "grok-2-latest" {
         info.max_tokens = Some(8192);
-        info.context_window = Some(128_000);
+        info.context_window = Some(1_000_000);
         info.supports_images = Some(true);
         info.supports_reasoning = Some(false);
-        info.input_price = Some(2.0); // $2 / 1M tokens
-        info.output_price = Some(10.0); // $10 / 1M tokens
-        info.temperature = Some(0.7);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
     } else if model_id == "grok-2-mini" || model_id == "grok-2-mini-latest" {
         info.max_tokens = Some(8192);
-        info.context_window = Some(128_000);
+        info.context_window = Some(1_000_000);
         info.supports_images = Some(true);
         info.supports_reasoning = Some(false);
-        info.input_price = Some(0.2); // $0.2 / 1M tokens
-        info.output_price = Some(0.3); // $0.3 / 1M tokens
-        info.temperature = Some(0.7);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
     } else if model_id == "grok-beta" {
         info.max_tokens = Some(8192);
-        info.context_window = Some(128_000);
+        info.context_window = Some(1_000_000);
         info.supports_images = Some(true);
         info.supports_reasoning = Some(false);
-        info.input_price = Some(5.0); // $5 / 1M tokens
-        info.output_price = Some(15.0); // $15 / 1M tokens
-        info.temperature = Some(0.7);
+        info.input_price = Some(1.25);
+        info.output_price = Some(2.50);
     }
 
     OpenAiCompatibleModelInfo {
@@ -152,41 +191,45 @@ mod tests {
 
     #[test]
     fn test_xai_model_info_grok_3() {
+        // grok-3 is aliased to grok-4.3 per xAI docs
         let info = get_xai_model_info("grok-3");
         assert_eq!(info.base.max_tokens, Some(8192));
-        assert_eq!(info.base.context_window, Some(128_000));
+        assert_eq!(info.base.context_window, Some(1_000_000));
         assert_eq!(info.base.supports_images, Some(true));
         assert_eq!(info.base.supports_reasoning, Some(false));
-        assert_eq!(info.base.input_price, Some(3.0));
-        assert_eq!(info.base.output_price, Some(15.0));
+        assert_eq!(info.base.input_price, Some(1.25));
+        assert_eq!(info.base.output_price, Some(2.50));
         assert_eq!(info.base.temperature, Some(0.7));
     }
 
     #[test]
     fn test_xai_model_info_grok_3_mini() {
+        // grok-3-mini is aliased to grok-4.3 per xAI docs
         let info = get_xai_model_info("grok-3-mini");
         assert_eq!(info.base.max_tokens, Some(8192));
-        assert_eq!(info.base.context_window, Some(128_000));
+        assert_eq!(info.base.context_window, Some(1_000_000));
         assert_eq!(info.base.supports_images, Some(true));
-        assert_eq!(info.base.input_price, Some(0.3));
-        assert_eq!(info.base.output_price, Some(0.5));
+        assert_eq!(info.base.input_price, Some(1.25));
+        assert_eq!(info.base.output_price, Some(2.50));
     }
 
     #[test]
     fn test_xai_model_info_grok_2() {
+        // grok-2 uses grok-4.3 pricing per xAI docs
         let info = get_xai_model_info("grok-2");
         assert_eq!(info.base.max_tokens, Some(8192));
-        assert_eq!(info.base.context_window, Some(128_000));
+        assert_eq!(info.base.context_window, Some(1_000_000));
         assert_eq!(info.base.supports_images, Some(true));
-        assert_eq!(info.base.input_price, Some(2.0));
-        assert_eq!(info.base.output_price, Some(10.0));
+        assert_eq!(info.base.input_price, Some(1.25));
+        assert_eq!(info.base.output_price, Some(2.50));
     }
 
     #[test]
     fn test_xai_model_info_unknown() {
+        // Default values based on xAI grok-4.3
         let info = get_xai_model_info("unknown-model");
         assert_eq!(info.base.max_tokens, Some(8192));
-        assert_eq!(info.base.context_window, Some(32_768));
-        assert_eq!(info.base.supports_images, Some(false));
+        assert_eq!(info.base.context_window, Some(1_000_000));
+        assert_eq!(info.base.supports_images, Some(true));
     }
 }
