@@ -79,7 +79,9 @@ impl OpenAiProvider {
         Ok(headers)
     }
 
-    fn base_url(&self) -> String {
+    /// Get the base URL for the API endpoint.
+    /// Normalizes URL by stripping trailing `/chat/completions` and slashes.
+    pub fn base_url(&self) -> String {
         self.config
             .base_url
             .as_ref()

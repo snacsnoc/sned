@@ -168,4 +168,19 @@ mod tests {
         let provider = DeepSeekProvider::new(config).unwrap();
         assert_eq!(provider.name(), "deepseek");
     }
+
+    #[test]
+    fn test_deepseek_base_url() {
+        // Verify DeepSeek base_url is exactly https://api.deepseek.com (no /v1 suffix)
+        // This is correct per official DeepSeek API docs:
+        // https://api.deepseek.com/chat/completions
+        let config = DeepSeekConfig {
+            api_key: "test-key".to_string(),
+            model_id: "deepseek-chat".to_string(),
+            model_info: None,
+        };
+        let provider = DeepSeekProvider::new(config).unwrap();
+        // Access inner provider's base_url for verification
+        assert_eq!(provider.inner.base_url(), "https://api.deepseek.com");
+    }
 }
