@@ -320,6 +320,7 @@ pub fn get_skills_directories_for_scan(cwd: &Path) -> Vec<(PathBuf, SkillSource)
     let mut dirs = vec![
         (cwd.join(".snedrules/skills"), SkillSource::Project),
         (cwd.join(".sned/skills"), SkillSource::Project),
+        (cwd.join(".codex/skills"), SkillSource::Project),
         (cwd.join(".claude/skills"), SkillSource::Project),
         (cwd.join(".ai/skills"), SkillSource::Project),
         (cwd.join(".agents/skills"), SkillSource::Project),
@@ -328,6 +329,7 @@ pub fn get_skills_directories_for_scan(cwd: &Path) -> Vec<(PathBuf, SkillSource)
     // Global directories
     if let Some(home) = dirs::home_dir() {
         dirs.push((home.join(".agents/skills"), SkillSource::Global));
+        dirs.push((home.join(".codex/skills"), SkillSource::Global));
         dirs.push((home.join(".claude/skills"), SkillSource::Global));
         dirs.push((home.join(".ai/skills"), SkillSource::Global));
     }
@@ -708,11 +710,11 @@ mod tests {
 
         let scan_dirs = get_skills_directories_for_scan(cwd);
 
-        // Should have 5 project + 3 global = 8 directories
+        // Should have 6 project + 4 global = 10 directories
         assert_eq!(
             scan_dirs.len(),
-            8,
-            "Should have 5 project and 3 global skill directories"
+            10,
+            "Should have 6 project and 4 global skill directories"
         );
 
         // Verify project directories
@@ -720,21 +722,25 @@ mod tests {
         assert_eq!(scan_dirs[0].1, SkillSource::Project);
         assert_eq!(scan_dirs[1].0, cwd.join(".sned/skills"));
         assert_eq!(scan_dirs[1].1, SkillSource::Project);
-        assert_eq!(scan_dirs[2].0, cwd.join(".claude/skills"));
+        assert_eq!(scan_dirs[2].0, cwd.join(".codex/skills"));
         assert_eq!(scan_dirs[2].1, SkillSource::Project);
-        assert_eq!(scan_dirs[3].0, cwd.join(".ai/skills"));
+        assert_eq!(scan_dirs[3].0, cwd.join(".claude/skills"));
         assert_eq!(scan_dirs[3].1, SkillSource::Project);
-        assert_eq!(scan_dirs[4].0, cwd.join(".agents/skills"));
+        assert_eq!(scan_dirs[4].0, cwd.join(".ai/skills"));
         assert_eq!(scan_dirs[4].1, SkillSource::Project);
+        assert_eq!(scan_dirs[5].0, cwd.join(".agents/skills"));
+        assert_eq!(scan_dirs[5].1, SkillSource::Project);
 
         // Verify global directories
         let home = dirs::home_dir().expect("home_dir should exist in test");
-        assert_eq!(scan_dirs[5].0, home.join(".agents/skills"));
-        assert_eq!(scan_dirs[5].1, SkillSource::Global);
-        assert_eq!(scan_dirs[6].0, home.join(".claude/skills"));
+        assert_eq!(scan_dirs[6].0, home.join(".agents/skills"));
         assert_eq!(scan_dirs[6].1, SkillSource::Global);
-        assert_eq!(scan_dirs[7].0, home.join(".ai/skills"));
+        assert_eq!(scan_dirs[7].0, home.join(".codex/skills"));
         assert_eq!(scan_dirs[7].1, SkillSource::Global);
+        assert_eq!(scan_dirs[8].0, home.join(".claude/skills"));
+        assert_eq!(scan_dirs[8].1, SkillSource::Global);
+        assert_eq!(scan_dirs[9].0, home.join(".ai/skills"));
+        assert_eq!(scan_dirs[9].1, SkillSource::Global);
     }
 
     #[test]
