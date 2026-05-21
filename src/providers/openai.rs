@@ -427,6 +427,7 @@ struct OpenAiDelta {
     reasoning_content: Option<String>,
     #[serde(rename = "tool_calls")]
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+    refusal: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -540,6 +541,17 @@ async fn process_openai_sse_line(
                         id: Some(chunk.id.clone()),
                     }),
                     "reasoning",
+                );
+            }
+
+            // Handle OpenAI refusal responses (content policy violations)
+            if let Some(refusal) = delta.refusal
+                && !refusal.is_empty()
+            {
+                try_send_chunk(
+                    tx,
+                    ApiStreamChunk::Error(format!("OpenAI model refused: {}", refusal)),
+                    "refusal",
                 );
             }
 
