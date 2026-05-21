@@ -308,9 +308,11 @@ fn html_to_text(html: &str) -> String {
     // Limit to reasonable size for LLM context
     const MAX_LENGTH: usize = 50_000;
     if text.len() > MAX_LENGTH {
+        // Use floor_char_boundary to avoid splitting multi-byte UTF-8 characters
+        let safe_end = text.floor_char_boundary(MAX_LENGTH);
         format!(
             "{}\n\n[Content truncated. Total length: {} characters]",
-            &text[..MAX_LENGTH],
+            &text[..safe_end],
             text.len()
         )
     } else {

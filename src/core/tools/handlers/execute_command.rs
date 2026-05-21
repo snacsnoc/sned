@@ -385,7 +385,9 @@ impl ExecuteCommandHandler {
                 .unwrap_or(10 * 1024);
 
             if combined_output.len() > limit_bytes {
-                let mut truncated = combined_output[..limit_bytes].to_string();
+                // Use floor_char_boundary to avoid splitting multi-byte UTF-8 characters
+                let safe_end = combined_output.floor_char_boundary(limit_bytes);
+                let mut truncated = combined_output[..safe_end].to_string();
                 truncated.push_str("\n\n(Output truncated due to size limit.)");
                 Ok(truncated)
             } else {
