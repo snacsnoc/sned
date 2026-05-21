@@ -875,11 +875,13 @@ pub async fn prompt_for_combined_approval(
     let _guard = set_approval_sender(sender);
     set_approval_prompt_active(true);
 
-    let input = match receiver.recv() {
-        Ok(c) => c,
-        Err(_) => {
-            // Channel closed (e.g. agent cancelled via Ctrl+C)
-            // Guard will clean up on drop
+    // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
+    let input_result = tokio::task::spawn_blocking(move || receiver.recv()).await;
+
+    let input = match input_result {
+        Ok(Ok(c)) => c,
+        Ok(Err(_)) | Err(_) => {
+            // Channel closed or task cancelled (e.g. agent cancelled via Ctrl+C)
             return Ok(ApprovalResult::Denied);
         }
     };

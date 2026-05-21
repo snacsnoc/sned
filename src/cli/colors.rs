@@ -283,9 +283,18 @@ pub fn reasoning(text: &str) -> String {
     }
 }
 
-/// Format a status badge (e.g., [PLAN], [ACT]).
+/// Format a status badge (e.g., [PLAN], [ACT]) for stdout.
 pub fn badge(text: &str) -> String {
     if stdout_colors_disabled() {
+        format!("[{}]", text)
+    } else {
+        format!("{}[{}{}]{}", style::DIM, style::BOLD, text, style::RESET)
+    }
+}
+
+/// Format a status badge (e.g., [PLAN], [ACT]) for stderr output.
+pub fn badge_stderr(text: &str) -> String {
+    if stderr_colors_disabled() {
         format!("[{}]", text)
     } else {
         format!("{}[{}{}]{}", style::DIM, style::BOLD, text, style::RESET)
@@ -458,6 +467,22 @@ mod tests {
     fn test_success_format() {
         let plain = success("done");
         assert!(plain.contains("done"));
+    }
+
+    #[test]
+    fn test_badge_stderr_uses_stderr_tty_check() {
+        // badge_stderr should check stderr TTY status, not stdout
+        if std::env::var("NO_COLOR").is_err()
+            && std::env::var("TERM").as_deref() != Ok("dumb")
+            && std::io::stderr().is_terminal()
+        {
+            let result = badge_stderr("ACT");
+            assert!(
+                result.contains("\x1b["),
+                "badge_stderr should contain ANSI when stderr is TTY"
+            );
+            assert!(result.contains("ACT"));
+        }
     }
 
     #[test]

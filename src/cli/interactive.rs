@@ -233,13 +233,14 @@ impl InteractiveSession {
         let context_info = get_context_window_info(provider);
         let context_window = format_context_window(context_info.context_window);
 
+        // Use stderr-aware color functions since this is printed via eprint_info()
         format!(
             "{} {}/{} | task {} | {} mode | {}",
-            crate::cli::colors::badge("sned"),
+            crate::cli::colors::badge_stderr("sned"),
             provider_name,
             model_name,
-            crate::cli::colors::colorize(task_id, crate::cli::colors::style::DIM),
-            crate::cli::colors::badge(mode),
+            crate::cli::colors::colorize_stderr(task_id, crate::cli::colors::style::DIM),
+            crate::cli::colors::badge_stderr(mode),
             context_window,
         )
     }
@@ -555,10 +556,12 @@ pub async fn run_interactive_shell_inner(
     ));
 
     // Print startup info line (respects NO_COLOR and --quiet)
+    // Note: Print BEFORE entering raw mode to avoid interfering with cursor positioning
     {
         let sess = session.lock().await;
         if !sess.is_quiet() {
             let startup_info = sess.get_startup_info();
+            // startup_info already includes [sned] prefix and stderr-aware colors
             eprintln!("{}", startup_info);
             crate::cli::colors::eprint_info(
                 "type a prompt and press Enter; type 'exit' or 'quit' to leave",
@@ -768,9 +771,8 @@ pub async fn run_interactive_shell_inner(
                         }
                     }
                     if !prompt.is_empty() {
-                        // Echo the prompt with the SAME identity as the live prompt
-                        // (includes model name, e.g., "sned [sonnet]> ") for consistency
-                        eprintln!("{}{}", prompt_prefix, &prompt);
+                        // Echo the prompt to stdout (same stream as live prompt rendering)
+                        writeln!(stdout, "{}{}", prompt_prefix, &prompt)?;
                     } else {
                         writeln!(stdout)?;
                     }
@@ -864,46 +866,69 @@ pub async fn run_interactive_shell_inner(
                                 println!("{}", crate::cli::slash_commands::format_models_text());
                             }
                             crate::cli::slash_commands::CliOnlyCommand::ResetCompact => {
-                                let mut sess = session.lock().await;
-                                if sess.clear_compacted_summary().await {
-                                    println!(
-                                        "Compacted summary cleared. You can now use /compact again."
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
                                     );
                                 } else {
-                                    println!("No compacted summary to clear.");
+                                    let mut sess = session.lock().await;
+                                    if sess.clear_compacted_summary().await {
+                                        println!(
+                                            "Compacted summary cleared. You can now use /compact again."
+                                        );
+                                    } else {
+                                        println!("No compacted summary to clear.");
+                                    }
+                                    drop(sess);
                                 }
-                                drop(sess);
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Stats => {
-                                let sess = session.lock().await;
-                                let state_handle = sess.agent_loop.state_handle();
-                                let state = state_handle.lock().await;
-                                let stats = crate::cli::slash_commands::format_stats_text(&state);
-                                eprintln!("{}", stats);
-                                drop(sess);
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
+                                    );
+                                } else {
+                                    let sess = session.lock().await;
+                                    let state_handle = sess.agent_loop.state_handle();
+                                    let state = state_handle.lock().await;
+                                    let stats = crate::cli::slash_commands::format_stats_text(&state);
+                                    eprintln!("{}", stats);
+                                    drop(sess);
+                                }
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Changes => {
-                                let sess = session.lock().await;
-                                let state_handle = sess.agent_loop.state_handle();
-                                let state = state_handle.lock().await;
-                                let changes =
-                                    crate::cli::slash_commands::format_changes_text(&state);
-                                eprintln!("{}", changes);
-                                drop(sess);
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
+                                    );
+                                } else {
+                                    let sess = session.lock().await;
+                                    let state_handle = sess.agent_loop.state_handle();
+                                    let state = state_handle.lock().await;
+                                    let changes =
+                                        crate::cli::slash_commands::format_changes_text(&state);
+                                    eprintln!("{}", changes);
+                                    drop(sess);
+                                }
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Undo
                             | crate::cli::slash_commands::CliOnlyCommand::CheckpointUndo => {
                                 // Use the checkpoint manager to restore the most recent checkpoint
-                                let sess = session.lock().await;
-                                let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
+                                    );
+                                } else {
+                                    let sess = session.lock().await;
+                                    let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
 
-                                if checkpoint_mgr.is_none() {
-                                    eprintln!("Checkpoint manager is not initialized.");
-                                    drop(sess);
-                                    continue;
-                                }
+                                    if checkpoint_mgr.is_none() {
+                                        eprintln!("Checkpoint manager is not initialized.");
+                                        drop(sess);
+                                        continue;
+                                    }
 
-                                let checkpoint_mgr = checkpoint_mgr.unwrap();
+                                    let checkpoint_mgr = checkpoint_mgr.unwrap();
 
                                 // Get the most recent checkpoint
                                 let checkpoints = match checkpoint_mgr.list_checkpoints() {
@@ -990,6 +1015,7 @@ pub async fn run_interactive_shell_inner(
                                 }
 
                                 drop(sess);
+                                }
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Diff => {
                                 if let Ok(workspace_root) = std::env::current_dir() {
@@ -1112,18 +1138,23 @@ pub async fn run_interactive_shell_inner(
                                 }
                             }
                             crate::cli::slash_commands::CliOnlyCommand::CheckpointList => {
-                                let sess = session.lock().await;
-                                let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
+                                    );
+                                } else {
+                                    let sess = session.lock().await;
+                                    let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
 
-                                if checkpoint_mgr.is_none() {
-                                    eprintln!("Checkpoint manager is not initialized.");
-                                    drop(sess);
-                                    continue;
-                                }
+                                    if checkpoint_mgr.is_none() {
+                                        eprintln!("Checkpoint manager is not initialized.");
+                                        drop(sess);
+                                        continue;
+                                    }
 
-                                let checkpoint_mgr = checkpoint_mgr.unwrap();
+                                    let checkpoint_mgr = checkpoint_mgr.unwrap();
 
-                                match checkpoint_mgr.list_checkpoints() {
+                                    match checkpoint_mgr.list_checkpoints() {
                                     Ok(checkpoints) => {
                                         if checkpoints.is_empty() {
                                             eprintln!("No checkpoints found.");
@@ -1152,16 +1183,22 @@ pub async fn run_interactive_shell_inner(
                                     }
                                 }
                                 drop(sess);
+                                }
                             }
                             crate::cli::slash_commands::CliOnlyCommand::CheckpointRestore => {
-                                let sess = session.lock().await;
-                                let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
+                                    );
+                                } else {
+                                    let sess = session.lock().await;
+                                    let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
 
-                                if checkpoint_mgr.is_none() {
-                                    eprintln!("Checkpoint manager is not initialized.");
-                                    drop(sess);
-                                    continue;
-                                }
+                                    if checkpoint_mgr.is_none() {
+                                        eprintln!("Checkpoint manager is not initialized.");
+                                        drop(sess);
+                                        continue;
+                                    }
 
                                 let checkpoint_mgr = checkpoint_mgr.unwrap();
 
@@ -1286,9 +1323,14 @@ pub async fn run_interactive_shell_inner(
                                     }
                                 }
                                 drop(sess);
+                                }
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Expand => {
-                                if let Some(index) =
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
+                                    );
+                                } else if let Some(index) =
                                     crate::cli::slash_commands::parse_expand_index(&prompt)
                                 {
                                     let sess = session.lock().await;
@@ -1565,9 +1607,29 @@ pub async fn run_interactive_shell_inner(
                                 state
                                     .is_cancelled_atomic
                                     .store(true, std::sync::atomic::Ordering::Release);
-                                crate::cli::colors::eprint_info("Cancelling agent...");
+                                // Kill any registered command PIDs to prevent orphans
+                                let pids = state.running_command_pids.clone();
+                                drop(state);
+                                if !pids.is_empty() {
+                                    #[cfg(unix)]
+                                    {
+                                        for pid in &pids {
+                                            let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+                                        }
+                                        // Brief pause for SIGTERM to take effect
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                        // Force kill any survivors
+                                        for pid in &pids {
+                                            let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+                                        }
+                                    }
+                                    crate::cli::colors::eprint_info(&format!(
+                                        "Killing {} running command(s)...",
+                                        pids.len()
+                                    ));
+                                }
                             }
-                        }
+                        };
                         // Cancel any pending approval prompt so its receiver wakes up
                         crate::core::approval::clear_approval_sender();
                         // Also abort the task as a fallback

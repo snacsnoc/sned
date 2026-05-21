@@ -264,6 +264,30 @@ impl ExecuteCommandHandler {
                             Err(e) => tracing::warn!("Failed to read stderr line: {}", e),
                         }
                     }
+                    // Periodic cancellation check to allow Ctrl+C to interrupt long-running commands
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                        // Check cancellation flag using try_lock (synchronous)
+                        let is_cancelled = task_state
+                            .as_ref()
+                            .and_then(|s| s.try_lock().ok())
+                            .map(|state| state.is_cancelled_atomic.load(std::sync::atomic::Ordering::Acquire))
+                            .unwrap_or(false);
+                        if is_cancelled {
+                            // Kill the process group on cancellation
+                            #[cfg(unix)]
+                            {
+                                let _ = unsafe { libc::kill(-child_pid, libc::SIGTERM) };
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                                let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = child.kill().await;
+                            }
+                            let _ = child.wait().await;
+                            return Err(anyhow::anyhow!("Command cancelled by user"));
+                        }
+                    }
                     result = timeout(timeout_duration, child.wait()) => {
                         break match result {
                             Ok(Ok(status)) => {

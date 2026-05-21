@@ -72,16 +72,17 @@ impl CancellationHandler {
                 #[cfg(unix)]
                 {
                     use libc;
+
+                    // Send SIGTERM to all processes first (graceful shutdown)
                     for pid in &pids_to_kill {
-                        // Send SIGTERM first for graceful shutdown
                         let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
                         tracing::debug!("Sent SIGTERM to PID {}", pid);
                     }
 
-                    // Wait briefly for graceful shutdown
+                    // Single global wait for all processes to handle SIGTERM
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-                    // Send SIGKILL to any remaining processes
+                    // Then SIGKILL any remaining processes
                     for pid in &pids_to_kill {
                         let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
                         tracing::debug!("Sent SIGKILL to PID {}", pid);

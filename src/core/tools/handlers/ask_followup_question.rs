@@ -49,11 +49,17 @@ impl AskFollowupQuestionHandler {
             crate::core::approval::set_followup_question_active(true);
             crate::core::approval::set_followup_sender(sender);
 
-            let response = match receiver.recv() {
-                Ok(r) => r,
-                Err(_) => {
-                    crate::core::approval::clear_followup_sender();
-                    crate::core::approval::set_followup_question_active(false);
+            // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
+            let response_result = tokio::task::spawn_blocking(move || receiver.recv())
+                .await;
+            
+            // Clean up regardless of result
+            crate::core::approval::clear_followup_sender();
+            crate::core::approval::set_followup_question_active(false);
+
+            let response = match response_result {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) | Err(_) => {
                     return Ok("User provided no response.".to_string());
                 }
             };
