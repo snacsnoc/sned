@@ -16,7 +16,6 @@ pub use crate::core::agent_types::{
 };
 use crate::core::agent_types::{
     MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE, MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT,
-    MAX_CONSECUTIVE_MISTAKES,
 };
 use crate::core::context::{ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager};
 use crate::core::file_editor::AnchorStateManager;
@@ -1752,11 +1751,11 @@ impl AgentLoop {
             state.consecutive_mistakes += 1;
             tracing::warn!(
                 consecutive_mistakes = state.consecutive_mistakes,
-                max_allowed = MAX_CONSECUTIVE_MISTAKES,
+                max_allowed = self.config.max_consecutive_mistakes,
                 "Model returned empty response (no text, no tool calls)"
             );
 
-            if state.consecutive_mistakes >= MAX_CONSECUTIVE_MISTAKES {
+            if state.consecutive_mistakes >= self.config.max_consecutive_mistakes {
                 return TurnResult::Error("Max consecutive mistakes reached".to_string());
             }
 
@@ -2426,16 +2425,16 @@ impl AgentLoop {
             {
                 let state = self.state.lock().await;
                 mistakes_count = state.consecutive_mistakes;
-                if mistakes_count >= MAX_CONSECUTIVE_MISTAKES {
+                if mistakes_count >= self.config.max_consecutive_mistakes {
                     return TurnResult::Error(format!(
                         "Max consecutive mistakes ({}) reached. The model is repeatedly failing.",
-                        MAX_CONSECUTIVE_MISTAKES
+                        self.config.max_consecutive_mistakes
                     ));
                 }
             }
 
             // Inject hint when approaching the mistake limit
-            if mistakes_count >= MAX_CONSECUTIVE_MISTAKES.saturating_sub(1) {
+            if mistakes_count >= self.config.max_consecutive_mistakes.saturating_sub(1) {
                 let hint = "[system] You are repeatedly failing on edit_file. If your edits keep failing due to anchor format issues (multi-line anchors, missing Word§ prefix), consider using write_to_file to rewrite the entire file instead of making incremental edits.";
                 let mut history = self.conversation_history.lock().await;
                 history.push(StorageMessage {
