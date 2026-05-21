@@ -20,24 +20,9 @@ use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-#[cfg(unix)]
-struct TermiosGuard {
-    fd: std::os::unix::io::RawFd,
-    original: libc::termios,
-}
-
-#[cfg(unix)]
-impl Drop for TermiosGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original);
-        }
-    }
-}
 
 const SAFE_BASE_COMMANDS: &[&str] = &[
     "ls", "pwd", "date", "whoami", "uname", "cat", "grep", "find", "head", "tail", "cd", "clear",
@@ -726,52 +711,13 @@ pub fn prompt_for_approval(
     set_approval_prompt_active(true);
 
     // Block until the CLI loop sends the user's response.
-    // Use recv_timeout to detect when no TUI is running (one-shot mode with prompt)
-    // Timeout is set high (2000ms) to give TUI loop time to forward keystrokes
-    let input = match receiver.recv_timeout(std::time::Duration::from_millis(2000)) {
+    // Use blocking recv() - the TUI loop forwards keystrokes via try_send_approval_response().
+    // No fallback to direct stdin reading: that would race with the TUI's stdin reader
+    // and corrupt raw-mode state (double enable/disable).
+    let input = match receiver.recv() {
         Ok(c) => c,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // No TUI loop forwarding input - fall back to direct stdin reading
-            // This happens when running with a prompt in one-shot mode (no TUI loop)
-            set_approval_prompt_active(false);
-            
-            // Use raw mode to read single character without requiring Enter
-            use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
-            
-            let _ = enable_raw_mode();
-            
-            // Read single character
-            let mut buf = [0u8; 1];
-            let result = if let Ok(n) = std::io::stdin().read(&mut buf) {
-                if n > 0 {
-                    let c = buf[0] as char;
-                    // Echo the character so user sees their choice
-                    print!("{}", c);
-                    let _ = std::io::stdout().flush();
-                    // Consume rest of line (Enter key if pressed)
-                    let mut _rest = [0u8; 16];
-                    let _ = std::io::stdin().read(&mut _rest);
-                    Ok(match c {
-                        'y' | 'Y' => ApprovalResult::Approved,
-                        'n' | 'N' => ApprovalResult::Denied,
-                        'a' | 'A' => ApprovalResult::Always,
-                        _ => ApprovalResult::Denied,
-                    })
-                } else {
-                    Ok(ApprovalResult::Denied)
-                }
-            } else {
-                Ok(ApprovalResult::Denied)
-            };
-            
-            // Restore terminal
-            let _ = disable_raw_mode();
-            println!(); // Newline after response
-            
-            return result;
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            // Channel closed (e.g. agent cancelled via Ctrl+C)
+        Err(_) => {
+            // Channel disconnected (e.g. agent cancelled via Ctrl+C)
             // Guard will clean up on drop
             return Ok(ApprovalResult::Denied);
         }
@@ -947,86 +893,14 @@ pub async fn prompt_for_combined_approval(
     let _guard = set_approval_sender(sender);
     set_approval_prompt_active(true);
 
-    // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
-    // Use recv_timeout to detect when no TUI is running (one-shot mode)
+    // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread.
+    // Use blocking recv() - the TUI loop forwards keystrokes via try_send_approval_response().
+    // No fallback to direct stdin reading: that would race with the TUI's stdin reader
+    // and corrupt raw-mode state (double enable/disable or termios conflicts).
     let input_result = tokio::task::spawn_blocking(move || {
-        match receiver.recv_timeout(std::time::Duration::from_millis(2000)) {
+        match receiver.recv() {
             Ok(c) => Ok(c),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // No TUI loop - fall back to direct stdin reading with raw mode
-                set_approval_prompt_active(false);
-                
-                let result: Result<char, ()>;
-                
-                #[cfg(unix)]
-                {
-                    use std::io::{Read, Write};
-                    use std::os::unix::io::AsRawFd;
-                    
-                    // Save original terminal settings
-                    let stdin_fd = std::io::stdin().as_raw_fd();
-                    let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
-                    let _restore_guard = unsafe {
-                        if libc::tcgetattr(stdin_fd, &mut original_termios) == 0 {
-                            Some(TermiosGuard {
-                                fd: stdin_fd,
-                                original: original_termios,
-                            })
-                        } else {
-                            None
-                        }
-                    };
-                    
-                    // Set raw mode: disable canonical mode, echo, and signal generation
-                    let mut raw_termios = original_termios;
-                    raw_termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
-                    raw_termios.c_cc[libc::VMIN as usize] = 1; // Read at least 1 byte
-                    raw_termios.c_cc[libc::VTIME as usize] = 0; // No timeout
-                    
-                    unsafe {
-                        if libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_termios) != 0 {
-                            result = Ok('n');
-                        } else {
-                            // Read single character
-                            let mut buf = [0u8; 1];
-                            result = match std::io::stdin().read_exact(&mut buf) {
-                                Ok(()) => {
-                                    let c = buf[0] as char;
-                                    // Echo the character so user sees their choice
-                                    let _ = print!("{}", c);
-                                    let _ = std::io::stdout().flush();
-                                    Ok(c)
-                                }
-                                Err(_) => Ok('n'),
-                            };
-                            // Terminal restored by TermiosGuard drop
-                            println!(); // Newline after response
-                        }
-                    };
-                }
-                
-                #[cfg(not(unix))]
-                {
-                    // Fallback for non-Unix systems
-                    use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
-                    let _ = enable_raw_mode();
-                    let mut buf = [0u8; 1];
-                    result = match std::io::stdin().read_exact(&mut buf) {
-                        Ok(()) => {
-                            let c = buf[0] as char;
-                            print!("{}", c);
-                            let _ = std::io::stdout().flush();
-                            Ok(c)
-                        }
-                        Err(_) => Ok('n'),
-                    };
-                    let _ = disable_raw_mode();
-                    println!();
-                }
-                
-                result
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(()),
+            Err(_) => Err(()), // Channel disconnected (e.g. Ctrl+C)
         }
     })
     .await;
