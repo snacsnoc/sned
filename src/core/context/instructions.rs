@@ -479,28 +479,37 @@ fn load_skill_from_md_file(
         return None;
     }
 
-    if !had_frontmatter {
-        tracing::warn!("Skill file {} missing YAML frontmatter", skill_md_path.display());
-        return None;
-    }
+    let (name, description) = if had_frontmatter {
+        let name = frontmatter.get("name")?.as_str()?;
+        let description = frontmatter.get("description")?.as_str()?;
 
-    let name = frontmatter.get("name")?.as_str()?;
-    let description = frontmatter.get("description")?.as_str()?;
+        // Name must match filename (without .md extension)
+        if name != skill_name {
+            tracing::warn!(
+                "Skill name \"{}\" in frontmatter doesn't match filename \"{}\" at {}",
+                name,
+                skill_name,
+                skill_md_path.display()
+            );
+            return None;
+        }
 
-    // Name must match filename (without .md extension)
-    if name != skill_name {
-        tracing::warn!(
-            "Skill name \"{}\" in frontmatter doesn't match filename \"{}\" at {}",
-            name,
-            skill_name,
+        (name.to_string(), description.to_string())
+    } else {
+        // No frontmatter: use filename as name, generate generic description
+        tracing::debug!(
+            "Skill file {} has no YAML frontmatter, using filename as name",
             skill_md_path.display()
         );
-        return None;
-    }
+        (
+            skill_name.to_string(),
+            format!("Skill loaded from {}", skill_md_path.file_name()?.to_str()?),
+        )
+    };
 
     Some(SkillMetadata {
-        name: skill_name.to_string(),
-        description: description.to_string(),
+        name,
+        description,
         path: skill_md_path.to_string_lossy().to_string(),
         source,
     })
@@ -779,6 +788,29 @@ mod tests {
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"outcome-replay"));
         assert!(names.contains(&"runtime-operations"));
+    }
+
+    #[test]
+    fn test_discover_skills_from_md_files_no_frontmatter() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path();
+
+        // Create skills directory with .md files WITHOUT frontmatter
+        let skills_dir = cwd.join(".agents/skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        
+        // Create skill as .md file without frontmatter
+        fs::write(
+            skills_dir.join("no-frontmatter.md"),
+            "# No Frontmatter Skill\n\nThis skill has no YAML frontmatter.",
+        )
+        .unwrap();
+
+        // Use scan_skills_directory directly for isolated test
+        let skills = scan_skills_directory(&skills_dir, SkillSource::Project);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "no-frontmatter");
+        assert!(skills[0].description.contains("no-frontmatter.md"));
     }
 
     #[test]
