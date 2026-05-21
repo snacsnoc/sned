@@ -179,25 +179,39 @@ fn read_replacements(params: &serde_json::Value) -> Vec<Replacement> {
         return replacements
             .iter()
             .filter_map(|item| {
+                // Schema declares "old_name"/"new_name", but support "symbol"/"text" for backwards compatibility
+                let symbol = item
+                    .get("symbol")
+                    .or_else(|| item.get("old_name"))
+                    .and_then(|v| v.as_str())?
+                    .to_string();
+                let text = item
+                    .get("text")
+                    .or_else(|| item.get("replacement"))
+                    .or_else(|| item.get("new_name"))
+                    .and_then(|v| v.as_str())?
+                    .to_string();
                 Some(Replacement {
                     path: item.get("path")?.as_str()?.to_string(),
-                    symbol: item.get("symbol")?.as_str()?.to_string(),
-                    text: item
-                        .get("text")
-                        .or_else(|| item.get("replacement"))
-                        .and_then(|v| v.as_str())?
-                        .to_string(),
+                    symbol,
+                    text,
                     symbol_type: item.get("type").and_then(|v| v.as_str()).map(String::from),
                 })
             })
             .collect();
     }
 
+    // Legacy singular format: also support schema keys old_name/new_name
     let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let symbol = params.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+    let symbol = params
+        .get("symbol")
+        .or_else(|| params.get("old_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let text = params
         .get("text")
         .or_else(|| params.get("replacement"))
+        .or_else(|| params.get("new_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
