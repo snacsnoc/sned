@@ -1019,6 +1019,7 @@ impl AgentLoop {
                 deleted_range,
                 self.config.use_auto_condense,
                 compacted_summary.as_ref(),
+                self.config.provider.name(),
             );
             drop(conversation_guard);
 
@@ -3845,6 +3846,7 @@ mod tests {
             None,
             false, // use_auto_condense = false
             None,  // no compacted summary yet
+            "anthropic", // provider_name
         );
 
         // Verify truncation occurred (history was shortened)

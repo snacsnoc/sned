@@ -126,12 +126,21 @@ pub fn get_new_context_messages_and_metadata(
     conversation_history_deleted_range: Option<(usize, usize)>,
     use_auto_condense: bool,
     compacted_summary: Option<&CompactedSummary>,
+    provider_name: &str,
 ) -> ContextUpdateResult {
     let mut updated_conversation_history_deleted_range = false;
     let mut new_deleted_range = conversation_history_deleted_range;
 
     if let Some(info) = api_req_info {
-        let total_tokens = info.tokens_in.unwrap_or(0) + info.tokens_out.unwrap_or(0);
+        // Include cache tokens for Anthropic (tokens_in already includes cache for OpenAI)
+        let cache_tokens = if provider_name == "openai" || provider_name == "minimax" {
+            0
+        } else {
+            info.cache_writes.unwrap_or(0) as u64 + info.cache_reads.unwrap_or(0) as u64
+        };
+        let total_tokens = (info.tokens_in.unwrap_or(0) as u64)
+            + (info.tokens_out.unwrap_or(0) as u64)
+            + cache_tokens;
 
         let threshold_pct = if use_auto_condense { 0.7 } else { 0.8 };
         let max_allowed_size = info
@@ -139,7 +148,7 @@ pub fn get_new_context_messages_and_metadata(
             .map(|cw| (cw as f64 * threshold_pct) as u64)
             .unwrap_or((256_000.0 * threshold_pct) as u64);
 
-        if total_tokens as u64 >= max_allowed_size {
+        if total_tokens >= max_allowed_size {
             let keep = if (total_tokens as u64 / 2) > max_allowed_size {
                 TruncationKeep::LastQuarter
             } else {
@@ -691,8 +700,14 @@ mod tests {
 
         // With auto_condense=true, truncation still happens at 70% safety threshold
         // 170k / 200k = 85% > 70%, so it should truncate
-        let result =
-            get_new_context_messages_and_metadata(&messages, Some(&info), None, true, None);
+        let result = get_new_context_messages_and_metadata(
+            &messages,
+            Some(&info),
+            None,
+            true,
+            None,
+            "anthropic",
+        );
         assert!(
             result.updated_conversation_history_deleted_range,
             "auto_condense should still truncate at 70% safety net"
@@ -700,8 +715,14 @@ mod tests {
         assert!(result.truncated_conversation_history.len() < 10);
 
         // With auto_condense=false, truncation at 80% threshold
-        let result =
-            get_new_context_messages_and_metadata(&messages, Some(&info), None, false, None);
+        let result = get_new_context_messages_and_metadata(
+            &messages,
+            Some(&info),
+            None,
+            false,
+            None,
+            "anthropic",
+        );
         assert!(result.updated_conversation_history_deleted_range);
         assert!(result.truncated_conversation_history.len() < 10);
 
@@ -712,14 +733,26 @@ mod tests {
             context_window: Some(200_000),
             ..Default::default()
         };
-        let result_auto =
-            get_new_context_messages_and_metadata(&messages, Some(&info_below), None, true, None);
+        let result_auto = get_new_context_messages_and_metadata(
+            &messages,
+            Some(&info_below),
+            None,
+            true,
+            None,
+            "anthropic",
+        );
         assert!(
             !result_auto.updated_conversation_history_deleted_range,
             "80k/200k=40% should not trigger truncation even with auto_condense"
         );
-        let result_no_auto =
-            get_new_context_messages_and_metadata(&messages, Some(&info_below), None, false, None);
+        let result_no_auto = get_new_context_messages_and_metadata(
+            &messages,
+            Some(&info_below),
+            None,
+            false,
+            None,
+            "anthropic",
+        );
         assert!(
             !result_no_auto.updated_conversation_history_deleted_range,
             "80k/200k=40% should not trigger truncation"
@@ -747,8 +780,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            get_new_context_messages_and_metadata(&messages, Some(&info_below), None, false, None);
+        let result = get_new_context_messages_and_metadata(
+            &messages,
+            Some(&info_below),
+            None,
+            false,
+            None,
+            "anthropic",
+        );
         assert!(!result.updated_conversation_history_deleted_range);
 
         // 170k total tokens = above threshold, SHOULD truncate
@@ -759,8 +798,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            get_new_context_messages_and_metadata(&messages, Some(&info_above), None, false, None);
+        let result = get_new_context_messages_and_metadata(
+            &messages,
+            Some(&info_above),
+            None,
+            false,
+            None,
+            "anthropic",
+        );
         assert!(result.updated_conversation_history_deleted_range);
     }
 }
