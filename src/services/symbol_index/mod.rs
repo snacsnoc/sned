@@ -351,7 +351,7 @@ impl SymbolIndexService {
                     return None;
                 };
 
-                let Ok(symbols) = extract_symbols(absolute_str, &content, &language_parsers) else {
+                let Ok(symbols) = extract_symbols_for_indexing(absolute_str, &content, &language_parsers) else {
                     return None;
                 };
 
@@ -421,7 +421,7 @@ impl SymbolIndexService {
         let content = std::fs::read_to_string(absolute_path)?;
         let parsers =
             crate::services::tree_sitter::load_required_language_parsers(&[absolute_path])?;
-        let symbols = extract_symbols(absolute_path, &content, &parsers)?;
+        let symbols = extract_symbols_for_indexing(absolute_path, &content, &parsers)?;
 
         let meta = std::fs::metadata(absolute_path)?;
         let mtime = meta
@@ -451,7 +451,9 @@ fn should_index_file(path: &str) -> bool {
     SUPPORTED_EXTENSIONS.contains(&ext.as_str())
 }
 
-fn extract_symbols(
+/// Extract symbols from file content for indexing.
+/// Exposed for use by tool handlers that need to parse symbols outside the index lock.
+pub fn extract_symbols_for_indexing(
     path: &str,
     content: &str,
     language_parsers: &crate::services::tree_sitter::LanguageParserMap,
@@ -833,7 +835,7 @@ mod tests {
         let content = "fn hello() {}\nstruct Foo {}\n";
         let parsers =
             crate::services::tree_sitter::load_required_language_parsers(&["test.rs"]).unwrap();
-        let symbols = extract_symbols("test.rs", content, &parsers).unwrap();
+        let symbols = extract_symbols_for_indexing("test.rs", content, &parsers).unwrap();
         assert!(!symbols.is_empty());
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"hello"), "Expected 'hello' in {:?}", names);

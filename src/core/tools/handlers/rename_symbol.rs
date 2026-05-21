@@ -104,12 +104,67 @@ impl RenameSymbolHandler {
 
         let expanded_paths = expand_paths(&paths, workspace_root).await?;
 
+        // Read file contents and parse symbols outside the lock to avoid blocking tokio workers
+        let mut file_contents: HashMap<String, String> = HashMap::new();
+        for abs_path in &expanded_paths {
+            match fs::read_to_string(abs_path).await {
+                Ok(content) => {
+                    file_contents.insert(abs_path.clone(), content);
+                }
+                Err(e) => {
+                    state.consecutive_mistakes += 1;
+                    tracing::warn!(
+                        consecutive_mistakes = state.consecutive_mistakes,
+                        error = %e,
+                        "rename_symbol: failed to read file"
+                    );
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Error reading file {}: {}",
+                        abs_path, e
+                    )));
+                }
+            }
+        }
+
+        // Update symbol index with file contents (lock held briefly for HashMap/DB updates only)
         if let Some(ref mutex) = self.symbol_index_service
             && expanded_paths.len() <= 100
-            && let Ok(mut index_service) = mutex.lock().map_err(|e| e.into_inner())
         {
-            for abs_path in &expanded_paths {
-                let _ = index_service.update_file(abs_path);
+            let mut parsed_symbols: Vec<(&str, Vec<crate::services::symbol_index::SymbolLocation>)> =
+                Vec::new();
+
+            for (abs_path, content) in &file_contents {
+                let language_parsers =
+                    load_required_language_parsers(&[abs_path.as_str()]).ok();
+                if let Some(parsers) = language_parsers {
+                    if let Ok(symbols) = crate::services::symbol_index::extract_symbols_for_indexing(
+                        abs_path,
+                        content,
+                        &parsers,
+                    ) {
+                        parsed_symbols.push((abs_path.as_str(), symbols));
+                    }
+                }
+            }
+
+            if let Ok(mut index_service) = mutex.lock().map_err(|e| e.into_inner()) {
+                let project_root = index_service.get_project_root().to_string();
+                let root = std::path::Path::new(&project_root);
+                for (abs_path, symbols) in parsed_symbols {
+                    let abs_path_obj = std::path::Path::new(abs_path);
+                    let rel_path = abs_path_obj.strip_prefix(root).unwrap_or(abs_path_obj);
+                    if let Some(rel_str) = rel_path.to_str() {
+                        if let Ok(meta) = std::fs::metadata(abs_path) {
+                            let mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            index_service.index_file(rel_str.to_string(), mtime, meta.len(), symbols);
+                        }
+                    }
+                }
             }
         }
 
@@ -126,21 +181,9 @@ impl RenameSymbolHandler {
         let mut locations_by_file: HashMap<String, FileData> = HashMap::new();
 
         for abs_path in &expanded_paths {
-            let content = match fs::read_to_string(abs_path).await {
-                Ok(c) => c,
-                Err(e) => {
-                    state.consecutive_mistakes += 1;
-                    tracing::warn!(
-                        consecutive_mistakes = state.consecutive_mistakes,
-                        error = %e,
-                        "rename_symbol: failed to read file"
-                    );
-                    return Err(ToolError::ExecutionFailed(format!(
-                        "Error reading file {}: {}",
-                        abs_path, e
-                    )));
-                }
-            };
+            let content = file_contents
+                .remove(abs_path)
+                .expect("file content should exist");
 
             let occurrences = if let Some(ref mutex) = self.symbol_index_service
                 && let Ok(index_service) = mutex.lock().map_err(|e| e.into_inner())
