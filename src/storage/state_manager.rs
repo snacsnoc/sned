@@ -1914,6 +1914,9 @@ impl StateManager {
             }
         }
 
+        // Persist workspace state
+        self.persist_workspace_state()?;
+
         // Update last persist time
         *self.last_persist.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 
@@ -2025,6 +2028,22 @@ impl StateManager {
                 self.secrets_store.set(key, value)?;
             }
         }
+        Ok(())
+    }
+
+    /// Persist workspace state to disk.
+    /// Writes the entire workspace state atomically.
+    fn persist_workspace_state(&self) -> io::Result<()> {
+        let workspace_state = self
+            .workspace_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let file_path = self.state_dir.join("workspace_state.json");
+        let data = serde_json::to_string_pretty(&*workspace_state)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        crate::storage::disk::atomic_write_file(&file_path, &data)?;
         Ok(())
     }
 }
