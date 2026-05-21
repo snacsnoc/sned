@@ -38,6 +38,10 @@ pub struct GeminiPart {
     /// Inline image data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inline_data: Option<GeminiInlineData>,
+
+    /// File data for URL-based media (images, audio, video).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<GeminiFileData>,
 }
 
 /// Gemini function call structure.
@@ -78,6 +82,19 @@ pub struct GeminiInlineData {
 
     /// Base64-encoded data.
     pub data: String,
+}
+
+/// Gemini file data for URL-based media.
+/// Reference: https://ai.google.dev/api/generate-content#FileData
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFileData {
+    /// URI of the file (can be HTTP URL or Google Cloud Storage URI).
+    pub file_uri: String,
+
+    /// MIME type of the file.
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
 }
 
 /// Gemini API content message.
@@ -147,6 +164,7 @@ fn convert_content_to_gemini_parts(
                 function_call: None,
                 function_response: None,
                 inline_data: None,
+                file_data: None,
             }]
         }
         MessageContent::UserBlocks(blocks) => {
@@ -169,6 +187,7 @@ fn convert_content_to_gemini_parts(
                             function_call: None,
                             function_response: None,
                             inline_data: None,
+                            file_data: None,
                         });
                     }
                     UserContentBlock::Image(img) => {
@@ -183,6 +202,31 @@ fn convert_content_to_gemini_parts(
                                     mime_type: media_type.clone(),
                                     data: data.clone(),
                                 }),
+                                file_data: None,
+                            });
+                        } else if let ImageSource::Url { url } = &img.source {
+                            // URL-based images: use file_data format
+                            // Infer MIME type from URL extension or default to image/jpeg
+                            let mime_type = if url.ends_with(".png") {
+                                "image/png"
+                            } else if url.ends_with(".gif") {
+                                "image/gif"
+                            } else if url.ends_with(".webp") {
+                                "image/webp"
+                            } else {
+                                "image/jpeg"
+                            };
+                            parts.push(GeminiPart {
+                                text: None,
+                                thought: None,
+                                thought_signature: img.shared.signature.clone(),
+                                function_call: None,
+                                function_response: None,
+                                inline_data: None,
+                                file_data: Some(GeminiFileData {
+                                    file_uri: url.clone(),
+                                    mime_type: mime_type.to_string(),
+                                }),
                             });
                         }
                     }
@@ -196,6 +240,7 @@ fn convert_content_to_gemini_parts(
                                     function_call: None,
                                     function_response: None,
                                     inline_data: None,
+                                    file_data: None,
                                 });
                             }
                             DocumentSource::Base64 { media_type, data } => {
@@ -209,6 +254,7 @@ fn convert_content_to_gemini_parts(
                                         mime_type: media_type.clone(),
                                         data: data.clone(),
                                     }),
+                                    file_data: None,
                                 });
                             }
                             DocumentSource::Url { url } => {
@@ -221,6 +267,7 @@ fn convert_content_to_gemini_parts(
                                     function_call: None,
                                     function_response: None,
                                     inline_data: None,
+                file_data: None,
                                 });
                             }
                         }
@@ -261,6 +308,7 @@ fn convert_content_to_gemini_parts(
                                 id: Some(tr.tool_use_id.clone()),
                             }),
                             inline_data: None,
+                file_data: None,
                         });
                     }
                 }
@@ -288,6 +336,7 @@ fn convert_content_to_gemini_parts(
                             function_call: None,
                             function_response: None,
                             inline_data: None,
+                file_data: None,
                         });
                     }
                     AssistantContentBlock::Thinking(thinking) => {
@@ -298,6 +347,7 @@ fn convert_content_to_gemini_parts(
                             function_call: None,
                             function_response: None,
                             inline_data: None,
+                file_data: None,
                         });
                     }
                     AssistantContentBlock::ToolUse(tu) => {
@@ -315,6 +365,7 @@ fn convert_content_to_gemini_parts(
                             }),
                             function_response: None,
                             inline_data: None,
+                            file_data: None,
                         });
                     }
                     AssistantContentBlock::Image(img) => {
@@ -329,6 +380,31 @@ fn convert_content_to_gemini_parts(
                                     mime_type: media_type.clone(),
                                     data: data.clone(),
                                 }),
+                                file_data: None,
+                            });
+                        } else if let ImageSource::Url { url } = &img.source {
+                            // URL-based images in assistant messages: use file_data format
+                            // Infer MIME type from URL extension or default to image/jpeg
+                            let mime_type = if url.ends_with(".png") {
+                                "image/png"
+                            } else if url.ends_with(".gif") {
+                                "image/gif"
+                            } else if url.ends_with(".webp") {
+                                "image/webp"
+                            } else {
+                                "image/jpeg"
+                            };
+                            parts.push(GeminiPart {
+                                text: None,
+                                thought: None,
+                                thought_signature: img.shared.signature.clone(),
+                                function_call: None,
+                                function_response: None,
+                                inline_data: None,
+                                file_data: Some(GeminiFileData {
+                                    file_uri: url.clone(),
+                                    mime_type: mime_type.to_string(),
+                                }),
                             });
                         }
                     }
@@ -341,6 +417,7 @@ fn convert_content_to_gemini_parts(
                                 function_call: None,
                                 function_response: None,
                                 inline_data: None,
+                file_data: None,
                             });
                         }
                     }
