@@ -1218,6 +1218,9 @@ async fn run_task_inner(
 }
 
 fn run_interactive_shell(task_opts: TaskOptions, root_opts: RootOnlyOptions) -> anyhow::Result<()> {
+    // ARCHITECTURAL GUARD: Interactive shell MUST use run_interactive_shell_inner
+    // which has the TUI loop. Never call session.run(None) directly here.
+    // See: AGENTS.md §Interactive Shell Architecture
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_interactive_shell_inner(task_opts, root_opts))
 }
@@ -1410,6 +1413,13 @@ mod tests {
             }
             _ => panic!("expected History command"),
         }
+    }
+
+    #[test]
+    fn test_run_interactive_shell_exists() {
+        // Compile-time guard: verify run_interactive_shell function exists
+        // This prevents accidental removal or signature changes
+        let _ = run_interactive_shell as fn(TaskOptions, RootOnlyOptions) -> anyhow::Result<()>;
     }
 
     #[test]
