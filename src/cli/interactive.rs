@@ -598,6 +598,11 @@ pub async fn run_interactive_shell_inner(
     let mut last_cursor_pos = 0;
     let mut last_picker_active = false;
 
+    // Mark that a TUI loop is now active and will handle stdin for approval responses.
+    // This tells the approval system to use channel-based forwarding instead of
+    // direct raw-mode stdin reading (which would race with this TUI loop).
+    crate::core::approval::set_tui_approval_handler(true);
+
     'main: loop {
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
@@ -835,6 +840,7 @@ pub async fn run_interactive_shell_inner(
                         match cli_cmd {
                             crate::cli::slash_commands::CliOnlyCommand::Exit
                             | crate::cli::slash_commands::CliOnlyCommand::Quit => {
+                                crate::core::approval::set_tui_approval_handler(false);
                                 cleanup_terminal(raw_guard.take())?;
                                 return Ok(());
                             }
@@ -1756,6 +1762,7 @@ pub async fn run_interactive_shell_inner(
                         writeln!(stdout, "^C")?;
                     } else if input_buf.is_empty() {
                         writeln!(stdout, "^C")?;
+                        crate::core::approval::set_tui_approval_handler(false);
                         cleanup_terminal(raw_guard.take())?;
                         return Ok(());
                     } else {
@@ -1788,6 +1795,7 @@ pub async fn run_interactive_shell_inner(
         }
     }
 
+    crate::core::approval::set_tui_approval_handler(false);
     cleanup_terminal(raw_guard.take())?;
     Ok(())
 }

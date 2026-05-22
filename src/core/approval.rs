@@ -24,6 +24,9 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 const SAFE_BASE_COMMANDS: &[&str] = &[
     "ls", "pwd", "date", "whoami", "uname", "cat", "grep", "find", "head", "tail", "cd", "clear",
     "echo", "hostname", "df", "du", "ps", "free", "uptime", "wc", "sort", "uniq", "file", "stat",
@@ -667,15 +670,105 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
     }
 }
 
+/// RAII guard to restore terminal settings on drop (Unix only).
+#[cfg(unix)]
+struct TermiosGuard {
+    fd: std::os::unix::io::RawFd,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original);
+        }
+    }
+}
+
+/// Read a single character from stdin in raw mode (VMIN=1, VTIME=0).
+/// Echoes the character so the user sees their choice.
+/// Returns the character or an error if reading fails.
+#[cfg(unix)]
+fn read_single_char_raw() -> io::Result<char> {
+    let stdin = io::stdin();
+    let stdin_fd = stdin.as_raw_fd();
+    
+    // Save original terminal settings
+    let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
+    let restore_guard = unsafe {
+        if libc::tcgetattr(stdin_fd, &mut original_termios) == 0 {
+            Some(TermiosGuard {
+                fd: stdin_fd,
+                original: original_termios,
+            })
+        } else {
+            None
+        }
+    };
+    
+    // Set raw mode: disable canonical mode, echo, and signal generation
+    let mut raw_termios = original_termios;
+    raw_termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+    raw_termios.c_cc[libc::VMIN as usize] = 1;
+    raw_termios.c_cc[libc::VTIME as usize] = 0;
+    
+    if unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    
+    // Read single character directly from fd (avoids borrow checker issue with stdin())
+    let mut buf = [0u8; 1];
+    let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if n == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin closed"));
+    }
+    let c = buf[0] as char;
+    
+    // Echo the character so user sees their choice
+    let _ = print!("{}", c);
+    let _ = io::stdout().flush();
+    println!();
+    
+    drop(restore_guard);
+    Ok(c)
+}
+
+/// Read a single character from stdin in raw mode (fallback for non-Unix).
+#[cfg(not(unix))]
+fn read_single_char_raw() -> io::Result<char> {
+    use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+    
+    let _ = enable_raw_mode();
+    let mut buf = [0u8; 1];
+    let result = match io::stdin().read_exact(&mut buf) {
+        Ok(()) => Ok(buf[0] as char),
+        Err(_) => Ok('n'),
+    };
+    let _ = disable_raw_mode();
+    println!();
+    result
+}
+
 /// Prompt the user for approval of a tool execution.
 ///
-/// Prints the tool name and parameters, then reads a line from stdin
-/// and interprets the first character:
+/// Prints the tool name and parameters, then reads a single character from stdin
+/// and interprets it:
 /// - 'y' or 'Y' -> Approved
 /// - 'n' or 'N' -> Denied
 /// - 'a' or 'A' -> Always (auto-approve for session)
 ///
 /// If stdin is not a terminal, the tool is auto-approved.
+///
+/// ## Implementation
+///
+/// - If a TUI loop is active (TUI_APPROVAL_HANDLER = true), uses channel-based
+///   forwarding: the TUI loop reads stdin and sends responses via try_send_approval_response().
+/// - If no TUI loop is active (one-shot mode), uses direct raw-mode stdin reading
+///   for immediate single-character response without requiring Enter.
 pub fn prompt_for_approval(
     tool_name: &str,
     params: &serde_json::Value,
@@ -703,36 +796,33 @@ pub fn prompt_for_approval(
     );
     io::stderr().flush()?;
 
-    // Create a channel so the CLI loop (sole stdin reader) can forward the response.
-    let (sender, receiver) = std::sync::mpsc::channel();
-    // RAII guard ensures cleanup even on panic/cancellation
-    let _guard = set_approval_sender(sender);
-    // Set flag BEFORE storing sender to avoid race condition with TUI loop
-    set_approval_prompt_active(true);
-
-    // Block until the CLI loop sends the user's response.
-    // Use blocking recv() - the TUI loop forwards keystrokes via try_send_approval_response().
-    // No fallback to direct stdin reading: that would race with the TUI's stdin reader
-    // and corrupt raw-mode state (double enable/disable).
-    let input = match receiver.recv() {
-        Ok(c) => c,
-        Err(_) => {
-            // Channel disconnected (e.g. agent cancelled via Ctrl+C)
-            // Guard will clean up on drop
-            return Ok(ApprovalResult::Denied);
+    // Branch based on whether a TUI loop is active.
+    // TUI mode: channel-based forwarding (TUI loop reads stdin, forwards via try_send_approval_response)
+    // One-shot mode: direct raw-mode stdin read (no TUI loop, so we read directly)
+    let input = if is_tui_approval_handler() {
+        // TUI mode: use channel. TUI loop will forward keystrokes.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _guard = set_approval_sender(sender);
+        set_approval_prompt_active(true);
+        match receiver.recv() {
+            Ok(c) => c,
+            Err(_) => {
+                // Channel disconnected (e.g. agent cancelled via Ctrl+C)
+                return Ok(ApprovalResult::Denied);
+            }
         }
+    } else {
+        // One-shot mode: direct raw-mode stdin read
+        set_approval_prompt_active(false);
+        let c = read_single_char_raw()?;
+        c
     };
 
-    // Guard cleans up on drop here
-
     match input {
-        'y' => Ok(ApprovalResult::Approved),
-        'n' => Ok(ApprovalResult::Denied),
-        'a' => Ok(ApprovalResult::Always),
-        _ => {
-            // Default to denied on unexpected input
-            Ok(ApprovalResult::Denied)
-        }
+        'y' | 'Y' => Ok(ApprovalResult::Approved),
+        'n' | 'N' => Ok(ApprovalResult::Denied),
+        'a' | 'A' => Ok(ApprovalResult::Always),
+        _ => Ok(ApprovalResult::Denied),
     }
 }
 
@@ -749,6 +839,21 @@ pub fn set_approval_prompt_active(active: bool) {
 /// Check if an approval prompt is currently active.
 pub fn is_approval_prompt_active() -> bool {
     APPROVAL_PROMPT_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Flag indicating if a TUI loop is actively reading stdin and forwarding approval responses.
+/// When true, approval prompts use the channel-based approach (TUI loop forwards keystrokes).
+/// When false, approval prompts use direct raw-mode stdin reading (one-shot mode).
+static TUI_APPROVAL_HANDLER: AtomicBool = AtomicBool::new(false);
+
+/// Mark whether a TUI loop is actively handling stdin for approval responses.
+pub fn set_tui_approval_handler(active: bool) {
+    TUI_APPROVAL_HANDLER.store(active, Ordering::SeqCst);
+}
+
+/// Check if a TUI loop is actively handling stdin.
+fn is_tui_approval_handler() -> bool {
+    TUI_APPROVAL_HANDLER.load(Ordering::SeqCst)
 }
 
 /// RAII guard to ensure approval channel is always cleaned up, even on panic/cancellation.
@@ -856,6 +961,11 @@ pub async fn prompt_for_approval_async(
 ///
 /// Shows a diff preview and asks for approval.
 /// Returns `ApprovalResult::Approved` if the user approves.
+///
+/// ## Implementation
+///
+/// - If a TUI loop is active, uses channel-based forwarding (TUI loop reads stdin).
+/// - If no TUI loop is active (one-shot mode), uses direct raw-mode stdin reading.
 pub async fn prompt_for_combined_approval(
     file_count: usize,
     edit_count: usize,
@@ -887,38 +997,31 @@ pub async fn prompt_for_combined_approval(
     );
     io::stderr().flush()?;
 
-    // Use the same channel-based mechanism as prompt_for_approval
-    let (sender, receiver) = std::sync::mpsc::channel();
-    // RAII guard ensures cleanup even on panic/cancellation
-    let _guard = set_approval_sender(sender);
-    set_approval_prompt_active(true);
-
-    // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread.
-    // Use blocking recv() - the TUI loop forwards keystrokes via try_send_approval_response().
-    // No fallback to direct stdin reading: that would race with the TUI's stdin reader
-    // and corrupt raw-mode state (double enable/disable or termios conflicts).
-    let input_result = tokio::task::spawn_blocking(move || {
-        match receiver.recv() {
+    // Branch based on whether a TUI loop is active.
+    let input = if is_tui_approval_handler() {
+        // TUI mode: use channel. TUI loop will forward keystrokes.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _guard = set_approval_sender(sender);
+        set_approval_prompt_active(true);
+        tokio::task::spawn_blocking(move || match receiver.recv() {
             Ok(c) => Ok(c),
-            Err(_) => Err(()), // Channel disconnected (e.g. Ctrl+C)
-        }
-    })
-    .await;
-
-    let input = match input_result {
-        Ok(Ok(c)) => c,
-        Ok(Err(_)) | Err(_) => {
-            // Channel closed or task cancelled (e.g. agent cancelled via Ctrl+C)
-            return Ok(ApprovalResult::Denied);
-        }
+            Err(_) => Err(()),
+        })
+        .await
+        .unwrap_or(Err(()))
+    } else {
+        // One-shot mode: direct raw-mode stdin read
+        set_approval_prompt_active(false);
+        tokio::task::spawn_blocking(read_single_char_raw)
+            .await
+            .map_err(|_| ())
+            .and_then(|r| r.map_err(|_| ()))
     };
 
-    // Guard cleans up on drop here
-
     match input {
-        'y' => Ok(ApprovalResult::Approved),
-        'n' => Ok(ApprovalResult::Denied),
-        'a' => Ok(ApprovalResult::Always),
+        Ok('y' | 'Y') => Ok(ApprovalResult::Approved),
+        Ok('n' | 'N') => Ok(ApprovalResult::Denied),
+        Ok('a' | 'A') => Ok(ApprovalResult::Always),
         _ => Ok(ApprovalResult::Denied),
     }
 }
