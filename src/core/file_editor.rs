@@ -153,7 +153,6 @@ struct TrackedDocument {
     /// VecDeque maintains insertion order, HashSet provides O(1) lookup.
     used_words: VecDeque<String>,
     used_words_set: HashSet<String>,
-    available_pool: Vec<String>,
 }
 
 /// Global anchor state storage.
@@ -182,9 +181,6 @@ impl AnchorStorage {
 const MAX_TRACKED_LINES: usize = 5000;
 const MAX_TRACKED_FILES: usize = 1024;
 const MAX_TRACKED_TASKS: usize = 50;
-
-/// Maximum anchor pool size to prevent memory bloat.
-const MAX_ANCHOR_POOL_SIZE: usize = 1000;
 
 /// Maximum used words per file to prevent HashSet bloat.
 const MAX_USED_WORDS: usize = 5000;
@@ -472,7 +468,6 @@ impl AnchorStateManager {
                 anchors,
                 used_words: used_words_vec,
                 used_words_set,
-                available_pool: Vec::new(), // No longer needed with hash-based selection
             };
             let anchors = tracked.anchors.clone();
             self.update_state(absolute_path, tracked, task_id);
@@ -530,7 +525,6 @@ impl AnchorStateManager {
             anchors: new_anchors,
             used_words: new_used_words_vec,
             used_words_set: new_used_words_set,
-            available_pool: Vec::new(), // No longer needed with hash-based selection
         };
         let anchors = tracked.anchors.clone();
         self.update_state(absolute_path, tracked, task_id);
