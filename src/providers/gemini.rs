@@ -191,10 +191,24 @@ impl GeminiProvider {
             let function_declarations: Vec<serde_json::Value> = tool_defs
                 .iter()
                 .map(|t| {
+                    // Gemini doesn't support additionalProperties in schemas
+                    // Strip it from the parameters object
+                    let mut params = t.function.parameters.clone();
+                    if let Some(obj) = params.as_object_mut() {
+                        obj.remove("additionalProperties");
+                        // Also strip from nested property schemas
+                        if let Some(props) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
+                            for (_, prop) in props.iter_mut() {
+                                if let Some(prop_obj) = prop.as_object_mut() {
+                                    prop_obj.remove("additionalProperties");
+                                }
+                            }
+                        }
+                    }
                     json!({
                         "name": t.function.name,
                         "description": t.function.description,
-                        "parameters": t.function.parameters,
+                        "parameters": params,
                     })
                 })
                 .collect();
@@ -1033,6 +1047,59 @@ mod tests {
         assert_eq!(tools.len(), 1);
         let func = &tools[0]["functionDeclarations"].as_array().unwrap()[0];
         assert_eq!(func["name"], "read_file");
+    }
+
+    #[test]
+    fn test_build_request_body_strips_additional_properties() {
+        // Gemini API rejects additionalProperties in tool parameter schemas
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-3-flash-preview".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![],
+            tools: Some(vec![ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "test_tool".to_string(),
+                    description: "A test tool".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "File path"
+                            }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false,
+                    }),
+                },
+            }]),
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        let func = &tools[0]["functionDeclarations"].as_array().unwrap()[0];
+        let params = &func["parameters"];
+        
+        // Verify additionalProperties was stripped
+        assert!(params.get("additionalProperties").is_none(), "additionalProperties should be stripped for Gemini");
+        // Verify other fields are preserved
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert_eq!(params["required"], json!(["path"]));
     }
 
     #[test]
