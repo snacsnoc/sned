@@ -1,7 +1,7 @@
 //! Condense tool handler for sned CLI.
 //!
 //!
-//! User-triggered context compaction variant (e.g. `/smol`, `/compact`).
+//! User-triggered context compaction variant (e.g. `/compact`).
 
 use crate::core::context::context_manager::{self, CompactedSummary, TruncationKeep};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};

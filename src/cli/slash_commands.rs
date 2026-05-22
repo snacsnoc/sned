@@ -23,7 +23,7 @@ impl SlashCommand {
     pub fn parse(s: &str) -> Option<SlashCommand> {
         match s {
             "newtask" => Some(SlashCommand::NewTask),
-            "smol" | "compact" => Some(SlashCommand::Smol),
+            "compact" => Some(SlashCommand::Smol),
             "newrule" => Some(SlashCommand::NewRule),
             "reportbug" => Some(SlashCommand::ReportBug),
             "explain-changes" => Some(SlashCommand::ExplainChanges),
@@ -543,8 +543,7 @@ pub fn format_help_text() -> String {
 
 Base Commands (sent to AI):
   /newtask         - Create a new task with context from the current task
-  /smol            - Condense your current context window
-  /compact         - Same as /smol
+  /compact         - Condense your current context window
   /newrule         - Create a new Sned rule based on your conversation
   /reportbug       - Submit a bug report to GitHub
   /explain-changes - Explain the changes you have made to the code
@@ -575,8 +574,7 @@ Examples:
   /undo                  - Undo last agent turn (requires --track-changes)
   /diff                  - Review last turn's changes (requires --track-changes)
   /commit "fix: auth bug" - Commit changes to git (requires --track-changes)
-  /expand 1              - Show snipped code block 1
-"#
+  /expand 1              - Show snipped code block 1"#
     .to_string()
 }
 
@@ -754,7 +752,7 @@ The condense tool is defined below:
 Description:
 Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing with the conversation and supporting any continuing tasks.
 The user will be presented with a preview of your generated summary and can choose to use it to compact their context window or keep chatting in the current conversation.
-Users may refer to this tool as 'smol' or 'compact' as well. You should consider these to be equivalent to 'condense' when used in a similar context.
+Users may refer to this tool as 'compact' as well. You should consider these to be equivalent to 'condense' when used in a similar context.
 
 Your summary MUST use the following structured Markdown format:
 
@@ -920,10 +918,10 @@ mod tests {
 
     #[test]
     fn test_slash_command_at_end() {
-        let result = parse_slash_command("Please help me /smol");
+        let result = parse_slash_command("Please help me /compact");
         assert_eq!(result.processed_text, "Please help me");
         let cmd = result.command.unwrap();
-        assert_eq!(cmd.command, "smol");
+        assert_eq!(cmd.command, "compact");
     }
 
     #[test]
@@ -971,12 +969,6 @@ mod tests {
     }
 
     #[test]
-    fn test_process_smol_command() {
-        let result = process_slash_command("/smol");
-        assert!(result.contains("<explicit_instructions type=\"condense\">"));
-    }
-
-    #[test]
     fn test_process_newrule_command() {
         let result = process_slash_command("/newrule");
         assert!(result.contains("<explicit_instructions type=\"new_rule\">"));
@@ -1006,8 +998,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_compact_command_smol() {
-        assert!(is_compact_command("/smol"));
+    fn test_is_compact_command_slash_compact() {
+        assert!(is_compact_command("/compact"));
     }
 
     #[test]
