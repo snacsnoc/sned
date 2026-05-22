@@ -268,72 +268,55 @@ impl AnchorStateManager {
         self.storage.lock()
     }
 
-    fn refill(
+    /// Gets a unique word deterministically based on line content hash.
+    ///
+    /// Uses the hash to select words from the dictionary, applying a salt counter
+    /// on collision to find an unused combination.
+    fn get_word_for_hash(
         &self,
-        _used_words_vec: &VecDeque<String>,
+        line_hash: u32,
         used_words_set: &HashSet<String>,
-        pool: &mut Vec<String>,
-    ) {
-        // Cap pool size to prevent memory bloat
-        if pool.len() >= MAX_ANCHOR_POOL_SIZE {
-            return;
-        }
-
-        let mut storage = self.storage();
-        let dict = storage.get_dictionary().to_vec();
-        let dict_len = dict.len();
-        drop(storage); // Release lock before random operations
-
-        let target = MAX_ANCHOR_POOL_SIZE - pool.len();
-        let mut new_words: Vec<String> = Vec::new();
-        let mut attempts = 0;
-
-        // Try to find unique two-word combinations up to target
-        while new_words.len() < target && attempts < 50000 {
-            let w1 = &dict[fastrand::usize(..dict_len)];
-            let w2 = &dict[fastrand::usize(..dict_len)];
-            let word = format!("{}{}", w1, w2);
-            if !used_words_set.contains(&word) {
-                new_words.push(word);
-            }
-            attempts += 1;
-        }
-
-        // Extreme fallback: three-word combinations
-        if new_words.len() < 10 {
-            for _ in 0..10 {
-                let w1 = &dict[fastrand::usize(..dict_len)];
-                let w2 = &dict[fastrand::usize(..dict_len)];
-                let w3 = &dict[fastrand::usize(..dict_len)];
-                let word = format!("{}{}{}", w1, w2, w3);
-                if !used_words_set.contains(&word) {
-                    new_words.push(word);
-                }
-            }
-        }
-
-        // Shuffle the new batch
-        fastrand::shuffle(&mut new_words);
-        pool.extend(new_words);
-    }
-
-    fn get_unique_word(
-        &self,
-        used_words_vec: &mut VecDeque<String>,
-        used_words_set: &mut HashSet<String>,
-        pool: &mut Vec<String>,
+        dictionary: &[String],
     ) -> String {
-        loop {
-            if pool.is_empty() {
-                self.refill(used_words_vec, used_words_set, pool);
-            }
+        let dict_len = dictionary.len();
+        let mut salt = 0u32;
 
-            if let Some(word) = pool.pop()
-                && !used_words_set.contains(&word)
-            {
+        loop {
+            // Mix salt into hash for collision resolution
+            let mixed_hash = line_hash.wrapping_add(salt.wrapping_mul(0x9e3779b9));
+
+            // Select two words deterministically from hash
+            let idx1 = (mixed_hash as usize) % dict_len;
+            let idx2 = ((mixed_hash >> 16) as usize) % dict_len;
+
+            let w1 = &dictionary[idx1];
+            let w2 = &dictionary[idx2];
+            let word = format!("{}{}", w1, w2);
+
+            if !used_words_set.contains(&word) {
                 return word;
             }
+
+            salt = salt.wrapping_add(1);
+
+            // Extreme fallback: three-word combinations if two-word fails repeatedly
+            if salt > 1000 {
+                let idx3 = ((mixed_hash >> 8) as usize) % dict_len;
+                let w3 = &dictionary[idx3];
+                let word3 = format!("{}{}{}", w1, w2, w3);
+                if !used_words_set.contains(&word3) {
+                    return word3;
+                }
+            }
+
+            // Safety: prevent infinite loop (should never reach this in practice)
+            if salt > 10000 {
+                break;
+            }
         }
+
+        // Final fallback: generate a unique word with hash suffix
+        format!("Word{:08x}", line_hash)
     }
 
     fn get_task_state(&self, task_id: &str) -> HashMap<String, TrackedDocument> {
@@ -428,33 +411,25 @@ impl AnchorStateManager {
             }
         }
 
-        // First time seeing this file? Assign unique random words to every line.
+        // First time seeing this file? Assign unique anchors to every line.
         if tracked.is_none() {
-            let mut used_words_vec = VecDeque::new();
-            let mut used_words_set = HashSet::new();
             let dict = {
                 let mut storage = self.storage();
                 storage.get_dictionary().to_vec()
             };
 
-            let mut pool = dict;
-            fastrand::shuffle(&mut pool);
-
-            let anchors: Vec<String> = current_lines
-                .iter()
-                .map(|_| {
-                    let word =
-                        self.get_unique_word(&mut used_words_vec, &mut used_words_set, &mut pool);
-                    used_words_vec.push_back(word.clone());
-                    used_words_set.insert(word.clone());
-                    word
-                })
-                .collect();
-
-            // Cap pool and used_words to prevent memory bloat
-            if pool.len() > MAX_ANCHOR_POOL_SIZE {
-                pool.truncate(MAX_ANCHOR_POOL_SIZE);
+            // Assign unique anchors deterministically based on line content hash
+            let mut used_words_vec: VecDeque<String> = VecDeque::new();
+            let mut used_words_set: HashSet<String> = HashSet::new();
+            let mut anchors: Vec<String> = Vec::with_capacity(current_hashes.len());
+            for hash in &current_hashes {
+                let word = self.get_word_for_hash(*hash, &used_words_set, &dict);
+                used_words_vec.push_back(word.clone());
+                used_words_set.insert(word.clone());
+                anchors.push(word);
             }
+
+            // Cap used_words to prevent memory bloat
             if used_words_vec.len() > MAX_USED_WORDS {
                 // Remove oldest-inserted entries (first half of VecDeque)
                 let to_remove_count = used_words_vec.len() / 2;
@@ -470,7 +445,7 @@ impl AnchorStateManager {
                 anchors,
                 used_words: used_words_vec,
                 used_words_set,
-                available_pool: pool,
+                available_pool: Vec::new(), // No longer needed with hash-based selection
             };
             let anchors = tracked.anchors.clone();
             self.update_state(absolute_path, tracked, task_id);
@@ -485,34 +460,27 @@ impl AnchorStateManager {
         let mut new_anchors: Vec<String> = Vec::new();
         let mut new_used_words_vec = tracked.used_words.clone();
         let mut new_used_words_set = tracked.used_words_set.clone();
-        let mut pool = tracked.available_pool.clone();
 
-        // If pool was lost, initialize it
-        if pool.is_empty() {
+        // Get dictionary for hash-based word selection
+        let dict = {
             let mut storage = self.storage();
-            let dict = storage.get_dictionary().to_vec();
-            drop(storage);
-
-            for word in dict {
-                if !new_used_words_set.contains(&word) {
-                    pool.push(word);
-                }
-            }
-            fastrand::shuffle(&mut pool);
-        }
+            storage.get_dictionary().to_vec()
+        };
 
         let mut old_idx = 0;
+        let mut new_idx = 0;
 
         for change in changes {
             match change {
                 DiffChange::Added(count) => {
-                    for _ in 0..count {
-                        let word =
-                            self.get_unique_word(&mut new_used_words_vec, &mut new_used_words_set, &mut pool);
+                    for i in 0..count {
+                        let line_hash = current_hashes[new_idx + i];
+                        let word = self.get_word_for_hash(line_hash, &new_used_words_set, &dict);
                         new_anchors.push(word.clone());
                         new_used_words_vec.push_back(word.clone());
                         new_used_words_set.insert(word);
                     }
+                    new_idx += count;
                 }
                 DiffChange::Removed(count) => {
                     old_idx += count;
@@ -525,6 +493,7 @@ impl AnchorStateManager {
                         new_used_words_set.insert(preserved_word);
                         old_idx += 1;
                     }
+                    new_idx += count;
                 }
             }
         }
@@ -534,7 +503,7 @@ impl AnchorStateManager {
             anchors: new_anchors,
             used_words: new_used_words_vec,
             used_words_set: new_used_words_set,
-            available_pool: pool,
+            available_pool: Vec::new(), // No longer needed with hash-based selection
         };
         let anchors = tracked.anchors.clone();
         self.update_state(absolute_path, tracked, task_id);
@@ -1296,8 +1265,16 @@ mod tests {
         let anchors1 = anchor_mgr.reconcile("/tmp/scope1.py", &lines, Some("scope_task1"));
         let anchors2 = anchor_mgr.reconcile("/tmp/scope2.py", &lines, Some("scope_task2"));
 
-        // Different tasks should have different anchors
-        assert_ne!(anchors1[0], anchors2[0]);
+        // With deterministic hash-based selection, same content produces same anchors.
+        // Task scoping is verified by checking that each task maintains independent state.
+        assert_eq!(anchors1[0], anchors2[0]); // Deterministic: same content → same anchor
+
+        // Verify state is still scoped: modifying one task doesn't affect the other
+        let modified_lines = vec!["def hello():".to_string(), "    pass".to_string()];
+        let anchors1_modified = anchor_mgr.reconcile("/tmp/scope1.py", &modified_lines, Some("scope_task1"));
+        // Task 1 should have 2 anchors now, task 2 still has 1
+        assert_eq!(anchors1_modified.len(), 2);
+        assert_eq!(anchor_mgr.get_anchors("/tmp/scope2.py", Some("scope_task2")).unwrap().len(), 1);
     }
 
     #[test]
