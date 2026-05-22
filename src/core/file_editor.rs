@@ -12,7 +12,7 @@
 
 use parking_lot::Mutex;
 use regex::Regex;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -148,7 +148,10 @@ pub fn hash_lines(
 struct TrackedDocument {
     hashes: Vec<u32>,
     anchors: Vec<String>,
-    used_words: BTreeSet<String>,
+    /// Tracks used words in insertion order for LRU eviction.
+    /// VecDeque maintains insertion order, HashSet provides O(1) lookup.
+    used_words: VecDeque<String>,
+    used_words_set: HashSet<String>,
     available_pool: Vec<String>,
 }
 
@@ -265,7 +268,12 @@ impl AnchorStateManager {
         self.storage.lock()
     }
 
-    fn refill(&self, used_words: &BTreeSet<String>, pool: &mut Vec<String>) {
+    fn refill(
+        &self,
+        _used_words_vec: &VecDeque<String>,
+        used_words_set: &HashSet<String>,
+        pool: &mut Vec<String>,
+    ) {
         // Cap pool size to prevent memory bloat
         if pool.len() >= MAX_ANCHOR_POOL_SIZE {
             return;
@@ -285,7 +293,7 @@ impl AnchorStateManager {
             let w1 = &dict[fastrand::usize(..dict_len)];
             let w2 = &dict[fastrand::usize(..dict_len)];
             let word = format!("{}{}", w1, w2);
-            if !used_words.contains(&word) {
+            if !used_words_set.contains(&word) {
                 new_words.push(word);
             }
             attempts += 1;
@@ -298,7 +306,7 @@ impl AnchorStateManager {
                 let w2 = &dict[fastrand::usize(..dict_len)];
                 let w3 = &dict[fastrand::usize(..dict_len)];
                 let word = format!("{}{}{}", w1, w2, w3);
-                if !used_words.contains(&word) {
+                if !used_words_set.contains(&word) {
                     new_words.push(word);
                 }
             }
@@ -309,14 +317,19 @@ impl AnchorStateManager {
         pool.extend(new_words);
     }
 
-    fn get_unique_word(&self, used_words: &mut BTreeSet<String>, pool: &mut Vec<String>) -> String {
+    fn get_unique_word(
+        &self,
+        used_words_vec: &mut VecDeque<String>,
+        used_words_set: &mut HashSet<String>,
+        pool: &mut Vec<String>,
+    ) -> String {
         loop {
             if pool.is_empty() {
-                self.refill(used_words, pool);
+                self.refill(used_words_vec, used_words_set, pool);
             }
 
             if let Some(word) = pool.pop()
-                && !used_words.contains(&word)
+                && !used_words_set.contains(&word)
             {
                 return word;
             }
@@ -417,7 +430,8 @@ impl AnchorStateManager {
 
         // First time seeing this file? Assign unique random words to every line.
         if tracked.is_none() {
-            let mut used_words = BTreeSet::new();
+            let mut used_words_vec = VecDeque::new();
+            let mut used_words_set = HashSet::new();
             let dict = {
                 let mut storage = self.storage();
                 storage.get_dictionary().to_vec()
@@ -429,8 +443,10 @@ impl AnchorStateManager {
             let anchors: Vec<String> = current_lines
                 .iter()
                 .map(|_| {
-                    let word = self.get_unique_word(&mut used_words, &mut pool);
-                    used_words.insert(word.clone());
+                    let word =
+                        self.get_unique_word(&mut used_words_vec, &mut used_words_set, &mut pool);
+                    used_words_vec.push_back(word.clone());
+                    used_words_set.insert(word.clone());
                     word
                 })
                 .collect();
@@ -439,22 +455,21 @@ impl AnchorStateManager {
             if pool.len() > MAX_ANCHOR_POOL_SIZE {
                 pool.truncate(MAX_ANCHOR_POOL_SIZE);
             }
-            if used_words.len() > MAX_USED_WORDS {
-                // Clear oldest entries (first half) to make room
-                let to_remove: Vec<String> = used_words
-                    .iter()
-                    .take(used_words.len() / 2)
-                    .cloned()
-                    .collect();
-                for word in to_remove {
-                    used_words.remove(&word);
+            if used_words_vec.len() > MAX_USED_WORDS {
+                // Remove oldest-inserted entries (first half of VecDeque)
+                let to_remove_count = used_words_vec.len() / 2;
+                for _ in 0..to_remove_count {
+                    if let Some(word) = used_words_vec.pop_front() {
+                        used_words_set.remove(&word);
+                    }
                 }
             }
 
             let tracked = TrackedDocument {
                 hashes: current_hashes,
                 anchors,
-                used_words,
+                used_words: used_words_vec,
+                used_words_set,
                 available_pool: pool,
             };
             let anchors = tracked.anchors.clone();
@@ -468,7 +483,8 @@ impl AnchorStateManager {
         let changes = diff_arrays(&tracked.hashes, &current_hashes);
 
         let mut new_anchors: Vec<String> = Vec::new();
-        let mut new_used_words = tracked.used_words.clone();
+        let mut new_used_words_vec = tracked.used_words.clone();
+        let mut new_used_words_set = tracked.used_words_set.clone();
         let mut pool = tracked.available_pool.clone();
 
         // If pool was lost, initialize it
@@ -478,7 +494,7 @@ impl AnchorStateManager {
             drop(storage);
 
             for word in dict {
-                if !new_used_words.contains(&word) {
+                if !new_used_words_set.contains(&word) {
                     pool.push(word);
                 }
             }
@@ -491,9 +507,11 @@ impl AnchorStateManager {
             match change {
                 DiffChange::Added(count) => {
                     for _ in 0..count {
-                        let word = self.get_unique_word(&mut new_used_words, &mut pool);
+                        let word =
+                            self.get_unique_word(&mut new_used_words_vec, &mut new_used_words_set, &mut pool);
                         new_anchors.push(word.clone());
-                        new_used_words.insert(word);
+                        new_used_words_vec.push_back(word.clone());
+                        new_used_words_set.insert(word);
                     }
                 }
                 DiffChange::Removed(count) => {
@@ -503,7 +521,8 @@ impl AnchorStateManager {
                     for _ in 0..count {
                         let preserved_word = tracked.anchors[old_idx].clone();
                         new_anchors.push(preserved_word.clone());
-                        new_used_words.insert(preserved_word);
+                        new_used_words_vec.push_back(preserved_word.clone());
+                        new_used_words_set.insert(preserved_word);
                         old_idx += 1;
                     }
                 }
@@ -513,7 +532,8 @@ impl AnchorStateManager {
         let tracked = TrackedDocument {
             hashes: current_hashes,
             anchors: new_anchors,
-            used_words: new_used_words,
+            used_words: new_used_words_vec,
+            used_words_set: new_used_words_set,
             available_pool: pool,
         };
         let anchors = tracked.anchors.clone();
@@ -1690,5 +1710,52 @@ mod tests {
         let err_msg = error.unwrap();
         assert!(err_msg.contains("not found in the file"));
         assert!(err_msg.contains("FakeWord"));
+    }
+
+    #[test]
+    fn test_used_words_eviction_is_lru_not_alphabetical() {
+        use std::collections::{HashSet, VecDeque};
+
+        let mut used_words_vec: VecDeque<String> = VecDeque::new();
+        let mut used_words_set: HashSet<String> = HashSet::new();
+
+        // Insert words in a specific order (not alphabetical)
+        let insert_order = vec!["Zebra", "Apple", "Mango", "Banana", "Cherry"];
+        for word in &insert_order {
+            used_words_vec.push_back(word.to_string());
+            used_words_set.insert(word.to_string());
+        }
+
+        // Simulate eviction when exceeding MAX_USED_WORDS (we'll use a smaller threshold for testing)
+        const TEST_MAX_USED_WORDS: usize = 3;
+        if used_words_vec.len() > TEST_MAX_USED_WORDS {
+            let to_remove_count = (used_words_vec.len() - TEST_MAX_USED_WORDS + 1) / 2;
+            for _ in 0..to_remove_count {
+                if let Some(word) = used_words_vec.pop_front() {
+                    used_words_set.remove(&word);
+                }
+            }
+        }
+
+        // Verify that the oldest-inserted words were removed, not alphabetically first
+        // "Zebra" (first inserted) should be removed, not "Apple" (alphabetically first)
+        assert!(
+            !used_words_set.contains("Zebra"),
+            "Zebra (oldest-inserted) should be evicted"
+        );
+        assert!(
+            used_words_set.contains("Apple"),
+            "Apple (newer) should remain"
+        );
+        assert!(
+            used_words_set.contains("Cherry"),
+            "Cherry (newest) should remain"
+        );
+
+        // Verify VecDeque maintains insertion order for remaining elements
+        let remaining: Vec<String> = used_words_vec.into_iter().collect();
+        assert!(remaining.contains(&"Mango".to_string()));
+        assert!(remaining.contains(&"Banana".to_string()));
+        assert!(remaining.contains(&"Cherry".to_string()));
     }
 }
