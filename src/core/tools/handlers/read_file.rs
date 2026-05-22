@@ -214,10 +214,8 @@ impl ReadFileHandler {
             }
         };
 
-        let all_lines: Vec<String> = content
-            .split_terminator('\n')
-            .map(|line| line.to_string())
-            .collect();
+        // Use .lines() to strip \r from CRLF line endings, matching read_full_file behavior
+        let all_lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
         let total_lines = all_lines.len();
 
         // Calculate the actual range (with clamping)
