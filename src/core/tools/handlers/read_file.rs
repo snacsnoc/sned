@@ -152,7 +152,9 @@ impl ReadFileHandler {
 
         // Register anchors using full file content (even for partial reads)
         // This ensures anchor state is consistent with the complete file
-        let lines_for_reconcile = full_lines.as_ref().expect("full_lines should always be Some");
+        let lines_for_reconcile = full_lines.as_ref().expect(
+            "full_lines must be Some: all read paths (range/truncated/full) return Some(full_lines)"
+        );
         let anchors = anchor_mgr.reconcile(path, lines_for_reconcile, task_id);
 
         // For output, use only the sliced lines and their corresponding anchors
@@ -849,6 +851,64 @@ mod tests {
             result
                 .content
                 .contains("[Note: start_line was clamped from 200 to 50 (file has 100 lines)]")
+        );
+    }
+
+    /// Integration test: verify that partial file reads register anchors for the FULL file,
+    /// not just the visible slice. This ensures edits using anchors from partial reads
+    /// can resolve correctly even if the anchor is outside the visible range.
+    #[tokio::test]
+    async fn test_partial_read_registers_full_anchor_state() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 1..=100 {
+            writeln!(temp_file, "line {}", i).unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let task_id = "test-partial-anchor-task";
+
+        // Read only lines 10-20 (11 lines visible to LLM)
+        let result = handler
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                Some(10),
+                Some(20),
+                &anchor_mgr,
+                Some(task_id),
+            )
+            .await;
+
+        assert!(result.success, "read should succeed");
+
+        // Verify output contains only the requested range
+        assert!(result.content.contains("line 10"), "should contain line 10");
+        assert!(result.content.contains("line 20"), "should contain line 20");
+        assert!(!result.content.contains("line 5"), "should NOT contain line 5 (outside range)");
+        assert!(!result.content.contains("line 50"), "should NOT contain line 50 (outside range)");
+
+        // CRITICAL: Verify that anchor state was registered for ALL 100 lines,
+        // not just the 11 visible lines. This is the fix for A34.
+        let anchors = anchor_mgr
+            .get_anchors(temp_file.path().to_str().unwrap(), Some(task_id))
+            .expect("file should be tracked");
+
+        // The anchor state should have 100 entries (one per line in the full file),
+        // not 11 (the visible slice)
+        assert_eq!(
+            anchors.len(),
+            100,
+            "anchor state should have anchors for all 100 lines, not just the 11 visible lines"
+        );
+
+        // Verify that an anchor from outside the visible range (e.g., line 50) exists
+        // in the tracked state. This proves the LLM could later edit line 50 even
+        // though it only saw lines 10-20.
+        let line_50_anchor = &anchors[49]; // 0-indexed
+        assert!(
+            !line_50_anchor.is_empty(),
+            "line 50 anchor should be tracked even though it wasn't in the visible range"
         );
     }
 }
