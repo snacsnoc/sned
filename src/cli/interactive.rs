@@ -148,6 +148,17 @@ fn display_width(s: &str) -> usize {
     width
 }
 
+/// Sanitize input string for single-line terminal rendering.
+///
+/// Replaces newlines and carriage returns with spaces to prevent
+/// terminal cursor movement during rendering. This is defensive:
+/// paste events already sanitize, but this catches any edge cases.
+fn sanitize_input(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect()
+}
+
 /// Format context window size as human-readable string (e.g., "200K context").
 fn format_context_window(tokens: u64) -> String {
     if tokens >= 1_000_000 {
@@ -625,8 +636,11 @@ pub async fn run_interactive_shell_inner(
             last_cursor_pos = cursor_pos;
             last_picker_active = picker_active;
 
+            // Sanitize input to remove newlines (defensive: paste already sanitizes)
+            let sanitized_buf = sanitize_input(&input_buf);
+
             // Calculate how many display lines the input spans (fix line-wrap duplication)
-            let full_input = format!("{}{}", prompt_prefix, &input_buf);
+            let full_input = format!("{}{}", prompt_prefix, &sanitized_buf);
             let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
             let input_lines = input_lines.max(1);
 
@@ -642,7 +656,9 @@ pub async fn run_interactive_shell_inner(
             write!(stdout, "\x1b[{};1H{}", term_rows, &full_input)?;
 
             if cursor_pos < input_buf.len() {
-                let right_of_cursor = &input_buf[cursor_pos..];
+                // Cursor position is in original buffer, but sanitized has same byte positions
+                // (newlines replaced with spaces, same width)
+                let right_of_cursor = &sanitized_buf[cursor_pos..];
                 let move_left = display_width(right_of_cursor);
                 write!(stdout, "\x1b[{}D", move_left)?;
             }
@@ -652,9 +668,8 @@ pub async fn run_interactive_shell_inner(
                 let picker_height = picker.overlay_height();
 
                 // Calculate cursor position from known state (avoid expensive CPR round-trip)
-                let full_prompt = format!("{}{}", prompt_prefix, &input_buf[..cursor_pos]);
-                let cursor_row_offset = full_prompt.matches('\n').count() as u16;
-                let cursor_row = (term_rows - 1).saturating_sub(cursor_row_offset) as usize;
+                // Note: input is single-line (newlines sanitized), so no vertical offset
+                let cursor_row = (term_rows - 1) as usize;
 
                 // Determine picker start row: try below, then above
                 let picker_start = if cursor_row + 1 + picker_height <= term_rows as usize {
@@ -735,9 +750,14 @@ pub async fn run_interactive_shell_inner(
             match event {
                 TerminalEvent::Paste(content) => {
                     // Append pasted content as a single block
+                    // Replace newlines with spaces to keep input single-line
+                    let sanitized: String = content
+                        .chars()
+                        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                        .collect();
                     let line_count = content.lines().count();
                     tracing::debug!(target: "sned::input", "Handling paste: {} bytes, {} lines", content.len(), line_count);
-                    input_buf.push_str(&content);
+                    input_buf.push_str(&sanitized);
                     cursor_pos = input_buf.len();
                     // Show feedback for multi-line pastes
                     if line_count > 1 {
@@ -1534,6 +1554,11 @@ pub async fn run_interactive_shell_inner(
                     input_row = term_rows.saturating_sub(2);
                 }
                 TerminalEvent::Char(c) => {
+                    // Skip newline characters - they should be Return events, but filter defensively
+                    if c == '\n' || c == '\r' {
+                        continue;
+                    }
+
                     // If an approval prompt is active, forward single-char responses
                     // immediately without adding to the input buffer or waiting for Enter.
                     let lower = c.to_ascii_lowercase();
