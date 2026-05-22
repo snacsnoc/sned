@@ -904,28 +904,31 @@ pub async fn run_interactive_shell_inner(
                                 } else {
                                     "No skills found.".to_string()
                                 };
-                                println!("{}", skills_text);
+                                crate::cli::colors::eprint_raw(&skills_text);
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Help => {
-                                println!("{}", crate::cli::slash_commands::format_help_text());
+                                crate::cli::colors::eprint_raw(
+                                    &crate::cli::slash_commands::format_help_text(),
+                                );
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Settings => {
                                 let provider = task_opts.provider.as_deref().unwrap_or("anthropic");
                                 let model =
                                     task_opts.model.as_deref().unwrap_or("claude-3-5-sonnet");
                                 let mode = if task_opts.plan { "plan" } else { "act" };
-                                println!(
-                                    "{}",
-                                    crate::cli::slash_commands::format_settings_text(
+                                crate::cli::colors::eprint_raw(
+                                    &crate::cli::slash_commands::format_settings_text(
                                         provider,
                                         model,
                                         mode,
-                                        auto_approve
-                                    )
+                                        auto_approve,
+                                    ),
                                 );
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Models => {
-                                println!("{}", crate::cli::slash_commands::format_models_text());
+                                crate::cli::colors::eprint_raw(
+                                    &crate::cli::slash_commands::format_models_text(),
+                                );
                             }
                             crate::cli::slash_commands::CliOnlyCommand::ResetCompact => {
                                 if agent_busy.load(Ordering::Relaxed) {

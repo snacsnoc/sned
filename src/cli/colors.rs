@@ -151,6 +151,26 @@ pub fn print_success(text: &str) {
     println!("{}", success(text));
 }
 
+/// Print multi-line text to stderr with `\r\n` line endings (for raw mode).
+pub fn eprint_raw(text: &str) {
+    use std::io::Write;
+    let stderr = std::io::stderr();
+    let mut handle = stderr.lock();
+    let _ = handle.write_all(text.replace('\n', "\r\n").as_bytes());
+    let _ = handle.write_all(b"\r\n");
+    let _ = handle.flush();
+}
+
+/// Print multi-line text to stdout with `\r\n` line endings (for raw mode).
+pub fn print_raw(text: &str) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    let _ = handle.write_all(text.replace('\n', "\r\n").as_bytes());
+    let _ = handle.write_all(b"\r\n");
+    let _ = handle.flush();
+}
+
 /// Format a tool call header with icon and color.
 /// Includes 2-space indent for consistent visual hierarchy.
 pub fn tool_call_header(tool_name: &str) -> String {
