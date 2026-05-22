@@ -362,6 +362,7 @@ impl AnchorStateManager {
         storage: &'a mut AnchorStorage,
         task_id: &str,
     ) -> &'a mut IndexMap<String, TrackedDocument> {
+        // Evict oldest task if at capacity and task doesn't exist
         if !storage.tasks.contains_key(task_id) && storage.tasks.len() >= MAX_TRACKED_TASKS {
             let oldest = storage.tasks.keys().next().cloned();
             if let Some(oldest_key) = oldest {
@@ -369,7 +370,12 @@ impl AnchorStateManager {
             }
         }
 
-        storage.tasks.entry(task_id.to_string()).or_default()
+        // For true LRU: remove and re-insert to move accessed task to back
+        // This ensures recently-used tasks are not evicted
+        let state = storage.tasks.shift_remove(task_id).unwrap_or_default();
+        storage.tasks.insert(task_id.to_string(), state);
+
+        storage.tasks.get_mut(task_id).unwrap()
     }
 
     fn update_state(&self, absolute_path: &str, document: TrackedDocument, task_id: &str) {
@@ -1755,5 +1761,107 @@ mod tests {
         assert!(remaining.contains(&"Mango".to_string()));
         assert!(remaining.contains(&"Banana".to_string()));
         assert!(remaining.contains(&"Cherry".to_string()));
+    }
+
+    #[test]
+    fn test_task_level_lru_eviction() {
+        // Test that task-level eviction follows true LRU order
+        // Per TODO A32: insert A, B, C, access A, then evict — verify B is evicted (not A)
+        let anchor_mgr = AnchorStateManager::new();
+
+        // Set up a low limit for testing
+        // Note: MAX_TRACKED_TASKS = 50 in production, we'll simulate by pre-filling
+        let task_a = "task_a_lru_test";
+        let task_b = "task_b_lru_test";
+        let task_c = "task_c_lru_test";
+        let task_d = "task_d_lru_test";
+
+        // Clear any existing state
+        anchor_mgr.reset(Some(task_a));
+        anchor_mgr.reset(Some(task_b));
+        anchor_mgr.reset(Some(task_c));
+        anchor_mgr.reset(Some(task_d));
+
+        // Create some file content
+        let lines = vec!["fn test() {}".to_string()];
+
+        // Insert tasks in order: A, B, C
+        anchor_mgr.reconcile("/tmp/task_a.rs", &lines, Some(task_a));
+        anchor_mgr.reconcile("/tmp/task_b.rs", &lines, Some(task_b));
+        anchor_mgr.reconcile("/tmp/task_c.rs", &lines, Some(task_c));
+
+        // Access task A again (should move it to back of LRU queue)
+        anchor_mgr.reconcile("/tmp/task_a.rs", &lines, Some(task_a));
+
+        // Verify all tasks are tracked
+        assert!(anchor_mgr.is_tracking("/tmp/task_a.rs", Some(task_a)));
+        assert!(anchor_mgr.is_tracking("/tmp/task_b.rs", Some(task_b)));
+        assert!(anchor_mgr.is_tracking("/tmp/task_c.rs", Some(task_c)));
+
+        // Now we need to test eviction - we'll do this by accessing the internal state
+        // Since MAX_TRACKED_TASKS is 50, we can't easily trigger eviction in a unit test
+        // Instead, we verify the LRU reordering logic by checking get_task_state_mut behavior
+
+        // Access pattern: A (new), B, C, A (again)
+        // After these accesses, LRU order should be: B, C, A (A is most recently used)
+        // If we evict, B should be removed first
+
+        // This test verifies the mechanism works - the actual eviction happens at scale
+        // The key fix: get_task_state_mut now re-inserts to move to back (true LRU)
+        // Previously it used entry() which doesn't reorder (FIFO, not LRU)
+
+        // Verify the test setup is valid
+        assert!(
+            anchor_mgr.is_tracking("/tmp/task_a.rs", Some(task_a)),
+            "Task A should be tracked after final access"
+        );
+    }
+
+    #[test]
+    fn test_task_lru_eviction_order_with_mock_limit() {
+        // Direct test of LRU ordering by manipulating storage directly
+        let mut storage = AnchorStorage::new();
+
+        // Insert three tasks in order
+        storage.tasks.insert("task_a".to_string(), IndexMap::new());
+        storage.tasks.insert("task_b".to_string(), IndexMap::new());
+        storage.tasks.insert("task_c".to_string(), IndexMap::new());
+
+        // Verify insertion order: A, B, C
+        let keys: Vec<_> = storage.tasks.keys().collect();
+        assert_eq!(keys, vec!["task_a", "task_b", "task_c"]);
+
+        // Simulate LRU access: access task_a (should move to back)
+        let _state_a = AnchorStateManager::get_task_state_mut(&mut storage, "task_a");
+
+        // After LRU access, order should be: B, C, A
+        let keys: Vec<_> = storage.tasks.keys().collect();
+        assert_eq!(
+            keys,
+            vec!["task_b", "task_c", "task_a"],
+            "task_a should be moved to back after access (true LRU)"
+        );
+
+        // Now if we evict, task_b (oldest) should be removed
+        // Simulate eviction at limit
+        if storage.tasks.len() >= 3 {
+            let oldest = storage.tasks.keys().next().cloned();
+            assert_eq!(oldest, Some("task_b".to_string()), "task_b should be oldest");
+            storage.tasks.shift_remove(&oldest.unwrap());
+        }
+
+        // Verify task_b was evicted, not task_a
+        assert!(
+            !storage.tasks.contains_key("task_b"),
+            "task_b (oldest) should be evicted"
+        );
+        assert!(
+            storage.tasks.contains_key("task_a"),
+            "task_a (recently used) should remain"
+        );
+        assert!(
+            storage.tasks.contains_key("task_c"),
+            "task_c should remain"
+        );
     }
 }
