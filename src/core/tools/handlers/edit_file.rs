@@ -144,8 +144,8 @@ impl EditFileHandler {
                     invalid_anchors.push(format!(
                         "  - File '{}': anchor '{}' is missing the '{}' delimiter",
                         path,
-                        if anchor.len() > 50 {
-                            format!("{}...", &anchor[..50])
+                        if anchor.chars().count() > 50 {
+                            format!("{}...", anchor.chars().take(50).collect::<String>())
                         } else {
                             anchor.to_string()
                         },
@@ -160,8 +160,8 @@ impl EditFileHandler {
                     invalid_anchors.push(format!(
                         "  - File '{}': end_anchor '{}' is missing the '{}' delimiter",
                         path,
-                        if end_anchor.len() > 50 {
-                            format!("{}...", &end_anchor[..50])
+                        if end_anchor.chars().count() > 50 {
+                            format!("{}...", end_anchor.chars().take(50).collect::<String>())
                         } else {
                             end_anchor.to_string()
                         },
