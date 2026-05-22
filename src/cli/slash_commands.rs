@@ -550,33 +550,33 @@ Base Commands (sent to AI):
   /explain-changes - Explain the changes you have made to the code
 
 CLI-Only Commands (handled locally):
-  /exit, /q       - Exit the CLI
-  /clear          - Clear the current conversation history
-  /history        - Show recent tasks
-  /skills         - List available skills
-  /help           - Show this help message
-  /settings       - Show current settings
-  /models         - Show available models
-  /stats          - Show token usage and session cost
-  /resetcompact   - Clear compacted summary (allows /compact to be used again)
-  /undo           - Undo the last agent turn (requires --track-changes)
-  /diff           - Show changes from the last turn (requires --track-changes)
-  /log            - Show agent turn history (requires --track-changes)
-  /commit "msg"   - Commit agent changes to your git repo (requires --track-changes)
-   /expand N       - Show a previously snipped code block
-   /checkpoint list        - List available checkpoints with timestamps
-   /checkpoint restore N   - Restore a specific checkpoint by number
-   /checkpoint undo        - Undo last turn using checkpoint (reverts files + trims history)
+  /exit, /q        - Exit the CLI
+  /clear           - Clear the current conversation history
+  /history         - Show recent tasks
+  /skills          - List available skills
+  /help            - Show this help message
+  /settings        - Show current settings
+  /models          - Show available models
+  /stats           - Show token usage and session cost
+  /resetcompact    - Clear compacted summary (allows /compact to be used again)
+  /undo            - Undo the last agent turn (requires --track-changes)
+  /diff            - Show changes from the last turn (requires --track-changes)
+  /log             - Show agent turn history (requires --track-changes)
+  /commit "msg"    - Commit agent changes to your git repo (requires --track-changes)
+  /expand N        - Show a previously snipped code block
+  /checkpoint list - List available checkpoints with timestamps
+  /checkpoint restore N - Restore a specific checkpoint by number
+  /checkpoint undo - Undo last turn using checkpoint (reverts files + trims history)
 
 Examples:
-  /compact                    - Compact context before a new topic
-  /newtask                     - Start a new task, carrying over context
-  /help                        - Show this help
-  /undo                        - Undo last agent turn (requires --track-changes)
-  /diff                        - Review last turn's changes (requires --track-changes)
-  /commit "fix: auth bug"      - Commit changes to git (requires --track-changes)
-  /expand 1                    - Show snipped code block 1
- "#
+  /compact               - Compact context before a new topic
+  /newtask               - Start a new task, carrying over context
+  /help                  - Show this help
+  /undo                  - Undo last agent turn (requires --track-changes)
+  /diff                  - Review last turn's changes (requires --track-changes)
+  /commit "fix: auth bug" - Commit changes to git (requires --track-changes)
+  /expand 1              - Show snipped code block 1
+"#
     .to_string()
 }
 
