@@ -66,15 +66,37 @@ pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> Strin
                 .map(String::from),
         ),
         Some(SnedTool::ExecuteCommand) => {
-            let cmd = params
-                .get("command")
-                .and_then(|c| c.as_str())
-                .unwrap_or_default();
-            let truncated = if cmd.len() > 120 {
-                let end = cmd.floor_char_boundary(117);
-                format!("{}...", &cmd[..end])
-            } else {
+            // Handle all three parameter forms: "commands" (array), "command" (singular), "script"
+            let cmd_text = if let Some(commands) = params.get("commands").and_then(|v| v.as_array()) {
+                // Primary form: array of commands, join with " && "
+                let cmds: Vec<&str> = commands
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                cmds.join(" && ")
+            } else if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
+                // Legacy fallback: singular command string
                 cmd.to_string()
+            } else if let Some(script) = params.get("script").and_then(|v| v.as_str()) {
+                // Alternative: script field
+                let truncated = if script.len() > 120 {
+                    let end = script.floor_char_boundary(117);
+                    format!("{}...", &script[..end])
+                } else {
+                    script.to_string()
+                };
+                truncated
+            } else {
+                // No command found - avoid printing empty "▶ " line
+                return format!("  ▶ {}", tool_name);
+            };
+
+            let truncated = if cmd_text.len() > 120 {
+                let end = cmd_text.floor_char_boundary(117);
+                format!("{}...", &cmd_text[..end])
+            } else {
+                cmd_text
             };
             return format!("  ▶ {}", truncated);
         }
@@ -272,4 +294,90 @@ pub fn format_tool_result(result: &str, max_lines: usize) -> String {
     let displayed: Vec<&str> = result.lines().take(max_lines).collect();
     let remaining = line_count - max_lines;
     format!("{}\n... {} more lines", displayed.join("\n"), remaining)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_tool_summary_execute_command_singular() {
+        let params = serde_json::json!({
+            "command": "cargo test"
+        });
+        let summary = format_tool_summary("execute_command", &params);
+        assert!(summary.contains("▶"));
+        assert!(summary.contains("cargo test"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_execute_command_array() {
+        let params = serde_json::json!({
+            "commands": ["cd project", "cargo build", "cargo test"]
+        });
+        let summary = format_tool_summary("execute_command", &params);
+        assert!(summary.contains("▶"));
+        assert!(summary.contains("cd project && cargo build && cargo test"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_execute_command_script() {
+        let params = serde_json::json!({
+            "script": "for i in 1 2 3; do echo $i; done"
+        });
+        let summary = format_tool_summary("execute_command", &params);
+        assert!(summary.contains("▶"));
+        assert!(summary.contains("for i in 1 2 3; do echo $i; done"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_execute_command_empty_params() {
+        let params = serde_json::json!({});
+        let summary = format_tool_summary("execute_command", &params);
+        // Should show tool name instead of empty "▶ " line
+        assert!(summary.contains("▶"));
+        assert!(summary.contains("execute_command"));
+        assert!(!summary.ends_with("▶ "));
+    }
+
+    #[test]
+    fn test_format_tool_summary_execute_command_truncation() {
+        let long_cmd = "a".repeat(150);
+        let params = serde_json::json!({
+            "command": long_cmd
+        });
+        let summary = format_tool_summary("execute_command", &params);
+        assert!(summary.contains("▶"));
+        assert!(summary.contains("..."));
+        assert!(summary.len() < 150);
+    }
+
+    #[test]
+    fn test_format_tool_summary_read_file() {
+        let params = serde_json::json!({
+            "paths": ["src/main.rs"]
+        });
+        let summary = format_tool_summary("read_file", &params);
+        assert!(summary.contains("▶"));
+        assert!(summary.contains("read"));
+        assert!(summary.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_edit_file() {
+        let params = serde_json::json!({
+            "files": [{"path": "src/lib.rs"}]
+        });
+        let summary = format_tool_summary("edit_file", &params);
+        assert!(summary.contains("▶"));
+        assert!(summary.contains("edited"));
+        assert!(summary.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_unknown_tool() {
+        let params = serde_json::json!({});
+        let summary = format_tool_summary("unknown_tool", &params);
+        assert_eq!(summary, "unknown_tool");
+    }
 }

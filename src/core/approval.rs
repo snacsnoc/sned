@@ -571,10 +571,29 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
     match tool_name {
         "execute_command" => {
             let mut output = String::new();
-            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+            
+            // Handle all three parameter forms: "commands" (array), "command" (singular), "script"
+            if let Some(commands) = obj.get("commands").and_then(|v| v.as_array()) {
+                // Primary form: array of commands
+                let cmds: Vec<&str> = commands
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !cmds.is_empty() {
+                    output.push_str("\n    ");
+                    output.push_str(&cmds.join(" && "));
+                }
+            } else if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                // Legacy fallback: singular command string
                 output.push_str("\n    ");
                 output.push_str(cmd);
+            } else if let Some(script) = obj.get("script").and_then(|v| v.as_str()) {
+                // Alternative: script field
+                output.push_str("\n    ");
+                output.push_str(script);
             }
+            
             if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str())
                 && cwd != "."
             {
@@ -1581,6 +1600,27 @@ mod tests {
         let formatted = format_tool_parameters("execute_command", &params);
         assert!(formatted.contains("ls -la"));
         assert!(formatted.contains("working directory: /tmp"));
+    }
+
+    #[test]
+    fn test_format_tool_parameters_execute_command_with_commands_array() {
+        let params = serde_json::json!({
+            "commands": ["cd project", "cargo build", "cargo test"],
+            "cwd": "."
+        });
+        let formatted = format_tool_parameters("execute_command", &params);
+        assert!(formatted.contains("cd project && cargo build && cargo test"));
+        assert!(!formatted.contains("cwd"));
+    }
+
+    #[test]
+    fn test_format_tool_parameters_execute_command_with_script() {
+        let params = serde_json::json!({
+            "script": "for i in 1 2 3; do echo $i; done",
+            "language": "bash"
+        });
+        let formatted = format_tool_parameters("execute_command", &params);
+        assert!(formatted.contains("for i in 1 2 3; do echo $i; done"));
     }
 
     #[test]
