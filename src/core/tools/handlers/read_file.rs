@@ -125,35 +125,46 @@ impl ReadFileHandler {
             };
         }
 
-        let (content_for_hash, lines, clamping_note) = if start_line.is_some() || end_line.is_some()
-        {
-            match self.read_lines_range(path, start_line, end_line).await {
-                Ok(v) => v,
-                Err(e) => return e,
-            }
-        } else if metadata.len() > max_file_read_size() as u64 {
-            match self.read_truncated(path, max_file_read_size()).await {
-                Ok((content, lines)) => {
-                    let size_kb = metadata.len() / 1024;
-                    let max_kb = max_file_read_size() as u64 / 1024;
-                    (content.clone(), lines, Some(format!(
-                        "[Note: File truncated to {}KB (file is {}KB). Use start_line and end_line parameters to read specific sections.]",
-                        max_kb, size_kb
-                    )))
+        let (content_for_hash, sliced_lines, clamping_note, full_lines, range_start, range_end) =
+            if start_line.is_some() || end_line.is_some() {
+                match self.read_lines_range(path, start_line, end_line).await {
+                    Ok(v) => v,
+                    Err(e) => return e,
                 }
-                Err(e) => return e,
-            }
+            } else if metadata.len() > max_file_read_size() as u64 {
+                match self.read_truncated(path, max_file_read_size()).await {
+                    Ok((content, lines)) => {
+                        let size_kb = metadata.len() / 1024;
+                        let max_kb = max_file_read_size() as u64 / 1024;
+                        (content.clone(), lines.clone(), Some(format!(
+                            "[Note: File truncated to {}KB (file is {}KB). Use start_line and end_line parameters to read specific sections.]",
+                            max_kb, size_kb
+                        )), Some(lines.clone()), 0, lines.len())
+                    }
+                    Err(e) => return e,
+                }
+            } else {
+                match self.read_full_file(path).await {
+                    Ok((content, lines)) => (content, lines.clone(), None, Some(lines.clone()), 0, lines.len()),
+                    Err(e) => return e,
+                }
+            };
+
+        // Register anchors using full file content (even for partial reads)
+        // This ensures anchor state is consistent with the complete file
+        let lines_for_reconcile = full_lines.as_ref().expect("full_lines should always be Some");
+        let anchors = anchor_mgr.reconcile(path, lines_for_reconcile, task_id);
+
+        // For output, use only the sliced lines and their corresponding anchors
+        let output_lines = &sliced_lines;
+        let output_anchors = if start_line.is_some() || end_line.is_some() {
+            // Use the clamped range indices returned from read_lines_range
+            &anchors[range_start..range_end.min(anchors.len())]
         } else {
-            match self.read_full_file(path).await {
-                Ok((content, lines)) => (content, lines, None),
-                Err(e) => return e,
-            }
+            &anchors
         };
 
-        // Generate per-line anchors for edit compatibility
-        let anchors = anchor_mgr.reconcile(path, &lines, task_id);
-
-        if lines.len() != anchors.len() {
+        if output_lines.len() != output_anchors.len() {
             return FileReadResult {
                 path: path.to_string(),
                 content: String::new(),
@@ -162,16 +173,16 @@ impl ReadFileHandler {
                 error: Some(format!(
                     "Internal error: anchor/line length mismatch for {}: {} lines vs {} anchors",
                     path,
-                    lines.len(),
-                    anchors.len()
+                    output_lines.len(),
+                    output_anchors.len()
                 )),
             };
         }
 
         // Format each line with its hash anchor
-        let anchored_content = lines
+        let anchored_content = output_lines
             .iter()
-            .zip(anchors.iter())
+            .zip(output_anchors.iter())
             .map(|(line, anchor)| format_line_with_hash(line, anchor))
             .collect::<Vec<_>>()
             .join("\n");
@@ -194,12 +205,15 @@ impl ReadFileHandler {
     }
 
     /// Read the file once, then slice the requested line range.
+    /// Returns (hash_content, sliced_lines, clamping_note, full_lines, start_idx, end_idx)
+    /// where full_lines is the complete file for anchor registration,
+    /// and start_idx/end_idx are the clamped range for anchor slicing.
     async fn read_lines_range(
         &self,
         path: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
-    ) -> Result<(String, Vec<String>, Option<String>), FileReadResult> {
+    ) -> Result<(String, Vec<String>, Option<String>, Option<Vec<String>>, usize, usize), FileReadResult> {
         let content = match tokio::fs::read_to_string(path).await {
             Ok(c) => c,
             Err(e) => {
@@ -252,7 +266,7 @@ impl ReadFileHandler {
         };
 
         let hash_content = collected_lines.join("\n");
-        Ok((hash_content, collected_lines, clamping_note))
+        Ok((hash_content, collected_lines, clamping_note, Some(all_lines), start_idx, end_exclusive))
     }
 
     /// Read the entire file (current behavior for full reads).
