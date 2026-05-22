@@ -228,6 +228,13 @@ impl FileLockManager {
         };
         lock.try_lock_owned().ok()
     }
+
+    /// Removes a lock entry when the last guard is dropped.
+    /// Called from Drop impl of FileEditGuard.
+    fn release(&self, path: &str) {
+        let mut locks = self.locks.lock();
+        locks.remove(path);
+    }
 }
 
 static FILE_LOCK_MANAGER: LazyLock<FileLockManager> = LazyLock::new(FileLockManager::new);
@@ -235,18 +242,31 @@ static FILE_LOCK_MANAGER: LazyLock<FileLockManager> = LazyLock::new(FileLockMana
 /// RAII guard for file editing. Holds lock for path duration.
 pub struct FileEditGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
+    path: String,
 }
 
 impl FileEditGuard {
     pub async fn acquire(path: &str) -> Self {
         let _guard = FILE_LOCK_MANAGER.acquire(path).await;
-        Self { _guard }
+        Self {
+            _guard,
+            path: path.to_string(),
+        }
     }
 
     pub fn try_acquire(path: &str) -> Option<Self> {
         FILE_LOCK_MANAGER
             .try_acquire(path)
-            .map(|_guard| Self { _guard })
+            .map(|_guard| Self {
+                _guard,
+                path: path.to_string(),
+            })
+    }
+}
+
+impl Drop for FileEditGuard {
+    fn drop(&mut self) {
+        FILE_LOCK_MANAGER.release(&self.path);
     }
 }
 
