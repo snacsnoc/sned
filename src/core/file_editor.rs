@@ -13,6 +13,7 @@
 use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
+use indexmap::IndexMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -158,14 +159,14 @@ struct TrackedDocument {
 /// Global anchor state storage.
 #[derive(Debug)]
 struct AnchorStorage {
-    tasks: HashMap<String, HashMap<String, TrackedDocument>>,
+    tasks: IndexMap<String, IndexMap<String, TrackedDocument>>,
     dictionary: Vec<String>,
 }
 
 impl AnchorStorage {
     fn new() -> Self {
         Self {
-            tasks: HashMap::new(),
+            tasks: IndexMap::new(),
             dictionary: Vec::new(),
         }
     }
@@ -339,16 +340,16 @@ impl AnchorStateManager {
         format!("Word{:08x}", line_hash)
     }
 
-    fn get_task_state(&self, task_id: &str) -> HashMap<String, TrackedDocument> {
+    fn get_task_state(&self, task_id: &str) -> IndexMap<String, TrackedDocument> {
         let mut storage = self.storage();
-        let state = storage.tasks.remove(task_id);
+        let state = storage.tasks.shift_remove(task_id);
 
         // Implement LRU for tasks
         if storage.tasks.len() >= MAX_TRACKED_TASKS {
-            // Remove oldest task (first key)
+            // Remove oldest task (first key - IndexMap maintains insertion order)
             let oldest = storage.tasks.keys().next().cloned();
             if let Some(oldest_key) = oldest {
-                storage.tasks.remove(&oldest_key);
+                storage.tasks.shift_remove(&oldest_key);
             }
         }
 
@@ -360,11 +361,11 @@ impl AnchorStateManager {
     fn get_task_state_mut<'a>(
         storage: &'a mut AnchorStorage,
         task_id: &str,
-    ) -> &'a mut HashMap<String, TrackedDocument> {
+    ) -> &'a mut IndexMap<String, TrackedDocument> {
         if !storage.tasks.contains_key(task_id) && storage.tasks.len() >= MAX_TRACKED_TASKS {
             let oldest = storage.tasks.keys().next().cloned();
             if let Some(oldest_key) = oldest {
-                storage.tasks.remove(&oldest_key);
+                storage.tasks.shift_remove(&oldest_key);
             }
         }
 
@@ -375,14 +376,14 @@ impl AnchorStateManager {
         let mut storage = self.storage();
         let state = Self::get_task_state_mut(&mut storage, task_id);
 
-        // Implement LRU for files
-        state.remove(absolute_path);
+        // Implement LRU for files - use shift_remove to maintain insertion order
+        state.shift_remove(absolute_path);
         state.insert(absolute_path.to_string(), document);
 
         if state.len() > MAX_TRACKED_FILES {
             let oldest = state.keys().next().cloned();
             if let Some(oldest_key) = oldest {
-                state.remove(&oldest_key);
+                state.shift_remove(&oldest_key);
             }
         }
     }
@@ -424,7 +425,7 @@ impl AnchorStateManager {
             if identical {
                 let mut storage = self.storage();
                 let state = Self::get_task_state_mut(&mut storage, task_id);
-                if let Some(document) = state.remove(absolute_path) {
+                if let Some(document) = state.shift_remove(absolute_path) {
                     state.insert(absolute_path.to_string(), document);
                 }
                 return tracked.anchors.clone();
@@ -548,7 +549,7 @@ impl AnchorStateManager {
     pub fn clear_state(&self, absolute_path: &str, task_id: Option<&str>) {
         let task_id = task_id.unwrap_or("default");
         let mut state = self.get_task_state(task_id);
-        state.remove(absolute_path);
+        state.shift_remove(absolute_path);
         let mut storage = self.storage();
         storage.tasks.insert(task_id.to_string(), state);
     }
@@ -557,7 +558,7 @@ impl AnchorStateManager {
     pub fn reset(&self, task_id: Option<&str>) {
         let mut storage = self.storage();
         if let Some(id) = task_id {
-            storage.tasks.remove(id);
+            storage.tasks.shift_remove(id);
         } else {
             storage.tasks.clear();
         }
