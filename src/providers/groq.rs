@@ -60,10 +60,11 @@ impl Provider for GroqProvider {
 /// Get model info for known Groq models.
 pub fn get_groq_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     // Default matching TS groqModelInfo
+    // All current Groq models have 131K context window
     let mut info = ModelInfo {
         name: Some(model_id.to_string()),
         max_tokens: Some(8192),
-        context_window: Some(32_768),
+        context_window: Some(131_072),
         supports_images: Some(false),
         supports_prompt_cache: false,
         supports_reasoning: Some(false),
@@ -98,6 +99,40 @@ pub fn get_groq_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         info.supports_reasoning = Some(false);
         info.input_price = Some(0.05); // $0.05 / 1M tokens
         info.output_price = Some(0.08); // $0.08 / 1M tokens
+        info.temperature = Some(0.7);
+    // GPT-OSS reasoning models (openai/ prefix on Groq)
+    } else if model_id == "openai/gpt-oss-120b" {
+        info.max_tokens = Some(65_536);
+        info.context_window = Some(131_072);
+        info.supports_images = Some(false);
+        info.supports_reasoning = Some(true);
+        info.input_price = Some(0.15); // $0.15 / 1M tokens
+        info.output_price = Some(0.60); // $0.60 / 1M tokens
+        info.temperature = Some(0.7);
+    } else if model_id == "openai/gpt-oss-20b" {
+        info.max_tokens = Some(65_536);
+        info.context_window = Some(131_072);
+        info.supports_images = Some(false);
+        info.supports_reasoning = Some(true);
+        info.input_price = Some(0.075); // $0.075 / 1M tokens
+        info.output_price = Some(0.30); // $0.30 / 1M tokens
+        info.temperature = Some(0.7);
+    } else if model_id == "openai/gpt-oss-safeguard-20b" {
+        info.max_tokens = Some(65_536);
+        info.context_window = Some(131_072);
+        info.supports_images = Some(false);
+        info.supports_reasoning = Some(true);
+        info.input_price = Some(0.075); // $0.075 / 1M tokens
+        info.output_price = Some(0.30); // $0.30 / 1M tokens
+        info.temperature = Some(0.7);
+    // Qwen reasoning model
+    } else if model_id == "qwen/qwen3-32b" {
+        info.max_tokens = Some(40_960);
+        info.context_window = Some(131_072);
+        info.supports_images = Some(false);
+        info.supports_reasoning = Some(true);
+        info.input_price = Some(0.29); // $0.29 / 1M tokens
+        info.output_price = Some(0.59); // $0.59 / 1M tokens
         info.temperature = Some(0.7);
     }
 
@@ -153,7 +188,37 @@ mod tests {
     fn test_groq_model_info_unknown() {
         let info = get_groq_model_info("unknown-model");
         assert_eq!(info.base.max_tokens, Some(8192));
-        assert_eq!(info.base.context_window, Some(32_768));
+        assert_eq!(info.base.context_window, Some(131_072));
         assert_eq!(info.base.supports_images, Some(false));
+    }
+
+    #[test]
+    fn test_groq_model_info_gpt_oss_120b() {
+        let info = get_groq_model_info("openai/gpt-oss-120b");
+        assert_eq!(info.base.max_tokens, Some(65_536));
+        assert_eq!(info.base.context_window, Some(131_072));
+        assert_eq!(info.base.supports_reasoning, Some(true));
+        assert_eq!(info.base.input_price, Some(0.15));
+        assert_eq!(info.base.output_price, Some(0.60));
+    }
+
+    #[test]
+    fn test_groq_model_info_gpt_oss_20b() {
+        let info = get_groq_model_info("openai/gpt-oss-20b");
+        assert_eq!(info.base.max_tokens, Some(65_536));
+        assert_eq!(info.base.context_window, Some(131_072));
+        assert_eq!(info.base.supports_reasoning, Some(true));
+        assert_eq!(info.base.input_price, Some(0.075));
+        assert_eq!(info.base.output_price, Some(0.30));
+    }
+
+    #[test]
+    fn test_groq_model_info_qwen3_32b() {
+        let info = get_groq_model_info("qwen/qwen3-32b");
+        assert_eq!(info.base.max_tokens, Some(40_960));
+        assert_eq!(info.base.context_window, Some(131_072));
+        assert_eq!(info.base.supports_reasoning, Some(true));
+        assert_eq!(info.base.input_price, Some(0.29));
+        assert_eq!(info.base.output_price, Some(0.59));
     }
 }
