@@ -420,10 +420,6 @@ impl InteractiveSession {
                 metrics: None,
                 ts: Some(chrono::Utc::now().timestamp_millis() as u64),
             });
-
-            if !self.task_opts.json {
-                crate::cli::colors::eprint_info(&format!("Running task: {}", p));
-            }
         }
 
         agent
