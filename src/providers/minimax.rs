@@ -193,7 +193,7 @@ impl MinimaxProvider {
                 name: Some("MiniMax-M2.7".to_string()),
                 max_tokens: Some(128000),
                 context_window: Some(204800),
-                supports_images: Some(true),
+                supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
                 input_price: Some(0.3),
@@ -222,7 +222,7 @@ impl MinimaxProvider {
                 name: Some("MiniMax-M2.7-highspeed".to_string()),
                 max_tokens: Some(128000),
                 context_window: Some(204800),
-                supports_images: Some(true),
+                supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
                 input_price: Some(0.6),
@@ -251,7 +251,7 @@ impl MinimaxProvider {
                 name: Some("MiniMax-M2.5".to_string()),
                 max_tokens: Some(16384),
                 context_window: Some(204800),
-                supports_images: Some(true),
+                supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
                 input_price: Some(0.3),
@@ -280,7 +280,7 @@ impl MinimaxProvider {
                 name: Some("MiniMax-M2.5-highspeed".to_string()),
                 max_tokens: Some(16384),
                 context_window: Some(204800),
-                supports_images: Some(true),
+                supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
                 input_price: Some(0.6),
@@ -309,7 +309,7 @@ impl MinimaxProvider {
                 name: Some("MiniMax-M2.1".to_string()),
                 max_tokens: Some(16384),
                 context_window: Some(204800),
-                supports_images: Some(true),
+                supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
                 input_price: Some(0.3),
@@ -338,7 +338,7 @@ impl MinimaxProvider {
                 name: Some("MiniMax-M2.1-highspeed".to_string()),
                 max_tokens: Some(16384),
                 context_window: Some(204800),
-                supports_images: Some(true),
+                supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
                 input_price: Some(0.6),
@@ -367,7 +367,7 @@ impl MinimaxProvider {
                 name: Some("MiniMax-M2".to_string()),
                 max_tokens: Some(16384),
                 context_window: Some(204800),
-                supports_images: Some(true),
+                supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
                 input_price: Some(0.3),
@@ -396,7 +396,7 @@ impl MinimaxProvider {
                 name: Some(model_id),
                 max_tokens: Some(128000),
                 context_window: Some(204800),
-                supports_images: Some(true),
+                supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
                 input_price: Some(0.3),
@@ -620,6 +620,14 @@ struct OpenAIStreamDelta {
     #[serde(default)]
     tool_calls: Vec<OpenAIStreamToolCall>,
     reasoning_content: Option<String>,
+    /// MiniMax returns reasoning_details as array when reasoning_split=true
+    #[serde(default)]
+    reasoning_details: Vec<MiniMaxReasoningDetail>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MiniMaxReasoningDetail {
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -769,6 +777,20 @@ async fn process_minimax_sse_line(
                         id: Some(event.id.clone()),
                     }),
                     "reasoning",
+                );
+            }
+            // Handle reasoning_details array (MiniMax with reasoning_split=true)
+            for detail in &choice.delta.reasoning_details {
+                try_send_chunk(
+                    tx,
+                    ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+                        reasoning: detail.text.clone(),
+                        details: None,
+                        signature: None,
+                        redacted_data: None,
+                        id: Some(event.id.clone()),
+                    }),
+                    "reasoning_details",
                 );
             }
 
