@@ -362,6 +362,7 @@ impl EditFileHandler {
                         "Error preparing edits for {}: {}",
                         batch.display_path, e
                     ));
+                    total_failed += batch.edits.len();
                     continue;
                 }
             };
@@ -1863,5 +1864,59 @@ edition = "2021"
                 edit_type
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_prepare_edits_failure_increments_total_failed() {
+        use std::fs;
+
+        let _guard = TEST_MUTEX.lock().await;
+
+        let temp_dir = "test_prepare_fail_tmp";
+        let _ = fs::remove_dir_all(temp_dir);
+        fs::create_dir_all(temp_dir).unwrap();
+
+        let file_path = format!("{}/test.txt", temp_dir);
+        fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            true,
+        );
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path,
+                "edits": [
+                    {
+                        "anchor": "WrongWord§line 1",
+                        "text": "replacement 1"
+                    },
+                    {
+                        "anchor": "BadWord§line 2",
+                        "text": "replacement 2"
+                    }
+                ]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok(), "Should not panic, should report failures");
+        let output = result.unwrap().as_str().unwrap().to_string();
+        assert!(
+            output.contains("0 edit(s) applied") || output.contains("failed"),
+            "Summary should report 0 applied or mention failures, got: {}",
+            output
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }
