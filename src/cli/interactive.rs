@@ -575,22 +575,24 @@ pub async fn run_interactive_shell_inner(
         InteractiveSession::build_interactive(task_opts.clone(), root_opts.clone()).await?,
     ));
 
-    // Print startup info line (respects NO_COLOR and --quiet)
-    // Note: Print BEFORE entering raw mode to avoid interfering with cursor positioning
-    {
-        let sess = session.lock().await;
-        if !sess.is_quiet() {
-            let startup_info = sess.get_startup_info();
-            // startup_info already includes [sned] prefix and stderr-aware colors
-            eprintln!("{}", startup_info);
-            crate::cli::colors::eprint_info(
-                "type a prompt and press Enter; type 'exit' or 'quit' to leave",
-            );
-            crate::cli::colors::eprint_info(
-                "type /help for slash commands, @ to search and mention files",
-            );
-        }
-    }
+     // Print startup info line (respects NO_COLOR and --quiet)
+     {
+         let sess = session.lock().await;
+         if !sess.is_quiet() {
+             let startup_info = sess.get_startup_info();
+             let startup_text = format!(
+                 "{}\n{}\n{}",
+                 startup_info,
+                 crate::cli::colors::info(
+                     "type a prompt and press Enter; type 'exit' or 'quit' to leave",
+                 ),
+                 crate::cli::colors::info(
+                     "type /help for slash commands, @ to search and mention files",
+                 ),
+             );
+             crate::cli::colors::eprint_raw(&startup_text);
+         }
+     }
 
     // Load command history for up/down arrow navigation
     let command_history = load_command_history();
@@ -607,14 +609,9 @@ pub async fn run_interactive_shell_inner(
     // Track last render state to avoid redundant re-renders
     let mut last_input_snapshot = String::new();
     let mut last_cursor_pos = 0;
-    let mut last_picker_active = false;
+     let mut last_picker_active = false;
 
-    // Mark that a TUI loop is now active and will handle stdin for approval responses.
-    // This tells the approval system to use channel-based forwarding instead of
-    // direct raw-mode stdin reading (which would race with this TUI loop).
-    crate::core::approval::set_tui_approval_handler(true);
-
-    'main: loop {
+     'main: loop {
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
         let prompt_prefix =
@@ -860,7 +857,6 @@ pub async fn run_interactive_shell_inner(
                         match cli_cmd {
                             crate::cli::slash_commands::CliOnlyCommand::Exit
                             | crate::cli::slash_commands::CliOnlyCommand::Quit => {
-                                crate::core::approval::set_tui_approval_handler(false);
                                 cleanup_terminal(raw_guard.take())?;
                                 return Ok(());
                             }
@@ -1562,16 +1558,15 @@ pub async fn run_interactive_shell_inner(
                         continue;
                     }
 
-                    // If an approval prompt is active, forward single-char responses
-                    // immediately without adding to the input buffer or waiting for Enter.
-                    let lower = c.to_ascii_lowercase();
-                    if lower == 'y' || lower == 'n' || lower == 'a' {
-                        if crate::core::approval::try_send_approval_response(lower) {
-                            // Echo the character so the user sees their choice
-                            write!(stdout, "{}", c)?;
-                            stdout.flush()?;
-                            continue;
-                        }
+                    // Without this guard, tokio::io::stdin() and the approval
+                    // prompt's libc::read() would both read from the same fd,
+                    // causing dropped or duplicated characters.
+                    //
+                    // INVARIANT: approval.rs must always reset APPROVAL_PROMPT_ACTIVE
+                    // to false before returning. If the flag leaks true, this loop
+                    // permanently skips all stdin.
+                    if crate::core::approval::is_approval_prompt_active() {
+                        continue;
                     }
 
                     // If a followup question is active, forward the full line response
@@ -1790,7 +1785,6 @@ pub async fn run_interactive_shell_inner(
                         writeln!(stdout, "^C")?;
                     } else if input_buf.is_empty() {
                         writeln!(stdout, "^C")?;
-                        crate::core::approval::set_tui_approval_handler(false);
                         cleanup_terminal(raw_guard.take())?;
                         return Ok(());
                     } else {
@@ -1823,7 +1817,6 @@ pub async fn run_interactive_shell_inner(
         }
     }
 
-    crate::core::approval::set_tui_approval_handler(false);
     cleanup_terminal(raw_guard.take())?;
     Ok(())
 }
