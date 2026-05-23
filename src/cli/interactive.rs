@@ -624,7 +624,12 @@ pub async fn run_interactive_shell_inner(
             || cursor_pos != last_cursor_pos
             || picker_active != last_picker_active;
 
-        if needs_render {
+        // CRITICAL: Skip all stdout ANSI rendering while agent is busy.
+        // The agent writes to stderr; TUI writes to stdout with cursor positioning.
+        // Both share the terminal cursor — concurrent writes cause horizontal whitespace
+        // and garbled display. Raw mode is exited before agent spawn; do not re-render
+        // until agent completes and raw mode is re-entered.
+        if needs_render && !agent_busy.load(Ordering::Relaxed) {
             last_input_snapshot = current_snapshot;
             last_cursor_pos = cursor_pos;
             last_picker_active = picker_active;
@@ -805,7 +810,10 @@ pub async fn run_interactive_shell_inner(
                     let prompt = input_buf.trim().to_string();
                     tracing::debug!(target: "sned::input", "Submitting prompt: {} chars", prompt.len());
 
-                    {
+                    // Echo prompt to stdout only if agent is not busy.
+                    // When agent is busy, stdout cursor positioning races with agent stderr output.
+                    // The prompt text itself is still submitted to the agent via message queue.
+                    if !agent_busy.load(Ordering::Relaxed) {
                         let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
                         let full = format!("{}{}", prompt_prefix, &input_buf);
                         let dw = display_width(&full);
@@ -817,13 +825,12 @@ pub async fn run_interactive_shell_inner(
                                 write!(stdout, "\x1b[{};1H\x1b[K", row)?;
                             }
                         }
-                    }
-                    tracing::debug!(target: "sned::input", "Echoing prompt to stdout");
-                    if !prompt.is_empty() {
-                        // Echo the prompt to stdout (same stream as live prompt rendering)
-                        writeln!(stdout, "{}{}", prompt_prefix, &prompt)?;
-                    } else {
-                        writeln!(stdout)?;
+                        tracing::debug!(target: "sned::input", "Echoing prompt to stdout");
+                        if !prompt.is_empty() {
+                            writeln!(stdout, "{}{}", prompt_prefix, &prompt)?;
+                        } else {
+                            writeln!(stdout)?;
+                        }
                     }
                     tracing::debug!(target: "sned::input", "Checking if prompt is empty");
 
@@ -858,7 +865,7 @@ pub async fn run_interactive_shell_inner(
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Clear => {
                                 write!(stdout, "\x1b[2J\x1b[H")?;
-                                println!("Conversation cleared.");
+                                eprintln!("Conversation cleared.");
                             }
                             crate::cli::slash_commands::CliOnlyCommand::History => {
                                 drop(raw_guard.take());
@@ -930,11 +937,11 @@ pub async fn run_interactive_shell_inner(
                                 } else {
                                     let mut sess = session.lock().await;
                                     if sess.clear_compacted_summary().await {
-                                        println!(
+                                        eprintln!(
                                             "Compacted summary cleared. You can now use /compact again."
                                         );
                                     } else {
-                                        println!("No compacted summary to clear.");
+                                        eprintln!("No compacted summary to clear.");
                                     }
                                     drop(sess);
                                 }
@@ -1104,7 +1111,7 @@ pub async fn run_interactive_shell_inner(
                                                 if diff.is_empty() {
                                                     eprintln!("No changes.");
                                                 } else {
-                                                    println!("{}", diff);
+                                                    eprintln!("{}", diff);
                                                 }
                                             }
                                             Err(e) => {
@@ -1127,9 +1134,9 @@ pub async fn run_interactive_shell_inner(
                                         ) {
                                             Ok(log) => {
                                                 if log.is_empty() {
-                                                    eprintln!("No turns recorded.");
+                                                    eprintln!("No log entries.");
                                                 } else {
-                                                    println!("{}", log);
+                                                    eprintln!("{}", log);
                                                 }
                                             }
                                             Err(e) => {
@@ -1240,11 +1247,11 @@ pub async fn run_interactive_shell_inner(
                                         if checkpoints.is_empty() {
                                             eprintln!("No checkpoints found.");
                                         } else {
-                                            println!("Available checkpoints:");
-                                            println!("  #  Hash      Message");
-                                            println!("  ──────────────────────────");
+                                            eprintln!("Available checkpoints:");
+                                            eprintln!("  #  Hash      Message");
+                                            eprintln!("  ──────────────────────────");
                                             for cp in checkpoints.iter().rev() {
-                                                println!(
+                                                eprintln!(
                                                     "  {}  {}  {}",
                                                     crate::cli::colors::colorize(
                                                         &cp.number.to_string(),
@@ -1295,11 +1302,11 @@ pub async fn run_interactive_shell_inner(
                                                 n
                                             } else {
                                                 // Show list and ask interactively
-                                                println!("Available checkpoints:");
-                                                println!("  #  Hash      Message");
-                                                println!("  ──────────────────────────");
+                                                eprintln!("Available checkpoints:");
+                                                eprintln!("  #  Hash      Message");
+                                                eprintln!("  ──────────────────────────");
                                                 for cp in checkpoints.iter().rev() {
-                                                    println!(
+                                                    eprintln!(
                                                         "  {}  {}  {}",
                                                         crate::cli::colors::colorize(
                                                             &cp.number.to_string(),
@@ -1312,9 +1319,9 @@ pub async fn run_interactive_shell_inner(
                                                         cp.message
                                                     );
                                                 }
-                                                println!();
-                                                println!("Enter checkpoint number to restore:");
-
+                                                eprintln!();
+                                                eprintln!("Enter checkpoint number to restore:");
+                                                
                                                 // Use channel-based input to avoid stdin race with TUI async reader
                                                 // Same pattern as condense tool (A9/A18 fix)
                                                 let (sender, receiver) = std::sync::mpsc::channel();
@@ -1363,14 +1370,14 @@ pub async fn run_interactive_shell_inner(
                                                 {
                                                     Ok(changed_files) => {
                                                         if !changed_files.is_empty() {
-                                                            println!(
+                                                            eprintln!(
                                                                 "\nFiles that will be restored:"
                                                             );
                                                             for file in &changed_files {
-                                                                println!("  - {}", file);
+                                                                eprintln!("  - {}", file);
                                                             }
-                                                            println!();
-                                                            println!("Continue? (y/n): ");
+                                                            eprintln!();
+                                                            eprintln!("Continue? (y/n): ");
 
                                                             // Use channel-based input to avoid stdin race with TUI async reader
                                                             // Same pattern as condense tool (A9/A18 fix)
@@ -1414,7 +1421,7 @@ pub async fn run_interactive_shell_inner(
 
                                                 match checkpoint_mgr.restore_by_number(num).await {
                                                     Ok(()) => {
-                                                        println!(
+                                                        eprintln!(
                                                             "Checkpoint {} ({}) restored successfully.",
                                                             num, checkpoint.hash
                                                         );

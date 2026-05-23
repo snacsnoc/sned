@@ -88,7 +88,7 @@ impl ToolHandler for AttemptCompletionHandler {
                 crate::cli::text_utils::draw_completion_box("Task Completed", &result, term_width);
             eprintln!(
                 "\n{}",
-                crate::cli::colors::colorize(&boxed, crate::cli::colors::style::GREEN)
+                crate::cli::colors::colorize_stderr(&boxed, crate::cli::colors::style::GREEN)
             );
         }
 

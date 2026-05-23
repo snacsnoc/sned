@@ -78,18 +78,18 @@ impl CondenseHandler {
         if !ctx.json_output {
             eprintln!(
                 "\n{}",
-                crate::cli::colors::colorize(
+                crate::cli::colors::colorize_stderr(
                     "[Sned wants to condense the conversation]",
                     crate::cli::colors::style::YELLOW
                 )
             );
             eprintln!(
                 "{}\n",
-                crate::cli::colors::colorize(&final_summary, crate::cli::colors::style::BOLD)
+                crate::cli::colors::colorize_stderr(&final_summary, crate::cli::colors::style::BOLD)
             );
             eprint!(
                 "{}",
-                crate::cli::colors::colorize(
+                crate::cli::colors::colorize_stderr(
                     "Press Enter to accept, or provide feedback: ",
                     crate::cli::colors::style::CYAN
                 )

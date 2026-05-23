@@ -146,9 +146,21 @@ pub fn eprint_info(text: &str) {
     eprintln!("{}", info(text));
 }
 
-/// Print a success message.
+/// Print a success message to stdout.
+///
+/// # Warning
+/// Do NOT call this from agent execution paths (tool handlers, agent_loop, etc.).
+/// Agent output goes to stderr; stdout writes during agent execution cause cursor
+/// races with TUI rendering. Use `eprint_success()` for agent-path success messages.
+#[deprecated = "Use eprint_success() for agent-path output to avoid stdout/stderr cursor races"]
 pub fn print_success(text: &str) {
     println!("{}", success(text));
+}
+
+/// Print a success message to stderr.
+/// Safe for agent-path output (tool handlers, agent_loop, etc.).
+pub fn eprint_success(text: &str) {
+    eprintln!("{}", success(text));
 }
 
 /// Print multi-line text to stderr with `\r\n` line endings (for raw mode).
@@ -162,6 +174,12 @@ pub fn eprint_raw(text: &str) {
 }
 
 /// Print multi-line text to stdout with `\r\n` line endings (for raw mode).
+///
+/// # Warning
+/// Do NOT call this from agent execution paths (tool handlers, agent_loop, etc.).
+/// Agent output goes to stderr; stdout writes during agent execution cause cursor
+/// races with TUI rendering. Use `eprint_raw()` for agent-path text output.
+#[deprecated = "Use eprint_raw() for agent-path output to avoid stdout/stderr cursor races"]
 pub fn print_raw(text: &str) {
     use std::io::Write;
     let stdout = std::io::stdout();
@@ -281,12 +299,13 @@ pub fn line_number(line: usize) -> String {
     }
 }
 
-/// Print a horizontal rule separator.
+/// Print a horizontal rule separator to stderr.
+/// Uses stderr to avoid cursor races with TUI stdout rendering during agent execution.
 pub fn print_horizontal_rule() {
-    if stdout_colors_disabled() {
-        println!("────────────────────────────────────────");
+    if stderr_colors_disabled() {
+        eprintln!("────────────────────────────────────────");
     } else {
-        println!(
+        eprintln!(
             "{}────────────────────────────────────────{}",
             style::DIM,
             style::RESET

@@ -61,8 +61,8 @@ impl PlanModeRespondHandler {
         } else {
             eprintln!(
                 "\n{} {}\n{}\n",
-                crate::cli::colors::colorize("📋", crate::cli::colors::style::CYAN),
-                crate::cli::colors::colorize("Plan", crate::cli::colors::style::BOLD),
+                crate::cli::colors::colorize_stderr("📋", crate::cli::colors::style::CYAN),
+                crate::cli::colors::colorize_stderr("Plan", crate::cli::colors::style::BOLD),
                 response
             );
         }

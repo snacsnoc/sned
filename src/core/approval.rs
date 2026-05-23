@@ -747,10 +747,11 @@ fn read_single_char_raw() -> io::Result<char> {
     }
     let c = buf[0] as char;
     
-    // Echo the character so user sees their choice
-    let _ = print!("{}", c);
-    let _ = io::stdout().flush();
-    println!();
+    // Echo the character so user sees their choice — use stderr to match
+    // the approval prompt stream and avoid stdout/stderr cursor races.
+    let _ = eprint!("{}", c);
+    let _ = io::stderr().flush();
+    eprintln!();
     
     drop(restore_guard);
     Ok(c)
@@ -768,7 +769,8 @@ fn read_single_char_raw() -> io::Result<char> {
         Err(_) => Ok('n'),
     };
     let _ = disable_raw_mode();
-    println!();
+    // Use stderr to match the approval prompt stream and avoid cursor races.
+    eprintln!();
     result
 }
 
@@ -805,12 +807,12 @@ pub fn prompt_for_approval(
     eprint!(
         "\r\x1b[K{}",
         build_tool_approval_prompt(
-            &crate::cli::colors::colorize("🔧", crate::cli::colors::style::YELLOW),
+            &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
             &crate::cli::colors::tool_name(tool_name),
             &params_str,
-            &crate::cli::colors::colorize("y", crate::cli::colors::style::GREEN),
-            &crate::cli::colors::colorize("n", crate::cli::colors::style::RED),
-            &crate::cli::colors::colorize("always", crate::cli::colors::style::CYAN),
+            &crate::cli::colors::colorize_stderr("y", crate::cli::colors::style::GREEN),
+            &crate::cli::colors::colorize_stderr("n", crate::cli::colors::style::RED),
+            &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
         )
     );
     io::stderr().flush()?;
@@ -936,13 +938,13 @@ pub async fn prompt_for_combined_approval(
     eprint!(
         "\r\x1b[K{}",
         build_combined_approval_prompt(
-            &crate::cli::colors::colorize("🔧", crate::cli::colors::style::YELLOW),
-            &crate::cli::colors::colorize(&file_names, crate::cli::colors::style::BOLD),
+            &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
+            &crate::cli::colors::colorize_stderr(&file_names, crate::cli::colors::style::BOLD),
             edit_count,
             diff_preview,
-            &crate::cli::colors::colorize("y", crate::cli::colors::style::GREEN),
-            &crate::cli::colors::colorize("n", crate::cli::colors::style::RED),
-            &crate::cli::colors::colorize("always", crate::cli::colors::style::CYAN),
+            &crate::cli::colors::colorize_stderr("y", crate::cli::colors::style::GREEN),
+            &crate::cli::colors::colorize_stderr("n", crate::cli::colors::style::RED),
+            &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
         )
     );
     io::stderr().flush()?;

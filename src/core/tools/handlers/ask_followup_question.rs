@@ -33,12 +33,12 @@ impl AskFollowupQuestionHandler {
         if !json_output {
             eprintln!(
                 "\n{} {}\n",
-                crate::cli::colors::colorize("[Sned Question]", crate::cli::colors::style::YELLOW),
-                crate::cli::colors::colorize(question, crate::cli::colors::style::BOLD)
+                crate::cli::colors::colorize_stderr("[Sned Question]", crate::cli::colors::style::YELLOW),
+                crate::cli::colors::colorize_stderr(question, crate::cli::colors::style::BOLD)
             );
             eprint!(
                 "{}",
-                crate::cli::colors::colorize("Your answer: ", crate::cli::colors::style::CYAN)
+                crate::cli::colors::colorize_stderr("Your answer: ", crate::cli::colors::style::CYAN)
             );
             io::stderr().flush().map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to flush stderr: {}", e))
