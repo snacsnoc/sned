@@ -896,6 +896,10 @@ async fn process_minimax_sse_line(
                         entry.1 = name.clone();
                     }
                     if let Some(args) = &func.arguments {
+                        // Skip empty argument chunks - MiniMax sends these before actual JSON content
+                        if args.is_empty() {
+                            continue;
+                        }
                         if entry.2.is_empty() {
                             if !args.starts_with('{') && !args.starts_with('[') && !args.starts_with('"') {
                                 tracing::warn!(
