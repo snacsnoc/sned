@@ -1042,19 +1042,6 @@ fn setup_hook_manager(
         hook_manager.add_workspace_hooks_dir(std::path::PathBuf::from(hooks_dir));
     }
 
-    let watch_dirs: Vec<std::path::PathBuf> = [
-        hook_manager.get_runtime_hooks_dir().cloned(),
-        hook_manager.get_global_hooks_dir().cloned(),
-    ]
-    .into_iter()
-    .flatten()
-    .chain(hook_manager.get_workspace_hooks_dirs().iter().cloned())
-    .collect();
-    if !watch_dirs.is_empty() {
-        let cache = crate::core::hook_cache::HookDiscoveryCache::new(watch_dirs);
-        hook_manager = hook_manager.with_discovery_cache(cache);
-    }
-
     Arc::new(hook_manager)
 }
 

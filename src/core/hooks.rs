@@ -167,8 +167,6 @@ pub struct HookManager {
     cancel_token: Option<CancellationToken>,
     /// Flag indicating hook was cancelled externally
     cancelled: Arc<std::sync::atomic::AtomicBool>,
-    /// Optional discovery cache for hook lookups
-    discovery_cache: Option<crate::core::hook_cache::HookDiscoveryCache>,
 }
 
 impl HookManager {
@@ -184,7 +182,6 @@ impl HookManager {
             active_child_pid: Arc::new(Mutex::new(None)),
             cancel_token: None,
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            discovery_cache: None,
         }
     }
 
@@ -213,15 +210,6 @@ impl HookManager {
         self.cancel_token = Some(token);
     }
 
-    /// Inject the hook discovery cache (builder pattern).
-    pub fn with_discovery_cache(
-        mut self,
-        cache: crate::core::hook_cache::HookDiscoveryCache,
-    ) -> Self {
-        self.discovery_cache = Some(cache);
-        self
-    }
-
     /// Get the runtime hooks directory if set.
     pub fn get_runtime_hooks_dir(&self) -> Option<&PathBuf> {
         self.runtime_hooks_dir.as_ref()
@@ -240,11 +228,6 @@ impl HookManager {
     /// Discover all hooks for a given hook name across all directories.
     /// Priority: runtime > workspace > global
     pub fn discover_hooks(&self, hook_name: HookName) -> Vec<PathBuf> {
-        // Use discovery cache if available
-        if let Some(ref cache) = self.discovery_cache {
-            return cache.discover_hooks(hook_name);
-        }
-
         let mut hooks = Vec::new();
         let hook_file = hook_name.as_str();
 

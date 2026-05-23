@@ -19,7 +19,6 @@ pub mod edit_batch;
 pub mod file_editor;
 pub mod file_search;
 pub mod hash_utils;
-pub mod hook_cache;
 pub mod hooks;
 pub mod mentions;
 pub mod provider_retry;
