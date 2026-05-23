@@ -577,14 +577,14 @@ pub fn format_help_text() -> String {
     s.push_str(&format!("  {}{}{}  - {}Show available models{}\n", style::CYAN, "/models", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show token usage and session cost{}\n", style::CYAN, "/stats", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Clear compacted summary (allows /compact to be used again){}\n", style::CYAN, "/resetcompact", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Undo the last agent turn (requires --track-changes){}\n", style::CYAN, "/undo", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show changes from the last turn (requires --track-changes){}\n", style::CYAN, "/diff", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show agent turn history (requires --track-changes){}\n", style::CYAN, "/log", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Commit agent changes to your git repo (requires --track-changes){}\n", style::CYAN, "/commit \"msg\"", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Undo the last agent turn {}{}{}\n", style::CYAN, "/undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Show changes from the last turn {}{}{}\n", style::CYAN, "/diff", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Show agent turn history {}{}{}\n", style::CYAN, "/log", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Commit agent changes to your git repo {}{}{}\n", style::CYAN, "/commit \"msg\"", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show a previously snipped code block{}\n", style::CYAN, "/expand N", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}List available checkpoints with timestamps (alias: /checkpoint-list){}\n", style::CYAN, "/checkpoint list", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Restore a specific checkpoint by number (alias: /checkpoint-restore){}\n", style::CYAN, "/checkpoint restore N", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Undo last turn using checkpoint (reverts files + trims history, alias: /checkpoint-undo){}\n\n", style::CYAN, "/checkpoint undo", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}List available checkpoints with timestamps {}{}{}\n", style::CYAN, "/checkpoint list", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Restore a specific checkpoint by number {}{}{}\n", style::CYAN, "/checkpoint restore N", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Undo last turn using checkpoint (reverts files + trims history, alias: /checkpoint-undo) {}{}{}\n\n", style::CYAN, "/checkpoint undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
     
     s.push_str(&format!("{}{}Keyboard Shortcuts:{}\n", style::BOLD, style::CYAN, style::RESET));
     s.push_str(&format!("{}─────────────────────────────{}\n", style::DIM, style::RESET));
@@ -602,9 +602,9 @@ pub fn format_help_text() -> String {
     s.push_str(&format!("  {}{}{}  - {}Compact context before a new topic{}\n", style::CYAN, "/compact", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Start a new task, carrying over context{}\n", style::CYAN, "/newtask", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show this help{}\n", style::CYAN, "/help", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Undo last agent turn (requires --track-changes){}\n", style::CYAN, "/undo", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Review last turn's changes (requires --track-changes){}\n", style::CYAN, "/diff", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Commit changes to git (requires --track-changes){}\n", style::CYAN, "/commit \"fix: auth bug\"", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Undo last agent turn {}{}{}\n", style::CYAN, "/undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Review last turn's changes {}{}{}\n", style::CYAN, "/diff", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Commit changes to git {}{}{}\n", style::CYAN, "/commit \"fix: auth bug\"", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show snipped code block 1{}", style::CYAN, "/expand 1", style::DIM, style::RESET, style::DIM));
     
     s
@@ -1431,12 +1431,23 @@ mod tests {
         let text = format_help_text();
         // Exit command aliases
         assert!(text.contains("aliases: /q, /quit"));
-        // Checkpoint command aliases
-        assert!(text.contains("alias: /checkpoint-list"));
-        assert!(text.contains("alias: /checkpoint-restore"));
-        assert!(text.contains("alias: /checkpoint-undo"));
         // Help command alias
         assert!(text.contains("alias: /help <command>"));
+    }
+
+    #[test]
+    fn test_format_help_text_shows_track_changes_badge() {
+        let text = format_help_text();
+        // Commands requiring --track-changes should have yellow badge
+        assert!(text.contains("[requires --track-changes]"));
+        // Check multiple commands have the badge
+        assert!(text.contains("/undo"));
+        assert!(text.contains("/diff"));
+        assert!(text.contains("/log"));
+        assert!(text.contains("/commit"));
+        assert!(text.contains("/checkpoint list"));
+        assert!(text.contains("/checkpoint restore"));
+        assert!(text.contains("/checkpoint undo"));
     }
 
     #[test]
