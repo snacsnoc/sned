@@ -93,6 +93,9 @@ impl EditFileHandler {
                     .and_then(|t| t.as_str())
                     .unwrap_or("replace");
 
+                // Validate edit_type is one of the allowed values
+                Self::validate_edit_type(edit_type)?;
+
                 let end_anchor = edit_raw.get("end_anchor").and_then(|e| e.as_str());
 
                 let text = edit_raw.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -115,6 +118,20 @@ impl EditFileHandler {
     fn resolve_path(&self, workspace_root: &Path, path: &str) -> Result<String, ToolError> {
         let resolved = crate::core::tools::resolve_sanitized_path(workspace_root, path)?;
         Ok(resolved.to_string_lossy().to_string())
+    }
+
+    /// Validate edit_type values.
+    ///
+    /// Valid edit types are: "replace", "insert_before", "insert_after".
+    /// Unknown edit types are rejected with a clear error message.
+    fn validate_edit_type(edit_type: &str) -> Result<(), ToolError> {
+        match edit_type {
+            "replace" | "insert_before" | "insert_after" => Ok(()),
+            _ => Err(ToolError::InvalidInput(format!(
+                "Unknown edit_type '{}'. Valid values are: replace, insert_before, insert_after",
+                edit_type
+            ))),
+        }
     }
 
     /// Validate that all anchors contain the hash delimiter.
@@ -1772,5 +1789,79 @@ edition = "2021"
         assert!(err_msg.contains("..."), "Long anchor should be truncated with ellipsis");
         assert!(!err_msg.contains("你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界"), 
                 "Long anchor should be truncated, not show full 80-char string");
+    }
+
+    #[tokio::test]
+    async fn test_validate_edit_type_rejects_unknown() {
+        let _guard = TEST_MUTEX.lock().await;
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": "test§some line",
+                    "edit_type": "delete",
+                    "text": "new content"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err(), "Should fail validation for unknown edit_type");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(err_msg.contains("Unknown edit_type 'delete'"));
+        assert!(err_msg.contains("Valid values are: replace, insert_before, insert_after"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_edit_type_accepts_valid_types() {
+        let _guard = TEST_MUTEX.lock().await;
+
+        for edit_type in &["replace", "insert_before", "insert_after"] {
+            let handler = EditFileHandler::new();
+            let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+            let ctx = ToolContext::new(
+                state,
+                None,
+                std::env::current_dir().unwrap(),
+                AnchorStateManager::new(),
+                false,
+                "test-task".to_string(),
+                None,
+                false,
+            );
+
+            let params = serde_json::json!({
+                "files": [{
+                    "path": "test.txt",
+                    "edits": [{
+                        "anchor": "test§some line",
+                        "edit_type": edit_type,
+                        "text": "new content"
+                    }]
+                }]
+            });
+
+            let result = ToolHandler::execute(&handler, &ctx, params).await;
+            assert!(
+                result.is_ok() || result.unwrap_err().to_string().contains("file not found"),
+                "edit_type '{}' should be accepted (file not found error is expected)",
+                edit_type
+            );
+        }
     }
 }
