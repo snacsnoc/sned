@@ -2138,7 +2138,15 @@ impl AgentLoop {
                     }
                 } else {
                     tracing::warn!(tool = %tool_name, "unknown tool requested");
-                    format!("Unknown tool: '{}'", tool_name)
+                    let available = crate::core::tools::definitions::get_active_tool_definitions()
+                        .iter()
+                        .map(|t| t.function.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "Unknown tool: '{}'. Available tools: {}",
+                        tool_name, available
+                    )
                 };
 
                 // For denied/restricted/unknown tools, add immediately (no parallel execution needed)
