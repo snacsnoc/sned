@@ -19,7 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::anchor_dictionary::ANCHOR_DICTIONARY;
 use crate::core::hash_utils::{
-    ANCHOR_DELIMITER, compute_hashes, format_line_with_hash, split_anchor, strip_hashes,
+    ANCHOR_DELIMITER, compute_hashes, split_anchor, strip_hashes,
 };
 
 // ============================================================================
@@ -98,47 +98,6 @@ static ANCHOR_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Allow word anchors (Apple) and line-number anchors (L1, L2, etc.) for large-file fallback
     Regex::new(r"^[A-Z][a-zA-Z0-9]*$").unwrap()
 });
-
-/// Hashes all lines using the stateful anchor manager.
-///
-pub fn hash_lines_stateful(
-    anchor_mgr: &AnchorStateManager,
-    absolute_path: &str,
-    content: &str,
-    task_id: Option<&str>,
-) -> String {
-    if content.is_empty() {
-        return String::new();
-    }
-
-    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    let anchors = anchor_mgr.reconcile(absolute_path, &lines, task_id);
-
-    lines
-        .iter()
-        .zip(anchors.iter())
-        .map(|(line, anchor)| format_line_with_hash(line, anchor))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Legacy wrapper for hashLines.
-///
-pub fn hash_lines(
-    anchor_mgr: &AnchorStateManager,
-    content: &str,
-    absolute_path: Option<&str>,
-    task_id: Option<&str>,
-) -> String {
-    if content.is_empty() {
-        return String::new();
-    }
-
-    match absolute_path {
-        Some(path) => hash_lines_stateful(anchor_mgr, path, content, task_id),
-        None => content.to_string(),
-    }
-}
 
 // ============================================================================
 // Anchor State Manager
