@@ -916,7 +916,7 @@ impl AgentLoop {
 
                     // Print session summary (not in JSON mode)
                     if !self.config.json_output {
-                        Self::print_session_summary(&self.state).await;
+                        Self::print_session_summary(&self.state, self.config.interactive_mode).await;
                     }
 
                     // Persist state to disk before exiting
@@ -2911,7 +2911,7 @@ impl AgentLoop {
     }
 
     /// Print session summary after task completion.
-    async fn print_session_summary(state: &Arc<Mutex<TaskState>>) {
+    async fn print_session_summary(state: &Arc<Mutex<TaskState>>, interactive_mode: bool) {
         use std::time::Duration;
 
         let state = state.lock().await;
@@ -3043,8 +3043,8 @@ impl AgentLoop {
 
         crate::cli::colors::print_horizontal_rule();
 
-        // JSON mode output
-        if state.turns_completed > 0 {
+        // JSON output: only in non-interactive mode (CLI/pipe consumers)
+        if state.turns_completed > 0 && !interactive_mode {
             tracing::info!(
                 target: "json_output",
                 "{}",
