@@ -1844,15 +1844,19 @@ pub async fn run_interactive_shell_inner(
                                         // to avoid blocking the tokio event loop
                                         let pids_clone = pids.clone();
                                         tokio::spawn(async move {
-                                            // Send SIGTERM
+                                            // Send SIGTERM (check liveness to avoid recycled PIDs)
                                             for pid in &pids_clone {
-                                                let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+                                                if unsafe { libc::kill(*pid, 0) } == 0 {
+                                                    let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+                                                }
                                             }
                                             // Async pause for SIGTERM to take effect
                                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                             // Force kill any survivors
                                             for pid in &pids_clone {
-                                                let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+                                                if unsafe { libc::kill(*pid, 0) } == 0 {
+                                                    let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+                                                }
                                             }
                                         });
                                     }

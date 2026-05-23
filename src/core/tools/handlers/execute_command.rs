@@ -327,9 +327,12 @@ impl ExecuteCommandHandler {
                             // Kill the process group on cancellation
                             #[cfg(unix)]
                             {
-                                let _ = unsafe { libc::kill(-child_pid, libc::SIGTERM) };
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                                let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                                // Check liveness first to avoid signaling recycled PIDs
+                                if unsafe { libc::kill(-child_pid, 0) } == 0 {
+                                    let _ = unsafe { libc::kill(-child_pid, libc::SIGTERM) };
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                    let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                                }
                             }
                             #[cfg(not(unix))]
                             {
@@ -391,8 +394,10 @@ impl ExecuteCommandHandler {
                                 // Kill the entire process group to ensure grandchildren are terminated
                                 #[cfg(unix)]
                                 {
-                                    // Send SIGKILL to the process group (negative PID)
-                                    let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                                    // Check liveness first to avoid signaling recycled PIDs
+                                    if unsafe { libc::kill(-child_pid, 0) } == 0 {
+                                        let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                                    }
                                 }
                                 #[cfg(not(unix))]
                                 {
@@ -625,7 +630,10 @@ impl ExecuteCommandHandler {
                 #[cfg(unix)]
                 {
                     if child_pid > 0 {
-                        let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                        // Check liveness first to avoid signaling recycled PIDs
+                        if unsafe { libc::kill(-child_pid, 0) } == 0 {
+                            let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                        }
                     }
                 }
                 #[cfg(not(unix))]

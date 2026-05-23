@@ -75,8 +75,11 @@ impl CancellationHandler {
 
                     // Send SIGTERM to all processes first (graceful shutdown)
                     for pid in &pids_to_kill {
-                        let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
-                        tracing::debug!("Sent SIGTERM to PID {}", pid);
+                        // Check liveness first to avoid signaling recycled PIDs
+                        if unsafe { libc::kill(*pid, 0) } == 0 {
+                            let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+                            tracing::debug!("Sent SIGTERM to PID {}", pid);
+                        }
                     }
 
                     // Single global wait for all processes to handle SIGTERM
@@ -84,8 +87,10 @@ impl CancellationHandler {
 
                     // Then SIGKILL any remaining processes
                     for pid in &pids_to_kill {
-                        let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
-                        tracing::debug!("Sent SIGKILL to PID {}", pid);
+                        if unsafe { libc::kill(*pid, 0) } == 0 {
+                            let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+                            tracing::debug!("Sent SIGKILL to PID {}", pid);
+                        }
                     }
                 }
                 #[cfg(not(unix))]

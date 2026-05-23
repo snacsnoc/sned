@@ -96,7 +96,7 @@ fn load_language_parser(_ext: &str) -> Result<LanguageParserEntry, LanguageParse
 fn load_language_parser(ext: &str) -> Result<LanguageParserEntry, LanguageParserError> {
     // Check cache first
     {
-        let mut cache = PARSER_CACHE.lock().unwrap();
+        let mut cache = PARSER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cache.get(ext) {
             // Return a copy of the cached entry - Arc makes this cheap
             return Ok(LanguageParserEntry {
@@ -186,7 +186,7 @@ fn load_language_parser(ext: &str) -> Result<LanguageParserEntry, LanguageParser
 
     // Cache a copy of the newly created parser
     {
-        let mut cache = PARSER_CACHE.lock().unwrap();
+        let mut cache = PARSER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.put(
             ext.to_string(),
             Arc::new(LanguageParserEntry {

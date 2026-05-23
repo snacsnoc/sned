@@ -114,8 +114,12 @@ fn parent_read_and_wait(
     loop {
         if start.elapsed() >= timeout {
             timed_out = true;
-            // Kill the entire process group
-            let _ = unsafe { libc::kill(-child.as_raw(), libc::SIGKILL) };
+            // Kill the entire process group (negative PID)
+            // Check liveness first to avoid killing recycled PIDs
+            let pgid = -child.as_raw();
+            if unsafe { libc::kill(pgid, 0) } == 0 {
+                let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
+            }
             // Wait for the child to be reaped
             let _ = nix::sys::wait::waitpid(child, None);
             break;
