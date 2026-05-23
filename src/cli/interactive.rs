@@ -185,6 +185,65 @@ fn sanitize_input(s: &str) -> String {
         .collect()
 }
 
+/// Render the input line at the bottom row of the terminal.
+///
+/// Clears the input area, writes the prompt prefix and input buffer,
+/// and positions the cursor. When `cursor_to_scroll_region` is true,
+/// moves the cursor to the bottom of the scroll region after rendering
+/// (so agent stderr output continues in the scroll area, not at the
+/// input line).
+fn render_input_line(
+    stdout: &mut impl std::io::Write,
+    input_buf: &str,
+    cursor_pos: usize,
+    prompt_prefix: &str,
+    term_cols: u16,
+    term_rows: u16,
+    cursor_to_scroll_region: bool,
+) -> std::io::Result<()> {
+    let sanitized_buf = sanitize_input(input_buf);
+    let full_input = format!("{}{}", prompt_prefix, &sanitized_buf);
+    let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols).max(1);
+    let base_row = term_rows - 1;
+
+    let mut buf = String::with_capacity(full_input.len() + 128);
+    for i in 0..input_lines {
+        let row = base_row.saturating_sub(i);
+        buf.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
+    }
+    buf.push_str(&format!("\x1b[{};1H{}", base_row + 1, &full_input));
+    if cursor_pos < input_buf.len() {
+        let right_of_cursor = &sanitized_buf[cursor_pos..];
+        let move_left = display_width(right_of_cursor);
+        buf.push_str(&format!("\x1b[{}D", move_left));
+    }
+    if cursor_to_scroll_region {
+        buf.push_str(&format!("\x1b[{};1H", term_rows.saturating_sub(1)));
+    }
+    stdout.write_all(buf.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Set the scroll region to rows 1 through (rows-1), pinning the bottom
+/// row for the input line. Agent output scrolls within the region;
+/// the input line stays fixed.
+fn set_scroll_region(stdout: &mut impl std::io::Write, term_rows: u16) -> std::io::Result<()> {
+    if term_rows > 2 {
+        write!(stdout, "\x1b[1;{}r", term_rows.saturating_sub(1))?;
+        write!(stdout, "\x1b[{};1H", term_rows.saturating_sub(1))?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+/// Reset the scroll region to the full screen.
+fn reset_scroll_region(stdout: &mut impl std::io::Write) -> std::io::Result<()> {
+    write!(stdout, "\x1b[r")?;
+    stdout.flush()?;
+    Ok(())
+}
+
 /// Format context window size as human-readable string (e.g., "200K context").
 fn format_context_window(tokens: u64) -> String {
     if tokens >= 1_000_000 {
@@ -515,14 +574,13 @@ pub fn cleanup_terminal(
 ) -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
 
-    // Disable bracketed paste mode
+    reset_scroll_region(&mut stdout)?;
     let _ = stdout.write_all(b"\x1b[?2004l");
     drop(raw_guard);
 
-    // Restore terminal state
-    let _ = stdout.write_all(b"\x1b[?25h"); // cursor visible
-    let _ = stdout.write_all(b"\x1b[0m"); // reset SGR
-    let _ = stdout.write_all(b"\n"); // newline for shell prompt
+    let _ = stdout.write_all(b"\x1b[?25h");
+    let _ = stdout.write_all(b"\x1b[0m");
+    let _ = stdout.write_all(b"\n");
     let _ = stdout.flush();
 
     Ok(())
@@ -571,6 +629,10 @@ pub async fn run_interactive_shell_inner(
     // Flush immediately to ensure the terminal processes this before we start reading.
     write!(stdout, "\x1b[?2004h")?;
     stdout.flush()?;
+
+    // Set scroll region: rows 1..(rows-1) scroll, bottom row is pinned for input.
+    let (_init_cols, init_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    set_scroll_region(&mut stdout, init_rows)?;
 
     // Give the terminal a moment to process the bracketed paste enable sequence.
     // Without this, rapid pastes immediately after startup might arrive before the
@@ -656,54 +718,25 @@ pub async fn run_interactive_shell_inner(
             || cursor_pos != last_cursor_pos
             || picker_active != last_picker_active;
 
-        // CRITICAL: Full TUI rendering (with picker, multi-line handling) is skipped while agent is busy.
-        // The agent writes to stderr; TUI writes to stdout with cursor positioning.
-        // Both share the terminal cursor — concurrent writes cause horizontal whitespace
-        // and garbled display. Raw mode is exited before agent spawn.
-        // 
-        // However, prompt-only rendering IS enabled during agent execution to keep the
-        // input line visible at the bottom of the terminal (like Opencode). This allows
-        // users to see their queued input and type new messages while the agent runs.
+        // Full TUI rendering (with picker) is skipped while agent is busy.
         if needs_render && !agent_busy.load(Ordering::Relaxed) {
             last_input_snapshot = current_snapshot.clone();
             last_cursor_pos = cursor_pos;
             last_picker_active = picker_active;
 
-            let sanitized_buf = sanitize_input(&input_buf);
-            let full_input = format!("{}{}", prompt_prefix, &sanitized_buf);
-            let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols).max(1);
-            let base_row = term_rows - 1;
-
-            let mut buf = String::with_capacity(full_input.len() + 64);
-            for i in 0..input_lines {
-                let row = base_row.saturating_sub(i);
-                buf.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
-            }
-            buf.push_str(&format!("\x1b[{};1H{}", term_rows, &full_input));
-            if cursor_pos < input_buf.len() {
-                let right_of_cursor = &sanitized_buf[cursor_pos..];
-                let move_left = display_width(right_of_cursor);
-                buf.push_str(&format!("\x1b[{}D", move_left));
-            }
-            stdout.write_all(buf.as_bytes())?;
-            stdout.flush()?;
+            render_input_line(&mut stdout, &input_buf, cursor_pos, &prompt_prefix, term_cols, term_rows, false)?;
 
             if picker_active {
                 let picker_height = picker.overlay_height();
 
-                // Calculate cursor position from known state (avoid expensive CPR round-trip)
-                // Note: input is single-line (newlines sanitized), so no vertical offset
                 let cursor_row = (term_rows - 1) as usize;
 
-                // Determine picker start row: try below, then above
                 let picker_start = if cursor_row + 1 + picker_height <= term_rows as usize {
                     cursor_row + 1
                 } else {
                     cursor_row.saturating_sub(picker_height)
                 };
 
-                // Save cursor, clear the picker region, render at the correct offset,
-                // then restore cursor.
                 write!(stdout, "\x1b[s")?;
                 for i in 0..picker_height {
                     write!(stdout, "\x1b[{};1H\x1b[K", picker_start + i + 1)?;
@@ -712,11 +745,9 @@ pub async fn run_interactive_shell_inner(
                 write!(stdout, "\x1b[u")?;
                 stdout.flush()?;
 
-                // Remember where we drew so we can clear it later
                 last_picker_row = Some(picker_start);
                 last_picker_height = picker_height;
             } else if let Some(start_row) = last_picker_row.take() {
-                // Picker was just closed — clear its old lines
                 write!(stdout, "\x1b[s")?;
                 for i in 0..last_picker_height {
                     write!(stdout, "\x1b[{};1H\x1b[K", start_row + i + 1)?;
@@ -726,33 +757,15 @@ pub async fn run_interactive_shell_inner(
             }
         }
 
-        // Render prompt-only during agent execution to keep input visible.
-        // Agent writes to stderr, TUI writes to stdout — concurrent writes share the terminal
-        // cursor and can garble display. Buffering into a single write_all() call minimizes
-        // the race window to one syscall instead of multiple.
+        // Render input during agent execution. Scroll region pins the bottom row
+        // so agent output scrolls above it. After rendering, cursor returns to
+        // the scroll region bottom so agent stderr continues there.
         if agent_busy.load(Ordering::Relaxed) && needs_render {
-            let sanitized_buf = sanitize_input(&input_buf);
-            let full_input = format!("{}{}", prompt_prefix, &sanitized_buf);
-            let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols).max(1);
-            let base_row = term_rows - 1;
-            
-            let mut buf = String::with_capacity(full_input.len() + 64);
-            for i in 0..input_lines {
-                let row = base_row.saturating_sub(i);
-                buf.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
-            }
-            buf.push_str(&format!("\x1b[{};1H{}", base_row + 1, &full_input));
-            if cursor_pos < input_buf.len() {
-                let right_of_cursor = &sanitized_buf[cursor_pos..];
-                let move_left = display_width(right_of_cursor);
-                buf.push_str(&format!("\x1b[{}D", move_left));
-            }
-            stdout.write_all(buf.as_bytes())?;
-            stdout.flush()?;
-            
             last_input_snapshot = current_snapshot;
             last_cursor_pos = cursor_pos;
             last_picker_active = picker_active;
+
+            render_input_line(&mut stdout, &input_buf, cursor_pos, &prompt_prefix, term_cols, term_rows, true)?;
         }
 
         let n = loop {
@@ -777,12 +790,6 @@ pub async fn run_interactive_shell_inner(
                     };
                 }
                 _ = agent_done.notified() => {
-                    // Re-enter raw mode after agent completes — pairs with raw_guard = None before agent spawn.
-                    // Ensures TUI input handling resumes correctly after agent stderr output finishes.
-                    if raw_guard.is_none() {
-                        raw_guard = Some(enter_raw_mode()?);
-                    }
-                    // Display elapsed time for the completed agent turn
                     if let Some(start) = *agent_start_time.lock().await {
                         let elapsed = start.elapsed();
                         let elapsed_str = format_duration(elapsed);
@@ -793,7 +800,10 @@ pub async fn run_interactive_shell_inner(
                         )?;
                         stdout.flush()?;
                     }
-                    last_input_snapshot = String::new();
+                    render_input_line(&mut stdout, &input_buf, cursor_pos, &prompt_prefix, term_cols, term_rows, false)?;
+                    last_input_snapshot = format!("{}|{}|{}", input_buf, cursor_pos, agent_busy.load(Ordering::Relaxed));
+                    last_cursor_pos = cursor_pos;
+                    last_picker_active = picker_active;
                     continue 'main;
                 }
                 _ = tokio::time::sleep(reprompt_delay) => {
@@ -1589,9 +1599,8 @@ pub async fn run_interactive_shell_inner(
                     };
 
                     let _ = stdout.flush();
-                    drop(raw_guard.take());
 
-                    tracing::debug!(target: "sned::input", "After drop(raw_guard), agent_busy={}", agent_busy.load(Ordering::Relaxed));
+                    tracing::debug!(target: "sned::input", "Agent busy={}, raw_guard={}", agent_busy.load(Ordering::Relaxed), raw_guard.is_some());
 
                     if agent_busy.load(Ordering::Relaxed) {
                         let qh = queue_handle.lock().await;
@@ -1606,13 +1615,7 @@ pub async fn run_interactive_shell_inner(
                                 ));
                             }
                         }
-                        raw_guard = Some(enter_raw_mode()?);
                     } else {
-                        // Exit raw mode before running agent to prevent TUI cursor races with stderr output.
-                        // Prompt-only rendering (stdout, single atomic write) runs during agent execution
-                        // to keep the input line visible. Full TUI is re-enabled on agent_done notification.
-                        raw_guard = None;
-                        
                         agent_busy.store(true, Ordering::Relaxed);
                         let start_time = std::time::Instant::now();
                         *agent_start_time.lock().await = Some(start_time);
@@ -1910,7 +1913,9 @@ pub async fn run_interactive_shell_inner(
                 TerminalEvent::Ctrl('w') if cursor_pos > 0 => {
                     cursor_pos = delete_word_backward(&mut input_buf, cursor_pos);
                 }
-                TerminalEvent::Resize { .. } => {
+                TerminalEvent::Resize { cols, rows } => {
+                    set_scroll_region(&mut stdout, rows)?;
+                    let _ = (cols, rows);
                     continue 'main;
                 }
                 _ => {}

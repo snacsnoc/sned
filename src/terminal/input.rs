@@ -24,10 +24,21 @@ use tokio::sync::mpsc;
 /// --------------------------------------------------------------------------
 /// Enter raw mode and return a guard that restores it on drop.
 ///
-/// Corresponds to Ink's implicit `process.stdin.setRawMode(true)` on mount.
+/// Re-enables OPOST so `\n` → `\r\n`. Raw mode disables OPOST by default,
+/// which causes horizontal whitespace in stderr output.
 pub fn enter_raw_mode() -> io::Result<RawModeGuard> {
     enable_raw_mode()?;
+    reenable_opost()?;
     Ok(RawModeGuard { active: true })
+}
+
+fn reenable_opost() -> io::Result<()> {
+    use nix::sys::termios::{self, OutputFlags, SetArg::TCSANOW};
+    let stdin = std::io::stdin();
+    let mut attrs = termios::tcgetattr(&stdin)?;
+    attrs.output_flags.insert(OutputFlags::OPOST);
+    termios::tcsetattr(&stdin, TCSANOW, &attrs)?;
+    Ok(())
 }
 
 /// RAII guard that restores canonical terminal mode when dropped.
