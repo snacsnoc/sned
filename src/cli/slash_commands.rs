@@ -567,6 +567,16 @@ CLI-Only Commands (handled locally):
   /checkpoint restore N - Restore a specific checkpoint by number
   /checkpoint undo - Undo last turn using checkpoint (reverts files + trims history)
 
+Keyboard Shortcuts:
+  Ctrl+A / Home    - Move cursor to beginning of line
+  Ctrl+E / End     - Move cursor to end of line
+  Ctrl+U           - Clear from cursor to beginning
+  Ctrl+K           - Clear from cursor to end
+  Ctrl+W           - Delete word backward
+  Ctrl+C           - Cancel current operation
+  Arrow Left/Right - Move cursor left/right
+  Arrow Up/Down    - Navigate command history / file picker
+
 Examples:
   /compact               - Compact context before a new topic
   /newtask               - Start a new task, carrying over context
@@ -1112,6 +1122,20 @@ mod tests {
         assert!(text.contains("/history"));
         assert!(text.contains("/skills"));
         assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn test_format_help_text_contains_keyboard_shortcuts() {
+        let text = format_help_text();
+        assert!(text.contains("Keyboard Shortcuts"));
+        assert!(text.contains("Ctrl+A"));
+        assert!(text.contains("Ctrl+E"));
+        assert!(text.contains("Ctrl+U"));
+        assert!(text.contains("Ctrl+K"));
+        assert!(text.contains("Ctrl+W"));
+        assert!(text.contains("Ctrl+C"));
+        assert!(text.contains("Arrow Left"));
+        assert!(text.contains("Arrow Up"));
     }
 
     #[test]
