@@ -945,14 +945,26 @@ pub async fn run_interactive_shell_inner(
                                 crate::cli::colors::eprint_raw(&skills_text);
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Help => {
-                                crate::cli::colors::eprint_raw(
-                                    &crate::cli::slash_commands::format_help_text(),
-                                );
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
+                                    );
+                                } else {
+                                    crate::cli::colors::eprint_raw(
+                                        &crate::cli::slash_commands::format_help_text(),
+                                    );
+                                }
                             }
                             crate::cli::slash_commands::CliOnlyCommand::HelpOption(cmd) => {
-                                crate::cli::colors::eprint_raw(
-                                    &crate::cli::slash_commands::format_help_for_command(&cmd),
-                                );
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    crate::cli::colors::eprint_warning(
+                                        "Agent is busy. Wait for it to finish before running this command.",
+                                    );
+                                } else {
+                                    crate::cli::colors::eprint_raw(
+                                        &crate::cli::slash_commands::format_help_for_command(&cmd),
+                                    );
+                                }
                             }
                             crate::cli::slash_commands::CliOnlyCommand::Settings => {
                                 let provider = task_opts.provider.as_deref().unwrap_or("anthropic");
