@@ -109,6 +109,7 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
             info.output_price = Some(15.0);
             info.cache_writes_price = Some(3.75);
             info.cache_reads_price = Some(0.3);
+            info.supports_reasoning = Some(true);
             info.description = Some(
                 "Claude Sonnet 4.5 - superior intelligence across coding and AI agents".to_string(),
             );
@@ -119,6 +120,7 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
             info.output_price = Some(15.0);
             info.cache_writes_price = Some(3.75);
             info.cache_reads_price = Some(0.3);
+            info.supports_reasoning = Some(true);
         } else if model_id.contains("claude-opus-4") || model_id.contains("claude-4-opus") {
             info.max_tokens = Some(64_000);
             info.context_window = Some(200_000);
@@ -126,6 +128,7 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
             info.output_price = Some(75.0);
             info.cache_writes_price = Some(18.75);
             info.cache_reads_price = Some(1.5);
+            info.supports_reasoning = Some(true);
         } else if model_id.contains("claude-3.7-sonnet") || model_id.contains("claude-3-7-sonnet") {
             info.max_tokens = Some(64_000);
             info.context_window = Some(200_000);
@@ -133,6 +136,7 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
             info.output_price = Some(15.0);
             info.cache_writes_price = Some(3.75);
             info.cache_reads_price = Some(0.3);
+            info.supports_reasoning = Some(true);
         } else if model_id.contains("claude-3.5-sonnet") || model_id.contains("claude-3-5-sonnet") {
             info.max_tokens = Some(8192);
             info.context_window = Some(200_000);
@@ -179,6 +183,13 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
             info.context_window = Some(16_385);
             info.input_price = Some(0.5);
             info.output_price = Some(1.5);
+        // OpenAI reasoning models (o-series)
+        } else if model_id.contains("o1") || model_id.contains("o3") || model_id.contains("o4-mini") {
+            info.max_tokens = Some(100_000);
+            info.context_window = Some(200_000);
+            info.input_price = Some(5.0);
+            info.output_price = Some(15.0);
+            info.supports_reasoning = Some(true);
         }
     }
     // Google Gemini models
