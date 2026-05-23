@@ -19,10 +19,14 @@ fn max_file_read_size() -> usize {
     use std::sync::OnceLock;
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
+        let default_size = 100 * 1024;
+        let max_allowed = 100 * 1024 * 1024;
         std::env::var("SNED_MAX_FILE_READ_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(100 * 1024)
+            .filter(|v| *v > 0)
+            .map(|v| v.min(max_allowed))
+            .unwrap_or(default_size)
     })
 }
 
