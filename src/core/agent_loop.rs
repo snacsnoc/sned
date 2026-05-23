@@ -374,11 +374,12 @@ impl AgentLoop {
                 tool_call.function.id = Some(generated);
             }
 
-            let tool_id = tool_call.function.id.clone().unwrap_or_else(|| {
+            let mut tool_call_clone = tool_call.clone();
+            let tool_id = tool_call_clone.function.id.take().unwrap_or_else(|| {
                 error!("Tool call ID is None after initialization, generating fallback");
                 ulid::Ulid::new().to_string()
             });
-            let tool_name = tool_call.function.name.clone().unwrap_or_else(|| {
+            let tool_name = tool_call_clone.function.name.take().unwrap_or_else(|| {
                 warn!("Tool call missing name, using 'unknown_tool'");
                 "unknown_tool".to_string()
             });
@@ -389,7 +390,7 @@ impl AgentLoop {
             );
 
             prepared.push(PreparedToolCall {
-                tool_call: tool_call.clone(),
+                tool_call: tool_call_clone,
                 tool_id,
                 tool_name,
                 parsed_args,
