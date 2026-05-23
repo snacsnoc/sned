@@ -562,17 +562,17 @@ pub fn format_help_text() -> String {
     s.push_str(&format!("{}─────────────────────────────{}\n", style::DIM, style::RESET));
     s.push_str(&format!("  {}{}{}  - {}Create a new task with context from the current task{}\n", style::CYAN, "/newtask", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Condense your current context window{}\n", style::CYAN, "/compact", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Create a new Sned rule based on your conversation{}\n", style::CYAN, "/newrule", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Create a new Snad rule based on your conversation{}\n", style::CYAN, "/newrule", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Submit a bug report to GitHub{}\n", style::CYAN, "/reportbug", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Explain the changes you have made to the code{}\n\n", style::CYAN, "/explain-changes", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Explain the changes you have made to the code (alias: /explain_changes){}\n\n", style::CYAN, "/explain-changes", style::DIM, style::RESET, style::DIM));
     
     s.push_str(&format!("{}{}CLI-Only Commands (handled locally):{}\n", style::BOLD, style::CYAN, style::RESET));
     s.push_str(&format!("{}─────────────────────────────{}\n", style::DIM, style::RESET));
-    s.push_str(&format!("  {}{}{}  - {}Exit the CLI{}\n", style::CYAN, "/exit, /q", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Exit the CLI (aliases: /q, /quit){}\n", style::CYAN, "/exit", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Clear the current conversation history{}\n", style::CYAN, "/clear", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show recent tasks{}\n", style::CYAN, "/history", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}List available skills{}\n", style::CYAN, "/skills", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show this help message{}\n", style::CYAN, "/help", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Show this help message (alias: /help <command>){}\n", style::CYAN, "/help", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show current settings{}\n", style::CYAN, "/settings", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show available models{}\n", style::CYAN, "/models", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show token usage and session cost{}\n", style::CYAN, "/stats", style::DIM, style::RESET, style::DIM));
@@ -582,9 +582,9 @@ pub fn format_help_text() -> String {
     s.push_str(&format!("  {}{}{}  - {}Show agent turn history (requires --track-changes){}\n", style::CYAN, "/log", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Commit agent changes to your git repo (requires --track-changes){}\n", style::CYAN, "/commit \"msg\"", style::DIM, style::RESET, style::DIM));
     s.push_str(&format!("  {}{}{}  - {}Show a previously snipped code block{}\n", style::CYAN, "/expand N", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}List available checkpoints with timestamps{}\n", style::CYAN, "/checkpoint list", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Restore a specific checkpoint by number{}\n", style::CYAN, "/checkpoint restore N", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Undo last turn using checkpoint (reverts files + trims history){}\n\n", style::CYAN, "/checkpoint undo", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}List available checkpoints with timestamps (alias: /checkpoint-list){}\n", style::CYAN, "/checkpoint list", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Restore a specific checkpoint by number (alias: /checkpoint-restore){}\n", style::CYAN, "/checkpoint restore N", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!("  {}{}{}  - {}Undo last turn using checkpoint (reverts files + trims history, alias: /checkpoint-undo){}\n\n", style::CYAN, "/checkpoint undo", style::DIM, style::RESET, style::DIM));
     
     s.push_str(&format!("{}{}Keyboard Shortcuts:{}\n", style::BOLD, style::CYAN, style::RESET));
     s.push_str(&format!("{}─────────────────────────────{}\n", style::DIM, style::RESET));
@@ -721,6 +721,8 @@ Use when:
 
         "resetcompact" => r#"Clears the compacted summary, allowing /compact to be used again.
 
+Alias: /clearcompact
+
 Use when:
   - Need to compact again after first use
   - Compacted summary is outdated
@@ -784,6 +786,8 @@ Use when:
 
 Requires: --track-changes flag
 
+Aliases: /checkpoint-list, /checkpoint list
+
 Use when:
   - Finding restore points
   - Reviewing checkpoint history
@@ -792,6 +796,8 @@ Use when:
         "checkpoint-restore" | "checkpoint restore" => r#"Restores files to a specific checkpoint state.
 
 Requires: --track-changes flag
+
+Aliases: /checkpoint-restore, /checkpoint restore
 
 Usage:
   /checkpoint restore N - Restore to checkpoint N
@@ -806,6 +812,8 @@ Warning: Reverts all files to checkpoint state."#,
         "checkpoint-undo" | "checkpoint undo" => r#"Undoes last turn using checkpoint (reverts files + trims history).
 
 Requires: --track-changes flag
+
+Aliases: /checkpoint-undo, /checkpoint undo
 
 Use when:
   - Complete undo of last agent action
@@ -1416,6 +1424,36 @@ mod tests {
         assert!(text.contains("CLI-Only Commands (handled locally):"));
         assert!(text.contains("Keyboard Shortcuts:"));
         assert!(text.contains("Examples:"));
+    }
+
+    #[test]
+    fn test_format_help_text_shows_aliases() {
+        let text = format_help_text();
+        // Exit command aliases
+        assert!(text.contains("aliases: /q, /quit"));
+        // Checkpoint command aliases
+        assert!(text.contains("alias: /checkpoint-list"));
+        assert!(text.contains("alias: /checkpoint-restore"));
+        assert!(text.contains("alias: /checkpoint-undo"));
+        // Help command alias
+        assert!(text.contains("alias: /help <command>"));
+    }
+
+    #[test]
+    fn test_format_help_for_command_shows_aliases() {
+        // Test checkpoint commands show aliases
+        let checkpoint_list = format_help_for_command("checkpoint list");
+        assert!(checkpoint_list.contains("Aliases: /checkpoint-list, /checkpoint list"));
+        
+        let checkpoint_restore = format_help_for_command("checkpoint restore");
+        assert!(checkpoint_restore.contains("Aliases: /checkpoint-restore, /checkpoint restore"));
+        
+        let checkpoint_undo = format_help_for_command("checkpoint undo");
+        assert!(checkpoint_undo.contains("Aliases: /checkpoint-undo, /checkpoint undo"));
+        
+        // Test resetcompact shows alias
+        let resetcompact = format_help_for_command("resetcompact");
+        assert!(resetcompact.contains("Alias: /clearcompact"));
     }
 
     #[test]
