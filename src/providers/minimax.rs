@@ -884,9 +884,16 @@ async fn process_minimax_sse_line(
                         entry.1 = name.clone();
                     }
                     if let Some(args) = &func.arguments {
-                        // Enforce MAX_TOOL_ARGUMENT_SIZE during accumulation to prevent
-                        // memory exhaustion from providers sending many small deltas.
-                        // This matches the validation in agent_loop.rs for other providers.
+                        if entry.2.is_empty() {
+                            if !args.starts_with('{') && !args.starts_with('[') && !args.starts_with('"') {
+                                tracing::warn!(
+                                    tool_index = idx,
+                                    args_preview = args.chars().take(40).collect::<String>(),
+                                    "MiniMax tool call arguments start with garbled content, discarding chunk"
+                                );
+                                continue;
+                            }
+                        }
                         if entry.2.len() + args.len() <= crate::providers::MAX_TOOL_ARGUMENT_SIZE {
                             entry.2.push_str(args);
                         } else {
