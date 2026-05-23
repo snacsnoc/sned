@@ -872,7 +872,19 @@ async fn process_minimax_sse_line(
                     let entry = accumulated_tool_calls
                         .entry(idx)
                         .or_insert_with(|| (id.clone(), String::new(), String::new()));
-                    entry.0 = id.clone();
+                    if entry.0 != id.clone() && !entry.0.is_empty() {
+                        tracing::warn!(
+                            tool_index = idx,
+                            old_id = %entry.0,
+                            new_id = %id,
+                            "MiniMax tool call id changed at index, resetting accumulated data"
+                        );
+                        entry.0 = id.clone();
+                        entry.1 = String::new();
+                        entry.2 = String::new();
+                    } else {
+                        entry.0 = id.clone();
+                    }
                 }
 
                 if let Some(func) = &tool_call.function {
