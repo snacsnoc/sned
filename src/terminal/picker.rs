@@ -7,6 +7,7 @@ pub struct FilePicker {
     results: Vec<FileSearchResult>,
     pub selected_index: usize,
     query: String,
+    scroll_offset: usize,
 }
 
 impl FilePicker {
@@ -15,6 +16,7 @@ impl FilePicker {
             results: Vec::new(),
             selected_index: 0,
             query: String::new(),
+            scroll_offset: 0,
         }
     }
 
@@ -23,6 +25,7 @@ impl FilePicker {
         self.selected_index = self
             .selected_index
             .min(self.results.len().saturating_sub(1));
+        self.scroll_offset = 0;
     }
 
     pub fn selected(&self) -> Option<&FileSearchResult> {
@@ -32,30 +35,44 @@ impl FilePicker {
     pub fn up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
+            if self.selected_index < self.scroll_offset {
+                self.scroll_offset = self.selected_index;
+            }
         }
     }
 
     pub fn down(&mut self) {
         if self.selected_index < self.results.len().saturating_sub(1) {
             self.selected_index += 1;
+            let visible_end = self.scroll_offset + MAX_VISIBLE_RESULTS;
+            if self.selected_index >= visible_end {
+                self.scroll_offset = self.selected_index - MAX_VISIBLE_RESULTS + 1;
+            }
         }
     }
 
     pub fn page_up(&mut self) {
         self.selected_index = self.selected_index.saturating_sub(MAX_VISIBLE_RESULTS);
+        self.scroll_offset = self.selected_index;
     }
 
     pub fn page_down(&mut self) {
         self.selected_index =
             (self.selected_index + MAX_VISIBLE_RESULTS).min(self.results.len().saturating_sub(1));
+        let visible_end = self.scroll_offset + MAX_VISIBLE_RESULTS;
+        if self.selected_index >= visible_end {
+            self.scroll_offset = self.selected_index - MAX_VISIBLE_RESULTS + 1;
+        }
     }
 
     pub fn home(&mut self) {
         self.selected_index = 0;
+        self.scroll_offset = 0;
     }
 
     pub fn end(&mut self) {
         self.selected_index = self.results.len().saturating_sub(1);
+        self.scroll_offset = self.selected_index.saturating_sub(MAX_VISIBLE_RESULTS - 1);
     }
 
     pub fn set_query(&mut self, query: &str) {
@@ -91,12 +108,14 @@ impl FilePicker {
             let visible: Vec<_> = self
                 .results
                 .iter()
+                .skip(self.scroll_offset)
                 .take(MAX_VISIBLE_RESULTS)
                 .enumerate()
                 .collect();
 
             for (dy, (i, result)) in visible.iter().enumerate() {
-                let is_selected = *i == self.selected_index;
+                let global_index = self.scroll_offset + i;
+                let is_selected = global_index == self.selected_index;
                 let prefix = if is_selected { ">" } else { " " };
                 let label = if result.file_type == FileType::Folder {
                     format!("{}/", result.label)
@@ -221,5 +240,58 @@ mod tests {
         assert_eq!(picker.selected_index, 0);
         picker.page_down();
         assert_eq!(picker.selected_index, 8);
+    }
+
+    #[test]
+    fn test_picker_scroll_offset() {
+        let mut picker = FilePicker::new(24, 80);
+        let results: Vec<_> = (0..20)
+            .map(|i| FileSearchResult {
+                path: format!("file{}.rs", i),
+                file_type: FileType::File,
+                label: format!("file{}.rs", i),
+            })
+            .collect();
+        picker.update_results(results);
+
+        // Initially at top, scroll_offset should be 0
+        assert_eq!(picker.scroll_offset, 0);
+        assert_eq!(picker.selected_index, 0);
+
+        // Navigate down to item 7 (still visible in first page)
+        for _ in 0..7 {
+            picker.down();
+        }
+        assert_eq!(picker.selected_index, 7);
+        assert_eq!(picker.scroll_offset, 0);
+
+        // Navigate down to item 8 (should trigger scroll)
+        picker.down();
+        assert_eq!(picker.selected_index, 8);
+        assert_eq!(picker.scroll_offset, 1);
+
+        // Navigate down to item 15
+        for _ in 0..7 {
+            picker.down();
+        }
+        assert_eq!(picker.selected_index, 15);
+        assert_eq!(picker.scroll_offset, 8);
+
+        // Navigate up within visible range - scroll_offset stays same
+        picker.up();
+        assert_eq!(picker.selected_index, 14);
+        assert_eq!(picker.scroll_offset, 8);
+
+        // Navigate up to scroll_offset boundary
+        for _ in 0..6 {
+            picker.up();
+        }
+        assert_eq!(picker.selected_index, 8);
+        assert_eq!(picker.scroll_offset, 8);
+
+        // Navigate up past boundary - should scroll back
+        picker.up();
+        assert_eq!(picker.selected_index, 7);
+        assert_eq!(picker.scroll_offset, 7);
     }
 }
