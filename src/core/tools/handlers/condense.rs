@@ -102,16 +102,16 @@ impl CondenseHandler {
             // Use channel-based input to avoid blocking tokio worker and fighting TUI stdin
             // Same pattern as ask_followup_question and prompt_for_approval
             let (sender, receiver) = std::sync::mpsc::channel();
-            crate::core::approval::set_followup_question_active(true);
-            crate::core::approval::set_followup_sender(sender);
+            crate::core::approval::set_followup_question_active(ctx.task_id.as_str(), true);
+            crate::core::approval::set_followup_sender(ctx.task_id.as_str(), sender);
 
             // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
             let response_result = tokio::task::spawn_blocking(move || receiver.recv())
                 .await;
 
             // Clean up regardless of result
-            crate::core::approval::clear_followup_sender();
-            crate::core::approval::set_followup_question_active(false);
+            crate::core::approval::clear_followup_sender(ctx.task_id.as_str());
+            crate::core::approval::set_followup_question_active(ctx.task_id.as_str(), false);
 
             let user_response = match response_result {
                 Ok(Ok(r)) => r.trim().to_string(),

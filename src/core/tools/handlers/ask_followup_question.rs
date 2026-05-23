@@ -22,6 +22,7 @@ impl AskFollowupQuestionHandler {
         _state: &mut TaskState,
         params: serde_json::Value,
         json_output: bool,
+        task_id: &str,
     ) -> Result<String, ToolError> {
         let question = params
             .get("question")
@@ -46,26 +47,25 @@ impl AskFollowupQuestionHandler {
 
             // Use channel-based input to avoid fighting the interactive loop
             let (sender, receiver) = std::sync::mpsc::channel();
-            crate::core::approval::set_followup_question_active(true);
-            crate::core::approval::set_followup_sender(sender);
+            crate::core::approval::set_followup_question_active(task_id, true);
+            crate::core::approval::set_followup_sender(task_id, sender);
 
             // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
             let response_result = tokio::task::spawn_blocking(move || receiver.recv())
                 .await;
             
             // Clean up regardless of result
-            crate::core::approval::clear_followup_sender();
-            crate::core::approval::set_followup_question_active(false);
+            crate::core::approval::clear_followup_sender(task_id);
+            crate::core::approval::set_followup_question_active(task_id, false);
 
             let response = match response_result {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) | Err(_) => {
+                    crate::core::approval::clear_followup_sender(task_id);
+                    crate::core::approval::set_followup_question_active(task_id, false);
                     return Ok("User provided no response.".to_string());
                 }
             };
-
-            crate::core::approval::clear_followup_sender();
-            crate::core::approval::set_followup_question_active(false);
 
             let response = response.trim().to_string();
 
@@ -91,7 +91,7 @@ impl ToolHandler for AskFollowupQuestionHandler {
     ) -> Result<serde_json::Value, ToolError> {
         // Don't acquire state lock - ask_followup_question doesn't use state
         // and holding the lock across user input delays Ctrl+C cancellation
-        Self::execute(self, &mut TaskState::default(), params, ctx.json_output)
+        Self::execute(self, &mut TaskState::default(), params, ctx.json_output, ctx.task_id.as_str())
             .await
             .map(serde_json::Value::String)
     }

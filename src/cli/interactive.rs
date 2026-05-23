@@ -598,6 +598,10 @@ pub async fn run_interactive_shell_inner(
     let session = Arc::new(tokio::sync::Mutex::new(
         InteractiveSession::build_interactive(task_opts.clone(), root_opts.clone()).await?,
     ));
+    let task_id = {
+        let sess = session.lock().await;
+        sess.agent_loop.task_id().to_string()
+    };
 
      // Print startup info line (respects NO_COLOR and --quiet)
      {
@@ -652,42 +656,36 @@ pub async fn run_interactive_shell_inner(
             || cursor_pos != last_cursor_pos
             || picker_active != last_picker_active;
 
-        // CRITICAL: Skip all stdout ANSI rendering while agent is busy.
+        // CRITICAL: Full TUI rendering (with picker, multi-line handling) is skipped while agent is busy.
         // The agent writes to stderr; TUI writes to stdout with cursor positioning.
         // Both share the terminal cursor — concurrent writes cause horizontal whitespace
-        // and garbled display. Raw mode is exited before agent spawn; do not re-render
-        // until agent completes and raw mode is re-entered.
+        // and garbled display. Raw mode is exited before agent spawn.
+        // 
+        // However, prompt-only rendering IS enabled during agent execution to keep the
+        // input line visible at the bottom of the terminal (like Opencode). This allows
+        // users to see their queued input and type new messages while the agent runs.
         if needs_render && !agent_busy.load(Ordering::Relaxed) {
-            last_input_snapshot = current_snapshot;
+            last_input_snapshot = current_snapshot.clone();
             last_cursor_pos = cursor_pos;
             last_picker_active = picker_active;
 
-            // Sanitize input to remove newlines (defensive: paste already sanitizes)
             let sanitized_buf = sanitize_input(&input_buf);
-
-            // Calculate how many display lines the input spans (fix line-wrap duplication)
             let full_input = format!("{}{}", prompt_prefix, &sanitized_buf);
-            let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
-            let input_lines = input_lines.max(1);
+            let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols).max(1);
+            let base_row = term_rows - 1;
 
-            // Clear all lines that the input spans, from bottom up
-            // Status bar is at bottom (row term_rows in 1-indexed), so input starts at
-            // row term_rows - 1 (second-to-last) and extends upward for multi-line input
+            let mut buf = String::with_capacity(full_input.len() + 64);
             for i in 0..input_lines {
-                let row = (term_rows - 1).saturating_sub(i); // 0-indexed, counting up from second-to-last
-                write!(stdout, "\x1b[{};1H\x1b[K", row + 1)?; // ANSI is 1-indexed
+                let row = base_row.saturating_sub(i);
+                buf.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
             }
-
-            // Render prompt at second-to-last line (status bar occupies bottom line)
-            write!(stdout, "\x1b[{};1H{}", term_rows, &full_input)?;
-
+            buf.push_str(&format!("\x1b[{};1H{}", term_rows, &full_input));
             if cursor_pos < input_buf.len() {
-                // Cursor position is in original buffer, but sanitized has same byte positions
-                // (newlines replaced with spaces, same width)
                 let right_of_cursor = &sanitized_buf[cursor_pos..];
                 let move_left = display_width(right_of_cursor);
-                write!(stdout, "\x1b[{}D", move_left)?;
+                buf.push_str(&format!("\x1b[{}D", move_left));
             }
+            stdout.write_all(buf.as_bytes())?;
             stdout.flush()?;
 
             if picker_active {
@@ -728,10 +726,37 @@ pub async fn run_interactive_shell_inner(
             }
         }
 
+        // Render prompt-only during agent execution to keep input visible.
+        // Agent writes to stderr, TUI writes to stdout — concurrent writes share the terminal
+        // cursor and can garble display. Buffering into a single write_all() call minimizes
+        // the race window to one syscall instead of multiple.
+        if agent_busy.load(Ordering::Relaxed) && needs_render {
+            let sanitized_buf = sanitize_input(&input_buf);
+            let full_input = format!("{}{}", prompt_prefix, &sanitized_buf);
+            let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols).max(1);
+            let base_row = term_rows - 1;
+            
+            let mut buf = String::with_capacity(full_input.len() + 64);
+            for i in 0..input_lines {
+                let row = base_row.saturating_sub(i);
+                buf.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
+            }
+            buf.push_str(&format!("\x1b[{};1H{}", base_row + 1, &full_input));
+            if cursor_pos < input_buf.len() {
+                let right_of_cursor = &sanitized_buf[cursor_pos..];
+                let move_left = display_width(right_of_cursor);
+                buf.push_str(&format!("\x1b[{}D", move_left));
+            }
+            stdout.write_all(buf.as_bytes())?;
+            stdout.flush()?;
+            
+            last_input_snapshot = current_snapshot;
+            last_cursor_pos = cursor_pos;
+            last_picker_active = picker_active;
+        }
+
         let n = loop {
-            // Poll with shorter delay while agent is busy for responsive UI after completion.
-            // Note: TUI rendering is disabled during agent execution (raw_mode exited) to prevent
-            // cursor races with agent stderr output — see agent spawn comment above.
+            // Shorter poll delay while agent is busy for responsive UI after completion.
             let reprompt_delay = if agent_busy.load(Ordering::Relaxed) {
                 tokio::time::Duration::from_millis(100)
             } else {
@@ -768,6 +793,7 @@ pub async fn run_interactive_shell_inner(
                         )?;
                         stdout.flush()?;
                     }
+                    last_input_snapshot = String::new();
                     continue 'main;
                 }
                 _ = tokio::time::sleep(reprompt_delay) => {
@@ -833,12 +859,12 @@ pub async fn run_interactive_shell_inner(
                     }
 
                     // If a followup question is active, forward the response via channel
-                    if crate::core::approval::is_followup_question_active() {
+                    if crate::core::approval::is_followup_question_active(&task_id) {
                         let response = input_buf.clone();
-                        if let Some(sender) = crate::core::approval::take_followup_sender() {
+                        if let Some(sender) = crate::core::approval::take_followup_sender(&task_id) {
                             let _ = sender.send(response);
-                            crate::core::approval::clear_followup_sender();
-                            crate::core::approval::set_followup_question_active(false);
+                            crate::core::approval::clear_followup_sender(&task_id);
+                            crate::core::approval::set_followup_question_active(&task_id, false);
                             input_buf.clear();
                             cursor_pos = 0;
                             writeln!(stdout)?;
@@ -1094,8 +1120,8 @@ pub async fn run_interactive_shell_inner(
                                     // Use channel-based input to avoid stdin race with TUI async reader
                                     // Same pattern as condense tool (A9/A18 fix)
                                     let (sender, receiver) = std::sync::mpsc::channel();
-                                    crate::core::approval::set_followup_question_active(true);
-                                    crate::core::approval::set_followup_sender(sender);
+                                    crate::core::approval::set_followup_question_active(&task_id, true);
+                                    crate::core::approval::set_followup_sender(&task_id, sender);
 
                                     // Wait for user input via channel (forwarded by TUI loop on Enter)
                                     // Timeout after 30 seconds to prevent indefinite blocking
@@ -1104,8 +1130,8 @@ pub async fn run_interactive_shell_inner(
                                     }).await;
 
                                     // Clean up regardless of result
-                                    crate::core::approval::clear_followup_sender();
-                                    crate::core::approval::set_followup_question_active(false);
+                                    crate::core::approval::clear_followup_sender(&task_id);
+                                    crate::core::approval::set_followup_question_active(&task_id, false);
 
                                     let confirm = match response_result {
                                         Ok(Ok(r)) => r,
@@ -1245,8 +1271,8 @@ pub async fn run_interactive_shell_inner(
                                                         // Use channel-based input to avoid stdin race with TUI async reader
                                                         // Same pattern as condense tool (A9/A18 fix)
                                                         let (sender, receiver) = std::sync::mpsc::channel();
-                                                        crate::core::approval::set_followup_question_active(true);
-                                                        crate::core::approval::set_followup_sender(sender);
+                                                        crate::core::approval::set_followup_question_active(&task_id, true);
+                                                        crate::core::approval::set_followup_sender(&task_id, sender);
 
                                                         // Wait for user input via channel (forwarded by TUI loop on Enter)
                                                         // Timeout after 30 seconds to prevent indefinite blocking
@@ -1255,8 +1281,8 @@ pub async fn run_interactive_shell_inner(
                                                         }).await;
 
                                                         // Clean up regardless of result
-                                                        crate::core::approval::clear_followup_sender();
-                                                        crate::core::approval::set_followup_question_active(false);
+                                                        crate::core::approval::clear_followup_sender(&task_id);
+                                                        crate::core::approval::set_followup_question_active(&task_id, false);
 
                                                         let confirm = match response_result {
                                                             Ok(Ok(r)) => r,
@@ -1388,21 +1414,21 @@ pub async fn run_interactive_shell_inner(
                                                 eprintln!();
                                                 eprintln!("Enter checkpoint number to restore:");
                                                 
-                                                // Use channel-based input to avoid stdin race with TUI async reader
-                                                // Same pattern as condense tool (A9/A18 fix)
-                                                let (sender, receiver) = std::sync::mpsc::channel();
-                                                crate::core::approval::set_followup_question_active(true);
-                                                crate::core::approval::set_followup_sender(sender);
+                                                        // Use channel-based input to avoid stdin race with TUI async reader
+                                                        // Same pattern as condense tool (A9/A18 fix)
+                                                        let (sender, receiver) = std::sync::mpsc::channel();
+                                                        crate::core::approval::set_followup_question_active(&task_id, true);
+                                                        crate::core::approval::set_followup_sender(&task_id, sender);
 
-                                                // Wait for user input via channel (forwarded by TUI loop on Enter)
-                                                // Timeout after 30 seconds to prevent indefinite blocking
-                                                let response_result = tokio::task::spawn_blocking(move || {
-                                                    receiver.recv_timeout(std::time::Duration::from_secs(30))
-                                                }).await;
+                                                        // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                                        // Timeout after 30 seconds to prevent indefinite blocking
+                                                        let response_result = tokio::task::spawn_blocking(move || {
+                                                            receiver.recv_timeout(std::time::Duration::from_secs(30))
+                                                        }).await;
 
-                                                // Clean up regardless of result
-                                                crate::core::approval::clear_followup_sender();
-                                                crate::core::approval::set_followup_question_active(false);
+                                                        // Clean up regardless of result
+                                                        crate::core::approval::clear_followup_sender(&task_id);
+                                                        crate::core::approval::set_followup_question_active(&task_id, false);
 
                                                 let input = match response_result {
                                                     Ok(Ok(r)) => r,
@@ -1449,8 +1475,8 @@ pub async fn run_interactive_shell_inner(
                                                         // Use channel-based input to avoid stdin race with TUI async reader
                                                         // Same pattern as condense tool (A9/A18 fix)
                                                         let (sender, receiver) = std::sync::mpsc::channel();
-                                                        crate::core::approval::set_followup_question_active(true);
-                                                        crate::core::approval::set_followup_sender(sender);
+                                                        crate::core::approval::set_followup_question_active(&task_id, true);
+                                                        crate::core::approval::set_followup_sender(&task_id, sender);
 
                                                         // Wait for user input via channel (forwarded by TUI loop on Enter)
                                                         // Timeout after 30 seconds to prevent indefinite blocking
@@ -1459,8 +1485,8 @@ pub async fn run_interactive_shell_inner(
                                                         }).await;
 
                                                         // Clean up regardless of result
-                                                        crate::core::approval::clear_followup_sender();
-                                                        crate::core::approval::set_followup_question_active(false);
+                                                        crate::core::approval::clear_followup_sender(&task_id);
+                                                        crate::core::approval::set_followup_question_active(&task_id, false);
 
                                                         let confirm = match response_result {
                                                             Ok(Ok(r)) => r,
@@ -1583,10 +1609,8 @@ pub async fn run_interactive_shell_inner(
                         raw_guard = Some(enter_raw_mode()?);
                     } else {
                         // Exit raw mode before running agent to prevent TUI cursor races with stderr output.
-                        // The TUI renders to stdout using ANSI cursor positioning, while agent outputs to stderr.
-                        // Both share the terminal cursor state — if raw mode is active, TUI re-renders during
-                        // agent execution will overwrite or misalign agent output, causing horizontal whitespace
-                        // and garbled display. Raw mode is re-entered when agent completes (agent_done notification).
+                        // Prompt-only rendering (stdout, single atomic write) runs during agent execution
+                        // to keep the input line visible. Full TUI is re-enabled on agent_done notification.
                         raw_guard = None;
                         
                         agent_busy.store(true, Ordering::Relaxed);
@@ -1647,7 +1671,7 @@ pub async fn run_interactive_shell_inner(
 
                     // If a followup question is active, forward the full line response
                     // when user presses Enter (handled in TerminalEvent::Return branch)
-                    if crate::core::approval::is_followup_question_active() {
+                    if crate::core::approval::is_followup_question_active(&task_id) {
                         // Just continue accumulating in input_buf until Enter
                     }
 

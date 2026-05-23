@@ -415,7 +415,7 @@ pub struct ProviderRequest {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{provider} POST {url} failed: {status} - {body}")]
 pub struct ProviderHttpError {
-    pub provider: &'static str,
+    pub provider: String,
     pub url: String,
     pub status: StatusCode,
     pub body: String,
@@ -425,7 +425,7 @@ pub struct ProviderHttpError {
 
 impl ProviderHttpError {
     pub fn new(
-        provider: &'static str,
+        provider: impl Into<String>,
         url: String,
         status: StatusCode,
         body: String,
@@ -449,7 +449,7 @@ impl ProviderHttpError {
         };
 
         Self {
-            provider,
+            provider: provider.into(),
             url,
             status,
             body: body_display,

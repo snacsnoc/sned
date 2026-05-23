@@ -27,8 +27,11 @@ pub struct LanguageParserEntry {
 /// Global cache for language parsers keyed by extension.
 /// Avoids recompiling tree-sitter queries on every handler invocation.
 /// Entries are Arc'd since Query is not Clone but can be shared.
-static PARSER_CACHE: LazyLock<Mutex<HashMap<String, Arc<LanguageParserEntry>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Uses LRU eviction (max 256 entries) to bound memory growth.
+static PARSER_CACHE: LazyLock<Mutex<lru::LruCache<String, Arc<LanguageParserEntry>>>> =
+    LazyLock::new(|| Mutex::new(lru::LruCache::new(
+        std::num::NonZero::new(256).unwrap()
+    )));
 
 /// Maps file extensions to loaded language parsers.
 pub type LanguageParserMap = HashMap<String, LanguageParserEntry>;
@@ -93,7 +96,7 @@ fn load_language_parser(_ext: &str) -> Result<LanguageParserEntry, LanguageParse
 fn load_language_parser(ext: &str) -> Result<LanguageParserEntry, LanguageParserError> {
     // Check cache first
     {
-        let cache = PARSER_CACHE.lock().unwrap();
+        let mut cache = PARSER_CACHE.lock().unwrap();
         if let Some(entry) = cache.get(ext) {
             // Return a copy of the cached entry - Arc makes this cheap
             return Ok(LanguageParserEntry {
@@ -184,7 +187,7 @@ fn load_language_parser(ext: &str) -> Result<LanguageParserEntry, LanguageParser
     // Cache a copy of the newly created parser
     {
         let mut cache = PARSER_CACHE.lock().unwrap();
-        cache.insert(
+        cache.put(
             ext.to_string(),
             Arc::new(LanguageParserEntry {
                 language: Arc::clone(&entry.language),

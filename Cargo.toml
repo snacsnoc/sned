@@ -50,6 +50,7 @@ regex = "1"
 similar = "2"
 fastrand = "2"
 ignore = "0.4"
+lru = "0.15"
 tree-sitter = "0.26"  # Updated from 0.25, pinned ABI
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-javascript = { version = "0.25", optional = true }

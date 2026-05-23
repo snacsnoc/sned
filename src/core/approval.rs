@@ -18,11 +18,12 @@
 use crate::core::tools::{SnedTool, ToolCategory};
 use parking_lot::Mutex;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -861,38 +862,48 @@ pub fn clear_approval_sender() {
 // Followup Question Input
 // ============================================================================
 
-/// Flag indicating if a followup question is waiting for input.
-static FOLLOWUP_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Per-session flag indicating if a followup question is waiting for input.
+/// Keyed by task_id to support concurrent sessions.
+static FOLLOWUP_ACTIVE: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Mark whether a followup question is currently active.
-pub fn set_followup_question_active(active: bool) {
-    FOLLOWUP_ACTIVE.store(active, Ordering::SeqCst);
+/// Mark whether a followup question is currently active for a session.
+pub fn set_followup_question_active(task_id: &str, active: bool) {
+    let mut guard = FOLLOWUP_ACTIVE.lock();
+    if active {
+        guard.insert(task_id.to_string());
+    } else {
+        guard.remove(task_id);
+    }
 }
 
-/// Check if a followup question is currently active.
-pub fn is_followup_question_active() -> bool {
-    FOLLOWUP_ACTIVE.load(Ordering::SeqCst)
+/// Check if a followup question is currently active for a session.
+pub fn is_followup_question_active(task_id: &str) -> bool {
+    let guard = FOLLOWUP_ACTIVE.lock();
+    guard.contains(task_id)
 }
 
 /// Channel for followup question responses (full line, not single char).
-static FOLLOWUP_SENDER: Mutex<Option<std::sync::mpsc::Sender<String>>> = Mutex::new(None);
+/// Keyed by task_id to support concurrent sessions.
+static FOLLOWUP_SENDER: LazyLock<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Store the sender for a followup question response.
-pub fn set_followup_sender(sender: std::sync::mpsc::Sender<String>) {
+pub fn set_followup_sender(task_id: &str, sender: std::sync::mpsc::Sender<String>) {
     let mut guard = FOLLOWUP_SENDER.lock();
-    *guard = Some(sender);
+    guard.insert(task_id.to_string(), sender);
 }
 
-/// Take the stored followup sender (if any).
-pub fn take_followup_sender() -> Option<std::sync::mpsc::Sender<String>> {
+/// Take the stored followup sender for a session (if any).
+pub fn take_followup_sender(task_id: &str) -> Option<std::sync::mpsc::Sender<String>> {
     let mut guard = FOLLOWUP_SENDER.lock();
-    guard.take()
+    guard.remove(task_id)
 }
 
-/// Clear the followup sender (e.g. on cancellation).
-pub fn clear_followup_sender() {
+/// Clear the followup sender for a session.
+pub fn clear_followup_sender(task_id: &str) {
     let mut guard = FOLLOWUP_SENDER.lock();
-    *guard = None;
+    guard.remove(task_id);
 }
 
 /// Asynchronous wrapper around `prompt_for_approval` for use in async contexts.

@@ -34,8 +34,7 @@ pub struct OpenAiConfig {
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     client: reqwest::Client,
-    /// Provider name for error messages (defaults to "OpenAI").
-    provider_name: &'static str,
+    provider_name: String,
 }
 
 impl OpenAiProvider {
@@ -46,13 +45,10 @@ impl OpenAiProvider {
             .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
             .pool_max_idle_per_host(10)
             .build()?;
-        // Provider name must be 'static str for error handling.
-        // We leak the String to get a 'static reference if a custom name was provided.
-        let provider_name = if let Some(name) = config.provider_name.clone() {
-            Box::leak(name.into_boxed_str())
-        } else {
-            "OpenAI"
-        };
+        let provider_name = config
+            .provider_name
+            .clone()
+            .unwrap_or_else(|| "OpenAI".to_string());
         Ok(Self { config, client, provider_name })
     }
 
@@ -826,7 +822,7 @@ impl Provider for OpenAiProvider {
             let status = response.status();
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderHttpError::new(self.provider_name, url, status, text, headers).into());
+            return Err(ProviderHttpError::new(&self.provider_name, url, status, text, headers).into());
         }
 
         let stream = response.bytes_stream();
