@@ -17,7 +17,7 @@ pub use crate::core::agent_types::{
 use crate::core::agent_types::{
     MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE, MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT,
 };
-use crate::core::context::{ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager};
+use crate::core::context::{ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager, context_window};
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::provider_retry::{RetryConfig, create_message_with_retry};
 use crate::core::tools::SnedTool;
@@ -968,6 +968,19 @@ impl AgentLoop {
                     return Ok(());
                 }
                 TurnResult::Error(e) => {
+                    // Rollback the user message that was never processed by the model.
+                    // The message was added to history at line 808 before execute_turn,
+                    // but the turn failed (e.g., context window exceeded). Keeping it
+                    // would compound the problem on retry attempts.
+                    let mut history = self.conversation_history.lock().await;
+                    if let Some(last) = history.last() {
+                        if last.role == MessageRole::User {
+                            history.pop();
+                            tracing::info!("Rolled back unprocessed user message from history after error");
+                        }
+                    }
+                    drop(history);
+
                     // Persist state on error
                     if let Err(e_persist) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                         error!("Failed to persist state manager on error: {}", e_persist);
@@ -1101,7 +1114,7 @@ impl AgentLoop {
         // 3. Send request and handle stream
         let tools = Some(get_active_tool_definitions());
 
-        let request = ProviderRequest {
+        let mut request = ProviderRequest {
             system_prompt: system_prompt.clone(),
             messages: pruned_history,
             tools,
@@ -1109,6 +1122,35 @@ impl AgentLoop {
             use_response_api: None,
             max_tokens: self.config.max_tokens,
         };
+
+        // Emergency truncation: if the request exceeds context limits, aggressively
+        // truncate to the last N messages to break the deadlock (e.g., /compact failing
+        // because the compact instruction itself pushes the request over the limit).
+        // This is a last-resort fallback after context_manager truncation.
+        if let Err(msg) = context_window::validate_context_window(&request, self.config.provider.as_ref()) {
+            tracing::warn!("Request exceeds context limits after context_manager truncation: {}", msg);
+            tracing::info!("Applying emergency truncation to break deadlock");
+
+            // Keep only the last 20 messages (10 turns) + system prompt
+            // This should always fit within any reasonable context window
+            let emergency_keep = 20;
+            let mut history = self.conversation_history.lock().await;
+            if history.len() > emergency_keep {
+                let dropped = history.len() - emergency_keep;
+                history.drain(0..dropped);
+                tracing::info!("Emergency truncation: dropped {} oldest messages, keeping last {}", dropped, emergency_keep);
+
+                // Rebuild request with truncated history
+                request.messages = history.clone();
+            }
+            drop(history);
+
+            // Re-validate after emergency truncation
+            if let Err(msg) = context_window::validate_context_window(&request, self.config.provider.as_ref()) {
+                tracing::error!("Request still exceeds context limits after emergency truncation: {}", msg);
+                return TurnResult::Error(format!("Context window overflow: {}", msg));
+            }
+        }
 
         // Create channel for stream chunks with large buffer to prevent
         // backpressure deadlocks when the provider emits faster than the
@@ -3855,9 +3897,11 @@ mod tests {
             });
         }
 
-        // Create ApiReqInfo with high token count to trigger truncation
+        // Create ApiReqInfo with high token count to trigger truncation.
+        // Note: context_manager now only counts tokens_in (not tokens_in + tokens_out)
+        // since we're validating input size. Threshold is context_window * 0.8 = 204,800.
         let api_req_info = ApiReqInfo {
-            tokens_in: Some(200_000),
+            tokens_in: Some(210_000),
             tokens_out: Some(50_000),
             context_window: Some(256_000),
             ..Default::default()

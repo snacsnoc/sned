@@ -132,15 +132,16 @@ pub fn get_new_context_messages_and_metadata(
     let mut new_deleted_range = conversation_history_deleted_range;
 
     if let Some(info) = api_req_info {
-        // Include cache tokens for Anthropic (tokens_in already includes cache for OpenAI)
+        // Only count input tokens (tokens_in) for truncation decision.
+        // Output tokens (tokens_out) are from previous responses and don't
+        // contribute to the current request size that validate_context_window checks.
+        // Include cache tokens for Anthropic (tokens_in already includes cache for OpenAI/MiniMax)
         let cache_tokens = if provider_name == "openai" || provider_name == "minimax" {
             0
         } else {
             info.cache_writes.unwrap_or(0) as u64 + info.cache_reads.unwrap_or(0) as u64
         };
-        let total_tokens = (info.tokens_in.unwrap_or(0) as u64)
-            + (info.tokens_out.unwrap_or(0) as u64)
-            + cache_tokens;
+        let total_tokens = (info.tokens_in.unwrap_or(0) as u64) + cache_tokens;
 
         let threshold_pct = if use_auto_condense { 0.7 } else { 0.8 };
         let max_allowed_size = info
@@ -691,15 +692,17 @@ mod tests {
             })
             .collect();
 
+        // tokens_in at 170k = 85% of context window, above both 70% and 80% thresholds
         let info = ApiReqInfo {
-            tokens_in: Some(100_000),
+            tokens_in: Some(170_000),
             tokens_out: Some(70_000),
             context_window: Some(200_000),
             ..Default::default()
         };
 
-        // With auto_condense=true, truncation still happens at 70% safety threshold
-        // 170k / 200k = 85% > 70%, so it should truncate
+        // With auto_condense=true, truncation happens at 70% safety threshold.
+        // tokens_in (170k) / 200k = 85% > 70%, so it should truncate.
+        // Note: tokens_out is no longer counted since we validate input size only.
         let result = get_new_context_messages_and_metadata(
             &messages,
             Some(&info),
@@ -790,9 +793,10 @@ mod tests {
         );
         assert!(!result.updated_conversation_history_deleted_range);
 
-        // 170k total tokens = above threshold, SHOULD truncate
+        // tokens_in at 170k = 85% of context window, above 80% threshold, SHOULD truncate
+        // Note: only tokens_in is counted now (not tokens_in + tokens_out)
         let info_above = ApiReqInfo {
-            tokens_in: Some(100_000),
+            tokens_in: Some(170_000),
             tokens_out: Some(70_000),
             context_window: Some(200_000),
             ..Default::default()
