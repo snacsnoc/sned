@@ -1736,4 +1736,41 @@ edition = "2021"
         // Clean up
         let _ = fs::remove_dir_all(temp_dir);
     }
+
+    #[tokio::test]
+    async fn test_validate_anchors_utf8_truncation() {
+        let _guard = TEST_MUTEX.lock().await;
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+        );
+
+        let long_anchor = "你好世界".repeat(20);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": long_anchor
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err(), "Should fail validation for missing delimiter");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(err_msg.contains("missing the '§' delimiter"));
+        assert!(err_msg.contains("..."), "Long anchor should be truncated with ellipsis");
+        assert!(!err_msg.contains("你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界"), 
+                "Long anchor should be truncated, not show full 80-char string");
+    }
 }
