@@ -235,7 +235,7 @@ pub fn get_skill_content_for_command(
     Some(skill_content.instructions)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliOnlyCommand {
     Exit,
     Quit,
@@ -256,6 +256,7 @@ pub enum CliOnlyCommand {
     CheckpointUndo,
     Expand,
     Changes,
+    HelpOption(String),
 }
 
 impl CliOnlyCommand {
@@ -282,6 +283,13 @@ impl CliOnlyCommand {
             "expand" => Some(CliOnlyCommand::Expand),
             "changes" => Some(CliOnlyCommand::Changes),
             _ => None,
+        }
+    }
+
+    pub fn parse_with_arg(cmd: &str, arg: &str) -> Option<CliOnlyCommand> {
+        match cmd.to_lowercase().as_str() {
+            "help" if !arg.is_empty() => Some(CliOnlyCommand::HelpOption(arg.to_lowercase())),
+            _ => Self::parse(cmd),
         }
     }
 
@@ -465,6 +473,12 @@ pub fn parse_cli_only_command(text: &str) -> CliCommandResult {
 pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command {
+        // Try the command with argument first (handles /help <command>, etc.)
+        if !result.processed_text.is_empty() {
+            if let Some(parsed) = CliOnlyCommand::parse_with_arg(&cmd.command, result.processed_text.trim()) {
+                return Some(parsed);
+            }
+        }
         // Try the command word first (handles /expand 1, /commit "msg", etc.)
         if let Some(parsed) = CliOnlyCommand::parse(&cmd.command) {
             return Some(parsed);
@@ -594,6 +608,214 @@ pub fn format_help_text() -> String {
     s.push_str(&format!("  {}{}{}  - {}Show snipped code block 1{}", style::CYAN, "/expand 1", style::DIM, style::RESET, style::DIM));
     
     s
+}
+
+pub fn format_help_for_command(cmd: &str) -> String {
+    use crate::cli::colors::style;
+
+    let cmd_lower = cmd.to_lowercase();
+    let banner = format!("{}{}═══════ Help: /{} ═══════{}", style::BOLD, style::CYAN, cmd, style::RESET);
+    
+    let help_text = match cmd_lower.as_str() {
+        "newtask" => r#"Creates a new task while preserving context from the current conversation.
+
+Use when:
+  - Starting a new subtask within a larger project
+  - Switching to a different topic while keeping conversation history
+  - Creating a focused task with inherited context
+
+Example:
+  /newtask - Create a new task with current context"#,
+
+        "compact" => r#"Condenses the current conversation history to reduce token usage.
+
+Use when:
+  - Approaching context window limits
+  - After completing a major task phase
+  - Before starting a new topic in the same session
+
+Note: Can only be used once per session. After that, use /resetcompact."#,
+
+        "newrule" => r#"Creates a new Sned rule based on your conversation context.
+
+Use when:
+  - You want to codify a pattern from your current work
+  - Creating project-specific conventions
+  - Documenting recurring workflows"#,
+
+        "reportbug" => r#"Submits a bug report to GitHub.
+
+Use when:
+  - You encounter unexpected behavior
+  - Found a regression or crash
+  - Want to report a feature request"#,
+
+        "explain-changes" => r#"Explains the changes you have made to the codebase.
+
+Use when:
+  - You want a summary of your modifications
+  - Preparing commit messages
+  - Reviewing your own work"#,
+
+        "exit" | "q" | "quit" => r#"Exits the Sned CLI.
+
+Aliases: /exit, /q, /quit
+
+Use when:
+  - Finished with your session
+  - Want to return to the shell"#,
+
+        "clear" => r#"Clears the current conversation history.
+
+Use when:
+  - Starting fresh without context
+  - Privacy concerns require clearing history
+  - Resetting a confused AI session
+
+Warning: This action cannot be undone."#,
+
+        "history" => r#"Shows recent tasks from your history.
+
+Use when:
+  - Looking for a previous task
+  - Reviewing past work sessions
+  - Finding task IDs for reference"#,
+
+        "skills" => r#"Lists available skills that can be invoked via slash commands.
+
+Use when:
+  - Discovering available skills
+  - Checking skill names and descriptions
+  - Learning about project-specific automations"#,
+
+        "help" => r#"Shows this help message or detailed help for a specific command.
+
+Usage:
+  /help - Show all commands
+  /help <command> - Show detailed help for a specific command
+
+Examples:
+  /help newtask - Get detailed help for /newtask
+  /help checkpoint - Get help for checkpoint commands"#,
+
+        "settings" => r#"Shows current Sned settings including provider, model, and mode.
+
+Use when:
+  - Verifying current configuration
+  - Checking which model is active
+  - Confirming auto-approve status"#,
+
+        "models" => r#"Lists available models across providers.
+
+Use when:
+  - Choosing a model for your task
+  - Checking model availability
+  - Comparing model options"#,
+
+        "stats" => r#"Shows token usage and session cost statistics.
+
+Use when:
+  - Monitoring API costs
+  - Tracking token consumption
+  - Optimizing prompt efficiency"#,
+
+        "resetcompact" => r#"Clears the compacted summary, allowing /compact to be used again.
+
+Use when:
+  - Need to compact again after first use
+  - Compacted summary is outdated
+  - Starting a new major phase"#,
+
+        "undo" => r#"Undoes the last agent turn by reverting file changes.
+
+Requires: --track-changes flag
+
+Use when:
+  - Agent made incorrect changes
+  - Want to retry with a different prompt
+  - Reverting experimental modifications
+
+Note: Requires checkpoint tracking to be enabled."#,
+
+        "diff" => r#"Shows changes from the last agent turn.
+
+Requires: --track-changes flag
+
+Use when:
+  - Reviewing what the agent changed
+  - Preparing to commit changes
+  - Understanding agent modifications"#,
+
+        "log" => r#"Shows agent turn history.
+
+Requires: --track-changes flag
+
+Use when:
+  - Reviewing session timeline
+  - Finding specific turns
+  - Auditing agent actions"#,
+
+        "commit" => r#"Commits agent changes to your git repository.
+
+Requires: --track-changes flag
+
+Usage:
+  /commit "message" - Commit with a custom message
+
+Use when:
+  - Ready to save agent changes
+  - Creating version control checkpoints
+  - Finalizing a completed task
+
+Example:
+  /commit "fix: resolve authentication bug""#,
+
+        "expand" => r#"Shows a previously snipped code block.
+
+Usage:
+  /expand N - Show code block number N
+
+Use when:
+  - Need to review truncated output
+  - Agent snipped long code blocks
+  - Checking specific sections of output"#,
+
+        "checkpoint" | "checkpoint-list" | "checkpoint list" => r#"Lists available checkpoints with timestamps.
+
+Requires: --track-changes flag
+
+Use when:
+  - Finding restore points
+  - Reviewing checkpoint history
+  - Identifying specific turns to restore"#,
+
+        "checkpoint-restore" | "checkpoint restore" => r#"Restores files to a specific checkpoint state.
+
+Requires: --track-changes flag
+
+Usage:
+  /checkpoint restore N - Restore to checkpoint N
+
+Use when:
+  - Reverting to a known good state
+  - Undoing multiple turns at once
+  - Experimenting with different approaches
+
+Warning: Reverts all files to checkpoint state."#,
+
+        "checkpoint-undo" | "checkpoint undo" => r#"Undoes last turn using checkpoint (reverts files + trims history).
+
+Requires: --track-changes flag
+
+Use when:
+  - Complete undo of last agent action
+  - Both file and history rollback needed
+  - More thorough than /undo alone"#,
+
+        _ => &format!("Unknown command: /{}\n\nUse /help to see all available commands.", cmd),
+    };
+
+    format!("{}\n\n{}", banner, help_text)
 }
 
 pub fn format_settings_text(provider: &str, model: &str, mode: &str, auto_approve: bool) -> String {
@@ -1064,6 +1286,27 @@ mod tests {
     fn test_parse_cli_only_help() {
         let result = get_cli_only_command("/help");
         assert_eq!(result, Some(CliOnlyCommand::Help));
+    }
+
+    #[test]
+    fn test_parse_cli_only_help_with_arg() {
+        let result = get_cli_only_command("/help newtask");
+        assert!(matches!(result, Some(CliOnlyCommand::HelpOption(ref cmd)) if cmd == "newtask"));
+    }
+
+    #[test]
+    fn test_format_help_for_command_newtask() {
+        let text = format_help_for_command("newtask");
+        assert!(text.contains("newtask"));
+        assert!(text.contains("Creates a new task"));
+        assert!(text.contains("═══════"));
+    }
+
+    #[test]
+    fn test_format_help_for_command_unknown() {
+        let text = format_help_for_command("unknowncmd");
+        assert!(text.contains("Unknown command"));
+        assert!(text.contains("unknowncmd"));
     }
 
     #[test]

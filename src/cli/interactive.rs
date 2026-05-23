@@ -949,6 +949,11 @@ pub async fn run_interactive_shell_inner(
                                     &crate::cli::slash_commands::format_help_text(),
                                 );
                             }
+                            crate::cli::slash_commands::CliOnlyCommand::HelpOption(cmd) => {
+                                crate::cli::colors::eprint_raw(
+                                    &crate::cli::slash_commands::format_help_for_command(&cmd),
+                                );
+                            }
                             crate::cli::slash_commands::CliOnlyCommand::Settings => {
                                 let provider = task_opts.provider.as_deref().unwrap_or("anthropic");
                                 let model =
