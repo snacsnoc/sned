@@ -998,7 +998,8 @@ pub async fn run_interactive_shell_inner(
                                 let checkpoints = match checkpoint_mgr.list_checkpoints().await {
                                     Ok(cps) => cps,
                                     Err(e) => {
-                                        eprintln!("Failed to list checkpoints: {}", e);
+                                        let actionable = crate::cli::actionable_errors::checkpoint_operation_failed("list", &e.to_string());
+                                        eprintln!("{}", actionable);
                                         drop(sess);
                                         continue;
                                     }
@@ -1090,7 +1091,8 @@ pub async fn run_interactive_shell_inner(
                                         }
                                     }
                                     Err(e) => {
-                                        eprintln!("Undo failed: {}", e);
+                                        let actionable = crate::cli::actionable_errors::git_operation_failed("undo", &e.to_string());
+                                        eprintln!("{}", actionable);
                                     }
                                 }
 
@@ -1117,7 +1119,8 @@ pub async fn run_interactive_shell_inner(
                                                 }
                                             }
                                             Err(e) => {
-                                                eprintln!("Diff failed: {}", e);
+                                                let actionable = crate::cli::actionable_errors::git_operation_failed("diff", &e.to_string());
+                                                eprintln!("{}", actionable);
                                             }
                                         }
                                     }
@@ -1142,7 +1145,8 @@ pub async fn run_interactive_shell_inner(
                                                 }
                                             }
                                             Err(e) => {
-                                                eprintln!("Log failed: {}", e);
+                                                let actionable = crate::cli::actionable_errors::git_operation_failed("log", &e.to_string());
+                                                eprintln!("{}", actionable);
                                             }
                                         }
                                     }
@@ -1210,7 +1214,8 @@ pub async fn run_interactive_shell_inner(
                                                                     eprintln!("Committed {} file(s) to your git repo.", files.len());
                                                                 }
                                                                 Err(e) => {
-                                                                    eprintln!("Commit failed: {}", e);
+                                                                    let actionable = crate::cli::actionable_errors::git_operation_failed("commit", &e.to_string());
+                                                                    eprintln!("{}", actionable);
                                                                 }
                                                             }
                                                         } else {
@@ -1219,7 +1224,8 @@ pub async fn run_interactive_shell_inner(
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    eprintln!("Failed to get diff: {}", e);
+                                                    let actionable = crate::cli::actionable_errors::git_operation_failed("get diff", &e.to_string());
+                                                    eprintln!("{}", actionable);
                                                 }
                                             }
                                         }
@@ -1432,7 +1438,8 @@ pub async fn run_interactive_shell_inner(
                                                         );
                                                     }
                                                     Err(e) => {
-                                                        eprintln!("Restore failed: {}", e);
+                                                        let actionable = crate::cli::actionable_errors::checkpoint_operation_failed("restore", &e.to_string());
+                                                        eprintln!("{}", actionable);
                                                     }
                                                 }
                                             }
