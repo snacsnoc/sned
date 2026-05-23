@@ -896,8 +896,9 @@ async fn process_minimax_sse_line(
                         entry.1 = name.clone();
                     }
                     if let Some(args) = &func.arguments {
-                        // Skip empty argument chunks - MiniMax sends these before actual JSON content
-                        if args.is_empty() {
+                        // Skip empty or whitespace-only argument chunks - MiniMax sends these
+                        // before actual JSON content arrives. These aren't garbled, just partial.
+                        if args.trim().is_empty() {
                             continue;
                         }
                         if entry.2.is_empty() {

@@ -18,7 +18,7 @@ pub const ANCHOR_DELIMITER: &str = "§";
 
 static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"\b[A-Z][a-zA-Z]*?{}",
+        r"\b[A-Z][a-zA-Z0-9]*?{}",
         regex::escape(ANCHOR_DELIMITER)
     ))
     .unwrap()
@@ -131,6 +131,20 @@ mod tests {
         let content = "Apple§line1\nBanana§line2";
         let stripped = strip_hashes(content);
         assert_eq!(stripped, "line1\nline2");
+    }
+
+    #[test]
+    fn test_strip_hashes_digit_anchors() {
+        let content = "L1§line1\nL42§line2\nL999§line3";
+        let stripped = strip_hashes(content);
+        assert_eq!(stripped, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn test_strip_hashes_mixed_anchors() {
+        let content = "Apple§alpha\nL10§beta\nDemographicFragile§gamma";
+        let stripped = strip_hashes(content);
+        assert_eq!(stripped, "alpha\nbeta\ngamma");
     }
 
     #[test]
