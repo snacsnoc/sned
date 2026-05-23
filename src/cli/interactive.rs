@@ -1494,6 +1494,7 @@ pub async fn run_interactive_shell_inner(
                         Some(prompt)
                     };
 
+                    let _ = stdout.flush();
                     drop(raw_guard.take());
 
                     tracing::debug!(target: "sned::input", "After drop(raw_guard), agent_busy={}", agent_busy.load(Ordering::Relaxed));

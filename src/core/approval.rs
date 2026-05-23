@@ -803,7 +803,6 @@ pub fn prompt_for_approval(
     // Format parameters with rich formatting based on tool type
     let params_str = format_tool_parameters(tool_name, params);
 
-    io::stdout().flush()?;
     eprint!(
         "\r\x1b[K{}",
         build_tool_approval_prompt(
@@ -934,7 +933,6 @@ pub async fn prompt_for_combined_approval(
         format!("{} files", file_count)
     };
 
-    io::stdout().flush()?;
     eprint!(
         "\r\x1b[K{}",
         build_combined_approval_prompt(
