@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use tokio::sync::Notify;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -21,6 +22,7 @@ pub struct Spinner {
     paused: Arc<AtomicBool>,
     handle: Option<tokio::task::JoinHandle<()>>,
     enabled: bool,
+    stopped_notify: Arc<Notify>,
 }
 
 impl Spinner {
@@ -32,9 +34,11 @@ impl Spinner {
         let cancel = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let stopped_notify = Arc::new(Notify::new());
         let cancel_clone = cancel.clone();
         let stopped_clone = stopped.clone();
         let paused_clone = paused.clone();
+        let stopped_notify_clone = stopped_notify.clone();
         let label = label.to_string();
         let start = Instant::now();
 
@@ -94,6 +98,7 @@ impl Spinner {
                 eprint!("\r\x1b[K");
                 let _ = io::stderr().flush();
             }
+            stopped_notify_clone.notify_one();
         });
 
         Self {
@@ -102,6 +107,7 @@ impl Spinner {
             paused,
             handle: Some(handle),
             enabled: true,
+            stopped_notify,
         }
     }
 
@@ -112,6 +118,7 @@ impl Spinner {
             paused: Arc::new(AtomicBool::new(true)),
             handle: None,
             enabled: false,
+            stopped_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -125,6 +132,14 @@ impl Spinner {
             eprint!("\r\x1b[K");
             let _ = io::stderr().flush();
         }
+    }
+
+    pub async fn wait_for_stop(&self) {
+        self.stopped_notify.notified().await;
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
     }
 
     pub fn stop_with_message(self, message: &str) {
@@ -175,6 +190,24 @@ impl Drop for Spinner {
             eprint!("\r\x1b[K");
             let _ = io::stderr().flush();
         }
+        self.stopped_notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_spinner_disabled() {
+        let spinner = Spinner::disabled();
+        assert!(spinner.is_stopped());
+    }
+
+    #[tokio::test]
+    async fn test_spinner_start_returns_disabled_when_not_tty() {
+        let spinner = Spinner::start("Test...");
+        assert!(spinner.is_stopped());
     }
 }
 

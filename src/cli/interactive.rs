@@ -1787,9 +1787,10 @@ pub async fn run_interactive_shell_inner(
                             let mut task = agent_task.lock().await;
                             if let Some(t) = task.take() {
                                 t.abort();
-                                // Wait briefly for task to fully unwind (Drop handlers run after abort)
+                                // Wait for task to fully unwind (Drop handlers run after abort)
+                                // Use timeout to avoid hanging if task doesn't respond
                                 let _ = tokio::time::timeout(
-                                    std::time::Duration::from_millis(100),
+                                    std::time::Duration::from_millis(500),
                                     t
                                 ).await;
                             }
