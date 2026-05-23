@@ -969,17 +969,20 @@ impl AgentLoop {
                 }
                 TurnResult::Error(e) => {
                     // Rollback the user message that was never processed by the model.
-                    // The message was added to history at line 808 before execute_turn,
-                    // but the turn failed (e.g., context window exceeded). Keeping it
-                    // would compound the problem on retry attempts.
-                    let mut history = self.conversation_history.lock().await;
-                    if let Some(last) = history.last() {
-                        if last.role == MessageRole::User {
-                            history.pop();
-                            tracing::info!("Rolled back unprocessed user message from history after error");
+                    // Only rollback for context-window errors to prevent compounding failure.
+                    // For other errors (rate limit, auth, etc.), keep the message so the user
+                    // doesn't lose their input when retrying after fixing the issue.
+                    let is_context_error = e.contains("exceeds") && e.contains("context");
+                    if is_context_error {
+                        let mut history = self.conversation_history.lock().await;
+                        if let Some(last) = history.last() {
+                            if last.role == MessageRole::User {
+                                history.pop();
+                                tracing::info!("Rolled back unprocessed user message after context window error");
+                            }
                         }
+                        drop(history);
                     }
-                    drop(history);
 
                     // Persist state on error
                     if let Err(e_persist) = StateManager::persist_async(Arc::clone(&state_manager)).await {
@@ -1144,6 +1147,17 @@ impl AgentLoop {
                 request.messages = history.clone();
             }
             drop(history);
+
+            // IMPORTANT: Reset deleted_range to None. The emergency truncation physically
+            // removed messages from the vec, so the old deleted_range indices are now invalid.
+            // Since messages are already gone, there's nothing left to logically delete.
+            {
+                let mut state = self.state.lock().await;
+                if state.conversation_history_deleted_range.is_some() {
+                    tracing::debug!("Reset conversation_history_deleted_range after emergency truncation");
+                    state.conversation_history_deleted_range = None;
+                }
+            }
 
             // Re-validate after emergency truncation
             if let Err(msg) = context_window::validate_context_window(&request, self.config.provider.as_ref()) {
