@@ -778,16 +778,16 @@ fn read_single_char_raw() -> io::Result<char> {
 /// and interprets it:
 /// - 'y' or 'Y' -> Approved
 /// - 'n' or 'N' -> Denied
-/// - 'a' or 'A' -> Always (auto-approve for session)
+/// - 'a' or 'A' -> Always (auto-approve this tool for the session)
 ///
 /// If stdin is not a terminal, the tool is auto-approved.
 ///
-/// ## Implementation
+/// ## Input method
 ///
-/// - If a TUI loop is active (TUI_APPROVAL_HANDLER = true), uses channel-based
-///   forwarding: the TUI loop reads stdin and sends responses via try_send_approval_response().
-/// - If no TUI loop is active (one-shot mode), uses direct raw-mode stdin reading
-///   for immediate single-character response without requiring Enter.
+/// Uses `read_single_char_raw` so the user can type y/n/a without pressing Enter.
+/// We avoid the TUI channel path: it requires cooked (line-buffered) stdin, which
+/// blocks all approvals during agent execution because raw mode is dropped before
+/// the agent runs (`interactive.rs:1498`).
 pub fn prompt_for_approval(
     tool_name: &str,
     params: &serde_json::Value,
@@ -815,27 +815,17 @@ pub fn prompt_for_approval(
     );
     io::stderr().flush()?;
 
-    // Branch based on whether a TUI loop is active.
-    // TUI mode: channel-based forwarding (TUI loop reads stdin, forwards via try_send_approval_response)
-    // One-shot mode: direct raw-mode stdin read (no TUI loop, so we read directly)
-    let input = if is_tui_approval_handler() {
-        // TUI mode: use channel. TUI loop will forward keystrokes.
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let _guard = set_approval_sender(sender);
-        set_approval_prompt_active(true);
-        match receiver.recv() {
-            Ok(c) => c,
-            Err(_) => {
-                // Channel disconnected (e.g. agent cancelled via Ctrl+C)
-                return Ok(ApprovalResult::Denied);
-            }
-        }
-    } else {
-        // One-shot mode: direct raw-mode stdin read
-        set_approval_prompt_active(false);
-        let c = read_single_char_raw()?;
-        c
-    };
+    // The TUI loop skips its stdin read while APPROVAL_PROMPT_ACTIVE is set,
+    // avoiding an fd race with this blocking libc::read().
+    //
+    // INVARIANT: set_approval_prompt_active(false) must always run, even on
+    // error. If the flag stays true, the TUI loop permanently skips stdin
+    // and the shell becomes unresponsive. We ensure this by deferring the ?
+    // until after the flag is cleared (no early-return between set and clear).
+    set_approval_prompt_active(true);
+    let input = read_single_char_raw();
+    set_approval_prompt_active(false);
+    let input = input?;
 
     match input {
         'y' | 'Y' => Ok(ApprovalResult::Approved),
@@ -860,69 +850,10 @@ pub fn is_approval_prompt_active() -> bool {
     APPROVAL_PROMPT_ACTIVE.load(Ordering::SeqCst)
 }
 
-/// Flag indicating if a TUI loop is actively reading stdin and forwarding approval responses.
-/// When true, approval prompts use the channel-based approach (TUI loop forwards keystrokes).
-/// When false, approval prompts use direct raw-mode stdin reading (one-shot mode).
-static TUI_APPROVAL_HANDLER: AtomicBool = AtomicBool::new(false);
 
-/// Mark whether a TUI loop is actively handling stdin for approval responses.
-pub fn set_tui_approval_handler(active: bool) {
-    TUI_APPROVAL_HANDLER.store(active, Ordering::SeqCst);
-}
 
-/// Check if a TUI loop is actively handling stdin.
-fn is_tui_approval_handler() -> bool {
-    TUI_APPROVAL_HANDLER.load(Ordering::SeqCst)
-}
-
-/// RAII guard to ensure approval channel is always cleaned up, even on panic/cancellation.
-pub(crate) struct ApprovalChannelGuard;
-
-impl Drop for ApprovalChannelGuard {
-    fn drop(&mut self) {
-        clear_approval_sender();
-        set_approval_prompt_active(false);
-    }
-}
-
-/// Channel sender used by the CLI loop to forward the user's approval response.
-/// The approval prompt blocks on the corresponding receiver.
-static APPROVAL_SENDER: Mutex<Option<std::sync::mpsc::Sender<char>>> = Mutex::new(None);
-
-/// Store the sender side of an approval-response channel.
-/// Called by `prompt_for_approval` before it blocks on the receiver.
-/// Returns a guard that ensures cleanup on drop (RAII pattern).
-pub(crate) fn set_approval_sender(sender: std::sync::mpsc::Sender<char>) -> ApprovalChannelGuard {
-    let mut guard = APPROVAL_SENDER.lock();
-    *guard = Some(sender);
-    ApprovalChannelGuard
-}
-
-/// Try to send an approval response directly (for TUI loop).
-/// Returns true if the sender was present and the send succeeded.
-pub fn try_send_approval_response(c: char) -> bool {
-    let mut guard = APPROVAL_SENDER.lock();
-    if let Some(ref sender) = *guard {
-        let _ = sender.send(c);
-        *guard = None; // Consume sender after sending
-        set_approval_prompt_active(false);
-        true
-    } else {
-        false
-    }
-}
-
-/// Take the stored approval sender (if any).
-/// Called by the CLI loop when it wants to forward input to a pending prompt.
-pub fn take_approval_sender() -> Option<std::sync::mpsc::Sender<char>> {
-    let mut guard = APPROVAL_SENDER.lock();
-    guard.take()
-}
-
-/// Clear any stored approval sender (e.g. on Ctrl+C cancellation).
+/// No-op retained for Ctrl+C handler compatibility; the approval channel was removed.
 pub fn clear_approval_sender() {
-    let mut guard = APPROVAL_SENDER.lock();
-    *guard = None;
 }
 
 // ============================================================================
@@ -1016,26 +947,15 @@ pub async fn prompt_for_combined_approval(
     );
     io::stderr().flush()?;
 
-    // Branch based on whether a TUI loop is active.
-    let input = if is_tui_approval_handler() {
-        // TUI mode: use channel. TUI loop will forward keystrokes.
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let _guard = set_approval_sender(sender);
-        set_approval_prompt_active(true);
-        tokio::task::spawn_blocking(move || match receiver.recv() {
-            Ok(c) => Ok(c),
-            Err(_) => Err(()),
-        })
+    // See prompt_for_approval for the APPROVAL_PROMPT_ACTIVE invariant.
+    // Here spawn_blocking captures errors in `result` without ?, so the
+    // clear always executes even on failure.
+    set_approval_prompt_active(true);
+    let input = tokio::task::spawn_blocking(read_single_char_raw)
         .await
-        .unwrap_or(Err(()))
-    } else {
-        // One-shot mode: direct raw-mode stdin read
-        set_approval_prompt_active(false);
-        tokio::task::spawn_blocking(read_single_char_raw)
-            .await
-            .map_err(|_| ())
-            .and_then(|r| r.map_err(|_| ()))
-    };
+        .map_err(|_| ())
+        .and_then(|r| r.map_err(|_| ()));
+    set_approval_prompt_active(false);
 
     match input {
         Ok('y' | 'Y') => Ok(ApprovalResult::Approved),
@@ -1101,6 +1021,22 @@ fn build_combined_approval_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_approval_prompt_active_flag_is_initially_false() {
+        assert!(!is_approval_prompt_active());
+    }
+
+    #[test]
+    fn test_approval_prompt_active_flag_always_resets() {
+        // Simulate the invariant: set true, then false, verify clean.
+        // If prompt_for_approval ever leaks the flag (e.g. early return
+        // between set and clear), the TUI loop permanently skips stdin.
+        set_approval_prompt_active(true);
+        assert!(is_approval_prompt_active());
+        set_approval_prompt_active(false);
+        assert!(!is_approval_prompt_active());
+    }
 
     #[test]
     fn test_read_only_tools_never_prompt() {
