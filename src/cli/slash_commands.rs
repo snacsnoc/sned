@@ -539,53 +539,102 @@ pub fn parse_checkpoint_restore(text: &str) -> Option<usize> {
 }
 
 pub fn format_help_text() -> String {
-    r#"Available Sned CLI commands:
+    use crate::cli::colors::style;
 
-Base Commands (sent to AI):
-  /newtask         - Create a new task with context from the current task
-  /compact         - Condense your current context window
-  /newrule         - Create a new Sned rule based on your conversation
-  /reportbug       - Submit a bug report to GitHub
-  /explain-changes - Explain the changes you have made to the code
+    let section_header = |name: &str| format!("{}{}{}", style::BOLD, name, style::RESET);
+    let cmd_name = |name: &str| format!("{}{}{}", style::CYAN, name, style::RESET);
+    let desc = |text: &str| format!("{}{}{}", style::DIM, text, style::RESET);
 
-CLI-Only Commands (handled locally):
-  /exit, /q        - Exit the CLI
-  /clear           - Clear the current conversation history
-  /history         - Show recent tasks
-  /skills          - List available skills
-  /help            - Show this help message
-  /settings        - Show current settings
-  /models          - Show available models
-  /stats           - Show token usage and session cost
-  /resetcompact    - Clear compacted summary (allows /compact to be used again)
-  /undo            - Undo the last agent turn (requires --track-changes)
-  /diff            - Show changes from the last turn (requires --track-changes)
-  /log             - Show agent turn history (requires --track-changes)
-  /commit "msg"    - Commit agent changes to your git repo (requires --track-changes)
-  /expand N        - Show a previously snipped code block
-  /checkpoint list - List available checkpoints with timestamps
-  /checkpoint restore N - Restore a specific checkpoint by number
-  /checkpoint undo - Undo last turn using checkpoint (reverts files + trims history)
+    format!(
+        r#"{}Available Sned CLI commands:
 
-Keyboard Shortcuts:
-  Ctrl+A / Home    - Move cursor to beginning of line
-  Ctrl+E / End     - Move cursor to end of line
-  Ctrl+U           - Clear from cursor to beginning
-  Ctrl+K           - Clear from cursor to end
-  Ctrl+W           - Delete word backward
-  Ctrl+C           - Cancel current operation
-  Arrow Left/Right - Move cursor left/right
-  Arrow Up/Down    - Navigate command history / file picker
+{}Base Commands (sent to AI):
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
 
-Examples:
-  /compact               - Compact context before a new topic
-  /newtask               - Start a new task, carrying over context
-  /help                  - Show this help
-  /undo                  - Undo last agent turn (requires --track-changes)
-  /diff                  - Review last turn's changes (requires --track-changes)
-  /commit "fix: auth bug" - Commit changes to git (requires --track-changes)
-  /expand 1              - Show snipped code block 1"#
-    .to_string()
+{}CLI-Only Commands (handled locally):
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+
+{}Keyboard Shortcuts:
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+
+{}Examples:
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}
+  {}  - {}"#,
+        section_header(""),
+        section_header("Base Commands (sent to AI):"),
+        cmd_name("/newtask"), desc("Create a new task with context from the current task"),
+        cmd_name("/compact"), desc("Condense your current context window"),
+        cmd_name("/newrule"), desc("Create a new Sned rule based on your conversation"),
+        cmd_name("/reportbug"), desc("Submit a bug report to GitHub"),
+        cmd_name("/explain-changes"), desc("Explain the changes you have made to the code"),
+        section_header("CLI-Only Commands (handled locally):"),
+        cmd_name("/exit, /q"), desc("Exit the CLI"),
+        cmd_name("/clear"), desc("Clear the current conversation history"),
+        cmd_name("/history"), desc("Show recent tasks"),
+        cmd_name("/skills"), desc("List available skills"),
+        cmd_name("/help"), desc("Show this help message"),
+        cmd_name("/settings"), desc("Show current settings"),
+        cmd_name("/models"), desc("Show available models"),
+        cmd_name("/stats"), desc("Show token usage and session cost"),
+        cmd_name("/resetcompact"), desc("Clear compacted summary (allows /compact to be used again)"),
+        cmd_name("/undo"), desc("Undo the last agent turn (requires --track-changes)"),
+        cmd_name("/diff"), desc("Show changes from the last turn (requires --track-changes)"),
+        cmd_name("/log"), desc("Show agent turn history (requires --track-changes)"),
+        cmd_name("/commit \"msg\""), desc("Commit agent changes to your git repo (requires --track-changes)"),
+        cmd_name("/expand N"), desc("Show a previously snipped code block"),
+        cmd_name("/checkpoint list"), desc("List available checkpoints with timestamps"),
+        cmd_name("/checkpoint restore N"), desc("Restore a specific checkpoint by number"),
+        cmd_name("/checkpoint undo"), desc("Undo last turn using checkpoint (reverts files + trims history)"),
+        section_header("Keyboard Shortcuts:"),
+        cmd_name("Ctrl+A / Home"), desc("Move cursor to beginning of line"),
+        cmd_name("Ctrl+E / End"), desc("Move cursor to end of line"),
+        cmd_name("Ctrl+U"), desc("Clear from cursor to beginning"),
+        cmd_name("Ctrl+K"), desc("Clear from cursor to end"),
+        cmd_name("Ctrl+W"), desc("Delete word backward"),
+        cmd_name("Ctrl+C"), desc("Cancel current operation"),
+        cmd_name("Arrow Left/Right"), desc("Move cursor left/right"),
+        cmd_name("Arrow Up/Down"), desc("Navigate command history / file picker"),
+        section_header("Examples:"),
+        cmd_name("/compact"), desc("Compact context before a new topic"),
+        cmd_name("/newtask"), desc("Start a new task, carrying over context"),
+        cmd_name("/help"), desc("Show this help"),
+        cmd_name("/undo"), desc("Undo last agent turn (requires --track-changes)"),
+        cmd_name("/diff"), desc("Review last turn's changes (requires --track-changes)"),
+        cmd_name("/commit \"fix: auth bug\""), desc("Commit changes to git (requires --track-changes)"),
+        cmd_name("/expand 1"), desc("Show snipped code block 1")
+    )
 }
 
 pub fn format_settings_text(provider: &str, model: &str, mode: &str, auto_approve: bool) -> String {
@@ -1136,6 +1185,21 @@ mod tests {
         assert!(text.contains("Ctrl+C"));
         assert!(text.contains("Arrow Left"));
         assert!(text.contains("Arrow Up"));
+    }
+
+    #[test]
+    fn test_format_help_text_contains_ansi_codes() {
+        let text = format_help_text();
+        // ANSI escape code prefix
+        assert!(text.contains("\x1b["));
+        // Bold style
+        assert!(text.contains("\x1b[1m"));
+        // Cyan color (for command names)
+        assert!(text.contains("\x1b[96m"));
+        // Dim style (for descriptions)
+        assert!(text.contains("\x1b[2m"));
+        // Reset code
+        assert!(text.contains("\x1b[0m"));
     }
 
     #[test]
