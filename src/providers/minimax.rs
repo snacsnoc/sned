@@ -591,27 +591,43 @@ struct OpenAIStreamPromptTokenDetails {
     cached_tokens: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
 struct OpenAIStreamUsage {
+    #[serde(default)]
     prompt_tokens: u32,
+    #[serde(default)]
     completion_tokens: u32,
     prompt_tokens_details: Option<OpenAIStreamPromptTokenDetails>,
     #[serde(rename = "prompt_cache_miss_tokens")]
     prompt_cache_miss_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    total_characters: u32,
 }
 
-// OpenAI streaming response types
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIStreamResponse {
     id: String,
     choices: Vec<OpenAIStreamChoice>,
     usage: Option<OpenAIStreamUsage>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    object: Option<String>,
+    #[serde(default)]
+    created: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAIStreamChoice {
     delta: OpenAIStreamDelta,
     finish_reason: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    index: usize,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -620,9 +636,14 @@ struct OpenAIStreamDelta {
     #[serde(default)]
     tool_calls: Vec<OpenAIStreamToolCall>,
     reasoning_content: Option<String>,
-    /// MiniMax returns reasoning_details as array when reasoning_split=true
     #[serde(default)]
     reasoning_details: Vec<MiniMaxReasoningDetail>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    role: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,6 +655,9 @@ struct MiniMaxReasoningDetail {
 struct OpenAIStreamToolCall {
     index: usize,
     id: Option<String>,
+    #[serde(rename = "type", default)]
+    #[allow(dead_code)]
+    tool_type: Option<String>,
     function: Option<OpenAIStreamFunction>,
 }
 
@@ -925,10 +949,15 @@ async fn process_minimax_sse_line(
         }
 
         if let Some(usage) = event.usage {
+            let input_tokens = if usage.prompt_tokens > 0 {
+                usage.prompt_tokens
+            } else {
+                usage.total_tokens
+            };
             try_send_chunk(
                 tx,
                 ApiStreamChunk::Usage(ApiStreamUsageChunk {
-                    input_tokens: usage.prompt_tokens,
+                    input_tokens,
                     output_tokens: usage.completion_tokens,
                     cache_write_tokens: usage.prompt_cache_miss_tokens,
                     cache_read_tokens: usage.prompt_tokens_details.map(|d| d.cached_tokens),
@@ -1626,5 +1655,40 @@ mod tests {
             params["paths"],
             serde_json::Value::String("tetris.c".to_string())
         );
+    }
+
+    #[test]
+    fn test_sse_parse_minimax_delta_with_name_and_role_fields() {
+        let line = r#"{"id":"06606d9933ccdc19dddfa3af953a03d3","choices":[{"index":0,"delta":{"role":"assistant","name":"MiniMax AI","tool_calls":[{"function":{"arguments":"|event::\"}"},"index":0}]}}],"created":1779514009,"model":"MiniMax-M2.7","object":"chat.completion.chunk","usage":{"total_tokens":0,"total_characters":0},"input_sensitive":false,"output_sensitive":false,"input_sensitive_type":0,"output_sensitive_type":0,"output_sensitive_int":0}"#;
+        let result = serde_json::from_str::<OpenAIStreamResponse>(line);
+        match &result {
+            Ok(resp) => {
+                assert_eq!(resp.choices.len(), 1);
+                let tc = &resp.choices[0].delta.tool_calls;
+                assert_eq!(tc.len(), 1);
+                assert_eq!(tc[0].index, 0);
+                assert!(tc[0].function.is_some());
+                assert_eq!(
+                    tc[0].function.as_ref().unwrap().arguments.as_deref(),
+                    Some("|event::\"}")
+                );
+            }
+            Err(e) => panic!("SSE line with delta.name/role should parse: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_sse_parse_minimax_tool_call_with_type_field() {
+        let line = r#"{"id":"06606d99","choices":[{"finish_reason":"tool_calls","index":0,"delta":{"role":"assistant","name":"MiniMax AI","tool_calls":[{"id":"call_function_jpaq2z2bgfh7_2","type":"function","function":{"name":"read_file","arguments":"{\"paths\": [\"src/providers/minimax.rs\"]}"},"index":1}]}}],"created":1779514009,"model":"MiniMax-M2.7","object":"chat.completion.chunk"}"#;
+        let result = serde_json::from_str::<OpenAIStreamResponse>(line);
+        match &result {
+            Ok(resp) => {
+                assert_eq!(resp.choices.len(), 1);
+                let tc = &resp.choices[0].delta.tool_calls;
+                assert_eq!(tc.len(), 1);
+                assert_eq!(tc[0].index, 1);
+            }
+            Err(e) => panic!("SSE line with tool_call.type should parse: {}", e),
+        }
     }
 }
