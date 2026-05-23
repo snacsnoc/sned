@@ -7,8 +7,25 @@ use crate::cli::{HistoryOptions, RootOnlyOptions, TaskOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use unicode_width::UnicodeWidthChar;
+
+/// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m")
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    if total_secs >= 3600 {
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        format!("{}h {}m", hours, mins)
+    } else if total_secs >= 60 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{}m {}s", mins, secs)
+    } else {
+        format!("{}s", total_secs)
+    }
+}
 
 // --------------------------------------------------------------------------
 // Command History
@@ -20,7 +37,7 @@ fn get_history_file_path() -> PathBuf {
 }
 
 /// Load command history from the history file.
-/// Returns the last MAX_HISTORY_LINES lines (most recent last).
+/// Returns the last N lines (most recent last), where N is configurable.
 fn load_command_history() -> Vec<String> {
     let history_path = get_history_file_path();
     if !history_path.exists() {
@@ -29,16 +46,17 @@ fn load_command_history() -> Vec<String> {
 
     match std::fs::read_to_string(&history_path) {
         Ok(content) => {
-            // Split into lines, filter empty, take last MAX_HISTORY_LINES
+            // Split into lines, filter empty, take last N (configurable)
             let mut lines: Vec<String> = content
                 .lines()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
 
-            // Keep only the most recent MAX_HISTORY_LINES
-            if lines.len() > MAX_HISTORY_LINES {
-                lines = lines[lines.len() - MAX_HISTORY_LINES..].to_vec();
+            // Keep only the most recent lines
+            let max = max_history_lines();
+            if lines.len() > max {
+                lines = lines[lines.len() - max..].to_vec();
             }
 
             lines
@@ -49,7 +67,7 @@ fn load_command_history() -> Vec<String> {
 
 /// Append a command to the history file.
 /// Creates the file if it doesn't exist.
-/// Trims the file to MAX_HISTORY_LINES if it grows too large.
+/// Trims the file to the configured max (default 10000) if it grows too large.
 fn append_to_history(command: &str) {
     if command.trim().is_empty() {
         return;
@@ -72,8 +90,9 @@ fn append_to_history(command: &str) {
     history.push(command.to_string());
 
     // Trim to max size
-    if history.len() > MAX_HISTORY_LINES {
-        history = history[history.len() - MAX_HISTORY_LINES..].to_vec();
+    let max = max_history_lines();
+    if history.len() > max {
+        history = history[history.len() - max..].to_vec();
     }
 
     // Write back atomically
@@ -83,8 +102,15 @@ fn append_to_history(command: &str) {
     }
 }
 
-/// Maximum number of history lines to keep in the history file
-const MAX_HISTORY_LINES: usize = 10_000;
+/// Maximum number of history lines to keep in the history file.
+/// Configurable via `SNED_HISTORY_LINES` environment variable.
+fn max_history_lines() -> usize {
+    std::env::var("SNED_HISTORY_LINES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10_000)
+}
 
 /// Delete the word before the cursor, handling multi-byte characters correctly.
 /// Returns the byte index where deletion started (new cursor position).
@@ -559,6 +585,8 @@ pub async fn run_interactive_shell_inner(
 
     let agent_busy = Arc::new(AtomicBool::new(false));
     let agent_done = Arc::new(tokio::sync::Notify::new());
+    let agent_start_time: Arc<tokio::sync::Mutex<Option<std::time::Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
     let queue_handle: Arc<tokio::sync::Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     let state_handle: Arc<
@@ -728,6 +756,17 @@ pub async fn run_interactive_shell_inner(
                     // Ensures TUI input handling resumes correctly after agent stderr output finishes.
                     if raw_guard.is_none() {
                         raw_guard = Some(enter_raw_mode()?);
+                    }
+                    // Display elapsed time for the completed agent turn
+                    if let Some(start) = *agent_start_time.lock().await {
+                        let elapsed = start.elapsed();
+                        let elapsed_str = format_duration(elapsed);
+                        writeln!(
+                            stdout,
+                            "\r\n{}",
+                            crate::cli::colors::info(&format!("⏱ Elapsed: {}", elapsed_str))
+                        )?;
+                        stdout.flush()?;
                     }
                     continue 'main;
                 }
@@ -1534,9 +1573,12 @@ pub async fn run_interactive_shell_inner(
                         raw_guard = None;
                         
                         agent_busy.store(true, Ordering::Relaxed);
+                        let start_time = std::time::Instant::now();
+                        *agent_start_time.lock().await = Some(start_time);
                         let busy = agent_busy.clone();
                         let sess = session.clone();
                         let at = agent_task.clone();
+                        let ast = agent_start_time.clone();
 
                         tracing::debug!(target: "sned::agent", "Spawning agent task, prompt length={}", effective_prompt.as_ref().map(|s| s.len()).unwrap_or(0));
 
@@ -1551,6 +1593,7 @@ pub async fn run_interactive_shell_inner(
                                 crate::cli::colors::eprint_error(&e.to_string());
                             }
                             busy.store(false, Ordering::Relaxed);
+                            *ast.lock().await = None;
                             agent_done_clone.notify_one();
                             // Clean up the task handle
                             let mut task = at.lock().await;
@@ -1881,6 +1924,30 @@ pub fn print_undo_result(added: Vec<String>, modified: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(1)), "1s");
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(format_duration(Duration::from_secs(150)), "2m 30s");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 0m");
+        assert_eq!(format_duration(Duration::from_secs(3660)), "1h 1m");
+        assert_eq!(format_duration(Duration::from_secs(4500)), "1h 15m");
+        assert_eq!(format_duration(Duration::from_secs(7320)), "2h 2m");
+    }
 
     #[test]
     fn test_resume_summary_section_header_format() {
