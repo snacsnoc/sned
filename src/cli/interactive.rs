@@ -1032,7 +1032,7 @@ pub async fn run_interactive_shell_inner(
                                     for f in &changed_files {
                                         eprintln!("  - {}", f);
                                     }
-                                    eprintln!("Continue? (y/n): ");
+                                    eprintln!("Continue? (y to cancel, Enter to confirm): ");
 
                                     // Use channel-based input to avoid stdin race with TUI async reader
                                     // Same pattern as condense tool (A9/A18 fix)
@@ -1041,8 +1041,9 @@ pub async fn run_interactive_shell_inner(
                                     crate::core::approval::set_followup_sender(sender);
 
                                     // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                    // Timeout after 30 seconds to prevent indefinite blocking
                                     let response_result = tokio::task::spawn_blocking(move || {
-                                        receiver.recv()
+                                        receiver.recv_timeout(std::time::Duration::from_secs(30))
                                     }).await;
 
                                     // Clean up regardless of result
@@ -1051,10 +1052,11 @@ pub async fn run_interactive_shell_inner(
 
                                     let confirm = match response_result {
                                         Ok(Ok(r)) => r,
-                                        Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
+                                        Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response or timeout
                                     };
 
-                                    if confirm.trim().to_lowercase() != "y" {
+                                    // Empty input (Enter) confirms by default; 'y' cancels
+                                    if !confirm.trim().is_empty() && confirm.trim().to_lowercase() == "y" {
                                         eprintln!("Undo cancelled.");
                                         drop(sess);
                                         continue;
@@ -1187,8 +1189,9 @@ pub async fn run_interactive_shell_inner(
                                                         crate::core::approval::set_followup_sender(sender);
 
                                                         // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                                        // Timeout after 30 seconds to prevent indefinite blocking
                                                         let response_result = tokio::task::spawn_blocking(move || {
-                                                            receiver.recv()
+                                                            receiver.recv_timeout(std::time::Duration::from_secs(30))
                                                         }).await;
 
                                                         // Clean up regardless of result
@@ -1200,7 +1203,8 @@ pub async fn run_interactive_shell_inner(
                                                             Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
                                                         };
 
-                                                        if confirm.trim().to_lowercase() == "y" {
+                                                        // Empty input (Enter) confirms by default
+                                                        if confirm.trim().is_empty() || confirm.trim().to_lowercase() == "y" {
                                                             match crate::core::shadow_git::commit_to_real_git(&workspace_root, &msg) {
                                                                 Ok(files) => {
                                                                     eprintln!("Committed {} file(s) to your git repo.", files.len());
@@ -1329,8 +1333,9 @@ pub async fn run_interactive_shell_inner(
                                                 crate::core::approval::set_followup_sender(sender);
 
                                                 // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                                // Timeout after 30 seconds to prevent indefinite blocking
                                                 let response_result = tokio::task::spawn_blocking(move || {
-                                                    receiver.recv()
+                                                    receiver.recv_timeout(std::time::Duration::from_secs(30))
                                                 }).await;
 
                                                 // Clean up regardless of result
@@ -1377,38 +1382,38 @@ pub async fn run_interactive_shell_inner(
                                                                 eprintln!("  - {}", file);
                                                             }
                                                             eprintln!();
-                                                            eprintln!("Continue? (y/n): ");
+                                                        eprintln!("Continue? (y to cancel, Enter to confirm): ");
 
-                                                            // Use channel-based input to avoid stdin race with TUI async reader
-                                                            // Same pattern as condense tool (A9/A18 fix)
-                                                            let (sender, receiver) = std::sync::mpsc::channel();
-                                                            crate::core::approval::set_followup_question_active(true);
-                                                            crate::core::approval::set_followup_sender(sender);
+                                                        // Use channel-based input to avoid stdin race with TUI async reader
+                                                        // Same pattern as condense tool (A9/A18 fix)
+                                                        let (sender, receiver) = std::sync::mpsc::channel();
+                                                        crate::core::approval::set_followup_question_active(true);
+                                                        crate::core::approval::set_followup_sender(sender);
 
-                                                            // Wait for user input via channel (forwarded by TUI loop on Enter)
-                                                            let response_result = tokio::task::spawn_blocking(move || {
-                                                                receiver.recv()
-                                                            }).await;
+                                                        // Wait for user input via channel (forwarded by TUI loop on Enter)
+                                                        // Timeout after 30 seconds to prevent indefinite blocking
+                                                        let response_result = tokio::task::spawn_blocking(move || {
+                                                            receiver.recv_timeout(std::time::Duration::from_secs(30))
+                                                        }).await;
 
-                                                            // Clean up regardless of result
-                                                            crate::core::approval::clear_followup_sender();
-                                                            crate::core::approval::set_followup_question_active(false);
+                                                        // Clean up regardless of result
+                                                        crate::core::approval::clear_followup_sender();
+                                                        crate::core::approval::set_followup_question_active(false);
 
-                                                            let confirm = match response_result {
-                                                                Ok(Ok(r)) => r,
-                                                                Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
-                                                            };
+                                                        let confirm = match response_result {
+                                                            Ok(Ok(r)) => r,
+                                                            Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response or timeout
+                                                        };
 
-                                                            if confirm.trim().to_lowercase() != "y"
-                                                            {
-                                                                eprintln!("Restore cancelled.");
-                                                                drop(sess);
-                                                                input_buf.clear();
-                                                                cursor_pos = 0;
-                                                                input_row =
-                                                                    input_row.saturating_add(1);
-                                                                continue;
-                                                            }
+                                                        // Empty input (Enter) confirms by default; 'y' cancels
+                                                        if !confirm.trim().is_empty() && confirm.trim().to_lowercase() == "y" {
+                                                            eprintln!("Restore cancelled.");
+                                                            drop(sess);
+                                                            input_buf.clear();
+                                                            cursor_pos = 0;
+                                                            input_row = input_row.saturating_add(1);
+                                                            continue;
+                                                        }
                                                         }
                                                     }
                                                     Err(e) => {
