@@ -698,15 +698,15 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
         "anthropic" => {
             let api_key =
                 std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "dummy".to_string());
-            // Use stored model ID default if not specified
-            let default_model = model_id.or_else(|| {
-                let state = crate::storage::global_state::load_global_state();
-                state.act_mode_api_model_id
-            }).unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string());
+            // Use stored model ID default and base URL if not specified
+            let state = crate::storage::global_state::load_global_state();
+            let default_model = model_id.or_else(|| state.act_mode_api_model_id.clone())
+                .unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string());
+            let base_url = state.anthropic_base_url.filter(|u| !u.is_empty());
             Arc::new(crate::providers::anthropic::AnthropicProvider::new(
                 crate::providers::anthropic::AnthropicConfig {
                     api_key,
-                    base_url: None,
+                    base_url,
                     model_id: default_model,
                     model_info: Some(crate::providers::ModelInfo::default()),
                     thinking_budget_tokens: thinking_budget,

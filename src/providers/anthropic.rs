@@ -44,7 +44,8 @@ impl AnthropicProvider {
     fn build_headers(&self) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        // Updated to 2025-04-14 to support prompt caching and extended thinking without beta headers
+        headers.insert("anthropic-version", HeaderValue::from_static("2025-04-14"));
 
         if !self.config.api_key.is_empty() {
             headers.insert("x-api-key", HeaderValue::from_str(&self.config.api_key)?);
@@ -214,18 +215,18 @@ impl AnthropicProvider {
 
             // Tool choice: respect request.tool_choice if provided
             // Anthropic API: "auto" (default), "any" (force tool use), "none" (no tools), "tool" (specific tool)
-            if !reasoning_on {
-                if let Some(tool_choice) = &request.tool_choice {
-                    body["tool_choice"] = match tool_choice {
-                        crate::providers::ToolChoice::Auto => json!({"type": "auto"}),
-                        crate::providers::ToolChoice::Required => json!({"type": "any"}),
-                        crate::providers::ToolChoice::None => json!({"type": "none"}),
-                        crate::providers::ToolChoice::Named(name) => json!({"type": "tool", "name": name}),
-                    };
-                } else {
-                    // Default: force tool use when tools are available
-                    body["tool_choice"] = json!({"type": "any"});
-                }
+            // Tool choice is now supported with extended thinking (Anthropic lifted restriction)
+            if let Some(tool_choice) = &request.tool_choice {
+                body["tool_choice"] = match tool_choice {
+                    crate::providers::ToolChoice::Auto => json!({"type": "auto"}),
+                    crate::providers::ToolChoice::Required => json!({"type": "any"}),
+                    crate::providers::ToolChoice::None => json!({"type": "none"}),
+                    crate::providers::ToolChoice::Named(name) => json!({"type": "tool", "name": name}),
+                };
+            } else {
+                // Default: auto (model decides whether to use tools)
+                // Changed from "any" to fix bug where model was forced to always call a tool
+                body["tool_choice"] = json!({"type": "auto"});
             }
         }
 
@@ -1252,7 +1253,8 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "read_file");
-        assert_eq!(body["tool_choice"]["type"], "any");
+        // Default tool_choice is now "auto" (model decides), not "any" (forced tool use)
+        assert_eq!(body["tool_choice"]["type"], "auto");
     }
 
     #[test]
