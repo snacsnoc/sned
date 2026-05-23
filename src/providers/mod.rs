@@ -701,52 +701,97 @@ pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -
                 e,
                 args.chars().take(100).collect::<String>()
             );
-            let mut repaired = args.to_string();
-            let mut brace_count: i32 = 0;
-            let mut bracket_count: i32 = 0;
-            let mut in_string = false;
-            let mut escape_next = false;
-            for c in args.chars() {
-                if escape_next {
-                    escape_next = false;
-                    continue;
-                }
-                if c == '\\' {
-                    escape_next = true;
-                    continue;
-                }
-                if c == '"' {
-                    in_string = !in_string;
-                    continue;
-                }
-                if !in_string {
-                    match c {
-                        '{' => brace_count += 1,
-                        '}' => brace_count -= 1,
-                        '[' => bracket_count += 1,
-                        ']' => bracket_count -= 1,
-                        _ => {}
-                    }
-                }
-            }
-            for _ in 0..bracket_count.max(0) {
-                repaired.push(']');
-            }
-            for _ in 0..brace_count.max(0) {
-                repaired.push('}');
-            }
-            if serde_json::from_str::<serde_json::Value>(&repaired).is_err() {
+
+            let repaired = repair_json_args(args);
+
+            if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+                repaired
+            } else {
                 tracing::warn!(
                     "{} tool call arguments JSON repair failed {}, using empty object",
                     provider_name,
                     context
                 );
                 "{}".to_string()
-            } else {
-                repaired
             }
         }
     }
+}
+
+fn repair_json_args(args: &str) -> String {
+    let trimmed = args.trim();
+
+    let json_start = find_json_start(trimmed);
+    if json_start > 0 {
+        let stripped = &trimmed[json_start..];
+        if serde_json::from_str::<serde_json::Value>(stripped).is_ok() {
+            return stripped.to_string();
+        }
+        return repair_close_braces(stripped);
+    }
+
+    repair_close_braces(trimmed)
+}
+
+fn find_json_start(s: &str) -> usize {
+    for (i, c) in s.char_indices() {
+        if c == '{' || c == '[' {
+            return i;
+        }
+    }
+    0
+}
+
+fn repair_close_braces(args: &str) -> String {
+    let mut repaired = String::with_capacity(args.len() + 4);
+    let mut brace_count: i32 = 0;
+    let mut bracket_count: i32 = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for c in args.chars() {
+        if escape_next {
+            repaired.push(c);
+            escape_next = false;
+            continue;
+        }
+        if c == '\\' {
+            repaired.push(c);
+            escape_next = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            repaired.push(c);
+            continue;
+        }
+        repaired.push(c);
+        if !in_string {
+            match c {
+                '{' => brace_count += 1,
+                '}' => brace_count -= 1,
+                '[' => bracket_count += 1,
+                ']' => bracket_count -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    if in_string {
+        repaired.push('"');
+        if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+            return repaired;
+        }
+    }
+
+    for _ in 0..bracket_count.max(0) {
+        repaired.push(']');
+    }
+    for _ in 0..brace_count.max(0) {
+        repaired.push('}');
+    }
+
+    repaired
 }
 
 /// Error types for LLM provider operations.
@@ -1115,5 +1160,36 @@ mod tests {
     fn test_validate_tool_call_args_valid_json_passes_through() {
         let args = r#"{"a": 1, "b": [2, 3]}"#;
         assert_eq!(validate_tool_call_args(args, "test", "unit"), args);
+    }
+
+    #[test]
+    fn test_validate_tool_call_args_repairs_unterminated_string() {
+        let args = r#"{"path": "/tmp/test"#;
+        let result = validate_tool_call_args(args, "test", "unit");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["path"], "/tmp/test");
+    }
+
+    #[test]
+    fn test_validate_tool_call_args_strips_prefix_garbage() {
+        let args = r#"garbage{"path": "/tmp/test"}"#;
+        let result = validate_tool_call_args(args, "test", "unit");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["path"], "/tmp/test");
+    }
+
+    #[test]
+    fn test_validate_tool_call_args_repairs_unterminated_string_with_close_brace() {
+        let args = r#"{"path": "/tmp/test}"#;
+        let result = validate_tool_call_args(args, "test", "unit");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["path"], "/tmp/test}");
+    }
+
+    #[test]
+    fn test_validate_tool_call_args_just_open_brace_repairs() {
+        let result = validate_tool_call_args("{", "test", "unit");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.is_object());
     }
 }
