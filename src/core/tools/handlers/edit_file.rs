@@ -1221,7 +1221,6 @@ mod tests {
         );
         let result_text = result.unwrap();
         let result_str = result_text.as_str().unwrap();
-        eprintln!("Result: {}", result_str);
         assert!(
             result_str.contains("Goodbye World"),
             "Edit should be applied in yolo mode. Result: {}",

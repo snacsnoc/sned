@@ -270,10 +270,12 @@ impl ExecuteCommandHandler {
                                 if !json_output {
                                     if displayed <= half {
                                         // Head: print live
-                                        eprintln!("{}", crate::cli::colors::colorize_stderr(&line, crate::cli::colors::style::DIM));
+                                        use crate::cli::output::OutputEvent;
+                                        use ratatui::style::{Modifier, Style};
+                                        output_writer.emit(OutputEvent::styled(line.clone(), Style::default().add_modifier(Modifier::DIM)));
                                     } else if displayed == half + 1 && !truncated {
                                         // First skipped line: emit condensed note once
-                                        eprintln!("{}", crate::cli::colors::colorize_stderr("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                        output_writer.emit(OutputEvent::plain("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string()));
                                         truncated = true;
                                     }
                                 }
@@ -298,10 +300,12 @@ impl ExecuteCommandHandler {
                                 if !json_output {
                                     if displayed <= half {
                                         // Head: print live
-                                        eprintln!("{}", crate::cli::colors::colorize_stderr(&line, crate::cli::colors::style::YELLOW));
+                                        use crate::cli::output::OutputEvent;
+                                        use ratatui::style::{Color, Style};
+                                        output_writer.emit(OutputEvent::styled(line.clone(), Style::default().fg(Color::Yellow)));
                                     } else if displayed == half + 1 && !truncated {
                                         // First skipped line: emit condensed note once
-                                        eprintln!("{}", crate::cli::colors::colorize_stderr("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                        output_writer.emit(OutputEvent::plain("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string()));
                                         truncated = true;
                                     }
                                 }
@@ -353,9 +357,11 @@ impl ExecuteCommandHandler {
                                     displayed += 1;
                                     if !json_output {
                                         if displayed <= half {
-                                            eprintln!("{}", crate::cli::colors::colorize_stderr(&line, crate::cli::colors::style::DIM));
+                                            use crate::cli::output::OutputEvent;
+                                            use ratatui::style::{Modifier, Style};
+                                            output_writer.emit(OutputEvent::styled(line.clone(), Style::default().add_modifier(Modifier::DIM)));
                                         } else if displayed == half + 1 && !truncated {
-                                            eprintln!("{}", crate::cli::colors::colorize_stderr("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                            output_writer.emit(OutputEvent::plain("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string()));
                                             truncated = true;
                                         }
                                     }
@@ -372,9 +378,11 @@ impl ExecuteCommandHandler {
                                     displayed += 1;
                                     if !json_output {
                                         if displayed <= half {
-                                            eprintln!("{}", crate::cli::colors::colorize_stderr(&line, crate::cli::colors::style::YELLOW));
+                                            use crate::cli::output::OutputEvent;
+                                            use ratatui::style::{Color, Style};
+                                            output_writer.emit(OutputEvent::styled(line.clone(), Style::default().fg(Color::Yellow)));
                                         } else if displayed == half + 1 && !truncated {
-                                            eprintln!("{}", crate::cli::colors::colorize_stderr("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)", crate::cli::colors::style::DIM));
+                                            output_writer.emit(OutputEvent::plain("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string()));
                                             truncated = true;
                                         }
                                     }
@@ -419,18 +427,14 @@ impl ExecuteCommandHandler {
             // Print tail lines after command completes (if we truncated)
             if truncated && !tail_buffer.is_empty() && !json_output {
                 let total = displayed;
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::colorize_stderr(
-                        &format!("--- last {} of {} lines ---", tail_buffer.len(), total),
-                        crate::cli::colors::style::DIM
-                    )
-                );
+                use crate::cli::output::OutputEvent;
+                use ratatui::style::{Modifier, Style};
+                output_writer.emit(OutputEvent::styled(
+                    format!("--- last {} of {} lines ---", tail_buffer.len(), total),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
                 for line in tail_buffer.iter() {
-                    eprintln!(
-                        "{}",
-                        crate::cli::colors::colorize_stderr(line, crate::cli::colors::style::DIM)
-                    );
+                    output_writer.emit(OutputEvent::styled(line.clone(), Style::default().add_modifier(Modifier::DIM)));
                 }
             }
 

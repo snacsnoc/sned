@@ -3,10 +3,8 @@
 //! Uses channel-based input (same pattern as approval prompts) to avoid
 //! fighting the interactive input loop for stdin.
 
-use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
-use std::io;
 
 /// Ask followup question tool handler.
 #[derive(Debug, Clone, Default)]

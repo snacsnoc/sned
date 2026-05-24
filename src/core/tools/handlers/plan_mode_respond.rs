@@ -96,6 +96,8 @@ impl ToolHandler for PlanModeRespondHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::tools::ToolContext;
+    use std::sync::Arc;
 
     #[test]
     fn test_plan_mode_respond_creation() {
@@ -103,5 +105,70 @@ mod tests {
         assert_eq!(format!("{:?}", handler), "PlanModeRespondHandler");
     }
 
-    // TODO: Update tests to use ToolContext
+    #[tokio::test]
+    async fn test_plan_mode_respond_missing_response() {
+        let handler = PlanModeRespondHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(crate::core::agent_loop::TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = handler.execute(&ctx, serde_json::json!({})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("response"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_respond_success() {
+        let handler = PlanModeRespondHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(crate::core::agent_loop::TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = handler
+            .execute(&ctx, serde_json::json!({"response": "Step 1: do this"}))
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().as_str().unwrap().contains("Step 1: do this"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_respond_needs_more() {
+        let handler = PlanModeRespondHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(crate::core::agent_loop::TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = handler
+            .execute(
+                &ctx,
+                serde_json::json!({"response": "I need to explore more", "needs_more_exploration": true}),
+            )
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().as_str().unwrap().contains("need more exploration"));
+    }
 }

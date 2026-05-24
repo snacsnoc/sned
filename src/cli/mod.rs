@@ -13,6 +13,7 @@ pub mod spinner;
 pub mod subcommands;
 pub mod syntax_highlight;
 pub mod text_utils;
+pub mod tui;
 
 pub use interactive::{
     InteractiveSession, cleanup_terminal, query_cursor_position, render_interactive_prompt_prefix,

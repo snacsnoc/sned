@@ -34,7 +34,6 @@ use crate::storage::state_manager::StateManager;
 use crate::storage::task_storage::TaskStorage;
 use futures::future::FutureExt;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
@@ -1407,7 +1406,7 @@ impl AgentLoop {
                             }
                             // Buffer flush to ~50ms frames to reduce syscalls on high-latency connections (P9)
                             if last_flush_time.elapsed() >= flush_interval {
-                                let _ = io::stderr().flush();
+                                self.config.output_writer.flush();
                                 last_flush_time = Instant::now();
                             }
                         }
@@ -1756,7 +1755,6 @@ impl AgentLoop {
         } else if !self.config.json_output {
             self.config.output_writer.flush();
         }
-        let _ = io::stderr().flush();
 
         // Wait for stream to complete
         if let Err(e) = stream_handle.await {
@@ -1962,8 +1960,8 @@ impl AgentLoop {
                         summary,
                         Style::default().add_modifier(Modifier::DIM),
                     ));
+                    self.config.output_writer.flush();
                 }
-                let _ = io::stderr().flush();
             }
 
             let hook_manager_handle = self.deps.hook_manager.clone();
