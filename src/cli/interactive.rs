@@ -1060,8 +1060,9 @@ async fn run_main_loop(
         terminal.draw(|f| app.render(f))?;
         
         // 3. Poll for events (blocking, 50ms timeout)
-        // Skip stdin read while approval prompt is active to avoid fd race
-        if !is_approval_prompt_active() && ratatui::crossterm::event::poll(Duration::from_millis(50))? {
+        // Always poll to provide delay; skip stdin read while approval is active to avoid fd race
+        let has_event = ratatui::crossterm::event::poll(Duration::from_millis(50))?;
+        if has_event && !is_approval_prompt_active() {
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {
                     if let Some(action) = handle_key_event(
