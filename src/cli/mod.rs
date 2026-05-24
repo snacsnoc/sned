@@ -6,6 +6,7 @@ pub mod actionable_errors;
 pub mod colors;
 pub mod image_input;
 pub mod interactive;
+pub mod output;
 pub mod redact;
 pub mod slash_commands;
 pub mod spinner;
@@ -1125,6 +1126,7 @@ async fn build_task_components(
             .unwrap_or(50),
         max_tokens: task_opts.max_tokens,
         interactive_mode: false,
+        output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
     };
 
     let shell_path = std::env::var("SHELL").ok();

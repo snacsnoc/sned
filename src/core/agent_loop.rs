@@ -3576,6 +3576,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         }
     }
 
@@ -3615,6 +3616,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let mut agent = AgentLoop::new(config);
@@ -3656,6 +3658,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let mut agent = AgentLoop::new(config);
@@ -3687,6 +3690,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let mut agent = AgentLoop::new(config);
@@ -3744,6 +3748,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let mut agent = AgentLoop::new(config);
@@ -3979,6 +3984,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config).with_task_storage(task_storage);
@@ -4102,6 +4108,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config).with_task_storage(task_storage);
@@ -4135,6 +4142,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         })
         .with_task_storage(task_storage_empty);
 
@@ -4165,6 +4173,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let hook_manager = Arc::new(HookManager::new("test-user"));
@@ -4201,6 +4210,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let hook_manager = Arc::new(HookManager::new("test-user"));
@@ -4286,6 +4296,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config);
@@ -4324,6 +4335,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config);
@@ -4361,6 +4373,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config);
@@ -4404,6 +4417,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let mut registry = ToolRegistry::new();
@@ -4469,6 +4483,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let mut registry = ToolRegistry::new();
@@ -4552,6 +4567,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let mut registry = ToolRegistry::new();
@@ -4614,6 +4630,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config);
@@ -4649,6 +4666,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config);
@@ -4683,6 +4701,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config);
@@ -4987,6 +5006,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let checkpoint_mgr = crate::core::checkpoints::TaskCheckpointManager::new(
@@ -5030,6 +5050,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config).with_system_prompt_context(
@@ -5095,6 +5116,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         };
 
         let agent = AgentLoop::new(config);

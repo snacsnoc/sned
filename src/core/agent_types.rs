@@ -204,6 +204,7 @@ impl Default for AgentConfig {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
         }
     }
 }
@@ -243,6 +244,8 @@ pub struct AgentConfig {
     pub max_tokens: Option<u32>,
     /// Whether running in interactive shell mode (affects display behavior).
     pub interactive_mode: bool,
+    /// Output writer for decoupled terminal output (ratatui migration).
+    pub output_writer: crate::cli::output::OutputWriterArc,
 }
 
 /// Result of a single turn in the agent loop.

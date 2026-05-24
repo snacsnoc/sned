@@ -66,6 +66,8 @@ tree-sitter-php = { version = "0.24", optional = true }
 tree-sitter-swift = { version = "0.7.2", optional = true }  # Updated to 0.7.2
 streaming-iterator = "0.1"
 crossterm = "0.29"  # Updated from 0.28.1
+ratatui = "0.29"
+tui-textarea = "0.7"
 nix = { version = "0.31", features = ["signal", "process", "user", "term", "fs"] }  # Updated from 0.29
 libc = "0.2"
 dirs = "6"
