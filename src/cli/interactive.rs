@@ -218,7 +218,9 @@ fn render_input_line(
         buf.push_str(&format!("\x1b[{}D", move_left));
     }
     if cursor_to_scroll_region {
-        buf.push_str(&format!("\x1b[{};1H", term_rows));
+        // Move cursor to scroll region bottom (one row above pinned input)
+        // so agent stderr output scrolls there, not over the input line
+        buf.push_str(&format!("\x1b[{};1H", term_rows.saturating_sub(1)));
         buf.push_str("\x1b[?25l");
     } else {
         buf.push_str("\x1b[?25h");
@@ -895,20 +897,21 @@ pub async fn run_interactive_shell_inner(
                         let full = format!("{}{}", prompt_prefix, &input_buf);
                         let dw = display_width(&full);
                         let span = (dw as u16).div_ceil(cols.max(1));
-                        // Clear rows in scroll region (not the pinned input row)
-                        for i in 0..span.max(1) {
-                            let row = term_rows.saturating_sub(i + 1);
+                        // Clear rows in scroll region (rows 1 to term_rows-1)
+                        for i in 0..span {
+                            let row = term_rows.saturating_sub(i + 2);
                             if row > 0 {
                                 write!(stdout, "\x1b[{};1H\x1b[K", row)?;
                             }
                         }
                         // Position cursor at bottom of scroll region and write prompt
+                        // Cursor MUST end at scroll region bottom, NOT the pinned input row
                         write!(stdout, "\x1b[{};1H", term_rows.saturating_sub(1))?;
                         if !prompt.is_empty() {
-                            writeln!(stdout, "{}{}", prompt_prefix, &prompt)?;
-                        } else {
-                            writeln!(stdout)?;
+                            write!(stdout, "{}{}", prompt_prefix, &prompt)?;
                         }
+                        // Move cursor DOWN one row to the pinned input row
+                        write!(stdout, "\x1b[{};1H", term_rows)?;
                         stdout.flush()?;
                     }
                     tracing::debug!(target: "sned::input", "Checking if prompt is empty");
@@ -1656,8 +1659,12 @@ pub async fn run_interactive_shell_inner(
 
                     input_buf.clear();
                     cursor_pos = 0;
-                    let (term_rows, _) = crossterm::terminal::size().unwrap_or((24, 80));
+                    let (term_rows, term_cols) = crossterm::terminal::size().unwrap_or((24, 80));
                     input_row = term_rows.saturating_sub(2);
+                    
+                    // Render empty input line at pinned row, cursor at scroll region bottom
+                    render_input_line(&mut stdout, &input_buf, cursor_pos, &prompt_prefix, term_cols, term_rows, true)?;
+                    stdout.flush()?;
                 }
                 TerminalEvent::Char(c) => {
                     // Skip newline characters - they should be Return events, but filter defensively
