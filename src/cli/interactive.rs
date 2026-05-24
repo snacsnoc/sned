@@ -218,7 +218,10 @@ fn render_input_line(
         buf.push_str(&format!("\x1b[{}D", move_left));
     }
     if cursor_to_scroll_region {
-        buf.push_str(&format!("\x1b[{};1H", term_rows.saturating_sub(1)));
+        buf.push_str(&format!("\x1b[{};1H", term_rows));
+        buf.push_str("\x1b[?25l");
+    } else {
+        buf.push_str("\x1b[?25h");
     }
     stdout.write_all(buf.as_bytes())?;
     stdout.flush()?;
@@ -777,18 +780,7 @@ pub async fn run_interactive_shell_inner(
             };
 
             tokio::select! {
-                result = stdin.read(&mut byte_buf) => {
-                    break match result {
-                        Ok(0) => 0,
-                        Ok(n) => n,
-                        Err(e) => {
-                            if e.kind() == io::ErrorKind::Interrupted {
-                                continue;
-                            }
-                            0
-                        }
-                    };
-                }
+                biased;
                 _ = agent_done.notified() => {
                     if let Some(start) = *agent_start_time.lock().await {
                         let elapsed = start.elapsed();
@@ -805,6 +797,18 @@ pub async fn run_interactive_shell_inner(
                     last_cursor_pos = cursor_pos;
                     last_picker_active = picker_active;
                     continue 'main;
+                }
+                result = stdin.read(&mut byte_buf) => {
+                    break match result {
+                        Ok(0) => 0,
+                        Ok(n) => n,
+                        Err(e) => {
+                            if e.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            0
+                        }
+                    };
                 }
                 _ = tokio::time::sleep(reprompt_delay) => {
                     // Periodic re-render while agent is busy
@@ -883,8 +887,6 @@ pub async fn run_interactive_shell_inner(
                     }
 
                     let prompt = input_buf.trim().to_string();
-                    tracing::debug!(target: "sned::input", "Submitting prompt: {} chars", prompt.len());
-
                     // Echo prompt to stdout only if agent is not busy.
                     // When agent is busy, stdout cursor positioning races with agent stderr output.
                     // The prompt text itself is still submitted to the agent via message queue.
@@ -893,19 +895,21 @@ pub async fn run_interactive_shell_inner(
                         let full = format!("{}{}", prompt_prefix, &input_buf);
                         let dw = display_width(&full);
                         let span = (dw as u16).div_ceil(cols.max(1));
-                        tracing::debug!(target: "sned::input", "display_width={} cols={} span={} term_rows={}", dw, cols, span, term_rows);
+                        // Clear rows in scroll region (not the pinned input row)
                         for i in 0..span.max(1) {
-                            let row = term_rows.saturating_sub(i);
+                            let row = term_rows.saturating_sub(i + 1);
                             if row > 0 {
                                 write!(stdout, "\x1b[{};1H\x1b[K", row)?;
                             }
                         }
-                        tracing::debug!(target: "sned::input", "Echoing prompt to stdout");
+                        // Position cursor at bottom of scroll region and write prompt
+                        write!(stdout, "\x1b[{};1H", term_rows.saturating_sub(1))?;
                         if !prompt.is_empty() {
                             writeln!(stdout, "{}{}", prompt_prefix, &prompt)?;
                         } else {
                             writeln!(stdout)?;
                         }
+                        stdout.flush()?;
                     }
                     tracing::debug!(target: "sned::input", "Checking if prompt is empty");
 
