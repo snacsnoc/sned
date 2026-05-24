@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use sned::core::file_editor::AnchorStateManager;
+use sned::cli::output::StderrOutputWriter;
 use sned::core::tools::{ToolContext, ToolHandler};
 use sned::services::tree_sitter::get_functions;
 use sned::services::tree_sitter::parser::load_required_language_parsers;
@@ -141,6 +142,7 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                     "test-task".to_string(),
                     None,
                     false,
+                    Arc::new(StderrOutputWriter),
                 );
                 let result = rt.block_on(ToolHandler::execute(
                     &handler,
@@ -189,6 +191,7 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                     "test-task".to_string(),
                     None,
                     false,
+                    Arc::new(StderrOutputWriter),
                 );
                 let result = rt.block_on(ToolHandler::execute(
                     &handler,
