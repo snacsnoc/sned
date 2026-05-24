@@ -50,17 +50,12 @@ pub enum ToolCategory {
     EditFiles,
     ExecuteCommand,
     WebFetch,
-    Subagents,
     Other,
 }
 
 impl ToolCategory {
     pub const fn is_read_only(self) -> bool {
         matches!(self, ToolCategory::ReadOnly)
-    }
-
-    pub const fn is_path_sensitive(self) -> bool {
-        matches!(self, ToolCategory::ReadFiles | ToolCategory::EditFiles)
     }
 }
 
@@ -105,7 +100,7 @@ impl SnedTool {
             | SnedTool::SearchFiles
             | SnedTool::UseSkill => ToolCategory::ReadFiles,
 
-            SnedTool::UseSubagents => ToolCategory::Subagents,
+            SnedTool::UseSubagents => ToolCategory::Other,
 
             SnedTool::WriteToFile
             | SnedTool::EditFile
@@ -118,7 +113,9 @@ impl SnedTool {
             SnedTool::ListSkills
             | SnedTool::AttemptCompletion
             | SnedTool::PlanModeRespond
-            | SnedTool::AskFollowupQuestion => ToolCategory::ReadOnly,
+            | SnedTool::AskFollowupQuestion
+            | SnedTool::Condense
+            | SnedTool::SummarizeTask => ToolCategory::ReadOnly,
 
             _ => ToolCategory::Other,
         }
@@ -369,16 +366,10 @@ pub trait ToolHandler: Send + Sync {
 /// Errors from tool execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
-    #[error("Tool not found: {0}")]
-    NotFound(String),
     #[error("Invalid input: {0}")]
     InvalidInput(String),
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
-    #[error("Permission denied: {0}")]
-    PermissionDenied(String),
-    #[error("Command unsafe: {0}")]
-    CommandUnsafe(String),
     #[error("Cancelled")]
     Cancelled,
 }
@@ -457,8 +448,7 @@ mod tests {
             SnedTool::AttemptCompletion.category(),
             ToolCategory::ReadOnly
         );
-        assert_eq!(SnedTool::Condense.category(), ToolCategory::Other);
-        assert_eq!(SnedTool::UseSubagents.category(), ToolCategory::Subagents);
+        assert_eq!(SnedTool::Condense.category(), ToolCategory::ReadOnly);
     }
 
     #[test]

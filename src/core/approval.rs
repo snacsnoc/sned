@@ -529,7 +529,7 @@ impl ApprovalManager {
             ToolCategory::EditFiles => (s.edit_files, s.edit_files_externally),
             ToolCategory::ExecuteCommand => (s.execute_commands, false),
             ToolCategory::WebFetch => (s.use_browser, false),
-            ToolCategory::ReadOnly | ToolCategory::Other | ToolCategory::Subagents => {
+            ToolCategory::ReadOnly | ToolCategory::Other => {
                 (false, false)
             }
         }
