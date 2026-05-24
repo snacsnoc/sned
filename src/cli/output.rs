@@ -31,6 +31,69 @@ impl OutputEvent {
         OutputEvent::Line(Line::from(Span::styled(text.into(), style)))
     }
 
+    /// Create a dim yellow line (e.g., slow connection warning).
+    pub fn dim_yellow(text: impl Into<String>) -> Self {
+        use ratatui::style::{Color, Modifier, Style};
+        OutputEvent::Line(Line::from(Span::styled(
+            text.into(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+        )))
+    }
+
+    /// Create a dim line (e.g., hints, metadata).
+    pub fn dim(text: impl Into<String>) -> Self {
+        use ratatui::style::{Modifier, Style};
+        OutputEvent::Line(Line::from(Span::styled(
+            text.into(),
+            Style::default().add_modifier(Modifier::DIM),
+        )))
+    }
+
+    /// Create a cyan line (e.g., model output).
+    pub fn cyan(text: impl Into<String>) -> Self {
+        use ratatui::style::{Color, Style};
+        OutputEvent::Line(Line::from(Span::styled(
+            text.into(),
+            Style::default().fg(Color::Cyan),
+        )))
+    }
+
+    /// Create a magenta line (e.g., tool calls).
+    pub fn magenta(text: impl Into<String>) -> Self {
+        use ratatui::style::{Color, Style};
+        OutputEvent::Line(Line::from(Span::styled(
+            text.into(),
+            Style::default().fg(Color::Magenta),
+        )))
+    }
+
+    /// Create a red line for errors or green for success.
+    pub fn error_or_success(text: impl Into<String>, is_error: bool) -> Self {
+        use ratatui::style::{Color, Style};
+        OutputEvent::Line(Line::from(Span::styled(
+            text.into(),
+            Style::default().fg(if is_error { Color::Red } else { Color::Green }),
+        )))
+    }
+
+    /// Create a bold line (e.g., section headers).
+    pub fn bold(text: impl Into<String>) -> Self {
+        use ratatui::style::{Modifier, Style};
+        OutputEvent::Line(Line::from(Span::styled(
+            text.into(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )))
+    }
+
+    /// Create a yellow warning line.
+    pub fn yellow(text: impl Into<String>) -> Self {
+        use ratatui::style::{Color, Style};
+        OutputEvent::Line(Line::from(Span::styled(
+            text.into(),
+            Style::default().fg(Color::Yellow),
+        )))
+    }
+
     /// Create an error line (red styling).
     pub fn error(text: impl fmt::Display) -> Self {
         use ratatui::style::{Color, Style};

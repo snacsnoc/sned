@@ -1272,10 +1272,8 @@ impl AgentLoop {
                 && first_chunk_start.elapsed().as_secs() >= 3
             {
                 slow_connection_warned = true;
-                use ratatui::style::{Color, Modifier, Style};
-                self.config.output_writer.emit(OutputEvent::styled(
+                self.config.output_writer.emit(OutputEvent::dim_yellow(
                     "⏳ Waiting for API response (slow connection?)...",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
                 ));
             }
 
@@ -1364,10 +1362,8 @@ impl AgentLoop {
                                             } else {
                                                 None
                                             };
-                                            use ratatui::style::{Modifier, Style};
-                                            self.config.output_writer.emit(OutputEvent::styled(
+                                            self.config.output_writer.emit(OutputEvent::dim(
                                                 snipped_code_block_hint(index),
-                                                Style::default().add_modifier(Modifier::DIM),
                                             ));
                                         }
                                         in_code_block = false;
@@ -1455,10 +1451,8 @@ impl AgentLoop {
                                     summary
                                 };
 
-                                use ratatui::style::{Modifier, Style};
-                                self.config.output_writer.emit(OutputEvent::styled(
+                                self.config.output_writer.emit(OutputEvent::dim(
                                     format!("  Ɵ {}", truncated),
-                                    Style::default().add_modifier(Modifier::DIM),
                                 ));
                                 reasoning_preview_shown = true;
                             }
@@ -1561,8 +1555,7 @@ impl AgentLoop {
                     if !self.config.json_output {
                         let total_tokens = tokens_in + tokens_out;
                         let cost = usage_chunk.total_cost.unwrap_or(0.0);
-                        use ratatui::style::{Modifier, Style};
-                        self.config.output_writer.emit(OutputEvent::styled(
+                        self.config.output_writer.emit(OutputEvent::dim(
                             format!(
                                 "  📊 {} tokens{} | ${:.4} | {:.0}% context",
                                 if total_tokens >= 1000 {
@@ -1578,7 +1571,6 @@ impl AgentLoop {
                                 cost,
                                 context_usage_pct
                             ),
-                            Style::default().add_modifier(Modifier::DIM),
                         ));
                     }
                 }
@@ -1743,10 +1735,8 @@ impl AgentLoop {
                 } else {
                     None
                 };
-                use ratatui::style::{Modifier, Style};
-                self.config.output_writer.emit(OutputEvent::styled(
+                self.config.output_writer.emit(OutputEvent::dim(
                     snipped_code_block_hint(index),
-                    Style::default().add_modifier(Modifier::DIM),
                 ));
             }
             self.config.output_writer.flush();
@@ -1958,10 +1948,8 @@ impl AgentLoop {
                         .as_ref()
                         .unwrap_or(&serde_json::Value::Null);
                     let summary = format_tool_summary(tool_name, tool_params);
-                    use ratatui::style::{Modifier, Style};
-                    self.config.output_writer.emit(OutputEvent::styled(
+                    self.config.output_writer.emit(OutputEvent::dim(
                         summary,
-                        Style::default().add_modifier(Modifier::DIM),
                     ));
                     self.config.output_writer.flush();
                 }
@@ -2335,16 +2323,13 @@ impl AgentLoop {
                             }
                         }
                         let status = if is_error { "✗" } else { "✓" };
-                        use ratatui::style::{Color, Style};
-                        self.config.output_writer.emit(OutputEvent::styled(
+                        self.config.output_writer.emit(OutputEvent::error_or_success(
                             format!("  {} {}", status, stats),
-                            Style::default().fg(if is_error { Color::Red } else { Color::Green }),
+                            is_error,
                         ));
                         if is_error && added == 0 && removed == 0 {
-                            use ratatui::style::{Modifier, Style};
-                            self.config.output_writer.emit(OutputEvent::styled(
+                            self.config.output_writer.emit(OutputEvent::dim(
                                 "  💡 Hint: If edit_file keeps failing, use write_to_file to rewrite the entire file instead.".to_string(),
-                                Style::default().add_modifier(Modifier::DIM),
                             ));
                         }
                     } else if tool_name == "execute_command" {
@@ -2352,10 +2337,9 @@ impl AgentLoop {
                         let displayed = format_tool_result(&result_text, max_lines);
                         let status = if is_error { "✗" } else { "✓" };
                         let first_line = displayed.lines().next().unwrap_or("");
-                        use ratatui::style::{Color, Style};
-                        self.config.output_writer.emit(OutputEvent::styled(
+                        self.config.output_writer.emit(OutputEvent::error_or_success(
                             format!("  {} {}", status, first_line),
-                            Style::default().fg(if is_error { Color::Red } else { Color::Green }),
+                            is_error,
                         ));
                     } else {
                         let max_lines = MAX_TOOL_RESULT_DISPLAY_LINES;
@@ -2363,22 +2347,19 @@ impl AgentLoop {
                         let status = if is_error { "✗" } else { "✓" };
                         let mut display_lines = displayed.lines();
                         let first = display_lines.next().unwrap_or("");
-                        use ratatui::style::{Color, Modifier, Style};
-                        self.config.output_writer.emit(OutputEvent::styled(
+                        self.config.output_writer.emit(OutputEvent::error_or_success(
                             format!("  {} {}", status, first),
-                            Style::default().fg(if is_error { Color::Red } else { Color::Green }),
+                            is_error,
                         ));
                         for line in display_lines.take(2) {
-                            self.config.output_writer.emit(OutputEvent::styled(
+                            self.config.output_writer.emit(OutputEvent::dim(
                                 format!("    {}", line),
-                                Style::default().add_modifier(Modifier::DIM),
                             ));
                         }
                         let total_lines = displayed.lines().count();
                         if total_lines > 3 {
-                            self.config.output_writer.emit(OutputEvent::styled(
+                            self.config.output_writer.emit(OutputEvent::dim(
                                 format!("    ... {} more lines", total_lines - 3),
-                                Style::default().add_modifier(Modifier::DIM),
                             ));
                         }
                     }
@@ -2511,10 +2492,8 @@ impl AgentLoop {
             }
 
             if !edit_files.is_empty() && !self.config.json_output {
-                use ratatui::style::{Modifier, Style};
-                self.config.output_writer.emit(OutputEvent::styled(
+                self.config.output_writer.emit(OutputEvent::dim(
                     format_heat_map(&edit_files),
-                    Style::default().add_modifier(Modifier::DIM),
                 ));
 
                 // Auto-commit to shadow git after file-modifying turns
@@ -2575,10 +2554,8 @@ impl AgentLoop {
                 }
 
                 if !parts.is_empty() {
-                    use ratatui::style::{Modifier, Style};
-                    self.config.output_writer.emit(OutputEvent::styled(
+                    self.config.output_writer.emit(OutputEvent::dim(
                         format!("  📝 {}", parts.join(", ")),
-                        Style::default().add_modifier(Modifier::DIM),
                     ));
                 }
             }
@@ -2636,8 +2613,7 @@ impl AgentLoop {
                     String::new()
                 };
 
-                use ratatui::style::{Color, Modifier, Style};
-                self.config.output_writer.emit(OutputEvent::styled(
+                self.config.output_writer.emit(OutputEvent::dim(
                     format!(
                         "  📊 Tokens: {} in / {} out{}{}{} | Context: {:.1}%",
                         tokens_in,
@@ -2658,23 +2634,19 @@ impl AgentLoop {
                         cost_str,
                         context_pct
                     ),
-                    Style::default().add_modifier(Modifier::DIM),
                 ));
 
                 if context_pct >= 95.0 {
-                    self.config.output_writer.emit(OutputEvent::styled(
+                    self.config.output_writer.emit(OutputEvent::yellow(
                         "⚠ 95% context window — /compact or start new session".to_string(),
-                        Style::default().fg(Color::Yellow),
                     ));
                 } else if context_pct >= 80.0 {
-                    self.config.output_writer.emit(OutputEvent::styled(
+                    self.config.output_writer.emit(OutputEvent::yellow(
                         "⚠ 80% context window used — consider /compact".to_string(),
-                        Style::default().fg(Color::Yellow),
                     ));
                 } else if context_pct >= 50.0 {
-                    self.config.output_writer.emit(OutputEvent::styled(
+                    self.config.output_writer.emit(OutputEvent::dim(
                         "ℹ 50% context window used — use /compact to free space before starting new topics".to_string(),
-                        Style::default().add_modifier(Modifier::DIM),
                     ));
                 }
 
@@ -2683,12 +2655,11 @@ impl AgentLoop {
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(5.0);
                 if cost >= cost_warn_threshold {
-                    self.config.output_writer.emit(OutputEvent::styled(
+                    self.config.output_writer.emit(OutputEvent::yellow(
                         format!(
                             "⚠ Session cost ${:.2} (threshold: ${:.2})",
                             cost, cost_warn_threshold
                         ),
-                        Style::default().fg(Color::Yellow),
                     ));
                 }
             }
@@ -2928,7 +2899,6 @@ impl AgentLoop {
         interactive_mode: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) {
-        use ratatui::style::{Modifier, Style};
         use std::time::Duration;
 
         let state = state.lock().await;
@@ -2993,10 +2963,7 @@ impl AgentLoop {
         // Print session summary box
         output_writer.flush();
         crate::cli::colors::print_horizontal_rule_writer(output_writer);
-        output_writer.emit(OutputEvent::styled(
-            "  Session".to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        output_writer.emit(OutputEvent::bold("  Session".to_string()));
         output_writer.emit(OutputEvent::plain(format!("  {}", summary_line)));
 
         // Per-file diff stats
@@ -3005,12 +2972,11 @@ impl AgentLoop {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string());
-            output_writer.emit(OutputEvent::styled(
+            output_writer.emit(OutputEvent::dim(
                 format!(
                     "  {:17} +{} -{}\t({})",
                     filename, stats.lines_added, stats.lines_removed, stats.action
                 ),
-                Style::default().add_modifier(Modifier::DIM),
             ));
         }
 
@@ -3018,9 +2984,8 @@ impl AgentLoop {
         #[allow(clippy::collapsible_if)]
         if let Some(ref cmd) = state.last_executed_command {
             if !cmd.is_empty() {
-                output_writer.emit(OutputEvent::styled(
+                output_writer.emit(OutputEvent::dim(
                     format!("  ⚙ {}", cmd),
-                    Style::default().add_modifier(Modifier::DIM),
                 ));
             }
         }
@@ -3037,7 +3002,7 @@ impl AgentLoop {
         } else {
             String::from("$0.000")
         };
-        output_writer.emit(OutputEvent::styled(
+        output_writer.emit(OutputEvent::dim(
             format!(
                 "  📊 {} tokens | {} | {} turn{} | {}",
                 tokens_str,
@@ -3046,7 +3011,6 @@ impl AgentLoop {
                 if state.turns_completed == 1 { "" } else { "s" },
                 Self::format_duration(duration)
             ),
-            Style::default().add_modifier(Modifier::DIM),
         ));
 
         crate::cli::colors::print_horizontal_rule_writer(output_writer);
