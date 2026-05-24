@@ -538,10 +538,32 @@ impl EditFileHandler {
                     let lock_result = fs2::FileExt::try_lock_exclusive(&std_file);
 
                     if lock_result.is_err() {
-                        // File is locked by another process - proceed without mtime check.
-                        // The atomic write (rename) is still safe.
+                        // File is locked by another process — still check mtime to detect
+                        // external modifications before writing.
+                        let mtime_ok = if let Some(initial_mtime) = &prepared.initial_mtime {
+                            match tokio::fs::metadata(&batch.absolute_path).await {
+                                Ok(current_metadata) => {
+                                    match current_metadata.modified() {
+                                        Ok(current_mtime) => &current_mtime == initial_mtime,
+                                        Err(_) => true,
+                                    }
+                                }
+                                Err(_) => true,
+                            }
+                        } else {
+                            true
+                        };
+
+                        if !mtime_ok {
+                            return Err(ToolError::ExecutionFailed(format!(
+                                "File {} was modified externally during edit operation. \
+                                 Aborting write to prevent data loss. Re-read the file and retry.",
+                                batch.display_path
+                            )));
+                        }
+
                         tracing::debug!(
-                            "File {} locked by another process, skipping mtime check",
+                            "File {} locked by another process, skipping exclusive lock",
                             batch.display_path
                         );
 
