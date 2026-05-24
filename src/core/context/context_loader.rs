@@ -255,14 +255,14 @@ impl ContextLoader {
             };
             
             // Batch query all definitions in one lock hold
-            let mut definitions = HashMap::new();
+            let mut definitions = HashMap::with_capacity(symbols.len());
             for symbol in &symbols {
                 let defs = service.get_definitions(symbol, Some(MAX_AUTO_SYMBOL_TOTAL_LINES));
                 definitions.insert(symbol.clone(), defs);
             }
             
             // Batch query all references in one lock hold
-            let mut references = HashMap::new();
+            let mut references = HashMap::with_capacity(symbols.len());
             for symbol in &symbols {
                 let remaining_limit = MAX_AUTO_SYMBOL_TOTAL_LINES.saturating_sub(
                     definitions
@@ -303,7 +303,7 @@ impl ContextLoader {
         }
 
         // Collect all unique locations, grouped by file path for efficient reading
-        let mut file_locations: HashMap<String, Vec<(String, SymbolLocation)>> = HashMap::new();
+        let mut file_locations: HashMap<String, Vec<(String, SymbolLocation)>> = HashMap::with_capacity(16);
         for (symbol, data) in &symbol_results {
             for loc in &data.all_locations {
                 let Some(loc_path_str) = &loc.path else {
@@ -330,7 +330,7 @@ impl ContextLoader {
         }
 
         // Read each file once, then extract all needed lines from cached content
-        let mut file_contents: HashMap<String, Vec<String>> = HashMap::new();
+        let mut file_contents: HashMap<String, Vec<String>> = HashMap::with_capacity(file_locations.len());
         for loc_path_str in file_locations.keys() {
             let abs_loc_path = if Path::new(loc_path_str).is_absolute() {
                 PathBuf::from(loc_path_str)

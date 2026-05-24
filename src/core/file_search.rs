@@ -15,7 +15,7 @@ struct FileSearchCacheEntry {
 /// TTL: 5 seconds - balances freshness vs performance for @-mention autocomplete
 static FILE_SEARCH_CACHE: once_cell::sync::Lazy<
     Arc<RwLock<HashMap<String, FileSearchCacheEntry>>>,
-> = once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+> = once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(HashMap::with_capacity(4))));
 
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 

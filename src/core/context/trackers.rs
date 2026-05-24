@@ -84,8 +84,8 @@ impl FileWatcher {
         Ok(Self {
             inner: Arc::new(Mutex::new(watcher)),
             watched_paths: HashSet::new(),
-            watch_targets: HashMap::new(),
-            watched_mtimes: Arc::new(Mutex::new(HashMap::new())),
+            watch_targets: HashMap::with_capacity(8),
+            watched_mtimes: Arc::new(Mutex::new(HashMap::with_capacity(8))),
             externally_modified,
         })
     }
@@ -256,7 +256,7 @@ pub struct FileContextTracker {
 impl Default for FileContextTracker {
     fn default() -> Self {
         Self {
-            tracked_files: HashMap::new(),
+            tracked_files: HashMap::with_capacity(16),
             recently_edited_by_sned: HashSet::new(),
             recently_modified_files: Vec::new(),
             file_watcher: FileWatcher::new().ok(),

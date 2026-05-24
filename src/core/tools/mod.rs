@@ -168,7 +168,7 @@ impl Default for ToolRegistry {
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            handlers: HashMap::new(),
+            handlers: HashMap::with_capacity(16),
         }
     }
 

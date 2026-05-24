@@ -699,7 +699,7 @@ impl Provider for GeminiProvider {
             let mut accumulated_tool_calls: HashMap<
                 String,
                 (String, String, String, Option<String>),
-            > = HashMap::new();
+            > = HashMap::with_capacity(4);
             let mut completed_tool_call_ids: HashSet<String> = HashSet::new();
             let mut last_stop_reason: Option<String> = None;
             let mut stream_errored = false;

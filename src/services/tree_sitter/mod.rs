@@ -60,7 +60,7 @@ pub fn parse_file(
     let mut all_references: Vec<(tree_sitter::Node, String, usize)> = Vec::new();
 
     // Pre-identify definition blocks
-    let mut definition_nodes: HashMap<usize, String> = HashMap::new();
+    let mut definition_nodes: HashMap<usize, String> = HashMap::with_capacity(16);
 
     let mut query_cursor = tree_sitter::QueryCursor::new();
     let mut captures = query_cursor.captures(&entry.query, root_node, file_content.as_bytes());
@@ -363,8 +363,8 @@ pub fn get_functions(
     // Each match can have multiple captures. We track which match a node belongs to,
     // and for each match, the name text from its "name." capture.
     // This mirrors the TypeScript logic using node.id() -> match mapping.
-    let mut node_to_match_id: HashMap<usize, u32> = HashMap::new();
-    let mut match_to_name_text: HashMap<u32, String> = HashMap::new();
+    let mut node_to_match_id: HashMap<usize, u32> = HashMap::with_capacity(16);
+    let mut match_to_name_text: HashMap<u32, String> = HashMap::with_capacity(16);
 
     {
         let mut qc = tree_sitter::QueryCursor::new();
@@ -578,8 +578,8 @@ pub fn get_symbol_range(
     let root_node = tree.root_node();
 
     // Build mappings for nested name resolution (same as get_functions)
-    let mut node_to_match_id: HashMap<usize, u32> = HashMap::new();
-    let mut match_to_name_text: HashMap<u32, String> = HashMap::new();
+    let mut node_to_match_id: HashMap<usize, u32> = HashMap::with_capacity(16);
+    let mut match_to_name_text: HashMap<u32, String> = HashMap::with_capacity(16);
 
     {
         let mut qc = tree_sitter::QueryCursor::new();

@@ -202,7 +202,7 @@ pub struct FileLockManager {
 impl FileLockManager {
     fn new() -> Self {
         Self {
-            locks: Mutex::new(HashMap::new()),
+            locks: Mutex::new(HashMap::with_capacity(4)),
         }
     }
 

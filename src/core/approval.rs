@@ -677,7 +677,7 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
             // Show anchor summary
             if let Some(anchors) = obj.get("anchors").and_then(|v| v.as_array()) {
                 let mut file_counts: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
+                    std::collections::HashMap::with_capacity(4);
                 for anchor in anchors {
                     if let Some(file) = anchor.get("file").and_then(|v| v.as_str()) {
                         *file_counts.entry(file.to_string()).or_insert(0) += 1;
@@ -929,7 +929,7 @@ pub fn is_followup_question_active(task_id: &str) -> bool {
 /// Channel for followup question responses (full line, not single char).
 /// Keyed by task_id to support concurrent sessions.
 static FOLLOWUP_SENDER: LazyLock<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::with_capacity(2)));
 
 /// Store the sender for a followup question response.
 pub fn set_followup_sender(task_id: &str, sender: std::sync::mpsc::Sender<String>) {
@@ -1076,6 +1076,7 @@ fn build_combined_approval_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_approval_prompt_active_flag_is_initially_false() {
@@ -1188,7 +1189,7 @@ mod tests {
     fn test_prompt_non_interactive_approves() {
         // In non-interactive mode (stdin is not a tty), the tool is auto-approved
         // This is the common case in tests since cargo test redirects stdin
-        let output_writer = Arc::new(crate::cli::output::StderrOutputWriter);
+        let output_writer = std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
         let result = prompt_for_approval("execute_command", &serde_json::json!({"command": "ls"}), &output_writer)
             .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);
@@ -1197,7 +1198,7 @@ mod tests {
     #[test]
     #[ignore = "requires interactive stdin - tested manually"]
     fn test_prompt_empty_params() {
-        let output_writer = Arc::new(crate::cli::output::StderrOutputWriter);
+        let output_writer = std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
         let result = prompt_for_approval("attempt_completion", &serde_json::json!({}), &output_writer)
             .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);

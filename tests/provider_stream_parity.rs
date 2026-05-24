@@ -38,6 +38,7 @@ async fn collect_openai_chunks(sse: &str) -> Vec<ApiStreamChunk> {
         &mut accumulated_tool_calls,
         &mut completed_tool_call_indices,
         &mut last_stop_reason,
+        &None,
     )
     .await;
     drop(tx);

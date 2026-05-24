@@ -757,7 +757,7 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                     model_info: None,
                     reasoning_effort: task_opts.reasoning_effort.clone(),
                     custom_headers: user_agent.map(|ua| {
-                        let mut headers = std::collections::HashMap::new();
+                        let mut headers = std::collections::HashMap::with_capacity(1);
                         headers.insert("User-Agent".to_string(), ua);
                         headers
                     }),

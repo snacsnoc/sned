@@ -839,7 +839,7 @@ impl Provider for OpenAiProvider {
             let mut accumulated_tool_calls: std::collections::HashMap<
                 usize,
                 (String, String, String),
-            > = std::collections::HashMap::new();
+            > = std::collections::HashMap::with_capacity(4);
             let mut completed_tool_call_indices: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             let mut last_stop_reason: Option<String> = None;

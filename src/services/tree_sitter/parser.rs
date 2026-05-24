@@ -43,7 +43,7 @@ pub type LanguageParserMap = HashMap<String, LanguageParserEntry>;
 pub fn load_required_language_parsers(
     file_paths: &[impl AsRef<str>],
 ) -> Result<LanguageParserMap, LanguageParserError> {
-    let mut parsers: LanguageParserMap = HashMap::new();
+    let mut parsers: LanguageParserMap = HashMap::with_capacity(8);
 
     for file_path in file_paths {
         let ext = get_extension(file_path.as_ref());

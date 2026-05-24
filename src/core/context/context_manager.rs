@@ -356,7 +356,7 @@ fn ensure_tool_results_follow_tool_use(messages: &mut [StorageMessage]) {
         }
 
         let mut tool_result_map: std::collections::HashMap<String, UserContentBlock> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(4);
         let mut other_blocks: Vec<UserContentBlock> = Vec::new();
 
         if let MessageContent::UserBlocks(blocks) = &next_message.content {

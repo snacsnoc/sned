@@ -113,7 +113,7 @@ pub struct GeminiContent {
 fn build_tool_use_id_to_name(
     messages: &[StorageMessage],
 ) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
+    let mut map = std::collections::HashMap::with_capacity(8);
     for msg in messages {
         if let MessageContent::AssistantBlocks(blocks) = &msg.content {
             for block in blocks {

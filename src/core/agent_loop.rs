@@ -1230,7 +1230,7 @@ impl AgentLoop {
         let mut accumulated_text_signature: Option<String> = None;
         let mut accumulated_redacted_data: Vec<String> = Vec::new();
         // Use HashMap for O(1) merge + Vec to preserve insertion order (P4)
-        let mut tool_calls_map: HashMap<String, ApiStreamToolCall> = HashMap::new();
+        let mut tool_calls_map: HashMap<String, ApiStreamToolCall> = HashMap::with_capacity(4);
         let mut tool_call_order: Vec<String> = Vec::new();
         let mut tool_call_detected = false;
         let mut display_buffer = String::new();
@@ -2259,7 +2259,7 @@ impl AgentLoop {
 
             // Map results back to original indices
             let mut result_map: std::collections::HashMap<usize, String> =
-                std::collections::HashMap::new();
+                std::collections::HashMap::with_capacity(tool_tasks.len());
             let mut non_edit_iter = non_edit_results.into_iter();
             for i in 0..tool_tasks.len() {
                 if non_edit_executed.contains(&i) {
@@ -3099,7 +3099,7 @@ impl AgentLoop {
         }
 
         // Build a map of tool_use_id → message index for all tool_uses in history
-        let mut tool_use_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut tool_use_index: std::collections::HashMap<String, usize> = std::collections::HashMap::with_capacity(16);
         for (idx, msg) in history.iter().enumerate() {
             if let MessageContent::AssistantBlocks(blocks) = &msg.content {
                 for block in blocks {
@@ -4689,7 +4689,7 @@ mod tests {
 
     #[test]
     fn test_prepared_tool_call_parses_args_once_for_display_summary() {
-        let mut tool_calls = HashMap::new();
+        let mut tool_calls = HashMap::with_capacity(1);
         tool_calls.insert(
             "0".to_string(),
             ApiStreamToolCall {

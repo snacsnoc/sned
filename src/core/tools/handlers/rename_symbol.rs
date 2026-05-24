@@ -105,7 +105,7 @@ impl RenameSymbolHandler {
         let expanded_paths = expand_paths(&paths, workspace_root).await?;
 
         // Read file contents and parse symbols outside the lock to avoid blocking tokio workers
-        let mut file_contents: HashMap<String, String> = HashMap::new();
+        let mut file_contents: HashMap<String, String> = HashMap::with_capacity(paths.len().max(1));
         for abs_path in &expanded_paths {
             match fs::read_to_string(abs_path).await {
                 Ok(content) => {
@@ -178,7 +178,7 @@ impl RenameSymbolHandler {
             ToolError::ExecutionFailed(format!("Failed to load language parsers: {}", e))
         })?;
 
-        let mut locations_by_file: HashMap<String, FileData> = HashMap::new();
+        let mut locations_by_file: HashMap<String, FileData> = HashMap::with_capacity(paths.len().max(1));
 
         for abs_path in &expanded_paths {
             let content = file_contents
@@ -463,8 +463,8 @@ fn collect_symbol_occurrences(
     let normalized_requested = symbol.replace("::", ".");
 
     // Build name-resolution mappings (same as find_symbol_references / get_symbol_range)
-    let mut node_to_match_id: HashMap<usize, u32> = HashMap::new();
-    let mut match_to_name_text: HashMap<u32, String> = HashMap::new();
+    let mut node_to_match_id: HashMap<usize, u32> = HashMap::with_capacity(16);
+    let mut match_to_name_text: HashMap<u32, String> = HashMap::with_capacity(16);
 
     {
         let mut qc = tree_sitter::QueryCursor::new();

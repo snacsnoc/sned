@@ -154,7 +154,7 @@ impl Default for TaskState {
             subagents_enabled: false,
             is_subagent_execution: false,
             turns_since_save: 0,
-            file_content_cache: std::collections::HashMap::new(),
+            file_content_cache: std::collections::HashMap::with_capacity(16),
             first_tool_result_printed: false,
             compacted_summary: None,
             session_start_time: None,
@@ -167,7 +167,7 @@ impl Default for TaskState {
             commands_executed: 0,
             turns_completed: 0,
             snipped_code_blocks: Vec::new(),
-            session_file_changes: std::collections::HashMap::new(),
+            session_file_changes: std::collections::HashMap::with_capacity(8),
             last_executed_command: None,
         }
     }

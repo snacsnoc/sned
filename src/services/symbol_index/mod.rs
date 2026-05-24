@@ -51,7 +51,7 @@ const FILES_PER_BATCH: usize = 50;
 impl SymbolIndexService {
     pub fn new(project_root: String) -> Self {
         Self {
-            files: HashMap::new(),
+            files: HashMap::with_capacity(1024),
             project_root,
             db: None,
             disabled: false,

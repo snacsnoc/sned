@@ -35,7 +35,7 @@ pub struct DiagnosticsScanHandler;
 /// Cache for detect_project_type results to avoid redundant filesystem walks.
 /// Keyed by (parent directory, file extension) to handle mixed file types in same dir.
 static PROJECT_TYPE_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), ProjectType>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::with_capacity(16)));
 
 impl DiagnosticsScanHandler {
     pub fn new() -> Self {
@@ -238,7 +238,7 @@ impl DiagnosticsScanHandler {
     ) -> HashMap<PathBuf, String> {
         use futures::future::join_all;
 
-        let mut results: HashMap<PathBuf, String> = HashMap::new();
+        let mut results: HashMap<PathBuf, String> = HashMap::with_capacity(files_by_project.len().max(1));
 
         // Run diagnostics for each (project_root, project_type) group in parallel
         let futures: Vec<_> = files_by_project
@@ -537,8 +537,8 @@ impl DiagnosticsScanHandler {
 
         // Group files by (project_root, project_type) to handle mixed-language projects.
         // This ensures Rust and JS files at the same root both get their respective diagnostics.
-        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::new();
-        let mut file_info: HashMap<PathBuf, (String, Option<String>)> = HashMap::new();
+        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::with_capacity(paths.len().max(1));
+        let mut file_info: HashMap<PathBuf, (String, Option<String>)> = HashMap::with_capacity(paths.len().max(1));
         let mut error_results = Vec::new();
 
         for rel_path in &paths {

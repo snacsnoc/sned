@@ -420,7 +420,7 @@ impl EditFileHandler {
 
         // Phase 3: Capture pre-save diagnostics for all files being edited
         // Group files by (project_root, project_type) to handle mixed-language projects
-        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::new();
+        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::with_capacity(prepared_batches.len());
         for (batch, _) in &prepared_batches {
             let path = PathBuf::from(&batch.absolute_path);
             let project_type = DiagnosticsScanHandler::detect_project_type(&path);
@@ -453,7 +453,7 @@ impl EditFileHandler {
         let mut pre_diagnostics: std::collections::HashMap<
             String,
             Vec<crate::core::tools::handlers::diagnostics_scan::Diagnostic>,
-        > = std::collections::HashMap::new();
+        > = std::collections::HashMap::with_capacity(prepared_batches.len());
         for (batch, _) in &prepared_batches {
             let diag_output = batch_diag_outputs
                 .get(&PathBuf::from(&batch.absolute_path))
@@ -565,7 +565,7 @@ impl EditFileHandler {
         // If any file fails to write, restore all previously written files to original content
         if !write_items.is_empty() {
             // Snapshot original content for all files before any writes
-            let mut original_contents: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut original_contents: std::collections::HashMap<String, String> = std::collections::HashMap::with_capacity(write_items.len());
             for item in &write_items {
                 if let Ok(c) = tokio::fs::read_to_string(&item.absolute_path).await {
                     original_contents.insert(item.absolute_path.clone(), c);
@@ -724,11 +724,11 @@ impl EditFileHandler {
         let mut post_diagnostics_by_file: std::collections::HashMap<
             String,
             Vec<crate::core::tools::handlers::diagnostics_scan::Diagnostic>,
-        > = std::collections::HashMap::new();
+        > = std::collections::HashMap::with_capacity(successfully_edited_files.len());
 
         if any_pre_errors && !successfully_edited_files.is_empty() {
             // Group successfully edited files by (project_root, project_type)
-            let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::new();
+            let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::with_capacity(successfully_edited_files.len());
             for (abs_path, _) in &successfully_edited_files {
                 let path = PathBuf::from(abs_path);
                 let project_type = DiagnosticsScanHandler::detect_project_type(&path);

@@ -30,7 +30,7 @@ pub struct OpenRouterProvider {
 impl OpenRouterProvider {
     pub fn new(config: OpenRouterConfig) -> Result<Self> {
         // OpenRouter-specific custom headers
-        let mut custom_headers = HashMap::new();
+        let mut custom_headers = HashMap::with_capacity(4);
         custom_headers.insert("HTTP-Referer".to_string(), "https://sned.run".to_string());
         custom_headers.insert("X-Title".to_string(), "Sned".to_string());
         custom_headers.insert(

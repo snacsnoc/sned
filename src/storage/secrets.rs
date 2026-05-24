@@ -49,7 +49,7 @@ pub const SECRET_KEYS: &[&str] = &[
 
 /// Environment variable to secret key mapping (from ENV_VAR_TO_SECRET_KEY in env-config.ts)
 pub fn env_var_to_secret_key() -> HashMap<&'static str, &'static str> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::with_capacity(16);
     map.insert("ANTHROPIC_API_KEY", "apiKey");
     map.insert("OPENAI_API_KEY", "openAiApiKey");
     map.insert("AZURE_OPENAI_API_KEY", "openAiApiKey");
@@ -85,7 +85,7 @@ pub fn env_var_to_secret_key() -> HashMap<&'static str, &'static str> {
 
 /// Environment variable to settings key mapping (from ENV_VAR_TO_SETTINGS_KEY in env-config.ts)
 pub fn env_var_to_settings_key() -> HashMap<&'static str, &'static str> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::with_capacity(8);
     map.insert("GOOGLE_CLOUD_PROJECT", "vertexProjectId");
     map.insert("GCP_PROJECT", "vertexProjectId");
     map.insert("GOOGLE_CLOUD_LOCATION", "vertexRegion");
@@ -99,7 +99,7 @@ pub fn env_var_to_settings_key() -> HashMap<&'static str, &'static str> {
 
 /// Get secrets from environment variables
 pub fn get_secrets_from_env() -> HashMap<String, String> {
-    let mut secrets = HashMap::new();
+    let mut secrets = HashMap::with_capacity(16);
     let env_map = env_var_to_secret_key();
 
     for (env_var, secret_key) in env_map.iter() {
@@ -130,7 +130,7 @@ pub fn get_secrets_from_env() -> HashMap<String, String> {
 
 /// Get settings from environment variables
 pub fn get_settings_from_env() -> HashMap<String, String> {
-    let mut settings = HashMap::new();
+    let mut settings = HashMap::with_capacity(8);
     let env_map = env_var_to_settings_key();
 
     for (env_var, settings_key) in env_map.iter() {
@@ -255,10 +255,10 @@ impl SecretsStore {
                         error = %error,
                         "Failed to parse secrets JSON"
                     );
-                    HashMap::new()
+                    HashMap::with_capacity(0)
                 }
             },
-            Err(_) => HashMap::new(),
+            Err(_) => HashMap::with_capacity(0),
         }
     }
 

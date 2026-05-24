@@ -175,7 +175,7 @@ fn strip_common_indent(lines: &[&str]) -> Vec<String> {
         .iter()
         .filter(|line| !line.trim().is_empty())
         .map(|line| line.len() - line.trim_start().len())
-        .fold(std::collections::HashMap::new(), |mut acc, indent| {
+        .fold(std::collections::HashMap::with_capacity(4), |mut acc, indent| {
             *acc.entry(indent).or_insert(0) += 1;
             acc
         });

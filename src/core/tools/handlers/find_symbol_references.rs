@@ -190,8 +190,8 @@ fn collect_hits_for_file(
     let mut query_cursor = tree_sitter::QueryCursor::new();
     let mut captures = query_cursor.captures(&entry.query, root_node, content.as_bytes());
 
-    let mut node_to_match: HashMap<usize, tree_sitter::Node> = HashMap::new();
-    let mut capture_text_by_node: HashMap<usize, String> = HashMap::new();
+    let mut node_to_match: HashMap<usize, tree_sitter::Node> = HashMap::with_capacity(16);
+    let mut capture_text_by_node: HashMap<usize, String> = HashMap::with_capacity(16);
 
     while let Some((match_, capture_index)) = captures.next() {
         let capture = match_.captures[*capture_index];
@@ -322,6 +322,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            None,
         );
 
         let params = serde_json::json!({

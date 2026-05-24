@@ -1222,11 +1222,11 @@ impl StateManager {
 
         Ok(Self {
             global_state: RwLock::new(GlobalState::default()),
-            task_state: RwLock::new(HashMap::new()),
-            secrets: RwLock::new(HashMap::new()),
-            workspace_state: RwLock::new(HashMap::new()),
+            task_state: RwLock::new(HashMap::with_capacity(8)),
+            secrets: RwLock::new(HashMap::with_capacity(4)),
+            workspace_state: RwLock::new(HashMap::with_capacity(8)),
             pending_global_keys: Mutex::new(HashSet::new()),
-            pending_task_states: Mutex::new(HashMap::new()),
+            pending_task_states: Mutex::new(HashMap::with_capacity(4)),
             pending_secrets: Mutex::new(HashSet::new()),
             last_persist: Mutex::new(None),
             secrets_store,
@@ -1823,7 +1823,7 @@ impl StateManager {
     fn load_workspace_state(&self) -> io::Result<WorkspaceState> {
         let file_path = self.state_dir.join("workspace_state.json");
         if !file_path.exists() {
-            return Ok(HashMap::new());
+            return Ok(HashMap::with_capacity(0));
         }
 
         let contents = fs::read_to_string(&file_path)?;
@@ -1857,7 +1857,7 @@ impl StateManager {
                         "Failed to parse workspace state JSON and backup failed"
                     );
                 }
-                Ok(HashMap::new())
+                Ok(HashMap::with_capacity(0))
             }
         }
     }

@@ -92,7 +92,7 @@ impl BatchProcessor {
     ) -> Vec<FileEditBatch> {
         let mut batches: Vec<FileEditBatch> = Vec::new();
         let mut seen_paths: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(file_edits.len());
 
         for (display_path, edits) in file_edits {
             if let Some(absolute_path) = resolve_path(display_path) {
