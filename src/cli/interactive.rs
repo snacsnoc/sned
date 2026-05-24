@@ -453,7 +453,8 @@ async fn handle_key_event(
             // Exit cleanly
             return Ok(Some(Action::Quit));
         } else {
-            // Clear input
+            // Clear input with visual feedback
+            app.push_plain("^C");
             app.input = tui_textarea::TextArea::new(Vec::new());
             return Ok(None);
         }
