@@ -6,10 +6,10 @@
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::cli::output::{OutputEvent, OutputWriterArc, ChannelOutputWriter};
 use crate::cli::tui::{App, ansi_to_ratatui_lines};
+use crate::cli::tui::history::append_to_history;
 use futures::FutureExt;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -30,92 +30,6 @@ fn format_duration(duration: Duration) -> String {
         format!("{}s", total_secs)
     }
 }
-
-// --------------------------------------------------------------------------
-// Command History
-// --------------------------------------------------------------------------
-
-/// Get the path to the CLI history file (~/.sned/cli_history)
-fn get_history_file_path() -> PathBuf {
-    crate::storage::disk::get_sned_dir().join("cli_history")
-}
-
-/// Load command history from the history file.
-/// Returns the last N lines (most recent last), where N is configurable.
-fn load_command_history() -> Vec<String> {
-    let history_path = get_history_file_path();
-    if !history_path.exists() {
-        return Vec::new();
-    }
-
-    match std::fs::read_to_string(&history_path) {
-        Ok(content) => {
-            // Split into lines, filter empty, take last N (configurable)
-            let mut lines: Vec<String> = content
-                .lines()
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            // Keep only the most recent lines
-            let max = max_history_lines();
-            if lines.len() > max {
-                lines = lines[lines.len() - max..].to_vec();
-            }
-
-            lines
-        }
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Append a command to the history file.
-/// Creates the file if it doesn't exist.
-/// Trims the file to the configured max (default 10000) if it grows too large.
-fn append_to_history(command: &str) {
-    if command.trim().is_empty() {
-        return;
-    }
-
-    let history_path = get_history_file_path();
-    let default_path = PathBuf::from(".");
-    let dir = history_path.parent().unwrap_or(&default_path);
-
-    // Ensure directory exists
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        eprintln!("Warning: Failed to create history directory: {}", e);
-        return;
-    }
-
-    // Read existing history
-    let mut history = load_command_history();
-
-    // Add new command
-    history.push(command.to_string());
-
-    // Trim to max size
-    let max = max_history_lines();
-    if history.len() > max {
-        history = history[history.len() - max..].to_vec();
-    }
-
-    // Write back atomically
-    let content = history.join("\n") + "\n";
-    if let Err(e) = crate::storage::disk::atomic_write_file(&history_path, &content) {
-        eprintln!("Warning: Failed to save command history: {}", e);
-    }
-}
-
-/// Maximum number of history lines to keep in the history file.
-/// Configurable via `SNED_HISTORY_LINES` environment variable.
-fn max_history_lines() -> usize {
-    std::env::var("SNED_HISTORY_LINES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(10_000)
-}
-
 
 
 /// Format context window size as human-readable string (e.g., "200K context").
@@ -589,24 +503,15 @@ async fn handle_key_event(
     
     // Up/Down for command history navigation
     if key.code == KeyCode::Up && app.input.cursor().0 == 0 && app.input.cursor().1 == 0 {
-        if !app.command_history.is_empty() && app.history_index < app.command_history.len() as isize - 1 {
-            app.history_index += 1;
-            let idx = (app.command_history.len() as isize - 1 - app.history_index) as usize;
-            if let Some(entry) = app.command_history.get(idx) {
-                app.input = tui_textarea::TextArea::new(vec![entry.clone()]);
-            }
+        if let Some(entry) = app.history.navigate_up() {
+            app.input = tui_textarea::TextArea::new(vec![entry.to_string()]);
         }
         return Ok(None);
     }
-    if key.code == KeyCode::Down && !app.command_history.is_empty() && app.history_index >= 0 {
-        if app.history_index > 0 {
-            app.history_index -= 1;
-            let idx = (app.command_history.len() as isize - 1 - app.history_index) as usize;
-            if let Some(entry) = app.command_history.get(idx) {
-                app.input = tui_textarea::TextArea::new(vec![entry.clone()]);
-            }
+    if key.code == KeyCode::Down && app.history.is_navigating() {
+        if let Some(entry) = app.history.navigate_down() {
+            app.input = tui_textarea::TextArea::new(vec![entry.to_string()]);
         } else {
-            app.history_index = -1;
             app.input = tui_textarea::TextArea::new(Vec::new());
         }
         return Ok(None);
@@ -698,8 +603,7 @@ async fn handle_cli_only_command(
             app.push_plain("Conversation cleared.");
         }
         CliOnlyCommand::History => {
-            let history = load_command_history();
-            let last_n: Vec<&str> = history.iter().rev().take(10).map(|s| s.as_str()).collect();
+            let last_n: Vec<String> = app.history.entries().iter().rev().take(10).cloned().collect();
             if last_n.is_empty() {
                 app.push_plain("No command history.");
             } else {
@@ -1171,8 +1075,9 @@ async fn run_main_loop(
                         match action {
                             Action::Quit => return Ok(()),
                             Action::Submit(text) => {
-                                // Save to command history
+                                // Save to command history and reset navigation
                                 append_to_history(&text);
+                                app.history.reload();
                                 
                                 // Check for CLI-only slash commands FIRST
                                 if let Some(cli_cmd) = crate::cli::slash_commands::get_cli_only_command(&text) {
@@ -1306,9 +1211,9 @@ pub async fn run_interactive_shell_inner(
     let agent_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(None));
     
-    // Load command history into app
-    app.command_history = load_command_history();
-    app.history_index = -1;
+    // Command history is loaded by App::new() via FileHistory::load()
+    // Reload in case history was written by another session
+    app.history.reload();
     
     {
         let sess = session.lock().await;

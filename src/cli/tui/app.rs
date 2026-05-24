@@ -12,6 +12,7 @@ use ratatui::{
 use tui_textarea::TextArea;
 use std::time::Instant;
 use crate::core::file_search::FileSearchResult;
+use super::history::FileHistory;
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -39,10 +40,8 @@ pub struct App {
     pub picker_results: Vec<FileSearchResult>,
     /// Selected index in picker results
     pub picker_index: usize,
-    /// Command history (most recent last)
-    pub command_history: Vec<String>,
-    /// Current history navigation index (-1 = no selection, 0 = most recent)
-    pub history_index: isize,
+    /// File-backed command history with navigation state
+    pub history: FileHistory,
 }
 
 impl App {
@@ -61,8 +60,7 @@ impl App {
             picker_active: false,
             picker_results: Vec::new(),
             picker_index: 0,
-            command_history: Vec::new(),
-            history_index: -1,
+            history: FileHistory::load(),
         }
     }
 
