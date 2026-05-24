@@ -552,10 +552,9 @@ impl ExecuteCommandHandler {
         use tokio::process::Command;
         use tokio::time::timeout;
 
-        // Apply safety checker for shell scripts (bash/sh/zsh)
-        // Python and Node.js scripts are not validated by the safety checker
+        // Apply safety checker for all script languages
         if !explicitly_approved
-            && matches!(language, "bash" | "sh" | "zsh")
+            && matches!(language, "bash" | "sh" | "zsh" | "python" | "python3" | "node" | "javascript")
             && let Err(e) = self.safety_checker.is_safe(script)
         {
             tracing::warn!(script = %script, reason = %e, "script rejected by safety checker");
