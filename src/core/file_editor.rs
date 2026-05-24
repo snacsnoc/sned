@@ -104,7 +104,7 @@ static ANCHOR_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 // ============================================================================
 
 /// Tracked document state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TrackedDocument {
     hashes: Vec<u64>,
     anchors: Vec<String>,
@@ -122,10 +122,53 @@ struct AnchorStorage {
 }
 
 impl AnchorStorage {
-    fn new() -> Self {
+    /// Load anchor state from disk (~/.sned/data/cache/anchors.json)
+    fn load() -> Self {
+        let cache_dir = crate::storage::disk::get_data_dir().join("cache");
+        let anchors_file = cache_dir.join("anchors.json");
+
+        if let Ok(content) = std::fs::read_to_string(&anchors_file) {
+            match serde_json::from_str::<IndexMap<String, IndexMap<String, TrackedDocument>>>(&content)
+            {
+                Ok(tasks) => {
+                    tracing::debug!("Loaded {} task(s) from anchor cache", tasks.len());
+                    return Self {
+                        tasks,
+                        dictionary: Vec::new(),
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse anchor cache: {}", e);
+                }
+            }
+        }
+
         Self {
             tasks: IndexMap::new(),
             dictionary: Vec::new(),
+        }
+    }
+
+    /// Save anchor state to disk
+    fn save(&self) {
+        let cache_dir = crate::storage::disk::get_data_dir().join("cache");
+        let anchors_file = cache_dir.join("anchors.json");
+
+        // Ensure cache directory exists
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            tracing::warn!("Failed to create cache directory: {}", e);
+            return;
+        }
+
+        match serde_json::to_string_pretty(&self.tasks) {
+            Ok(json) => {
+                if let Err(e) = crate::storage::disk::atomic_write_file(&anchors_file, &json) {
+                    tracing::warn!("Failed to save anchor cache: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize anchor cache: {}", e);
+            }
         }
     }
 
@@ -236,7 +279,7 @@ pub struct AnchorStateManager {
 impl AnchorStateManager {
     pub fn new() -> Self {
         Self {
-            storage: Arc::new(Mutex::new(AnchorStorage::new())),
+            storage: Arc::new(Mutex::new(AnchorStorage::load())),
         }
     }
 
@@ -250,12 +293,12 @@ impl AnchorStateManager {
     /// on collision to find an unused combination.
     fn get_word_for_hash(
         &self,
-        line_hash: u32,
+        line_hash: u64,
         used_words_set: &HashSet<String>,
         dictionary: &[String],
     ) -> String {
         let dict_len = dictionary.len();
-        let mut salt = 0u32;
+        let mut salt = 0u64;
 
         loop {
             // Mix salt into hash for collision resolution
@@ -487,6 +530,10 @@ impl AnchorStateManager {
         };
         let anchors = tracked.anchors.clone();
         self.update_state(absolute_path, tracked, task_id);
+        
+        // Persist anchor state to disk
+        self.save();
+        
         anchors
     }
 
@@ -511,6 +558,8 @@ impl AnchorStateManager {
         state.shift_remove(absolute_path);
         let mut storage = self.storage();
         storage.tasks.insert(task_id.to_string(), state);
+        drop(storage);
+        self.save();
     }
 
     /// Resets all anchors for a specific task or all tasks.
@@ -521,6 +570,13 @@ impl AnchorStateManager {
         } else {
             storage.tasks.clear();
         }
+        self.save();
+    }
+
+    /// Persists anchor state to disk.
+    pub fn save(&self) {
+        let storage = self.storage();
+        storage.save();
     }
 }
 
@@ -541,9 +597,9 @@ enum DiffChange {
     Unchanged(usize),
 }
 
-/// Computes diff between two arrays of u32 values.
+/// Computes diff between two arrays of u64 values.
 ///
-fn diff_arrays(old: &[u32], new: &[u32]) -> Vec<DiffChange> {
+fn diff_arrays(old: &[u64], new: &[u64]) -> Vec<DiffChange> {
     use similar::{Algorithm, DiffOp};
 
     let mut changes: Vec<DiffChange> = Vec::new();
