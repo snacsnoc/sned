@@ -4,6 +4,7 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_string_array};
+use crate::cli::output::OutputEvent;
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -106,8 +107,9 @@ impl ExecuteCommandHandler {
         commands: Vec<String>,
         cwd: Option<&Path>,
     ) -> anyhow::Result<String> {
+        let output_writer: crate::cli::output::OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         // Default: apply safety checks (not explicitly approved)
-        self.execute_commands_with_timeout(commands, cwd, None, false, None, false, false)
+        self.execute_commands_with_timeout(commands, cwd, None, false, None, false, false, &output_writer)
             .await
     }
 
@@ -124,6 +126,7 @@ impl ExecuteCommandHandler {
         task_state: Option<Arc<Mutex<TaskState>>>,
         raw_output: bool,
         json_output: bool,
+        output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         self.execute_commands_with_timeout(
             commands,
@@ -133,6 +136,7 @@ impl ExecuteCommandHandler {
             task_state,
             raw_output,
             json_output,
+            output_writer,
         )
         .await
     }
@@ -146,6 +150,7 @@ impl ExecuteCommandHandler {
         task_state: Option<Arc<Mutex<TaskState>>>,
         _raw_output: bool,
         json_output: bool,
+        output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         self.execute_commands_tokio(
             commands,
@@ -154,6 +159,7 @@ impl ExecuteCommandHandler {
             explicitly_approved,
             task_state,
             json_output,
+            output_writer,
         )
         .await
     }
@@ -166,6 +172,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         json_output: bool,
+        output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -186,10 +193,7 @@ impl ExecuteCommandHandler {
             tracing::debug!(command = %cmd_str, cwd = ?cwd, "executing command");
 
             if !json_output {
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::info(&format!("Running: {}", cmd_str))
-                );
+                output_writer.emit(OutputEvent::info(format!("Running: {}", cmd_str)));
             }
 
             // Execute via shell for portability and shell feature support
@@ -525,7 +529,8 @@ impl ExecuteCommandHandler {
         language: &str,
         cwd: Option<&Path>,
     ) -> anyhow::Result<String> {
-        self.execute_script_with_timeout(script, language, cwd, None, false)
+        let output_writer: crate::cli::output::OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        self.execute_script_with_timeout(script, language, cwd, None, false, &output_writer)
             .await
     }
 
@@ -536,6 +541,7 @@ impl ExecuteCommandHandler {
         cwd: Option<&Path>,
         timeout_override: Option<Duration>,
         explicitly_approved: bool,
+        _output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
         use tokio::io::AsyncReadExt;
@@ -704,7 +710,8 @@ impl ExecuteCommandHandler {
         _state: &mut TaskState,
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
-        self.execute_without_state(None, params, None, false, None, false)
+        let output_writer: crate::cli::output::OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        self.execute_without_state(None, params, None, false, None, false, &output_writer)
             .await
     }
 
@@ -716,6 +723,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         json_output: bool,
+        output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
         let commands = coerce_string_array(&params, "commands", "command");
         let commands = if commands.is_empty() {
@@ -736,11 +744,12 @@ impl ExecuteCommandHandler {
                 task_state,
                 raw_output,
                 json_output,
+                output_writer,
             )
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
         } else if let Some(s) = script {
-            self.execute_script_with_timeout(s, language, cwd, None, explicitly_approved)
+            self.execute_script_with_timeout(s, language, cwd, None, explicitly_approved, output_writer)
                 .await
                 .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
         } else {
@@ -767,6 +776,7 @@ impl ToolHandler for ExecuteCommandHandler {
             ctx.explicitly_approved,
             Some(ctx.state.clone()),
             ctx.json_output,
+            &ctx.output_writer,
         )
         .await
         .map(serde_json::Value::String)
@@ -828,6 +838,7 @@ mod tests {
         let pid_file = temp_dir.path().join("pid.txt");
         let command = format!("echo $$ > {}; while :; do :; done", pid_file.display());
 
+        let output_writer: crate::cli::output::OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let result = handler
             .execute_commands_with_timeout(
                 vec![command],
@@ -837,6 +848,7 @@ mod tests {
                 None,
                 false,
                 false,
+                &output_writer,
             )
             .await;
 
@@ -872,6 +884,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let pid_file = temp_dir.path().join("pid.txt");
         let script = format!("echo $$ > {}; while :; do :; done", pid_file.display());
+        let output_writer: crate::cli::output::OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
 
         let result = handler
             .execute_script_with_timeout(
@@ -880,6 +893,7 @@ mod tests {
                 None,
                 Some(Duration::from_millis(100)),
                 false,
+                &output_writer,
             )
             .await;
 
@@ -948,6 +962,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"commands": ["pwd"]}))
@@ -981,6 +996,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = ToolHandler::execute(
@@ -1012,6 +1028,7 @@ mod tests {
             .metrics()
             .num_alive_tasks();
 
+        let output_writer: crate::cli::output::OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let result = handler
             .execute_commands_with_timeout(
                 vec![command],
@@ -1021,6 +1038,7 @@ mod tests {
                 None,
                 false,
                 false,
+                &output_writer,
             )
             .await;
 
@@ -1060,6 +1078,7 @@ mod tests {
             let handler = ExecuteCommandHandler::new().with_yolo(true);
             let temp_dir = tempfile::tempdir().unwrap();
             let grandchild_pid_file = temp_dir.path().join("grandchild_pid.txt");
+            let output_writer: crate::cli::output::OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
 
             // Spawn a shell that creates a background grandchild process
             // The grandchild writes its PID to a file so we can check if it's alive
@@ -1077,6 +1096,7 @@ mod tests {
                     None,
                     false,
                     false,
+                    &output_writer,
                 )
                 .await;
 
@@ -1122,6 +1142,7 @@ mod tests {
                 "(sleep 300 & echo $! > {}); while :; do :; done",
                 grandchild_pid_file.display()
             );
+            let output_writer: crate::cli::output::OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
 
             let result = handler
                 .execute_script_with_timeout(
@@ -1130,6 +1151,7 @@ mod tests {
                     None,
                     Some(Duration::from_millis(200)),
                     false,
+                    &output_writer,
                 )
                 .await;
 

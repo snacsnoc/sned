@@ -17,6 +17,7 @@ pub use crate::core::agent_types::{
 use crate::core::agent_types::{
     MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE, MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT,
 };
+use crate::cli::output::OutputEvent;
 use crate::core::context::{ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager, context_window};
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::provider_retry::{RetryConfig, create_message_with_retry};
@@ -916,7 +917,7 @@ impl AgentLoop {
 
                     // Print session summary (not in JSON mode)
                     if !self.config.json_output {
-                        Self::print_session_summary(&self.state, self.config.interactive_mode).await;
+                        Self::print_session_summary(&self.state, self.config.interactive_mode, &self.config.output_writer).await;
                     }
 
                     // Persist state to disk before exiting
@@ -1041,10 +1042,10 @@ impl AgentLoop {
                         Some(vec![start as i32, end as i32]);
                     state_manager.add_task_to_history(history_item);
                     if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
-                        eprintln!(
-                            "[agent_loop] Failed to persist state after compaction: {}",
+                        self.config.output_writer.emit(OutputEvent::error(format!(
+                            "Failed to persist state after compaction: {}",
                             e
-                        );
+                        )));
                     }
                 }
             }
@@ -1089,6 +1090,7 @@ impl AgentLoop {
             self.config.task_id.clone(),
             self.deps.hook_manager.clone(),
             false, // Initial context: not explicitly approved (approval happens per-tool)
+            self.config.output_writer.clone(),
         ));
         let system_prompt = if let Some(prompt) = self.deps.cached_system_prompt.clone() {
             prompt
@@ -1268,17 +1270,11 @@ impl AgentLoop {
                 && first_chunk_start.elapsed().as_secs() >= 3
             {
                 slow_connection_warned = true;
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::colorize_stderr(
-                        "⏳ Waiting for API response (slow connection?)...",
-                        &format!(
-                            "{}{}",
-                            crate::cli::colors::style::YELLOW,
-                            crate::cli::colors::style::DIM
-                        ),
-                    )
-                );
+                use ratatui::style::{Color, Modifier, Style};
+                self.config.output_writer.emit(OutputEvent::styled(
+                    "⏳ Waiting for API response (slow connection?)...",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+                ));
             }
 
             if !first_chunk_received {
@@ -1366,13 +1362,11 @@ impl AgentLoop {
                                             } else {
                                                 None
                                             };
-                                            eprintln!(
-                                                "{}",
-                                                crate::cli::colors::colorize_stderr(
-                                                    &snipped_code_block_hint(index),
-                                                    crate::cli::colors::style::DIM
-                                                )
-                                            );
+                                            use ratatui::style::{Modifier, Style};
+                                            self.config.output_writer.emit(OutputEvent::styled(
+                                                snipped_code_block_hint(index),
+                                                Style::default().add_modifier(Modifier::DIM),
+                                            ));
                                         }
                                         in_code_block = false;
                                         code_block_lang.clear();
@@ -1459,13 +1453,11 @@ impl AgentLoop {
                                     summary
                                 };
 
-                                eprintln!(
-                                    "{}",
-                                    crate::cli::colors::colorize_stderr(
-                                        &format!("  Ɵ {}", truncated),
-                                        crate::cli::colors::style::DIM
-                                    )
-                                );
+                                use ratatui::style::{Modifier, Style};
+                                self.config.output_writer.emit(OutputEvent::styled(
+                                    format!("  Ɵ {}", truncated),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ));
                                 reasoning_preview_shown = true;
                             }
                         }
@@ -1567,33 +1559,31 @@ impl AgentLoop {
                     if !self.config.json_output {
                         let total_tokens = tokens_in + tokens_out;
                         let cost = usage_chunk.total_cost.unwrap_or(0.0);
-                        eprintln!(
-                            "{}",
-                            crate::cli::colors::colorize_stderr(
-                                &format!(
-                                    "  📊 {} tokens{} | ${:.4} | {:.0}% context",
-                                    if total_tokens >= 1000 {
-                                        format!("{:.1}K", total_tokens as f64 / 1000.0)
-                                    } else {
-                                        total_tokens.to_string()
-                                    },
-                                    if usage_chunk.reasoning_tokens.unwrap_or(0) > 0 {
-                                        format!(" ({} reasoning)", usage_chunk.reasoning_tokens.unwrap())
-                                    } else {
-                                        String::new()
-                                    },
-                                    cost,
-                                    context_usage_pct
-                                ),
-                                crate::cli::colors::style::DIM
-                            )
-                        );
+                        use ratatui::style::{Modifier, Style};
+                        self.config.output_writer.emit(OutputEvent::styled(
+                            format!(
+                                "  📊 {} tokens{} | ${:.4} | {:.0}% context",
+                                if total_tokens >= 1000 {
+                                    format!("{:.1}K", total_tokens as f64 / 1000.0)
+                                } else {
+                                    total_tokens.to_string()
+                                },
+                                if usage_chunk.reasoning_tokens.unwrap_or(0) > 0 {
+                                    format!(" ({} reasoning)", usage_chunk.reasoning_tokens.unwrap())
+                                } else {
+                                    String::new()
+                                },
+                                cost,
+                                context_usage_pct
+                            ),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ));
                     }
                 }
                 ApiStreamChunk::ToolCalls(tool_chunk) => {
                     // Print separator when first tool call is detected
                     if !tool_call_detected && !self.config.json_output {
-                        eprintln!();
+                        self.config.output_writer.flush();
                         tool_call_detected = true;
                     }
 
@@ -1619,7 +1609,7 @@ impl AgentLoop {
                     // Print tool call header only on first appearance of this tool call key
                     if !self.config.json_output && !tool_calls_map.contains_key(&key) {
                         let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
-                        eprintln!("{}", crate::cli::colors::tool_call_header(tool_name));
+                        self.config.output_writer.emit(OutputEvent::tool_call(format!("▶ {}", tool_name)));
                     }
                     if self.config.json_output {
                         tracing::info!(
@@ -1751,22 +1741,20 @@ impl AgentLoop {
                 } else {
                     None
                 };
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::colorize_stderr(
-                        &snipped_code_block_hint(index),
-                        crate::cli::colors::style::DIM
-                    )
-                );
+                use ratatui::style::{Modifier, Style};
+                self.config.output_writer.emit(OutputEvent::styled(
+                    snipped_code_block_hint(index),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
             }
-            eprintln!(); // Ensure we're on a fresh line for tool summaries
+            self.config.output_writer.flush();
         } else if !display_buffer.is_empty() && !self.config.json_output {
             let remaining = display_buffer.trim_end().to_string();
             if !remaining.is_empty() {
                 print_model_line(&remaining, &self.config.output_writer);
             }
         } else if !self.config.json_output {
-            eprintln!(); // Ensure newline even if buffer was empty
+            self.config.output_writer.flush();
         }
         let _ = io::stderr().flush();
 
@@ -1969,10 +1957,11 @@ impl AgentLoop {
                         .as_ref()
                         .unwrap_or(&serde_json::Value::Null);
                     let summary = format_tool_summary(tool_name, tool_params);
-                    eprintln!(
-                        "{}",
-                        crate::cli::colors::colorize_stderr(&summary, crate::cli::colors::style::DIM)
-                    );
+                    use ratatui::style::{Modifier, Style};
+                    self.config.output_writer.emit(OutputEvent::styled(
+                        summary,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
                 }
                 let _ = io::stderr().flush();
             }
@@ -2341,79 +2330,51 @@ impl AgentLoop {
                             }
                         }
                         let status = if is_error { "✗" } else { "✓" };
-                        eprintln!(
-                            "{}",
-                            crate::cli::colors::colorize_stderr(
-                                &format!("  {} {}", status, stats),
-                                if is_error {
-                                    crate::cli::colors::style::RED
-                                } else {
-                                    crate::cli::colors::style::GREEN
-                                }
-                            )
-                        );
+                        use ratatui::style::{Color, Style};
+                        self.config.output_writer.emit(OutputEvent::styled(
+                            format!("  {} {}", status, stats),
+                            Style::default().fg(if is_error { Color::Red } else { Color::Green }),
+                        ));
                         if is_error && added == 0 && removed == 0 {
-                            eprintln!(
-                                "{}",
-                                crate::cli::colors::colorize_stderr(
-                                    "  💡 Hint: If edit_file keeps failing, use write_to_file to rewrite the entire file instead.",
-                                    crate::cli::colors::style::DIM
-                                )
-                            );
+                            use ratatui::style::{Modifier, Style};
+                            self.config.output_writer.emit(OutputEvent::styled(
+                                "  💡 Hint: If edit_file keeps failing, use write_to_file to rewrite the entire file instead.".to_string(),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ));
                         }
                     } else if tool_name == "execute_command" {
                         let max_lines = MAX_COMMAND_RESULT_DISPLAY_LINES;
                         let displayed = format_tool_result(&result_text, max_lines);
                         let status = if is_error { "✗" } else { "✓" };
                         let first_line = displayed.lines().next().unwrap_or("");
-                        // Consistent 2-space indent for all tool results
-                        eprintln!(
-                            "{}",
-                            crate::cli::colors::colorize_stderr(
-                                &format!("  {} {}", status, first_line),
-                                if is_error {
-                                    crate::cli::colors::style::RED
-                                } else {
-                                    crate::cli::colors::style::GREEN
-                                }
-                            )
-                        );
+                        use ratatui::style::{Color, Style};
+                        self.config.output_writer.emit(OutputEvent::styled(
+                            format!("  {} {}", status, first_line),
+                            Style::default().fg(if is_error { Color::Red } else { Color::Green }),
+                        ));
                     } else {
                         let max_lines = MAX_TOOL_RESULT_DISPLAY_LINES;
                         let displayed = format_tool_result(&result_text, max_lines);
                         let status = if is_error { "✗" } else { "✓" };
                         let mut display_lines = displayed.lines();
                         let first = display_lines.next().unwrap_or("");
-                        // Consistent 2-space indent for all tool results
-                        eprintln!(
-                            "{}",
-                            crate::cli::colors::colorize_stderr(
-                                &format!("  {} {}", status, first),
-                                if is_error {
-                                    crate::cli::colors::style::RED
-                                } else {
-                                    crate::cli::colors::style::GREEN
-                                }
-                            )
-                        );
+                        use ratatui::style::{Color, Modifier, Style};
+                        self.config.output_writer.emit(OutputEvent::styled(
+                            format!("  {} {}", status, first),
+                            Style::default().fg(if is_error { Color::Red } else { Color::Green }),
+                        ));
                         for line in display_lines.take(2) {
-                            eprintln!(
-                                "{}",
-                                crate::cli::colors::colorize_stderr(
-                                    &format!("    {}", line),
-                                    crate::cli::colors::style::DIM
-                                )
-                            );
+                            self.config.output_writer.emit(OutputEvent::styled(
+                                format!("    {}", line),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ));
                         }
                         let total_lines = displayed.lines().count();
                         if total_lines > 3 {
-                            eprintln!(
-                                "{}",
-                                crate::cli::colors::colorize_stderr(
-                                    &format!("    ... {} more lines", total_lines - 3),
-                                    crate::cli::colors::style::DIM
-                                )
-                            );
+                            self.config.output_writer.emit(OutputEvent::styled(
+                                format!("    ... {} more lines", total_lines - 3),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ));
                         }
                     }
                 }
@@ -2453,7 +2414,7 @@ impl AgentLoop {
             }
             if !tool_result_blocks.is_empty() {
                 if !self.config.json_output {
-                    eprintln!();
+                    self.config.output_writer.flush();
                 }
 
                 let mut history = self.conversation_history.lock().await;
@@ -2545,13 +2506,11 @@ impl AgentLoop {
             }
 
             if !edit_files.is_empty() && !self.config.json_output {
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::colorize_stderr(
-                        &format_heat_map(&edit_files),
-                        crate::cli::colors::style::DIM
-                    )
-                );
+                use ratatui::style::{Modifier, Style};
+                self.config.output_writer.emit(OutputEvent::styled(
+                    format_heat_map(&edit_files),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
 
                 // Auto-commit to shadow git after file-modifying turns
                 // Only commit if files were actually modified (not just attempted or failed)
@@ -2611,13 +2570,11 @@ impl AgentLoop {
                 }
 
                 if !parts.is_empty() {
-                    eprintln!(
-                        "{}",
-                        crate::cli::colors::colorize_stderr(
-                            &format!("  📝 {}", parts.join(", ")),
-                            crate::cli::colors::style::DIM
-                        )
-                    );
+                    use ratatui::style::{Modifier, Style};
+                    self.config.output_writer.emit(OutputEvent::styled(
+                        format!("  📝 {}", parts.join(", ")),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
                 }
             }
         }
@@ -2674,57 +2631,46 @@ impl AgentLoop {
                     String::new()
                 };
 
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::colorize_stderr(
-                        &format!(
-                            "  📊 Tokens: {} in / {} out{}{}{} | Context: {:.1}%",
-                            tokens_in,
-                            tokens_out,
-                            if cache_writes > 0 || cache_reads > 0 {
-                                format!(
-                                    " ({} cache write / {} cache read)",
-                                    cache_writes, cache_reads
-                                )
-                            } else {
-                                String::new()
-                            },
-                            if reasoning > 0 {
-                                format!(" | {} reasoning", reasoning)
-                            } else {
-                                String::new()
-                            },
-                            cost_str,
-                            context_pct
-                        ),
-                        crate::cli::colors::style::DIM
-                    )
-                );
+                use ratatui::style::{Color, Modifier, Style};
+                self.config.output_writer.emit(OutputEvent::styled(
+                    format!(
+                        "  📊 Tokens: {} in / {} out{}{}{} | Context: {:.1}%",
+                        tokens_in,
+                        tokens_out,
+                        if cache_writes > 0 || cache_reads > 0 {
+                            format!(
+                                " ({} cache write / {} cache read)",
+                                cache_writes, cache_reads
+                            )
+                        } else {
+                            String::new()
+                        },
+                        if reasoning > 0 {
+                            format!(" | {} reasoning", reasoning)
+                        } else {
+                            String::new()
+                        },
+                        cost_str,
+                        context_pct
+                    ),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
 
                 if context_pct >= 95.0 {
-                    eprintln!(
-                        "{}",
-                        crate::cli::colors::colorize_stderr(
-                            "⚠ 95% context window — /compact or start new session",
-                            crate::cli::colors::style::YELLOW
-                        )
-                    );
+                    self.config.output_writer.emit(OutputEvent::styled(
+                        "⚠ 95% context window — /compact or start new session".to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ));
                 } else if context_pct >= 80.0 {
-                    eprintln!(
-                        "{}",
-                        crate::cli::colors::colorize_stderr(
-                            "⚠ 80% context window used — consider /compact",
-                            crate::cli::colors::style::YELLOW
-                        )
-                    );
+                    self.config.output_writer.emit(OutputEvent::styled(
+                        "⚠ 80% context window used — consider /compact".to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ));
                 } else if context_pct >= 50.0 {
-                    eprintln!(
-                        "{}",
-                        crate::cli::colors::colorize_stderr(
-                            "ℹ 50% context window used — use /compact to free space before starting new topics",
-                            crate::cli::colors::style::DIM
-                        )
-                    );
+                    self.config.output_writer.emit(OutputEvent::styled(
+                        "ℹ 50% context window used — use /compact to free space before starting new topics".to_string(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
                 }
 
                 let cost_warn_threshold = std::env::var("SNED_COST_WARN")
@@ -2732,16 +2678,13 @@ impl AgentLoop {
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(5.0);
                 if cost >= cost_warn_threshold {
-                    eprintln!(
-                        "{}",
-                        crate::cli::colors::colorize_stderr(
-                            &format!(
-                                "⚠ Session cost ${:.2} (threshold: ${:.2})",
-                                cost, cost_warn_threshold
-                            ),
-                            crate::cli::colors::style::YELLOW
-                        )
-                    );
+                    self.config.output_writer.emit(OutputEvent::styled(
+                        format!(
+                            "⚠ Session cost ${:.2} (threshold: ${:.2})",
+                            cost, cost_warn_threshold
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ));
                 }
             }
         }
@@ -2975,7 +2918,12 @@ impl AgentLoop {
     }
 
     /// Print session summary after task completion.
-    async fn print_session_summary(state: &Arc<Mutex<TaskState>>, interactive_mode: bool) {
+    async fn print_session_summary(
+        state: &Arc<Mutex<TaskState>>,
+        interactive_mode: bool,
+        output_writer: &crate::cli::output::OutputWriterArc,
+    ) {
+        use ratatui::style::{Modifier, Style};
         use std::time::Duration;
 
         let state = state.lock().await;
@@ -3038,13 +2986,13 @@ impl AgentLoop {
         };
 
         // Print session summary box
-        eprintln!();
+        output_writer.flush();
         crate::cli::colors::print_horizontal_rule();
-        eprintln!(
-            "{}",
-            crate::cli::colors::colorize_stderr("  Session", crate::cli::colors::style::BOLD)
-        );
-        eprintln!("  {}", summary_line);
+        output_writer.emit(OutputEvent::styled(
+            "  Session".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        output_writer.emit(OutputEvent::plain(format!("  {}", summary_line)));
 
         // Per-file diff stats
         for (path, stats) in &file_entries {
@@ -3052,29 +3000,23 @@ impl AgentLoop {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string());
-            eprintln!(
-                "{}",
-                crate::cli::colors::colorize_stderr(
-                    &format!(
-                        "  {:17} +{} -{}\t({})",
-                        filename, stats.lines_added, stats.lines_removed, stats.action
-                    ),
-                    crate::cli::colors::style::DIM
-                )
-            );
+            output_writer.emit(OutputEvent::styled(
+                format!(
+                    "  {:17} +{} -{}\t({})",
+                    filename, stats.lines_added, stats.lines_removed, stats.action
+                ),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
         }
 
         // Last executed command with ⚙ icon
         #[allow(clippy::collapsible_if)]
         if let Some(ref cmd) = state.last_executed_command {
             if !cmd.is_empty() {
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::colorize_stderr(
-                        &format!("  ⚙ {}", cmd),
-                        crate::cli::colors::style::DIM
-                    )
-                );
+                output_writer.emit(OutputEvent::styled(
+                    format!("  ⚙ {}", cmd),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
             }
         }
 
@@ -3090,20 +3032,17 @@ impl AgentLoop {
         } else {
             String::from("$0.000")
         };
-        eprintln!(
-            "{}",
-            crate::cli::colors::colorize_stderr(
-                &format!(
-                    "  📊 {} tokens | {} | {} turn{} | {}",
-                    tokens_str,
-                    cost_str,
-                    state.turns_completed,
-                    if state.turns_completed == 1 { "" } else { "s" },
-                    Self::format_duration(duration)
-                ),
-                crate::cli::colors::style::DIM
-            )
-        );
+        output_writer.emit(OutputEvent::styled(
+            format!(
+                "  📊 {} tokens | {} | {} turn{} | {}",
+                tokens_str,
+                cost_str,
+                state.turns_completed,
+                if state.turns_completed == 1 { "" } else { "s" },
+                Self::format_duration(duration)
+            ),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
 
         crate::cli::colors::print_horizontal_rule();
 

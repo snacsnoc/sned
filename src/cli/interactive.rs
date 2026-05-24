@@ -280,13 +280,30 @@ impl InteractiveSession {
         Self::build_with_mode(task_opts, root_opts, true).await
     }
 
+    pub async fn build_with_writer(
+        task_opts: TaskOptions,
+        root_opts: RootOnlyOptions,
+        output_writer: Option<crate::cli::output::OutputWriterArc>,
+    ) -> anyhow::Result<Self> {
+        Self::build_with_mode_and_writer(task_opts, root_opts, true, output_writer).await
+    }
+
     async fn build_with_mode(
         task_opts: TaskOptions,
         root_opts: RootOnlyOptions,
         interactive_mode: bool,
     ) -> anyhow::Result<Self> {
+        Self::build_with_mode_and_writer(task_opts, root_opts, interactive_mode, None).await
+    }
+
+    async fn build_with_mode_and_writer(
+        task_opts: TaskOptions,
+        root_opts: RootOnlyOptions,
+        interactive_mode: bool,
+        output_writer: Option<crate::cli::output::OutputWriterArc>,
+    ) -> anyhow::Result<Self> {
         let mut components =
-            crate::cli::build_task_components(task_opts.clone(), root_opts.clone()).await?;
+            crate::cli::build_task_components(task_opts.clone(), root_opts.clone(), output_writer).await?;
         components.config.interactive_mode = interactive_mode;
 
         let agent_loop = crate::core::agent_loop::AgentLoop::new(components.config)
@@ -662,8 +679,25 @@ pub async fn run_interactive_shell_inner(
     let agent_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     let auto_approve = task_opts.yolo || task_opts.auto_approve_all;
+    
+    // Phase 1: Create output channel and drain to stderr
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+    let output_writer: crate::cli::output::OutputWriterArc =
+        Arc::new(crate::cli::output::ChannelOutputWriter::new(output_tx));
+    
+    // Spawn drain task (Phase 1 only - forwards to stderr)
+    tokio::spawn(async move {
+        use crate::cli::output::OutputEvent;
+        while let Some(event) = output_rx.recv().await {
+            match event {
+                OutputEvent::Line(line) => eprintln!("{}", line),
+                OutputEvent::RawAnsi(s) => eprint!("{}", s),
+            }
+        }
+    });
+    
     let session = Arc::new(tokio::sync::Mutex::new(
-        InteractiveSession::build_interactive(task_opts.clone(), root_opts.clone()).await?,
+        InteractiveSession::build_with_writer(task_opts.clone(), root_opts.clone(), Some(output_writer.clone())).await?,
     ));
     let task_id = {
         let sess = session.lock().await;

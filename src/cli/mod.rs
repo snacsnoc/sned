@@ -1049,6 +1049,7 @@ fn setup_hook_manager(
 async fn build_task_components(
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
+    output_writer: Option<crate::cli::output::OutputWriterArc>,
 ) -> anyhow::Result<TaskComponents> {
     use crate::core::agent_loop::{AgentConfig, AgentMode};
     use crate::core::context::SystemPromptContext;
@@ -1126,7 +1127,7 @@ async fn build_task_components(
             .unwrap_or(50),
         max_tokens: task_opts.max_tokens,
         interactive_mode: false,
-        output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+        output_writer: output_writer.unwrap_or_else(|| Arc::new(crate::cli::output::StderrOutputWriter)),
     };
 
     let shell_path = std::env::var("SHELL").ok();

@@ -21,9 +21,8 @@ impl PlanModeRespondHandler {
 
     pub async fn execute(
         &self,
-        state: &mut TaskState,
+        ctx: &ToolContext,
         params: serde_json::Value,
-        json_output: bool,
     ) -> Result<String, ToolError> {
         let response = params
             .get("response")
@@ -39,7 +38,9 @@ impl PlanModeRespondHandler {
             .unwrap_or(false);
 
         // Reset consecutive mistakes
+        let mut state = ctx.state.lock().await;
         state.consecutive_mistakes = 0;
+        drop(state);
 
         if needs_more {
             return Ok(
@@ -49,7 +50,7 @@ impl PlanModeRespondHandler {
         }
 
         // Print plan response to user
-        if json_output {
+        if ctx.json_output {
             tracing::info!(
                 target: "json_output",
                 "{}",
@@ -59,12 +60,17 @@ impl PlanModeRespondHandler {
                 })
             );
         } else {
-            eprintln!(
-                "\n{} {}\n{}\n",
-                crate::cli::colors::colorize_stderr("📋", crate::cli::colors::style::CYAN),
-                crate::cli::colors::colorize_stderr("Plan", crate::cli::colors::style::BOLD),
-                response
-            );
+            use crate::cli::output::OutputEvent;
+            use ratatui::style::{Color, Modifier, Style};
+            ctx.output_writer.emit(OutputEvent::styled(
+                format!(
+                    "\n{} {}\n{}\n",
+                    "📋",
+                    "Plan",
+                    response
+                ),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
         }
 
         Ok(format!("<user_message>\n{}\n</user_message>", response))

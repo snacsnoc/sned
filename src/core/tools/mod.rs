@@ -201,6 +201,8 @@ pub struct ToolContext {
     /// When true, skip safety checks because user explicitly approved this execution.
     /// Safety checks still apply for auto-approved tools (from previous "always" selection).
     pub explicitly_approved: bool,
+    /// Output writer for decoupled terminal output.
+    pub output_writer: crate::cli::output::OutputWriterArc,
 }
 
 impl ToolContext {
@@ -213,6 +215,7 @@ impl ToolContext {
         task_id: String,
         hook_manager: Option<Arc<crate::core::hooks::HookManager>>,
         explicitly_approved: bool,
+        output_writer: crate::cli::output::OutputWriterArc,
     ) -> Self {
         Self {
             state,
@@ -223,6 +226,7 @@ impl ToolContext {
             task_id,
             hook_manager,
             explicitly_approved,
+            output_writer,
         }
     }
 }
