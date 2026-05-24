@@ -214,6 +214,7 @@ impl EditFileHandler {
         task_id: Option<&str>,
         explicitly_approved: bool,
         json_output: bool,
+        output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
         // Parse files parameter
         let files = params
@@ -289,16 +290,15 @@ impl EditFileHandler {
                     .file_context_tracker
                     .was_read_this_session(&batch.display_path)
             {
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::colorize(
-                        &format!(
-                            "⚠ editing {} (not read this session — may have stale assumptions)",
-                            batch.display_path
-                        ),
-                        crate::cli::colors::style::YELLOW
-                    )
-                );
+                use crate::cli::output::OutputEvent;
+                use ratatui::style::{Color, Style};
+                output_writer.emit(OutputEvent::styled(
+                    format!(
+                        "⚠ editing {} (not read this session — may have stale assumptions)",
+                        batch.display_path
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ));
             }
 
             // Read file content and capture mtime (check cache first for cross-call coordination)
@@ -772,10 +772,11 @@ impl EditFileHandler {
         if total_failed > 0 {
             state.consecutive_mistakes += 1;
             if !json_output {
-                eprintln!(
+                use crate::cli::output::OutputEvent;
+                output_writer.emit(OutputEvent::plain(format!(
                     "[edit_file] {} edit(s) failed (consecutive_mistakes={})",
                     total_failed, state.consecutive_mistakes
-                );
+                )));
             }
         } else if total_applied > 0 {
             state.consecutive_mistakes = 0;
@@ -824,16 +825,18 @@ impl ToolHandler for EditFileHandler {
                 Some(ctx.task_id.as_str()),
                 ctx.explicitly_approved,
                 ctx.json_output,
+                &ctx.output_writer,
             )
             .await;
 
         if result.is_err() {
             state.consecutive_mistakes += 1;
             if !ctx.json_output {
-                eprintln!(
+                use crate::cli::output::OutputEvent;
+                ctx.output_writer.emit(OutputEvent::plain(format!(
                     "[edit_file] Handler error, incrementing consecutive_mistakes={}",
                     state.consecutive_mistakes
-                );
+                )));
             }
         }
 
