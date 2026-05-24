@@ -449,6 +449,7 @@ pub fn setup_sigterm_handler() {
                 // First SIGTERM – disable raw mode and exit
                 let _ = disable_raw_mode();
                 // Use raw ANSI escapes to avoid potential blocking
+                let _ = std::io::stderr().write_all(b"\x1b[?1049l"); // leave alternate screen
                 let _ = std::io::stderr().write_all(b"\x1b[?25h");
                 let _ = std::io::stderr().write_all(b"\x1b[0m");
                 let _ = std::io::stderr().flush();
@@ -507,6 +508,7 @@ pub fn install_panic_hook() {
         // Restore terminal state using raw ANSI sequences (no allocation)
         let _ = disable_raw_mode();
         // Use raw ANSI escapes to avoid allocation in panic handler
+        let _ = std::io::stderr().write_all(b"\x1b[?1049l"); // leave alternate screen
         let _ = std::io::stderr().write_all(b"\x1b[?25h"); // show cursor
         let _ = std::io::stderr().write_all(b"\x1b[0m"); // reset colors
         let _ = std::io::stderr().flush();
