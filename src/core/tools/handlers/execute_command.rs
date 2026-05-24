@@ -545,7 +545,7 @@ impl ExecuteCommandHandler {
         cwd: Option<&Path>,
         timeout_override: Option<Duration>,
         explicitly_approved: bool,
-        _output_writer: &crate::cli::output::OutputWriterArc,
+        output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
         use tokio::io::AsyncReadExt;
@@ -693,6 +693,11 @@ impl ExecuteCommandHandler {
                 output.status.code(),
             );
             combined.push_str(&format!("\n{}", err.display()));
+        }
+
+        if !combined.is_empty() {
+            use crate::cli::output::OutputEvent;
+            output_writer.emit(OutputEvent::RawAnsi(combined.clone()));
         }
 
         Ok(combined)
