@@ -12,17 +12,12 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::warn;
 
-/// Print a user-visible retry status message (P8)
-fn print_retry_status(
+/// Log a retry status message (visible in logs, not terminal during TUI)
+fn log_retry_status(
     retry_attempt: usize,
     delay: Duration,
     error: &ProviderError,
-    json_output: bool,
 ) {
-    if json_output {
-        return;
-    }
-
     let delay_secs = delay.as_secs_f64();
     let error_summary = match error {
         ProviderError::NetworkError(_) => "network error",
@@ -32,22 +27,11 @@ fn print_retry_status(
         ProviderError::ApiError(_) => "API error",
         ProviderError::UnexpectedError(_) => "unexpected error",
     };
-    eprintln!(
-        "{}",
-        crate::cli::colors::colorize(
-            &format!(
-                "⚠️ {} — retrying (attempt {}/{}, ~{:.0}s)...",
-                error_summary,
-                retry_attempt + 1,
-                retry_attempt + 1,
-                delay_secs
-            ),
-            &format!(
-                "{}{}",
-                crate::cli::colors::style::YELLOW,
-                crate::cli::colors::style::DIM
-            ),
-        )
+    tracing::info!(
+        attempt = retry_attempt + 1,
+        delay_secs = delay_secs,
+        "⚠️ {} — retrying",
+        error_summary
     );
 }
 
@@ -111,7 +95,7 @@ pub async fn create_message_with_retry(
                     error = %error,
                     "provider request failed; retrying"
                 );
-                print_retry_status(retry_attempt, delay, &error, json_output);
+                log_retry_status(retry_attempt, delay, &error);
                 sleep(delay).await;
                 retry_attempt += 1;
             }

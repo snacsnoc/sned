@@ -14,6 +14,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tracing::warn;
 
 /// Tracks workspace state via a shadow git repository.
 #[derive(Clone)]
@@ -109,7 +110,7 @@ impl CheckpointTracker {
             Self::run_git_cmd_with_worktree(&self.shadow_git_path, &self.cwd, &["add", "--all"]);
 
         if let Err(e) = add_result {
-            eprintln!("[checkpoints] Warning: failed to stage files: {}", e);
+            warn!("[checkpoints] Warning: failed to stage files: {}", e);
         }
 
         let commit_message = format!("checkpoint-{}-{}", self.cwd_hash, self.task_id);
@@ -395,7 +396,7 @@ impl TaskCheckpointManager {
         let tracker = match CheckpointTracker::new(task_id, enable_checkpoints, workspace_path) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[checkpoints] Failed to initialize: {}", e);
+                warn!("[checkpoints] Failed to initialize: {}", e);
                 None
             }
         };
@@ -427,13 +428,13 @@ impl TaskCheckpointManager {
             }
             Ok(Err(e)) => {
                 let msg = format!("Failed to save checkpoint: {}", e);
-                eprintln!("[checkpoints] {}", msg);
+                warn!("[checkpoints] {}", msg);
                 self.error_message = Some(msg);
                 None
             }
             Err(e) => {
                 let msg = format!("Checkpoint task panicked: {}", e);
-                eprintln!("[checkpoints] {}", msg);
+                warn!("[checkpoints] {}", msg);
                 self.error_message = Some(msg);
                 None
             }
