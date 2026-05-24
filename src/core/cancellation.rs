@@ -8,10 +8,16 @@ use crate::storage::disk;
 use crate::storage::state_manager::StateManager;
 #[cfg(unix)]
 use libc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+
+/// Set to true when ratatui terminal has been initialized (TUI mode).
+/// Guards ratatui::restore() calls in the force-exit signal handler
+/// so we don't write ANSI escape sequences to stdout in one-shot mode.
+pub(crate) static TERMINAL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Handles task cancellation and cleanup.
 pub struct CancellationHandler {
@@ -221,7 +227,9 @@ async fn handle_shutdown_signal(
                 );
             }
             // Restore terminal state before forced exit to avoid breaking user's shell
-            ratatui::restore();
+            if TERMINAL_INITIALIZED.load(Ordering::Acquire) {
+                ratatui::restore();
+            }
             std::process::exit(exit_code);
         }
     }

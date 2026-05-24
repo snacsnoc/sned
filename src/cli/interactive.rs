@@ -16,6 +16,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 
+/// RAII guard that restores ratatui terminal state on drop.
+/// Prevents terminal from being left in alternate screen on early returns or errors.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
 /// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m")
 fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
@@ -1171,6 +1181,8 @@ pub async fn run_interactive_shell_inner(
     } else {
         ratatui::init()
     };
+    crate::core::cancellation::TERMINAL_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
+    let _guard = TerminalGuard;
     let mut app = App::new();
     if let Ok(cwd) = std::env::current_dir() {
         app.cwd = cwd.to_string_lossy().to_string();
@@ -1250,8 +1262,6 @@ pub async fn run_interactive_shell_inner(
         auto_approve,
     ).await;
     
-    // 7. Always restore terminal
-    ratatui::restore();
     result
 }
 pub fn should_start_interactive_shell(

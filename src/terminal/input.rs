@@ -12,8 +12,7 @@
 //!   It replicates the exact escape-sequence tables from the TypeScript
 //!   source so that Home / End / Backspace / Delete / Option-arrows work
 //!   across Terminal.app, iTerm2, Ghostty, and Linux consoles.
-//! - `setup_sigterm_handler` installs a SIGTERM handler that restores the
-//!   terminal before exiting. Ctrl+C is handled via TerminalEvent::Ctrl('c').
+//! Ctrl+C is handled via TerminalEvent::Ctrl('c').
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
@@ -417,48 +416,6 @@ impl InputParser {
 /// --------------------------------------------------------------------------
 /// Signal handling
 /// --------------------------------------------------------------------------
-/// Install SIGTERM signal handler for graceful shutdown.
-///
-/// Mirrors `setupSignalHandlers()` in `dirac/cli/src/index.ts`:
-/// - SIGTERM triggers graceful shutdown with immediate exit on second signal.
-/// - Terminal mode is always restored before exiting.
-///
-/// Note: Ctrl+C is handled via TerminalEvent::Ctrl('c') in the interactive
-/// shell's main event loop (raw mode captures 0x03 byte). This handler is
-/// only for SIGTERM.
-///
-/// # Usage
-///
-/// Call this once at application startup.
-pub fn setup_sigterm_handler() {
-    // SIGTERM (Unix only)
-    #[cfg(unix)]
-    {
-        tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to install SIGTERM handler: {}", e);
-                    return;
-                }
-            };
-            #[allow(clippy::never_loop)]
-            loop {
-                sigterm.recv().await;
-                // First SIGTERM – disable raw mode and exit
-                let _ = disable_raw_mode();
-                // Use raw ANSI escapes to avoid potential blocking
-                let _ = std::io::stderr().write_all(b"\x1b[?1049l"); // leave alternate screen
-                let _ = std::io::stderr().write_all(b"\x1b[?25h");
-                let _ = std::io::stderr().write_all(b"\x1b[0m");
-                let _ = std::io::stderr().flush();
-                std::process::exit(crate::exit_codes::EXIT_INTERRUPTED);
-            }
-        });
-    }
-}
-
 /// Install a SIGWINCH handler that sends resize events through a channel.
 ///
 /// On Unix, when the terminal window is resized, this handler reads the new
