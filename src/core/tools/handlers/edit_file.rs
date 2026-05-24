@@ -474,7 +474,7 @@ impl EditFileHandler {
             })
         });
 
-        // Phase 4: Apply and save all approved edits
+        // Phase 4a: Validate all edits and compute final content (no disk writes)
         // Track which files were successfully edited for post-diagnostics
         let mut successfully_edited_files: Vec<(String, String)> = Vec::new(); // (absolute_path, display_path)
         
@@ -488,6 +488,15 @@ impl EditFileHandler {
             had_success: bool,
         }
         let mut file_results: Vec<FileResult> = Vec::new();
+        
+        // Collect file writes for Phase 4b (two-phase commit with rollback)
+        struct WriteItem {
+            absolute_path: String,
+            display_path: String,
+            final_content: String,
+            initial_mtime: Option<std::time::SystemTime>,
+        }
+        let mut write_items: Vec<WriteItem> = Vec::new();
 
         for (batch, mut prepared) in prepared_batches {
             let result =
@@ -519,122 +528,14 @@ impl EditFileHandler {
                     ));
                 }
                 
-                // Write updated content back to file atomically
-                if let Some(final_content) = &result.final_content {
-                    // Acquire OS-level file lock to serialize writes with external
-                    // processes. This prevents TOCTOU races where an external process
-                    // modifies the file between our mtime check and write.
-                    let std_file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&batch.absolute_path)
-                        .map_err(|e| {
-                            ToolError::ExecutionFailed(format!(
-                                "Failed to open file {} for locking: {}",
-                                batch.display_path, e
-                            ))
-                        })?;
-
-                    // Try to acquire exclusive lock (non-blocking)
-                    let lock_result = fs2::FileExt::try_lock_exclusive(&std_file);
-
-                    if lock_result.is_err() {
-                        // File is locked by another process — still check mtime to detect
-                        // external modifications before writing.
-                        let mtime_ok = if let Some(initial_mtime) = &prepared.initial_mtime {
-                            match tokio::fs::metadata(&batch.absolute_path).await {
-                                Ok(current_metadata) => {
-                                    match current_metadata.modified() {
-                                        Ok(current_mtime) => &current_mtime == initial_mtime,
-                                        Err(_) => true,
-                                    }
-                                }
-                                Err(_) => true,
-                            }
-                        } else {
-                            true
-                        };
-
-                        if !mtime_ok {
-                            return Err(ToolError::ExecutionFailed(format!(
-                                "File {} was modified externally during edit operation. \
-                                 Aborting write to prevent data loss. Re-read the file and retry.",
-                                batch.display_path
-                            )));
-                        }
-
-                        tracing::debug!(
-                            "File {} locked by another process, skipping exclusive lock",
-                            batch.display_path
-                        );
-
-                        // Update cache and write anyway
-                        state.insert_file_content(
-                            batch.absolute_path.clone(),
-                            final_content.clone(),
-                        );
-
-                        match crate::storage::disk::atomic_write_file_async(
-                            &batch.absolute_path,
-                            final_content,
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(e) => {
-                                all_results.push(format!(
-                                    "Error writing file {}: {}",
-                                    batch.display_path, e
-                                ));
-                                continue;
-                            }
-                        }
-                    } else {
-                        // Lock acquired - check mtime BEFORE write to detect modifications
-                        // that occurred while we were preparing the edit.
-                        if let Some(initial_mtime) = &prepared.initial_mtime
-                            && let Ok(current_metadata) =
-                                tokio::fs::metadata(&batch.absolute_path).await
-                            && let Ok(current_mtime) = current_metadata.modified()
-                            && &current_mtime != initial_mtime
-                        {
-                            // Release lock before returning error
-                            let _ = fs2::FileExt::unlock(&std_file);
-                            return Err(ToolError::ExecutionFailed(format!(
-                                "File {} was modified externally during edit operation. \
-                                 Aborting write to prevent data loss. Re-read the file and retry.",
-                                batch.display_path
-                            )));
-                        }
-
-                        // Update cache for cross-call coordination
-                        state.insert_file_content(
-                            batch.absolute_path.clone(),
-                            final_content.clone(),
-                        );
-
-                        // Perform atomic write WHILE HOLDING LOCK. The rename operation
-                        // inside atomic_write_file_async is atomic on POSIX, and holding
-                        // the lock ensures no other process can interfere.
-                        let write_result = crate::storage::disk::atomic_write_file_async(
-                            &batch.absolute_path,
-                            final_content,
-                        )
-                        .await;
-
-                        // Release lock after write completes
-                        let _ = fs2::FileExt::unlock(&std_file);
-
-                        match write_result {
-                            Ok(()) => {}
-                            Err(e) => {
-                                all_results.push(format!(
-                                    "Error writing file {}: {}",
-                                    batch.display_path, e
-                                ));
-                                continue;
-                            }
-                        }
-                    }
+                // Collect for write phase (Phase 4b)
+                if let Some(ref final_content) = result.final_content {
+                    write_items.push(WriteItem {
+                        absolute_path: batch.absolute_path.clone(),
+                        display_path: batch.display_path.clone(),
+                        final_content: final_content.clone(),
+                        initial_mtime: prepared.initial_mtime,
+                    });
                 }
             }
 
@@ -658,6 +559,164 @@ impl EditFileHandler {
                 final_hashes,
                 had_success: result.success,
             });
+        }
+
+        // Phase 4b: Write all files with rollback on failure
+        // If any file fails to write, restore all previously written files to original content
+        if !write_items.is_empty() {
+            // Snapshot original content for all files before any writes
+            let mut original_contents: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            for item in &write_items {
+                if let Ok(c) = tokio::fs::read_to_string(&item.absolute_path).await {
+                    original_contents.insert(item.absolute_path.clone(), c);
+                }
+            }
+
+            // Track which files were successfully written for rollback
+            let mut written_paths: Vec<String> = Vec::new();
+
+            for item in &write_items {
+                let std_file = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&item.absolute_path)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // Rollback all previously written files
+                        for path in written_paths.iter().rev() {
+                            if let Some(orig) = original_contents.get(path) {
+                                if let Err(re) = std::fs::write(path, orig) {
+                                    tracing::error!("Failed to rollback file {}: {}", path, re);
+                                }
+                            }
+                        }
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "Failed to open file {} for locking: {}",
+                            item.display_path, e
+                        )));
+                    }
+                };
+
+                let lock_result = fs2::FileExt::try_lock_exclusive(&std_file);
+
+                if lock_result.is_err() {
+                    let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
+                        match tokio::fs::metadata(&item.absolute_path).await {
+                            Ok(current_metadata) => {
+                                match current_metadata.modified() {
+                                    Ok(current_mtime) => &current_mtime == initial_mtime,
+                                    Err(_) => true,
+                                }
+                            }
+                            Err(_) => true,
+                        }
+                    } else {
+                        true
+                    };
+
+                    if !mtime_ok {
+                        for path in written_paths.iter().rev() {
+                            if let Some(orig) = original_contents.get(path) {
+                                if let Err(re) = std::fs::write(path, orig) {
+                                    tracing::error!("Failed to rollback file {}: {}", path, re);
+                                }
+                            }
+                        }
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "File {} was modified externally during edit operation. \
+                             Aborting write to prevent data loss. Re-read the file and retry.",
+                            item.display_path
+                        )));
+                    }
+
+                    tracing::debug!(
+                        "File {} locked by another process, skipping exclusive lock",
+                        item.display_path
+                    );
+
+                    state.insert_file_content(
+                        item.absolute_path.clone(),
+                        item.final_content.clone(),
+                    );
+
+                    match crate::storage::disk::atomic_write_file_async(
+                        &item.absolute_path,
+                        &item.final_content,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            written_paths.push(item.absolute_path.clone());
+                        }
+                        Err(e) => {
+                            for path in written_paths.iter().rev() {
+                                if let Some(orig) = original_contents.get(path) {
+                                    if let Err(re) = std::fs::write(path, orig) {
+                                        tracing::error!("Failed to rollback file {}: {}", path, re);
+                                    }
+                                }
+                            }
+                            all_results.push(format!(
+                                "Error writing file {}: {}",
+                                item.display_path, e
+                            ));
+                        }
+                    }
+                } else {
+                    if let Some(initial_mtime) = &item.initial_mtime
+                        && let Ok(current_metadata) =
+                            tokio::fs::metadata(&item.absolute_path).await
+                        && let Ok(current_mtime) = current_metadata.modified()
+                        && &current_mtime != initial_mtime
+                    {
+                        let _ = fs2::FileExt::unlock(&std_file);
+                        for path in written_paths.iter().rev() {
+                            if let Some(orig) = original_contents.get(path) {
+                                if let Err(re) = std::fs::write(path, orig) {
+                                    tracing::error!("Failed to rollback file {}: {}", path, re);
+                                }
+                            }
+                        }
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "File {} was modified externally during edit operation. \
+                             Aborting write to prevent data loss. Re-read the file and retry.",
+                            item.display_path
+                        )));
+                    }
+
+                    state.insert_file_content(
+                        item.absolute_path.clone(),
+                        item.final_content.clone(),
+                    );
+
+                    let write_result = crate::storage::disk::atomic_write_file_async(
+                        &item.absolute_path,
+                        &item.final_content,
+                    )
+                    .await;
+
+                    let _ = fs2::FileExt::unlock(&std_file);
+
+                    match write_result {
+                        Ok(()) => {
+                            written_paths.push(item.absolute_path.clone());
+                        }
+                        Err(e) => {
+                            for path in written_paths.iter().rev() {
+                                if let Some(orig) = original_contents.get(path) {
+                                    if let Err(re) = std::fs::write(path, orig) {
+                                        tracing::error!("Failed to rollback file {}: {}", path, re);
+                                    }
+                                }
+                            }
+                            all_results.push(format!(
+                                "Error writing file {}: {}",
+                                item.display_path, e
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Phase 5: Run post-save diagnostics in batch for all successfully edited files
