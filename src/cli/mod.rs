@@ -619,11 +619,7 @@ fn build_symbol_index_service(
             match service.with_persistence() {
                 Ok(svc) => Ok(svc),
                 Err(e) => {
-                    // Log warning about DB corruption
-                    eprintln!(
-                        "\x1b[33mWarning: Symbol index DB corruption detected, falling back to memory mode: {}\x1b[0m",
-                        e
-                    );
+                    tracing::warn!("Symbol index DB corruption detected, falling back to memory mode: {}", e);
                     // Delete corrupted DB file so next session can start fresh
                     let db_dir = std::path::Path::new(&cwd_str)
                         .join(crate::services::symbol_index::INDEX_DIR);
@@ -675,9 +671,8 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
         provider_name
     };
 
-    // Print detected provider at startup
     if was_auto_detected && !task_opts.json {
-        eprintln!("[sned] Auto-detected provider: {}", provider_name);
+        tracing::info!("Auto-detected provider: {}", provider_name);
     }
 
     let model_id = task_opts.model.clone();
