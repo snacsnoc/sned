@@ -7,6 +7,7 @@ use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::cli::output::{OutputEvent, OutputWriterArc, ChannelOutputWriter};
 use crate::cli::tui::{App, ansi_to_ratatui_lines};
 use crate::cli::tui::history::append_to_history;
+use crate::core::approval::is_approval_prompt_active;
 use futures::FutureExt;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
@@ -1058,7 +1059,8 @@ async fn run_main_loop(
         terminal.draw(|f| app.render(f))?;
         
         // 3. Poll for events (blocking, 50ms timeout)
-        if ratatui::crossterm::event::poll(Duration::from_millis(50))? {
+        // Skip stdin read while approval prompt is active to avoid fd race
+        if !is_approval_prompt_active() && ratatui::crossterm::event::poll(Duration::from_millis(50))? {
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {
                     if let Some(action) = handle_key_event(
