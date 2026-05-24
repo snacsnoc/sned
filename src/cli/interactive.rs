@@ -1151,6 +1151,9 @@ pub async fn run_interactive_shell_inner(
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
 ) -> anyhow::Result<()> {
+    // 0. Install panic hook to restore terminal on panic
+    crate::terminal::input::install_panic_hook();
+    
     // 1. Initialize ratatui (replaces enter_raw_mode, scroll_region, bracketed paste)
     let mut terminal = if std::env::var("SNED_NO_ALTERNATE_SCREEN").is_ok() {
         ratatui::Terminal::with_options(

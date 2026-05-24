@@ -220,6 +220,8 @@ async fn handle_shutdown_signal(
                     disk::active_atomic_write_count()
                 );
             }
+            // Restore terminal state before forced exit to avoid breaking user's shell
+            ratatui::restore();
             std::process::exit(exit_code);
         }
     }
