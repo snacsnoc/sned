@@ -39,16 +39,16 @@ pub fn content_hash(content: &str) -> String {
     format!("{:08x}", h)
 }
 
-/// Computes FNV-1a hashes for all lines.
+/// Computes 64-bit FNV-1a hashes for all lines.
 ///
-pub fn compute_hashes(lines: &[String]) -> Vec<u32> {
+pub fn compute_hashes(lines: &[String]) -> Vec<u64> {
     lines
         .iter()
         .map(|line| {
-            let mut h: u32 = 2166136261;
+            let mut h: u64 = 14695981039346656037;
             for byte in line.bytes() {
-                h ^= byte as u32;
-                h = h.wrapping_mul(16777619);
+                h ^= byte as u64;
+                h = h.wrapping_mul(1099511628211);
             }
             h
         })
