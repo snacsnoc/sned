@@ -294,6 +294,19 @@ new_script() {
     cat > "$f" <<'EXPECT'
     set timeout 10
     set env(TERM) xterm-256color
+    # check_cursor: wait 2s for ?25h/?25l after agent completion.
+    # Uses short timeout because if sned doesn't emit either escape,
+    # waiting 10s is pointless — it's already a bug.
+    proc check_cursor {fail_msg} {
+        set old_timeout $::timeout
+        set timeout 2
+        expect {
+            -re {\?25h} { }
+            -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) at idle. $fail_msg"; exit 1 }
+            timeout { puts "TUI_TEST_FAIL no cursor escape at idle. $fail_msg"; exit 1 }
+        }
+        set timeout $old_timeout
+    }
     spawn /Users/easto/projects/dirac-fork/user-scripts/sned-pty-helper 24 80 /Users/easto/projects/dirac-fork/target/debug/sned --provider minimax --model "MiniMax-M2.7" --yolo
     sleep 1
     expect {
@@ -357,11 +370,7 @@ test_idle_enter_nonempty() {
         timeout { puts "TUI_TEST_FAIL agent did not return to idle prompt. Check: is agent_done.notify_one() called? Does render_input_line(..., false) show cursor?"; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) at idle after agent completed. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape at idle after agent completed. Check: render_input_line() emits ?25h on IDLE transition."; exit 1 }
-    }
+    check_cursor "Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."
     puts "TUI_TEST_PASS prompt echoed and agent completed"
 EXPECT
     finish_script "$f"
@@ -407,11 +416,7 @@ test_idle_ctrl_c_nonempty() {
         timeout { puts "TUI_TEST_FAIL sned exited on Ctrl+C with non-empty input -- should clear input, not exit. Check: Ctrl+C handler branch for non-empty input in interactive.rs."; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) after Ctrl+C cleared input. Check: Ctrl+C handler must show cursor after clearing."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape after Ctrl+C cleared input. Check: Ctrl+C handler must emit ?25h."; exit 1 }
-    }
+    check_cursor "After Ctrl+C cleared input. Check: Ctrl+C handler must show cursor."
     send "still here"
     sleep 0.3
     puts "TUI_TEST_PASS Ctrl+C cleared input but did not exit"
@@ -452,11 +457,7 @@ test_busy_keystroke() {
         timeout { puts "TUI_TEST_FAIL agent did not complete. Check: does the agent task call agent_done.notify_one()? Does render_input_line show cursor after completion?"; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) at idle after agent completed while typing. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape at idle after agent completed while typing. Check: render_input_line() emits ?25h on IDLE."; exit 1 }
-    }
+    check_cursor "After agent completed while typing. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."
     puts "TUI_TEST_PASS input visible during agent execution"
     send "\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f"
 EXPECT
@@ -480,11 +481,7 @@ test_busy_enter_queue() {
         timeout { puts "TUI_TEST_FAIL agent did not complete after queue. Check: does agent_done.notify_one() fire after processing queued messages?"; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) at idle after queued agent completed. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape at idle after queued agent completed. Check: render_input_line() emits ?25h on IDLE."; exit 1 }
-    }
+    check_cursor "After queued agent completed. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."
     puts "TUI_TEST_PASS queued message echoed and agent completed"
 EXPECT
     finish_script "$f"
@@ -503,11 +500,7 @@ test_busy_ctrl_c() {
         timeout { puts "TUI_TEST_FAIL Ctrl+C did not return to idle prompt. Check: agent cancellation in interactive.rs, agent_done notification after abort."; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) at idle after Ctrl+C aborted agent. Check: agent cancellation path must show cursor before returning to IDLE."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape at idle after Ctrl+C aborted agent. Check: cancellation path emits ?25h."; exit 1 }
-    }
+    check_cursor "After Ctrl+C aborted agent. Check: agent cancellation path must show cursor."
     send "still alive"
     sleep 0.3
     puts "TUI_TEST_PASS Ctrl+C aborted agent, returned to idle"
@@ -528,11 +521,7 @@ test_agent_done() {
     # Wait for idle render to flush, then verify cursor visible BEFORE any typing.
     # The ?25h must come from agent-done render_input_line, not from the next keypress.
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) at idle after agent completed. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h, not ?25l."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape at idle after agent completion. Cursor state unknown. Check: render_input_line() emits ?25h on IDLE transition."; exit 1 }
-    }
+    check_cursor "After agent completed. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."
     send "after done"
     sleep 0.3
     send "\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f"
@@ -554,11 +543,7 @@ test_multi_turn() {
     # Verify cursor visible at idle BEFORE sending turn 2.
     # The ?25h must come from agent completion, not from typing the next prompt.
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) after turn 1. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape after turn 1. Check: render_input_line() emits ?25h on IDLE."; exit 1 }
-    }
+    check_cursor "After turn 1. Bug: cursor-disappears-after-turn. Check: render_input_line(false) must emit ?25h."
     # Turn 2
     send "say world\r"
     expect {
@@ -567,11 +552,7 @@ test_multi_turn() {
     }
     # Verify cursor visible at idle BEFORE sending turn 3.
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) after turn 2. Bug confirmed: cursor disappears on follow-up prompts. Check: render_input_line(false) cursor show logic."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape after turn 2. Check: render_input_line() emits ?25h on IDLE."; exit 1 }
-    }
+    check_cursor "After turn 2. Bug confirmed: cursor disappears on follow-up prompts. Check: render_input_line(false) cursor show logic."
     # Turn 3
     send "say foo\r"
     sleep 0.5
@@ -581,11 +562,7 @@ test_multi_turn() {
         timeout { puts "TUI_TEST_FAIL turn 3 did not complete. Check: cursor toggle across multiple AGENT_BUSY/IDLE transitions."; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden (?25l) after turn 3. Cursor disappears on every subsequent prompt. Check: render_input_line(false) always emits ?25h."; exit 1 }
-        timeout { puts "TUI_TEST_FAIL no cursor escape after turn 3. Check: render_input_line() emits ?25h on IDLE."; exit 1 }
-    }
+    check_cursor "After turn 3. Cursor disappears on every subsequent prompt. Check: render_input_line(false) always emits ?25h."
     puts "TUI_TEST_PASS three turns completed with cursor toggling"
 EXPECT
     finish_script "$f"
@@ -602,11 +579,7 @@ test_input_line_clean() {
         timeout { puts "TUI_TEST_FAIL turn 1 did not complete"; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden after turn 1"; exit 1 }
-        timeout { }
-    }
+    check_cursor "After turn 1 in input-line-clean."
     # After agent completes, the input line should be clean (empty).
     # Wait at idle without typing -- if old text persists on the input line,
     # sned's idle render will emit the marker again.
@@ -624,11 +597,7 @@ test_input_line_clean() {
         timeout { puts "TUI_TEST_FAIL turn 2 did not complete"; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden after turn 2"; exit 1 }
-        timeout { }
-    }
+    check_cursor "After turn 2 in input-line-clean."
     # Again check no residual text at idle
     set timeout 2
     expect {
@@ -656,11 +625,7 @@ test_queue_input_clean() {
         timeout { puts "TUI_TEST_FAIL agent did not complete queued turns. Check: agent_done after queue processing."; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden after queued turns completed"; exit 1 }
-        timeout { }
-    }
+    check_cursor "After queued turns completed."
     # Input line must be clean -- no leftover text from either submission.
     # Bug pattern: after queuing messages during AGENT_BUSY, the last
     # submitted text persists on the input line and agent output renders
@@ -681,11 +646,7 @@ test_queue_input_clean() {
         timeout { puts "TUI_TEST_FAIL agent did not complete second queue batch."; exit 1 }
     }
     sleep 0.2
-    expect {
-        -re {\?25h} { }
-        -re {\?25l} { puts "TUI_TEST_FAIL cursor hidden after second queue batch"; exit 1 }
-        timeout { }
-    }
+    check_cursor "After second queue batch."
     set timeout 2
     expect {
         "say fourth_Jt3n" { puts "TUI_TEST_FAIL fourth submission text persists on input line after queue. Input line not cleaned after multi-message queue. Check: render_input_line() must reset input buffer after each queued submission completes."; exit 1 }
