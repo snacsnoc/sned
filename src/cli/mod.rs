@@ -16,8 +16,8 @@ pub mod text_utils;
 pub mod tui;
 
 pub use interactive::{
-    InteractiveSession, cleanup_terminal, query_cursor_position, render_interactive_prompt_prefix,
-    restore_raw_mode, run_interactive_shell_inner, should_start_interactive_shell,
+    InteractiveSession, render_interactive_prompt_prefix,
+    run_interactive_shell_inner, should_start_interactive_shell,
 };
 pub use subcommands::{
     format_config_output, parse_config_assignment, print_dry_run_report, run_auth, run_config,

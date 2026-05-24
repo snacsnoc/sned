@@ -313,6 +313,20 @@ pub fn print_horizontal_rule() {
     }
 }
 
+/// Print a horizontal rule via the output writer.
+pub fn print_horizontal_rule_writer(writer: &crate::cli::output::OutputWriterArc) {
+    use crate::cli::output::OutputEvent;
+    if stderr_colors_disabled() {
+        writer.emit(OutputEvent::RawAnsi("────────────────────────────────────────\n".to_string()));
+    } else {
+        writer.emit(OutputEvent::RawAnsi(format!(
+            "{}────────────────────────────────────────{}\n",
+            style::DIM,
+            style::RESET
+        )));
+    }
+}
+
 /// Format reasoning/thinking text with dim styling.
 pub fn reasoning(text: &str) -> String {
     if stdout_colors_disabled() {

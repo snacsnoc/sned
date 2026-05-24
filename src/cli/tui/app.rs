@@ -30,13 +30,24 @@ pub struct App {
     pub start_time: Option<Instant>,
     /// Spinner animation frame index
     pub spinner_index: usize,
+    /// Current working directory (for file search)
+    pub cwd: String,
+    /// Whether @ mention file picker is active
+    pub picker_active: bool,
+    /// Current file search results
+    pub picker_results: Vec<String>,
+    /// Selected index in picker results
+    pub picker_index: usize,
+    /// Command history (most recent last)
+    pub command_history: Vec<String>,
+    /// Current history navigation index (-1 = no selection, 0 = most recent)
+    pub history_index: isize,
 }
 
 impl App {
     /// Create a new App instance.
     pub fn new() -> Self {
-        let mut input = TextArea::new(Vec::new());
-        input.set_block(Block::bordered().title("❯"));
+        let input = TextArea::new(Vec::new());
         Self {
             output_lines: Vec::new(),
             input,
@@ -45,6 +56,12 @@ impl App {
             auto_scroll: true,
             start_time: None,
             spinner_index: 0,
+            cwd: String::new(),
+            picker_active: false,
+            picker_results: Vec::new(),
+            picker_index: 0,
+            command_history: Vec::new(),
+            history_index: -1,
         }
     }
 
@@ -68,11 +85,19 @@ impl App {
     }
 
     /// Render the application state to the frame.
-    pub fn render(&self, frame: &mut Frame) {
+    pub fn render(&mut self, frame: &mut Frame) {
         let [output_area, input_area] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(3),
         ]).areas(frame.area());
+
+        // Update input block title with spinner when busy
+        let title = if self.agent_busy {
+            format!("{} Working...", self.spinner_char())
+        } else {
+            "❯".to_string()
+        };
+        self.input.set_block(Block::bordered().title(title));
 
         // Output pane
         let visible_height = output_area.height as usize;

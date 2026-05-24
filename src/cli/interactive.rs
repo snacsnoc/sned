@@ -275,6 +275,11 @@ pub struct InteractiveSession {
 }
 
 impl InteractiveSession {
+    /// Get a reference to the underlying AgentLoop.
+    pub fn agent_loop(&self) -> &crate::core::agent_loop::AgentLoop {
+        &self.agent_loop
+    }
+
     pub async fn build(task_opts: TaskOptions, root_opts: RootOnlyOptions) -> anyhow::Result<Self> {
         Self::build_with_mode(task_opts, root_opts, false).await
     }
@@ -375,7 +380,8 @@ impl InteractiveSession {
     }
 
     /// Print resume summary showing previous session state.
-    async fn print_resume_summary(agent: &crate::core::agent_loop::AgentLoop) {
+    async fn print_resume_summary(agent: &crate::core::agent_loop::AgentLoop, writer: &crate::cli::output::OutputWriterArc) {
+        use crate::cli::output::OutputEvent;
         use crate::providers::{AssistantContentBlock, MessageContent, MessageRole};
 
         let state_handle = agent.state_handle();
@@ -397,7 +403,6 @@ impl InteractiveSession {
                                     return Some(format!("{} (...)", tool.name));
                                 }
                             }
-                            // Check for text response
                             for block in blocks {
                                 if let AssistantContentBlock::Text(text) = block {
                                     let preview = text.text.chars().take(50).collect::<String>();
@@ -416,45 +421,45 @@ impl InteractiveSession {
             })
         };
 
-        eprintln!(
-            "{}",
+        writer.emit(OutputEvent::RawAnsi(format!(
+            "{}\n",
             crate::cli::colors::section_header(&format!(
                 "Resumed task {} · {} turn{}",
                 agent.task_id(),
                 turns_completed,
                 if turns_completed == 1 { "" } else { "s" }
             ))
-        );
+        )));
 
         if let Some(action) = last_action {
-            eprintln!(
-                "{}",
+            writer.emit(OutputEvent::RawAnsi(format!(
+                "{}\n",
                 crate::cli::colors::colorize(
                     &format!("  📌 Last action: {}", action),
                     crate::cli::colors::style::DIM
                 )
-            );
+            )));
         }
 
         if files_tracked > 0 {
-            eprintln!(
-                "{}",
+            writer.emit(OutputEvent::RawAnsi(format!(
+                "{}\n",
                 crate::cli::colors::colorize(
                     &format!("  📁 Files changed: {}", files_tracked),
                     crate::cli::colors::style::DIM
                 )
-            );
+            )));
         }
 
-        eprintln!(
-            "{}",
+        writer.emit(OutputEvent::RawAnsi(format!(
+            "{}\n",
             crate::cli::colors::colorize(
                 &format!("  📊 Tokens: {}", total_tokens),
                 crate::cli::colors::style::DIM
             )
-        );
+        )));
 
-        crate::cli::colors::print_horizontal_rule();
+        crate::cli::colors::print_horizontal_rule_writer(writer);
     }
 
     pub async fn run(&mut self, prompt: Option<String>) -> anyhow::Result<()> {
@@ -473,7 +478,7 @@ impl InteractiveSession {
             let _ = self.hook_manager.task_resume(agent.task_id());
 
             if loaded && !self.task_opts.json {
-                Self::print_resume_summary(agent).await;
+                Self::print_resume_summary(agent, agent.output_writer()).await;
             }
         }
 
@@ -492,11 +497,11 @@ impl InteractiveSession {
             let supports_images = model_info.supports_images.unwrap_or(false);
             let image_blocks = if !all_image_paths.is_empty() && !supports_images {
                 if !self.task_opts.json {
-                    crate::cli::colors::eprint_warning(&format!(
+                    agent.output_writer().emit(crate::cli::output::OutputEvent::warning(format!(
                         "Model '{}' does not support images. Ignoring {} image(s).",
                         model_info.name.as_deref().unwrap_or("unknown"),
                         all_image_paths.len()
-                    ));
+                    )));
                 }
                 Vec::new()
             } else {
@@ -731,7 +736,6 @@ async fn handle_key_event(
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
-    use ratatui::widgets::Block;
     
     // Ctrl+C handling
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -743,29 +747,20 @@ async fn handle_key_event(
             // Exit cleanly
             return Ok(Some(Action::Quit));
         } else {
-            // Clear input - create new textarea with empty lines
-            let title = if agent_busy.load(Ordering::Relaxed) {
-                format!("{} Working...", app.spinner_char())
-            } else {
-                "❯".to_string()
-            };
-            let mut new_input = tui_textarea::TextArea::new(Vec::new());
-            new_input.set_block(Block::bordered().title(title));
-            app.input = new_input;
+            // Clear input
+            app.input = tui_textarea::TextArea::new(Vec::new());
             return Ok(None);
         }
     }
     
     // Enter key - intercept before passing to textarea
     if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
-        // Check for followup question
+        // Check for followup question (used by /undo, /commit, /checkpoint-restore)
         if is_followup_question_active(task_id) {
             if let Some(sender) = take_followup_sender(task_id) {
                 let text = app.input.lines().join("");
                 let _ = sender.send(text);
-                let mut new_input = tui_textarea::TextArea::new(Vec::new());
-                new_input.set_block(Block::bordered().title("❯"));
-                app.input = new_input;
+                app.input = tui_textarea::TextArea::new(Vec::new());
             }
             return Ok(None);
         }
@@ -778,10 +773,8 @@ async fn handle_key_event(
                 format!("❯ {}", text),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             );
-            // Clear textarea - create new one with empty lines
-            let mut new_input = tui_textarea::TextArea::new(Vec::new());
-            new_input.set_block(Block::bordered().title("❯"));
-            app.input = new_input;
+            // Clear textarea
+            app.input = tui_textarea::TextArea::new(Vec::new());
             // Submit to agent
             return Ok(Some(Action::Submit(text)));
         }
@@ -803,10 +796,534 @@ async fn handle_key_event(
         }
     }
     
+    // Up/Down for command history navigation
+    if key.code == KeyCode::Up && app.input.cursor().0 == 0 && app.input.cursor().1 == 0 {
+        if !app.command_history.is_empty() && app.history_index < app.command_history.len() as isize - 1 {
+            app.history_index += 1;
+            let idx = (app.command_history.len() as isize - 1 - app.history_index) as usize;
+            if let Some(entry) = app.command_history.get(idx) {
+                app.input = tui_textarea::TextArea::new(vec![entry.clone()]);
+            }
+        }
+        return Ok(None);
+    }
+    if key.code == KeyCode::Down && !app.command_history.is_empty() && app.history_index >= 0 {
+        if app.history_index > 0 {
+            app.history_index -= 1;
+            let idx = (app.command_history.len() as isize - 1 - app.history_index) as usize;
+            if let Some(entry) = app.command_history.get(idx) {
+                app.input = tui_textarea::TextArea::new(vec![entry.clone()]);
+            }
+        } else {
+            // At most recent history entry - clear to blank
+            app.history_index = -1;
+            app.input = tui_textarea::TextArea::new(Vec::new());
+        }
+        return Ok(None);
+    }
+    
+    // Tab key with active file picker -> insert selection
+    if key.code == KeyCode::Tab && app.picker_active && !app.picker_results.is_empty() {
+        let path = &app.picker_results[app.picker_index];
+        let text = app.input.lines().join("");
+        let mq = crate::core::file_search::extract_mention_query(&text);
+        if mq.in_mention_mode {
+            let new_text = crate::core::file_search::insert_mention(&text, mq.at_index as usize, path);
+            app.input = tui_textarea::TextArea::new(vec![new_text]);
+            app.picker_active = false;
+            app.picker_results.clear();
+        }
+        return Ok(None);
+    }
+    
     // All other keys go to textarea
     use tui_textarea::Input;
     app.input.input(Input::from(key));
+    
+    // Check for @ mention mode (simplified Phase 2: show results in output pane)
+    let input_text = app.input.lines().join("");
+    let mq = crate::core::file_search::extract_mention_query(&input_text);
+    if mq.in_mention_mode && !app.cwd.is_empty() {
+        let query = mq.query.clone();
+        let cwd = app.cwd.clone();
+        let results = crate::core::file_search::search_workspace_files(
+            &query, &cwd, 10
+        ).await;
+        app.picker_active = true;
+        app.picker_results = results.iter().map(|r| r.path.clone()).collect();
+        app.picker_index = 0;
+    } else {
+        app.picker_active = false;
+        app.picker_results.clear();
+    }
     Ok(None)
+}
+
+/// Handle CLI-only slash commands, routing output to the App buffer.
+/// Returns `true` if the caller should exit the main loop (for /exit, /quit).
+async fn handle_cli_only_command(
+    cli_cmd: crate::cli::slash_commands::CliOnlyCommand,
+    text: &str,
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    task_id: &str,
+    agent_busy: &AtomicBool,
+    agent_start_time: &Arc<Mutex<Option<Instant>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    task_opts: &TaskOptions,
+    auto_approve: bool,
+) -> anyhow::Result<bool> {
+    use crate::cli::slash_commands::{CliOnlyCommand, format_help_text, format_settings_text, format_stats_text, format_changes_text, format_help_for_command};
+    
+    if agent_busy.load(Ordering::Relaxed) {
+        let busy_cmds = [CliOnlyCommand::Exit, CliOnlyCommand::Quit, CliOnlyCommand::Clear, CliOnlyCommand::History];
+        if !busy_cmds.contains(&cli_cmd) {
+            app.push_styled("Agent is busy. Wait for it to finish before running this command.",
+                Style::default().fg(Color::Yellow));
+            return Ok(false);
+        }
+    }
+    
+    match cli_cmd {
+        CliOnlyCommand::Exit | CliOnlyCommand::Quit => {
+            return Ok(true);
+        }
+        CliOnlyCommand::Clear => {
+            app.output_lines.clear();
+            app.push_plain("Conversation cleared.");
+        }
+        CliOnlyCommand::History => {
+            let history = load_command_history();
+            let last_n: Vec<&str> = history.iter().rev().take(10).map(|s| s.as_str()).collect();
+            if last_n.is_empty() {
+                app.push_plain("No command history.");
+            } else {
+                app.push_plain("Recent history (last 10):");
+                for (i, entry) in last_n.iter().rev().enumerate() {
+                    app.push_plain(format!("  {}  {}", i + 1, entry));
+                }
+            }
+        }
+        CliOnlyCommand::Skills => {
+            let skills_text = if let Ok(cwd) = std::env::current_dir() {
+                let project_skills = crate::core::context::discover_skills(&cwd);
+                let all_skills = crate::core::context::get_available_skills(project_skills);
+                if all_skills.is_empty() {
+                    "No skills found.".to_string()
+                } else {
+                    let mut lines = vec!["Available Skills:".to_string(), String::new()];
+                    for skill in all_skills {
+                        lines.push(format!("  {} - {}", skill.name, skill.description));
+                    }
+                    lines.join("\n")
+                }
+            } else {
+                "No skills found.".to_string()
+            };
+            for line in ansi_to_ratatui_lines(&skills_text) {
+                app.push_output(line);
+            }
+        }
+        CliOnlyCommand::Help => {
+            let help_text = format_help_text();
+            for line in ansi_to_ratatui_lines(&help_text) {
+                app.push_output(line);
+            }
+        }
+        CliOnlyCommand::HelpOption(cmd) => {
+            let help_text = format_help_for_command(&cmd);
+            for line in ansi_to_ratatui_lines(&help_text) {
+                app.push_output(line);
+            }
+        }
+        CliOnlyCommand::Settings => {
+            let provider = task_opts.provider.as_deref().unwrap_or("anthropic");
+            let model = task_opts.model.as_deref().unwrap_or("claude-3-5-sonnet");
+            let mode = if task_opts.plan { "plan" } else { "act" };
+            let settings_text = format_settings_text(provider, model, mode, auto_approve);
+            for line in ansi_to_ratatui_lines(&settings_text) {
+                app.push_output(line);
+            }
+        }
+        CliOnlyCommand::Models => {
+            let models_text = crate::cli::slash_commands::format_models_text();
+            for line in ansi_to_ratatui_lines(&models_text) {
+                app.push_output(line);
+            }
+        }
+        CliOnlyCommand::ResetCompact => {
+            let mut sess = session.lock().await;
+            if sess.clear_compacted_summary().await {
+                app.push_plain("Compacted summary cleared. You can now use /compact again.");
+            } else {
+                app.push_plain("No compacted summary to clear.");
+            }
+        }
+        CliOnlyCommand::Stats => {
+            let sess = session.lock().await;
+            let sh = sess.agent_loop().state_handle();
+            let state = sh.lock().await;
+            let stats = format_stats_text(&state);
+            app.push_plain(stats);
+        }
+        CliOnlyCommand::Changes => {
+            let sess = session.lock().await;
+            let sh = sess.agent_loop().state_handle();
+            let state = sh.lock().await;
+            let changes = format_changes_text(&state);
+            app.push_plain(changes);
+        }
+        CliOnlyCommand::Undo | CliOnlyCommand::CheckpointUndo => {
+            let sess = session.lock().await;
+            let checkpoint_mgr = sess.agent_loop().checkpoint_manager();
+
+            if checkpoint_mgr.is_none() {
+                app.push_plain("Checkpoint manager is not initialized.");
+                return Ok(false);
+            }
+
+            let checkpoint_mgr = checkpoint_mgr.unwrap();
+            let checkpoints = match checkpoint_mgr.list_checkpoints().await {
+                Ok(cps) => cps,
+                Err(e) => {
+                    app.push_plain(format!("Failed to list checkpoints: {}", e));
+                    return Ok(false);
+                }
+            };
+
+            if checkpoints.is_empty() {
+                app.push_plain("No checkpoints available to undo.");
+                return Ok(false);
+            }
+
+            let most_recent = &checkpoints[0];
+            let current_hash = checkpoint_mgr.last_checkpoint().map(|h| h.as_str());
+            let changed_files = if let Some(current) = current_hash {
+                checkpoint_mgr.get_changed_files(&most_recent.hash, Some(current)).await.unwrap_or_else(|_| vec![])
+            } else {
+                vec![]
+            };
+
+            if !changed_files.is_empty() {
+                app.push_styled("/undo will revert the following files to the previous checkpoint:",
+                    Style::default().fg(Color::Yellow));
+                for f in &changed_files {
+                    app.push_plain(format!("  - {}", f));
+                }
+                app.push_plain("Continue? (y to cancel, Enter to confirm): ");
+
+                let (sender, receiver) = std::sync::mpsc::channel();
+                crate::core::approval::set_followup_question_active(task_id, true);
+                crate::core::approval::set_followup_sender(task_id, sender);
+
+                let response_result = tokio::task::spawn_blocking(move || {
+                    receiver.recv_timeout(std::time::Duration::from_secs(30))
+                }).await;
+
+                crate::core::approval::clear_followup_sender(task_id);
+                crate::core::approval::set_followup_question_active(task_id, false);
+
+                let confirm = match response_result {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_)) | Err(_) => String::new(),
+                };
+
+                if !confirm.trim().is_empty() && confirm.trim().to_lowercase() == "y" {
+                    app.push_plain("Undo cancelled.");
+                    return Ok(false);
+                }
+            }
+
+            match checkpoint_mgr.restore_checkpoint(&most_recent.hash).await {
+                Ok(()) => {
+                    app.push_plain(format!("Restored to checkpoint {} — {} file(s) reverted",
+                        most_recent.number, changed_files.len()));
+                    if !changed_files.is_empty() {
+                        app.push_plain("\nReverted files:");
+                        for f in &changed_files {
+                            app.push_plain(format!("  - {}", f));
+                        }
+                    }
+                    let removed = sess.agent_loop().remove_last_turn().await;
+                    if removed > 0 {
+                        app.push_plain(format!("Removed {} message(s) from conversation history.", removed));
+                    }
+                }
+                Err(e) => {
+                    app.push_plain(format!("Undo failed: {}", e));
+                }
+            }
+        }
+        CliOnlyCommand::Diff => {
+            if let Ok(workspace_root) = std::env::current_dir() {
+                if !crate::core::shadow_git::is_initialized(&workspace_root) {
+                    app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
+                } else {
+                    match crate::core::shadow_git::diff_turns(&workspace_root, 1, 0) {
+                        Ok(diff) => {
+                            if diff.is_empty() {
+                                app.push_plain("No changes.");
+                            } else {
+                                for line in ansi_to_ratatui_lines(&diff) {
+                                    app.push_output(line);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            app.push_plain(format!("Failed to get diff: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+        CliOnlyCommand::Log => {
+            if let Ok(workspace_root) = std::env::current_dir() {
+                if !crate::core::shadow_git::is_initialized(&workspace_root) {
+                    app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
+                } else {
+                    match crate::core::shadow_git::log(&workspace_root, Some(10)) {
+                        Ok(log) => {
+                            if log.is_empty() {
+                                app.push_plain("No log entries.");
+                            } else {
+                                for line in ansi_to_ratatui_lines(&log) {
+                                    app.push_output(line);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            app.push_plain(format!("Failed to get log: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+        CliOnlyCommand::Commit => {
+            let commit_msg = if text.starts_with("/commit ") {
+                text.strip_prefix("/commit ")
+                    .map(|s| s.trim_matches('"').trim_matches('\'').to_string())
+            } else {
+                None
+            };
+
+            if let Some(msg) = commit_msg {
+                if let Ok(workspace_root) = std::env::current_dir() {
+                    if !crate::core::shadow_git::is_initialized(&workspace_root) {
+                        app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
+                    } else {
+                        match crate::core::shadow_git::diff_turns(&workspace_root, 1, 0) {
+                            Ok(diff) => {
+                                if diff.is_empty() {
+                                    app.push_plain("No changes to commit.");
+                                } else {
+                                    app.push_styled("Changes to commit:", Style::default().fg(Color::Cyan));
+                                    for line in ansi_to_ratatui_lines(&diff) {
+                                        app.push_output(line);
+                                    }
+                                    app.push_plain("Commit to your git repo? (y/n): ");
+
+                                    let (sender, receiver) = std::sync::mpsc::channel();
+                                    crate::core::approval::set_followup_question_active(task_id, true);
+                                    crate::core::approval::set_followup_sender(task_id, sender);
+
+                                    let response_result = tokio::task::spawn_blocking(move || {
+                                        receiver.recv_timeout(std::time::Duration::from_secs(30))
+                                    }).await;
+
+                                    crate::core::approval::clear_followup_sender(task_id);
+                                    crate::core::approval::set_followup_question_active(task_id, false);
+
+                                    let confirm = match response_result {
+                                        Ok(Ok(r)) => r,
+                                        Ok(Err(_)) | Err(_) => String::new(),
+                                    };
+
+                                    if confirm.trim().is_empty() || confirm.trim().to_lowercase() == "y" {
+                                        match crate::core::shadow_git::commit_to_real_git(&workspace_root, &msg) {
+                                            Ok(files) => {
+                                                app.push_plain(format!("Committed {} file(s) to your git repo.", files.len()));
+                                            }
+                                            Err(e) => {
+                                                app.push_plain(format!("Commit failed: {}", e));
+                                            }
+                                        }
+                                    } else {
+                                        app.push_plain("Commit cancelled.");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.push_plain(format!("Failed to get diff: {}", e));
+                            }
+                        }
+                    }
+                }
+            } else {
+                app.push_plain("Usage: /commit <message>");
+            }
+        }
+        CliOnlyCommand::CheckpointList => {
+            let sess = session.lock().await;
+            let checkpoint_mgr = sess.agent_loop().checkpoint_manager();
+
+            if checkpoint_mgr.is_none() {
+                app.push_plain("Checkpoint manager is not initialized.");
+                return Ok(false);
+            }
+
+            let checkpoint_mgr = checkpoint_mgr.unwrap();
+            match checkpoint_mgr.list_checkpoints().await {
+                Ok(checkpoints) => {
+                    if checkpoints.is_empty() {
+                        app.push_plain("No checkpoints found.");
+                    } else {
+                        app.push_plain("Available checkpoints:");
+                        app.push_plain("  #  Hash      Message");
+                        app.push_plain("  ──────────────────────────");
+                        for cp in checkpoints.iter().rev() {
+                            app.push_plain(format!("  {}  {}  {}", cp.number, cp.hash, cp.message));
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.push_plain(format!("Failed to list checkpoints: {}", e));
+                }
+            }
+        }
+        CliOnlyCommand::CheckpointRestore => {
+            let sess = session.lock().await;
+            let checkpoint_mgr = sess.agent_loop().checkpoint_manager();
+
+            if checkpoint_mgr.is_none() {
+                app.push_plain("Checkpoint manager is not initialized.");
+                return Ok(false);
+            }
+
+            let checkpoint_mgr = checkpoint_mgr.unwrap();
+            let checkpoints = match checkpoint_mgr.list_checkpoints().await {
+                Ok(cps) => cps,
+                Err(e) => {
+                    app.push_plain(format!("Failed to list checkpoints: {}", e));
+                    return Ok(false);
+                }
+            };
+
+            if checkpoints.is_empty() {
+                app.push_plain("No checkpoints to restore.");
+                return Ok(false);
+            }
+
+            let checkpoint_num = crate::cli::slash_commands::parse_checkpoint_restore(text);
+            let num = if let Some(n) = checkpoint_num {
+                n
+            } else {
+                app.push_plain("Available checkpoints:");
+                app.push_plain("  #  Hash      Message");
+                app.push_plain("  ──────────────────────────");
+                for cp in checkpoints.iter().rev() {
+                    app.push_plain(format!("  {}  {}  {}", cp.number, cp.hash, cp.message));
+                }
+                app.push_plain("Enter checkpoint number to restore:");
+
+                let (sender, receiver) = std::sync::mpsc::channel();
+                crate::core::approval::set_followup_question_active(task_id, true);
+                crate::core::approval::set_followup_sender(task_id, sender);
+
+                let response_result = tokio::task::spawn_blocking(move || {
+                    receiver.recv_timeout(std::time::Duration::from_secs(30))
+                }).await;
+
+                crate::core::approval::clear_followup_sender(task_id);
+                crate::core::approval::set_followup_question_active(task_id, false);
+
+                let input = match response_result {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_)) | Err(_) => String::new(),
+                };
+                input.trim().parse::<usize>().unwrap_or(0)
+            };
+
+            if num == 0 || num > checkpoints.len() {
+                app.push_plain(format!("Invalid checkpoint number. Available: 1-{}", checkpoints.len()));
+                return Ok(false);
+            }
+
+            if let Some(checkpoint) = checkpoints.get(num - 1) {
+                let current_hash = checkpoint_mgr.last_checkpoint()
+                    .map(|h| h.as_str()).unwrap_or("HEAD");
+                match checkpoint_mgr.get_changed_files(&checkpoint.hash, Some(current_hash)).await {
+                    Ok(changed_files) => {
+                        if !changed_files.is_empty() {
+                            app.push_styled("Files that will be restored:", Style::default().fg(Color::Yellow));
+                            for file in &changed_files {
+                                app.push_plain(format!("  - {}", file));
+                            }
+                            app.push_plain("Continue? (y to cancel, Enter to confirm): ");
+
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            crate::core::approval::set_followup_question_active(task_id, true);
+                            crate::core::approval::set_followup_sender(task_id, sender);
+
+                            let response_result = tokio::task::spawn_blocking(move || {
+                                receiver.recv_timeout(std::time::Duration::from_secs(30))
+                            }).await;
+
+                            crate::core::approval::clear_followup_sender(task_id);
+                            crate::core::approval::set_followup_question_active(task_id, false);
+
+                            let confirm = match response_result {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(_)) | Err(_) => String::new(),
+                            };
+
+                            if !confirm.trim().is_empty() && confirm.trim().to_lowercase() == "y" {
+                                app.push_plain("Restore cancelled.");
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.push_plain(format!("Warning: Could not determine changed files: {}", e));
+                    }
+                }
+
+                match checkpoint_mgr.restore_by_number(num).await {
+                    Ok(()) => {
+                        app.push_plain(format!("Checkpoint {} ({}) restored successfully.", num, checkpoint.hash));
+                    }
+                    Err(e) => {
+                        app.push_plain(format!("Failed to restore checkpoint: {}", e));
+                    }
+                }
+            }
+        }
+        CliOnlyCommand::Expand => {
+            if let Some(index) = crate::cli::slash_commands::parse_expand_index(text) {
+                let sess = session.lock().await;
+                let sh = sess.agent_loop().state_handle();
+                drop(sess);
+                let state = sh.lock().await;
+                if let Some(block) = state.snipped_code_blocks.iter().find(|block| block.index == index) {
+                    if block.language.is_empty() {
+                        app.push_plain("```");
+                    } else {
+                        app.push_plain(format!("```{}", block.language));
+                    }
+                    let highlighted = crate::cli::syntax_highlight::highlight_code(&block.code, &block.language);
+                    for line in ansi_to_ratatui_lines(&highlighted) {
+                        app.push_output(line);
+                    }
+                    app.push_plain("```");
+                } else {
+                    app.push_plain(format!("No snipped code block {}.", index));
+                }
+            } else {
+                app.push_plain("Usage: /expand N");
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Main ratatui event loop.
@@ -821,6 +1338,9 @@ async fn run_main_loop(
     agent_start_time: Arc<Mutex<Option<Instant>>>,
     state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     agent_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    queue_handle: Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
+    task_opts: &TaskOptions,
+    auto_approve: bool,
 ) -> anyhow::Result<()> {
     loop {
         // 1. Drain channel into app
@@ -847,14 +1367,44 @@ async fn run_main_loop(
                         match action {
                             Action::Quit => return Ok(()),
                             Action::Submit(text) => {
-                                spawn_agent_task(
-                                    &session,
-                                    &text,
-                                    &agent_busy,
-                                    &agent_done,
-                                    &agent_start_time,
-                                    &agent_task,
-                                ).await?;
+                                // Save to command history
+                                append_to_history(&text);
+                                
+                                // Check for CLI-only slash commands FIRST
+                                if let Some(cli_cmd) = crate::cli::slash_commands::get_cli_only_command(&text) {
+                                    let should_exit = handle_cli_only_command(
+                                        cli_cmd, &text, app, &session, &task_id,
+                                        &agent_busy, &agent_start_time, &agent_task,
+                                        &state_handle, task_opts, auto_approve,
+                                    ).await?;
+                                    if should_exit {
+                                        return Ok(());
+                                    }
+                                    continue;
+                                }
+                                
+                                // Process model-side slash commands (e.g., /compact, /plan)
+                                let processed = crate::cli::slash_commands::process_slash_command(&text);
+                                
+                                // If agent is busy, queue the message; otherwise spawn
+                                if agent_busy.load(Ordering::Relaxed) {
+                                    if let Some(qh) = queue_handle.lock().await.as_ref() {
+                                        if !processed.is_empty() {
+                                            qh.enqueue_text_message(processed).await;
+                                            let count = qh.queued_message_count().await;
+                                            app.push_styled(
+                                                format!("Message queued ({} in queue)", count),
+                                                Style::default().add_modifier(Modifier::DIM),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    spawn_agent_task(
+                                        &session, &processed,
+                                        &agent_busy, &agent_done,
+                                        &agent_start_time, &agent_task,
+                                    ).await?;
+                                }
                             }
                             Action::CancelAgent => {
                                 app.push_plain("^C");
@@ -895,6 +1445,9 @@ pub async fn run_interactive_shell_inner(
     // 1. Initialize ratatui (replaces enter_raw_mode, scroll_region, bracketed paste)
     let mut terminal = ratatui::init();
     let mut app = App::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        app.cwd = cwd.to_string_lossy().to_string();
+    }
     
     // 2. Create output channel (Phase 1 infrastructure, now drains to App)
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
@@ -938,8 +1491,8 @@ pub async fn run_interactive_shell_inner(
     let agent_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(None));
     
-    // Load command history (for Phase 3.3 integration with tui-textarea)
-    let _command_history = load_command_history();
+    // Load command history into app
+    app.command_history = load_command_history();
     
     {
         let sess = session.lock().await;
@@ -950,6 +1503,7 @@ pub async fn run_interactive_shell_inner(
     }
     
     // 6. Main loop
+    let auto_approve = task_opts.yolo || task_opts.auto_approve_all;
     let result = run_main_loop(
         &mut terminal,
         &mut app,
@@ -961,6 +1515,9 @@ pub async fn run_interactive_shell_inner(
         agent_start_time,
         state_handle,
         agent_task,
+        queue_handle,
+        &task_opts,
+        auto_approve,
     ).await;
     
     // 7. Always restore terminal
@@ -987,161 +1544,23 @@ pub fn render_interactive_prompt_prefix() -> String {
     )
 }
 
-pub fn print_undo_result(added: Vec<String>, modified: Vec<String>) {
+pub fn print_undo_result(added: Vec<String>, modified: Vec<String>, app: &mut App) {
     if !added.is_empty() {
-        eprintln!("Deleted {} file(s) created in last turn:", added.len());
+        app.push_plain(format!("Deleted {} file(s) created in last turn:", added.len()));
         for f in &added {
-            eprintln!("  - {}", f);
+            app.push_plain(format!("  - {}", f));
         }
     }
     if !modified.is_empty() {
-        eprintln!("Restored {} file(s) to previous state:", modified.len());
+        app.push_plain(format!("Restored {} file(s) to previous state:", modified.len()));
         for f in &modified {
-            eprintln!("  - {}", f);
+            app.push_plain(format!("  - {}", f));
         }
     }
     if added.is_empty() && modified.is_empty() {
-        eprintln!("No changes to undo.");
+        app.push_plain("No changes to undo.");
     } else {
-        eprintln!("Undone last turn.");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_duration_seconds() {
-        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
-        assert_eq!(format_duration(Duration::from_secs(1)), "1s");
-        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
-        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
-    }
-
-    #[test]
-    fn test_format_duration_minutes() {
-        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
-        assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
-        assert_eq!(format_duration(Duration::from_secs(150)), "2m 30s");
-        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
-    }
-
-    #[test]
-    fn test_format_duration_hours() {
-        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 0m");
-        assert_eq!(format_duration(Duration::from_secs(3660)), "1h 1m");
-        assert_eq!(format_duration(Duration::from_secs(4500)), "1h 15m");
-        assert_eq!(format_duration(Duration::from_secs(7320)), "2h 2m");
-    }
-
-    #[test]
-    fn test_resume_summary_section_header_format() {
-        // Verify section_header format for resume summary
-        let header = crate::cli::colors::section_header("Resumed task abc123 · 3 turns");
-        assert!(header.contains("Resumed task"));
-        assert!(header.contains("3 turns"));
-        assert!(header.contains("═══"));
-    }
-
-    #[test]
-    fn test_display_width_ascii() {
-        assert_eq!(display_width("hello"), 5);
-        assert_eq!(display_width(""), 0);
-        assert_eq!(display_width("a"), 1);
-    }
-
-    #[test]
-    fn test_display_width_cjk() {
-        assert_eq!(display_width("你好"), 4);
-        assert_eq!(display_width("你好 hello"), 10);
-        assert_eq!(display_width("🎉"), 2);
-        assert_eq!(display_width("🎉hello"), 7);
-    }
-
-    #[test]
-    fn test_ctrl_w_deletes_word_cjk() {
-        let mut buf = String::from("hello 世界");
-        let len = buf.len();
-        let pos = delete_word_backward(&mut buf, len);
-        assert_eq!(buf, "hello ");
-        assert_eq!(pos, 6);
-    }
-
-    #[test]
-    fn test_ctrl_w_deletes_word_with_multiple_spaces() {
-        let mut buf = String::from("hello   世界");
-        let len = buf.len();
-        let pos = delete_word_backward(&mut buf, len);
-        assert_eq!(buf, "hello   ");
-        assert_eq!(pos, 8);
-    }
-
-    #[test]
-    fn test_ctrl_w_deletes_single_word() {
-        let mut buf = String::from("hello");
-        let pos = delete_word_backward(&mut buf, 5);
-        assert_eq!(buf, "");
-        assert_eq!(pos, 0);
-    }
-
-    #[test]
-    fn test_ctrl_w_no_whitespace_deletes_all() {
-        let mut buf = String::from("hello世界test");
-        let len = buf.len();
-        let pos = delete_word_backward(&mut buf, len);
-        assert_eq!(buf, "");
-        assert_eq!(pos, 0);
-    }
-
-    #[test]
-    fn test_ctrl_w_emoji_word() {
-        let mut buf = String::from("hello 🎉🎊");
-        let len = buf.len();
-        let pos = delete_word_backward(&mut buf, len);
-        assert_eq!(buf, "hello ");
-        assert_eq!(pos, 6);
-    }
-
-    #[test]
-    fn test_input_lines_calculation_cjk() {
-        let term_cols: u16 = 80;
-        let prompt_prefix = "❯ ";
-        let input_buf = "你好 hello";
-        let full_input = format!("{}{}", prompt_prefix, input_buf);
-        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
-        let input_lines = input_lines.max(1);
-        assert_eq!(input_lines, 1);
-
-        let long_cjk = "你好世界 hello world test";
-        let full_input = format!("{}{}", prompt_prefix, long_cjk);
-        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
-        let input_lines = input_lines.max(1);
-        assert_eq!(input_lines, 1);
-
-        let very_long_cjk =
-            "你好世界 hello world test 你好世界 hello world test 你好世界 hello world test 你好";
-        let full_input = format!("{}{}", prompt_prefix, very_long_cjk);
-        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
-        let input_lines = input_lines.max(1);
-        assert!(
-            input_lines > 1,
-            "Long CJK input should wrap to multiple lines"
-        );
-    }
-
-    #[test]
-    fn test_cursor_move_left_cjk() {
-        let input_buf = "你好 hello";
-        let cursor_pos = 7;
-        let right_of_cursor = &input_buf[cursor_pos..];
-        let move_left = display_width(right_of_cursor);
-        assert_eq!(move_left, 5);
-
-        let cursor_pos = 0;
-        let right_of_cursor = &input_buf[cursor_pos..];
-        let move_left = display_width(right_of_cursor);
-        assert_eq!(move_left, 10);
+        app.push_plain("Undone last turn.");
     }
 }
 

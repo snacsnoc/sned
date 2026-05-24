@@ -481,6 +481,11 @@ impl AgentLoop {
         self.deps.checkpoint_manager.as_mut()
     }
 
+    /// Get a reference to the output writer.
+    pub fn output_writer(&self) -> &crate::cli::output::OutputWriterArc {
+        &self.config.output_writer
+    }
+
     /// Get a clonable handle for enqueuing messages from other tasks.
     pub fn message_queue_handle(&self) -> MessageQueueHandle {
         MessageQueueHandle {
