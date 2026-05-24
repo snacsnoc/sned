@@ -9,6 +9,7 @@ use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
@@ -194,6 +195,7 @@ impl UseSubagentsHandler {
         params: serde_json::Value,
         workspace_root: &Path,
         json_output: bool,
+        output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
         // Prevent subagent recursion (matches TypeScript SubagentToolHandler.ts:96-98)
         if state.is_subagent_execution {
@@ -301,13 +303,11 @@ impl UseSubagentsHandler {
         let cwd = workspace_root.to_path_buf();
 
         if !json_output {
-            eprintln!(
-                "{}",
-                crate::cli::colors::info(&format!(
-                    "Running {} subagent(s) in parallel...",
-                    prompts.len()
-                ))
-            );
+            use crate::cli::output::OutputEvent;
+            output_writer.emit(OutputEvent::info(format!(
+                "Running {} subagent(s) in parallel...",
+                prompts.len()
+            )));
         }
 
         let mut handles = Vec::new();
@@ -427,13 +427,11 @@ impl UseSubagentsHandler {
 
         let summary = summary_lines.join("\n");
         if !json_output {
-            eprintln!(
-                "{}",
-                crate::cli::colors::info(&format!(
-                    "Subagent batch complete: {} succeeded, {} failed",
-                    successes, failures
-                ))
-            );
+            use crate::cli::output::OutputEvent;
+            output_writer.emit(OutputEvent::info(format!(
+                "Subagent batch complete: {} succeeded, {} failed",
+                successes, failures
+            )));
         }
 
         Ok(summary)
@@ -447,7 +445,9 @@ impl UseSubagentsHandler {
         let workspace_root = std::env::current_dir()
             .ok()
             .unwrap_or_else(|| Path::new(".").to_path_buf());
-        self.execute_with_workspace_root(state, params, workspace_root.as_path(), false)
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        self.execute_with_workspace_root(state, params, workspace_root.as_path(), false, &output_writer)
             .await
     }
 }
@@ -479,6 +479,7 @@ impl ToolHandler for UseSubagentsHandler {
             params,
             ctx.workspace_root.as_path(),
             ctx.json_output,
+            &ctx.output_writer,
         )
         .await
         .map(serde_json::Value::String)
@@ -656,6 +657,7 @@ mod tests {
             "test-task".to_string(),
             None,  // no hook manager
             false, // explicitly_approved = false
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let params = serde_json::json!({"prompt_1": "Test subagent"});
