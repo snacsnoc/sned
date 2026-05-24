@@ -1113,6 +1113,7 @@ async fn run_main_loop(
                                         &agent_busy, &agent_done,
                                         &agent_start_time, &agent_task,
                                     ).await?;
+                                    app.agent_busy = true;
                                 }
                             }
                             Action::CancelAgent => {
@@ -1132,6 +1133,7 @@ async fn run_main_loop(
         if agent_busy.load(Ordering::Relaxed) {
             if agent_done.notified().now_or_never().is_some() {
                 agent_busy.store(false, Ordering::Relaxed);
+                app.agent_busy = false;
                 if let Some(start) = agent_start_time.lock().await.take() {
                     let elapsed = start.elapsed();
                     app.push_styled(
