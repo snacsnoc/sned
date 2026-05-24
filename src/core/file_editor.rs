@@ -106,7 +106,7 @@ static ANCHOR_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Tracked document state.
 #[derive(Debug, Clone)]
 struct TrackedDocument {
-    hashes: Vec<u32>,
+    hashes: Vec<u64>,
     anchors: Vec<String>,
     /// Tracks used words in insertion order for LRU eviction.
     /// VecDeque maintains insertion order, HashSet provides O(1) lookup.
