@@ -44,6 +44,14 @@ const SAFE_GIT_SUBCOMMANDS: &[&str] = &["status", "log", "diff", "branch", "show
 
 const DANGEROUS_FIND_FLAGS: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "-okdir"];
 
+/// Commands that are always denied regardless of SNED_SAFE_COMMANDS or user approval.
+/// These cannot be whitelisted via environment variable.
+const HARD_CODED_DENY_LIST: &[&str] = &[
+    "rm", "dd", "mkfs", "curl", "wget", "nc", "ncat", "netcat", "ssh", "sudo",
+    "chmod", "chown", "kill", "killall", "reboot", "shutdown", "poweroff",
+    "insmod", "rmmod", "modprobe", "apt-get", "yum", "dnf", "apt",
+];
+
 #[derive(Debug, Clone)]
 pub struct CommandSafetyChecker {
     yolo_mode: bool,
@@ -141,6 +149,14 @@ impl CommandSafetyChecker {
             }
 
             let base_command = parts[0].to_lowercase();
+
+            // Hardcoded deny list: these commands are never allowed regardless of SNED_SAFE_COMMANDS
+            if HARD_CODED_DENY_LIST.contains(&base_command.as_str()) {
+                return Err(CommandUnsafe::new(&format!(
+                    "command '{}' is permanently denied for safety",
+                    base_command
+                )));
+            }
 
             if base_command == "git" {
                 if parts.len() < 2 {
