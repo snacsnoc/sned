@@ -57,7 +57,7 @@ pub(crate) fn append_to_history(command: &str) {
     let dir = history_path.parent().unwrap_or(&default_path);
 
     if let Err(e) = std::fs::create_dir_all(dir) {
-        eprintln!("Warning: Failed to create history directory: {}", e);
+        tracing::warn!("Failed to create history directory: {}", e);
         return;
     }
 
@@ -72,7 +72,7 @@ pub(crate) fn append_to_history(command: &str) {
 
     let content = history.join("\n") + "\n";
     if let Err(e) = crate::storage::disk::atomic_write_file(&history_path, &content) {
-        eprintln!("Warning: Failed to save command history: {}", e);
+        tracing::warn!("Failed to save command history: {}", e);
     }
 }
 
