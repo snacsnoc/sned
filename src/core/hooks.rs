@@ -167,6 +167,8 @@ pub struct HookManager {
     cancel_token: Option<CancellationToken>,
     /// Flag indicating hook was cancelled externally
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether workspace hooks are explicitly opted-in (require .snedrules/hooks/.signed)
+    workspace_hooks_opted_in: bool,
 }
 
 impl HookManager {
@@ -182,6 +184,7 @@ impl HookManager {
             active_child_pid: Arc::new(Mutex::new(None)),
             cancel_token: None,
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            workspace_hooks_opted_in: false,
         }
     }
 
@@ -193,6 +196,14 @@ impl HookManager {
     /// Add a workspace hooks directory
     pub fn add_workspace_hooks_dir(&mut self, path: PathBuf) {
         self.workspace_hooks_dirs.push(path);
+    }
+
+    /// Enable workspace hooks with explicit opt-in.
+    /// Workspace hooks must have a `.signed` marker file in their directory
+    /// to be executed. This prevents arbitrary workspace scripts from running.
+    pub fn enable_workspace_hooks(&mut self, dir: PathBuf) {
+        self.workspace_hooks_dirs.push(dir);
+        self.workspace_hooks_opted_in = true;
     }
 
     /// Set the runtime hooks directory (--hooks-dir)
@@ -226,16 +237,36 @@ impl HookManager {
     }
 
     /// Discover all hooks for a given hook name across all directories.
-    /// Priority: runtime > workspace > global
+    /// Priority: runtime > workspace (> requires opt-in) > global
     pub fn discover_hooks(&self, hook_name: HookName) -> Vec<PathBuf> {
         let mut hooks = Vec::new();
         let hook_file = hook_name.as_str();
 
-        let mut check_dir = |dir: &std::path::Path| {
+        let mut check_dir = |dir: &std::path::Path, is_workspace: bool| {
+            // For workspace hooks, require opt-in and .signed marker
+            if is_workspace && self.workspace_hooks_opted_in {
+                let signed_path = dir.join(".signed");
+                if !signed_path.exists() {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        "Skipping workspace hooks: no .signed marker found (unverified workspace)"
+                    );
+                    return;
+                }
+            }
+
             // Unix: extensionless executable hooks are canonical
             // Windows: .ps1 PowerShell scripts
             let path = dir.join(hook_file);
             if path.exists() {
+                if is_workspace && !self.workspace_hooks_opted_in {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        hook = %hook_file,
+                        "Skipping unverified workspace hook. Create .snedrules/hooks/.signed to enable."
+                    );
+                    return;
+                }
                 hooks.push(path);
             }
 
@@ -244,21 +275,29 @@ impl HookManager {
             {
                 let ps1_path = dir.join(format!("{}.ps1", hook_file));
                 if ps1_path.exists() {
+                    if is_workspace && !self.workspace_hooks_opted_in {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            hook = %hook_file,
+                            "Skipping unverified workspace hook. Create .snedrules/hooks/.signed to enable."
+                        );
+                        return;
+                    }
                     hooks.push(ps1_path);
                 }
             }
         };
 
         if let Some(dir) = &self.runtime_hooks_dir {
-            check_dir(dir);
+            check_dir(dir, false);
         }
 
         for dir in &self.workspace_hooks_dirs {
-            check_dir(dir);
+            check_dir(dir, true);
         }
 
         if let Some(dir) = &self.global_hooks_dir {
-            check_dir(dir);
+            check_dir(dir, false);
         }
 
         hooks
@@ -353,12 +392,32 @@ impl HookManager {
         // rather than user's login shell which could execute malicious rc files
         let shell = "/bin/sh";
 
-        // Run the hook script
+        // Run the hook script with sandboxed environment
         let mut cmd = Command::new(shell);
         cmd.arg(hook_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("SNED_VERSION", &self.sned_version)
+            .env("SNED_USER_ID", &self.user_id)
+            // Remove sensitive environment variables for sandboxing
+            .env_clear()
+            .envs(std::env::vars().filter(|(k, _)| {
+                // Only allow safe environment variables through
+                matches!(
+                    k.as_str(),
+                    "PATH"
+                        | "HOME"
+                        | "USER"
+                        | "LANG"
+                        | "LC_ALL"
+                        | "SNED_VERSION"
+                        | "SNED_USER_ID"
+                        | "TERM"
+                        | "TERM_PROGRAM"
+                        | "TZ"
+                )
+            }))
             .env("SNED_VERSION", &self.sned_version)
             .env("SNED_USER_ID", &self.user_id);
 
