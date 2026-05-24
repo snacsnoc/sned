@@ -2074,8 +2074,10 @@ impl AgentLoop {
                                     coerce_string_array(&tool_params, "commands", "command");
                                 let script = tool_params.get("script").and_then(|s| s.as_str());
                                 let yolo = mgr.is_yolo_mode();
+                                let user_safe = mgr.get_user_safe_commands().clone();
                                 let checker = crate::core::approval::CommandSafetyChecker::new()
-                                    .with_yolo(yolo);
+                                    .with_yolo(yolo)
+                                    .with_user_safe_commands(user_safe);
                                 let any_unsafe = commands
                                     .iter()
                                     .any(|cmd| !cmd.is_empty() && checker.is_safe(cmd).is_err())

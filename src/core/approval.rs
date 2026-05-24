@@ -347,6 +347,8 @@ pub struct ApprovalManager {
     auto_approve_patterns: Vec<PathPattern>,
     /// Output writer for routing approval prompt to ratatui TUI.
     output_writer: Option<OutputWriterArc>,
+    /// User-configured safe commands shared with the agent loop safety check.
+    user_safe_commands: Vec<String>,
 }
 
 impl Default for ApprovalManager {
@@ -359,6 +361,7 @@ impl Default for ApprovalManager {
             auto_approval_settings: AutoApprovalSettings::default(),
             auto_approve_patterns: Vec::new(),
             output_writer: None,
+            user_safe_commands: Vec::new(),
         }
     }
 }
@@ -402,7 +405,17 @@ impl ApprovalManager {
     /// Set output writer for routing approval prompt to ratatui TUI.
     pub fn with_output_writer(mut self, output_writer: OutputWriterArc) -> Self {
         self.output_writer = Some(output_writer);
+    }
+
+    /// Set user-safe commands (overrides SNED_SAFE_COMMANDS env var).
+    pub fn with_user_safe_commands(mut self, commands: Vec<String>) -> Self {
+        self.user_safe_commands = commands;
         self
+    }
+
+    /// Get the user-safe commands list.
+    pub fn get_user_safe_commands(&self) -> &Vec<String> {
+        &self.user_safe_commands
     }
 
     /// Check if a tool should prompt for approval.
