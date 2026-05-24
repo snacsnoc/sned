@@ -3,19 +3,17 @@
 //! Extracted from `cli/mod.rs` — handles raw mode, terminal rendering,
 //! file picker, input queuing, and agent lifecycle.
 
-use crate::cli::{HistoryOptions, RootOnlyOptions, TaskOptions};
+use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::cli::output::{OutputEvent, OutputWriterArc, ChannelOutputWriter};
 use crate::cli::tui::{App, ansi_to_ratatui_lines};
 use futures::FutureExt;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, mpsc};
 use unicode_width::UnicodeWidthChar;
 
@@ -894,106 +892,55 @@ pub async fn run_interactive_shell_inner(
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
 ) -> anyhow::Result<()> {
-    use crate::core::file_search::{extract_mention_query, insert_mention, search_workspace_files};
-    use crate::terminal::input::{InputParser, TerminalEvent, enter_raw_mode, install_panic_hook};
-    use crate::terminal::picker::FilePicker;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    install_panic_hook();
-
-    let cwd = std::env::current_dir()?;
-    let cwd_str = cwd.to_string_lossy().into_owned();
-
-    let mut input_buf = String::new();
-    let mut cursor_pos: usize = 0;
-    let mut parser = InputParser::new();
-    let mut picker_active = false;
-    let mut picker = FilePicker::new(13, 80);
-
-    let mut raw_guard = Some(enter_raw_mode()?);
-
-    let mut stdout = io::stdout();
-
-    // Enable bracketed paste mode so pasted multi-line text is treated as a single input.
-    // Flush immediately to ensure the terminal processes this before we start reading.
-    write!(stdout, "\x1b[?2004h")?;
-    stdout.flush()?;
-
-    // Set scroll region: rows 1..(rows-1) scroll, bottom row is pinned for input.
-    let (_init_cols, init_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    set_scroll_region(&mut stdout, init_rows)?;
-
-    // Give the terminal a moment to process the bracketed paste enable sequence.
-    // Without this, rapid pastes immediately after startup might arrive before the
-    // terminal has processed the escape sequence.
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-    let mut input_row: u16 = 0;
-    let mut last_picker_row: Option<usize> = None;
-    let mut last_picker_height: usize = 0;
-    let mut stdin = tokio::io::stdin();
-    let mut byte_buf = [0u8; 4096];
-
-    let agent_busy = Arc::new(AtomicBool::new(false));
-    let agent_done = Arc::new(tokio::sync::Notify::new());
-    let agent_start_time: Arc<tokio::sync::Mutex<Option<std::time::Instant>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let queue_handle: Arc<tokio::sync::Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let state_handle: Arc<
-        tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<crate::core::agent_types::TaskState>>>>,
-    > = Arc::new(tokio::sync::Mutex::new(None));
-    let agent_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let auto_approve = task_opts.yolo || task_opts.auto_approve_all;
+    // 1. Initialize ratatui (replaces enter_raw_mode, scroll_region, bracketed paste)
+    let mut terminal = ratatui::init();
+    let mut app = App::new();
     
-    // Phase 1: Create output channel and drain to stderr
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
-    let output_writer: crate::cli::output::OutputWriterArc =
-        Arc::new(crate::cli::output::ChannelOutputWriter::new(output_tx));
+    // 2. Create output channel (Phase 1 infrastructure, now drains to App)
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(output_tx));
     
-    // Spawn drain task (Phase 1 only - forwards to stderr)
-    tokio::spawn(async move {
-        use crate::cli::output::OutputEvent;
-        while let Some(event) = output_rx.recv().await {
-            match event {
-                OutputEvent::Line(line) => eprintln!("{}", line),
-                OutputEvent::RawAnsi(s) => eprint!("{}", s),
-            }
-        }
-    });
-    
-    let session = Arc::new(tokio::sync::Mutex::new(
-        InteractiveSession::build_with_writer(task_opts.clone(), root_opts.clone(), Some(output_writer.clone())).await?,
+    // 3. Build session
+    let session = Arc::new(Mutex::new(
+        InteractiveSession::build_with_writer(
+            task_opts.clone(), 
+            root_opts.clone(), 
+            Some(output_writer.clone())
+        ).await?,
     ));
+    
     let task_id = {
         let sess = session.lock().await;
         sess.agent_loop.task_id().to_string()
     };
-
-     // Print startup info line (respects NO_COLOR and --quiet)
-     {
-         let sess = session.lock().await;
-         if !sess.is_quiet() {
-             let startup_info = sess.get_startup_info();
-             let startup_text = format!(
-                 "{}\n{}\n{}",
-                 startup_info,
-                 crate::cli::colors::info(
-                     "type a prompt and press Enter; type 'exit' or 'quit' to leave",
-                 ),
-                 crate::cli::colors::info(
-                     "type /help for slash commands, @ to search and mention files",
-                 ),
-             );
-             crate::cli::colors::eprint_raw(&startup_text);
-         }
-     }
-
-    // Load command history for up/down arrow navigation
-    let command_history = load_command_history();
-    let mut history_index: Option<usize> = None;
-
+    
+    // 4. Startup banner → app.push_output()
+    {
+        let sess = session.lock().await;
+        if !sess.is_quiet() {
+            let startup_info = sess.get_startup_info();
+            app.push_plain(startup_info);
+            app.push_styled("type a prompt and press Enter; type /exit to leave", 
+                Style::default().add_modifier(Modifier::DIM));
+            app.push_styled("type /help for slash commands, @ to search and mention files",
+                Style::default().add_modifier(Modifier::DIM));
+        }
+    }
+    
+    // 5. Shared state (same as current)
+    let agent_busy = Arc::new(AtomicBool::new(false));
+    let agent_done = Arc::new(tokio::sync::Notify::new());
+    let agent_start_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let queue_handle: Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>> =
+        Arc::new(Mutex::new(None));
+    let state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>> =
+        Arc::new(Mutex::new(None));
+    let agent_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(None));
+    
+    // Load command history (for Phase 3.3 integration with tui-textarea)
+    let _command_history = load_command_history();
+    
     {
         let sess = session.lock().await;
         let mut qh = queue_handle.lock().await;
@@ -1001,1248 +948,25 @@ pub async fn run_interactive_shell_inner(
         let mut sh = state_handle.lock().await;
         *sh = Some(sess.state_handle());
     }
-
-    // Track last render state to avoid redundant re-renders
-    let mut last_input_snapshot = String::new();
-    let mut last_cursor_pos = 0;
-     let mut last_picker_active = false;
-
-     'main: loop {
-        let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-
-        let prompt_prefix =
-            render_interactive_prompt_prefix();
-
-        // Check if re-render is necessary (skip if nothing changed and picker state unchanged)
-        let current_snapshot = format!(
-            "{}|{}|{}",
-            input_buf,
-            cursor_pos,
-            agent_busy.load(Ordering::Relaxed)
-        );
-        let needs_render = current_snapshot != last_input_snapshot
-            || cursor_pos != last_cursor_pos
-            || picker_active != last_picker_active;
-
-        // Full TUI rendering (with picker) is skipped while agent is busy.
-        if needs_render && !agent_busy.load(Ordering::Relaxed) {
-            last_input_snapshot = current_snapshot.clone();
-            last_cursor_pos = cursor_pos;
-            last_picker_active = picker_active;
-
-            render_input_line(&mut stdout, &input_buf, cursor_pos, &prompt_prefix, term_cols, term_rows, false)?;
-
-            if picker_active {
-                let picker_height = picker.overlay_height();
-
-                let cursor_row = (term_rows - 1) as usize;
-
-                let picker_start = if cursor_row + 1 + picker_height <= term_rows as usize {
-                    cursor_row + 1
-                } else {
-                    cursor_row.saturating_sub(picker_height)
-                };
-
-                write!(stdout, "\x1b[s")?;
-                for i in 0..picker_height {
-                    write!(stdout, "\x1b[{};1H\x1b[K", picker_start + i + 1)?;
-                }
-                picker.render_at(&mut stdout, picker_start)?;
-                write!(stdout, "\x1b[u")?;
-                stdout.flush()?;
-
-                last_picker_row = Some(picker_start);
-                last_picker_height = picker_height;
-            } else if let Some(start_row) = last_picker_row.take() {
-                write!(stdout, "\x1b[s")?;
-                for i in 0..last_picker_height {
-                    write!(stdout, "\x1b[{};1H\x1b[K", start_row + i + 1)?;
-                }
-                write!(stdout, "\x1b[u")?;
-                stdout.flush()?;
-            }
-        }
-
-        // Render input during agent execution. Scroll region pins the bottom row
-        // so agent output scrolls above it. After rendering, cursor returns to
-        // the scroll region bottom so agent stderr continues there.
-        if agent_busy.load(Ordering::Relaxed) && needs_render {
-            last_input_snapshot = current_snapshot;
-            last_cursor_pos = cursor_pos;
-            last_picker_active = picker_active;
-
-            render_input_line(&mut stdout, &input_buf, cursor_pos, &prompt_prefix, term_cols, term_rows, true)?;
-        }
-
-        let n = loop {
-            // Shorter poll delay while agent is busy for responsive UI after completion.
-            let reprompt_delay = if agent_busy.load(Ordering::Relaxed) {
-                tokio::time::Duration::from_millis(100)
-            } else {
-                tokio::time::Duration::from_millis(500)
-            };
-
-            tokio::select! {
-                biased;
-                _ = agent_done.notified() => {
-                    if let Some(start) = *agent_start_time.lock().await {
-                        let elapsed = start.elapsed();
-                        let elapsed_str = format_duration(elapsed);
-                        writeln!(
-                            stdout,
-                            "\r\n{}",
-                            crate::cli::colors::info(&format!("⏱ Elapsed: {}", elapsed_str))
-                        )?;
-                        stdout.flush()?;
-                    }
-                    render_input_line(&mut stdout, &input_buf, cursor_pos, &prompt_prefix, term_cols, term_rows, false)?;
-                    last_input_snapshot = format!("{}|{}|{}", input_buf, cursor_pos, agent_busy.load(Ordering::Relaxed));
-                    last_cursor_pos = cursor_pos;
-                    last_picker_active = picker_active;
-                    continue 'main;
-                }
-                result = stdin.read(&mut byte_buf) => {
-                    break match result {
-                        Ok(0) => 0,
-                        Ok(n) => n,
-                        Err(e) => {
-                            if e.kind() == io::ErrorKind::Interrupted {
-                                continue;
-                            }
-                            0
-                        }
-                    };
-                }
-                _ = tokio::time::sleep(reprompt_delay) => {
-                    // Periodic re-render while agent is busy
-                    continue 'main;
-                }
-            }
-        };
-        if n == 0 {
-            break;
-        }
-
-        parser.feed(&byte_buf[..n]);
-        let events = parser.drain_events();
-
-        for event in events {
-            match event {
-                TerminalEvent::Paste(content) => {
-                    // Append pasted content as a single block
-                    // Replace newlines with spaces to keep input single-line
-                    let sanitized: String = content
-                        .chars()
-                        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-                        .collect();
-                    let line_count = content.lines().count();
-                    tracing::debug!(target: "sned::input", "Handling paste: {} bytes, {} lines", content.len(), line_count);
-                    input_buf.push_str(&sanitized);
-                    cursor_pos = input_buf.len();
-                    // Show feedback for multi-line pastes
-                    if line_count > 1 {
-                        writeln!(
-                            stdout,
-                            "\r\n📋 Pasted {} lines (use Enter to submit)",
-                            line_count
-                        )?;
-                        stdout.flush()?;
-                    }
-                    continue;
-                }
-                TerminalEvent::Return => {
-                    tracing::debug!(target: "sned::input", "Return event: input_buf length={} chars", input_buf.len());
-                    if picker_active {
-                        if let Some(selected) = picker.selected() {
-                            let mq = extract_mention_query(&input_buf);
-                            if mq.in_mention_mode && mq.at_index >= 0 {
-                                input_buf = insert_mention(
-                                    &input_buf,
-                                    mq.at_index as usize,
-                                    &selected.path,
-                                );
-                                cursor_pos = input_buf.len();
-                            }
-                        }
-                        picker_active = false;
-                        continue;
-                    }
-
-                    // If an approval prompt is active, Enter does nothing
-                    if crate::core::approval::is_approval_prompt_active() {
-                        input_buf.clear();
-                        cursor_pos = 0;
-                        continue;
-                    }
-
-                    // If a followup question is active, forward the response via channel
-                    if crate::core::approval::is_followup_question_active(&task_id) {
-                        let response = input_buf.clone();
-                        if let Some(sender) = crate::core::approval::take_followup_sender(&task_id) {
-                            let _ = sender.send(response);
-                            crate::core::approval::clear_followup_sender(&task_id);
-                            crate::core::approval::set_followup_question_active(&task_id, false);
-                            input_buf.clear();
-                            cursor_pos = 0;
-                            writeln!(stdout)?;
-                            continue;
-                        }
-                    }
-
-                    let prompt = input_buf.trim().to_string();
-                    // Echo prompt to stdout only if agent is not busy.
-                    // When agent is busy, stdout cursor positioning races with agent stderr output.
-                    // The prompt text itself is still submitted to the agent via message queue.
-                    if !agent_busy.load(Ordering::Relaxed) {
-                        let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let full = format!("{}{}", prompt_prefix, &input_buf);
-                        let dw = display_width(&full);
-                        let span = (dw as u16).div_ceil(cols.max(1));
-                        // Clear rows in scroll region (rows 1 to term_rows-1)
-                        for i in 0..span {
-                            let row = term_rows.saturating_sub(i + 2);
-                            if row > 0 {
-                                write!(stdout, "\x1b[{};1H\x1b[K", row)?;
-                            }
-                        }
-                        // Position cursor at bottom of scroll region and write prompt
-                        // Cursor MUST end at scroll region bottom, NOT the pinned input row
-                        write!(stdout, "\x1b[{};1H", term_rows.saturating_sub(1))?;
-                        if !prompt.is_empty() {
-                            write!(stdout, "{}{}", prompt_prefix, &prompt)?;
-                        }
-                        // Move cursor DOWN one row to the pinned input row
-                        write!(stdout, "\x1b[{};1H", term_rows)?;
-                        stdout.flush()?;
-                    }
-                    tracing::debug!(target: "sned::input", "Checking if prompt is empty");
-
-                    if prompt.is_empty() {
-                        input_buf.clear();
-                        cursor_pos = 0;
-                        input_row = input_row.saturating_add(1);
-                        continue;
-                    }
-
-                    tracing::debug!(target: "sned::input", "Saving to history");
-                    // Save non-empty prompt to history
-                    append_to_history(&prompt);
-                    // Reset history index when submitting a new command
-                    history_index = None;
-                    tracing::debug!(target: "sned::input", "Processing slash commands");
-
-                    // Check for slash commands
-                    let processed_prompt =
-                        crate::cli::slash_commands::process_slash_command(&prompt);
-                    tracing::debug!(target: "sned::input", "Processed slash command: {} -> {}", prompt.escape_debug(), processed_prompt.escape_debug());
-
-                    // Handle CLI-only commands locally
-                    if let Some(cli_cmd) = crate::cli::slash_commands::get_cli_only_command(&prompt)
-                    {
-                        tracing::debug!(target: "sned::input", "CLI command: {:?}", cli_cmd);
-                        match cli_cmd {
-                            crate::cli::slash_commands::CliOnlyCommand::Exit
-                            | crate::cli::slash_commands::CliOnlyCommand::Quit => {
-                                cleanup_terminal(raw_guard.take())?;
-                                return Ok(());
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Clear => {
-                                write!(stdout, "\x1b[2J\x1b[H")?;
-                                eprintln!("Conversation cleared.");
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::History => {
-                                drop(raw_guard.take());
-                                let _ = crate::cli::subcommands::run_history(HistoryOptions {
-                                    limit: 10,
-                                    page: 1,
-                                    favorites_only: false,
-                                    workspace_only: false,
-                                    search: None,
-                                    sort: "newest".to_string(),
-                                    config: task_opts.config.clone(),
-                                });
-                                restore_raw_mode(&mut raw_guard)?;
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Skills => {
-                                // Discover and list skills
-                                let skills_text = if let Ok(cwd) = std::env::current_dir() {
-                                    let project_skills =
-                                        crate::core::context::discover_skills(&cwd);
-                                    let all_skills =
-                                        crate::core::context::get_available_skills(project_skills);
-                                    if all_skills.is_empty() {
-                                        "No skills found.".to_string()
-                                    } else {
-                                        let mut lines =
-                                            vec!["Available Skills:".to_string(), String::new()];
-                                        for skill in all_skills {
-                                            lines.push(format!(
-                                                "  {} - {}",
-                                                skill.name, skill.description
-                                            ));
-                                        }
-                                        lines.join("\n")
-                                    }
-                                } else {
-                                    "No skills found.".to_string()
-                                };
-                                crate::cli::colors::eprint_raw(&skills_text);
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Help => {
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else {
-                                    crate::cli::colors::eprint_raw(
-                                        &crate::cli::slash_commands::format_help_text(),
-                                    );
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::HelpOption(cmd) => {
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else {
-                                    crate::cli::colors::eprint_raw(
-                                        &crate::cli::slash_commands::format_help_for_command(&cmd),
-                                    );
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Settings => {
-                                let provider = task_opts.provider.as_deref().unwrap_or("anthropic");
-                                let model =
-                                    task_opts.model.as_deref().unwrap_or("claude-3-5-sonnet");
-                                let mode = if task_opts.plan { "plan" } else { "act" };
-                                crate::cli::colors::eprint_raw(
-                                    &crate::cli::slash_commands::format_settings_text(
-                                        provider,
-                                        model,
-                                        mode,
-                                        auto_approve,
-                                    ),
-                                );
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Models => {
-                                crate::cli::colors::eprint_raw(
-                                    &crate::cli::slash_commands::format_models_text(),
-                                );
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::ResetCompact => {
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else {
-                                    let mut sess = session.lock().await;
-                                    if sess.clear_compacted_summary().await {
-                                        eprintln!(
-                                            "Compacted summary cleared. You can now use /compact again."
-                                        );
-                                    } else {
-                                        eprintln!("No compacted summary to clear.");
-                                    }
-                                    drop(sess);
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Stats => {
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else {
-                                    let sess = session.lock().await;
-                                    let state_handle = sess.agent_loop.state_handle();
-                                    let state = state_handle.lock().await;
-                                    let stats = crate::cli::slash_commands::format_stats_text(&state);
-                                    eprintln!("{}", stats);
-                                    drop(sess);
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Changes => {
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else {
-                                    let sess = session.lock().await;
-                                    let state_handle = sess.agent_loop.state_handle();
-                                    let state = state_handle.lock().await;
-                                    let changes =
-                                        crate::cli::slash_commands::format_changes_text(&state);
-                                    eprintln!("{}", changes);
-                                    drop(sess);
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Undo
-                            | crate::cli::slash_commands::CliOnlyCommand::CheckpointUndo => {
-                                // Use the checkpoint manager to restore the most recent checkpoint
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else {
-                                    let sess = session.lock().await;
-                                    let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
-
-                                    if checkpoint_mgr.is_none() {
-                                        eprintln!("Checkpoint manager is not initialized.");
-                                        drop(sess);
-                                        continue;
-                                    }
-
-                                    let checkpoint_mgr = checkpoint_mgr.unwrap();
-
-                                // Get the most recent checkpoint
-                                let checkpoints = match checkpoint_mgr.list_checkpoints().await {
-                                    Ok(cps) => cps,
-                                    Err(e) => {
-                                        let actionable = crate::cli::actionable_errors::checkpoint_operation_failed("list", &e.to_string());
-                                        eprintln!("{}", actionable);
-                                        drop(sess);
-                                        continue;
-                                    }
-                                };
-
-                                if checkpoints.is_empty() {
-                                    eprintln!("No checkpoints available to undo.");
-                                    drop(sess);
-                                    continue;
-                                }
-
-                                // Most recent checkpoint is first in the list (git log order: newest first)
-                                let most_recent = &checkpoints[0];
-
-                                // Get files that will be reverted
-                                let current_hash =
-                                    checkpoint_mgr.last_checkpoint().map(|h| h.as_str());
-                                let changed_files = if let Some(current) = current_hash {
-                                    checkpoint_mgr
-                                        .get_changed_files(&most_recent.hash, Some(current))
-                                        .await
-                                        .unwrap_or_else(|_| vec![])
-                                } else {
-                                    vec![]
-                                };
-
-                                if !changed_files.is_empty() {
-                                    eprintln!(
-                                        "⚠ /undo will revert the following files to the previous checkpoint:"
-                                    );
-                                    for f in &changed_files {
-                                        eprintln!("  - {}", f);
-                                    }
-                                    eprintln!("Continue? (y to cancel, Enter to confirm): ");
-
-                                    // Use channel-based input to avoid stdin race with TUI async reader
-                                    // Same pattern as condense tool (A9/A18 fix)
-                                    let (sender, receiver) = std::sync::mpsc::channel();
-                                    crate::core::approval::set_followup_question_active(&task_id, true);
-                                    crate::core::approval::set_followup_sender(&task_id, sender);
-
-                                    // Wait for user input via channel (forwarded by TUI loop on Enter)
-                                    // Timeout after 30 seconds to prevent indefinite blocking
-                                    let response_result = tokio::task::spawn_blocking(move || {
-                                        receiver.recv_timeout(std::time::Duration::from_secs(30))
-                                    }).await;
-
-                                    // Clean up regardless of result
-                                    crate::core::approval::clear_followup_sender(&task_id);
-                                    crate::core::approval::set_followup_question_active(&task_id, false);
-
-                                    let confirm = match response_result {
-                                        Ok(Ok(r)) => r,
-                                        Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response or timeout
-                                    };
-
-                                    // Empty input (Enter) confirms by default; 'y' cancels
-                                    if !confirm.trim().is_empty() && confirm.trim().to_lowercase() == "y" {
-                                        eprintln!("Undo cancelled.");
-                                        drop(sess);
-                                        continue;
-                                    }
-                                }
-
-                                // Restore to the most recent checkpoint
-                                match checkpoint_mgr.restore_checkpoint(&most_recent.hash).await {
-                                    Ok(()) => {
-                                        eprintln!(
-                                            "Restored to checkpoint {} — {} file(s) reverted",
-                                            most_recent.number,
-                                            changed_files.len()
-                                        );
-
-                                        // Show diff
-                                        if !changed_files.is_empty() {
-                                            eprintln!("\nReverted files:");
-                                            for f in &changed_files {
-                                                eprintln!("  - {}", f);
-                                            }
-                                        }
-
-                                        // Remove last turn from conversation history
-                                        let removed = sess.agent_loop.remove_last_turn().await;
-                                        if removed > 0 {
-                                            eprintln!(
-                                                "Removed {} message(s) from conversation history.",
-                                                removed
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let actionable = crate::cli::actionable_errors::git_operation_failed("undo", &e.to_string());
-                                        eprintln!("{}", actionable);
-                                    }
-                                }
-
-                                drop(sess);
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Diff => {
-                                if let Ok(workspace_root) = std::env::current_dir() {
-                                    if !crate::core::shadow_git::is_initialized(&workspace_root) {
-                                        eprintln!(
-                                            "Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning."
-                                        );
-                                    } else {
-                                        match crate::core::shadow_git::diff_turns(
-                                            &workspace_root,
-                                            1,
-                                            0,
-                                        ) {
-                                            Ok(diff) => {
-                                                if diff.is_empty() {
-                                                    eprintln!("No changes.");
-                                                } else {
-                                                    eprintln!("{}", diff);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                let actionable = crate::cli::actionable_errors::git_operation_failed("diff", &e.to_string());
-                                                eprintln!("{}", actionable);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Log => {
-                                if let Ok(workspace_root) = std::env::current_dir() {
-                                    if !crate::core::shadow_git::is_initialized(&workspace_root) {
-                                        eprintln!(
-                                            "Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning."
-                                        );
-                                    } else {
-                                        match crate::core::shadow_git::log(
-                                            &workspace_root,
-                                            Some(10),
-                                        ) {
-                                            Ok(log) => {
-                                                if log.is_empty() {
-                                                    eprintln!("No log entries.");
-                                                } else {
-                                                    eprintln!("{}", log);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                let actionable = crate::cli::actionable_errors::git_operation_failed("log", &e.to_string());
-                                                eprintln!("{}", actionable);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Commit => {
-                                // Extract commit message from prompt
-                                let commit_msg = if prompt.starts_with("/commit ") {
-                                    prompt
-                                        .strip_prefix("/commit ")
-                                        .map(|s| s.trim_matches('"').trim_matches('\'').to_string())
-                                } else {
-                                    None
-                                };
-
-                                if let Some(msg) = commit_msg {
-                                    if let Ok(workspace_root) = std::env::current_dir() {
-                                        if !crate::core::shadow_git::is_initialized(&workspace_root)
-                                        {
-                                            eprintln!(
-                                                "Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning."
-                                            );
-                                        } else {
-                                            // Show diff for confirmation
-                                            match crate::core::shadow_git::diff_turns(
-                                                &workspace_root,
-                                                1,
-                                                0,
-                                            ) {
-                                                Ok(diff) => {
-                                                    if diff.is_empty() {
-                                                        eprintln!("No changes to commit.");
-                                                    } else {
-                                                        eprintln!("Changes to commit:");
-                                                        eprintln!("{}", diff);
-                                                        eprintln!(
-                                                            "Commit to your git repo? (y/n): "
-                                                        );
-
-                                                        // Use channel-based input to avoid stdin race with TUI async reader
-                                                        // Same pattern as condense tool (A9/A18 fix)
-                                                        let (sender, receiver) = std::sync::mpsc::channel();
-                                                        crate::core::approval::set_followup_question_active(&task_id, true);
-                                                        crate::core::approval::set_followup_sender(&task_id, sender);
-
-                                                        // Wait for user input via channel (forwarded by TUI loop on Enter)
-                                                        // Timeout after 30 seconds to prevent indefinite blocking
-                                                        let response_result = tokio::task::spawn_blocking(move || {
-                                                            receiver.recv_timeout(std::time::Duration::from_secs(30))
-                                                        }).await;
-
-                                                        // Clean up regardless of result
-                                                        crate::core::approval::clear_followup_sender(&task_id);
-                                                        crate::core::approval::set_followup_question_active(&task_id, false);
-
-                                                        let confirm = match response_result {
-                                                            Ok(Ok(r)) => r,
-                                                            Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
-                                                        };
-
-                                                        // Empty input (Enter) confirms by default
-                                                        if confirm.trim().is_empty() || confirm.trim().to_lowercase() == "y" {
-                                                            match crate::core::shadow_git::commit_to_real_git(&workspace_root, &msg) {
-                                                                Ok(files) => {
-                                                                    eprintln!("Committed {} file(s) to your git repo.", files.len());
-                                                                }
-                                                                Err(e) => {
-                                                                    let actionable = crate::cli::actionable_errors::git_operation_failed("commit", &e.to_string());
-                                                                    eprintln!("{}", actionable);
-                                                                }
-                                                            }
-                                                        } else {
-                                                            eprintln!("Commit cancelled.");
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    let actionable = crate::cli::actionable_errors::git_operation_failed("get diff", &e.to_string());
-                                                    eprintln!("{}", actionable);
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    eprintln!("Usage: /commit \"commit message\"");
-                                    eprintln!("Example: /commit \"fix: auth bug\"");
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::CheckpointList => {
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else {
-                                    let sess = session.lock().await;
-                                    let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
-
-                                    if checkpoint_mgr.is_none() {
-                                        eprintln!("Checkpoint manager is not initialized.");
-                                        drop(sess);
-                                        continue;
-                                    }
-
-                                    let checkpoint_mgr = checkpoint_mgr.unwrap();
-
-                                    match checkpoint_mgr.list_checkpoints().await {
-                                    Ok(checkpoints) => {
-                                        if checkpoints.is_empty() {
-                                            eprintln!("No checkpoints found.");
-                                        } else {
-                                            eprintln!("Available checkpoints:");
-                                            eprintln!("  #  Hash      Message");
-                                            eprintln!("  ──────────────────────────");
-                                            for cp in checkpoints.iter().rev() {
-                                                eprintln!(
-                                                    "  {}  {}  {}",
-                                                    crate::cli::colors::colorize(
-                                                        &cp.number.to_string(),
-                                                        crate::cli::colors::style::BOLD
-                                                    ),
-                                                    crate::cli::colors::colorize(
-                                                        &cp.hash,
-                                                        crate::cli::colors::style::DIM
-                                                    ),
-                                                    cp.message
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to list checkpoints: {}", e);
-                                    }
-                                }
-                                drop(sess);
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::CheckpointRestore => {
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else {
-                                    let sess = session.lock().await;
-                                    let checkpoint_mgr = sess.agent_loop.checkpoint_manager();
-
-                                    if checkpoint_mgr.is_none() {
-                                        eprintln!("Checkpoint manager is not initialized.");
-                                        drop(sess);
-                                        continue;
-                                    }
-
-                                let checkpoint_mgr = checkpoint_mgr.unwrap();
-
-                                match checkpoint_mgr.list_checkpoints().await {
-                                    Ok(checkpoints) => {
-                                        if checkpoints.is_empty() {
-                                            eprintln!("No checkpoints to restore.");
-                                        } else {
-                                            // Try to parse checkpoint number from command
-                                            let checkpoint_num = crate::cli::slash_commands::parse_checkpoint_restore(&prompt);
-
-                                            let num = if let Some(n) = checkpoint_num {
-                                                n
-                                            } else {
-                                                // Show list and ask interactively
-                                                eprintln!("Available checkpoints:");
-                                                eprintln!("  #  Hash      Message");
-                                                eprintln!("  ──────────────────────────");
-                                                for cp in checkpoints.iter().rev() {
-                                                    eprintln!(
-                                                        "  {}  {}  {}",
-                                                        crate::cli::colors::colorize(
-                                                            &cp.number.to_string(),
-                                                            crate::cli::colors::style::BOLD
-                                                        ),
-                                                        crate::cli::colors::colorize(
-                                                            &cp.hash,
-                                                            crate::cli::colors::style::DIM
-                                                        ),
-                                                        cp.message
-                                                    );
-                                                }
-                                                eprintln!();
-                                                eprintln!("Enter checkpoint number to restore:");
-                                                
-                                                        // Use channel-based input to avoid stdin race with TUI async reader
-                                                        // Same pattern as condense tool (A9/A18 fix)
-                                                        let (sender, receiver) = std::sync::mpsc::channel();
-                                                        crate::core::approval::set_followup_question_active(&task_id, true);
-                                                        crate::core::approval::set_followup_sender(&task_id, sender);
-
-                                                        // Wait for user input via channel (forwarded by TUI loop on Enter)
-                                                        // Timeout after 30 seconds to prevent indefinite blocking
-                                                        let response_result = tokio::task::spawn_blocking(move || {
-                                                            receiver.recv_timeout(std::time::Duration::from_secs(30))
-                                                        }).await;
-
-                                                        // Clean up regardless of result
-                                                        crate::core::approval::clear_followup_sender(&task_id);
-                                                        crate::core::approval::set_followup_question_active(&task_id, false);
-
-                                                let input = match response_result {
-                                                    Ok(Ok(r)) => r,
-                                                    Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response
-                                                };
-
-                                                input.trim().parse::<usize>().unwrap_or(0)
-                                            };
-
-                                            if num == 0 || num > checkpoints.len() {
-                                                eprintln!(
-                                                    "Invalid checkpoint number. Available: 1-{}",
-                                                    checkpoints.len()
-                                                );
-                                                drop(sess);
-                                                input_buf.clear();
-                                                cursor_pos = 0;
-                                                input_row = input_row.saturating_add(1);
-                                                continue;
-                                            }
-
-                                            if let Some(checkpoint) = checkpoints.get(num - 1) {
-                                                let current_hash = checkpoint_mgr
-                                                    .last_checkpoint()
-                                                    .map(|h| h.as_str())
-                                                    .unwrap_or("HEAD");
-                                                match checkpoint_mgr.get_changed_files(
-                                                    &checkpoint.hash,
-                                                    Some(current_hash),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(changed_files) => {
-                                                        if !changed_files.is_empty() {
-                                                            eprintln!(
-                                                                "\nFiles that will be restored:"
-                                                            );
-                                                            for file in &changed_files {
-                                                                eprintln!("  - {}", file);
-                                                            }
-                                                            eprintln!();
-                                                        eprintln!("Continue? (y to cancel, Enter to confirm): ");
-
-                                                        // Use channel-based input to avoid stdin race with TUI async reader
-                                                        // Same pattern as condense tool (A9/A18 fix)
-                                                        let (sender, receiver) = std::sync::mpsc::channel();
-                                                        crate::core::approval::set_followup_question_active(&task_id, true);
-                                                        crate::core::approval::set_followup_sender(&task_id, sender);
-
-                                                        // Wait for user input via channel (forwarded by TUI loop on Enter)
-                                                        // Timeout after 30 seconds to prevent indefinite blocking
-                                                        let response_result = tokio::task::spawn_blocking(move || {
-                                                            receiver.recv_timeout(std::time::Duration::from_secs(30))
-                                                        }).await;
-
-                                                        // Clean up regardless of result
-                                                        crate::core::approval::clear_followup_sender(&task_id);
-                                                        crate::core::approval::set_followup_question_active(&task_id, false);
-
-                                                        let confirm = match response_result {
-                                                            Ok(Ok(r)) => r,
-                                                            Ok(Err(_)) | Err(_) => String::new(), // Channel closed = no response or timeout
-                                                        };
-
-                                                        // Empty input (Enter) confirms by default; 'y' cancels
-                                                        if !confirm.trim().is_empty() && confirm.trim().to_lowercase() == "y" {
-                                                            eprintln!("Restore cancelled.");
-                                                            drop(sess);
-                                                            input_buf.clear();
-                                                            cursor_pos = 0;
-                                                            input_row = input_row.saturating_add(1);
-                                                            continue;
-                                                        }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!(
-                                                            "Warning: Could not determine changed files: {}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-
-                                                match checkpoint_mgr.restore_by_number(num).await {
-                                                    Ok(()) => {
-                                                        eprintln!(
-                                                            "Checkpoint {} ({}) restored successfully.",
-                                                            num, checkpoint.hash
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        let actionable = crate::cli::actionable_errors::checkpoint_operation_failed("restore", &e.to_string());
-                                                        eprintln!("{}", actionable);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to list checkpoints: {}", e);
-                                    }
-                                }
-                                drop(sess);
-                                }
-                            }
-                            crate::cli::slash_commands::CliOnlyCommand::Expand => {
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    crate::cli::colors::eprint_warning(
-                                        "Agent is busy. Wait for it to finish before running this command.",
-                                    );
-                                } else if let Some(index) =
-                                    crate::cli::slash_commands::parse_expand_index(&prompt)
-                                {
-                                    let sess = session.lock().await;
-                                    let state_handle = sess.agent_loop.state_handle();
-                                    drop(sess);
-
-                                    let state = state_handle.lock().await;
-                                    if let Some(block) = state
-                                        .snipped_code_blocks
-                                        .iter()
-                                        .find(|block| block.index == index)
-                                    {
-                                        if block.language.is_empty() {
-                                            eprintln!("```");
-                                        } else {
-                                            eprintln!("```{}", block.language);
-                                        }
-                                        let highlighted =
-                                            crate::cli::syntax_highlight::highlight_code(
-                                                &block.code,
-                                                &block.language,
-                                            );
-                                        for line in highlighted.lines() {
-                                            eprintln!("{}", line);
-                                        }
-                                        eprintln!("```");
-                                    } else {
-                                        eprintln!("No snipped code block {}.", index);
-                                    }
-                                } else {
-                                    eprintln!("Usage: /expand N");
-                                }
-                            }
-                        }
-
-                        input_buf.clear();
-                        cursor_pos = 0;
-                        input_row = input_row.saturating_add(1);
-                        continue;
-                    }
-
-                    // Check if prompt was processed (base slash command)
-                    let effective_prompt = if processed_prompt != prompt {
-                        Some(processed_prompt)
-                    } else {
-                        Some(prompt)
-                    };
-
-                    let _ = stdout.flush();
-
-                    tracing::debug!(target: "sned::input", "Agent busy={}, raw_guard={}", agent_busy.load(Ordering::Relaxed), raw_guard.is_some());
-
-                    if agent_busy.load(Ordering::Relaxed) {
-                        let qh = queue_handle.lock().await;
-                        if let Some(handle) = qh.as_ref() {
-                            let msg = effective_prompt.unwrap_or_default();
-                            if !msg.is_empty() {
-                                handle.enqueue_text_message(msg).await;
-                                let count = handle.queued_message_count().await;
-                                crate::cli::colors::eprint_info(&format!(
-                                    "Message queued ({} in queue)",
-                                    count
-                                ));
-                            }
-                        }
-                    } else {
-                        agent_busy.store(true, Ordering::Relaxed);
-                        let start_time = std::time::Instant::now();
-                        *agent_start_time.lock().await = Some(start_time);
-                        let busy = agent_busy.clone();
-                        let sess = session.clone();
-                        let at = agent_task.clone();
-                        let ast = agent_start_time.clone();
-
-                        tracing::debug!(target: "sned::agent", "Spawning agent task, prompt length={}", effective_prompt.as_ref().map(|s| s.len()).unwrap_or(0));
-
-                        let agent_done_clone = agent_done.clone();
-                        let handle = tokio::spawn(async move {
-                            tracing::debug!(target: "sned::agent", "Inside spawned task, acquiring session lock");
-                            let mut s = sess.lock().await;
-                            tracing::debug!(target: "sned::agent", "Session lock acquired, calling run()");
-                            let result = s.run(effective_prompt).await;
-                            tracing::debug!(target: "sned::agent", "session.run() returned: {:?}", result.as_ref().map(|_| "Ok").unwrap_or("Err"));
-                            if let Err(e) = result {
-                                crate::cli::colors::eprint_error(&e.to_string());
-                            }
-                            busy.store(false, Ordering::Relaxed);
-                            *ast.lock().await = None;
-                            agent_done_clone.notify_one();
-                            // Clean up the task handle
-                            let mut task = at.lock().await;
-                            *task = None;
-                        });
-
-                        {
-                            let mut task = agent_task.lock().await;
-                            *task = Some(handle);
-                        }
-                    }
-
-                    input_buf.clear();
-                    cursor_pos = 0;
-                    let (term_rows, term_cols) = crossterm::terminal::size().unwrap_or((24, 80));
-                    input_row = term_rows.saturating_sub(2);
-                    
-                    // Render empty input line at pinned row, cursor at scroll region bottom
-                    render_input_line(&mut stdout, &input_buf, cursor_pos, &prompt_prefix, term_cols, term_rows, true)?;
-                    stdout.flush()?;
-                }
-                TerminalEvent::Char(c) => {
-                    // Skip newline characters - they should be Return events, but filter defensively
-                    if c == '\n' || c == '\r' {
-                        continue;
-                    }
-
-                    // Without this guard, tokio::io::stdin() and the approval
-                    // prompt's libc::read() would both read from the same fd,
-                    // causing dropped or duplicated characters.
-                    //
-                    // INVARIANT: approval.rs must always reset APPROVAL_PROMPT_ACTIVE
-                    // to false before returning. If the flag leaks true, this loop
-                    // permanently skips all stdin.
-                    if crate::core::approval::is_approval_prompt_active() {
-                        continue;
-                    }
-
-                    // If a followup question is active, forward the full line response
-                    // when user presses Enter (handled in TerminalEvent::Return branch)
-                    if crate::core::approval::is_followup_question_active(&task_id) {
-                        // Just continue accumulating in input_buf until Enter
-                    }
-
-                    // Insert at byte index, then advance cursor to next char boundary
-                    input_buf.insert(cursor_pos, c);
-                    cursor_pos += c.len_utf8();
-
-                    let mq = extract_mention_query(&input_buf);
-                    if mq.in_mention_mode {
-                        picker_active = true;
-                        picker.set_query(&mq.query);
-                        let results = search_workspace_files(&mq.query, &cwd_str, 20).await;
-                        picker.update_results(results);
-                    } else if picker_active {
-                        picker_active = false;
-                    }
-                }
-                TerminalEvent::Backspace => {
-                    if cursor_pos > 0 {
-                        // Find previous char boundary
-                        let prev_pos = input_buf[..cursor_pos]
-                            .char_indices()
-                            .next_back()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        input_buf.remove(prev_pos);
-                        cursor_pos = prev_pos;
-                    }
-
-                    if picker_active {
-                        let mq = extract_mention_query(&input_buf);
-                        if mq.in_mention_mode {
-                            picker.set_query(&mq.query);
-                            let results = search_workspace_files(&mq.query, &cwd_str, 20).await;
-                            picker.update_results(results);
-                        } else {
-                            picker_active = false;
-                        }
-                    }
-                }
-                TerminalEvent::Delete if cursor_pos < input_buf.len() => {
-                    input_buf.remove(cursor_pos);
-                }
-                TerminalEvent::Arrow(dir) => {
-                    use crate::terminal::input::ArrowDirection;
-                    if picker_active {
-                        match dir {
-                            ArrowDirection::Up => picker.up(),
-                            ArrowDirection::Down => picker.down(),
-                            ArrowDirection::Left | ArrowDirection::Right => {
-                                picker_active = false;
-                                if dir == ArrowDirection::Left && cursor_pos > 0 {
-                                    // Move to previous char boundary
-                                    cursor_pos = input_buf[..cursor_pos]
-                                        .char_indices()
-                                        .next_back()
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(0);
-                                } else if dir == ArrowDirection::Right
-                                    && cursor_pos < input_buf.len()
-                                {
-                                    // Move to next char boundary
-                                    if let Some((i, ch)) =
-                                        input_buf[cursor_pos..].char_indices().next()
-                                    {
-                                        cursor_pos = cursor_pos + i + ch.len_utf8();
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        match dir {
-                            ArrowDirection::Left if cursor_pos > 0 => {
-                                cursor_pos = input_buf[..cursor_pos]
-                                    .char_indices()
-                                    .next_back()
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(0);
-                            }
-                            ArrowDirection::Right if cursor_pos < input_buf.len() => {
-                                if let Some((i, ch)) = input_buf[cursor_pos..].char_indices().next()
-                                {
-                                    cursor_pos = cursor_pos + i + ch.len_utf8();
-                                }
-                            }
-                            ArrowDirection::Up => {
-                                let mq = extract_mention_query(&input_buf);
-                                if mq.in_mention_mode {
-                                    picker_active = true;
-                                    picker.set_query(&mq.query);
-                                    let results =
-                                        search_workspace_files(&mq.query, &cwd_str, 20).await;
-                                    picker.update_results(results);
-                                } else if !command_history.is_empty() {
-                                    // History navigation: go to previous entry
-                                    let new_index = match history_index {
-                                        None => command_history.len() - 1,
-                                        Some(i) if i > 0 => i - 1,
-                                        Some(i) => i, // Stay at first entry
-                                    };
-                                    history_index = Some(new_index);
-                                    input_buf = command_history[new_index].clone();
-                                    cursor_pos = input_buf.len();
-                                }
-                            }
-                            ArrowDirection::Down => {
-                                let mq = extract_mention_query(&input_buf);
-                                if mq.in_mention_mode {
-                                    // Stay in mention mode
-                                } else if !command_history.is_empty() {
-                                    // History navigation: go to next entry or clear
-                                    match history_index {
-                                        Some(i) if i < command_history.len() - 1 => {
-                                            history_index = Some(i + 1);
-                                            input_buf = command_history[i + 1].clone();
-                                        }
-                                        Some(_) => {
-                                            // Past last entry, clear buffer
-                                            history_index = None;
-                                            input_buf.clear();
-                                        }
-                                        None => {
-                                            // Not in history, stay cleared
-                                        }
-                                    }
-                                    cursor_pos = input_buf.len();
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                TerminalEvent::Escape if picker_active => {
-                    picker_active = false;
-                }
-                TerminalEvent::Tab if picker_active => {
-                    if let Some(selected) = picker.selected() {
-                        let mq = extract_mention_query(&input_buf);
-                        if mq.in_mention_mode && mq.at_index >= 0 {
-                            input_buf =
-                                insert_mention(&input_buf, mq.at_index as usize, &selected.path);
-                            cursor_pos = input_buf.len();
-                        }
-                    }
-                    picker_active = false;
-                }
-                TerminalEvent::Ctrl('c') => {
-                    if picker_active {
-                        picker_active = false;
-                    } else if agent_busy.load(Ordering::Relaxed) {
-                        // Cancel the running agent
-                        {
-                            let sh = state_handle.lock().await;
-                            if let Some(handle) = sh.as_ref() {
-                                let mut state = handle.lock().await;
-                                state.is_cancelled = true;
-                                state
-                                    .is_cancelled_atomic
-                                    .store(true, std::sync::atomic::Ordering::Release);
-                                // Kill any registered command PIDs to prevent orphans
-                                let pids = state.running_command_pids.clone();
-                                drop(state);
-                                if !pids.is_empty() {
-                                    #[cfg(unix)]
-                                    {
-                                        // Spawn a task to handle SIGTERM→sleep→SIGKILL asynchronously
-                                        // to avoid blocking the tokio event loop
-                                        let pids_clone = pids.clone();
-                                        tokio::spawn(async move {
-                                            // Send SIGTERM (check liveness to avoid recycled PIDs)
-                                            for pid in &pids_clone {
-                                                if unsafe { libc::kill(*pid, 0) } == 0 {
-                                                    let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
-                                                }
-                                            }
-                                            // Async pause for SIGTERM to take effect
-                                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                            // Force kill any survivors
-                                            for pid in &pids_clone {
-                                                if unsafe { libc::kill(*pid, 0) } == 0 {
-                                                    let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
-                                                }
-                                            }
-                                        });
-                                    }
-                                    crate::cli::colors::eprint_info(&format!(
-                                        "Killing {} running command(s)...",
-                                        pids.len()
-                                    ));
-                                }
-                            }
-                        };
-                        // Cancel any pending approval prompt so its receiver wakes up
-                        crate::core::approval::clear_approval_sender();
-                        // Abort the agent task and wait for it to fully unwind (including Drop handlers)
-                        // to prevent Spinner::Drop from clearing the prompt line after we re-render.
-                        // Spinner::Drop writes \r\x1b[K asynchronously after abort() returns — if we
-                        // continue immediately and re-draw the prompt, the late Drop clears it, leaving
-                        // the user with an invisible prompt until they type.
-                        {
-                            let mut task = agent_task.lock().await;
-                            if let Some(t) = task.take() {
-                                t.abort();
-                                // Wait for task to fully unwind (Drop handlers run after abort)
-                                // Use timeout to avoid hanging if task doesn't respond
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_millis(500),
-                                    t
-                                ).await;
-                            }
-                        }
-                        // Ensure busy flag is cleared even if abort skipped cleanup
-                        agent_busy.store(false, Ordering::Relaxed);
-                        input_buf.clear();
-                        cursor_pos = 0;
-                        writeln!(stdout, "^C")?;
-                    } else if input_buf.is_empty() {
-                        writeln!(stdout, "^C")?;
-                        cleanup_terminal(raw_guard.take())?;
-                        return Ok(());
-                    } else {
-                        input_buf.clear();
-                        cursor_pos = 0;
-                        writeln!(stdout, "^C")?;
-                    }
-                }
-                TerminalEvent::Ctrl('a') | TerminalEvent::Home => {
-                    cursor_pos = 0;
-                }
-                TerminalEvent::Ctrl('e') | TerminalEvent::End => {
-                    cursor_pos = input_buf.len();
-                }
-                TerminalEvent::Ctrl('u') => {
-                    input_buf.drain(..cursor_pos);
-                    cursor_pos = 0;
-                }
-                TerminalEvent::Ctrl('k') => {
-                    input_buf.drain(cursor_pos..);
-                }
-                TerminalEvent::Ctrl('w') if cursor_pos > 0 => {
-                    cursor_pos = delete_word_backward(&mut input_buf, cursor_pos);
-                }
-                TerminalEvent::Resize { cols, rows } => {
-                    set_scroll_region(&mut stdout, rows)?;
-                    let _ = (cols, rows);
-                    continue 'main;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    cleanup_terminal(raw_guard.take())?;
-    Ok(())
+    
+    // 6. Main loop
+    let result = run_main_loop(
+        &mut terminal,
+        &mut app,
+        &mut output_rx,
+        session,
+        task_id,
+        agent_busy,
+        agent_done,
+        agent_start_time,
+        state_handle,
+        agent_task,
+    ).await;
+    
+    // 7. Always restore terminal
+    ratatui::restore();
+    result
 }
-
 pub fn should_start_interactive_shell(
     has_prompt: bool,
     stdin_is_tty: bool,
@@ -2280,6 +1004,144 @@ pub fn print_undo_result(added: Vec<String>, modified: Vec<String>) {
         eprintln!("No changes to undo.");
     } else {
         eprintln!("Undone last turn.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(1)), "1s");
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(format_duration(Duration::from_secs(150)), "2m 30s");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 0m");
+        assert_eq!(format_duration(Duration::from_secs(3660)), "1h 1m");
+        assert_eq!(format_duration(Duration::from_secs(4500)), "1h 15m");
+        assert_eq!(format_duration(Duration::from_secs(7320)), "2h 2m");
+    }
+
+    #[test]
+    fn test_resume_summary_section_header_format() {
+        // Verify section_header format for resume summary
+        let header = crate::cli::colors::section_header("Resumed task abc123 · 3 turns");
+        assert!(header.contains("Resumed task"));
+        assert!(header.contains("3 turns"));
+        assert!(header.contains("═══"));
+    }
+
+    #[test]
+    fn test_display_width_ascii() {
+        assert_eq!(display_width("hello"), 5);
+        assert_eq!(display_width(""), 0);
+        assert_eq!(display_width("a"), 1);
+    }
+
+    #[test]
+    fn test_display_width_cjk() {
+        assert_eq!(display_width("你好"), 4);
+        assert_eq!(display_width("你好 hello"), 10);
+        assert_eq!(display_width("🎉"), 2);
+        assert_eq!(display_width("🎉hello"), 7);
+    }
+
+    #[test]
+    fn test_ctrl_w_deletes_word_cjk() {
+        let mut buf = String::from("hello 世界");
+        let len = buf.len();
+        let pos = delete_word_backward(&mut buf, len);
+        assert_eq!(buf, "hello ");
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn test_ctrl_w_deletes_word_with_multiple_spaces() {
+        let mut buf = String::from("hello   世界");
+        let len = buf.len();
+        let pos = delete_word_backward(&mut buf, len);
+        assert_eq!(buf, "hello   ");
+        assert_eq!(pos, 8);
+    }
+
+    #[test]
+    fn test_ctrl_w_deletes_single_word() {
+        let mut buf = String::from("hello");
+        let pos = delete_word_backward(&mut buf, 5);
+        assert_eq!(buf, "");
+        assert_eq!(pos, 0);
+    }
+
+    #[test]
+    fn test_ctrl_w_no_whitespace_deletes_all() {
+        let mut buf = String::from("hello世界test");
+        let len = buf.len();
+        let pos = delete_word_backward(&mut buf, len);
+        assert_eq!(buf, "");
+        assert_eq!(pos, 0);
+    }
+
+    #[test]
+    fn test_ctrl_w_emoji_word() {
+        let mut buf = String::from("hello 🎉🎊");
+        let len = buf.len();
+        let pos = delete_word_backward(&mut buf, len);
+        assert_eq!(buf, "hello ");
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn test_input_lines_calculation_cjk() {
+        let term_cols: u16 = 80;
+        let prompt_prefix = "❯ ";
+        let input_buf = "你好 hello";
+        let full_input = format!("{}{}", prompt_prefix, input_buf);
+        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
+        let input_lines = input_lines.max(1);
+        assert_eq!(input_lines, 1);
+
+        let long_cjk = "你好世界 hello world test";
+        let full_input = format!("{}{}", prompt_prefix, long_cjk);
+        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
+        let input_lines = input_lines.max(1);
+        assert_eq!(input_lines, 1);
+
+        let very_long_cjk =
+            "你好世界 hello world test 你好世界 hello world test 你好世界 hello world test 你好";
+        let full_input = format!("{}{}", prompt_prefix, very_long_cjk);
+        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
+        let input_lines = input_lines.max(1);
+        assert!(
+            input_lines > 1,
+            "Long CJK input should wrap to multiple lines"
+        );
+    }
+
+    #[test]
+    fn test_cursor_move_left_cjk() {
+        let input_buf = "你好 hello";
+        let cursor_pos = 7;
+        let right_of_cursor = &input_buf[cursor_pos..];
+        let move_left = display_width(right_of_cursor);
+        assert_eq!(move_left, 5);
+
+        let cursor_pos = 0;
+        let right_of_cursor = &input_buf[cursor_pos..];
+        let move_left = display_width(right_of_cursor);
+        assert_eq!(move_left, 10);
     }
 }
 
