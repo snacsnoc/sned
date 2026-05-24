@@ -323,12 +323,10 @@ pub fn combine_rule_toggles(toggles1: &RuleToggles, toggles2: &RuleToggles) -> R
 /// Get skills directories to scan
 pub fn get_skills_directories_for_scan(cwd: &Path) -> Vec<(PathBuf, SkillSource)> {
     let mut dirs = vec![
-        (cwd.join(".snedrules/skills"), SkillSource::Project),
-        (cwd.join(".sned/skills"), SkillSource::Project),
-        (cwd.join(".codex/skills"), SkillSource::Project),
+        (cwd.join(".agents/skills"), SkillSource::Project),
         (cwd.join(".claude/skills"), SkillSource::Project),
         (cwd.join(".ai/skills"), SkillSource::Project),
-        (cwd.join(".agents/skills"), SkillSource::Project),
+        (cwd.join(".codex/skills"), SkillSource::Project),
     ];
 
     // Global directories
@@ -890,18 +888,14 @@ mod tests {
         );
 
         // Verify project directories
-        assert_eq!(scan_dirs[0].0, cwd.join(".snedrules/skills"));
+        assert_eq!(scan_dirs[0].0, cwd.join(".agents/skills"));
         assert_eq!(scan_dirs[0].1, SkillSource::Project);
-        assert_eq!(scan_dirs[1].0, cwd.join(".sned/skills"));
+        assert_eq!(scan_dirs[1].0, cwd.join(".claude/skills"));
         assert_eq!(scan_dirs[1].1, SkillSource::Project);
-        assert_eq!(scan_dirs[2].0, cwd.join(".codex/skills"));
+        assert_eq!(scan_dirs[2].0, cwd.join(".ai/skills"));
         assert_eq!(scan_dirs[2].1, SkillSource::Project);
-        assert_eq!(scan_dirs[3].0, cwd.join(".claude/skills"));
+        assert_eq!(scan_dirs[3].0, cwd.join(".codex/skills"));
         assert_eq!(scan_dirs[3].1, SkillSource::Project);
-        assert_eq!(scan_dirs[4].0, cwd.join(".ai/skills"));
-        assert_eq!(scan_dirs[4].1, SkillSource::Project);
-        assert_eq!(scan_dirs[5].0, cwd.join(".agents/skills"));
-        assert_eq!(scan_dirs[5].1, SkillSource::Project);
 
         // Verify global directories
         let home = dirs::home_dir().expect("home_dir should exist in test");
@@ -1057,13 +1051,13 @@ mod tests {
 
     #[test]
     fn test_workflows_not_yet_implemented() {
-        // Workflows require .snedrules/workflows directory scanning
+        // Workflows require .agents/workflows directory scanning
         // which is similar to skills but with different semantics.
         // This test documents the expected behavior when implemented.
         let temp = TempDir::new().unwrap();
         let cwd = temp.path();
 
-        let workflows_dir = cwd.join(".snedrules/workflows");
+        let workflows_dir = cwd.join(".agents/workflows");
         fs::create_dir_all(&workflows_dir).unwrap();
         fs::write(
             workflows_dir.join("default-workflows.md"),

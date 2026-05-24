@@ -365,12 +365,6 @@ impl GlobalFileNames {
     pub const VERCEL_AI_GATEWAY_MODELS: &'static str = "vercel_ai_gateway_models.json";
     pub const GROQ_MODELS: &'static str = "groq_models.json";
     pub const BASETEN_MODELS: &'static str = "baseten_models.json";
-    pub const SNED_RULES: &'static str = ".snedrules";
-    pub const WORKFLOWS: &'static str = ".snedrules/workflows";
-    pub const HOOKS_DIR: &'static str = ".snedrules/hooks";
-    pub const SNEDRULE_SKILLS_DIR: &'static str = ".snedrules/skills";
-    pub const SNED_SKILLS_DIR: &'static str = ".sned/skills";
-    pub const CLAUDE_SKILLS_DIR: &'static str = ".claude/skills";
     pub const AGENTS_SKILLS_DIR: &'static str = ".agents/skills";
     pub const AI_SKILLS_DIR: &'static str = ".ai/skills";
     pub const CURSOR_RULES_DIR: &'static str = ".cursor/rules";

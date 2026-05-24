@@ -149,7 +149,7 @@ pub struct HookResult {
 pub struct HookManager {
     /// Global hooks directory (e.g., ~/Documents/Sned/Hooks or ~/.sned/hooks)
     global_hooks_dir: Option<PathBuf>,
-    /// Workspace hooks directories (.snedrules/hooks)
+    /// Workspace hooks directories (.agents/hooks)
     workspace_hooks_dirs: Vec<PathBuf>,
     /// Runtime hooks directory (--hooks-dir)
     runtime_hooks_dir: Option<PathBuf>,
@@ -167,7 +167,7 @@ pub struct HookManager {
     cancel_token: Option<CancellationToken>,
     /// Flag indicating hook was cancelled externally
     cancelled: Arc<std::sync::atomic::AtomicBool>,
-    /// Whether workspace hooks are explicitly opted-in (require .snedrules/hooks/.signed)
+    /// Whether workspace hooks are explicitly opted-in (require .agents/hooks/.signed)
     workspace_hooks_opted_in: bool,
 }
 
@@ -263,7 +263,7 @@ impl HookManager {
                     tracing::warn!(
                         dir = %dir.display(),
                         hook = %hook_file,
-                        "Skipping unverified workspace hook. Create .snedrules/hooks/.signed to enable."
+                        "Skipping unverified workspace hook. Create .agents/hooks/.signed to enable."
                     );
                     return;
                 }
@@ -279,7 +279,7 @@ impl HookManager {
                         tracing::warn!(
                             dir = %dir.display(),
                             hook = %hook_file,
-                            "Skipping unverified workspace hook. Create .snedrules/hooks/.signed to enable."
+"Skipping unverified workspace hook. Create .agents/hooks/.signed to enable."
                         );
                         return;
                     }
@@ -897,7 +897,7 @@ impl HookManager {
 }
 
 /// Get hooks directories from the filesystem.
-/// Priority: runtime (--hooks-dir) > workspace (.snedrules/hooks) > global
+/// Priority: runtime (--hooks-dir) > workspace (.agents/hooks) > global
 pub fn get_hooks_dirs(runtime_dir: Option<&Path>, workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
@@ -910,7 +910,7 @@ pub fn get_hooks_dirs(runtime_dir: Option<&Path>, workspace_roots: &[PathBuf]) -
 
     // Workspace hooks directories
     for root in workspace_roots {
-        let workspace_hooks = root.join(".snedrules").join("hooks");
+        let workspace_hooks = root.join(".agents").join("hooks");
         if workspace_hooks.exists() {
             dirs.push(workspace_hooks);
         }
@@ -1041,7 +1041,7 @@ mod tests {
         fs::create_dir_all(&temp_dir).unwrap();
 
         let runtime_dir = temp_dir.join("runtime");
-        let workspace_dir = temp_dir.join("workspace").join(".snedrules").join("hooks");
+        let workspace_dir = temp_dir.join("workspace").join(".agents").join("hooks");
         let global_dir = temp_dir.join("global");
 
         fs::create_dir_all(&runtime_dir).unwrap();
@@ -1077,7 +1077,7 @@ mod tests {
 
         let runtime_dir = temp_dir.join("runtime");
         let workspace_root = temp_dir.join("workspace");
-        let workspace_hooks = workspace_root.join(".snedrules").join("hooks");
+        let workspace_hooks = workspace_root.join(".agents").join("hooks");
 
         fs::create_dir_all(&runtime_dir).unwrap();
         fs::create_dir_all(&workspace_hooks).unwrap();

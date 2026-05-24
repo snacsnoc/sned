@@ -271,7 +271,7 @@ impl MigrationEngine {
 
         let tasks = self.execute_task_directories_migration()?;
 
-        self.execute_snedrules_migration()?;
+        self.execute_agents_migration()?;
 
         for op in &self.executed_operations {
             if let Some(ref backup) = op.backup_path {
@@ -810,9 +810,9 @@ impl MigrationEngine {
         })
     }
 
-    fn execute_snedrules_migration(&mut self) -> Result<(), MigrationError> {
-        let source_rules_dir = self.source_root.join(".snedrules");
-        let destination_rules_dir = self.destination_root.join(".snedrules");
+    fn execute_agents_migration(&mut self) -> Result<(), MigrationError> {
+        let source_rules_dir = self.source_root.join(".agents");
+        let destination_rules_dir = self.destination_root.join(".agents");
 
         if !source_rules_dir.exists() {
             return Ok(());

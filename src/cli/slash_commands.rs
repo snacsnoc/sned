@@ -134,7 +134,7 @@ fn build_workflows_list(
 ) -> Vec<WorkflowInfo> {
     let mut workflows = Vec::new();
 
-    let local_dir = cwd.join(".snedrules/workflows");
+    let local_dir = cwd.join(".agents/workflows");
     if local_dir.exists()
         && local_dir.is_dir()
         && let Ok(entries) = std::fs::read_dir(&local_dir)
@@ -1039,16 +1039,16 @@ Below is the user's input when they indicated that they wanted to compact their 
 "#;
 
 const NEW_RULE_INSTRUCTION: &str = r#"<explicit_instructions type="new_rule">
-The user has explicitly asked you to help them create a new Sned rule file inside the .snedrules top-level directory based on the conversation up to this point in time. The user may have provided instructions or additional information for you to consider when creating the new Sned rule.
-When creating a new Sned rule file, you should NOT overwrite or alter an existing Sned rule file. To create the new Sned rule file you MUST use the new_rule tool. The new_rule tool can be used in either of the PLAN or ACT modes.
+The user has explicitly asked you to help them create a new project rule file inside the .agents directory based on the conversation up to this point in time. The user may have provided instructions or additional information for you to consider when creating the new rule.
+When creating a new project rule file, you should NOT overwrite or alter an existing rule file. To create the new rule file you MUST use the new_rule tool. The new_rule tool can be used in either of the PLAN or ACT modes.
 
 The new_rule tool is defined below:
 
 Description:
-Your task is to create a new Sned rule file which includes guidelines on how to approach developing code in tandem with the user, which can be either project specific or cover more global rules. This includes but is not limited to: desired conversational style, favorite project dependencies, coding styles, naming conventions, architectural choices, ui/ux preferences, etc.
-The Sned rule file must be formatted as markdown and be a '.md' file. The name of the file you generate must be as succinct as possible and be encompassing the main overarching concept of the rules you added to the file (e.g., 'memory-bank.md' or 'project-overview.md').
+Your task is to create a new project rule file which includes guidelines on how to approach developing code in tandem with the user, which can be either project specific or cover more global rules. This includes but is not limited to: desired conversational style, favorite project dependencies, coding styles, naming conventions, architectural choices, ui/ux preferences, etc.
+The project rule file must be formatted as markdown and be a '.md' file. The name of the file you generate must be as succinct as possible and be encompassing the main overarching concept of the rules you added to the file (e.g., 'memory-bank.md' or 'project-overview.md').
 
-Below is the user's input when they indicated that they wanted to create a new Sned rule file.
+Below is the user's input when they indicated that they wanted to create a new project rule file.
 </explicit_instructions>
 "#;
 
