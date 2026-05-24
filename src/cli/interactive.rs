@@ -4,11 +4,19 @@
 //! file picker, input queuing, and agent lifecycle.
 
 use crate::cli::{HistoryOptions, RootOnlyOptions, TaskOptions};
+use crate::cli::output::{OutputEvent, OutputWriterArc, ChannelOutputWriter};
+use crate::cli::tui::{App, ansi_to_ratatui_lines};
+use futures::FutureExt;
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
+use tokio::sync::{Mutex, mpsc};
 use unicode_width::UnicodeWidthChar;
 
 /// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m")
@@ -620,6 +628,265 @@ pub fn restore_raw_mode(
             let _ = cleanup_terminal(None);
             Err(e.into())
         }
+    }
+}
+
+
+/// Action returned by key event handler.
+enum Action {
+    Quit,
+    Submit(String),
+    CancelAgent,
+}
+
+/// Drain output channel into app buffer.
+fn drain_output(rx: &mut mpsc::UnboundedReceiver<OutputEvent>, app: &mut App) {
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            OutputEvent::Line(line) => app.push_output(line),
+            OutputEvent::RawAnsi(s) => {
+                let lines = ansi_to_ratatui_lines(&s);
+                for line in lines {
+                    app.push_output(line);
+                }
+            }
+        }
+    }
+}
+
+/// Spawn agent task with proper state management.
+async fn spawn_agent_task(
+    session: &Arc<Mutex<InteractiveSession>>,
+    prompt: &str,
+    agent_busy: &Arc<AtomicBool>,
+    agent_done: &Arc<tokio::sync::Notify>,
+    agent_start_time: &Arc<Mutex<Option<Instant>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+) -> anyhow::Result<()> {
+    agent_busy.store(true, Ordering::Relaxed);
+    *agent_start_time.lock().await = Some(Instant::now());
+    
+    let session_clone = Arc::clone(session);
+    let prompt = prompt.to_string();
+    let agent_busy_clone = Arc::clone(agent_busy);
+    let agent_done_clone = Arc::clone(agent_done);
+    
+    let handle = tokio::spawn(async move {
+        let mut sess = session_clone.lock().await;
+        let result = sess.run(Some(prompt)).await;
+        drop(sess);
+        
+        agent_busy_clone.store(false, Ordering::Relaxed);
+        agent_done_clone.notify_one();
+        
+        if let Err(e) = result {
+            tracing::error!("Agent task failed: {}", e);
+        }
+    });
+    
+    *agent_task.lock().await = Some(handle);
+    Ok(())
+}
+
+/// Cancel running agent task.
+async fn cancel_agent(
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    agent_done: &Arc<tokio::sync::Notify>,
+) -> anyhow::Result<()> {
+    // Set cancellation flag
+    if let Some(sh) = state_handle.lock().await.as_ref() {
+        let mut state = sh.lock().await;
+        state.is_cancelled = true;
+        state.is_cancelled_atomic.store(true, Ordering::Release);
+        
+        // Kill running PIDs
+        #[cfg(unix)]
+        for &pid in &state.running_command_pids.clone() {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
+        state.running_command_pids.clear();
+    }
+    
+    // Abort agent task
+    if let Some(task) = agent_task.lock().await.take() {
+        task.abort();
+        // Wait briefly for cleanup
+        tokio::time::timeout(Duration::from_secs(2), async {
+            agent_done.notified().await
+        }).await.ok();
+    }
+    
+    Ok(())
+}
+
+/// Handle key events in ratatui loop.
+async fn handle_key_event(
+    key: KeyEvent,
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    task_id: &str,
+    agent_busy: &AtomicBool,
+    agent_done: &Arc<tokio::sync::Notify>,
+    agent_start_time: &Arc<Mutex<Option<Instant>>>,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+) -> anyhow::Result<Option<Action>> {
+    use crate::core::approval::{is_followup_question_active, take_followup_sender};
+    use ratatui::widgets::Block;
+    
+    // Ctrl+C handling
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if agent_busy.load(Ordering::Relaxed) {
+            // Cancel agent
+            cancel_agent(state_handle, agent_task, agent_done).await?;
+            return Ok(Some(Action::CancelAgent));
+        } else if app.input.lines().join("\n").is_empty() {
+            // Exit cleanly
+            return Ok(Some(Action::Quit));
+        } else {
+            // Clear input - create new textarea with empty lines
+            let title = if agent_busy.load(Ordering::Relaxed) {
+                format!("{} Working...", app.spinner_char())
+            } else {
+                "❯".to_string()
+            };
+            let mut new_input = tui_textarea::TextArea::new(Vec::new());
+            new_input.set_block(Block::bordered().title(title));
+            app.input = new_input;
+            return Ok(None);
+        }
+    }
+    
+    // Enter key - intercept before passing to textarea
+    if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        // Check for followup question
+        if is_followup_question_active(task_id) {
+            if let Some(sender) = take_followup_sender(task_id) {
+                let text = app.input.lines().join("");
+                let _ = sender.send(text);
+                let mut new_input = tui_textarea::TextArea::new(Vec::new());
+                new_input.set_block(Block::bordered().title("❯"));
+                app.input = new_input;
+            }
+            return Ok(None);
+        }
+        
+        // Normal submit
+        let text = app.input.lines().join("");
+        if !text.is_empty() {
+            // Echo prompt to output pane
+            app.push_styled(
+                format!("❯ {}", text),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            );
+            // Clear textarea - create new one with empty lines
+            let mut new_input = tui_textarea::TextArea::new(Vec::new());
+            new_input.set_block(Block::bordered().title("❯"));
+            app.input = new_input;
+            // Submit to agent
+            return Ok(Some(Action::Submit(text)));
+        }
+        return Ok(None);
+    }
+    
+    // Shift+Up/Down for manual scroll
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        if key.code == KeyCode::Up {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+            return Ok(None);
+        }
+        if key.code == KeyCode::Down {
+            app.scroll_offset = app.scroll_offset.saturating_add(1);
+            // Re-enable auto-scroll if scrolled to bottom
+            app.auto_scroll = true;
+            return Ok(None);
+        }
+    }
+    
+    // All other keys go to textarea
+    use tui_textarea::Input;
+    app.input.input(Input::from(key));
+    Ok(None)
+}
+
+/// Main ratatui event loop.
+async fn run_main_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    session: Arc<Mutex<InteractiveSession>>,
+    task_id: String,
+    agent_busy: Arc<AtomicBool>,
+    agent_done: Arc<tokio::sync::Notify>,
+    agent_start_time: Arc<Mutex<Option<Instant>>>,
+    state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    agent_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+) -> anyhow::Result<()> {
+    loop {
+        // 1. Drain channel into app
+        drain_output(output_rx, app);
+        
+        // 2. Render
+        terminal.draw(|f| app.render(f))?;
+        
+        // 3. Poll for events (blocking, 50ms timeout)
+        if ratatui::crossterm::event::poll(Duration::from_millis(50))? {
+            match ratatui::crossterm::event::read()? {
+                Event::Key(key) => {
+                    if let Some(action) = handle_key_event(
+                        key,
+                        app,
+                        &session,
+                        &task_id,
+                        &agent_busy,
+                        &agent_done,
+                        &agent_start_time,
+                        &state_handle,
+                        &agent_task,
+                    ).await? {
+                        match action {
+                            Action::Quit => return Ok(()),
+                            Action::Submit(text) => {
+                                spawn_agent_task(
+                                    &session,
+                                    &text,
+                                    &agent_busy,
+                                    &agent_done,
+                                    &agent_start_time,
+                                    &agent_task,
+                                ).await?;
+                            }
+                            Action::CancelAgent => {
+                                app.push_plain("^C");
+                            }
+                        }
+                    }
+                }
+                Event::Resize(_, _) => {
+                    // Ratatui handles resize automatically on next draw
+                }
+                _ => {}
+            }
+        }
+        
+        // 4. Check agent completion (non-blocking)
+        if agent_busy.load(Ordering::Relaxed) {
+            if agent_done.notified().now_or_never().is_some() {
+                agent_busy.store(false, Ordering::Relaxed);
+                if let Some(start) = agent_start_time.lock().await.take() {
+                    let elapsed = start.elapsed();
+                    app.push_styled(
+                        format!("⏱ Elapsed: {}", format_duration(elapsed)),
+                        Style::default().add_modifier(Modifier::DIM),
+                    );
+                }
+            }
+        }
+        
+        // 5. Tick spinner
+        app.tick_spinner();
     }
 }
 
