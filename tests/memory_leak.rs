@@ -118,28 +118,7 @@ async fn test_symbol_index_db_connections_closed() {
 
 /// Test that spinner cleanup works properly.
 ///
-/// Verifies spinner task is aborted on drop.
-#[tokio::test]
-async fn test_spinner_cleanup_on_drop() {
-    use sned::cli::spinner::Spinner;
-    use std::time::Instant;
 
-    let start = Instant::now();
-
-    {
-        let _spinner = Spinner::start("test");
-        // Let it run briefly
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    // Drop should be immediate
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "Spinner drop took {:?}, expected < 500ms",
-        elapsed
-    );
-}
 
 /// Test that checkpoint tracker cleans up properly.
 ///

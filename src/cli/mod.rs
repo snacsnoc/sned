@@ -9,7 +9,6 @@ pub mod interactive;
 pub mod output;
 pub mod redact;
 pub mod slash_commands;
-pub mod spinner;
 pub mod subcommands;
 pub mod syntax_highlight;
 pub mod text_utils;

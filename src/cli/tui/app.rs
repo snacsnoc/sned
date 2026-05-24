@@ -3,14 +3,15 @@
 //! This is the main application state for the ratatui render loop.
 
 use ratatui::{
-    layout::{Constraint, Layout},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Layout, Rect},
+    style::{Style, Color, Modifier},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap, Clear},
     Frame,
 };
 use tui_textarea::TextArea;
 use std::time::Instant;
+use crate::core::file_search::FileSearchResult;
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -35,7 +36,7 @@ pub struct App {
     /// Whether @ mention file picker is active
     pub picker_active: bool,
     /// Current file search results
-    pub picker_results: Vec<String>,
+    pub picker_results: Vec<FileSearchResult>,
     /// Selected index in picker results
     pub picker_index: usize,
     /// Command history (most recent last)
@@ -115,6 +116,51 @@ impl App {
 
         // Input pane
         frame.render_widget(&self.input, input_area);
+
+        // File picker overlay (when active)
+        if self.picker_active && !self.picker_results.is_empty() {
+            self.render_picker_overlay(frame, output_area);
+        }
+    }
+
+    /// Render file picker overlay as a floating Table widget.
+    fn render_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
+        let max_height = 10.min(self.picker_results.len() as u16);
+        let width = 50.min(output_area.width);
+        
+        let overlay_area = Rect {
+            x: output_area.x + 2,
+            y: output_area.y + 2,
+            width,
+            height: max_height + 2, // +2 for border
+        };
+
+        let rows: Vec<Line> = self.picker_results
+            .iter()
+            .enumerate()
+            .map(|(i, result)| {
+                let icon = match result.file_type {
+                    crate::core::file_search::FileType::Folder => "📁",
+                    crate::core::file_search::FileType::File => "📄",
+                };
+                let label = format!("{} {}", icon, result.label);
+                if i == self.picker_index {
+                    Line::from(Span::styled(label, Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)))
+                } else {
+                    Line::from(label)
+                }
+            })
+            .collect();
+
+        let picker = Paragraph::new(rows)
+            .block(Block::bordered().title(format!(" Files ({}) ", self.picker_results.len())))
+            .style(Style::default().bg(Color::Black));
+
+        frame.render_widget(Clear, overlay_area);
+        frame.render_widget(picker, overlay_area);
     }
 
     /// Increment spinner frame (call on each render tick when agent_busy).

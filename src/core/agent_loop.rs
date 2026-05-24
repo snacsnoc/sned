@@ -148,9 +148,7 @@ fn print_code_block(lines: &[String], lang: &str, output_writer: &crate::cli::ou
 
     let code = lines.join("\n");
     let highlighted = crate::cli::syntax_highlight::highlight_code(&code, lang);
-    for line in highlighted.lines() {
-        output_writer.emit(OutputEvent::plain(format!("  {}", line)));
-    }
+    output_writer.emit(OutputEvent::RawAnsi(format!("  {}\n", highlighted.replace("\n", "\n  "))));
 }
 
 fn code_block_display_limit(interactive_mode: bool) -> usize {
@@ -2045,6 +2043,7 @@ impl AgentLoop {
                                 match crate::core::approval::prompt_for_approval_async(
                                     &tool_name,
                                     &tool_params,
+                                    Some(self.config.output_writer.clone()),
                                 )
                                 .await
                                 {
@@ -2088,6 +2087,7 @@ impl AgentLoop {
                                     match crate::core::approval::prompt_for_approval_async(
                                         &tool_name,
                                         &tool_params,
+                                        Some(self.config.output_writer.clone()),
                                     )
                                     .await
                                     {

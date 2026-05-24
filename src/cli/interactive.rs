@@ -9,13 +9,11 @@ use crate::cli::tui::{App, ansi_to_ratatui_lines};
 use futures::FutureExt;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
-use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
-use unicode_width::UnicodeWidthChar;
 
 /// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m")
 fn format_duration(duration: Duration) -> String {
@@ -118,142 +116,7 @@ fn max_history_lines() -> usize {
         .unwrap_or(10_000)
 }
 
-/// Delete the word before the cursor, handling multi-byte characters correctly.
-/// Returns the byte index where deletion started (new cursor position).
-pub(crate) fn delete_word_backward(input_buf: &mut String, cursor_pos: usize) -> usize {
-    let prefix = &input_buf[..cursor_pos];
-    let start = prefix
-        .char_indices()
-        .rev()
-        .skip_while(|(_, c)| c.is_whitespace())
-        .find(|(_, c)| c.is_whitespace())
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    input_buf.drain(start..cursor_pos);
-    start
-}
 
-/// Calculate the display width of a string, handling multi-byte characters correctly.
-/// - CJK characters: 2 columns
-/// - Emoji: 2 columns
-/// - Combining marks: 0 columns
-/// - ANSI escape sequences: 0 columns (skipped)
-/// - Normal ASCII: 1 column
-fn display_width(s: &str) -> usize {
-    let mut width = 0;
-    let mut chars = s.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Consume entire escape sequence
-            if let Some(next) = chars.next() {
-                if next == '[' {
-                    // CSI sequence - consume until final byte (0x40-0x7E)
-                    // Handles sequences like \x1b[31;1m, \x1b[38;2;R;G;Bm, \x1b[10;20H
-                    for c in chars.by_ref() {
-                        if (0x40..=0x7E).contains(&(c as u32)) {
-                            break;
-                        }
-                    }
-                } else if next == ']' {
-                    // OSC sequence - consume until ST (\x1b\\) or BEL (\x07)
-                    // Handles sequences like \x1b]8;;url\x1b\\ (hyperlinks)
-                    // or \x1b]0;title\x07 (BEL-terminated)
-                    let mut prev = next;
-                    for c in chars.by_ref() {
-                        if c == '\x07' || (prev == '\x1b' && c == '\\') {
-                            break;
-                        }
-                        prev = c;
-                    }
-                } else if next == '(' || next == ')' {
-                    // Character set selection (e.g., \x1b(B for ASCII)
-                    let _ = chars.next();
-                }
-                // Other escape sequences consume until terminator
-            }
-            continue;
-        }
-        width += UnicodeWidthChar::width(ch).unwrap_or(1);
-    }
-
-    width
-}
-
-/// Sanitize input string for single-line terminal rendering.
-///
-/// Replaces newlines and carriage returns with spaces to prevent
-/// terminal cursor movement during rendering. This is defensive:
-/// paste events already sanitize, but this catches any edge cases.
-fn sanitize_input(s: &str) -> String {
-    s.chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect()
-}
-
-/// Render the input line at the bottom row of the terminal.
-///
-/// Clears the input area, writes the prompt prefix and input buffer,
-/// and positions the cursor. When `cursor_to_scroll_region` is true,
-/// moves the cursor to the bottom of the scroll region after rendering
-/// (so agent stderr output continues in the scroll area, not at the
-/// input line).
-fn render_input_line(
-    stdout: &mut impl std::io::Write,
-    input_buf: &str,
-    cursor_pos: usize,
-    prompt_prefix: &str,
-    term_cols: u16,
-    term_rows: u16,
-    cursor_to_scroll_region: bool,
-) -> std::io::Result<()> {
-    let sanitized_buf = sanitize_input(input_buf);
-    let full_input = format!("{}{}", prompt_prefix, &sanitized_buf);
-    let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols).max(1);
-    let base_row = term_rows - 1;
-
-    let mut buf = String::with_capacity(full_input.len() + 128);
-    for i in 0..input_lines {
-        let row = base_row.saturating_sub(i);
-        buf.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
-    }
-    buf.push_str(&format!("\x1b[{};1H{}", base_row + 1, &full_input));
-    if cursor_pos < input_buf.len() {
-        let right_of_cursor = &sanitized_buf[cursor_pos..];
-        let move_left = display_width(right_of_cursor);
-        buf.push_str(&format!("\x1b[{}D", move_left));
-    }
-    if cursor_to_scroll_region {
-        // Move cursor to scroll region bottom (one row above pinned input)
-        // so agent stderr output scrolls there, not over the input line
-        buf.push_str(&format!("\x1b[{};1H", term_rows.saturating_sub(1)));
-        buf.push_str("\x1b[?25l");
-    } else {
-        buf.push_str("\x1b[?25h");
-    }
-    stdout.write_all(buf.as_bytes())?;
-    stdout.flush()?;
-    Ok(())
-}
-
-/// Set the scroll region to rows 1 through (rows-1), pinning the bottom
-/// row for the input line. Agent output scrolls within the region;
-/// the input line stays fixed.
-fn set_scroll_region(stdout: &mut impl std::io::Write, term_rows: u16) -> std::io::Result<()> {
-    if term_rows > 2 {
-        write!(stdout, "\x1b[1;{}r", term_rows.saturating_sub(1))?;
-        write!(stdout, "\x1b[{};1H", term_rows.saturating_sub(1))?;
-        stdout.flush()?;
-    }
-    Ok(())
-}
-
-/// Reset the scroll region to the full screen.
-fn reset_scroll_region(stdout: &mut impl std::io::Write) -> std::io::Result<()> {
-    write!(stdout, "\x1b[r")?;
-    stdout.flush()?;
-    Ok(())
-}
 
 /// Format context window size as human-readable string (e.g., "200K context").
 fn format_context_window(tokens: u64) -> String {
@@ -563,78 +426,6 @@ impl InteractiveSession {
     }
 }
 
-pub fn query_cursor_position() -> io::Result<(u16, u16)> {
-    let mut stdout = io::stdout();
-    write!(stdout, "\x1b[6n")?;
-    stdout.flush()?;
-
-    let mut stdin = io::stdin();
-    let mut buf = [0u8; 32];
-    let mut response = String::new();
-
-    // Read the CPR response: ESC [ row ; col R
-    loop {
-        let n = stdin.read(&mut buf)?;
-        if n == 0 {
-            return Err(io::Error::other("no CPR response"));
-        }
-        response.push_str(&String::from_utf8_lossy(&buf[..n]));
-        if response.contains('R') {
-            break;
-        }
-    }
-
-    // Parse \x1b[row;colR
-    if let Some(start) = response.rfind('\x1b') {
-        let seq = &response[start..];
-        if seq.starts_with("\x1b[") && seq.ends_with('R') {
-            let inner = &seq[2..seq.len() - 1];
-            let parts: Vec<&str> = inner.split(';').collect();
-            if parts.len() == 2 {
-                let row = parts[0].parse().unwrap_or(1);
-                let col = parts[1].parse().unwrap_or(1);
-                return Ok((row, col));
-            }
-        }
-    }
-
-    // Default to position (1, 1) if parsing fails
-    Ok((1, 1))
-}
-
-pub fn cleanup_terminal(
-    raw_guard: Option<crate::terminal::input::RawModeGuard>,
-) -> std::io::Result<()> {
-    let mut stdout = std::io::stdout();
-
-    reset_scroll_region(&mut stdout)?;
-    let _ = stdout.write_all(b"\x1b[?2004l");
-    drop(raw_guard);
-
-    let _ = stdout.write_all(b"\x1b[?25h");
-    let _ = stdout.write_all(b"\x1b[0m");
-    let _ = stdout.write_all(b"\n");
-    let _ = stdout.flush();
-
-    Ok(())
-}
-
-pub fn restore_raw_mode(
-    raw_guard: &mut Option<crate::terminal::input::RawModeGuard>,
-) -> anyhow::Result<()> {
-    match crate::terminal::input::enter_raw_mode() {
-        Ok(guard) => {
-            *raw_guard = Some(guard);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = cleanup_terminal(None);
-            Err(e.into())
-        }
-    }
-}
-
-
 /// Action returned by key event handler.
 enum Action {
     Quit,
@@ -727,11 +518,11 @@ async fn cancel_agent(
 async fn handle_key_event(
     key: KeyEvent,
     app: &mut App,
-    session: &Arc<Mutex<InteractiveSession>>,
+    _session: &Arc<Mutex<InteractiveSession>>,
     task_id: &str,
     agent_busy: &AtomicBool,
     agent_done: &Arc<tokio::sync::Notify>,
-    agent_start_time: &Arc<Mutex<Option<Instant>>>,
+    _agent_start_time: &Arc<Mutex<Option<Instant>>>,
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<Option<Action>> {
@@ -815,20 +606,33 @@ async fn handle_key_event(
                 app.input = tui_textarea::TextArea::new(vec![entry.clone()]);
             }
         } else {
-            // At most recent history entry - clear to blank
             app.history_index = -1;
             app.input = tui_textarea::TextArea::new(Vec::new());
         }
         return Ok(None);
     }
     
+    // Up/Down for file picker navigation (when picker is active)
+    
+    // Up/Down for file picker navigation (when picker is active)
+    if app.picker_active && !app.picker_results.is_empty() {
+        if key.code == KeyCode::Up {
+            app.picker_index = app.picker_index.saturating_sub(1);
+            return Ok(None);
+        }
+        if key.code == KeyCode::Down {
+            app.picker_index = (app.picker_index + 1).min(app.picker_results.len() - 1);
+            return Ok(None);
+        }
+    }
+    
     // Tab key with active file picker -> insert selection
     if key.code == KeyCode::Tab && app.picker_active && !app.picker_results.is_empty() {
-        let path = &app.picker_results[app.picker_index];
+        let result = &app.picker_results[app.picker_index];
         let text = app.input.lines().join("");
         let mq = crate::core::file_search::extract_mention_query(&text);
         if mq.in_mention_mode {
-            let new_text = crate::core::file_search::insert_mention(&text, mq.at_index as usize, path);
+            let new_text = crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
             app.input = tui_textarea::TextArea::new(vec![new_text]);
             app.picker_active = false;
             app.picker_results.clear();
@@ -840,7 +644,7 @@ async fn handle_key_event(
     use tui_textarea::Input;
     app.input.input(Input::from(key));
     
-    // Check for @ mention mode (simplified Phase 2: show results in output pane)
+    // Check for @ mention mode - show file picker overlay
     let input_text = app.input.lines().join("");
     let mq = crate::core::file_search::extract_mention_query(&input_text);
     if mq.in_mention_mode && !app.cwd.is_empty() {
@@ -850,7 +654,7 @@ async fn handle_key_event(
             &query, &cwd, 10
         ).await;
         app.picker_active = true;
-        app.picker_results = results.iter().map(|r| r.path.clone()).collect();
+        app.picker_results = results;
         app.picker_index = 0;
     } else {
         app.picker_active = false;
@@ -868,9 +672,9 @@ async fn handle_cli_only_command(
     session: &Arc<Mutex<InteractiveSession>>,
     task_id: &str,
     agent_busy: &AtomicBool,
-    agent_start_time: &Arc<Mutex<Option<Instant>>>,
-    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    _agent_start_time: &Arc<Mutex<Option<Instant>>>,
+    _agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    _state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     task_opts: &TaskOptions,
     auto_approve: bool,
 ) -> anyhow::Result<bool> {
@@ -1443,7 +1247,16 @@ pub async fn run_interactive_shell_inner(
     root_opts: RootOnlyOptions,
 ) -> anyhow::Result<()> {
     // 1. Initialize ratatui (replaces enter_raw_mode, scroll_region, bracketed paste)
-    let mut terminal = ratatui::init();
+    let mut terminal = if std::env::var("SNED_NO_ALTERNATE_SCREEN").is_ok() {
+        ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(24),
+            },
+        )?
+    } else {
+        ratatui::init()
+    };
     let mut app = App::new();
     if let Ok(cwd) = std::env::current_dir() {
         app.cwd = cwd.to_string_lossy().to_string();
@@ -1472,7 +1285,9 @@ pub async fn run_interactive_shell_inner(
         let sess = session.lock().await;
         if !sess.is_quiet() {
             let startup_info = sess.get_startup_info();
-            app.push_plain(startup_info);
+            for line in ansi_to_ratatui_lines(&startup_info) {
+                app.push_output(line);
+            }
             app.push_styled("type a prompt and press Enter; type /exit to leave", 
                 Style::default().add_modifier(Modifier::DIM));
             app.push_styled("type /help for slash commands, @ to search and mention files",
@@ -1493,6 +1308,7 @@ pub async fn run_interactive_shell_inner(
     
     // Load command history into app
     app.command_history = load_command_history();
+    app.history_index = -1;
     
     {
         let sess = session.lock().await;
@@ -1544,26 +1360,6 @@ pub fn render_interactive_prompt_prefix() -> String {
     )
 }
 
-pub fn print_undo_result(added: Vec<String>, modified: Vec<String>, app: &mut App) {
-    if !added.is_empty() {
-        app.push_plain(format!("Deleted {} file(s) created in last turn:", added.len()));
-        for f in &added {
-            app.push_plain(format!("  - {}", f));
-        }
-    }
-    if !modified.is_empty() {
-        app.push_plain(format!("Restored {} file(s) to previous state:", modified.len()));
-        for f in &modified {
-            app.push_plain(format!("  - {}", f));
-        }
-    }
-    if added.is_empty() && modified.is_empty() {
-        app.push_plain("No changes to undo.");
-    } else {
-        app.push_plain("Undone last turn.");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1599,105 +1395,5 @@ mod tests {
         assert!(header.contains("Resumed task"));
         assert!(header.contains("3 turns"));
         assert!(header.contains("═══"));
-    }
-
-    #[test]
-    fn test_display_width_ascii() {
-        assert_eq!(display_width("hello"), 5);
-        assert_eq!(display_width(""), 0);
-        assert_eq!(display_width("a"), 1);
-    }
-
-    #[test]
-    fn test_display_width_cjk() {
-        assert_eq!(display_width("你好"), 4);
-        assert_eq!(display_width("你好 hello"), 10);
-        assert_eq!(display_width("🎉"), 2);
-        assert_eq!(display_width("🎉hello"), 7);
-    }
-
-    #[test]
-    fn test_ctrl_w_deletes_word_cjk() {
-        let mut buf = String::from("hello 世界");
-        let len = buf.len();
-        let pos = delete_word_backward(&mut buf, len);
-        assert_eq!(buf, "hello ");
-        assert_eq!(pos, 6);
-    }
-
-    #[test]
-    fn test_ctrl_w_deletes_word_with_multiple_spaces() {
-        let mut buf = String::from("hello   世界");
-        let len = buf.len();
-        let pos = delete_word_backward(&mut buf, len);
-        assert_eq!(buf, "hello   ");
-        assert_eq!(pos, 8);
-    }
-
-    #[test]
-    fn test_ctrl_w_deletes_single_word() {
-        let mut buf = String::from("hello");
-        let pos = delete_word_backward(&mut buf, 5);
-        assert_eq!(buf, "");
-        assert_eq!(pos, 0);
-    }
-
-    #[test]
-    fn test_ctrl_w_no_whitespace_deletes_all() {
-        let mut buf = String::from("hello世界test");
-        let len = buf.len();
-        let pos = delete_word_backward(&mut buf, len);
-        assert_eq!(buf, "");
-        assert_eq!(pos, 0);
-    }
-
-    #[test]
-    fn test_ctrl_w_emoji_word() {
-        let mut buf = String::from("hello 🎉🎊");
-        let len = buf.len();
-        let pos = delete_word_backward(&mut buf, len);
-        assert_eq!(buf, "hello ");
-        assert_eq!(pos, 6);
-    }
-
-    #[test]
-    fn test_input_lines_calculation_cjk() {
-        let term_cols: u16 = 80;
-        let prompt_prefix = "❯ ";
-        let input_buf = "你好 hello";
-        let full_input = format!("{}{}", prompt_prefix, input_buf);
-        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
-        let input_lines = input_lines.max(1);
-        assert_eq!(input_lines, 1);
-
-        let long_cjk = "你好世界 hello world test";
-        let full_input = format!("{}{}", prompt_prefix, long_cjk);
-        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
-        let input_lines = input_lines.max(1);
-        assert_eq!(input_lines, 1);
-
-        let very_long_cjk =
-            "你好世界 hello world test 你好世界 hello world test 你好世界 hello world test 你好";
-        let full_input = format!("{}{}", prompt_prefix, very_long_cjk);
-        let input_lines = (display_width(&full_input) as u16).div_ceil(term_cols);
-        let input_lines = input_lines.max(1);
-        assert!(
-            input_lines > 1,
-            "Long CJK input should wrap to multiple lines"
-        );
-    }
-
-    #[test]
-    fn test_cursor_move_left_cjk() {
-        let input_buf = "你好 hello";
-        let cursor_pos = 7;
-        let right_of_cursor = &input_buf[cursor_pos..];
-        let move_left = display_width(right_of_cursor);
-        assert_eq!(move_left, 5);
-
-        let cursor_pos = 0;
-        let right_of_cursor = &input_buf[cursor_pos..];
-        let move_left = display_width(right_of_cursor);
-        assert_eq!(move_left, 10);
     }
 }

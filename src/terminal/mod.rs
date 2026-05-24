@@ -10,11 +10,7 @@ pub mod picker;
 pub mod command_pty;
 pub mod vt_renderer;
 
-// Re-export the main types for convenience.
-pub use input::{
-    ArrowDirection, InputParser, RawModeGuard, TerminalEvent, enter_raw_mode, install_panic_hook,
-    setup_sigwinch_handler,
-};
+
 
 #[cfg(unix)]
 pub use command_pty::{CommandOutput, PtyError, run_command_in_pty};

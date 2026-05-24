@@ -312,8 +312,10 @@ pub struct AutoApprovalSettings {
     pub use_browser: bool,
 }
 
+use crate::cli::output::OutputWriterArc;
+
 /// Tracks which tool types have been auto-approved for the current session.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct ApprovalManager {
     /// Tool names that the user has chosen to auto-approve for this session.
     session_auto_approve: HashSet<String>,
@@ -327,6 +329,22 @@ pub struct ApprovalManager {
     auto_approval_settings: AutoApprovalSettings,
     /// Per-path auto-approval patterns.
     auto_approve_patterns: Vec<PathPattern>,
+    /// Output writer for routing approval prompt to ratatui TUI.
+    output_writer: Option<OutputWriterArc>,
+}
+
+impl Default for ApprovalManager {
+    fn default() -> Self {
+        Self {
+            session_auto_approve: HashSet::new(),
+            yolo_mode: false,
+            auto_approve_all: false,
+            workspace_root: None,
+            auto_approval_settings: AutoApprovalSettings::default(),
+            auto_approve_patterns: Vec::new(),
+            output_writer: None,
+        }
+    }
 }
 
 impl ApprovalManager {
@@ -362,6 +380,12 @@ impl ApprovalManager {
     /// Set per-path auto-approval patterns.
     pub fn with_auto_approve_patterns(mut self, patterns: Vec<PathPattern>) -> Self {
         self.auto_approve_patterns = patterns;
+        self
+    }
+
+    /// Set output writer for routing approval prompt to ratatui TUI.
+    pub fn with_output_writer(mut self, output_writer: OutputWriterArc) -> Self {
+        self.output_writer = Some(output_writer);
         self
     }
 
@@ -800,6 +824,7 @@ fn read_single_char_raw() -> io::Result<char> {
 pub fn prompt_for_approval(
     tool_name: &str,
     params: &serde_json::Value,
+    output_writer: Option<&OutputWriterArc>,
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
@@ -810,18 +835,22 @@ pub fn prompt_for_approval(
     // Format parameters with rich formatting based on tool type
     let params_str = format_tool_parameters(tool_name, params);
 
-    eprint!(
-        "\r\x1b[K{}",
-        build_tool_approval_prompt(
-            &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
-            &crate::cli::colors::tool_name(tool_name),
-            &params_str,
-            &crate::cli::colors::colorize_stderr("y", crate::cli::colors::style::GREEN),
-            &crate::cli::colors::colorize_stderr("n", crate::cli::colors::style::RED),
-            &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
-        )
+    let prompt = build_tool_approval_prompt(
+        &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
+        &crate::cli::colors::tool_name(tool_name),
+        &params_str,
+        &crate::cli::colors::colorize_stderr("y", crate::cli::colors::style::GREEN),
+        &crate::cli::colors::colorize_stderr("n", crate::cli::colors::style::RED),
+        &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
     );
-    io::stderr().flush()?;
+
+    if let Some(w) = output_writer {
+        use crate::cli::output::OutputEvent;
+        w.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
+    } else {
+        eprint!("\r\x1b[K{}", prompt);
+        io::stderr().flush()?;
+    }
 
     // The TUI loop skips its stdin read while APPROVAL_PROMPT_ACTIVE is set,
     // avoiding an fd race with this blocking libc::read().
@@ -916,11 +945,12 @@ pub fn clear_followup_sender(task_id: &str) {
 pub async fn prompt_for_approval_async(
     tool_name: &str,
     params: &serde_json::Value,
+    output_writer: Option<OutputWriterArc>,
 ) -> io::Result<ApprovalResult> {
     let tool_name = tool_name.to_string();
     let params_owned = params.clone();
 
-    tokio::task::spawn_blocking(move || prompt_for_approval(&tool_name, &params_owned))
+    tokio::task::spawn_blocking(move || prompt_for_approval(&tool_name, &params_owned, output_writer.as_ref()))
         .await
         .map_err(|e| io::Error::other(format!("spawn_blocking failed: {}", e)))?
 }
@@ -938,6 +968,7 @@ pub async fn prompt_for_combined_approval(
     file_count: usize,
     edit_count: usize,
     diff_preview: &str,
+    output_writer: Option<&OutputWriterArc>,
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
@@ -950,19 +981,23 @@ pub async fn prompt_for_combined_approval(
         format!("{} files", file_count)
     };
 
-    eprint!(
-        "\r\x1b[K{}",
-        build_combined_approval_prompt(
-            &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
-            &crate::cli::colors::colorize_stderr(&file_names, crate::cli::colors::style::BOLD),
-            edit_count,
-            diff_preview,
-            &crate::cli::colors::colorize_stderr("y", crate::cli::colors::style::GREEN),
-            &crate::cli::colors::colorize_stderr("n", crate::cli::colors::style::RED),
-            &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
-        )
+    let prompt = build_combined_approval_prompt(
+        &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
+        &crate::cli::colors::colorize_stderr(&file_names, crate::cli::colors::style::BOLD),
+        edit_count,
+        diff_preview,
+        &crate::cli::colors::colorize_stderr("y", crate::cli::colors::style::GREEN),
+        &crate::cli::colors::colorize_stderr("n", crate::cli::colors::style::RED),
+        &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
     );
-    io::stderr().flush()?;
+
+    if let Some(w) = output_writer {
+        use crate::cli::output::OutputEvent;
+        w.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
+    } else {
+        eprint!("\r\x1b[K{}", prompt);
+        io::stderr().flush()?;
+    }
 
     // See prompt_for_approval for the APPROVAL_PROMPT_ACTIVE invariant.
     // Here spawn_blocking captures errors in `result` without ?, so the
@@ -1150,7 +1185,7 @@ mod tests {
     fn test_prompt_non_interactive_approves() {
         // In non-interactive mode (stdin is not a tty), the tool is auto-approved
         // This is the common case in tests since cargo test redirects stdin
-        let result = prompt_for_approval("execute_command", &serde_json::json!({"command": "ls"}))
+        let result = prompt_for_approval("execute_command", &serde_json::json!({"command": "ls"}), None)
             .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);
     }
@@ -1158,7 +1193,7 @@ mod tests {
     #[test]
     #[ignore = "requires interactive stdin - tested manually"]
     fn test_prompt_empty_params() {
-        let result = prompt_for_approval("attempt_completion", &serde_json::json!({}))
+        let result = prompt_for_approval("attempt_completion", &serde_json::json!({}), None)
             .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);
     }

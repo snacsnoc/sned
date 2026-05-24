@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Edit file tool handler.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EditFileHandler {
     /// Optional approval manager for combined edit approval.
     approval_manager: Option<Arc<Mutex<ApprovalManager>>>,
@@ -393,7 +393,7 @@ impl EditFileHandler {
 
             if should_prompt {
                 let diff_text = diff_previews.join("\n\n");
-                match prompt_for_combined_approval(prepared_batches.len(), total_edits, &diff_text)
+                match prompt_for_combined_approval(prepared_batches.len(), total_edits, &diff_text, Some(output_writer))
                     .await
                 {
                     Ok(crate::core::approval::ApprovalResult::Denied) => {
@@ -878,6 +878,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
         assert!(result.is_err());
@@ -897,6 +898,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
         assert!(result.is_err());
@@ -916,6 +918,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         // Test with anchors missing the § delimiter (simulating edit_file called without read_file first)
@@ -956,6 +959,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         // Test with valid anchor but invalid end_anchor
@@ -1721,6 +1725,7 @@ edition = "2021"
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         // Edit both files to fix the errors using hash-anchored format
@@ -1772,6 +1777,7 @@ edition = "2021"
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let long_anchor = "你好世界".repeat(20);
@@ -1809,6 +1815,7 @@ edition = "2021"
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let params = serde_json::json!({
