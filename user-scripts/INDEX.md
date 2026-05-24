@@ -15,7 +15,7 @@ Use the script that matches the job:
 | Analyze dhat output | `analyze-dhat-heap.sh <json>` | Use after profiling |
 | Regenerate repo map | `regen-infiniloom.sh` | Use after structural changes |
 | Check Zig setup | `setup-zig-0.15.sh` | Only for libghostty-rs / Zig issues |
-| **Test TUI changes** | `tui-smoke-test.sh` | **Run after ANY change to interactive.rs or input.rs** |
+| **Test TUI changes** | `tui-smoke-test.sh` | **Run after ANY change to interactive.rs or tui/** |
 
 **Default flow**
 1. If the user did not already name a task, run `list-open-todos.sh`.
