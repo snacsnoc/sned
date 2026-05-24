@@ -63,7 +63,7 @@ pub async fn create_message_with_retry(
     request: ProviderRequest,
     task_state: Arc<Mutex<TaskState>>,
     retry_config: RetryConfig,
-    json_output: bool,
+    _json_output: bool,
 ) -> Result<ApiStream, ProviderError> {
     // Validate context window before sending request
     if let Err(msg) = context_window::validate_context_window(&request, provider.as_ref()) {
