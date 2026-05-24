@@ -131,18 +131,17 @@ fn get_terminal_width() -> usize {
     }
 }
 
-fn print_model_line(line: &str) {
+fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriterArc) {
+    use crate::cli::output::OutputEvent;
     let term_width = get_terminal_width();
     let indent = "  ";
     let wrapped = crate::cli::text_utils::wrap_text(line, term_width, indent);
 
-    eprintln!(
-        "{}",
-        crate::cli::colors::colorize_stderr(&wrapped, crate::cli::colors::style::CYAN)
-    );
+    output_writer.emit(OutputEvent::model_output(wrapped));
 }
 
-fn print_code_block(lines: &[String], lang: &str) {
+fn print_code_block(lines: &[String], lang: &str, output_writer: &crate::cli::output::OutputWriterArc) {
+    use crate::cli::output::OutputEvent;
     if lines.is_empty() {
         return;
     }
@@ -150,7 +149,7 @@ fn print_code_block(lines: &[String], lang: &str) {
     let code = lines.join("\n");
     let highlighted = crate::cli::syntax_highlight::highlight_code(&code, lang);
     for line in highlighted.lines() {
-        eprintln!("  {}", line);
+        output_writer.emit(OutputEvent::plain(format!("  {}", line)));
     }
 }
 
@@ -1355,7 +1354,7 @@ impl AgentLoop {
 
                                 if trimmed_line.starts_with("```") {
                                     if in_code_block {
-                                        print_code_block(&code_block_buffer, &code_block_lang);
+                                        print_code_block(&code_block_buffer, &code_block_lang, &self.config.output_writer);
                                         if code_block_snipped {
                                             let index = if self.config.interactive_mode {
                                                 Some(push_snipped_code_block(
@@ -1391,7 +1390,7 @@ impl AgentLoop {
                                         code_block_snipped = false;
                                     }
 
-                                    print_model_line(trimmed_line);
+                                    print_model_line(trimmed_line, &self.config.output_writer);
                                     continue;
                                 }
 
@@ -1410,7 +1409,7 @@ impl AgentLoop {
                                 }
 
                                 // Regular content - already trimmed
-                                print_model_line(trimmed_line);
+                                print_model_line(trimmed_line, &self.config.output_writer);
                             }
                             // Buffer flush to ~50ms frames to reduce syscalls on high-latency connections (P9)
                             if last_flush_time.elapsed() >= flush_interval {
@@ -1740,7 +1739,7 @@ impl AgentLoop {
                     code_block_snipped = true;
                 }
             }
-            print_code_block(&code_block_buffer, &code_block_lang);
+            print_code_block(&code_block_buffer, &code_block_lang, &self.config.output_writer);
             if code_block_snipped {
                 let index = if self.config.interactive_mode {
                     Some(push_snipped_code_block(
@@ -1764,7 +1763,7 @@ impl AgentLoop {
         } else if !display_buffer.is_empty() && !self.config.json_output {
             let remaining = display_buffer.trim_end().to_string();
             if !remaining.is_empty() {
-                print_model_line(&remaining);
+                print_model_line(&remaining, &self.config.output_writer);
             }
         } else if !self.config.json_output {
             eprintln!(); // Ensure newline even if buffer was empty
