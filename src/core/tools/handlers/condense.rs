@@ -76,28 +76,21 @@ impl CondenseHandler {
 
         // INTERACTIVE APPROVAL: Show summary and wait for user response
         if !ctx.json_output {
-            eprintln!(
-                "\n{}",
-                crate::cli::colors::colorize_stderr(
-                    "[Sned wants to condense the conversation]",
-                    crate::cli::colors::style::YELLOW
-                )
-            );
-            eprintln!(
-                "{}\n",
-                crate::cli::colors::colorize_stderr(&final_summary, crate::cli::colors::style::BOLD)
-            );
-            eprint!(
-                "{}",
-                crate::cli::colors::colorize_stderr(
-                    "Press Enter to accept, or provide feedback: ",
-                    crate::cli::colors::style::CYAN
-                )
-            );
-            use std::io::{self, Write};
-            io::stderr().flush().map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to flush stderr: {}", e))
-            })?;
+            use crate::cli::output::OutputEvent;
+            use ratatui::style::{Color, Modifier, Style};
+            ctx.output_writer.emit(OutputEvent::styled(
+                "\n[Sned wants to condense the conversation]",
+                Style::default().fg(Color::Yellow),
+            ));
+            ctx.output_writer.emit(OutputEvent::styled(
+                format!("{}\n", final_summary),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            ctx.output_writer.emit(OutputEvent::styled(
+                "Press Enter to accept, or provide feedback: ",
+                Style::default().fg(Color::Cyan),
+            ));
+            ctx.output_writer.flush();
 
             // Use channel-based input to avoid blocking tokio worker and fighting TUI stdin
             // Same pattern as ask_followup_question and prompt_for_approval
