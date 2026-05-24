@@ -2990,7 +2990,7 @@ impl AgentLoop {
 
         // Print session summary box
         output_writer.flush();
-        crate::cli::colors::print_horizontal_rule();
+        crate::cli::colors::print_horizontal_rule_writer(output_writer);
         output_writer.emit(OutputEvent::styled(
             "  Session".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -3047,7 +3047,7 @@ impl AgentLoop {
             Style::default().add_modifier(Modifier::DIM),
         ));
 
-        crate::cli::colors::print_horizontal_rule();
+        crate::cli::colors::print_horizontal_rule_writer(output_writer);
 
         // JSON output: only in non-interactive mode (CLI/pipe consumers)
         if state.turns_completed > 0 && !interactive_mode {

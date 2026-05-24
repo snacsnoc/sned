@@ -794,12 +794,6 @@ fn read_single_char_raw() -> io::Result<char> {
     }
     let c = buf[0] as char;
     
-    // Echo the character so user sees their choice — use stderr to match
-    // the approval prompt stream and avoid stdout/stderr cursor races.
-    let _ = eprint!("{}", c);
-    let _ = io::stderr().flush();
-    eprintln!();
-    
     drop(restore_guard);
     Ok(c)
 }
@@ -816,8 +810,6 @@ fn read_single_char_raw() -> io::Result<char> {
         Err(_) => Ok('n'),
     };
     let _ = disable_raw_mode();
-    // Use stderr to match the approval prompt stream and avoid cursor races.
-    eprintln!();
     result
 }
 
