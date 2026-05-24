@@ -47,7 +47,8 @@ pub struct App {
 impl App {
     /// Create a new App instance.
     pub fn new() -> Self {
-        let input = TextArea::new(Vec::new());
+        let mut input = TextArea::new(Vec::new());
+        input.set_placeholder_text("❯ ");
         Self {
             output_lines: Vec::new(),
             input,
@@ -92,9 +93,9 @@ impl App {
 
         // Update input block title with spinner when busy
         let title = if self.agent_busy {
-            format!("{} Working...", self.spinner_char())
+            format!(" {} Working ", self.spinner_char())
         } else {
-            "❯".to_string()
+            " Input ".to_string()
         };
         self.input.set_block(Block::bordered().title(title));
 
