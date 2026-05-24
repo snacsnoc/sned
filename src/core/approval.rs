@@ -345,8 +345,6 @@ pub struct ApprovalManager {
     auto_approval_settings: AutoApprovalSettings,
     /// Per-path auto-approval patterns.
     auto_approve_patterns: Vec<PathPattern>,
-    /// Output writer for routing approval prompt to ratatui TUI.
-    output_writer: Option<OutputWriterArc>,
     /// User-configured safe commands shared with the agent loop safety check.
     user_safe_commands: Vec<String>,
 }
@@ -360,7 +358,6 @@ impl Default for ApprovalManager {
             workspace_root: None,
             auto_approval_settings: AutoApprovalSettings::default(),
             auto_approve_patterns: Vec::new(),
-            output_writer: None,
             user_safe_commands: Vec::new(),
         }
     }
@@ -399,12 +396,6 @@ impl ApprovalManager {
     /// Set per-path auto-approval patterns.
     pub fn with_auto_approve_patterns(mut self, patterns: Vec<PathPattern>) -> Self {
         self.auto_approve_patterns = patterns;
-        self
-    }
-
-    /// Set output writer for routing approval prompt to ratatui TUI.
-    pub fn with_output_writer(mut self, output_writer: OutputWriterArc) -> Self {
-        self.output_writer = Some(output_writer);
         self
     }
 
