@@ -2031,7 +2031,7 @@ impl AgentLoop {
                                 match crate::core::approval::prompt_for_approval_async(
                                     &tool_name,
                                     &tool_params,
-                                    Some(self.config.output_writer.clone()),
+                                    self.config.output_writer.clone(),
                                 )
                                 .await
                                 {
@@ -2077,7 +2077,7 @@ impl AgentLoop {
                                     match crate::core::approval::prompt_for_approval_async(
                                         &tool_name,
                                         &tool_params,
-                                        Some(self.config.output_writer.clone()),
+                                        self.config.output_writer.clone(),
                                     )
                                     .await
                                     {

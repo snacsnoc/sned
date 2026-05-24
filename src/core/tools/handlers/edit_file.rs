@@ -393,7 +393,7 @@ impl EditFileHandler {
 
             if should_prompt {
                 let diff_text = diff_previews.join("\n\n");
-                match prompt_for_combined_approval(prepared_batches.len(), total_edits, &diff_text, Some(output_writer))
+                match prompt_for_combined_approval(prepared_batches.len(), total_edits, &diff_text, output_writer)
                     .await
                 {
                     Ok(crate::core::approval::ApprovalResult::Denied) => {

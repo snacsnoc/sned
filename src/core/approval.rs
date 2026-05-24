@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fmt::Write as FmtWrite;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -405,6 +405,7 @@ impl ApprovalManager {
     /// Set output writer for routing approval prompt to ratatui TUI.
     pub fn with_output_writer(mut self, output_writer: OutputWriterArc) -> Self {
         self.output_writer = Some(output_writer);
+        self
     }
 
     /// Set user-safe commands (overrides SNED_SAFE_COMMANDS env var).
@@ -845,7 +846,7 @@ fn read_single_char_raw() -> io::Result<char> {
 pub fn prompt_for_approval(
     tool_name: &str,
     params: &serde_json::Value,
-    output_writer: Option<&OutputWriterArc>,
+    output_writer: &OutputWriterArc,
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
@@ -865,13 +866,8 @@ pub fn prompt_for_approval(
         &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
     );
 
-    if let Some(w) = output_writer {
-        use crate::cli::output::OutputEvent;
-        w.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
-    } else {
-        eprint!("\r\x1b[K{}", prompt);
-        io::stderr().flush()?;
-    }
+    use crate::cli::output::OutputEvent;
+    output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
 
     // The TUI loop skips its stdin read while APPROVAL_PROMPT_ACTIVE is set,
     // avoiding an fd race with this blocking libc::read().
@@ -966,12 +962,12 @@ pub fn clear_followup_sender(task_id: &str) {
 pub async fn prompt_for_approval_async(
     tool_name: &str,
     params: &serde_json::Value,
-    output_writer: Option<OutputWriterArc>,
+    output_writer: OutputWriterArc,
 ) -> io::Result<ApprovalResult> {
     let tool_name = tool_name.to_string();
     let params_owned = params.clone();
 
-    tokio::task::spawn_blocking(move || prompt_for_approval(&tool_name, &params_owned, output_writer.as_ref()))
+    tokio::task::spawn_blocking(move || prompt_for_approval(&tool_name, &params_owned, &output_writer))
         .await
         .map_err(|e| io::Error::other(format!("spawn_blocking failed: {}", e)))?
 }
@@ -989,7 +985,7 @@ pub async fn prompt_for_combined_approval(
     file_count: usize,
     edit_count: usize,
     diff_preview: &str,
-    output_writer: Option<&OutputWriterArc>,
+    output_writer: &OutputWriterArc,
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
@@ -1012,13 +1008,8 @@ pub async fn prompt_for_combined_approval(
         &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
     );
 
-    if let Some(w) = output_writer {
-        use crate::cli::output::OutputEvent;
-        w.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
-    } else {
-        eprint!("\r\x1b[K{}", prompt);
-        io::stderr().flush()?;
-    }
+    use crate::cli::output::OutputEvent;
+    output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
 
     // See prompt_for_approval for the APPROVAL_PROMPT_ACTIVE invariant.
     // Here spawn_blocking captures errors in `result` without ?, so the
@@ -1206,7 +1197,8 @@ mod tests {
     fn test_prompt_non_interactive_approves() {
         // In non-interactive mode (stdin is not a tty), the tool is auto-approved
         // This is the common case in tests since cargo test redirects stdin
-        let result = prompt_for_approval("execute_command", &serde_json::json!({"command": "ls"}), None)
+        let output_writer = Arc::new(crate::cli::output::StderrOutputWriter);
+        let result = prompt_for_approval("execute_command", &serde_json::json!({"command": "ls"}), &output_writer)
             .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);
     }
@@ -1214,7 +1206,8 @@ mod tests {
     #[test]
     #[ignore = "requires interactive stdin - tested manually"]
     fn test_prompt_empty_params() {
-        let result = prompt_for_approval("attempt_completion", &serde_json::json!({}), None)
+        let output_writer = Arc::new(crate::cli::output::StderrOutputWriter);
+        let result = prompt_for_approval("attempt_completion", &serde_json::json!({}), &output_writer)
             .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);
     }
