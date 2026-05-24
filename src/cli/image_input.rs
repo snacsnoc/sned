@@ -100,10 +100,7 @@ pub fn load_images_to_content_blocks(
         .filter_map(|path| match load_image_to_content_block(path) {
             Ok(block) => Some(block),
             Err(e) => {
-                eprintln!(
-                    "{}",
-                    crate::cli::colors::warning(&format!("failed to load image '{}': {}", path, e))
-                );
+                tracing::warn!("Failed to load image '{}': {}", path, e);
                 None
             }
         })
