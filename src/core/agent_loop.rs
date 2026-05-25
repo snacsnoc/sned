@@ -1133,23 +1133,27 @@ impl AgentLoop {
         }
 
         // 3. Select tool profile and build tool definitions
-        let profile = self.deps.tool_profile.unwrap_or_else(|| {
-            let mode_str = match self.config.mode {
-                crate::core::agent_types::AgentMode::Plan => "plan",
-                crate::core::agent_types::AgentMode::Act => "act",
-            };
-            let prompt = pruned_history
-                .iter()
-                .find(|m| m.role == crate::providers::MessageRole::User)
-                .and_then(|m| match &m.content {
-                    crate::providers::MessageContent::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .unwrap_or("");
-            let p = crate::core::tools::definitions::select_tool_profile(prompt, mode_str);
-            tracing::info!(profile = ?p, prompt_len = prompt.len(), "selected tool profile");
-            p
-        });
+        let profile = match self.deps.tool_profile {
+            Some(profile) => profile,
+            None => {
+                let mode_str = match self.config.mode {
+                    crate::core::agent_types::AgentMode::Plan => "plan",
+                    crate::core::agent_types::AgentMode::Act => "act",
+                };
+                let prompt = pruned_history
+                    .iter()
+                    .find(|m| m.role == crate::providers::MessageRole::User)
+                    .and_then(|m| match &m.content {
+                        crate::providers::MessageContent::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                let p = crate::core::tools::definitions::select_tool_profile(prompt, mode_str);
+                tracing::info!(profile = ?p, prompt_len = prompt.len(), "selected tool profile");
+                self.deps.tool_profile = Some(p);
+                p
+            }
+        };
         let tools = Some(crate::core::tools::definitions::get_tool_definitions_for_profile(profile));
 
         let mut request = ProviderRequest {
