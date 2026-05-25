@@ -1958,7 +1958,7 @@ impl StateManager {
     pub async fn persist_async(this: Arc<Self>) -> io::Result<()> {
         tokio::task::spawn_blocking(move || this.persist())
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            .map_err(io::Error::other)?
     }
 
     /// Persist global state to disk, writing only the specified keys.

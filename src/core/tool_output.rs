@@ -80,13 +80,12 @@ pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> Strin
                 cmd.to_string()
             } else if let Some(script) = params.get("script").and_then(|v| v.as_str()) {
                 // Alternative: script field
-                let truncated = if script.len() > 120 {
+                if script.len() > 120 {
                     let end = script.floor_char_boundary(117);
                     format!("{}...", &script[..end])
                 } else {
                     script.to_string()
-                };
-                truncated
+                }
             } else {
                 // No command found - avoid printing empty "▶ " line
                 return format!("  ▶ {}", tool_name);

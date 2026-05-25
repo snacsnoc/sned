@@ -331,7 +331,7 @@ pub struct AutoApprovalSettings {
 use crate::cli::output::OutputWriterArc;
 
 /// Tracks which tool types have been auto-approved for the current session.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ApprovalManager {
     /// Tool names that the user has chosen to auto-approve for this session.
     session_auto_approve: HashSet<String>,
@@ -349,19 +349,7 @@ pub struct ApprovalManager {
     user_safe_commands: Vec<String>,
 }
 
-impl Default for ApprovalManager {
-    fn default() -> Self {
-        Self {
-            session_auto_approve: HashSet::new(),
-            yolo_mode: false,
-            auto_approve_all: false,
-            workspace_root: None,
-            auto_approval_settings: AutoApprovalSettings::default(),
-            auto_approve_patterns: Vec::new(),
-            user_safe_commands: Vec::new(),
-        }
-    }
-}
+
 
 impl ApprovalManager {
     /// Create a new approval manager with no session auto-approvals.
@@ -781,8 +769,8 @@ fn read_single_char_raw() -> io::Result<char> {
     // Set raw mode: disable canonical mode, echo, and signal generation
     let mut raw_termios = original_termios;
     raw_termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
-    raw_termios.c_cc[libc::VMIN as usize] = 1;
-    raw_termios.c_cc[libc::VTIME as usize] = 0;
+    raw_termios.c_cc[libc::VMIN] = 1;
+    raw_termios.c_cc[libc::VTIME] = 0;
     
     if unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_termios) } != 0 {
         return Err(io::Error::last_os_error());

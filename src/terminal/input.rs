@@ -12,7 +12,7 @@
 //!   It replicates the exact escape-sequence tables from the TypeScript
 //!   source so that Home / End / Backspace / Delete / Option-arrows work
 //!   across Terminal.app, iTerm2, Ghostty, and Linux consoles.
-//! Ctrl+C is handled via TerminalEvent::Ctrl('c').
+//! - Ctrl+C is handled via TerminalEvent::Ctrl('c').
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
@@ -205,8 +205,8 @@ impl InputParser {
                 let paste_end_prefix = b"\x1b[201~";
                 for prefix_len in 1..6 {
                     if self.paste_buffer.len() >= prefix_len
-                        && &self.paste_buffer[self.paste_buffer.len() - prefix_len..]
-                            == &paste_end_prefix[..prefix_len]
+                        && self.paste_buffer[self.paste_buffer.len() - prefix_len..]
+                            == paste_end_prefix[..prefix_len]
                         && self.buf.len() >= 6 - prefix_len
                         && self.buf.iter().take(6 - prefix_len).eq(
                             paste_end_prefix[prefix_len..].iter()

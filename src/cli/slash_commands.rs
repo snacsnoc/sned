@@ -474,26 +474,23 @@ pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command {
         // Try the command with argument first (handles /help <command>, etc.)
-        if !result.processed_text.is_empty() {
-            if let Some(parsed) = CliOnlyCommand::parse_with_arg(&cmd.command, result.processed_text.trim()) {
-                return Some(parsed);
-            }
+        if !result.processed_text.is_empty()
+            && let Some(parsed) = CliOnlyCommand::parse_with_arg(&cmd.command, result.processed_text.trim())
+        {
+            return Some(parsed);
         }
         // Try the command word first (handles /expand 1, /commit "msg", etc.)
         if let Some(parsed) = CliOnlyCommand::parse(&cmd.command) {
             return Some(parsed);
         }
         // Fall back to full command + args (handles /checkpoint list, /checkpoint restore N, etc.)
-        if !result.processed_text.is_empty() {
-            let full_command = format!("{} {}", cmd.command, result.processed_text);
-            if let Some(parsed) = CliOnlyCommand::parse(&full_command) {
-                return Some(parsed);
-            }
+        if !result.processed_text.is_empty()
+            && let Some(parsed) = CliOnlyCommand::parse(&format!("{} {}", cmd.command, result.processed_text))
+        {
+            return Some(parsed);
         }
-        None
-    } else {
-        None
     }
+    None
 }
 
 pub fn parse_expand_index(text: &str) -> Option<usize> {

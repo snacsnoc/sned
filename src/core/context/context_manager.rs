@@ -152,7 +152,7 @@ pub fn get_new_context_messages_and_metadata(
             .unwrap_or((256_000.0 * threshold_pct) as u64);
 
         if total_tokens >= max_allowed_size {
-            let keep = if (total_tokens as u64 / 2) > max_allowed_size {
+            let keep = if (total_tokens / 2) > max_allowed_size {
                 TruncationKeep::LastQuarter
             } else {
                 TruncationKeep::Half

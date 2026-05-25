@@ -139,14 +139,11 @@ pub async fn list_workspace_files(
     let workspace_path_str = workspace_path.to_string();
     
     // Check cache first
+    if let Some(entry) = FILE_SEARCH_CACHE.read().await.get(&workspace_path_str)
+        && entry.timestamp.elapsed() < CACHE_TTL
     {
-        let cache = FILE_SEARCH_CACHE.read().await;
-        if let Some(entry) = cache.get(&workspace_path_str) {
-            if entry.timestamp.elapsed() < CACHE_TTL {
-                // Cache hit - return cached results (filtered by limit)
-                return Ok(entry.results.iter().take(limit).cloned().collect());
-            }
-        }
+        // Cache hit - return cached results (filtered by limit)
+        return Ok(entry.results.iter().take(limit).cloned().collect());
     }
 
     // Cache miss or expired - run blocking WalkBuilder iteration
@@ -212,7 +209,7 @@ pub async fn list_workspace_files(
         all_results
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    .map_err(std::io::Error::other)?;
 
     // Update cache with full results (before limit applied)
     {
@@ -269,10 +266,8 @@ fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
 
     if qi == query_bytes.len() {
         // Prefix bonus: matches starting at position 0 rank higher
-        if let Some(first_idx) = first_match_idx {
-            if first_idx == 0 {
-                score += 10;
-            }
+        if first_match_idx == Some(0) {
+            score += 10;
         }
         // Length normalization: shorter targets rank higher for same query
         let target_len = target_bytes.len();

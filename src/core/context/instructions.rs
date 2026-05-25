@@ -68,12 +68,10 @@ pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
         .build();
     
     for entry in walker.flatten() {
-        if entry.file_type().map_or(false, |ft| ft.is_file()) {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.eq_ignore_ascii_case("AGENTS.md") {
-                    results.push(entry.path().to_path_buf());
-                }
-            }
+        if entry.file_type().is_some_and(|ft| ft.is_file())
+            && entry.file_name().to_str().is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md"))
+        {
+            results.push(entry.path().to_path_buf());
         }
     }
     results
@@ -378,19 +376,15 @@ pub fn scan_skills_directory(dir_path: &Path, source: SkillSource) -> Vec<SkillM
             }
         }
         // Support .md files directly in the skills directory
-        else if entry_path.is_file() {
-            if let Some(ext) = entry_path.extension() {
-                if ext == "md" {
-                    let skill_name = entry_path
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
+        else if entry_path.is_file() && entry_path.extension().is_some_and(|ext| ext == "md") {
+            let skill_name = entry_path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
 
-                    if let Some(skill) = load_skill_from_md_file(&entry_path, source.clone(), &skill_name) {
-                        skills.push(skill);
-                    }
-                }
+            if let Some(skill) = load_skill_from_md_file(&entry_path, source.clone(), &skill_name) {
+                skills.push(skill);
             }
         }
     }

@@ -1110,17 +1110,16 @@ async fn run_main_loop(
                                 let processed = crate::cli::slash_commands::process_slash_command(&text);
                                 
                                 // If agent is busy, queue the message; otherwise spawn
-                                if agent_busy.load(Ordering::Relaxed) {
-                                    if let Some(qh) = queue_handle.lock().await.as_ref() {
-                                        if !processed.is_empty() {
-                                            qh.enqueue_text_message(processed).await;
-                                            let count = qh.queued_message_count().await;
-                                            app.push_styled(
-                                                format!("Message queued ({} in queue)", count),
-                                                Style::default().add_modifier(Modifier::DIM),
-                                            );
-                                        }
-                                    }
+                                if agent_busy.load(Ordering::Relaxed)
+                                    && let Some(qh) = queue_handle.lock().await.as_ref()
+                                    && !processed.is_empty()
+                                {
+                                    qh.enqueue_text_message(processed).await;
+                                    let count = qh.queued_message_count().await;
+                                    app.push_styled(
+                                        format!("Message queued ({} in queue)", count),
+                                        Style::default().add_modifier(Modifier::DIM),
+                                    );
                                 } else {
                                     spawn_agent_task(
                                         &session, &processed,
@@ -1144,17 +1143,15 @@ async fn run_main_loop(
         }
         
         // 4. Check agent completion (non-blocking)
-        if agent_busy.load(Ordering::Relaxed) {
-            if agent_done.notified().now_or_never().is_some() {
-                agent_busy.store(false, Ordering::Relaxed);
-                app.agent_busy = false;
-                if let Some(start) = agent_start_time.lock().await.take() {
-                    let elapsed = start.elapsed();
-                    app.push_styled(
-                        format!("⏱ Elapsed: {}", format_duration(elapsed)),
-                        Style::default().add_modifier(Modifier::DIM),
-                    );
-                }
+        if agent_busy.load(Ordering::Relaxed) && agent_done.notified().now_or_never().is_some() {
+            agent_busy.store(false, Ordering::Relaxed);
+            app.agent_busy = false;
+            if let Some(start) = agent_start_time.lock().await.take() {
+                let elapsed = start.elapsed();
+                app.push_styled(
+                    format!("⏱ Elapsed: {}", format_duration(elapsed)),
+                    Style::default().add_modifier(Modifier::DIM),
+                );
             }
         }
         
@@ -1246,7 +1243,7 @@ pub async fn run_interactive_shell_inner(
     
     // 6. Main loop
     let auto_approve = task_opts.yolo || task_opts.auto_approve_all;
-    let result = run_main_loop(
+    run_main_loop(
         &mut terminal,
         &mut app,
         &mut output_rx,
@@ -1260,9 +1257,7 @@ pub async fn run_interactive_shell_inner(
         queue_handle,
         &task_opts,
         auto_approve,
-    ).await;
-    
-    result
+    ).await
 }
 pub fn should_start_interactive_shell(
     has_prompt: bool,

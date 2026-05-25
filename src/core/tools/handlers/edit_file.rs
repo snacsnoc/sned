@@ -584,10 +584,10 @@ impl EditFileHandler {
                     Err(e) => {
                         // Rollback all previously written files
                         for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path) {
-                                if let Err(re) = std::fs::write(path, orig) {
-                                    tracing::error!("Failed to rollback file {}: {}", path, re);
-                                }
+                            if let Some(orig) = original_contents.get(path)
+                                && let Err(re) = std::fs::write(path, orig)
+                            {
+                                tracing::error!("Failed to rollback file {}: {}", path, re);
                             }
                         }
                         return Err(ToolError::ExecutionFailed(format!(
@@ -616,10 +616,10 @@ impl EditFileHandler {
 
                     if !mtime_ok {
                         for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path) {
-                                if let Err(re) = std::fs::write(path, orig) {
-                                    tracing::error!("Failed to rollback file {}: {}", path, re);
-                                }
+                            if let Some(orig) = original_contents.get(path)
+                                && let Err(re) = std::fs::write(path, orig)
+                            {
+                                tracing::error!("Failed to rollback file {}: {}", path, re);
                             }
                         }
                         return Err(ToolError::ExecutionFailed(format!(
@@ -650,10 +650,10 @@ impl EditFileHandler {
                         }
                         Err(e) => {
                             for path in written_paths.iter().rev() {
-                                if let Some(orig) = original_contents.get(path) {
-                                    if let Err(re) = std::fs::write(path, orig) {
-                                        tracing::error!("Failed to rollback file {}: {}", path, re);
-                                    }
+                                if let Some(orig) = original_contents.get(path)
+                                    && let Err(re) = std::fs::write(path, orig)
+                                {
+                                    tracing::error!("Failed to rollback file {}: {}", path, re);
                                 }
                             }
                             all_results.push(format!(
@@ -671,10 +671,10 @@ impl EditFileHandler {
                     {
                         let _ = fs2::FileExt::unlock(&std_file);
                         for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path) {
-                                if let Err(re) = std::fs::write(path, orig) {
-                                    tracing::error!("Failed to rollback file {}: {}", path, re);
-                                }
+                            if let Some(orig) = original_contents.get(path)
+                                && let Err(re) = std::fs::write(path, orig)
+                            {
+                                tracing::error!("Failed to rollback file {}: {}", path, re);
                             }
                         }
                         return Err(ToolError::ExecutionFailed(format!(
@@ -703,10 +703,10 @@ impl EditFileHandler {
                         }
                         Err(e) => {
                             for path in written_paths.iter().rev() {
-                                if let Some(orig) = original_contents.get(path) {
-                                    if let Err(re) = std::fs::write(path, orig) {
-                                        tracing::error!("Failed to rollback file {}: {}", path, re);
-                                    }
+                                if let Some(orig) = original_contents.get(path)
+                                    && let Err(re) = std::fs::write(path, orig)
+                                {
+                                    tracing::error!("Failed to rollback file {}: {}", path, re);
                                 }
                             }
                             all_results.push(format!(

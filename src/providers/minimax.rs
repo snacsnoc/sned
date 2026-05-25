@@ -901,15 +901,17 @@ async fn process_minimax_sse_line(
                         if args.trim().is_empty() {
                             continue;
                         }
-                        if entry.2.is_empty() {
-                            if !args.starts_with('{') && !args.starts_with('[') && !args.starts_with('"') {
-                                tracing::warn!(
-                                    tool_index = idx,
-                                    args_preview = args.chars().take(40).collect::<String>(),
-                                    "MiniMax tool call arguments start with garbled content, discarding chunk"
-                                );
-                                continue;
-                            }
+                        if entry.2.is_empty()
+                            && !args.starts_with('{')
+                            && !args.starts_with('[')
+                            && !args.starts_with('"')
+                        {
+                            tracing::warn!(
+                                tool_index = idx,
+                                args_preview = args.chars().take(40).collect::<String>(),
+                                "MiniMax tool call arguments start with garbled content, discarding chunk"
+                            );
+                            continue;
                         }
                         if entry.2.len() + args.len() <= crate::providers::MAX_TOOL_ARGUMENT_SIZE {
                             entry.2.push_str(args);

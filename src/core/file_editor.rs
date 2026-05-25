@@ -149,6 +149,7 @@ impl AnchorStorage {
         }
     }
 
+    #[cfg(test)]
     fn new() -> Self {
         Self {
             tasks: IndexMap::new(),

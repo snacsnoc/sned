@@ -975,16 +975,14 @@ impl AgentLoop {
                     // Only rollback for context-window errors to prevent compounding failure.
                     // For other errors (rate limit, auth, etc.), keep the message so the user
                     // doesn't lose their input when retrying after fixing the issue.
-                    let is_context_error = e.contains("exceeds") && e.contains("context");
-                    if is_context_error {
+                    if e.contains("exceeds") && e.contains("context") {
                         let mut history = self.conversation_history.lock().await;
-                        if let Some(last) = history.last() {
-                            if last.role == MessageRole::User {
-                                history.pop();
-                                tracing::info!("Rolled back unprocessed user message after context window error");
-                            }
+                        if let Some(last) = history.last()
+                            && last.role == MessageRole::User
+                        {
+                            history.pop();
+                            tracing::info!("Rolled back unprocessed user message after context window error");
                         }
-                        drop(history);
                     }
 
                     // Persist state on error
@@ -1043,10 +1041,9 @@ impl AgentLoop {
                     history_item.conversation_history_deleted_range =
                         Some(vec![start as i32, end as i32]);
                     state_manager.add_task_to_history(history_item);
-                    if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
+                    if let Err(e) = StateManager::persist_async(state_manager.clone()).await {
                         self.config.output_writer.emit(OutputEvent::error(format!(
-                            "Failed to persist state after compaction: {}",
-                            e
+                            "Failed to persist state after compaction: {e}"
                         )));
                     }
                 }
@@ -3124,15 +3121,13 @@ impl AgentLoop {
         for msg in history.iter().skip(keep_from_base) {
             if let MessageContent::UserBlocks(blocks) = &msg.content {
                 for block in blocks {
-                    if let UserContentBlock::ToolResult(tr) = block {
-                        // Check if this tool_result's tool_use exists and is before keep_from
-                        if let Some(&tool_use_idx) = tool_use_index.get(&tr.tool_use_id) {
-                            if tool_use_idx < keep_from {
-                                // This tool_use would be pruned but its result is kept — orphan!
-                                // Extend keep_from backwards to include the tool_use
-                                keep_from = keep_from.min(tool_use_idx);
-                            }
-                        }
+                    if let UserContentBlock::ToolResult(tr) = block
+                        && let Some(&tool_use_idx) = tool_use_index.get(&tr.tool_use_id)
+                        && tool_use_idx < keep_from
+                    {
+                        // This tool_use would be pruned but its result is kept — orphan!
+                        // Extend keep_from backwards to include the tool_use
+                        keep_from = keep_from.min(tool_use_idx);
                     }
                 }
             }

@@ -134,16 +134,14 @@ impl RenameSymbolHandler {
                 Vec::new();
 
             for (abs_path, content) in &file_contents {
-                let language_parsers =
-                    load_required_language_parsers(&[abs_path.as_str()]).ok();
-                if let Some(parsers) = language_parsers {
-                    if let Ok(symbols) = crate::services::symbol_index::extract_symbols_for_indexing(
+                if let Some(parsers) = load_required_language_parsers(&[abs_path.as_str()]).ok()
+                    && let Ok(symbols) = crate::services::symbol_index::extract_symbols_for_indexing(
                         abs_path,
                         content,
                         &parsers,
-                    ) {
-                        parsed_symbols.push((abs_path.as_str(), symbols));
-                    }
+                    )
+                {
+                    parsed_symbols.push((abs_path.as_str(), symbols));
                 }
             }
 
@@ -153,16 +151,16 @@ impl RenameSymbolHandler {
                 for (abs_path, symbols) in parsed_symbols {
                     let abs_path_obj = std::path::Path::new(abs_path);
                     let rel_path = abs_path_obj.strip_prefix(root).unwrap_or(abs_path_obj);
-                    if let Some(rel_str) = rel_path.to_str() {
-                        if let Ok(meta) = std::fs::metadata(abs_path) {
-                            let mtime = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            index_service.index_file(rel_str.to_string(), mtime, meta.len(), symbols);
-                        }
+                    if let Some(rel_str) = rel_path.to_str()
+                        && let Ok(meta) = std::fs::metadata(abs_path)
+                    {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        index_service.index_file(rel_str.to_string(), mtime, meta.len(), symbols);
                     }
                 }
             }
