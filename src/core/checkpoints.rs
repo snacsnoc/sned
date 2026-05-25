@@ -561,6 +561,7 @@ mod tests {
         INIT.call_once(|| {
             let base_dir = PathBuf::from("/private/tmp/sned-checkpoints-tests");
             std::fs::create_dir_all(&base_dir).unwrap();
+            // SAFETY: called once via Once; no concurrent env mutation possible
             unsafe { std::env::set_var("SNED_CHECKPOINTS_BASE_DIR", &base_dir) };
         });
     }
@@ -578,6 +579,7 @@ mod tests {
     #[test]
     fn test_get_shadow_git_path() {
         // Clear env var that may be set by other tests
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { std::env::remove_var("SNED_CHECKPOINTS_BASE_DIR") };
 
         let hash = "abc123";

@@ -392,10 +392,12 @@ mod tests {
     fn assert_colored(code: &str, lang: &str) {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let previous = std::env::var_os("NO_COLOR");
+        // SAFETY: env mutation guarded by mutex; no other thread reads NO_COLOR concurrently
         unsafe {
             std::env::remove_var("NO_COLOR");
         }
         let highlighted = highlight_code(code, lang);
+        // SAFETY: env mutation guarded by mutex; restoring previous value
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("NO_COLOR", value),
@@ -457,10 +459,12 @@ mod tests {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let code = "fn main() { let count = 42; }";
         let previous = std::env::var_os("NO_COLOR");
+        // SAFETY: env mutation guarded by mutex; no other thread reads NO_COLOR concurrently
         unsafe {
             std::env::set_var("NO_COLOR", "1");
         }
         assert_eq!(highlight_code(code, "rust"), code);
+        // SAFETY: env mutation guarded by mutex; restoring previous value
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("NO_COLOR", value),
@@ -474,6 +478,7 @@ mod tests {
     fn highlights_typical_block_under_five_ms() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let previous = std::env::var_os("NO_COLOR");
+        // SAFETY: env mutation guarded by mutex; no other thread reads NO_COLOR concurrently
         unsafe {
             std::env::remove_var("NO_COLOR");
         }
@@ -493,6 +498,7 @@ impl User {
         let highlighted = highlight_code(code, "rust");
         let elapsed = start.elapsed();
 
+        // SAFETY: env mutation guarded by mutex; restoring previous value
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("NO_COLOR", value),

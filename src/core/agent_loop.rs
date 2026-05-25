@@ -3999,6 +3999,7 @@ mod tests {
         // Create a temp directory and set SNED_DIR to use it
         let temp_dir = TempDir::new().unwrap();
         let sned_dir = temp_dir.path().join(".sned");
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             env::set_var("SNED_DIR", &sned_dir);
         }
@@ -4087,6 +4088,7 @@ mod tests {
         let loaded_empty = agent_empty.load_conversation_history().await;
         assert!(!loaded_empty, "Should not load history for empty task");
 
+        // SAFETY: single-threaded test; restoring env after test
         unsafe { env::remove_var("SNED_DIR") };
     }
 
@@ -5349,12 +5351,14 @@ mod tests {
     #[test]
     fn test_truncate_tool_result_respects_env_var() {
         // Test with custom limit via environment variable
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             std::env::set_var(TOOL_RESULT_HISTORY_LIMIT_ENV, "100");
         }
         let large = "x".repeat(500);
         let result = truncate_tool_result(&large);
         assert!(result.len() < 150); // 100 limit + marker
+        // SAFETY: single-threaded test; restoring env after test
         unsafe {
             std::env::remove_var(TOOL_RESULT_HISTORY_LIMIT_ENV);
         }
@@ -5475,6 +5479,7 @@ mod tests {
     #[test]
     fn test_truncate_old_thinking_blocks_respects_env_var() {
         // Test with custom limit via environment variable
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             std::env::set_var(THINKING_HISTORY_LIMIT_ENV, "100");
         }
@@ -5547,6 +5552,7 @@ mod tests {
             );
         }
 
+        // SAFETY: single-threaded test; restoring env after test
         unsafe {
             std::env::remove_var(THINKING_HISTORY_LIMIT_ENV);
         }

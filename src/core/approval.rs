@@ -730,6 +730,8 @@ struct TermiosGuard {
 #[cfg(unix)]
 impl Drop for TermiosGuard {
     fn drop(&mut self) {
+        // SAFETY: self.original is a valid termios struct we previously read
+        // from this fd. tcsetattr is async-signal-safe and we own the fd.
         unsafe {
             let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original);
         }
@@ -745,7 +747,10 @@ fn read_single_char_raw() -> io::Result<char> {
     let stdin_fd = stdin.as_raw_fd();
 
     // Save original terminal settings
+    // SAFETY: std::mem::zeroed() is safe for libc::termios (all-zero is valid)
     let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: stdin_fd is a valid fd from io::stdin().as_raw_fd().
+    // tcgetattr reads into our owned termios struct.
     let restore_guard = unsafe {
         if libc::tcgetattr(stdin_fd, &mut original_termios) == 0 {
             Some(TermiosGuard {
@@ -763,12 +768,16 @@ fn read_single_char_raw() -> io::Result<char> {
     raw_termios.c_cc[libc::VMIN] = 1;
     raw_termios.c_cc[libc::VTIME] = 0;
 
+    // SAFETY: raw_termios is a valid termios struct we just initialized.
+    // stdin_fd is valid, TCSAFLUSH is a valid selector.
     if unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_termios) } != 0 {
         return Err(io::Error::last_os_error());
     }
 
     // Read single character directly from fd (avoids borrow checker issue with stdin())
     let mut buf = [0u8; 1];
+    // SAFETY: stdin_fd is valid, buf is properly initialized and sized.
+    // Casting to *mut c_void is required by libc::read signature.
     let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
     if n < 0 {
         return Err(io::Error::last_os_error());

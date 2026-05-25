@@ -50,6 +50,7 @@ pub fn run_command_in_pty(
     };
 
     // forkpty creates a PTY and forks in one call
+    // SAFETY: forkpty is a well-defined POSIX call; winsize is properly initialized
     let result = unsafe { nix::pty::forkpty(Some(&winsize), None) };
 
     match result {
@@ -61,6 +62,7 @@ pub fn run_command_in_pty(
         }
         Ok(ForkptyResult::Parent { child, master }) => {
             // Wrap the OwnedFd in a PtyMaster
+            // SAFETY: master fd was just returned by forkpty as a valid PTY master
             let master = unsafe { PtyMaster::from_owned_fd(master) };
             // Parent process: read from master and wait for child
             parent_read_and_wait(master, child, timeout)
@@ -116,6 +118,7 @@ fn parent_read_and_wait(
             timed_out = true;
             // Kill the entire process group (negative PID)
             // Check liveness first to avoid killing recycled PIDs
+            // SAFETY: pgid is a process group ID from fork(); signal 0/SIGKILL are valid
             let pgid = -child.as_raw();
             if unsafe { libc::kill(pgid, 0) } == 0 {
                 let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };

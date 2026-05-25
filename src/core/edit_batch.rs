@@ -997,6 +997,7 @@ mod tests {
     #[test]
     fn test_generate_diff_respects_no_color() {
         // Set NO_COLOR to test plain text output
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             std::env::set_var("NO_COLOR", "1");
         }
@@ -1037,6 +1038,7 @@ mod tests {
         assert!(!diff.contains("\x1b[92m+ ")); // Should be plain "+ " not colored
 
         // Cleanup
+        // SAFETY: single-threaded test; restoring env after test
         unsafe {
             std::env::remove_var("NO_COLOR");
         }

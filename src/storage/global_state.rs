@@ -382,12 +382,14 @@ mod tests {
         let temp_home = TempDir::new().unwrap();
         let old_home = std::env::var_os("HOME");
 
+        // SAFETY: env mutation guarded by mutex; no concurrent access to HOME
         unsafe {
             std::env::set_var("HOME", temp_home.path());
         }
 
         let result = f(&temp_home);
 
+        // SAFETY: env mutation guarded by mutex; restoring previous value
         unsafe {
             if let Some(old_home) = old_home {
                 std::env::set_var("HOME", old_home);

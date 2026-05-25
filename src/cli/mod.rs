@@ -491,6 +491,7 @@ pub fn apply_config_override(cli: &Cli) {
     }
 
     if let Some(path) = config_path {
+        // SAFETY: called during CLI startup before any worker threads spawn
         unsafe {
             std::env::set_var("SNED_DIR", &path);
         }
@@ -2029,6 +2030,7 @@ mod tests {
                 "GOOGLE_CLOUD_PROJECT",
                 "GCP_PROJECT",
             ] {
+                // SAFETY: single-threaded test; clearing env before each assertion
                 unsafe { env::remove_var(var) };
             }
         }
@@ -2039,16 +2041,19 @@ mod tests {
 
         // Test 2: ANTHROPIC_API_KEY set - should detect anthropic
         clear_env();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("ANTHROPIC_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("anthropic"));
 
         // Test 3: OPENAI_API_KEY set - should detect openai-native
         clear_env();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("OPENAI_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("openai-native"));
 
         // Test 4: Multiple keys - priority order (anthropic > openrouter > openai)
         clear_env();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             env::set_var("ANTHROPIC_API_KEY", "ant-key");
             env::set_var("OPENAI_API_KEY", "openai-key");
@@ -2057,21 +2062,25 @@ mod tests {
 
         // Test 5: Groq provider
         clear_env();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("GROQ_API_KEY", "groq-key") };
         assert_eq!(get_provider_from_env(), Some("groq"));
 
         // Test 6: xAI provider
         clear_env();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("XAI_API_KEY", "xai-key") };
         assert_eq!(get_provider_from_env(), Some("xai"));
 
         // Test 7: OpenRouter provider
         clear_env();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("OPENROUTER_API_KEY", "or-key") };
         assert_eq!(get_provider_from_env(), Some("openrouter"));
 
         // Test 8: DeepSeek provider
         clear_env();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("DEEPSEEK_API_KEY", "ds-key") };
         assert_eq!(get_provider_from_env(), Some("deepseek"));
 
@@ -2119,10 +2128,12 @@ mod tests {
             "OPENAI_COMPATIBLE_CUSTOM_KEY",
         ];
         for var in &all_provider_vars {
+            // SAFETY: single-threaded test; clearing env before each assertion
             unsafe { env::remove_var(var) };
         }
 
         // Set only ANTHROPIC_API_KEY
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("ANTHROPIC_API_KEY", "test-key") };
 
         let task_opts = TaskOptions {
@@ -2161,6 +2172,7 @@ mod tests {
         let result = create_provider(&task_opts);
         assert!(result.is_ok(), "Expected Ok when ANTHROPIC_API_KEY is set");
 
+        // SAFETY: single-threaded test; cleaning up env after assertion
         unsafe { env::remove_var("ANTHROPIC_API_KEY") };
     }
 
@@ -2205,10 +2217,12 @@ mod tests {
             "OPENAI_COMPATIBLE_CUSTOM_KEY",
         ];
         for var in &all_provider_vars {
+            // SAFETY: single-threaded test; clearing env before each assertion
             unsafe { env::remove_var(var) };
         }
 
         // Set ANTHROPIC_API_KEY but explicitly request groq
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("ANTHROPIC_API_KEY", "ant-key") };
 
         let task_opts = TaskOptions {
@@ -2247,6 +2261,7 @@ mod tests {
         let result = create_provider(&task_opts);
         assert!(result.is_ok(), "Expected Ok with explicit provider");
 
+        // SAFETY: single-threaded test; cleaning up env after assertion
         unsafe { env::remove_var("ANTHROPIC_API_KEY") };
     }
 

@@ -25,7 +25,7 @@ fn bench_check_stale(c: &mut Criterion) {
     c.bench_function("check_stale_unchanged", |b| {
         b.iter(|| {
             let result = tracker.check_stale(black_box(&path));
-            black_box(result);
+            let _ = black_box(result);
         })
     });
 
@@ -36,19 +36,25 @@ fn bench_check_stale(c: &mut Criterion) {
     c.bench_function("check_stale_modified", |b| {
         b.iter(|| {
             let result = tracker.check_stale(black_box(&path));
-            black_box(result);
+            let _ = black_box(result);
         })
     });
 }
 
 fn bench_track_file_context(c: &mut Criterion) {
+    use tokio::runtime::Runtime;
+    let rt = Runtime::new().unwrap();
     let mut tracker = FileContextTracker::new();
     let temp_file = tempfile::NamedTempFile::new().unwrap();
     let path = temp_file.path().to_str().unwrap();
 
     c.bench_function("track_file_context", |b| {
         b.iter(|| {
-            tracker.track_file_context(black_box(path), FileRecordSource::ReadTool);
+            rt.block_on(async {
+                tracker
+                    .track_file_context(black_box(path), FileRecordSource::ReadTool)
+                    .await;
+            });
         })
     });
 }

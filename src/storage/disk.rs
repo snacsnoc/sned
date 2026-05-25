@@ -439,16 +439,19 @@ mod tests {
         let content = r#"{"test": "fsync"}"#;
 
         // Default (no env var) - should not fsync
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { std::env::remove_var("SNED_FSYNC") };
         let result = atomic_write_file_async(&file_path, content).await;
         assert!(result.is_ok());
 
         // With SNED_FSYNC=on - should fsync
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { std::env::set_var("SNED_FSYNC", "on") };
         let result = atomic_write_file_async(&file_path, content).await;
         assert!(result.is_ok());
 
         // Clean up
+        // SAFETY: single-threaded test; restoring env after test
         unsafe { std::env::remove_var("SNED_FSYNC") };
     }
 

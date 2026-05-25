@@ -338,6 +338,7 @@ mod tests {
     async fn test_search_files_custom_max_count_via_env() {
         // Test with custom limit via environment variable
         // Use a unique value to avoid interference from other tests
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
         }
@@ -369,6 +370,7 @@ mod tests {
         );
         assert!(result.contains("Too many matches"));
 
+        // SAFETY: single-threaded test; restoring env after test
         unsafe {
             std::env::remove_var(SEARCH_MAX_LINES_ENV);
         }

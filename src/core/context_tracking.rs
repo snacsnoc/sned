@@ -140,6 +140,7 @@ mod tests {
 
         // Override SNED_DATA_DIR for this test
         let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
         }
@@ -160,10 +161,12 @@ mod tests {
 
         // Restore original env var
         if let Some(val) = original_data_dir {
+            // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
                 std::env::set_var("SNED_DATA_DIR", val);
             }
         } else {
+            // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
                 std::env::remove_var("SNED_DATA_DIR");
             }
@@ -191,6 +194,7 @@ mod tests {
 
         // Override SNED_DATA_DIR for this test
         let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
         }
@@ -246,10 +250,12 @@ mod tests {
 
         // Restore original env var
         if let Some(val) = original_data_dir {
+            // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
                 std::env::set_var("SNED_DATA_DIR", val);
             }
         } else {
+            // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
                 std::env::remove_var("SNED_DATA_DIR");
             }

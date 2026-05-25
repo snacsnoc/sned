@@ -346,6 +346,8 @@ impl ExecuteCommandHandler {
                             #[cfg(unix)]
                             {
                                 // Check liveness first to avoid signaling recycled PIDs
+                                // SAFETY: -child_pid is a process group ID from fork();
+                                // signal 0/SIGTERM/SIGKILL are valid constants
                                 if unsafe { libc::kill(-child_pid, 0) } == 0 {
                                     let _ = unsafe { libc::kill(-child_pid, libc::SIGTERM) };
                                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -417,6 +419,8 @@ impl ExecuteCommandHandler {
                                 #[cfg(unix)]
                                 {
                                     // Check liveness first to avoid signaling recycled PIDs
+                                    // SAFETY: -child_pid is a process group ID from fork();
+                                    // signal 0/SIGKILL are valid constants
                                     if unsafe { libc::kill(-child_pid, 0) } == 0 {
                                         let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
                                     }
@@ -657,6 +661,8 @@ impl ExecuteCommandHandler {
                 {
                     if child_pid > 0 {
                         // Check liveness first to avoid signaling recycled PIDs
+                        // SAFETY: -child_pid is a process group ID from fork();
+                        // signal 0/SIGKILL are valid constants
                         if unsafe { libc::kill(-child_pid, 0) } == 0 {
                             let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
                         }
@@ -1282,6 +1288,7 @@ mod tests {
     #[test]
     fn test_stream_output_line_limit_default() {
         // Clear any cached value from previous tests
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { std::env::remove_var("SNED_STREAM_OUTPUT_LINES") };
         // Reset the OnceLock by calling the function (it will cache default)
         let limit = ExecuteCommandHandler::stream_output_line_limit();
@@ -1291,6 +1298,7 @@ mod tests {
     #[test]
     fn test_stream_output_line_limit_env_parsing() {
         // Test the env var parsing logic (OnceLock caches first value, so we test the parsing inline)
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { std::env::set_var("SNED_STREAM_OUTPUT_LINES", "50") };
         let env_val = std::env::var("SNED_STREAM_OUTPUT_LINES")
             .ok()
@@ -1298,11 +1306,13 @@ mod tests {
             .filter(|&v| v > 0)
             .unwrap_or(20);
         assert_eq!(env_val, 50, "should parse valid positive integer");
+        // SAFETY: single-threaded test; restoring env after test
         unsafe { std::env::remove_var("SNED_STREAM_OUTPUT_LINES") };
     }
 
     #[test]
     fn test_stream_output_line_limit_invalid_env_falls_back() {
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { std::env::set_var("SNED_STREAM_OUTPUT_LINES", "invalid") };
         let env_val = std::env::var("SNED_STREAM_OUTPUT_LINES")
             .ok()
@@ -1310,6 +1320,7 @@ mod tests {
             .filter(|&v| v > 0)
             .unwrap_or(20);
         assert_eq!(env_val, 20, "invalid env should fall back to default");
+        // SAFETY: single-threaded test; restoring env after test
         unsafe { std::env::remove_var("SNED_STREAM_OUTPUT_LINES") };
     }
 }

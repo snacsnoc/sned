@@ -113,6 +113,7 @@ mod tests {
             "GCP_PROJECT",
         ];
         for var in &vars {
+            // SAFETY: single-threaded test; clearing env before each assertion
             unsafe {
                 env::remove_var(var);
             }
@@ -125,19 +126,23 @@ mod tests {
 
         // Test ANTHROPIC_API_KEY has highest priority
         clear_test_env_vars();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("ANTHROPIC_API_KEY", "sk-ant-test") };
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("OPENAI_API_KEY", "sk-openai-test") };
         assert_eq!(get_provider_from_env(), Some("anthropic"));
 
         clear_test_env_vars();
 
         // Test OPENAI_API_KEY alone
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("OPENAI_API_KEY", "sk-openai-test") };
         assert_eq!(get_provider_from_env(), Some("openai-native"));
 
         clear_test_env_vars();
 
         // Test AWS Bedrock detection
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("AWS_ACCESS_KEY_ID", "AKIA...") };
         assert_eq!(get_provider_from_env(), Some("bedrock"));
 
@@ -169,6 +174,7 @@ mod tests {
 
         for (env_var, expected_provider) in test_cases {
             clear_test_env_vars();
+            // SAFETY: single-threaded test; sequential env mutation
             unsafe { env::set_var(env_var, "test-key") };
             assert_eq!(
                 get_provider_from_env(),
@@ -182,18 +188,21 @@ mod tests {
 
         // Test special mappings
         // MINIMAX_CN_API_KEY maps to minimax
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("MINIMAX_CN_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("minimax"));
 
         clear_test_env_vars();
 
         // KIMI_API_KEY maps to moonshot (Kimi is Moonshot AI's product)
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("KIMI_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("moonshot"));
 
         clear_test_env_vars();
 
         // GCP_PROJECT maps to vertex
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("GCP_PROJECT", "my-project") };
         assert_eq!(get_provider_from_env(), Some("vertex"));
 

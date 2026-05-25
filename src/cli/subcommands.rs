@@ -145,6 +145,7 @@ pub fn run_config(opts: ConfigOptions) -> anyhow::Result<()> {
     use crate::storage::global_state::load_global_state;
 
     if let Some(config_path) = &opts.config {
+        // SAFETY: called during CLI startup before any worker threads spawn
         unsafe {
             std::env::set_var("SNED_DIR", config_path);
         }
@@ -689,6 +690,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
     use std::io::{self, Write};
 
     if let Some(config_path) = &opts.config {
+        // SAFETY: called during CLI startup before any worker threads spawn
         unsafe {
             std::env::set_var("SNED_DIR", config_path);
         }
@@ -994,6 +996,7 @@ mod tests {
 
         // Override SNED_DATA_DIR for this test
         let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
         }
@@ -1015,10 +1018,12 @@ mod tests {
 
         // Restore original env var
         if let Some(val) = original_data_dir {
+            // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
                 std::env::set_var("SNED_DATA_DIR", val);
             }
         } else {
+            // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
                 std::env::remove_var("SNED_DATA_DIR");
             }
@@ -1038,6 +1043,7 @@ mod tests {
 
         // Override SNED_DATA_DIR for this test
         let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        // SAFETY: single-threaded test; sequential env mutation
         unsafe {
             std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
         }
@@ -1059,10 +1065,12 @@ mod tests {
 
         // Restore original env var
         if let Some(val) = original_data_dir {
+            // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
                 std::env::set_var("SNED_DATA_DIR", val);
             }
         } else {
+            // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
                 std::env::remove_var("SNED_DATA_DIR");
             }

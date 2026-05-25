@@ -155,6 +155,7 @@ fn benchmark_get_new_context(c: &mut Criterion) {
                         None,
                         true,
                         None,
+                        "anthropic",
                     );
                     black_box(result.truncated_conversation_history.len());
                 })

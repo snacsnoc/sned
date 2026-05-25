@@ -66,6 +66,7 @@ fn bench_provider_creation(c: &mut Criterion) {
                 model_info: None,
                 reasoning_effort: None,
                 custom_headers: None,
+                provider_name: None,
             };
             let _ = black_box(sned::providers::openai::OpenAiProvider::new(config).unwrap());
         })

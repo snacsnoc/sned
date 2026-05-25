@@ -491,10 +491,12 @@ mod tests {
     #[test]
     fn test_env_colors_disabled_respects_no_color() {
         let original = std::env::var("NO_COLOR").ok();
+        // SAFETY: single-threaded test; env mutation guarded by sequential execution
         unsafe {
             std::env::set_var("NO_COLOR", "1");
         }
         assert!(env_colors_disabled());
+        // SAFETY: single-threaded test; restoring env after assertion
         unsafe {
             match original {
                 Some(v) => std::env::set_var("NO_COLOR", v),
@@ -506,10 +508,12 @@ mod tests {
     #[test]
     fn test_env_colors_disabled_respects_term_dumb() {
         let original = std::env::var("TERM").ok();
+        // SAFETY: single-threaded test; env mutation guarded by sequential execution
         unsafe {
             std::env::set_var("TERM", "dumb");
         }
         assert!(env_colors_disabled());
+        // SAFETY: single-threaded test; restoring env after assertion
         unsafe {
             match original {
                 Some(v) => std::env::set_var("TERM", v),

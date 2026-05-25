@@ -103,6 +103,7 @@ assert_cmd = "2.2"  # Updated to 2.2.x
 predicates = "3"
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }  # Updated to 0.8
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
 name = "hook_execution"

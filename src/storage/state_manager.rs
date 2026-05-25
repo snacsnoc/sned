@@ -2122,12 +2122,14 @@ mod tests {
         let data_dir = temp_dir.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
 
+        // SAFETY: single-threaded test helper; env mutation scoped to this closure
         unsafe {
             std::env::set_var("SNED_DATA_DIR", &data_dir);
         }
 
         let result = f();
 
+        // SAFETY: single-threaded test helper; restoring env after test
         unsafe {
             std::env::remove_var("SNED_DATA_DIR");
         }

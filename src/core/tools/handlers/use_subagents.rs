@@ -185,6 +185,8 @@ impl UseSubagentsHandler {
                 #[cfg(unix)]
                 {
                     // Check liveness first to avoid signaling recycled PIDs
+                    // SAFETY: -child_pid is a process group ID from fork();
+                    // signal 0/SIGKILL are valid constants
                     if unsafe { libc::kill(-child_pid, 0) } == 0 {
                         let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
                     }
