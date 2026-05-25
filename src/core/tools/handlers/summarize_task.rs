@@ -245,6 +245,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         )
     }
 
@@ -389,6 +390,7 @@ mod tests {
             "test-task".to_string(),
             Some(Arc::new(hook_mgr)),
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         // Without an actual hook script, the hook won't run

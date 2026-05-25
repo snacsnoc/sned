@@ -149,6 +149,13 @@ impl AnchorStorage {
         }
     }
 
+    fn new() -> Self {
+        Self {
+            tasks: IndexMap::new(),
+            dictionary: Vec::new(),
+        }
+    }
+
     /// Save anchor state to disk
     fn save(&self) {
         let cache_dir = crate::storage::disk::get_data_dir().join("cache");
@@ -564,11 +571,13 @@ impl AnchorStateManager {
 
     /// Resets all anchors for a specific task or all tasks.
     pub fn reset(&self, task_id: Option<&str>) {
-        let mut storage = self.storage();
-        if let Some(id) = task_id {
-            storage.tasks.shift_remove(id);
-        } else {
-            storage.tasks.clear();
+        {
+            let mut storage = self.storage();
+            if let Some(id) = task_id {
+                storage.tasks.shift_remove(id);
+            } else {
+                storage.tasks.clear();
+            }
         }
         self.save();
     }
@@ -1595,16 +1604,16 @@ mod tests {
 
     #[test]
     fn test_diff_arrays_identical() {
-        let old = vec![1u32, 2, 3];
-        let new = vec![1u32, 2, 3];
+        let old = vec![1u64, 2, 3];
+        let new = vec![1u64, 2, 3];
         let changes = diff_arrays(&old, &new);
         assert_eq!(changes, vec![DiffChange::Unchanged(3)]);
     }
 
     #[test]
     fn test_diff_arrays_inserted() {
-        let old = vec![1u32, 3];
-        let new = vec![1u32, 2, 3];
+        let old = vec![1u64, 3];
+        let new = vec![1u64, 2, 3];
         let changes = diff_arrays(&old, &new);
         // Should detect: unchanged(1), added(1), unchanged(1)
         assert_eq!(
@@ -1619,8 +1628,8 @@ mod tests {
 
     #[test]
     fn test_diff_arrays_deleted() {
-        let old = vec![1u32, 2, 3];
-        let new = vec![1u32, 3];
+        let old = vec![1u64, 2, 3];
+        let new = vec![1u64, 3];
         let changes = diff_arrays(&old, &new);
         // Should detect: unchanged(1), removed(1), unchanged(1)
         assert_eq!(

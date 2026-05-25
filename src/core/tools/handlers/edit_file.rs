@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Edit file tool handler.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EditFileHandler {
     /// Optional approval manager for combined edit approval.
     approval_manager: Option<Arc<Mutex<ApprovalManager>>>,
@@ -1081,6 +1081,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let params = serde_json::json!({
@@ -1116,6 +1117,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         // Use proper anchor format (with §) but file doesn't exist, so edit will fail
@@ -1187,6 +1189,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(result.is_ok());
@@ -1240,6 +1243,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(result.is_ok());
@@ -1297,6 +1301,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -1359,6 +1364,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -1420,6 +1426,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -1483,6 +1490,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(result.is_ok());
@@ -1542,6 +1550,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -1601,6 +1610,7 @@ mod tests {
                     format!("test-task-{}", i),
                     None,
                     false,
+                    Arc::new(crate::cli::output::StderrOutputWriter),
                 );
 
                 let params = serde_json::json!({
@@ -1684,6 +1694,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         // Get the initial anchor from the file
@@ -1934,6 +1945,7 @@ edition = "2021"
                 "test-task".to_string(),
                 None,
                 false,
+                Arc::new(crate::cli::output::StderrOutputWriter),
             );
 
             let params = serde_json::json!({
@@ -1980,6 +1992,7 @@ edition = "2021"
             "test-task".to_string(),
             None,
             true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let params = serde_json::json!({

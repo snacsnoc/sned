@@ -574,9 +574,9 @@ mod tests {
         let contents = fs::read_to_string(&metadata_path).unwrap();
         let metadata: serde_json::Value = serde_json::from_str(&contents).unwrap();
 
-        assert_eq!(metadata["cwd"], "/tmp/test");
-        assert_eq!(metadata["model"], "claude-sonnet-4-20250514");
-        assert!(metadata["created_at"].is_number());
+        assert_eq!(metadata["initial_info"]["cwd"], "/tmp/test");
+        assert_eq!(metadata["initial_info"]["model"], "claude-sonnet-4-20250514");
+        assert!(metadata["initial_info"]["created_at"].is_number());
     }
 
     #[test]

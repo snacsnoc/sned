@@ -265,10 +265,11 @@ mod tests {
             None,
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
-            false,
+            true,
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = handler.execute(&ctx, serde_json::json!({})).await;
@@ -288,10 +289,11 @@ mod tests {
             None,
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
-            false,
+            true,
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = handler
@@ -301,7 +303,6 @@ mod tests {
         let text = result.unwrap();
         assert!(text.contains("Condensed summary"));
         assert!(text.contains("Conversation condensed"));
-        // No history provided, so state should be unchanged
         let state_guard = state.lock().await;
         assert!(state_guard.conversation_history_deleted_range.is_none());
     }
@@ -314,7 +315,6 @@ mod tests {
         let handler = CondenseHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
 
-        // Build a synthetic conversation history with 10 messages
         let history: Vec<StorageMessage> = (0..10)
             .map(|i| StorageMessage {
                 id: Some(format!("msg_{}", i)),
@@ -330,7 +330,6 @@ mod tests {
             })
             .collect();
 
-        // Last message is Assistant -> keep strategy = LastTwo
         assert_eq!(history.last().unwrap().role, MessageRole::Assistant);
 
         let ctx = ToolContext::new(
@@ -338,10 +337,11 @@ mod tests {
             None,
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
-            false,
+            true,
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = handler
@@ -359,7 +359,6 @@ mod tests {
         assert!(state_guard.conversation_history_deleted_range.is_some());
 
         let (start, end) = state_guard.conversation_history_deleted_range.unwrap();
-        // With LastTwo on 10 messages, range should be (2, 7)
         assert_eq!(start, 2);
         assert_eq!(end, 7);
     }
@@ -372,7 +371,6 @@ mod tests {
         let handler = CondenseHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
 
-        // Build a synthetic conversation history where the last message is User
         let history: Vec<StorageMessage> = (0..9)
             .map(|i| StorageMessage {
                 id: Some(format!("msg_{}", i)),
@@ -388,7 +386,6 @@ mod tests {
             })
             .collect();
 
-        // Last message is User (index 8 is even) -> keep strategy = None
         assert_eq!(history.last().unwrap().role, MessageRole::User);
 
         let ctx = ToolContext::new(
@@ -396,10 +393,11 @@ mod tests {
             None,
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
-            false,
+            true,
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = handler
@@ -417,10 +415,6 @@ mod tests {
         assert!(state_guard.conversation_history_deleted_range.is_some());
 
         let (start, end) = state_guard.conversation_history_deleted_range.unwrap();
-        // With None on 9 messages:
-        // - messages_to_remove = 9 - 2 = 7
-        // - range_end_index = 2 + 7 - 1 = 8
-        // - But message at index 8 is User, so it gets adjusted to 7
         assert_eq!(start, 2);
         assert_eq!(end, 7);
     }
@@ -451,10 +445,11 @@ mod tests {
             None,
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
-            false,
+            true,
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = handler
@@ -487,10 +482,11 @@ mod tests {
             None,
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
-            false,
+            true,
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = handler
@@ -528,10 +524,11 @@ mod tests {
             None,
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
-            false,
+            true,
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = handler
@@ -570,6 +567,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         // First compaction should succeed
@@ -625,6 +623,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         // First compaction
@@ -767,6 +766,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = handler

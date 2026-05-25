@@ -831,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_script_python() {
-        let handler = ExecuteCommandHandler::new();
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
         let result = handler
             .execute_script("print('hello from python')", "python3", None)
             .await

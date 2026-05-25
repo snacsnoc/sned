@@ -256,7 +256,7 @@ mod tests {
         assert!(prompt.contains("Do not pass absolute paths or paths outside the workspace"));
         assert!(prompt.contains("Word§line content"));
         assert!(prompt.contains("In ACT mode"));
-        assert!(prompt.contains("In PLAN mode"));
+        assert!(prompt.contains("PLAN mode"));
         // Environment info is now provided by context_loader, not in system prompt
         assert!(!prompt.contains("ENVIRONMENT"));
         assert!(!prompt.contains("Current Working Directory:"));

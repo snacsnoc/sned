@@ -880,11 +880,10 @@ mod tests {
 
         let scan_dirs = get_skills_directories_for_scan(cwd);
 
-        // Should have 6 project + 4 global = 10 directories
         assert_eq!(
             scan_dirs.len(),
-            10,
-            "Should have 6 project and 4 global skill directories"
+            8,
+            "Should have 4 project and 4 global skill directories"
         );
 
         // Verify project directories
@@ -899,14 +898,14 @@ mod tests {
 
         // Verify global directories
         let home = dirs::home_dir().expect("home_dir should exist in test");
-        assert_eq!(scan_dirs[6].0, home.join(".agents/skills"));
+        assert_eq!(scan_dirs[4].0, home.join(".agents/skills"));
+        assert_eq!(scan_dirs[4].1, SkillSource::Global);
+        assert_eq!(scan_dirs[5].0, home.join(".codex/skills"));
+        assert_eq!(scan_dirs[5].1, SkillSource::Global);
+        assert_eq!(scan_dirs[6].0, home.join(".claude/skills"));
         assert_eq!(scan_dirs[6].1, SkillSource::Global);
-        assert_eq!(scan_dirs[7].0, home.join(".codex/skills"));
+        assert_eq!(scan_dirs[7].0, home.join(".ai/skills"));
         assert_eq!(scan_dirs[7].1, SkillSource::Global);
-        assert_eq!(scan_dirs[8].0, home.join(".claude/skills"));
-        assert_eq!(scan_dirs[8].1, SkillSource::Global);
-        assert_eq!(scan_dirs[9].0, home.join(".ai/skills"));
-        assert_eq!(scan_dirs[9].1, SkillSource::Global);
     }
 
     #[test]

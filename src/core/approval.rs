@@ -331,7 +331,7 @@ pub struct AutoApprovalSettings {
 use crate::cli::output::OutputWriterArc;
 
 /// Tracks which tool types have been auto-approved for the current session.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ApprovalManager {
     /// Tool names that the user has chosen to auto-approve for this session.
     session_auto_approve: HashSet<String>,
@@ -1189,7 +1189,7 @@ mod tests {
     fn test_prompt_non_interactive_approves() {
         // In non-interactive mode (stdin is not a tty), the tool is auto-approved
         // This is the common case in tests since cargo test redirects stdin
-        let output_writer = std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
+        let output_writer: crate::cli::output::OutputWriterArc = std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
         let result = prompt_for_approval("execute_command", &serde_json::json!({"command": "ls"}), &output_writer)
             .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);
@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     #[ignore = "requires interactive stdin - tested manually"]
     fn test_prompt_empty_params() {
-        let output_writer = std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
+        let output_writer: crate::cli::output::OutputWriterArc = std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
         let result = prompt_for_approval("attempt_completion", &serde_json::json!({}), &output_writer)
             .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);

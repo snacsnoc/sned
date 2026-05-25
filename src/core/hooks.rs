@@ -1048,6 +1048,8 @@ mod tests {
         fs::create_dir_all(&workspace_dir).unwrap();
         fs::create_dir_all(&global_dir).unwrap();
 
+        fs::write(workspace_dir.join(".signed"), "").unwrap();
+
         // Create hooks in all three locations
         fs::write(runtime_dir.join("PreToolUse"), "runtime").unwrap();
         fs::write(workspace_dir.join("PreToolUse"), "workspace").unwrap();
@@ -1055,7 +1057,7 @@ mod tests {
 
         let mut manager = HookManager::new("test-user");
         manager.set_runtime_hooks_dir(runtime_dir.clone());
-        manager.add_workspace_hooks_dir(workspace_dir.clone());
+        manager.enable_workspace_hooks(workspace_dir.clone());
         manager.set_global_hooks_dir(global_dir.clone());
 
         let hooks = manager.discover_hooks(HookName::PreToolUse);

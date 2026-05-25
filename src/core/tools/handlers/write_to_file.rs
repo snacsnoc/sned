@@ -362,6 +362,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = ToolHandler::execute(
@@ -395,6 +396,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = ToolHandler::execute(
@@ -434,6 +436,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let first = ToolHandler::execute(
@@ -485,6 +488,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let result = ToolHandler::execute(

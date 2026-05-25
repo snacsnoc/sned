@@ -322,12 +322,12 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
-            None,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
         let params = serde_json::json!({
             "paths": vec!["test.rs"],
-            "symbols": vec!["foo"],
+            "names": vec!["foo"],
             "find_type": "both",
         });
 

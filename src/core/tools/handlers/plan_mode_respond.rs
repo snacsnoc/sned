@@ -144,7 +144,7 @@ mod tests {
             .execute(&ctx, serde_json::json!({"response": "Step 1: do this"}))
             .await;
         assert!(result.is_ok());
-        assert!(result.unwrap().as_str().unwrap().contains("Step 1: do this"));
+        assert!(result.unwrap().contains("Step 1: do this"));
     }
 
     #[tokio::test]
@@ -169,6 +169,6 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        assert!(result.unwrap().as_str().unwrap().contains("need more exploration"));
+        assert!(result.unwrap().contains("need more exploration"));
     }
 }

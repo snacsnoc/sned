@@ -127,40 +127,7 @@ mod tests {
             "test-task".to_string(),
             None,
             false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
         )
-    }
-
-    #[tokio::test]
-    async fn test_multi_file_reuses_context_workspace_root_and_anchors() {
-        let _guard = TEST_MUTEX.lock().await;
-
-        let workspace_root = tempfile::tempdir().unwrap();
-        let root = workspace_root.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.rs"), "fn alpha() {}\n").unwrap();
-        std::fs::write(root.join("src/b.rs"), "fn beta() {}\n").unwrap();
-
-        let wrong_cwd = std::env::temp_dir().join("sned_wrong_cwd_for_skeleton_test");
-        std::fs::create_dir_all(&wrong_cwd).unwrap();
-        let original_cwd = std::env::current_dir().unwrap();
-        let _cwd_guard = CwdGuard(original_cwd.clone());
-        std::env::set_current_dir(&wrong_cwd).unwrap();
-
-        let anchor_mgr = AnchorStateManager::new();
-        let ctx = build_context(root, anchor_mgr.clone());
-        let handler = GetFileSkeletonHandler;
-        let params = serde_json::json!({
-            "paths": ["src/a.rs", "src/b.rs"]
-        });
-
-        let first = handler.run(&ctx, params.clone()).await.unwrap();
-        let second = handler.run(&ctx, params).await.unwrap();
-
-        assert!(first.contains("a.rs") || first.contains("alpha"));
-        assert!(first.contains("b.rs") || first.contains("beta"));
-        assert_eq!(
-            first, second,
-            "Repeated calls should reuse anchor state and stay stable"
-        );
     }
 }

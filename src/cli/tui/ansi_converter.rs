@@ -112,7 +112,7 @@ mod tests {
     fn test_bold() {
         let lines = ansi_to_ratatui_lines("\x1b[1mbold\x1b[0m");
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].spans[0].style.add_modifier(Modifier::BOLD));
+        assert!(lines[0].spans[0].style.add_modifier.intersects(Modifier::BOLD));
     }
 
     #[test]
