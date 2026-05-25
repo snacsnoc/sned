@@ -9,7 +9,10 @@ use crate::cli::tui::{App, ansi_to_ratatui_lines};
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::is_approval_prompt_active;
 use futures::FutureExt;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
+use ratatui::crossterm::execute;
 use ratatui::style::{Color, Modifier, Style};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +25,8 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Disable bracketed paste mode before restoring terminal
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -485,15 +490,15 @@ async fn handle_key_event(
         // Check for followup question (used by /undo, /commit, /checkpoint-restore)
         if is_followup_question_active(task_id) {
             if let Some(sender) = take_followup_sender(task_id) {
-                let text = app.input.lines().join("");
+                let text = app.get_input_with_expanded_pastes();
                 let _ = sender.send(text);
                 app.input = tui_textarea::TextArea::new(Vec::new());
             }
             return Ok(None);
         }
 
-        // Normal submit
-        let text = app.input.lines().join("");
+        // Normal submit - expand all paste markers before sending
+        let text = app.get_input_with_expanded_pastes();
         if !text.is_empty() {
             // Echo prompt to output pane
             app.push_styled(
@@ -502,8 +507,9 @@ async fn handle_key_event(
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             );
-            // Clear textarea
+            // Clear textarea and paste tracking
             app.input = tui_textarea::TextArea::new(Vec::new());
+            app.clear_pastes();
             // Submit to agent
             return Ok(Some(Action::Submit(text)));
         }
@@ -1233,6 +1239,19 @@ async fn run_main_loop(
                         }
                     }
                 }
+                Event::Paste(content) => {
+                    // Handle paste event with folding for large pastes
+                    let folded = app.handle_paste(&content);
+                    if folded {
+                        app.push_styled(
+                            format!(
+                                "Large paste folded ({} chars) - press Ctrl+E to expand",
+                                content.len()
+                            ),
+                            Style::default().add_modifier(Modifier::DIM),
+                        );
+                    }
+                }
                 Event::Resize(_, _) => {
                     // Ratatui handles resize automatically on next draw
                 }
@@ -1276,6 +1295,10 @@ pub async fn run_interactive_shell_inner(
     } else {
         ratatui::init()
     };
+
+    // Enable bracketed paste mode for proper paste handling
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
+
     crate::core::cancellation::TERMINAL_INITIALIZED
         .store(true, std::sync::atomic::Ordering::Release);
     let _guard = TerminalGuard;

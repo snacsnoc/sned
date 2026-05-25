@@ -141,7 +141,7 @@ fn build_workflows_list(
     {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            if path.is_file() && path.extension().map(|e| e == "md").unwrap_or(false) {
+            if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                 let file_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -173,7 +173,7 @@ fn build_workflows_list(
     {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            if path.is_file() && path.extension().map(|e| e == "md").unwrap_or(false) {
+            if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                 let file_name = path
                     .file_name()
                     .and_then(|n| n.to_str())

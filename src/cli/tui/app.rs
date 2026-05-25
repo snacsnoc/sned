@@ -16,6 +16,19 @@ use tui_textarea::TextArea;
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// Tracks a pasted chunk of text that was folded into a marker.
+#[derive(Debug, Clone)]
+pub struct PasteChunk {
+    /// The marker text shown in the textarea (e.g., "[pasted 1,234 chars]")
+    pub marker: String,
+    /// The original pasted content
+    pub content: String,
+    /// Start position in the textarea (line, column)
+    pub start_line: usize,
+    /// Whether this paste has been expanded by the user
+    pub expanded: bool,
+}
+
 /// Application state for the ratatui TUI.
 pub struct App {
     /// Output lines buffer (agent output, submitted prompts, etc.)
@@ -42,6 +55,10 @@ pub struct App {
     pub picker_index: usize,
     /// File-backed command history with navigation state
     pub history: FileHistory,
+    /// Folded paste chunks (marker -> original content)
+    pub paste_chunks: Vec<PasteChunk>,
+    /// Threshold for folding pastes (in characters)
+    pub paste_fold_threshold: usize,
 }
 
 impl App {
@@ -62,6 +79,8 @@ impl App {
             picker_results: Vec::new(),
             picker_index: 0,
             history: FileHistory::load(),
+            paste_chunks: Vec::new(),
+            paste_fold_threshold: 500, // Fold pastes > 500 chars
         }
     }
 
@@ -162,6 +181,53 @@ impl App {
 
         frame.render_widget(Clear, overlay_area);
         frame.render_widget(picker, overlay_area);
+    }
+
+    /// Handle a paste event, folding large pastes into markers.
+    /// Returns true if the paste was folded, false if inserted directly.
+    pub fn handle_paste(&mut self, content: &str) -> bool {
+        let folded = content.len() > self.paste_fold_threshold;
+
+        if folded {
+            // Create a marker for the folded paste
+            let marker = format!("[pasted {} chars]", content.len());
+
+            // Insert the marker at cursor position
+            self.input.insert_str(&marker);
+
+            // Track this paste chunk (store globally, expand on submit)
+            self.paste_chunks.push(PasteChunk {
+                marker,
+                content: content.to_string(),
+                start_line: 0, // Simplified: track globally, not per-line
+                expanded: false,
+            });
+        } else {
+            // Insert small pastes directly
+            self.input.insert_str(content);
+        }
+
+        folded
+    }
+
+    /// Get the final input text, expanding all paste markers.
+    pub fn get_input_with_expanded_pastes(&mut self) -> String {
+        // Get current textarea content
+        let mut text = self.input.lines().join("\n");
+
+        // Replace all markers with original content
+        for paste in self.paste_chunks.drain(..) {
+            if let Some(pos) = text.find(&paste.marker) {
+                text.replace_range(pos..pos + paste.marker.len(), &paste.content);
+            }
+        }
+
+        text
+    }
+
+    /// Clear all paste chunks.
+    pub fn clear_pastes(&mut self) {
+        self.paste_chunks.clear();
     }
 
     /// Increment spinner frame (call on each render tick when agent_busy).

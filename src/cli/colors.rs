@@ -7,7 +7,7 @@ use std::io::IsTerminal;
 use std::sync::OnceLock;
 
 fn env_colors_disabled() -> bool {
-    std::env::var("NO_COLOR").is_ok() || std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false)
+    std::env::var("NO_COLOR").is_ok() || std::env::var("TERM").is_ok_and(|t| t == "dumb")
 }
 
 fn stdout_colors_disabled() -> bool {
