@@ -10,8 +10,6 @@ pub mod picker;
 pub mod command_pty;
 pub mod vt_renderer;
 
-
-
 #[cfg(unix)]
 pub use command_pty::{CommandOutput, PtyError, run_command_in_pty};
 pub use vt_renderer::{VtRenderer, strip_progress_artifacts};

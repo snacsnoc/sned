@@ -302,7 +302,7 @@ fn html_to_text(html: &str) -> String {
             continue;
         }
 
-            if ch.is_whitespace() {
+        if ch.is_whitespace() {
             if !prev_was_space {
                 text.push(' ');
                 prev_was_space = true;

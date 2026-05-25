@@ -456,9 +456,8 @@ impl TaskStorage {
             .truncate(false)
             .open(&lock_path)?;
 
-        file.try_lock_exclusive().map_err(|e| {
-            io::Error::other(format!("Task is locked by another process: {}", e))
-        })?;
+        file.try_lock_exclusive()
+            .map_err(|e| io::Error::other(format!("Task is locked by another process: {}", e)))?;
 
         Ok(LockGuard { _file: file })
     }
@@ -475,9 +474,8 @@ impl TaskStorage {
             .truncate(false)
             .open(&lock_path)?;
 
-        file.lock_exclusive().map_err(|e| {
-            io::Error::other(format!("Failed to acquire lock: {}", e))
-        })?;
+        file.lock_exclusive()
+            .map_err(|e| io::Error::other(format!("Failed to acquire lock: {}", e)))?;
 
         Ok(LockGuard { _file: file })
     }
@@ -575,7 +573,10 @@ mod tests {
         let metadata: serde_json::Value = serde_json::from_str(&contents).unwrap();
 
         assert_eq!(metadata["initial_info"]["cwd"], "/tmp/test");
-        assert_eq!(metadata["initial_info"]["model"], "claude-sonnet-4-20250514");
+        assert_eq!(
+            metadata["initial_info"]["model"],
+            "claude-sonnet-4-20250514"
+        );
         assert!(metadata["initial_info"]["created_at"].is_number());
     }
 
@@ -821,8 +822,8 @@ mod tests {
     /// The lock serializes access, ensuring both updates are preserved.
     #[test]
     fn test_concurrent_metadata_updates_not_clobbered() {
-        use crate::core::context::trackers::{FileMetadataEntry, FileRecordSource};
         use crate::core::context::trackers::FileRecordState;
+        use crate::core::context::trackers::{FileMetadataEntry, FileRecordSource};
         use std::sync::Arc;
         use std::thread;
         use std::time::Duration;
@@ -846,9 +847,11 @@ mod tests {
                 sned_edit_date: Some(1000),
                 user_edit_date: None,
             }];
-            storage1.update_metadata(|metadata| {
-                metadata.files_in_context = entries;
-            }).unwrap();
+            storage1
+                .update_metadata(|metadata| {
+                    metadata.files_in_context = entries;
+                })
+                .unwrap();
         });
 
         // Thread 2: Update model_usage (may need to wait for lock)
@@ -856,14 +859,16 @@ mod tests {
         let handle2 = thread::spawn(move || {
             // Small delay to increase chance of contention
             thread::sleep(Duration::from_millis(5));
-            storage2.update_metadata(|metadata| {
-                metadata.model_usage.push(ModelUsageEntry {
-                    ts: 2000,
-                    model_id: "test-model".to_string(),
-                    model_provider_id: "test-provider".to_string(),
-                    mode: "test".to_string(),
-                });
-            }).unwrap();
+            storage2
+                .update_metadata(|metadata| {
+                    metadata.model_usage.push(ModelUsageEntry {
+                        ts: 2000,
+                        model_id: "test-model".to_string(),
+                        model_provider_id: "test-provider".to_string(),
+                        mode: "test".to_string(),
+                    });
+                })
+                .unwrap();
         });
 
         // Wait for both threads
@@ -877,26 +882,20 @@ mod tests {
             1,
             "files_in_context update should be preserved"
         );
-        assert_eq!(
-            final_metadata.files_in_context[0].path,
-            "/tmp/file1.rs"
-        );
+        assert_eq!(final_metadata.files_in_context[0].path, "/tmp/file1.rs");
         assert_eq!(
             final_metadata.model_usage.len(),
             1,
             "model_usage update should be preserved"
         );
-        assert_eq!(
-            final_metadata.model_usage[0].model_id,
-            "test-model"
-        );
+        assert_eq!(final_metadata.model_usage[0].model_id, "test-model");
     }
 
     /// Regression test: rapid successive updates to same field do not lose data.
     #[test]
     fn test_rapid_successive_metadata_updates() {
-        use crate::core::context::trackers::{FileMetadataEntry, FileRecordSource};
         use crate::core::context::trackers::FileRecordState;
+        use crate::core::context::trackers::{FileMetadataEntry, FileRecordSource};
 
         let temp_dir = TempDir::new().unwrap();
         let task_dir = temp_dir.path().join("test-rapid-updates");

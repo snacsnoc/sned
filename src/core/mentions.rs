@@ -14,7 +14,8 @@ const MAX_FILE_READ_SIZE: u64 = 100 * 1024;
 static MENTION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@(/[^\s]*|[a-f0-9]{7,40}|git-changes)").unwrap());
 
-static COMMIT_HASH_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-f0-9]{7,40}$").unwrap());
+static COMMIT_HASH_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-f0-9]{7,40}$").unwrap());
 
 /// Regex for matching mentions in text.
 /// Matches: @/path/to/file, @folder/, @git-changes, @commit-hash

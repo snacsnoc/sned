@@ -32,7 +32,8 @@ impl RatatuiPerformer {
 
     fn finish(mut self) -> Vec<Line<'static>> {
         if !self.current_spans.is_empty() {
-            self.lines.push(Line::from(std::mem::take(&mut self.current_spans)));
+            self.lines
+                .push(Line::from(std::mem::take(&mut self.current_spans)));
         }
         self.lines
     }
@@ -40,19 +41,25 @@ impl RatatuiPerformer {
 
 impl Perform for RatatuiPerformer {
     fn print(&mut self, c: char) {
-        self.current_spans.push(Span::styled(
-            c.to_string(),
-            self.current_style,
-        ));
+        self.current_spans
+            .push(Span::styled(c.to_string(), self.current_style));
     }
 
     fn execute(&mut self, byte: u8) {
-        if byte == 0x0A { // newline
-            self.lines.push(Line::from(std::mem::take(&mut self.current_spans)));
+        if byte == 0x0A {
+            // newline
+            self.lines
+                .push(Line::from(std::mem::take(&mut self.current_spans)));
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(
+        &mut self,
+        params: &Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
         if action == 'm' {
             // SGR — Select Graphic Rendition
             for param in params.iter() {
@@ -61,7 +68,9 @@ impl Perform for RatatuiPerformer {
                     [1] => self.current_style = self.current_style.add_modifier(Modifier::BOLD),
                     [2] => self.current_style = self.current_style.add_modifier(Modifier::DIM),
                     [3] => self.current_style = self.current_style.add_modifier(Modifier::ITALIC),
-                    [4] => self.current_style = self.current_style.add_modifier(Modifier::UNDERLINED),
+                    [4] => {
+                        self.current_style = self.current_style.add_modifier(Modifier::UNDERLINED)
+                    }
                     [30] => self.current_style = self.current_style.fg(Color::Black),
                     [31] => self.current_style = self.current_style.fg(Color::Red),
                     [32] => self.current_style = self.current_style.fg(Color::Green),
@@ -79,10 +88,14 @@ impl Perform for RatatuiPerformer {
                     [96] => self.current_style = self.current_style.fg(Color::Cyan),
                     [97] => self.current_style = self.current_style.fg(Color::White),
                     // 256-color: [38, 5, N] → Color::Indexed(N)
-                    [38, 5, n] => self.current_style = self.current_style.fg(Color::Indexed(*n as u8)),
+                    [38, 5, n] => {
+                        self.current_style = self.current_style.fg(Color::Indexed(*n as u8))
+                    }
                     // Truecolor: [38, 2, R, G, B] → Color::Rgb(R, G, B)
                     [38, 2, r, g, b] => {
-                        self.current_style = self.current_style.fg(Color::Rgb(*r as u8, *g as u8, *b as u8))
+                        self.current_style = self
+                            .current_style
+                            .fg(Color::Rgb(*r as u8, *g as u8, *b as u8))
                     }
                     _ => {}
                 }
@@ -112,7 +125,12 @@ mod tests {
     fn test_bold() {
         let lines = ansi_to_ratatui_lines("\x1b[1mbold\x1b[0m");
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].spans[0].style.add_modifier.intersects(Modifier::BOLD));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .intersects(Modifier::BOLD)
+        );
     }
 
     #[test]

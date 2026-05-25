@@ -431,6 +431,7 @@ fn new_context_auto_condense_skips_truncation() {
         None,
         true, // use_auto_condense = true
         None,
+        "test",
     );
 
     assert!(!result.updated_conversation_history_deleted_range);
@@ -449,6 +450,7 @@ fn new_context_mechanical_truncation_half() {
         None,
         false, // use_auto_condense = false
         None,
+        "test",
     );
 
     assert!(result.updated_conversation_history_deleted_range);
@@ -467,6 +469,7 @@ fn new_context_mechanical_truncation_quarter_when_large() {
         None,
         false,
         None,
+        "test",
     );
 
     assert!(result.updated_conversation_history_deleted_range);

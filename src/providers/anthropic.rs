@@ -148,11 +148,17 @@ impl AnthropicProvider {
                         })
                     }
                     crate::providers::MessageContent::UserBlocks(blocks) => {
-                        let content = convert_user_blocks(blocks, supports_cache, msg_index, total_messages);
+                        let content =
+                            convert_user_blocks(blocks, supports_cache, msg_index, total_messages);
                         json!({"role": role, "content": content})
                     }
                     crate::providers::MessageContent::AssistantBlocks(blocks) => {
-                        let content = convert_assistant_blocks(blocks, supports_cache, msg_index, total_messages);
+                        let content = convert_assistant_blocks(
+                            blocks,
+                            supports_cache,
+                            msg_index,
+                            total_messages,
+                        );
                         json!({"role": role, "content": content})
                     }
                 }
@@ -221,7 +227,9 @@ impl AnthropicProvider {
                     crate::providers::ToolChoice::Auto => json!({"type": "auto"}),
                     crate::providers::ToolChoice::Required => json!({"type": "any"}),
                     crate::providers::ToolChoice::None => json!({"type": "none"}),
-                    crate::providers::ToolChoice::Named(name) => json!({"type": "tool", "name": name}),
+                    crate::providers::ToolChoice::Named(name) => {
+                        json!({"type": "tool", "name": name})
+                    }
                 };
             } else {
                 // Default: auto (model decides whether to use tools)
@@ -352,7 +360,8 @@ fn convert_user_blocks(
 
         // Add cache_control to last block of last 2 messages only (Anthropic limit: 4 breakpoints)
         // Budget: 1 for system + 2 for last messages = 3 breakpoints (1 under limit)
-        if supports_cache && i == blocks.len() - 1 && msg_index >= total_messages.saturating_sub(2) {
+        if supports_cache && i == blocks.len() - 1 && msg_index >= total_messages.saturating_sub(2)
+        {
             item["cache_control"] = json!({"type": "ephemeral"});
         }
 
@@ -449,7 +458,8 @@ fn convert_assistant_blocks(
             },
         };
 
-        if supports_cache && i == blocks.len() - 1 && msg_index >= total_messages.saturating_sub(2) {
+        if supports_cache && i == blocks.len() - 1 && msg_index >= total_messages.saturating_sub(2)
+        {
             item["cache_control"] = json!({"type": "ephemeral"});
         }
 
@@ -839,7 +849,10 @@ async fn process_anthropic_event(
         AnthropicStreamEvent::Error { error } => {
             try_send_chunk(
                 tx,
-                ApiStreamChunk::Error(format!("Anthropic API error ({}): {}", error.error_type, error.message)),
+                ApiStreamChunk::Error(format!(
+                    "Anthropic API error ({}): {}",
+                    error.error_type, error.message
+                )),
                 "error",
             );
         }

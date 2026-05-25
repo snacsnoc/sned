@@ -15,7 +15,8 @@ const MAX_AUTO_SYMBOL_LINE_LENGTH_BYTES: usize = 200;
 
 static CODE_FENCE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"```[\s\S]*?```").unwrap());
 static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\w+:\/\/[^\s]+").unwrap());
-static MENTION_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@([A-Za-z0-9_./\-]+)").unwrap());
+static MENTION_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@([A-Za-z0-9_./\-]+)").unwrap());
 static SLASH_COMMAND_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(^|\s)/([A-Za-z0-9_.:@-]+)").unwrap());
 static SYMBOL_TOKEN_REGEX: LazyLock<Regex> =
@@ -253,27 +254,23 @@ impl ContextLoader {
             } else {
                 root.to_string()
             };
-            
+
             // Batch query all definitions in one lock hold
             let mut definitions = HashMap::with_capacity(symbols.len());
             for symbol in &symbols {
                 let defs = service.get_definitions(symbol, Some(MAX_AUTO_SYMBOL_TOTAL_LINES));
                 definitions.insert(symbol.clone(), defs);
             }
-            
+
             // Batch query all references in one lock hold
             let mut references = HashMap::with_capacity(symbols.len());
             for symbol in &symbols {
-                let remaining_limit = MAX_AUTO_SYMBOL_TOTAL_LINES.saturating_sub(
-                    definitions
-                        .get(symbol)
-                        .map(|d| d.len())
-                        .unwrap_or(0),
-                );
+                let remaining_limit = MAX_AUTO_SYMBOL_TOTAL_LINES
+                    .saturating_sub(definitions.get(symbol).map(|d| d.len()).unwrap_or(0));
                 let refs = service.get_references(symbol, Some(remaining_limit));
                 references.insert(symbol.clone(), refs);
             }
-            
+
             (project_root, definitions, references)
         };
         let project_root = PathBuf::from(project_root);
@@ -303,23 +300,26 @@ impl ContextLoader {
         }
 
         // Collect all unique locations, grouped by file path for efficient reading
-        let mut file_locations: HashMap<String, Vec<(String, SymbolLocation)>> = HashMap::with_capacity(16);
+        let mut file_locations: HashMap<String, Vec<(String, SymbolLocation)>> =
+            HashMap::with_capacity(16);
         for (symbol, data) in &symbol_results {
             for loc in &data.all_locations {
                 let Some(loc_path_str) = &loc.path else {
                     continue;
                 };
-                
+
                 // Check if we already have this exact location
                 let existing = file_locations
                     .get(loc_path_str)
-                    .map(|locs| locs.iter().any(|(s, l)| {
-                        l.path.as_deref() == Some(loc_path_str.as_str()) 
-                            && l.start_line == loc.start_line 
-                            && s == symbol
-                    }))
+                    .map(|locs| {
+                        locs.iter().any(|(s, l)| {
+                            l.path.as_deref() == Some(loc_path_str.as_str())
+                                && l.start_line == loc.start_line
+                                && s == symbol
+                        })
+                    })
                     .unwrap_or(false);
-                
+
                 if !existing {
                     file_locations
                         .entry(loc_path_str.clone())
@@ -330,7 +330,8 @@ impl ContextLoader {
         }
 
         // Read each file once, then extract all needed lines from cached content
-        let mut file_contents: HashMap<String, Vec<String>> = HashMap::with_capacity(file_locations.len());
+        let mut file_contents: HashMap<String, Vec<String>> =
+            HashMap::with_capacity(file_locations.len());
         for loc_path_str in file_locations.keys() {
             let abs_loc_path = if Path::new(loc_path_str).is_absolute() {
                 PathBuf::from(loc_path_str)
@@ -339,7 +340,10 @@ impl ContextLoader {
             };
 
             if let Ok(content) = tokio::fs::read_to_string(&abs_loc_path).await {
-                file_contents.insert(loc_path_str.clone(), content.lines().map(String::from).collect());
+                file_contents.insert(
+                    loc_path_str.clone(),
+                    content.lines().map(String::from).collect(),
+                );
             }
         }
 
@@ -578,7 +582,7 @@ mod tests {
         tokio::fs::create_dir_all(utils_path.parent().unwrap())
             .await
             .unwrap();
-        
+
         // Create two files with different symbols
         tokio::fs::write(&lib_path, "fn fooBar() {}\nfn bazQux() {}\n")
             .await
@@ -634,7 +638,7 @@ mod tests {
 
         let loader = ContextLoader::new(root.to_string_lossy().to_string())
             .with_symbol_index_service(Arc::new(Mutex::new(service)));
-        
+
         // Prompt with multiple camelCase symbols should trigger batching
         let (enriched, _) = loader
             .load_initial_context("Please inspect fooBar and bazQux in the codebase")

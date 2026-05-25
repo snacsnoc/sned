@@ -1,6 +1,6 @@
 use serde::Deserialize;
-use sned::core::file_editor::AnchorStateManager;
 use sned::cli::output::StderrOutputWriter;
+use sned::core::file_editor::AnchorStateManager;
 use sned::core::tools::{ToolContext, ToolHandler};
 use sned::services::tree_sitter::get_functions;
 use sned::services::tree_sitter::parser::load_required_language_parsers;

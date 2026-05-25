@@ -100,34 +100,8 @@ impl ToolHandler for GetFileSkeletonHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::core::agent_loop::TaskState;
-    use crate::core::file_editor::AnchorStateManager;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, LazyLock};
-
-    static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-    struct CwdGuard(PathBuf);
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-
-    fn build_context(workspace_root: &Path, anchor_mgr: AnchorStateManager) -> ToolContext {
-        ToolContext::new(
-            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
-            None,
-            workspace_root.to_path_buf(),
-            anchor_mgr,
-            false,
-            "test-task".to_string(),
-            None,
-            false,
-            Arc::new(crate::cli::output::StderrOutputWriter),
-        )
+    #[allow(dead_code)]
+    fn _dummy_test() {
+        // Placeholder to keep test module
     }
 }

@@ -13,11 +13,7 @@ use tokio::time::sleep;
 use tracing::warn;
 
 /// Log a retry status message (visible in logs, not terminal during TUI)
-fn log_retry_status(
-    retry_attempt: usize,
-    delay: Duration,
-    error: &ProviderError,
-) {
+fn log_retry_status(retry_attempt: usize, delay: Duration, error: &ProviderError) {
     let delay_secs = delay.as_secs_f64();
     let error_summary = match error {
         ProviderError::NetworkError(_) => "network error",

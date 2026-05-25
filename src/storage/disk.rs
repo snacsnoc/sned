@@ -1,10 +1,10 @@
+use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::env;
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
@@ -121,7 +121,9 @@ pub fn get_settings_dir() -> PathBuf {
 /// Enable for crash-safety in production environments where data integrity
 /// outweighs the 5-50ms latency cost per write.
 fn should_fsync() -> bool {
-    env::var("SNED_FSYNC").map(|v| v == "1" || v == "on" || v == "true").unwrap_or(false)
+    env::var("SNED_FSYNC")
+        .map(|v| v == "1" || v == "on" || v == "true")
+        .unwrap_or(false)
 }
 
 /// Atomically write data to a file using temp file + rename pattern.

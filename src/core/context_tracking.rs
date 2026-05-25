@@ -175,9 +175,9 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_tracker_updates_not_clobbered() {
         use std::sync::Arc;
-        use std::thread;
-        use std::sync::OnceLock;
         use std::sync::Mutex;
+        use std::sync::OnceLock;
+        use std::thread;
 
         // Static mutex to serialize tests that modify SNED_DATA_DIR
         static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();

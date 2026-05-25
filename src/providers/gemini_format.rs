@@ -267,7 +267,7 @@ fn convert_content_to_gemini_parts(
                                     function_call: None,
                                     function_response: None,
                                     inline_data: None,
-                file_data: None,
+                                    file_data: None,
                                 });
                             }
                         }
@@ -308,7 +308,7 @@ fn convert_content_to_gemini_parts(
                                 id: Some(tr.tool_use_id.clone()),
                             }),
                             inline_data: None,
-                file_data: None,
+                            file_data: None,
                         });
                     }
                 }
@@ -336,7 +336,7 @@ fn convert_content_to_gemini_parts(
                             function_call: None,
                             function_response: None,
                             inline_data: None,
-                file_data: None,
+                            file_data: None,
                         });
                     }
                     AssistantContentBlock::Thinking(thinking) => {
@@ -347,7 +347,7 @@ fn convert_content_to_gemini_parts(
                             function_call: None,
                             function_response: None,
                             inline_data: None,
-                file_data: None,
+                            file_data: None,
                         });
                     }
                     AssistantContentBlock::ToolUse(tu) => {
@@ -417,7 +417,7 @@ fn convert_content_to_gemini_parts(
                                 function_call: None,
                                 function_response: None,
                                 inline_data: None,
-                file_data: None,
+                                file_data: None,
                             });
                         }
                     }
@@ -636,10 +636,7 @@ mod tests {
         assert_eq!(fc.id, Some("call_abc123".to_string()));
 
         // Critical: thought signature must be preserved for Gemini 3 validation
-        assert_eq!(
-            part.thought_signature,
-            Some("sig_flight_check".to_string())
-        );
+        assert_eq!(part.thought_signature, Some("sig_flight_check".to_string()));
     }
 
     #[test]
@@ -686,11 +683,17 @@ mod tests {
             gemini[0].parts[0].thought_signature,
             Some("sig_first".to_string())
         );
-        assert_eq!(gemini[0].parts[0].function_call.as_ref().unwrap().name, "check_flight");
+        assert_eq!(
+            gemini[0].parts[0].function_call.as_ref().unwrap().name,
+            "check_flight"
+        );
 
         // Second FC must NOT have signature (parallel FCs don't inherit)
         assert_eq!(gemini[0].parts[1].thought_signature, None);
-        assert_eq!(gemini[0].parts[1].function_call.as_ref().unwrap().name, "book_taxi");
+        assert_eq!(
+            gemini[0].parts[1].function_call.as_ref().unwrap().name,
+            "book_taxi"
+        );
     }
 
     #[test]

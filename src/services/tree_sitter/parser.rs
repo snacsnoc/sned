@@ -29,9 +29,7 @@ pub struct LanguageParserEntry {
 /// Entries are Arc'd since Query is not Clone but can be shared.
 /// Uses LRU eviction (max 256 entries) to bound memory growth.
 static PARSER_CACHE: LazyLock<Mutex<lru::LruCache<String, Arc<LanguageParserEntry>>>> =
-    LazyLock::new(|| Mutex::new(lru::LruCache::new(
-        std::num::NonZero::new(256).unwrap()
-    )));
+    LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZero::new(256).unwrap())));
 
 /// Maps file extensions to loaded language parsers.
 pub type LanguageParserMap = HashMap<String, LanguageParserEntry>;

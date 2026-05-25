@@ -99,8 +99,7 @@ impl CondenseHandler {
             crate::core::approval::set_followup_sender(ctx.task_id.as_str(), sender);
 
             // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
-            let response_result = tokio::task::spawn_blocking(move || receiver.recv())
-                .await;
+            let response_result = tokio::task::spawn_blocking(move || receiver.recv()).await;
 
             // Clean up regardless of result
             crate::core::approval::clear_followup_sender(ctx.task_id.as_str());

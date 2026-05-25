@@ -130,15 +130,15 @@ impl RenameSymbolHandler {
         if let Some(ref mutex) = self.symbol_index_service
             && expanded_paths.len() <= 100
         {
-            let mut parsed_symbols: Vec<(&str, Vec<crate::services::symbol_index::SymbolLocation>)> =
-                Vec::new();
+            let mut parsed_symbols: Vec<(
+                &str,
+                Vec<crate::services::symbol_index::SymbolLocation>,
+            )> = Vec::new();
 
             for (abs_path, content) in &file_contents {
                 if let Some(parsers) = load_required_language_parsers(&[abs_path.as_str()]).ok()
                     && let Ok(symbols) = crate::services::symbol_index::extract_symbols_for_indexing(
-                        abs_path,
-                        content,
-                        &parsers,
+                        abs_path, content, &parsers,
                     )
                 {
                     parsed_symbols.push((abs_path.as_str(), symbols));
@@ -176,7 +176,8 @@ impl RenameSymbolHandler {
             ToolError::ExecutionFailed(format!("Failed to load language parsers: {}", e))
         })?;
 
-        let mut locations_by_file: HashMap<String, FileData> = HashMap::with_capacity(paths.len().max(1));
+        let mut locations_by_file: HashMap<String, FileData> =
+            HashMap::with_capacity(paths.len().max(1));
 
         for abs_path in &expanded_paths {
             let content = file_contents
@@ -226,7 +227,13 @@ impl RenameSymbolHandler {
             };
 
             if !occurrences.is_empty() {
-                locations_by_file.insert(abs_path.clone(), FileData { content, occurrences });
+                locations_by_file.insert(
+                    abs_path.clone(),
+                    FileData {
+                        content,
+                        occurrences,
+                    },
+                );
             }
         }
 
@@ -278,7 +285,8 @@ impl RenameSymbolHandler {
 
             if replacement_count > 0 {
                 let final_content = current_lines.join("\n");
-                match crate::storage::disk::atomic_write_file_async(&abs_path, &final_content).await {
+                match crate::storage::disk::atomic_write_file_async(&abs_path, &final_content).await
+                {
                     Ok(_) => {
                         // Mark file as edited by Sned to suppress stale mtime detection
                         state
@@ -911,15 +919,31 @@ mod tests {
             .unwrap();
 
         // Verify both files were processed
-        assert!(result.contains("2 files"), "Should process both files: {}", result);
+        assert!(
+            result.contains("2 files"),
+            "Should process both files: {}",
+            result
+        );
 
         // Verify content was correctly read and modified (single read per file)
         let content1 = fs::read_to_string(&file1).await.unwrap();
         let content2 = fs::read_to_string(&file2).await.unwrap();
-        assert!(content1.contains("renamed"), "file1 should contain 'renamed'");
-        assert!(content2.contains("renamed"), "file2 should contain 'renamed'");
-        assert!(!content1.contains("target"), "file1 should not contain 'target'");
-        assert!(!content2.contains("target"), "file2 should not contain 'target'");
+        assert!(
+            content1.contains("renamed"),
+            "file1 should contain 'renamed'"
+        );
+        assert!(
+            content2.contains("renamed"),
+            "file2 should contain 'renamed'"
+        );
+        assert!(
+            !content1.contains("target"),
+            "file1 should not contain 'target'"
+        );
+        assert!(
+            !content2.contains("target"),
+            "file2 should not contain 'target'"
+        );
 
         // Drop to avoid unused warning
         drop(read_log_clone);

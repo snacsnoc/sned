@@ -505,9 +505,7 @@ impl GlobalStateKey {
             GlobalStateKey::PlanModeApiModelId => {
                 serde_json::to_value(&state.plan_mode_api_model_id).ok()
             }
-            GlobalStateKey::AzureApiVersion => {
-                serde_json::to_value(&state.azure_api_version).ok()
-            }
+            GlobalStateKey::AzureApiVersion => serde_json::to_value(&state.azure_api_version).ok(),
             GlobalStateKey::PreferredLanguage => {
                 serde_json::to_value(&state.preferred_language).ok()
             }
@@ -929,17 +927,13 @@ impl std::str::FromStr for GlobalStateKey {
                 Ok(GlobalStateKey::PlanModeApiProvider)
             }
             // actModeApiModelId
-            "actModeApiModelId" | "act_mode_api_model_id" => {
-                Ok(GlobalStateKey::ActModeApiModelId)
-            }
+            "actModeApiModelId" | "act_mode_api_model_id" => Ok(GlobalStateKey::ActModeApiModelId),
             // planModeApiModelId
             "planModeApiModelId" | "plan_mode_api_model_id" => {
                 Ok(GlobalStateKey::PlanModeApiModelId)
             }
             // azureApiVersion
-            "azureApiVersion" | "azure_api_version" => {
-                Ok(GlobalStateKey::AzureApiVersion)
-            }
+            "azureApiVersion" | "azure_api_version" => Ok(GlobalStateKey::AzureApiVersion),
             // preferredLanguage
             "preferredLanguage" | "preferred_language" => Ok(GlobalStateKey::PreferredLanguage),
             // telemetrySetting

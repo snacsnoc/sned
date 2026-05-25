@@ -12,7 +12,7 @@ impl GetFunctionHandler {
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
         let path = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        
+
         // Schema declares "name" as string, but support "names" array for backwards compatibility
         let names = if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
             vec![name.to_string()]

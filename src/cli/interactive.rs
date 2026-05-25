@@ -3,10 +3,10 @@
 //! Extracted from `cli/mod.rs` — handles raw mode, terminal rendering,
 //! file picker, input queuing, and agent lifecycle.
 
-use crate::cli::{RootOnlyOptions, TaskOptions};
-use crate::cli::output::{OutputEvent, OutputWriterArc, ChannelOutputWriter};
-use crate::cli::tui::{App, ansi_to_ratatui_lines};
+use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
 use crate::cli::tui::history::append_to_history;
+use crate::cli::tui::{App, ansi_to_ratatui_lines};
+use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::is_approval_prompt_active;
 use futures::FutureExt;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -41,7 +41,6 @@ fn format_duration(duration: Duration) -> String {
         format!("{}s", total_secs)
     }
 }
-
 
 /// Format context window size as human-readable string (e.g., "200K context").
 fn format_context_window(tokens: u64) -> String {
@@ -102,7 +101,8 @@ impl InteractiveSession {
         output_writer: Option<crate::cli::output::OutputWriterArc>,
     ) -> anyhow::Result<Self> {
         let mut components =
-            crate::cli::build_task_components(task_opts.clone(), root_opts.clone(), output_writer).await?;
+            crate::cli::build_task_components(task_opts.clone(), root_opts.clone(), output_writer)
+                .await?;
         components.config.interactive_mode = interactive_mode;
 
         let agent_loop = crate::core::agent_loop::AgentLoop::new(components.config)
@@ -168,7 +168,10 @@ impl InteractiveSession {
     }
 
     /// Print resume summary showing previous session state.
-    async fn print_resume_summary(agent: &crate::core::agent_loop::AgentLoop, writer: &crate::cli::output::OutputWriterArc) {
+    async fn print_resume_summary(
+        agent: &crate::core::agent_loop::AgentLoop,
+        writer: &crate::cli::output::OutputWriterArc,
+    ) {
         use crate::cli::output::OutputEvent;
         use crate::providers::{AssistantContentBlock, MessageContent, MessageRole};
 
@@ -285,11 +288,13 @@ impl InteractiveSession {
             let supports_images = model_info.supports_images.unwrap_or(false);
             let image_blocks = if !all_image_paths.is_empty() && !supports_images {
                 if !self.task_opts.json {
-                    agent.output_writer().emit(crate::cli::output::OutputEvent::warning(format!(
-                        "Model '{}' does not support images. Ignoring {} image(s).",
-                        model_info.name.as_deref().unwrap_or("unknown"),
-                        all_image_paths.len()
-                    )));
+                    agent
+                        .output_writer()
+                        .emit(crate::cli::output::OutputEvent::warning(format!(
+                            "Model '{}' does not support images. Ignoring {} image(s).",
+                            model_info.name.as_deref().unwrap_or("unknown"),
+                            all_image_paths.len()
+                        )));
                 }
                 Vec::new()
             } else {
@@ -384,25 +389,25 @@ async fn spawn_agent_task(
 ) -> anyhow::Result<()> {
     agent_busy.store(true, Ordering::Relaxed);
     *agent_start_time.lock().await = Some(Instant::now());
-    
+
     let session_clone = Arc::clone(session);
     let prompt = prompt.to_string();
     let agent_busy_clone = Arc::clone(agent_busy);
     let agent_done_clone = Arc::clone(agent_done);
-    
+
     let handle = tokio::spawn(async move {
         let mut sess = session_clone.lock().await;
         let result = sess.run(Some(prompt)).await;
         drop(sess);
-        
+
         agent_busy_clone.store(false, Ordering::Relaxed);
         agent_done_clone.notify_one();
-        
+
         if let Err(e) = result {
             tracing::error!("Agent task failed: {}", e);
         }
     });
-    
+
     *agent_task.lock().await = Some(handle);
     Ok(())
 }
@@ -418,24 +423,29 @@ async fn cancel_agent(
         let mut state = sh.lock().await;
         state.is_cancelled = true;
         state.is_cancelled_atomic.store(true, Ordering::Release);
-        
+
         // Kill running PIDs
         #[cfg(unix)]
         for &pid in &state.running_command_pids.clone() {
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
         state.running_command_pids.clear();
     }
-    
+
     // Abort agent task
     if let Some(task) = agent_task.lock().await.take() {
         task.abort();
         // Wait briefly for cleanup
         tokio::time::timeout(Duration::from_secs(2), async {
             agent_done.notified().await
-        }).await.ok();
+        })
+        .await
+        .ok();
     }
-    
+
     Ok(())
 }
 
@@ -452,7 +462,7 @@ async fn handle_key_event(
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
-    
+
     // Ctrl+C handling
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if agent_busy.load(Ordering::Relaxed) {
@@ -469,7 +479,7 @@ async fn handle_key_event(
             return Ok(None);
         }
     }
-    
+
     // Enter key - intercept before passing to textarea
     if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
         // Check for followup question (used by /undo, /commit, /checkpoint-restore)
@@ -481,14 +491,16 @@ async fn handle_key_event(
             }
             return Ok(None);
         }
-        
+
         // Normal submit
         let text = app.input.lines().join("");
         if !text.is_empty() {
             // Echo prompt to output pane
             app.push_styled(
                 format!("❯ {}", text),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             );
             // Clear textarea
             app.input = tui_textarea::TextArea::new(Vec::new());
@@ -497,7 +509,7 @@ async fn handle_key_event(
         }
         return Ok(None);
     }
-    
+
     // Shift+Up/Down for manual scroll
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         if key.code == KeyCode::Up {
@@ -512,7 +524,7 @@ async fn handle_key_event(
             return Ok(None);
         }
     }
-    
+
     // Up/Down for command history navigation
     if key.code == KeyCode::Up && app.input.cursor().0 == 0 && app.input.cursor().1 == 0 {
         if let Some(entry) = app.history.navigate_up() {
@@ -528,9 +540,9 @@ async fn handle_key_event(
         }
         return Ok(None);
     }
-    
+
     // Up/Down for file picker navigation (when picker is active)
-    
+
     // Up/Down for file picker navigation (when picker is active)
     if app.picker_active && !app.picker_results.is_empty() {
         if key.code == KeyCode::Up {
@@ -542,34 +554,33 @@ async fn handle_key_event(
             return Ok(None);
         }
     }
-    
+
     // Tab key with active file picker -> insert selection
     if key.code == KeyCode::Tab && app.picker_active && !app.picker_results.is_empty() {
         let result = &app.picker_results[app.picker_index];
         let text = app.input.lines().join("");
         let mq = crate::core::file_search::extract_mention_query(&text);
         if mq.in_mention_mode {
-            let new_text = crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
+            let new_text =
+                crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
             app.input = tui_textarea::TextArea::new(vec![new_text]);
             app.picker_active = false;
             app.picker_results.clear();
         }
         return Ok(None);
     }
-    
+
     // All other keys go to textarea
     use tui_textarea::Input;
     app.input.input(Input::from(key));
-    
+
     // Check for @ mention mode - show file picker overlay
     let input_text = app.input.lines().join("");
     let mq = crate::core::file_search::extract_mention_query(&input_text);
     if mq.in_mention_mode && !app.cwd.is_empty() {
         let query = mq.query.clone();
         let cwd = app.cwd.clone();
-        let results = crate::core::file_search::search_workspace_files(
-            &query, &cwd, 10
-        ).await;
+        let results = crate::core::file_search::search_workspace_files(&query, &cwd, 10).await;
         app.picker_active = true;
         app.picker_results = results;
         app.picker_index = 0;
@@ -595,17 +606,27 @@ async fn handle_cli_only_command(
     task_opts: &TaskOptions,
     auto_approve: bool,
 ) -> anyhow::Result<bool> {
-    use crate::cli::slash_commands::{CliOnlyCommand, format_help_text, format_settings_text, format_stats_text, format_changes_text, format_help_for_command};
-    
+    use crate::cli::slash_commands::{
+        CliOnlyCommand, format_changes_text, format_help_for_command, format_help_text,
+        format_settings_text, format_stats_text,
+    };
+
     if agent_busy.load(Ordering::Relaxed) {
-        let busy_cmds = [CliOnlyCommand::Exit, CliOnlyCommand::Quit, CliOnlyCommand::Clear, CliOnlyCommand::History];
+        let busy_cmds = [
+            CliOnlyCommand::Exit,
+            CliOnlyCommand::Quit,
+            CliOnlyCommand::Clear,
+            CliOnlyCommand::History,
+        ];
         if !busy_cmds.contains(&cli_cmd) {
-            app.push_styled("Agent is busy. Wait for it to finish before running this command.",
-                Style::default().fg(Color::Yellow));
+            app.push_styled(
+                "Agent is busy. Wait for it to finish before running this command.",
+                Style::default().fg(Color::Yellow),
+            );
             return Ok(false);
         }
     }
-    
+
     match cli_cmd {
         CliOnlyCommand::Exit | CliOnlyCommand::Quit => {
             return Ok(true);
@@ -615,7 +636,14 @@ async fn handle_cli_only_command(
             app.push_plain("Conversation cleared.");
         }
         CliOnlyCommand::History => {
-            let last_n: Vec<String> = app.history.entries().iter().rev().take(10).cloned().collect();
+            let last_n: Vec<String> = app
+                .history
+                .entries()
+                .iter()
+                .rev()
+                .take(10)
+                .cloned()
+                .collect();
             if last_n.is_empty() {
                 app.push_plain("No command history.");
             } else {
@@ -720,14 +748,19 @@ async fn handle_cli_only_command(
             let most_recent = &checkpoints[0];
             let current_hash = checkpoint_mgr.last_checkpoint().map(|h| h.as_str());
             let changed_files = if let Some(current) = current_hash {
-                checkpoint_mgr.get_changed_files(&most_recent.hash, Some(current)).await.unwrap_or_else(|_| vec![])
+                checkpoint_mgr
+                    .get_changed_files(&most_recent.hash, Some(current))
+                    .await
+                    .unwrap_or_else(|_| vec![])
             } else {
                 vec![]
             };
 
             if !changed_files.is_empty() {
-                app.push_styled("/undo will revert the following files to the previous checkpoint:",
-                    Style::default().fg(Color::Yellow));
+                app.push_styled(
+                    "/undo will revert the following files to the previous checkpoint:",
+                    Style::default().fg(Color::Yellow),
+                );
                 for f in &changed_files {
                     app.push_plain(format!("  - {}", f));
                 }
@@ -739,7 +772,8 @@ async fn handle_cli_only_command(
 
                 let response_result = tokio::task::spawn_blocking(move || {
                     receiver.recv_timeout(std::time::Duration::from_secs(30))
-                }).await;
+                })
+                .await;
 
                 crate::core::approval::clear_followup_sender(task_id);
                 crate::core::approval::set_followup_question_active(task_id, false);
@@ -757,8 +791,11 @@ async fn handle_cli_only_command(
 
             match checkpoint_mgr.restore_checkpoint(&most_recent.hash).await {
                 Ok(()) => {
-                    app.push_plain(format!("Restored to checkpoint {} — {} file(s) reverted",
-                        most_recent.number, changed_files.len()));
+                    app.push_plain(format!(
+                        "Restored to checkpoint {} — {} file(s) reverted",
+                        most_recent.number,
+                        changed_files.len()
+                    ));
                     if !changed_files.is_empty() {
                         app.push_plain("\nReverted files:");
                         for f in &changed_files {
@@ -767,7 +804,10 @@ async fn handle_cli_only_command(
                     }
                     let removed = sess.agent_loop().remove_last_turn().await;
                     if removed > 0 {
-                        app.push_plain(format!("Removed {} message(s) from conversation history.", removed));
+                        app.push_plain(format!(
+                            "Removed {} message(s) from conversation history.",
+                            removed
+                        ));
                     }
                 }
                 Err(e) => {
@@ -837,32 +877,48 @@ async fn handle_cli_only_command(
                                 if diff.is_empty() {
                                     app.push_plain("No changes to commit.");
                                 } else {
-                                    app.push_styled("Changes to commit:", Style::default().fg(Color::Cyan));
+                                    app.push_styled(
+                                        "Changes to commit:",
+                                        Style::default().fg(Color::Cyan),
+                                    );
                                     for line in ansi_to_ratatui_lines(&diff) {
                                         app.push_output(line);
                                     }
                                     app.push_plain("Commit to your git repo? (y/n): ");
 
                                     let (sender, receiver) = std::sync::mpsc::channel();
-                                    crate::core::approval::set_followup_question_active(task_id, true);
+                                    crate::core::approval::set_followup_question_active(
+                                        task_id, true,
+                                    );
                                     crate::core::approval::set_followup_sender(task_id, sender);
 
                                     let response_result = tokio::task::spawn_blocking(move || {
                                         receiver.recv_timeout(std::time::Duration::from_secs(30))
-                                    }).await;
+                                    })
+                                    .await;
 
                                     crate::core::approval::clear_followup_sender(task_id);
-                                    crate::core::approval::set_followup_question_active(task_id, false);
+                                    crate::core::approval::set_followup_question_active(
+                                        task_id, false,
+                                    );
 
                                     let confirm = match response_result {
                                         Ok(Ok(r)) => r,
                                         Ok(Err(_)) | Err(_) => String::new(),
                                     };
 
-                                    if confirm.trim().is_empty() || confirm.trim().to_lowercase() == "y" {
-                                        match crate::core::shadow_git::commit_to_real_git(&workspace_root, &msg) {
+                                    if confirm.trim().is_empty()
+                                        || confirm.trim().to_lowercase() == "y"
+                                    {
+                                        match crate::core::shadow_git::commit_to_real_git(
+                                            &workspace_root,
+                                            &msg,
+                                        ) {
                                             Ok(files) => {
-                                                app.push_plain(format!("Committed {} file(s) to your git repo.", files.len()));
+                                                app.push_plain(format!(
+                                                    "Committed {} file(s) to your git repo.",
+                                                    files.len()
+                                                ));
                                             }
                                             Err(e) => {
                                                 app.push_plain(format!("Commit failed: {}", e));
@@ -952,7 +1008,8 @@ async fn handle_cli_only_command(
 
                 let response_result = tokio::task::spawn_blocking(move || {
                     receiver.recv_timeout(std::time::Duration::from_secs(30))
-                }).await;
+                })
+                .await;
 
                 crate::core::approval::clear_followup_sender(task_id);
                 crate::core::approval::set_followup_question_active(task_id, false);
@@ -965,17 +1022,28 @@ async fn handle_cli_only_command(
             };
 
             if num == 0 || num > checkpoints.len() {
-                app.push_plain(format!("Invalid checkpoint number. Available: 1-{}", checkpoints.len()));
+                app.push_plain(format!(
+                    "Invalid checkpoint number. Available: 1-{}",
+                    checkpoints.len()
+                ));
                 return Ok(false);
             }
 
             if let Some(checkpoint) = checkpoints.get(num - 1) {
-                let current_hash = checkpoint_mgr.last_checkpoint()
-                    .map(|h| h.as_str()).unwrap_or("HEAD");
-                match checkpoint_mgr.get_changed_files(&checkpoint.hash, Some(current_hash)).await {
+                let current_hash = checkpoint_mgr
+                    .last_checkpoint()
+                    .map(|h| h.as_str())
+                    .unwrap_or("HEAD");
+                match checkpoint_mgr
+                    .get_changed_files(&checkpoint.hash, Some(current_hash))
+                    .await
+                {
                     Ok(changed_files) => {
                         if !changed_files.is_empty() {
-                            app.push_styled("Files that will be restored:", Style::default().fg(Color::Yellow));
+                            app.push_styled(
+                                "Files that will be restored:",
+                                Style::default().fg(Color::Yellow),
+                            );
                             for file in &changed_files {
                                 app.push_plain(format!("  - {}", file));
                             }
@@ -987,7 +1055,8 @@ async fn handle_cli_only_command(
 
                             let response_result = tokio::task::spawn_blocking(move || {
                                 receiver.recv_timeout(std::time::Duration::from_secs(30))
-                            }).await;
+                            })
+                            .await;
 
                             crate::core::approval::clear_followup_sender(task_id);
                             crate::core::approval::set_followup_question_active(task_id, false);
@@ -1004,13 +1073,19 @@ async fn handle_cli_only_command(
                         }
                     }
                     Err(e) => {
-                        app.push_plain(format!("Warning: Could not determine changed files: {}", e));
+                        app.push_plain(format!(
+                            "Warning: Could not determine changed files: {}",
+                            e
+                        ));
                     }
                 }
 
                 match checkpoint_mgr.restore_by_number(num).await {
                     Ok(()) => {
-                        app.push_plain(format!("Checkpoint {} ({}) restored successfully.", num, checkpoint.hash));
+                        app.push_plain(format!(
+                            "Checkpoint {} ({}) restored successfully.",
+                            num, checkpoint.hash
+                        ));
                     }
                     Err(e) => {
                         app.push_plain(format!("Failed to restore checkpoint: {}", e));
@@ -1024,13 +1099,18 @@ async fn handle_cli_only_command(
                 let sh = sess.agent_loop().state_handle();
                 drop(sess);
                 let state = sh.lock().await;
-                if let Some(block) = state.snipped_code_blocks.iter().find(|block| block.index == index) {
+                if let Some(block) = state
+                    .snipped_code_blocks
+                    .iter()
+                    .find(|block| block.index == index)
+                {
                     if block.language.is_empty() {
                         app.push_plain("```");
                     } else {
                         app.push_plain(format!("```{}", block.language));
                     }
-                    let highlighted = crate::cli::syntax_highlight::highlight_code(&block.code, &block.language);
+                    let highlighted =
+                        crate::cli::syntax_highlight::highlight_code(&block.code, &block.language);
                     for line in ansi_to_ratatui_lines(&highlighted) {
                         app.push_output(line);
                     }
@@ -1065,10 +1145,10 @@ async fn run_main_loop(
     loop {
         // 1. Drain channel into app
         drain_output(output_rx, app);
-        
+
         // 2. Render
         terminal.draw(|f| app.render(f))?;
-        
+
         // 3. Poll for events (blocking, 50ms timeout)
         // Always poll to provide delay; skip stdin read while approval is active to avoid fd race
         let has_event = ratatui::crossterm::event::poll(Duration::from_millis(50))?;
@@ -1085,30 +1165,44 @@ async fn run_main_loop(
                         &agent_start_time,
                         &state_handle,
                         &agent_task,
-                    ).await? {
+                    )
+                    .await?
+                    {
                         match action {
                             Action::Quit => return Ok(()),
                             Action::Submit(text) => {
                                 // Save to command history and reset navigation
                                 append_to_history(&text);
                                 app.history.reload();
-                                
+
                                 // Check for CLI-only slash commands FIRST
-                                if let Some(cli_cmd) = crate::cli::slash_commands::get_cli_only_command(&text) {
+                                if let Some(cli_cmd) =
+                                    crate::cli::slash_commands::get_cli_only_command(&text)
+                                {
                                     let should_exit = handle_cli_only_command(
-                                        cli_cmd, &text, app, &session, &task_id,
-                                        &agent_busy, &agent_start_time, &agent_task,
-                                        &state_handle, task_opts, auto_approve,
-                                    ).await?;
+                                        cli_cmd,
+                                        &text,
+                                        app,
+                                        &session,
+                                        &task_id,
+                                        &agent_busy,
+                                        &agent_start_time,
+                                        &agent_task,
+                                        &state_handle,
+                                        task_opts,
+                                        auto_approve,
+                                    )
+                                    .await?;
                                     if should_exit {
                                         return Ok(());
                                     }
                                     continue;
                                 }
-                                
+
                                 // Process model-side slash commands (e.g., /compact, /plan)
-                                let processed = crate::cli::slash_commands::process_slash_command(&text);
-                                
+                                let processed =
+                                    crate::cli::slash_commands::process_slash_command(&text);
+
                                 // If agent is busy, queue the message; otherwise spawn
                                 if agent_busy.load(Ordering::Relaxed)
                                     && let Some(qh) = queue_handle.lock().await.as_ref()
@@ -1122,10 +1216,14 @@ async fn run_main_loop(
                                     );
                                 } else {
                                     spawn_agent_task(
-                                        &session, &processed,
-                                        &agent_busy, &agent_done,
-                                        &agent_start_time, &agent_task,
-                                    ).await?;
+                                        &session,
+                                        &processed,
+                                        &agent_busy,
+                                        &agent_done,
+                                        &agent_start_time,
+                                        &agent_task,
+                                    )
+                                    .await?;
                                     app.agent_busy = true;
                                 }
                             }
@@ -1141,7 +1239,7 @@ async fn run_main_loop(
                 _ => {}
             }
         }
-        
+
         // 4. Check agent completion (non-blocking)
         if agent_busy.load(Ordering::Relaxed) && agent_done.notified().now_or_never().is_some() {
             agent_busy.store(false, Ordering::Relaxed);
@@ -1154,7 +1252,7 @@ async fn run_main_loop(
                 );
             }
         }
-        
+
         // 5. Tick spinner
         app.tick_spinner();
     }
@@ -1166,7 +1264,7 @@ pub async fn run_interactive_shell_inner(
 ) -> anyhow::Result<()> {
     // 0. Install panic hook to restore terminal on panic
     crate::terminal::input::install_panic_hook();
-    
+
     // 1. Initialize ratatui (replaces enter_raw_mode, scroll_region, bracketed paste)
     let mut terminal = if std::env::var("SNED_NO_ALTERNATE_SCREEN").is_ok() {
         ratatui::Terminal::with_options(
@@ -1178,31 +1276,33 @@ pub async fn run_interactive_shell_inner(
     } else {
         ratatui::init()
     };
-    crate::core::cancellation::TERMINAL_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
+    crate::core::cancellation::TERMINAL_INITIALIZED
+        .store(true, std::sync::atomic::Ordering::Release);
     let _guard = TerminalGuard;
     let mut app = App::new();
     if let Ok(cwd) = std::env::current_dir() {
         app.cwd = cwd.to_string_lossy().to_string();
     }
-    
+
     // 2. Create output channel (Phase 1 infrastructure, now drains to App)
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(output_tx));
-    
+
     // 3. Build session
     let session = Arc::new(Mutex::new(
         InteractiveSession::build_with_writer(
-            task_opts.clone(), 
-            root_opts.clone(), 
-            Some(output_writer.clone())
-        ).await?,
+            task_opts.clone(),
+            root_opts.clone(),
+            Some(output_writer.clone()),
+        )
+        .await?,
     ));
-    
+
     let task_id = {
         let sess = session.lock().await;
         sess.agent_loop.task_id().to_string()
     };
-    
+
     // 4. Startup banner → app.push_output()
     {
         let sess = session.lock().await;
@@ -1211,13 +1311,17 @@ pub async fn run_interactive_shell_inner(
             for line in ansi_to_ratatui_lines(&startup_info) {
                 app.push_output(line);
             }
-            app.push_styled("type a prompt and press Enter; type /exit to leave", 
-                Style::default().add_modifier(Modifier::DIM));
-            app.push_styled("type /help for slash commands, @ to search and mention files",
-                Style::default().add_modifier(Modifier::DIM));
+            app.push_styled(
+                "type a prompt and press Enter; type /exit to leave",
+                Style::default().add_modifier(Modifier::DIM),
+            );
+            app.push_styled(
+                "type /help for slash commands, @ to search and mention files",
+                Style::default().add_modifier(Modifier::DIM),
+            );
         }
     }
-    
+
     // 5. Shared state (same as current)
     let agent_busy = Arc::new(AtomicBool::new(false));
     let agent_done = Arc::new(tokio::sync::Notify::new());
@@ -1226,13 +1330,12 @@ pub async fn run_interactive_shell_inner(
         Arc::new(Mutex::new(None));
     let state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>> =
         Arc::new(Mutex::new(None));
-    let agent_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
-        Arc::new(Mutex::new(None));
-    
+    let agent_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
     // Command history is loaded by App::new() via FileHistory::load()
     // Reload in case history was written by another session
     app.history.reload();
-    
+
     {
         let sess = session.lock().await;
         let mut qh = queue_handle.lock().await;
@@ -1240,7 +1343,7 @@ pub async fn run_interactive_shell_inner(
         let mut sh = state_handle.lock().await;
         *sh = Some(sess.state_handle());
     }
-    
+
     // 6. Main loop
     let auto_approve = task_opts.yolo || task_opts.auto_approve_all;
     run_main_loop(
@@ -1257,7 +1360,8 @@ pub async fn run_interactive_shell_inner(
         queue_handle,
         &task_opts,
         auto_approve,
-    ).await
+    )
+    .await
 }
 pub fn should_start_interactive_shell(
     has_prompt: bool,

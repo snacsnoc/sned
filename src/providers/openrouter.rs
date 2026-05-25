@@ -45,7 +45,11 @@ impl OpenRouterProvider {
             model_info: config.model_info,
             reasoning_effort: None,
             custom_headers: Some(custom_headers),
-            provider_name: Some(config.provider_name.unwrap_or_else(|| "openrouter".to_string())),
+            provider_name: Some(
+                config
+                    .provider_name
+                    .unwrap_or_else(|| "openrouter".to_string()),
+            ),
         };
 
         let inner = OpenAiProvider::new(openai_config)?;
@@ -184,7 +188,8 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
             info.input_price = Some(0.5);
             info.output_price = Some(1.5);
         // OpenAI reasoning models (o-series)
-        } else if model_id.contains("o1") || model_id.contains("o3") || model_id.contains("o4-mini") {
+        } else if model_id.contains("o1") || model_id.contains("o3") || model_id.contains("o4-mini")
+        {
             info.max_tokens = Some(100_000);
             info.context_window = Some(200_000);
             info.input_price = Some(5.0);

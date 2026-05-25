@@ -208,15 +208,17 @@ impl InputParser {
                         && self.paste_buffer[self.paste_buffer.len() - prefix_len..]
                             == paste_end_prefix[..prefix_len]
                         && self.buf.len() >= 6 - prefix_len
-                        && self.buf.iter().take(6 - prefix_len).eq(
-                            paste_end_prefix[prefix_len..].iter()
-                        )
+                        && self
+                            .buf
+                            .iter()
+                            .take(6 - prefix_len)
+                            .eq(paste_end_prefix[prefix_len..].iter())
                     {
-                        self.paste_buffer.truncate(self.paste_buffer.len() - prefix_len);
+                        self.paste_buffer
+                            .truncate(self.paste_buffer.len() - prefix_len);
                         self.buf.drain(..6 - prefix_len);
                         self.paste_mode = false;
-                        let paste_content =
-                            String::from_utf8_lossy(&self.paste_buffer).to_string();
+                        let paste_content = String::from_utf8_lossy(&self.paste_buffer).to_string();
                         self.paste_buffer.clear();
                         return Some(TerminalEvent::Paste(paste_content));
                     }
@@ -230,9 +232,10 @@ impl InputParser {
                     if self.buf.len() >= 6 && self.buf.iter().take(6).eq(b"\x1b[201~".iter()) {
                         self.buf.drain(..6);
                     }
-                    return Some(TerminalEvent::Paste(
-                        format!("[paste truncated - exceeded {} byte limit]", max_paste_size())
-                    ));
+                    return Some(TerminalEvent::Paste(format!(
+                        "[paste truncated - exceeded {} byte limit]",
+                        max_paste_size()
+                    )));
                 }
                 if let Some(byte) = self.buf.pop_front() {
                     self.paste_buffer.push(byte);

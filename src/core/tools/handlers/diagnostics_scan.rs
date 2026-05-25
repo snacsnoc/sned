@@ -24,9 +24,8 @@ static ESLINT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Pre-compiled regex for Python-style diagnostics.
 /// Matches: `File "...", line N`
-static PYTHON_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"File\s+"([^"]+)",\s*line\s*(\d+)"#).unwrap()
-});
+static PYTHON_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"File\s+"([^"]+)",\s*line\s*(\d+)"#).unwrap());
 
 /// Diagnostics scan tool handler.
 #[derive(Debug, Clone, Default)]
@@ -238,7 +237,8 @@ impl DiagnosticsScanHandler {
     ) -> HashMap<PathBuf, String> {
         use futures::future::join_all;
 
-        let mut results: HashMap<PathBuf, String> = HashMap::with_capacity(files_by_project.len().max(1));
+        let mut results: HashMap<PathBuf, String> =
+            HashMap::with_capacity(files_by_project.len().max(1));
 
         // Run diagnostics for each (project_root, project_type) group in parallel
         let futures: Vec<_> = files_by_project
@@ -537,19 +537,21 @@ impl DiagnosticsScanHandler {
 
         // Group files by (project_root, project_type) to handle mixed-language projects.
         // This ensures Rust and JS files at the same root both get their respective diagnostics.
-        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::with_capacity(paths.len().max(1));
-        let mut file_info: HashMap<PathBuf, (String, Option<String>)> = HashMap::with_capacity(paths.len().max(1));
+        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> =
+            HashMap::with_capacity(paths.len().max(1));
+        let mut file_info: HashMap<PathBuf, (String, Option<String>)> =
+            HashMap::with_capacity(paths.len().max(1));
         let mut error_results = Vec::new();
 
         for rel_path in &paths {
-            let abs_path = match crate::core::tools::resolve_sanitized_path(workspace_root, rel_path)
-            {
-                Ok(path) => path,
-                Err(e) => {
-                    error_results.push(format!("- file: {}\n  error: {}", rel_path, e));
-                    continue;
-                }
-            };
+            let abs_path =
+                match crate::core::tools::resolve_sanitized_path(workspace_root, rel_path) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        error_results.push(format!("- file: {}\n  error: {}", rel_path, e));
+                        continue;
+                    }
+                };
 
             // Try to read the file
             let file_content = match tokio::fs::read_to_string(&abs_path).await {
@@ -573,11 +575,15 @@ impl DiagnosticsScanHandler {
                 },
             )
             .or_else(|| {
-                Self::find_ancestor_with_file(&abs_path, "package.json").or_else(|| {
-                    abs_path.parent().map(|p| p.to_path_buf())
-                })
+                Self::find_ancestor_with_file(&abs_path, "package.json")
+                    .or_else(|| abs_path.parent().map(|p| p.to_path_buf()))
             })
-            .unwrap_or_else(|| abs_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")));
+            .unwrap_or_else(|| {
+                abs_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
 
             files_by_project
                 .entry((project_root, project_type))
@@ -594,9 +600,13 @@ impl DiagnosticsScanHandler {
         // Format results for each file
         let mut results = Vec::new();
         for (abs_path, (display_path, file_content)) in &file_info {
-            let diag_output = batch_diag_outputs.get(abs_path).cloned().unwrap_or_default();
+            let diag_output = batch_diag_outputs
+                .get(abs_path)
+                .cloned()
+                .unwrap_or_default();
             let diagnostics = Self::parse_diagnostics(&diag_output, display_path);
-            let formatted = Self::format_diagnostics(display_path, &diagnostics, file_content.as_deref());
+            let formatted =
+                Self::format_diagnostics(display_path, &diagnostics, file_content.as_deref());
             results.push(formatted);
         }
 
@@ -907,8 +917,12 @@ mod tests {
         let results = DiagnosticsScanHandler::run_diagnostics_batch(&files_by_project).await;
 
         // Both files should have the same diagnostics output (one invocation served both)
-        let output1 = results.get(&rust_dir.join("file1.rs")).expect("file1.rs should have output");
-        let output2 = results.get(&rust_dir.join("file2.rs")).expect("file2.rs should have output");
+        let output1 = results
+            .get(&rust_dir.join("file1.rs"))
+            .expect("file1.rs should have output");
+        let output2 = results
+            .get(&rust_dir.join("file2.rs"))
+            .expect("file2.rs should have output");
         assert_eq!(
             output1, output2,
             "Both files in the same project should receive identical diagnostics output (proving single invocation)"

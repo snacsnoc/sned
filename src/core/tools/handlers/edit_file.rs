@@ -393,8 +393,13 @@ impl EditFileHandler {
 
             if should_prompt {
                 let diff_text = diff_previews.join("\n\n");
-                match prompt_for_combined_approval(prepared_batches.len(), total_edits, &diff_text, output_writer)
-                    .await
+                match prompt_for_combined_approval(
+                    prepared_batches.len(),
+                    total_edits,
+                    &diff_text,
+                    output_writer,
+                )
+                .await
                 {
                     Ok(crate::core::approval::ApprovalResult::Denied) => {
                         return Ok(format!(
@@ -420,14 +425,14 @@ impl EditFileHandler {
 
         // Phase 3: Capture pre-save diagnostics for all files being edited
         // Group files by (project_root, project_type) to handle mixed-language projects
-        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::with_capacity(prepared_batches.len());
+        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> =
+            HashMap::with_capacity(prepared_batches.len());
         for (batch, _) in &prepared_batches {
             let path = PathBuf::from(&batch.absolute_path);
             let project_type = DiagnosticsScanHandler::detect_project_type(&path);
             let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
                 &path,
-                if project_type
-                    == crate::core::tools::handlers::diagnostics_scan::ProjectType::Rust
+                if project_type == crate::core::tools::handlers::diagnostics_scan::ProjectType::Rust
                 {
                     "Cargo.toml"
                 } else {
@@ -477,7 +482,7 @@ impl EditFileHandler {
         // Phase 4a: Validate all edits and compute final content (no disk writes)
         // Track which files were successfully edited for post-diagnostics
         let mut successfully_edited_files: Vec<(String, String)> = Vec::new(); // (absolute_path, display_path)
-        
+
         // Store intermediate results for building final output after batch diagnostics
         struct FileResult {
             batch_absolute_path: String,
@@ -488,7 +493,7 @@ impl EditFileHandler {
             had_success: bool,
         }
         let mut file_results: Vec<FileResult> = Vec::new();
-        
+
         // Collect file writes for Phase 4b (two-phase commit with rollback)
         struct WriteItem {
             absolute_path: String,
@@ -522,12 +527,10 @@ impl EditFileHandler {
             if result.success {
                 // Track for post-diagnostics if there were pre-errors
                 if any_pre_errors {
-                    successfully_edited_files.push((
-                        batch.absolute_path.clone(),
-                        batch.display_path.clone(),
-                    ));
+                    successfully_edited_files
+                        .push((batch.absolute_path.clone(), batch.display_path.clone()));
                 }
-                
+
                 // Collect for write phase (Phase 4b)
                 if let Some(ref final_content) = result.final_content {
                     write_items.push(WriteItem {
@@ -565,7 +568,8 @@ impl EditFileHandler {
         // If any file fails to write, restore all previously written files to original content
         if !write_items.is_empty() {
             // Snapshot original content for all files before any writes
-            let mut original_contents: std::collections::HashMap<String, String> = std::collections::HashMap::with_capacity(write_items.len());
+            let mut original_contents: std::collections::HashMap<String, String> =
+                std::collections::HashMap::with_capacity(write_items.len());
             for item in &write_items {
                 if let Ok(c) = tokio::fs::read_to_string(&item.absolute_path).await {
                     original_contents.insert(item.absolute_path.clone(), c);
@@ -602,12 +606,10 @@ impl EditFileHandler {
                 if lock_result.is_err() {
                     let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
                         match tokio::fs::metadata(&item.absolute_path).await {
-                            Ok(current_metadata) => {
-                                match current_metadata.modified() {
-                                    Ok(current_mtime) => &current_mtime == initial_mtime,
-                                    Err(_) => true,
-                                }
-                            }
+                            Ok(current_metadata) => match current_metadata.modified() {
+                                Ok(current_mtime) => &current_mtime == initial_mtime,
+                                Err(_) => true,
+                            },
                             Err(_) => true,
                         }
                     } else {
@@ -656,16 +658,13 @@ impl EditFileHandler {
                                     tracing::error!("Failed to rollback file {}: {}", path, re);
                                 }
                             }
-                            all_results.push(format!(
-                                "Error writing file {}: {}",
-                                item.display_path, e
-                            ));
+                            all_results
+                                .push(format!("Error writing file {}: {}", item.display_path, e));
                         }
                     }
                 } else {
                     if let Some(initial_mtime) = &item.initial_mtime
-                        && let Ok(current_metadata) =
-                            tokio::fs::metadata(&item.absolute_path).await
+                        && let Ok(current_metadata) = tokio::fs::metadata(&item.absolute_path).await
                         && let Ok(current_mtime) = current_metadata.modified()
                         && &current_mtime != initial_mtime
                     {
@@ -709,10 +708,8 @@ impl EditFileHandler {
                                     tracing::error!("Failed to rollback file {}: {}", path, re);
                                 }
                             }
-                            all_results.push(format!(
-                                "Error writing file {}: {}",
-                                item.display_path, e
-                            ));
+                            all_results
+                                .push(format!("Error writing file {}: {}", item.display_path, e));
                         }
                     }
                 }
@@ -728,7 +725,8 @@ impl EditFileHandler {
 
         if any_pre_errors && !successfully_edited_files.is_empty() {
             // Group successfully edited files by (project_root, project_type)
-            let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::with_capacity(successfully_edited_files.len());
+            let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> =
+                HashMap::with_capacity(successfully_edited_files.len());
             for (abs_path, _) in &successfully_edited_files {
                 let path = PathBuf::from(abs_path);
                 let project_type = DiagnosticsScanHandler::detect_project_type(&path);
@@ -1776,13 +1774,11 @@ mod tests {
         fs::create_dir_all(temp_dir).unwrap();
 
         // Create Cargo.toml
-        let cargo_toml = format!(
-            r#"[package]
+        let cargo_toml = r#"[package]
 name = "test_batch"
 version = "0.1.0"
 edition = "2021"
-"#
-        );
+"#;
         fs::write(format!("{}/Cargo.toml", temp_dir), cargo_toml).unwrap();
 
         // Create src directory
@@ -1790,8 +1786,10 @@ edition = "2021"
 
         // Create two files with intentional errors (undefined function)
         // Use hash-anchored format: content§line
-        let file1_content = "func1§pub fn func1() {\nbad_call§    nonexistent_function();\nclose§}\n";
-        let file2_content = "func2§pub fn func2() {\nbad_call2§    another_nonexistent_function();\nclose2§}\n";
+        let file1_content =
+            "func1§pub fn func1() {\nbad_call§    nonexistent_function();\nclose§}\n";
+        let file2_content =
+            "func2§pub fn func2() {\nbad_call2§    another_nonexistent_function();\nclose2§}\n";
         fs::write(format!("{}/src/file1.rs", temp_dir), file1_content).unwrap();
         fs::write(format!("{}/src/file2.rs", temp_dir), file2_content).unwrap();
 
@@ -1883,11 +1881,17 @@ edition = "2021"
         });
 
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_err(), "Should fail validation for missing delimiter");
+        assert!(
+            result.is_err(),
+            "Should fail validation for missing delimiter"
+        );
         let err = result.unwrap_err();
         let err_msg = format!("{}", err);
         assert!(err_msg.contains("missing the '§' delimiter"));
-        assert!(err_msg.contains("..."), "Long anchor should be truncated with ellipsis");
+        assert!(
+            err_msg.contains("..."),
+            "Long anchor should be truncated with ellipsis"
+        );
         assert!(!err_msg.contains("你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界"), 
                 "Long anchor should be truncated, not show full 80-char string");
     }
@@ -1922,7 +1926,10 @@ edition = "2021"
         });
 
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_err(), "Should fail validation for unknown edit_type");
+        assert!(
+            result.is_err(),
+            "Should fail validation for unknown edit_type"
+        );
         let err = result.unwrap_err();
         let err_msg = format!("{}", err);
         assert!(err_msg.contains("Unknown edit_type 'delete'"));

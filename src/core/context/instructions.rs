@@ -60,16 +60,19 @@ pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
     }
 
     let mut results = Vec::new();
-    
+
     // Use ignore::WalkBuilder for .gitignore-aware filtering
     // This automatically respects .gitignore and skips .git/, node_modules/, target/, etc.
     let walker = ignore::WalkBuilder::new(cwd)
-        .standard_filters(true)  // Enable standard .gitignore filters
+        .standard_filters(true) // Enable standard .gitignore filters
         .build();
-    
+
     for entry in walker.flatten() {
         if entry.file_type().is_some_and(|ft| ft.is_file())
-            && entry.file_name().to_str().is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md"))
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md"))
         {
             results.push(entry.path().to_path_buf());
         }
@@ -362,7 +365,7 @@ pub fn scan_skills_directory(dir_path: &Path, source: SkillSource) -> Vec<SkillM
 
     for entry in entries.filter_map(|e| e.ok()) {
         let entry_path = entry.path();
-        
+
         // Support subdirectories with SKILL.md inside
         if entry_path.is_dir() {
             let skill_name = entry_path
@@ -459,7 +462,11 @@ fn load_skill_from_md_file(
     let file_content = match fs::read_to_string(skill_md_path) {
         Ok(content) => content,
         Err(e) => {
-            tracing::warn!("Failed to load skill file {}: {}", skill_md_path.display(), e);
+            tracing::warn!(
+                "Failed to load skill file {}: {}",
+                skill_md_path.display(),
+                e
+            );
             return None;
         }
     };
@@ -764,14 +771,14 @@ mod tests {
         // Create skills directory with .md files directly (like .agents/skills/)
         let skills_dir = cwd.join(".agents/skills");
         fs::create_dir_all(&skills_dir).unwrap();
-        
+
         // Create skill as .md file with frontmatter
         fs::write(
             skills_dir.join("outcome-replay.md"),
             "---\nname: outcome-replay\ndescription: Replay and analyze trading outcomes\n---\n\nSkill instructions here.",
         )
         .unwrap();
-        
+
         fs::write(
             skills_dir.join("runtime-operations.md"),
             "---\nname: runtime-operations\ndescription: Manage runtime trading operations\n---\n\nMore instructions.",
@@ -781,7 +788,7 @@ mod tests {
         // Use scan_skills_directory directly for isolated test
         let skills = scan_skills_directory(&skills_dir, SkillSource::Project);
         assert_eq!(skills.len(), 2);
-        
+
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"outcome-replay"));
         assert!(names.contains(&"runtime-operations"));
@@ -795,7 +802,7 @@ mod tests {
         // Create skills directory with .md files WITHOUT frontmatter
         let skills_dir = cwd.join(".agents/skills");
         fs::create_dir_all(&skills_dir).unwrap();
-        
+
         // Create skill as .md file without frontmatter
         fs::write(
             skills_dir.join("no-frontmatter.md"),
@@ -818,7 +825,7 @@ mod tests {
         // Create skills directory with both formats
         let skills_dir = cwd.join("mixed-skills");
         fs::create_dir_all(&skills_dir).unwrap();
-        
+
         // Subdirectory with SKILL.md
         let subdir_skill = skills_dir.join("dir-skill");
         fs::create_dir_all(&subdir_skill).unwrap();
@@ -827,7 +834,7 @@ mod tests {
             "---\nname: dir-skill\ndescription: Directory-based skill\n---\n\nInstructions.",
         )
         .unwrap();
-        
+
         // .md file directly
         fs::write(
             skills_dir.join("file-skill.md"),
@@ -838,7 +845,7 @@ mod tests {
         // Use scan_skills_directory directly for isolated test
         let skills = scan_skills_directory(&skills_dir, SkillSource::Project);
         assert_eq!(skills.len(), 2);
-        
+
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"dir-skill"));
         assert!(names.contains(&"file-skill"));

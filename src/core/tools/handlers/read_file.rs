@@ -140,16 +140,30 @@ impl ReadFileHandler {
                     Ok((content, lines)) => {
                         let size_kb = metadata.len() / 1024;
                         let max_kb = max_file_read_size() as u64 / 1024;
-                        (content.clone(), lines.clone(), Some(format!(
-                            "[Note: File truncated to {}KB (file is {}KB). Use start_line and end_line parameters to read specific sections.]",
-                            max_kb, size_kb
-                        )), Some(lines.clone()), 0, lines.len())
+                        (
+                            content.clone(),
+                            lines.clone(),
+                            Some(format!(
+                                "[Note: File truncated to {}KB (file is {}KB). Use start_line and end_line parameters to read specific sections.]",
+                                max_kb, size_kb
+                            )),
+                            Some(lines.clone()),
+                            0,
+                            lines.len(),
+                        )
                     }
                     Err(e) => return e,
                 }
             } else {
                 match self.read_full_file(path).await {
-                    Ok((content, lines)) => (content, lines.clone(), None, Some(lines.clone()), 0, lines.len()),
+                    Ok((content, lines)) => (
+                        content,
+                        lines.clone(),
+                        None,
+                        Some(lines.clone()),
+                        0,
+                        lines.len(),
+                    ),
                     Err(e) => return e,
                 }
             };
@@ -219,7 +233,17 @@ impl ReadFileHandler {
         path: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
-    ) -> Result<(String, Vec<String>, Option<String>, Option<Vec<String>>, usize, usize), FileReadResult> {
+    ) -> Result<
+        (
+            String,
+            Vec<String>,
+            Option<String>,
+            Option<Vec<String>>,
+            usize,
+            usize,
+        ),
+        FileReadResult,
+    > {
         let content = match tokio::fs::read_to_string(path).await {
             Ok(c) => c,
             Err(e) => {
@@ -272,7 +296,14 @@ impl ReadFileHandler {
         };
 
         let hash_content = collected_lines.join("\n");
-        Ok((hash_content, collected_lines, clamping_note, Some(all_lines), start_idx, end_exclusive))
+        Ok((
+            hash_content,
+            collected_lines,
+            clamping_note,
+            Some(all_lines),
+            start_idx,
+            end_exclusive,
+        ))
     }
 
     /// Read the entire file (current behavior for full reads).
@@ -661,7 +692,10 @@ mod tests {
 
         assert!(result.success, "UTF-8 boundary should not cause error");
         // Content must be valid UTF-8 (no replacement characters from broken multi-byte sequence)
-        assert!(!result.content.contains('\u{FFFD}'), "no replacement characters allowed");
+        assert!(
+            !result.content.contains('\u{FFFD}'),
+            "no replacement characters allowed"
+        );
     }
 
     #[tokio::test]
@@ -890,8 +924,14 @@ mod tests {
         // Verify output contains only the requested range
         assert!(result.content.contains("line 10"), "should contain line 10");
         assert!(result.content.contains("line 20"), "should contain line 20");
-        assert!(!result.content.contains("line 5"), "should NOT contain line 5 (outside range)");
-        assert!(!result.content.contains("line 50"), "should NOT contain line 50 (outside range)");
+        assert!(
+            !result.content.contains("line 5"),
+            "should NOT contain line 5 (outside range)"
+        );
+        assert!(
+            !result.content.contains("line 50"),
+            "should NOT contain line 50 (outside range)"
+        );
 
         // CRITICAL: Verify that anchor state was registered for ALL 100 lines,
         // not just the 11 visible lines. This is the fix for A34.

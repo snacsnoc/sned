@@ -32,7 +32,9 @@ impl AskFollowupQuestionHandler {
             use ratatui::style::{Color, Modifier, Style};
             ctx.output_writer.emit(OutputEvent::styled(
                 format!("\n{} {}\n", "[Sned Question]", question),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ));
             ctx.output_writer.emit(OutputEvent::styled(
                 "Your answer: ",
@@ -42,16 +44,15 @@ impl AskFollowupQuestionHandler {
 
             // Capture task_id for use after spawn_blocking
             let task_id = ctx.task_id.clone();
-            
+
             // Use channel-based input to avoid fighting the interactive loop
             let (sender, receiver) = std::sync::mpsc::channel();
             crate::core::approval::set_followup_question_active(&task_id, true);
             crate::core::approval::set_followup_sender(&task_id, sender);
 
             // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
-            let response_result = tokio::task::spawn_blocking(move || receiver.recv())
-                .await;
-            
+            let response_result = tokio::task::spawn_blocking(move || receiver.recv()).await;
+
             // Clean up regardless of result
             crate::core::approval::clear_followup_sender(&task_id);
             crate::core::approval::set_followup_question_active(&task_id, false);

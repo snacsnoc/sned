@@ -120,7 +120,10 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
             "  "
         };
 
-        println!("  {}{:>4}  {:16}  {}{}", favorite_marker, item.number, dt, preview, tokens);
+        println!(
+            "  {}{:>4}  {:16}  {}{}",
+            favorite_marker, item.number, dt, preview, tokens
+        );
     }
 
     println!("{}", "─".repeat(separator_width));
@@ -129,7 +132,10 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
         limit
     );
     if !filter_parts.is_empty() {
-        println!(" Active filters: {}. Use --help to see filter options.", filter_parts.join(", "));
+        println!(
+            " Active filters: {}. Use --help to see filter options.",
+            filter_parts.join(", ")
+        );
     }
 
     Ok(())
@@ -973,7 +979,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Test that run_auth accepts and processes modelid flag without error.
-    /// 
+    ///
     /// Note: This test verifies the flag is accepted and processed.
     /// Persistence to disk happens asynchronously via StateManager's background persist.
     #[test]

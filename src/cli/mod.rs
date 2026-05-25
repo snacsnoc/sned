@@ -15,8 +15,8 @@ pub mod text_utils;
 pub mod tui;
 
 pub use interactive::{
-    InteractiveSession, render_interactive_prompt_prefix,
-    run_interactive_shell_inner, should_start_interactive_shell,
+    InteractiveSession, render_interactive_prompt_prefix, run_interactive_shell_inner,
+    should_start_interactive_shell,
 };
 pub use subcommands::{
     format_config_output, parse_config_assignment, print_dry_run_report, run_auth, run_config,
@@ -619,7 +619,10 @@ fn build_symbol_index_service(
             match service.with_persistence() {
                 Ok(svc) => Ok(svc),
                 Err(e) => {
-                    tracing::warn!("Symbol index DB corruption detected, falling back to memory mode: {}", e);
+                    tracing::warn!(
+                        "Symbol index DB corruption detected, falling back to memory mode: {}",
+                        e
+                    );
                     // Delete corrupted DB file so next session can start fresh
                     let db_dir = std::path::Path::new(&cwd_str)
                         .join(crate::services::symbol_index::INDEX_DIR);
@@ -628,7 +631,9 @@ fn build_symbol_index_service(
                         let _ = std::fs::remove_file(&db_path);
                     }
                     // Return in-memory service (service was moved into with_persistence, so create new one)
-                    Ok(crate::services::symbol_index::SymbolIndexService::new(cwd_str))
+                    Ok(crate::services::symbol_index::SymbolIndexService::new(
+                        cwd_str,
+                    ))
                 }
             }
         }
@@ -696,7 +701,8 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "dummy".to_string());
             // Use stored model ID default and base URL if not specified
             let state = crate::storage::global_state::load_global_state();
-            let default_model = model_id.or_else(|| state.act_mode_api_model_id.clone())
+            let default_model = model_id
+                .or_else(|| state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string());
             let base_url = state.anthropic_base_url.filter(|u| !u.is_empty());
             Arc::new(crate::providers::anthropic::AnthropicProvider::new(
@@ -711,10 +717,12 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
         }
         "minimax" => {
             // Use stored model ID default if not specified
-            let default_model = model_id.or_else(|| {
-                let state = crate::storage::global_state::load_global_state();
-                state.act_mode_api_model_id
-            }).unwrap_or_else(|| "MiniMax-M2.7".to_string());
+            let default_model = model_id
+                .or_else(|| {
+                    let state = crate::storage::global_state::load_global_state();
+                    state.act_mode_api_model_id
+                })
+                .unwrap_or_else(|| "MiniMax-M2.7".to_string());
             // Determine api_line: "china" if MINIMAX_CN_API_KEY is set, otherwise default
             let api_line = if std::env::var("MINIMAX_CN_API_KEY").is_ok() {
                 Some("china".to_string())
@@ -745,10 +753,12 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 .clone()
                 .or_else(|| std::env::var("OPENAI_API_BASE").ok());
             // Use stored model ID default if not specified
-            let default_model = model_id.or_else(|| {
-                let state = crate::storage::global_state::load_global_state();
-                state.act_mode_api_model_id
-            }).unwrap_or_else(|| "gpt-4o".to_string());
+            let default_model = model_id
+                .or_else(|| {
+                    let state = crate::storage::global_state::load_global_state();
+                    state.act_mode_api_model_id
+                })
+                .unwrap_or_else(|| "gpt-4o".to_string());
             Arc::new(crate::providers::openai::OpenAiProvider::new(
                 crate::providers::openai::OpenAiConfig {
                     model_id: default_model,
@@ -776,10 +786,12 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 .clone()
                 .or_else(|| std::env::var("GEMINI_BASE_URL").ok());
             // Use stored model ID default if not specified
-            let default_model = model_id.or_else(|| {
-                let state = crate::storage::global_state::load_global_state();
-                state.act_mode_api_model_id
-            }).unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+            let default_model = model_id
+                .or_else(|| {
+                    let state = crate::storage::global_state::load_global_state();
+                    state.act_mode_api_model_id
+                })
+                .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
             Arc::new(crate::providers::gemini::GeminiProvider::new(
                 crate::providers::gemini::GeminiConfig {
                     model_id: default_model,
@@ -1122,7 +1134,8 @@ async fn build_task_components(
             .unwrap_or(50),
         max_tokens: task_opts.max_tokens,
         interactive_mode: false,
-        output_writer: output_writer.unwrap_or_else(|| Arc::new(crate::cli::output::StderrOutputWriter)),
+        output_writer: output_writer
+            .unwrap_or_else(|| Arc::new(crate::cli::output::StderrOutputWriter)),
     };
 
     let shell_path = std::env::var("SHELL").ok();
@@ -1270,7 +1283,10 @@ pub fn run() -> anyhow::Result<()> {
     let cli = parse();
     apply_config_override(&cli);
 
-    init_tracing(tracing_mode(cli.task_opts.json, cli.task_opts.verbose), cli.task_opts.debug);
+    init_tracing(
+        tracing_mode(cli.task_opts.json, cli.task_opts.verbose),
+        cli.task_opts.debug,
+    );
 
     match cli.command {
         Some(Command::Task { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),
@@ -1946,22 +1962,28 @@ mod tests {
         fs::create_dir_all(temp_dir).unwrap();
 
         // Create corrupted DB file
-        let db_dir = std::path::Path::new(temp_dir)
-            .join(crate::services::symbol_index::INDEX_DIR);
+        let db_dir = std::path::Path::new(temp_dir).join(crate::services::symbol_index::INDEX_DIR);
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = db_dir.join(crate::services::symbol_index::DB_FILENAME);
         {
             let mut f = fs::File::create(&db_path).unwrap();
-            f.write_all(b"This is not a valid SQLite database file").unwrap();
+            f.write_all(b"This is not a valid SQLite database file")
+                .unwrap();
         }
 
         // Build service with persisted mode - should fallback to memory
         let service = build_symbol_index_service(temp_dir.to_string(), SymbolIndexMode::Persisted);
-        assert!(service.is_ok(), "Service should fallback to memory mode on corrupted DB");
+        assert!(
+            service.is_ok(),
+            "Service should fallback to memory mode on corrupted DB"
+        );
 
         // Verify service is functional (not disabled)
         let svc = service.unwrap();
-        assert!(!svc.is_disabled(), "Service should be functional after fallback");
+        assert!(
+            !svc.is_disabled(),
+            "Service should be functional after fallback"
+        );
 
         // Verify corrupted DB file was deleted
         assert!(

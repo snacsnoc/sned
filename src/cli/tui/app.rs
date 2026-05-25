@@ -2,17 +2,17 @@
 //!
 //! This is the main application state for the ratatui render loop.
 
-use ratatui::{
-    layout::{Constraint, Layout, Rect},
-    style::{Style, Color, Modifier},
-    text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap, Clear},
-    Frame,
-};
-use tui_textarea::TextArea;
-use std::time::Instant;
-use crate::core::file_search::FileSearchResult;
 use super::history::FileHistory;
+use crate::core::file_search::FileSearchResult;
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Clear, Paragraph, Wrap},
+};
+use std::time::Instant;
+use tui_textarea::TextArea;
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -86,10 +86,8 @@ impl App {
 
     /// Render the application state to the frame.
     pub fn render(&mut self, frame: &mut Frame) {
-        let [output_area, input_area] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ]).areas(frame.area());
+        let [output_area, input_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(frame.area());
 
         // Update input block title with spinner when busy
         let title = if self.agent_busy {
@@ -126,7 +124,7 @@ impl App {
     fn render_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
         let max_height = 10.min(self.picker_results.len() as u16);
         let width = 50.min(output_area.width);
-        
+
         let overlay_area = Rect {
             x: output_area.x + 2,
             y: output_area.y + 2,
@@ -134,7 +132,8 @@ impl App {
             height: max_height + 2, // +2 for border
         };
 
-        let rows: Vec<Line> = self.picker_results
+        let rows: Vec<Line> = self
+            .picker_results
             .iter()
             .enumerate()
             .map(|(i, result)| {
@@ -144,10 +143,13 @@ impl App {
                 };
                 let label = format!("{} {}", icon, result.label);
                 if i == self.picker_index {
-                    Line::from(Span::styled(label, Style::default()
-                        .bg(Color::Blue)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)))
+                    Line::from(Span::styled(
+                        label,
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ))
                 } else {
                     Line::from(label)
                 }

@@ -1,8 +1,8 @@
 use ignore::WalkBuilder;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
 
 /// Cache entry with timestamp for TTL-based invalidation
 #[derive(Debug, Clone)]
@@ -137,7 +137,7 @@ pub async fn list_workspace_files(
     limit: usize,
 ) -> std::io::Result<Vec<FileSearchResult>> {
     let workspace_path_str = workspace_path.to_string();
-    
+
     // Check cache first
     if let Some(entry) = FILE_SEARCH_CACHE.read().await.get(&workspace_path_str)
         && entry.timestamp.elapsed() < CACHE_TTL
@@ -164,7 +164,8 @@ pub async fn list_workspace_files(
                     return !is_excluded_dir(&name);
                 }
                 // Filter out database files
-                if name.ends_with(".db") || name.ends_with(".sqlite") || name.ends_with(".sqlite3") {
+                if name.ends_with(".db") || name.ends_with(".sqlite") || name.ends_with(".sqlite3")
+                {
                     return false;
                 }
                 true
@@ -229,7 +230,7 @@ pub async fn list_workspace_files(
 fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
     let query_bytes = query.to_lowercase().into_bytes();
     let target_bytes = target.to_lowercase().into_bytes();
-    
+
     if query_bytes.is_empty() {
         return Some(0);
     }
@@ -242,7 +243,7 @@ fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
     for (ti, tb) in target_bytes.iter().enumerate() {
         if qi < query_bytes.len() && *tb == query_bytes[qi] {
             let ti_usize = ti as isize;
-            
+
             if qi == 0 {
                 first_match_idx = Some(ti);
             }
@@ -251,14 +252,16 @@ fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
             if ti_usize == last_match_idx + 1 {
                 // Consecutive match (e.g., "main" in "main.rs")
                 score += 5;
-            } else if ti == 0 || (ti > 0 && target_bytes[ti - 1] == b'/' || target_bytes[ti - 1] == b'_') {
+            } else if ti == 0
+                || (ti > 0 && target_bytes[ti - 1] == b'/' || target_bytes[ti - 1] == b'_')
+            {
                 // Word boundary (e.g., "AGE" at start of "AGENTS" or after "/")
                 score += 4;
             } else {
                 // Scattered match
                 score += 1;
             }
-            
+
             last_match_idx = ti_usize;
             qi += 1;
         }

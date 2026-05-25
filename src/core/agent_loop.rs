@@ -11,14 +11,16 @@
 //! When multiple locks are needed, acquire them in order and release them in
 //! reverse order when possible.
 
+use crate::cli::output::OutputEvent;
 pub use crate::core::agent_types::{
     AgentConfig, AgentError, AgentMode, SnippedCodeBlock, TaskState, TurnResult,
 };
 use crate::core::agent_types::{
     MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE, MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT,
 };
-use crate::cli::output::OutputEvent;
-use crate::core::context::{ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager, context_window};
+use crate::core::context::{
+    ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager, context_window,
+};
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::provider_retry::{RetryConfig, create_message_with_retry};
 use crate::core::tools::SnedTool;
@@ -51,8 +53,6 @@ const TOOL_RESULT_HISTORY_LIMIT_ENV: &str = "SNED_TOOL_RESULT_HISTORY_LIMIT";
 const DEFAULT_THINKING_HISTORY_LIMIT: usize = 2_000;
 /// Environment variable to configure thinking block history limit
 const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
-
-
 
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
 use crate::core::tool_output::{
@@ -140,7 +140,11 @@ fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriter
     output_writer.emit(OutputEvent::model_output(wrapped));
 }
 
-fn print_code_block(lines: &[String], lang: &str, output_writer: &crate::cli::output::OutputWriterArc) {
+fn print_code_block(
+    lines: &[String],
+    lang: &str,
+    output_writer: &crate::cli::output::OutputWriterArc,
+) {
     use crate::cli::output::OutputEvent;
     if lines.is_empty() {
         return;
@@ -148,7 +152,10 @@ fn print_code_block(lines: &[String], lang: &str, output_writer: &crate::cli::ou
 
     let code = lines.join("\n");
     let highlighted = crate::cli::syntax_highlight::highlight_code(&code, lang);
-    output_writer.emit(OutputEvent::RawAnsi(format!("  {}\n", highlighted.replace("\n", "\n  "))));
+    output_writer.emit(OutputEvent::RawAnsi(format!(
+        "  {}\n",
+        highlighted.replace("\n", "\n  ")
+    )));
 }
 
 fn code_block_display_limit(interactive_mode: bool) -> usize {
@@ -768,7 +775,9 @@ impl AgentLoop {
                             e
                         );
                         // Fallback: at least save state to prevent data loss
-                        if let Err(save_e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
+                        if let Err(save_e) =
+                            StateManager::persist_async(Arc::clone(&state_manager)).await
+                        {
                             error!("Fallback state persist failed: {}", save_e);
                         }
                     }
@@ -919,7 +928,12 @@ impl AgentLoop {
 
                     // Print session summary (not in JSON mode)
                     if !self.config.json_output {
-                        Self::print_session_summary(&self.state, self.config.interactive_mode, &self.config.output_writer).await;
+                        Self::print_session_summary(
+                            &self.state,
+                            self.config.interactive_mode,
+                            &self.config.output_writer,
+                        )
+                        .await;
                     }
 
                     // Persist state to disk before exiting
@@ -981,12 +995,16 @@ impl AgentLoop {
                             && last.role == MessageRole::User
                         {
                             history.pop();
-                            tracing::info!("Rolled back unprocessed user message after context window error");
+                            tracing::info!(
+                                "Rolled back unprocessed user message after context window error"
+                            );
                         }
                     }
 
                     // Persist state on error
-                    if let Err(e_persist) = StateManager::persist_async(Arc::clone(&state_manager)).await {
+                    if let Err(e_persist) =
+                        StateManager::persist_async(Arc::clone(&state_manager)).await
+                    {
                         error!("Failed to persist state manager on error: {}", e_persist);
                     }
                     return Err(AgentError::ExecutionError(e));
@@ -997,8 +1015,6 @@ impl AgentLoop {
 
     /// Executes a single turn of the agent loop.
     async fn execute_turn(&mut self) -> TurnResult {
-  
-
         // 1. Prepare conversation history (possibly truncated by context manager)
         let truncated_history = {
             // Read api_req_info + deleted_range BEFORE locking history,
@@ -1131,8 +1147,13 @@ impl AgentLoop {
         // truncate to the last N messages to break the deadlock (e.g., /compact failing
         // because the compact instruction itself pushes the request over the limit).
         // This is a last-resort fallback after context_manager truncation.
-        if let Err(msg) = context_window::validate_context_window(&request, self.config.provider.as_ref()) {
-            tracing::warn!("Request exceeds context limits after context_manager truncation: {}", msg);
+        if let Err(msg) =
+            context_window::validate_context_window(&request, self.config.provider.as_ref())
+        {
+            tracing::warn!(
+                "Request exceeds context limits after context_manager truncation: {}",
+                msg
+            );
             tracing::info!("Applying emergency truncation to break deadlock");
 
             // Keep only the last 20 messages (10 turns) + system prompt
@@ -1142,7 +1163,11 @@ impl AgentLoop {
             if history.len() > emergency_keep {
                 let dropped = history.len() - emergency_keep;
                 history.drain(0..dropped);
-                tracing::info!("Emergency truncation: dropped {} oldest messages, keeping last {}", dropped, emergency_keep);
+                tracing::info!(
+                    "Emergency truncation: dropped {} oldest messages, keeping last {}",
+                    dropped,
+                    emergency_keep
+                );
 
                 // Rebuild request with truncated history
                 request.messages = history.clone();
@@ -1155,14 +1180,21 @@ impl AgentLoop {
             {
                 let mut state = self.state.lock().await;
                 if state.conversation_history_deleted_range.is_some() {
-                    tracing::debug!("Reset conversation_history_deleted_range after emergency truncation");
+                    tracing::debug!(
+                        "Reset conversation_history_deleted_range after emergency truncation"
+                    );
                     state.conversation_history_deleted_range = None;
                 }
             }
 
             // Re-validate after emergency truncation
-            if let Err(msg) = context_window::validate_context_window(&request, self.config.provider.as_ref()) {
-                tracing::error!("Request still exceeds context limits after emergency truncation: {}", msg);
+            if let Err(msg) =
+                context_window::validate_context_window(&request, self.config.provider.as_ref())
+            {
+                tracing::error!(
+                    "Request still exceeds context limits after emergency truncation: {}",
+                    msg
+                );
                 return TurnResult::Error(format!("Context window overflow: {}", msg));
             }
         }
@@ -1347,7 +1379,11 @@ impl AgentLoop {
 
                                 if trimmed_line.starts_with("```") {
                                     if in_code_block {
-                                        print_code_block(&code_block_buffer, &code_block_lang, &self.config.output_writer);
+                                        print_code_block(
+                                            &code_block_buffer,
+                                            &code_block_lang,
+                                            &self.config.output_writer,
+                                        );
                                         if code_block_snipped {
                                             let index = if self.config.interactive_mode {
                                                 Some(push_snipped_code_block(
@@ -1448,9 +1484,9 @@ impl AgentLoop {
                                     summary
                                 };
 
-                                self.config.output_writer.emit(OutputEvent::dim(
-                                    format!("  Ɵ {}", truncated),
-                                ));
+                                self.config
+                                    .output_writer
+                                    .emit(OutputEvent::dim(format!("  Ɵ {}", truncated)));
                                 reasoning_preview_shown = true;
                             }
                         }
@@ -1552,23 +1588,21 @@ impl AgentLoop {
                     if !self.config.json_output {
                         let total_tokens = tokens_in + tokens_out;
                         let cost = usage_chunk.total_cost.unwrap_or(0.0);
-                        self.config.output_writer.emit(OutputEvent::dim(
-                            format!(
-                                "  📊 {} tokens{} | ${:.4} | {:.0}% context",
-                                if total_tokens >= 1000 {
-                                    format!("{:.1}K", total_tokens as f64 / 1000.0)
-                                } else {
-                                    total_tokens.to_string()
-                                },
-                                if usage_chunk.reasoning_tokens.unwrap_or(0) > 0 {
-                                    format!(" ({} reasoning)", usage_chunk.reasoning_tokens.unwrap())
-                                } else {
-                                    String::new()
-                                },
-                                cost,
-                                context_usage_pct
-                            ),
-                        ));
+                        self.config.output_writer.emit(OutputEvent::dim(format!(
+                            "  📊 {} tokens{} | ${:.4} | {:.0}% context",
+                            if total_tokens >= 1000 {
+                                format!("{:.1}K", total_tokens as f64 / 1000.0)
+                            } else {
+                                total_tokens.to_string()
+                            },
+                            if usage_chunk.reasoning_tokens.unwrap_or(0) > 0 {
+                                format!(" ({} reasoning)", usage_chunk.reasoning_tokens.unwrap())
+                            } else {
+                                String::new()
+                            },
+                            cost,
+                            context_usage_pct
+                        )));
                     }
                 }
                 ApiStreamChunk::ToolCalls(tool_chunk) => {
@@ -1600,7 +1634,9 @@ impl AgentLoop {
                     // Print tool call header only on first appearance of this tool call key
                     if !self.config.json_output && !tool_calls_map.contains_key(&key) {
                         let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
-                        self.config.output_writer.emit(OutputEvent::tool_call(format!("▶ {}", tool_name)));
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::tool_call(format!("▶ {}", tool_name)));
                     }
                     if self.config.json_output {
                         tracing::info!(
@@ -1720,7 +1756,11 @@ impl AgentLoop {
                     code_block_snipped = true;
                 }
             }
-            print_code_block(&code_block_buffer, &code_block_lang, &self.config.output_writer);
+            print_code_block(
+                &code_block_buffer,
+                &code_block_lang,
+                &self.config.output_writer,
+            );
             if code_block_snipped {
                 let index = if self.config.interactive_mode {
                     Some(push_snipped_code_block(
@@ -1732,9 +1772,9 @@ impl AgentLoop {
                 } else {
                     None
                 };
-                self.config.output_writer.emit(OutputEvent::dim(
-                    snipped_code_block_hint(index),
-                ));
+                self.config
+                    .output_writer
+                    .emit(OutputEvent::dim(snipped_code_block_hint(index)));
             }
             self.config.output_writer.flush();
         } else if !display_buffer.is_empty() && !self.config.json_output {
@@ -1945,9 +1985,7 @@ impl AgentLoop {
                         .as_ref()
                         .unwrap_or(&serde_json::Value::Null);
                     let summary = format_tool_summary(tool_name, tool_params);
-                    self.config.output_writer.emit(OutputEvent::dim(
-                        summary,
-                    ));
+                    self.config.output_writer.emit(OutputEvent::dim(summary));
                     self.config.output_writer.flush();
                 }
             }
@@ -2320,10 +2358,12 @@ impl AgentLoop {
                             }
                         }
                         let status = if is_error { "✗" } else { "✓" };
-                        self.config.output_writer.emit(OutputEvent::error_or_success(
-                            format!("  {} {}", status, stats),
-                            is_error,
-                        ));
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::error_or_success(
+                                format!("  {} {}", status, stats),
+                                is_error,
+                            ));
                         if is_error && added == 0 && removed == 0 {
                             self.config.output_writer.emit(OutputEvent::dim(
                                 "  💡 Hint: If edit_file keeps failing, use write_to_file to rewrite the entire file instead.".to_string(),
@@ -2334,30 +2374,35 @@ impl AgentLoop {
                         let displayed = format_tool_result(&result_text, max_lines);
                         let status = if is_error { "✗" } else { "✓" };
                         let first_line = displayed.lines().next().unwrap_or("");
-                        self.config.output_writer.emit(OutputEvent::error_or_success(
-                            format!("  {} {}", status, first_line),
-                            is_error,
-                        ));
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::error_or_success(
+                                format!("  {} {}", status, first_line),
+                                is_error,
+                            ));
                     } else {
                         let max_lines = MAX_TOOL_RESULT_DISPLAY_LINES;
                         let displayed = format_tool_result(&result_text, max_lines);
                         let status = if is_error { "✗" } else { "✓" };
                         let mut display_lines = displayed.lines();
                         let first = display_lines.next().unwrap_or("");
-                        self.config.output_writer.emit(OutputEvent::error_or_success(
-                            format!("  {} {}", status, first),
-                            is_error,
-                        ));
-                        for line in display_lines.take(2) {
-                            self.config.output_writer.emit(OutputEvent::dim(
-                                format!("    {}", line),
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::error_or_success(
+                                format!("  {} {}", status, first),
+                                is_error,
                             ));
+                        for line in display_lines.take(2) {
+                            self.config
+                                .output_writer
+                                .emit(OutputEvent::dim(format!("    {}", line)));
                         }
                         let total_lines = displayed.lines().count();
                         if total_lines > 3 {
-                            self.config.output_writer.emit(OutputEvent::dim(
-                                format!("    ... {} more lines", total_lines - 3),
-                            ));
+                            self.config.output_writer.emit(OutputEvent::dim(format!(
+                                "    ... {} more lines",
+                                total_lines - 3
+                            )));
                         }
                     }
                 }
@@ -2489,9 +2534,9 @@ impl AgentLoop {
             }
 
             if !edit_files.is_empty() && !self.config.json_output {
-                self.config.output_writer.emit(OutputEvent::dim(
-                    format_heat_map(&edit_files),
-                ));
+                self.config
+                    .output_writer
+                    .emit(OutputEvent::dim(format_heat_map(&edit_files)));
 
                 // Auto-commit to shadow git after file-modifying turns
                 // Only commit if files were actually modified (not just attempted or failed)
@@ -2551,9 +2596,9 @@ impl AgentLoop {
                 }
 
                 if !parts.is_empty() {
-                    self.config.output_writer.emit(OutputEvent::dim(
-                        format!("  📝 {}", parts.join(", ")),
-                    ));
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::dim(format!("  📝 {}", parts.join(", "))));
                 }
             }
         }
@@ -2610,28 +2655,26 @@ impl AgentLoop {
                     String::new()
                 };
 
-                self.config.output_writer.emit(OutputEvent::dim(
-                    format!(
-                        "  📊 Tokens: {} in / {} out{}{}{} | Context: {:.1}%",
-                        tokens_in,
-                        tokens_out,
-                        if cache_writes > 0 || cache_reads > 0 {
-                            format!(
-                                " ({} cache write / {} cache read)",
-                                cache_writes, cache_reads
-                            )
-                        } else {
-                            String::new()
-                        },
-                        if reasoning > 0 {
-                            format!(" | {} reasoning", reasoning)
-                        } else {
-                            String::new()
-                        },
-                        cost_str,
-                        context_pct
-                    ),
-                ));
+                self.config.output_writer.emit(OutputEvent::dim(format!(
+                    "  📊 Tokens: {} in / {} out{}{}{} | Context: {:.1}%",
+                    tokens_in,
+                    tokens_out,
+                    if cache_writes > 0 || cache_reads > 0 {
+                        format!(
+                            " ({} cache write / {} cache read)",
+                            cache_writes, cache_reads
+                        )
+                    } else {
+                        String::new()
+                    },
+                    if reasoning > 0 {
+                        format!(" | {} reasoning", reasoning)
+                    } else {
+                        String::new()
+                    },
+                    cost_str,
+                    context_pct
+                )));
 
                 if context_pct >= 95.0 {
                     self.config.output_writer.emit(OutputEvent::yellow(
@@ -2652,12 +2695,10 @@ impl AgentLoop {
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(5.0);
                 if cost >= cost_warn_threshold {
-                    self.config.output_writer.emit(OutputEvent::yellow(
-                        format!(
-                            "⚠ Session cost ${:.2} (threshold: ${:.2})",
-                            cost, cost_warn_threshold
-                        ),
-                    ));
+                    self.config.output_writer.emit(OutputEvent::yellow(format!(
+                        "⚠ Session cost ${:.2} (threshold: ${:.2})",
+                        cost, cost_warn_threshold
+                    )));
                 }
             }
         }
@@ -2969,21 +3010,17 @@ impl AgentLoop {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string());
-            output_writer.emit(OutputEvent::dim(
-                format!(
-                    "  {:17} +{} -{}\t({})",
-                    filename, stats.lines_added, stats.lines_removed, stats.action
-                ),
-            ));
+            output_writer.emit(OutputEvent::dim(format!(
+                "  {:17} +{} -{}\t({})",
+                filename, stats.lines_added, stats.lines_removed, stats.action
+            )));
         }
 
         // Last executed command with ⚙ icon
         #[allow(clippy::collapsible_if)]
         if let Some(ref cmd) = state.last_executed_command {
             if !cmd.is_empty() {
-                output_writer.emit(OutputEvent::dim(
-                    format!("  ⚙ {}", cmd),
-                ));
+                output_writer.emit(OutputEvent::dim(format!("  ⚙ {}", cmd)));
             }
         }
 
@@ -2999,16 +3036,14 @@ impl AgentLoop {
         } else {
             String::from("$0.000")
         };
-        output_writer.emit(OutputEvent::dim(
-            format!(
-                "  📊 {} tokens | {} | {} turn{} | {}",
-                tokens_str,
-                cost_str,
-                state.turns_completed,
-                if state.turns_completed == 1 { "" } else { "s" },
-                Self::format_duration(duration)
-            ),
-        ));
+        output_writer.emit(OutputEvent::dim(format!(
+            "  📊 {} tokens | {} | {} turn{} | {}",
+            tokens_str,
+            cost_str,
+            state.turns_completed,
+            if state.turns_completed == 1 { "" } else { "s" },
+            Self::format_duration(duration)
+        )));
 
         crate::cli::colors::print_horizontal_rule_writer(output_writer);
 
@@ -3096,7 +3131,8 @@ impl AgentLoop {
         }
 
         // Build a map of tool_use_id → message index for all tool_uses in history
-        let mut tool_use_index: std::collections::HashMap<String, usize> = std::collections::HashMap::with_capacity(16);
+        let mut tool_use_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(16);
         for (idx, msg) in history.iter().enumerate() {
             if let MessageContent::AssistantBlocks(blocks) = &msg.content {
                 for block in blocks {
@@ -3834,8 +3870,8 @@ mod tests {
             &history,
             Some(&api_req_info),
             None,
-            false, // use_auto_condense = false
-            None,  // no compacted summary yet
+            false,       // use_auto_condense = false
+            None,        // no compacted summary yet
             "anthropic", // provider_name
         );
 
@@ -5401,8 +5437,14 @@ mod tests {
         // First message thinking should be truncated
         if let MessageContent::AssistantBlocks(blocks) = &history[0].content {
             if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
-                assert!(tb.thinking.len() < 10000, "Old thinking should be truncated");
-                assert!(tb.thinking.contains("[truncated]"), "Should have truncation marker");
+                assert!(
+                    tb.thinking.len() < 10000,
+                    "Old thinking should be truncated"
+                );
+                assert!(
+                    tb.thinking.contains("[truncated]"),
+                    "Should have truncation marker"
+                );
             } else {
                 panic!("First block should be Thinking");
             }
@@ -5413,8 +5455,15 @@ mod tests {
         // Second message thinking should NOT be truncated (most recent)
         if let MessageContent::AssistantBlocks(blocks) = &history[1].content {
             if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
-                assert_eq!(tb.thinking.len(), 10000, "Recent thinking should NOT be truncated");
-                assert!(!tb.thinking.contains("[truncated]"), "Should NOT have truncation marker");
+                assert_eq!(
+                    tb.thinking.len(),
+                    10000,
+                    "Recent thinking should NOT be truncated"
+                );
+                assert!(
+                    !tb.thinking.contains("[truncated]"),
+                    "Should NOT have truncation marker"
+                );
             } else {
                 panic!("First block should be Thinking");
             }
@@ -5435,8 +5484,8 @@ mod tests {
             StorageMessage {
                 id: None,
                 role: MessageRole::Assistant,
-                content: MessageContent::AssistantBlocks(vec![
-                    AssistantContentBlock::Thinking(ThinkingBlock {
+                content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
+                    ThinkingBlock {
                         thinking: "z".repeat(2000),
                         signature: "sig".to_string(),
                         shared: SharedContentFields {
@@ -5444,8 +5493,8 @@ mod tests {
                             signature: None,
                         },
                         summary: None,
-                    }),
-                ]),
+                    },
+                )]),
                 model_info: None,
                 metrics: None,
                 ts: Some(1000),
@@ -5454,8 +5503,8 @@ mod tests {
             StorageMessage {
                 id: None,
                 role: MessageRole::Assistant,
-                content: MessageContent::AssistantBlocks(vec![
-                    AssistantContentBlock::Thinking(ThinkingBlock {
+                content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
+                    ThinkingBlock {
                         thinking: "w".repeat(2000),
                         signature: "sig2".to_string(),
                         shared: SharedContentFields {
@@ -5463,8 +5512,8 @@ mod tests {
                             signature: None,
                         },
                         summary: None,
-                    }),
-                ]),
+                    },
+                )]),
                 model_info: None,
                 metrics: None,
                 ts: Some(2000),
@@ -5474,18 +5523,28 @@ mod tests {
         truncate_old_thinking_blocks(&mut history);
 
         // With 100 token limit (400 chars), first message's 2000 chars should be truncated
-        if let MessageContent::AssistantBlocks(blocks) = &history[0].content {
-            if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
-                assert!(tb.thinking.len() < 2000, "Should be truncated with custom limit");
-                assert!(tb.thinking.contains("[truncated]"), "Should have truncation marker");
-            }
+        if let MessageContent::AssistantBlocks(blocks) = &history[0].content
+            && let AssistantContentBlock::Thinking(tb) = &blocks[0]
+        {
+            assert!(
+                tb.thinking.len() < 2000,
+                "Should be truncated with custom limit"
+            );
+            assert!(
+                tb.thinking.contains("[truncated]"),
+                "Should have truncation marker"
+            );
         }
 
         // Second message (most recent) should NOT be truncated
-        if let MessageContent::AssistantBlocks(blocks) = &history[1].content {
-            if let AssistantContentBlock::Thinking(tb) = &blocks[0] {
-                assert_eq!(tb.thinking.len(), 2000, "Most recent thinking should NOT be truncated");
-            }
+        if let MessageContent::AssistantBlocks(blocks) = &history[1].content
+            && let AssistantContentBlock::Thinking(tb) = &blocks[0]
+        {
+            assert_eq!(
+                tb.thinking.len(),
+                2000,
+                "Most recent thinking should NOT be truncated"
+            );
         }
 
         unsafe {
@@ -5542,10 +5601,7 @@ mod tests {
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
-        let mut agent = AgentLoop::new(test_agent_config(
-            provider,
-            "test-cumulative-tokens",
-        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-cumulative-tokens"));
 
         // Execute turn 1
         let result1 = agent.execute_turn().await;
@@ -5579,11 +5635,13 @@ mod tests {
             );
             let api_info = state.last_api_req_info.as_ref().unwrap();
             assert_eq!(
-                api_info.tokens_in, Some(100),
+                api_info.tokens_in,
+                Some(100),
                 "Turn 1 api_req_info tokens_in should be 100"
             );
             assert_eq!(
-                api_info.tokens_out, Some(50),
+                api_info.tokens_out,
+                Some(50),
                 "Turn 1 api_req_info tokens_out should be 50"
             );
             // Context percentage: (100+50)/8192*100 = 1.8310546875
@@ -5622,11 +5680,13 @@ mod tests {
             // Check last_api_req_info
             let api_info = state.last_api_req_info.as_ref().unwrap();
             assert_eq!(
-                api_info.tokens_in, Some(200),
+                api_info.tokens_in,
+                Some(200),
                 "Turn 2 api_req_info tokens_in should be 200"
             );
             assert_eq!(
-                api_info.tokens_out, Some(100),
+                api_info.tokens_out,
+                Some(100),
                 "Turn 2 api_req_info tokens_out should be 100"
             );
             // Context percentage: (200+100)/8192*100 = 3.662109375
@@ -5655,10 +5715,7 @@ mod tests {
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
-        let mut agent = AgentLoop::new(test_agent_config(
-            provider,
-            "test-context-fallback",
-        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-context-fallback"));
 
         // Execute turn 1
         let _result = agent.execute_turn().await;

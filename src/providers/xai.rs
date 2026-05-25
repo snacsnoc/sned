@@ -68,7 +68,7 @@ pub fn get_xai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         supports_images: Some(true),
         supports_prompt_cache: true,
         supports_reasoning: Some(false),
-        input_price: Some(1.25), // $1.25 / 1M tokens
+        input_price: Some(1.25),  // $1.25 / 1M tokens
         output_price: Some(2.50), // $2.50 / 1M tokens
         image_output_price: None,
         thinking_config: None,

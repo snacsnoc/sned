@@ -142,7 +142,7 @@ fn test_history_subcommand_empty() {
     cmd.arg("history");
     cmd.assert()
         .success()
-        .stdout(contains("No task history found."));
+        .stdout(contains("No task history found matching"));
 }
 
 #[test]

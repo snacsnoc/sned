@@ -36,7 +36,9 @@ impl OutputEvent {
         use ratatui::style::{Color, Modifier, Style};
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
         )))
     }
 
@@ -117,7 +119,9 @@ impl OutputEvent {
         use ratatui::style::{Color, Modifier, Style};
         OutputEvent::Line(Line::from(Span::styled(
             format!("[sned] {}", text),
-            Style::default().fg(Color::White).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::DIM),
         )))
     }
 

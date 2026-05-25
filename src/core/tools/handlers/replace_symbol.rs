@@ -586,7 +586,7 @@ mod tests {
         // for each calculate_byte_offset call
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace_root = temp_dir.path();
-        
+
         // Create a test file with a symbol to replace
         let file_content = "fn foo() {}\nfn bar() { foo(); }\n";
         std::fs::write(workspace_root.join("test.rs"), file_content).unwrap();
@@ -606,7 +606,7 @@ mod tests {
 
         // Verify the result indicates replacements were made
         assert!(result.contains("test.rs"));
-        
+
         // Verify the file was updated correctly
         let new_content = fs::read_to_string(workspace_root.join("test.rs"))
             .await

@@ -65,7 +65,7 @@ impl SearchFilesHandler {
             // --max-count: limit matches per file (prevents huge single-file results)
             let mut c = Command::new("rg");
             c.args(["--line-number", "--color=never", "--with-filename"]);
-            
+
             // Limit per-file to prevent huge results from single files
             let max_per_file = std::env::var(SEARCH_MAX_LINES_ENV)
                 .ok()
@@ -123,7 +123,7 @@ impl SearchFilesHandler {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_SEARCH_MAX_LINES as usize);
-            
+
             if lines.len() >= max_lines {
                 let mut result = lines.join("\n");
                 result.push_str(&format!(
@@ -308,7 +308,10 @@ mod tests {
     async fn test_search_files_respects_max_count_per_file() {
         // Create a file with more matches than the default limit (100)
         let temp_dir = TempDir::new().unwrap();
-        let content = (0..150).map(|i| format!("match {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (0..150)
+            .map(|i| format!("match {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(temp_dir.path().join("large_file.txt"), content).unwrap();
 
         let handler = SearchFilesHandler::new();
@@ -323,7 +326,11 @@ mod tests {
             .lines()
             .filter(|l| l.contains("large_file.txt:"))
             .count();
-        assert!(line_count <= 100, "expected <= 100 match lines, got {}", line_count);
+        assert!(
+            line_count <= 100,
+            "expected <= 100 match lines, got {}",
+            line_count
+        );
         assert!(result.contains("Too many matches"));
     }
 
@@ -337,7 +344,10 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         // Create a single file with more matches than the limit
-        let content = (0..50).map(|i| format!("match {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (0..50)
+            .map(|i| format!("match {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(temp_dir.path().join("large_file.txt"), content).unwrap();
 
         let handler = SearchFilesHandler::new();
@@ -352,7 +362,11 @@ mod tests {
             .lines()
             .filter(|l| l.contains("large_file.txt:"))
             .count();
-        assert!(line_count <= 10, "expected <= 10 match lines, got {}", line_count);
+        assert!(
+            line_count <= 10,
+            "expected <= 10 match lines, got {}",
+            line_count
+        );
         assert!(result.contains("Too many matches"));
 
         unsafe {
@@ -414,6 +428,9 @@ mod tests {
             "ripgrep availability was checked twice ({} vs {})",
             calls_after_first, calls_after_second
         );
-        assert_eq!(calls_after_first, 1, "expected exactly one availability check");
+        assert_eq!(
+            calls_after_first, 1,
+            "expected exactly one availability check"
+        );
     }
 }

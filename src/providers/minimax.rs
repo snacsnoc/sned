@@ -166,12 +166,17 @@ impl MinimaxProvider {
             body["tools"] = json!(tools_json);
             // Tool choice: respect request.tool_choice if provided
             // MiniMax uses OpenAI-compatible format: "auto"|"required"|"none" or {"type": "function", ...}
-            let tool_choice = request.tool_choice.as_ref().unwrap_or(&crate::providers::ToolChoice::Auto);
+            let tool_choice = request
+                .tool_choice
+                .as_ref()
+                .unwrap_or(&crate::providers::ToolChoice::Auto);
             body["tool_choice"] = match tool_choice {
                 crate::providers::ToolChoice::Auto => json!("auto"),
                 crate::providers::ToolChoice::Required => json!("required"),
                 crate::providers::ToolChoice::None => json!("none"),
-                crate::providers::ToolChoice::Named(name) => json!({"type": "function", "function": {"name": name}}),
+                crate::providers::ToolChoice::Named(name) => {
+                    json!({"type": "function", "function": {"name": name}})
+                }
             };
         }
 
@@ -239,8 +244,7 @@ impl MinimaxProvider {
                 cache_writes_price: Some(0.375),
                 cache_reads_price: Some(0.06),
                 description: Some(
-                    "MiniMax M2.7 Highspeed: Same performance, faster and more agile."
-                        .to_string(),
+                    "MiniMax M2.7 Highspeed: Same performance, faster and more agile.".to_string(),
                 ),
                 tiers: None,
                 temperature: Some(1.0),
@@ -297,8 +301,7 @@ impl MinimaxProvider {
                 cache_writes_price: Some(0.375),
                 cache_reads_price: Some(0.03),
                 description: Some(
-                    "MiniMax M2.5 highspeed: Same performance, faster and more agile."
-                        .to_string(),
+                    "MiniMax M2.5 highspeed: Same performance, faster and more agile.".to_string(),
                 ),
                 tiers: None,
                 temperature: Some(1.0),
@@ -354,10 +357,7 @@ impl MinimaxProvider {
                 supports_global_endpoint: None,
                 cache_writes_price: Some(0.375),
                 cache_reads_price: Some(0.03),
-                description: Some(
-                    "MiniMax M2.1 highspeed: Faster and more agile."
-                        .to_string(),
-                ),
+                description: Some("MiniMax M2.1 highspeed: Faster and more agile.".to_string()),
                 tiers: None,
                 temperature: Some(1.0),
                 supports_tools: Some(true),
@@ -384,8 +384,7 @@ impl MinimaxProvider {
                 cache_writes_price: Some(0.375),
                 cache_reads_price: Some(0.03),
                 description: Some(
-                    "MiniMax M2 - Agentic capabilities, Advanced reasoning."
-                        .to_string(),
+                    "MiniMax M2 - Agentic capabilities, Advanced reasoning.".to_string(),
                 ),
                 tiers: None,
                 temperature: Some(1.0),
@@ -1493,8 +1492,8 @@ mod tests {
         let msg = StorageMessage {
             id: None,
             role: MessageRole::Assistant,
-            content: MessageContent::AssistantBlocks(vec![
-                AssistantContentBlock::ToolUse(crate::providers::ToolUseBlock {
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                crate::providers::ToolUseBlock {
                     id: "call_abc".to_string(),
                     name: "read_file".to_string(),
                     input: json!({"path": "Cargo.toml"}),
@@ -1503,8 +1502,8 @@ mod tests {
                         signature: None,
                     },
                     reasoning_details: None,
-                }),
-            ]),
+                },
+            )]),
             model_info: None,
             metrics: None,
             ts: None,
@@ -1565,23 +1564,40 @@ mod tests {
         let body = provider.build_request_body(&request).unwrap();
 
         // 1. reasoning_split must be top-level (not nested in extra_body)
-        assert_eq!(body["reasoning_split"], true, "reasoning_split must be top-level");
-        assert!(body.get("extra_body").is_none(), "extra_body should not exist in request body");
+        assert_eq!(
+            body["reasoning_split"], true,
+            "reasoning_split must be top-level"
+        );
+        assert!(
+            body.get("extra_body").is_none(),
+            "extra_body should not exist in request body"
+        );
 
         // 2. Tools must use nested format with "type":"function"
         let tools_arr = body["tools"].as_array().expect("tools should be array");
         assert_eq!(tools_arr.len(), 1);
         let tool = &tools_arr[0];
         assert_eq!(tool["type"], "function", "tool must have type='function'");
-        assert!(tool["function"].is_object(), "tool must have nested 'function' object");
+        assert!(
+            tool["function"].is_object(),
+            "tool must have nested 'function' object"
+        );
         assert_eq!(tool["function"]["name"], "read_file");
 
         // 3. Must use max_completion_tokens (not max_tokens)
-        assert_eq!(body["max_completion_tokens"], 1024, "must use max_completion_tokens");
-        assert!(body.get("max_tokens").is_none(), "max_tokens should not exist in request body");
+        assert_eq!(
+            body["max_completion_tokens"], 1024,
+            "must use max_completion_tokens"
+        );
+        assert!(
+            body.get("max_tokens").is_none(),
+            "max_tokens should not exist in request body"
+        );
 
         // 4. Messages must have non-null content
-        let messages = body["messages"].as_array().expect("messages should be array");
+        let messages = body["messages"]
+            .as_array()
+            .expect("messages should be array");
         for (i, msg) in messages.iter().enumerate() {
             assert!(
                 msg.get("content").is_some(),

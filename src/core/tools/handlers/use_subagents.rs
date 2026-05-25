@@ -135,7 +135,7 @@ impl UseSubagentsHandler {
                     status: "failed".to_string(),
                     error: Some(format!("spawn failed: {}", e)),
                     ..Default::default()
-                }
+                };
             }
         };
 
@@ -153,11 +153,7 @@ impl UseSubagentsHandler {
             let _ = fd.read_to_string(&mut stderr_buf).await;
         }
 
-        let wait_result = timeout(
-            Duration::from_secs(timeout_secs),
-            child.wait(),
-        )
-        .await;
+        let wait_result = timeout(Duration::from_secs(timeout_secs), child.wait()).await;
 
         match wait_result {
             Ok(Ok(status)) => {
@@ -466,8 +462,14 @@ impl UseSubagentsHandler {
             .unwrap_or_else(|| Path::new(".").to_path_buf());
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
-        self.execute_with_workspace_root(state, params, workspace_root.as_path(), false, &output_writer)
-            .await
+        self.execute_with_workspace_root(
+            state,
+            params,
+            workspace_root.as_path(),
+            false,
+            &output_writer,
+        )
+        .await
     }
 }
 
@@ -732,6 +734,9 @@ mod tests {
         //
         // This test documents the pattern - actual deadlock testing would
         // require spawning a process that fills pipe buffers.
-        assert!(true); // Pattern verified by code inspection
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(true); // Pattern verified by code inspection
+        }
     }
 }

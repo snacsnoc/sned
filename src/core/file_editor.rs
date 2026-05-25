@@ -10,17 +10,15 @@
 //! CRITICAL: The hash-anchored edit system is Sned's single most important
 //! feature. Port the exact algorithm from TypeScript, do not change it.
 
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use indexmap::IndexMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::anchor_dictionary::ANCHOR_DICTIONARY;
-use crate::core::hash_utils::{
-    ANCHOR_DELIMITER, compute_hashes, split_anchor, strip_hashes,
-};
+use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor, strip_hashes};
 
 // ============================================================================
 // Error Types
@@ -128,8 +126,9 @@ impl AnchorStorage {
         let anchors_file = cache_dir.join("anchors.json");
 
         if let Ok(content) = std::fs::read_to_string(&anchors_file) {
-            match serde_json::from_str::<IndexMap<String, IndexMap<String, TrackedDocument>>>(&content)
-            {
+            match serde_json::from_str::<IndexMap<String, IndexMap<String, TrackedDocument>>>(
+                &content,
+            ) {
                 Ok(tasks) => {
                     tracing::debug!("Loaded {} task(s) from anchor cache", tasks.len());
                     return Self {
@@ -262,12 +261,10 @@ impl FileEditGuard {
     }
 
     pub fn try_acquire(path: &str) -> Option<Self> {
-        FILE_LOCK_MANAGER
-            .try_acquire(path)
-            .map(|_guard| Self {
-                _guard,
-                path: path.to_string(),
-            })
+        FILE_LOCK_MANAGER.try_acquire(path).map(|_guard| Self {
+            _guard,
+            path: path.to_string(),
+        })
     }
 }
 
@@ -538,10 +535,10 @@ impl AnchorStateManager {
         };
         let anchors = tracked.anchors.clone();
         self.update_state(absolute_path, tracked, task_id);
-        
+
         // Persist anchor state to disk
         self.save();
-        
+
         anchors
     }
 
@@ -1317,10 +1314,17 @@ mod tests {
 
         // Verify state is still scoped: modifying one task doesn't affect the other
         let modified_lines = vec!["def hello():".to_string(), "    pass".to_string()];
-        let anchors1_modified = anchor_mgr.reconcile("/tmp/scope1.py", &modified_lines, Some("scope_task1"));
+        let anchors1_modified =
+            anchor_mgr.reconcile("/tmp/scope1.py", &modified_lines, Some("scope_task1"));
         // Task 1 should have 2 anchors now, task 2 still has 1
         assert_eq!(anchors1_modified.len(), 2);
-        assert_eq!(anchor_mgr.get_anchors("/tmp/scope2.py", Some("scope_task2")).unwrap().len(), 1);
+        assert_eq!(
+            anchor_mgr
+                .get_anchors("/tmp/scope2.py", Some("scope_task2"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1752,7 +1756,7 @@ mod tests {
         // Simulate eviction when exceeding MAX_USED_WORDS (we'll use a smaller threshold for testing)
         const TEST_MAX_USED_WORDS: usize = 3;
         if used_words_vec.len() > TEST_MAX_USED_WORDS {
-            let to_remove_count = (used_words_vec.len() - TEST_MAX_USED_WORDS + 1) / 2;
+            let to_remove_count = (used_words_vec.len() - TEST_MAX_USED_WORDS).div_ceil(2);
             for _ in 0..to_remove_count {
                 if let Some(word) = used_words_vec.pop_front() {
                     used_words_set.remove(&word);
@@ -1865,7 +1869,11 @@ mod tests {
         // Simulate eviction at limit
         if storage.tasks.len() >= 3 {
             let oldest = storage.tasks.keys().next().cloned();
-            assert_eq!(oldest, Some("task_b".to_string()), "task_b should be oldest");
+            assert_eq!(
+                oldest,
+                Some("task_b".to_string()),
+                "task_b should be oldest"
+            );
             storage.tasks.shift_remove(&oldest.unwrap());
         }
 
@@ -1878,9 +1886,6 @@ mod tests {
             storage.tasks.contains_key("task_a"),
             "task_a (recently used) should remain"
         );
-        assert!(
-            storage.tasks.contains_key("task_c"),
-            "task_c should remain"
-        );
+        assert!(storage.tasks.contains_key("task_c"), "task_c should remain");
     }
 }

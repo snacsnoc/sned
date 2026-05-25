@@ -25,11 +25,11 @@ use crate::core::tools::{SnedTool, ToolCategory};
 use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal};
 use std::path::Path;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -47,9 +47,9 @@ const DANGEROUS_FIND_FLAGS: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "
 /// Commands that are always denied regardless of SNED_SAFE_COMMANDS or user approval.
 /// These cannot be whitelisted via environment variable.
 const HARD_CODED_DENY_LIST: &[&str] = &[
-    "rm", "dd", "mkfs", "curl", "wget", "nc", "ncat", "netcat", "ssh", "sudo",
-    "chmod", "chown", "kill", "killall", "reboot", "shutdown", "poweroff",
-    "insmod", "rmmod", "modprobe", "apt-get", "yum", "dnf", "apt",
+    "rm", "dd", "mkfs", "curl", "wget", "nc", "ncat", "netcat", "ssh", "sudo", "chmod", "chown",
+    "kill", "killall", "reboot", "shutdown", "poweroff", "insmod", "rmmod", "modprobe", "apt-get",
+    "yum", "dnf", "apt",
 ];
 
 #[derive(Debug, Clone)]
@@ -349,8 +349,6 @@ pub struct ApprovalManager {
     user_safe_commands: Vec<String>,
 }
 
-
-
 impl ApprovalManager {
     /// Create a new approval manager with no session auto-approvals.
     pub fn new() -> Self {
@@ -517,9 +515,7 @@ impl ApprovalManager {
             ToolCategory::EditFiles => (s.edit_files, s.edit_files_externally),
             ToolCategory::ExecuteCommand => (s.execute_commands, false),
             ToolCategory::WebFetch => (s.use_browser, false),
-            ToolCategory::ReadOnly | ToolCategory::Other => {
-                (false, false)
-            }
+            ToolCategory::ReadOnly | ToolCategory::Other => (false, false),
         }
     }
 
@@ -611,7 +607,7 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
     match tool_name {
         "execute_command" => {
             let mut output = String::new();
-            
+
             // Handle all three parameter forms: "commands" (array), "command" (singular), "script"
             if let Some(commands) = obj.get("commands").and_then(|v| v.as_array()) {
                 // Primary form: array of commands
@@ -633,7 +629,7 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
                 output.push_str("\n    ");
                 output.push_str(script);
             }
-            
+
             if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str())
                 && cwd != "."
             {
@@ -752,7 +748,7 @@ impl Drop for TermiosGuard {
 fn read_single_char_raw() -> io::Result<char> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_raw_fd();
-    
+
     // Save original terminal settings
     let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
     let restore_guard = unsafe {
@@ -765,17 +761,17 @@ fn read_single_char_raw() -> io::Result<char> {
             None
         }
     };
-    
+
     // Set raw mode: disable canonical mode, echo, and signal generation
     let mut raw_termios = original_termios;
     raw_termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
     raw_termios.c_cc[libc::VMIN] = 1;
     raw_termios.c_cc[libc::VTIME] = 0;
-    
+
     if unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_termios) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    
+
     // Read single character directly from fd (avoids borrow checker issue with stdin())
     let mut buf = [0u8; 1];
     let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
@@ -786,7 +782,7 @@ fn read_single_char_raw() -> io::Result<char> {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin closed"));
     }
     let c = buf[0] as char;
-    
+
     drop(restore_guard);
     Ok(c)
 }
@@ -794,8 +790,8 @@ fn read_single_char_raw() -> io::Result<char> {
 /// Read a single character from stdin in raw mode (fallback for non-Unix).
 #[cfg(not(unix))]
 fn read_single_char_raw() -> io::Result<char> {
-    use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
-    
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
     let _ = enable_raw_mode();
     let mut buf = [0u8; 1];
     let result = match io::stdin().read_exact(&mut buf) {
@@ -883,11 +879,8 @@ pub fn is_approval_prompt_active() -> bool {
     APPROVAL_PROMPT_ACTIVE.load(Ordering::SeqCst)
 }
 
-
-
 /// No-op retained for Ctrl+C handler compatibility; the approval channel was removed.
-pub fn clear_approval_sender() {
-}
+pub fn clear_approval_sender() {}
 
 // ============================================================================
 // Followup Question Input
@@ -946,9 +939,11 @@ pub async fn prompt_for_approval_async(
     let tool_name = tool_name.to_string();
     let params_owned = params.clone();
 
-    tokio::task::spawn_blocking(move || prompt_for_approval(&tool_name, &params_owned, &output_writer))
-        .await
-        .map_err(|e| io::Error::other(format!("spawn_blocking failed: {}", e)))?
+    tokio::task::spawn_blocking(move || {
+        prompt_for_approval(&tool_name, &params_owned, &output_writer)
+    })
+    .await
+    .map_err(|e| io::Error::other(format!("spawn_blocking failed: {}", e)))?
 }
 
 /// Prompt the user for combined approval of multiple file edits.
@@ -1064,7 +1059,6 @@ fn build_combined_approval_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn test_approval_prompt_active_flag_is_initially_false() {
@@ -1177,18 +1171,25 @@ mod tests {
     fn test_prompt_non_interactive_approves() {
         // In non-interactive mode (stdin is not a tty), the tool is auto-approved
         // This is the common case in tests since cargo test redirects stdin
-        let output_writer: crate::cli::output::OutputWriterArc = std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
-        let result = prompt_for_approval("execute_command", &serde_json::json!({"command": "ls"}), &output_writer)
-            .expect("prompt should succeed");
+        let output_writer: crate::cli::output::OutputWriterArc =
+            std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
+        let result = prompt_for_approval(
+            "execute_command",
+            &serde_json::json!({"command": "ls"}),
+            &output_writer,
+        )
+        .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);
     }
 
     #[test]
     #[ignore = "requires interactive stdin - tested manually"]
     fn test_prompt_empty_params() {
-        let output_writer: crate::cli::output::OutputWriterArc = std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
-        let result = prompt_for_approval("attempt_completion", &serde_json::json!({}), &output_writer)
-            .expect("prompt should succeed");
+        let output_writer: crate::cli::output::OutputWriterArc =
+            std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
+        let result =
+            prompt_for_approval("attempt_completion", &serde_json::json!({}), &output_writer)
+                .expect("prompt should succeed");
         assert_eq!(result, ApprovalResult::Approved);
     }
 

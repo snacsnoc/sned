@@ -428,10 +428,7 @@ mod tests {
             );
 
             let output = writer.output();
-            assert!(
-                output.contains("corrupted global state JSON"),
-                "{output}"
-            );
+            assert!(output.contains("corrupted global state JSON"), "{output}");
             assert!(output.contains("global_settings.json"), "{output}");
         });
     }

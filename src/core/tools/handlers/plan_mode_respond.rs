@@ -62,13 +62,10 @@ impl PlanModeRespondHandler {
             use crate::cli::output::OutputEvent;
             use ratatui::style::{Color, Modifier, Style};
             ctx.output_writer.emit(OutputEvent::styled(
-                format!(
-                    "\n{} {}\n{}\n",
-                    "📋",
-                    "Plan",
-                    response
-                ),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                format!("\n{} {}\n{}\n", "📋", "Plan", response),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
 
@@ -108,7 +105,9 @@ mod tests {
     #[tokio::test]
     async fn test_plan_mode_respond_missing_response() {
         let handler = PlanModeRespondHandler::new();
-        let state = Arc::new(tokio::sync::Mutex::new(crate::core::agent_loop::TaskState::default()));
+        let state = Arc::new(tokio::sync::Mutex::new(
+            crate::core::agent_loop::TaskState::default(),
+        ));
         let ctx = ToolContext::new(
             state,
             None,
@@ -128,7 +127,9 @@ mod tests {
     #[tokio::test]
     async fn test_plan_mode_respond_success() {
         let handler = PlanModeRespondHandler::new();
-        let state = Arc::new(tokio::sync::Mutex::new(crate::core::agent_loop::TaskState::default()));
+        let state = Arc::new(tokio::sync::Mutex::new(
+            crate::core::agent_loop::TaskState::default(),
+        ));
         let ctx = ToolContext::new(
             state,
             None,
@@ -150,7 +151,9 @@ mod tests {
     #[tokio::test]
     async fn test_plan_mode_respond_needs_more() {
         let handler = PlanModeRespondHandler::new();
-        let state = Arc::new(tokio::sync::Mutex::new(crate::core::agent_loop::TaskState::default()));
+        let state = Arc::new(tokio::sync::Mutex::new(
+            crate::core::agent_loop::TaskState::default(),
+        ));
         let ctx = ToolContext::new(
             state,
             None,

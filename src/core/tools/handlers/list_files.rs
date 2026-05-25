@@ -623,7 +623,11 @@ mod tests {
         fs::write(temp_dir.path().join("file2.txt"), "line1\nline2\n").unwrap();
         fs::write(temp_dir.path().join("file3.txt"), "single line").unwrap();
         fs::write(temp_dir.path().join("file4.txt"), "").unwrap();
-        fs::write(temp_dir.path().join("file5.txt"), "line1\nline2\nline3\nline4\nline5\n").unwrap();
+        fs::write(
+            temp_dir.path().join("file5.txt"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
 
         let handler = ListFilesHandler::new();
         let result = handler
@@ -641,11 +645,26 @@ mod tests {
             .map(|f| (f.path.clone(), f.line_count))
             .collect();
 
-        assert_eq!(file_counts.remove(&format!("{}/file1.txt", temp_dir.path().display())), Some(Some(3)));
-        assert_eq!(file_counts.remove(&format!("{}/file2.txt", temp_dir.path().display())), Some(Some(2)));
-        assert_eq!(file_counts.remove(&format!("{}/file3.txt", temp_dir.path().display())), Some(Some(1)));
-        assert_eq!(file_counts.remove(&format!("{}/file4.txt", temp_dir.path().display())), Some(Some(0)));
-        assert_eq!(file_counts.remove(&format!("{}/file5.txt", temp_dir.path().display())), Some(Some(5)));
+        assert_eq!(
+            file_counts.remove(&format!("{}/file1.txt", temp_dir.path().display())),
+            Some(Some(3))
+        );
+        assert_eq!(
+            file_counts.remove(&format!("{}/file2.txt", temp_dir.path().display())),
+            Some(Some(2))
+        );
+        assert_eq!(
+            file_counts.remove(&format!("{}/file3.txt", temp_dir.path().display())),
+            Some(Some(1))
+        );
+        assert_eq!(
+            file_counts.remove(&format!("{}/file4.txt", temp_dir.path().display())),
+            Some(Some(0))
+        );
+        assert_eq!(
+            file_counts.remove(&format!("{}/file5.txt", temp_dir.path().display())),
+            Some(Some(5))
+        );
         assert!(file_counts.is_empty());
     }
 
@@ -658,7 +677,11 @@ mod tests {
         fs::write(temp_dir.path().join("subdir/nested1.txt"), "a\nb\nc\nd\n").unwrap();
         fs::write(temp_dir.path().join("subdir/nested2.txt"), "x\n").unwrap();
         fs::create_dir(temp_dir.path().join("subdir/deeper")).unwrap();
-        fs::write(temp_dir.path().join("subdir/deeper/deep.txt"), "1\n2\n3\n4\n5\n6\n").unwrap();
+        fs::write(
+            temp_dir.path().join("subdir/deeper/deep.txt"),
+            "1\n2\n3\n4\n5\n6\n",
+        )
+        .unwrap();
 
         let handler = ListFilesHandler::new();
         let result = handler
@@ -677,10 +700,25 @@ mod tests {
             .map(|f| (f.path.clone(), f.line_count))
             .collect();
 
-        assert_eq!(file_counts.remove(&format!("{}/root.txt", temp_dir.path().display())), Some(Some(2)));
-        assert_eq!(file_counts.remove(&format!("{}/subdir/nested1.txt", temp_dir.path().display())), Some(Some(4)));
-        assert_eq!(file_counts.remove(&format!("{}/subdir/nested2.txt", temp_dir.path().display())), Some(Some(1)));
-        assert_eq!(file_counts.remove(&format!("{}/subdir/deeper/deep.txt", temp_dir.path().display())), Some(Some(6)));
+        assert_eq!(
+            file_counts.remove(&format!("{}/root.txt", temp_dir.path().display())),
+            Some(Some(2))
+        );
+        assert_eq!(
+            file_counts.remove(&format!("{}/subdir/nested1.txt", temp_dir.path().display())),
+            Some(Some(4))
+        );
+        assert_eq!(
+            file_counts.remove(&format!("{}/subdir/nested2.txt", temp_dir.path().display())),
+            Some(Some(1))
+        );
+        assert_eq!(
+            file_counts.remove(&format!(
+                "{}/subdir/deeper/deep.txt",
+                temp_dir.path().display()
+            )),
+            Some(Some(6))
+        );
         assert!(file_counts.is_empty());
     }
 }

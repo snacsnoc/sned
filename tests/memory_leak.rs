@@ -117,9 +117,6 @@ async fn test_symbol_index_db_connections_closed() {
 }
 
 /// Test that spinner cleanup works properly.
-///
-
-
 /// Test that checkpoint tracker cleans up properly.
 ///
 /// Verifies checkpoint operations complete without hanging.

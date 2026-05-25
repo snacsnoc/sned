@@ -73,7 +73,7 @@ impl FindSymbolReferencesHandler {
                 .map_err(|e| {
                     ToolError::ExecutionFailed(format!("Error finding references: {}", e))
                 })?;
-            
+
             let lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
             file_data.insert(path.clone(), FileData { lines, hits });
         }
@@ -82,7 +82,10 @@ impl FindSymbolReferencesHandler {
             return Err(err);
         }
 
-        let total_hits = file_data.values().map(|data| data.hits.len()).sum::<usize>();
+        let total_hits = file_data
+            .values()
+            .map(|data| data.hits.len())
+            .sum::<usize>();
         if total_hits == 0 {
             let kind = if find_type == "both" {
                 "references or definitions".to_string()
@@ -305,7 +308,7 @@ mod tests {
         // Test that find_symbol_references works correctly with stored file content
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace_root = temp_dir.path();
-        
+
         // Create a test file with a function and its reference
         let file_content = "fn foo() {}\nfn bar() { foo(); }\n";
         std::fs::write(workspace_root.join("test.rs"), file_content).unwrap();
@@ -332,7 +335,7 @@ mod tests {
         });
 
         let result = handler.execute(&ctx, params).await.unwrap();
-        
+
         // Verify the result contains both the definition and reference
         let result_str = result.as_str().unwrap();
         assert!(result_str.contains("test.rs"));

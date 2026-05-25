@@ -475,7 +475,8 @@ pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
     if let Some(cmd) = result.command {
         // Try the command with argument first (handles /help <command>, etc.)
         if !result.processed_text.is_empty()
-            && let Some(parsed) = CliOnlyCommand::parse_with_arg(&cmd.command, result.processed_text.trim())
+            && let Some(parsed) =
+                CliOnlyCommand::parse_with_arg(&cmd.command, result.processed_text.trim())
         {
             return Some(parsed);
         }
@@ -485,7 +486,8 @@ pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
         }
         // Fall back to full command + args (handles /checkpoint list, /checkpoint restore N, etc.)
         if !result.processed_text.is_empty()
-            && let Some(parsed) = CliOnlyCommand::parse(&format!("{} {}", cmd.command, result.processed_text))
+            && let Some(parsed) =
+                CliOnlyCommand::parse(&format!("{} {}", cmd.command, result.processed_text))
         {
             return Some(parsed);
         }
@@ -553,57 +555,361 @@ pub fn format_help_text() -> String {
     use crate::cli::colors::style;
 
     let mut s = String::new();
-    s.push_str(&format!("{}{}═══════ Sned Commands ═══════{}\n\n", style::BOLD, style::CYAN, style::RESET));
-    
-    s.push_str(&format!("{}{}Base Commands (sent to AI):{}\n", style::BOLD, style::CYAN, style::RESET));
-    s.push_str(&format!("{}─────────────────────────────{}\n", style::DIM, style::RESET));
-    s.push_str(&format!("  {}{}{}  - {}Create a new task with context from the current task{}\n", style::CYAN, "/newtask", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Condense your current context window{}\n", style::CYAN, "/compact", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Create a new Snad rule based on your conversation{}\n", style::CYAN, "/newrule", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Submit a bug report to GitHub{}\n", style::CYAN, "/reportbug", style::DIM, style::RESET, style::DIM));
+    s.push_str(&format!(
+        "{}{}═══════ Sned Commands ═══════{}\n\n",
+        style::BOLD,
+        style::CYAN,
+        style::RESET
+    ));
+
+    s.push_str(&format!(
+        "{}{}Base Commands (sent to AI):{}\n",
+        style::BOLD,
+        style::CYAN,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "{}─────────────────────────────{}\n",
+        style::DIM,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Create a new task with context from the current task{}\n",
+        style::CYAN,
+        "/newtask",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Condense your current context window{}\n",
+        style::CYAN,
+        "/compact",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Create a new Snad rule based on your conversation{}\n",
+        style::CYAN,
+        "/newrule",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Submit a bug report to GitHub{}\n",
+        style::CYAN,
+        "/reportbug",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
     s.push_str(&format!("  {}{}{}  - {}Explain the changes you have made to the code (alias: /explain_changes){}\n\n", style::CYAN, "/explain-changes", style::DIM, style::RESET, style::DIM));
-    
-    s.push_str(&format!("{}{}CLI-Only Commands (handled locally):{}\n", style::BOLD, style::CYAN, style::RESET));
-    s.push_str(&format!("{}─────────────────────────────{}\n", style::DIM, style::RESET));
-    s.push_str(&format!("  {}{}{}  - {}Exit the CLI (aliases: /q, /quit){}\n", style::CYAN, "/exit", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Clear the current conversation history{}\n", style::CYAN, "/clear", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show recent tasks{}\n", style::CYAN, "/history", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}List available skills{}\n", style::CYAN, "/skills", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show this help message (alias: /help <command>){}\n", style::CYAN, "/help", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show current settings{}\n", style::CYAN, "/settings", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show available models{}\n", style::CYAN, "/models", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show token usage and session cost{}\n", style::CYAN, "/stats", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Clear compacted summary (allows /compact to be used again){}\n", style::CYAN, "/resetcompact", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Undo the last agent turn {}{}{}\n", style::CYAN, "/undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show changes from the last turn {}{}{}\n", style::CYAN, "/diff", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show agent turn history {}{}{}\n", style::CYAN, "/log", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Commit agent changes to your git repo {}{}{}\n", style::CYAN, "/commit \"msg\"", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show a previously snipped code block{}\n", style::CYAN, "/expand N", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}List available checkpoints with timestamps {}{}{}\n", style::CYAN, "/checkpoint list", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Restore a specific checkpoint by number {}{}{}\n", style::CYAN, "/checkpoint restore N", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+
+    s.push_str(&format!(
+        "{}{}CLI-Only Commands (handled locally):{}\n",
+        style::BOLD,
+        style::CYAN,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "{}─────────────────────────────{}\n",
+        style::DIM,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Exit the CLI (aliases: /q, /quit){}\n",
+        style::CYAN,
+        "/exit",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Clear the current conversation history{}\n",
+        style::CYAN,
+        "/clear",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show recent tasks{}\n",
+        style::CYAN,
+        "/history",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}List available skills{}\n",
+        style::CYAN,
+        "/skills",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show this help message (alias: /help <command>){}\n",
+        style::CYAN,
+        "/help",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show current settings{}\n",
+        style::CYAN,
+        "/settings",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show available models{}\n",
+        style::CYAN,
+        "/models",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show token usage and session cost{}\n",
+        style::CYAN,
+        "/stats",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Clear compacted summary (allows /compact to be used again){}\n",
+        style::CYAN,
+        "/resetcompact",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Undo the last agent turn {}{}{}\n",
+        style::CYAN,
+        "/undo",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show changes from the last turn {}{}{}\n",
+        style::CYAN,
+        "/diff",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show agent turn history {}{}{}\n",
+        style::CYAN,
+        "/log",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Commit agent changes to your git repo {}{}{}\n",
+        style::CYAN,
+        "/commit \"msg\"",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show a previously snipped code block{}\n",
+        style::CYAN,
+        "/expand N",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}List available checkpoints with timestamps {}{}{}\n",
+        style::CYAN,
+        "/checkpoint list",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Restore a specific checkpoint by number {}{}{}\n",
+        style::CYAN,
+        "/checkpoint restore N",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
     s.push_str(&format!("  {}{}{}  - {}Undo last turn using checkpoint (reverts files + trims history, alias: /checkpoint-undo) {}{}{}\n\n", style::CYAN, "/checkpoint undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    
-    s.push_str(&format!("{}{}Keyboard Shortcuts:{}\n", style::BOLD, style::CYAN, style::RESET));
-    s.push_str(&format!("{}─────────────────────────────{}\n", style::DIM, style::RESET));
-    s.push_str(&format!("  {}{}{}  - {}Move cursor to beginning of line{}\n", style::CYAN, "Ctrl+A / Home", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Move cursor to end of line{}\n", style::CYAN, "Ctrl+E / End", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Clear from cursor to beginning{}\n", style::CYAN, "Ctrl+U", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Clear from cursor to end{}\n", style::CYAN, "Ctrl+K", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Delete word backward{}\n", style::CYAN, "Ctrl+W", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Cancel current operation{}\n", style::CYAN, "Ctrl+C", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Move cursor left/right{}\n", style::CYAN, "Arrow Left/Right", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Navigate command history / file picker{}\n\n", style::CYAN, "Arrow Up/Down", style::DIM, style::RESET, style::DIM));
-    
-    s.push_str(&format!("{}{}Examples:{}\n", style::BOLD, style::CYAN, style::RESET));
-    s.push_str(&format!("{}─────────────────────────────{}\n", style::DIM, style::RESET));
-    s.push_str(&format!("  {}{}{}  - {}Compact context before a new topic{}\n", style::CYAN, "/compact", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Start a new task, carrying over context{}\n", style::CYAN, "/newtask", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show this help{}\n", style::CYAN, "/help", style::DIM, style::RESET, style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Undo last agent turn {}{}{}\n", style::CYAN, "/undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Review last turn's changes {}{}{}\n", style::CYAN, "/diff", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Commit changes to git {}{}{}\n", style::CYAN, "/commit \"fix: auth bug\"", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-    s.push_str(&format!("  {}{}{}  - {}Show snipped code block 1{}", style::CYAN, "/expand 1", style::DIM, style::RESET, style::DIM));
-    
+
+    s.push_str(&format!(
+        "{}{}Keyboard Shortcuts:{}\n",
+        style::BOLD,
+        style::CYAN,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "{}─────────────────────────────{}\n",
+        style::DIM,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Move cursor to beginning of line{}\n",
+        style::CYAN,
+        "Ctrl+A / Home",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Move cursor to end of line{}\n",
+        style::CYAN,
+        "Ctrl+E / End",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Clear from cursor to beginning{}\n",
+        style::CYAN,
+        "Ctrl+U",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Clear from cursor to end{}\n",
+        style::CYAN,
+        "Ctrl+K",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Delete word backward{}\n",
+        style::CYAN,
+        "Ctrl+W",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Cancel current operation{}\n",
+        style::CYAN,
+        "Ctrl+C",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Move cursor left/right{}\n",
+        style::CYAN,
+        "Arrow Left/Right",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Navigate command history / file picker{}\n\n",
+        style::CYAN,
+        "Arrow Up/Down",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+
+    s.push_str(&format!(
+        "{}{}Examples:{}\n",
+        style::BOLD,
+        style::CYAN,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "{}─────────────────────────────{}\n",
+        style::DIM,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Compact context before a new topic{}\n",
+        style::CYAN,
+        "/compact",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Start a new task, carrying over context{}\n",
+        style::CYAN,
+        "/newtask",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show this help{}\n",
+        style::CYAN,
+        "/help",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Undo last agent turn {}{}{}\n",
+        style::CYAN,
+        "/undo",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Review last turn's changes {}{}{}\n",
+        style::CYAN,
+        "/diff",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Commit changes to git {}{}{}\n",
+        style::CYAN,
+        "/commit \"fix: auth bug\"",
+        style::DIM,
+        style::RESET,
+        style::YELLOW,
+        "[requires --track-changes]",
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show snipped code block 1{}",
+        style::CYAN,
+        "/expand 1",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+
     s
 }
 
@@ -611,10 +917,17 @@ pub fn format_help_for_command(cmd: &str) -> String {
     use crate::cli::colors::style;
 
     let cmd_lower = cmd.to_lowercase();
-    let banner = format!("{}{}═══════ Help: /{} ═══════{}", style::BOLD, style::CYAN, cmd, style::RESET);
-    
+    let banner = format!(
+        "{}{}═══════ Help: /{} ═══════{}",
+        style::BOLD,
+        style::CYAN,
+        cmd,
+        style::RESET
+    );
+
     let help_text = match cmd_lower.as_str() {
-        "newtask" => r#"Creates a new task while preserving context from the current conversation.
+        "newtask" => {
+            r#"Creates a new task while preserving context from the current conversation.
 
 Use when:
   - Starting a new subtask within a larger project
@@ -622,70 +935,88 @@ Use when:
   - Creating a focused task with inherited context
 
 Example:
-  /newtask - Create a new task with current context"#,
+  /newtask - Create a new task with current context"#
+        }
 
-        "compact" => r#"Condenses the current conversation history to reduce token usage.
+        "compact" => {
+            r#"Condenses the current conversation history to reduce token usage.
 
 Use when:
   - Approaching context window limits
   - After completing a major task phase
   - Before starting a new topic in the same session
 
-Note: Can only be used once per session. After that, use /resetcompact."#,
+Note: Can only be used once per session. After that, use /resetcompact."#
+        }
 
-        "newrule" => r#"Creates a new Sned rule based on your conversation context.
+        "newrule" => {
+            r#"Creates a new Sned rule based on your conversation context.
 
 Use when:
   - You want to codify a pattern from your current work
   - Creating project-specific conventions
-  - Documenting recurring workflows"#,
+  - Documenting recurring workflows"#
+        }
 
-        "reportbug" => r#"Submits a bug report to GitHub.
+        "reportbug" => {
+            r#"Submits a bug report to GitHub.
 
 Use when:
   - You encounter unexpected behavior
   - Found a regression or crash
-  - Want to report a feature request"#,
+  - Want to report a feature request"#
+        }
 
-        "explain-changes" => r#"Explains the changes you have made to the codebase.
+        "explain-changes" => {
+            r#"Explains the changes you have made to the codebase.
 
 Use when:
   - You want a summary of your modifications
   - Preparing commit messages
-  - Reviewing your own work"#,
+  - Reviewing your own work"#
+        }
 
-        "exit" | "q" | "quit" => r#"Exits the Sned CLI.
+        "exit" | "q" | "quit" => {
+            r#"Exits the Sned CLI.
 
 Aliases: /exit, /q, /quit
 
 Use when:
   - Finished with your session
-  - Want to return to the shell"#,
+  - Want to return to the shell"#
+        }
 
-        "clear" => r#"Clears the current conversation history.
+        "clear" => {
+            r#"Clears the current conversation history.
 
 Use when:
   - Starting fresh without context
   - Privacy concerns require clearing history
   - Resetting a confused AI session
 
-Warning: This action cannot be undone."#,
+Warning: This action cannot be undone."#
+        }
 
-        "history" => r#"Shows recent tasks from your history.
+        "history" => {
+            r#"Shows recent tasks from your history.
 
 Use when:
   - Looking for a previous task
   - Reviewing past work sessions
-  - Finding task IDs for reference"#,
+  - Finding task IDs for reference"#
+        }
 
-        "skills" => r#"Lists available skills that can be invoked via slash commands.
+        "skills" => {
+            r#"Lists available skills that can be invoked via slash commands.
 
 Use when:
   - Discovering available skills
   - Checking skill names and descriptions
-  - Learning about project-specific automations"#,
+  - Learning about project-specific automations"#
+        }
 
-        "help" => r#"Shows this help message or detailed help for a specific command.
+        "help" => {
+            r#"Shows this help message or detailed help for a specific command.
 
 Usage:
   /help - Show all commands
@@ -693,39 +1024,49 @@ Usage:
 
 Examples:
   /help newtask - Get detailed help for /newtask
-  /help checkpoint - Get help for checkpoint commands"#,
+  /help checkpoint - Get help for checkpoint commands"#
+        }
 
-        "settings" => r#"Shows current Sned settings including provider, model, and mode.
+        "settings" => {
+            r#"Shows current Sned settings including provider, model, and mode.
 
 Use when:
   - Verifying current configuration
   - Checking which model is active
-  - Confirming auto-approve status"#,
+  - Confirming auto-approve status"#
+        }
 
-        "models" => r#"Lists available models across providers.
+        "models" => {
+            r#"Lists available models across providers.
 
 Use when:
   - Choosing a model for your task
   - Checking model availability
-  - Comparing model options"#,
+  - Comparing model options"#
+        }
 
-        "stats" => r#"Shows token usage and session cost statistics.
+        "stats" => {
+            r#"Shows token usage and session cost statistics.
 
 Use when:
   - Monitoring API costs
   - Tracking token consumption
-  - Optimizing prompt efficiency"#,
+  - Optimizing prompt efficiency"#
+        }
 
-        "resetcompact" => r#"Clears the compacted summary, allowing /compact to be used again.
+        "resetcompact" => {
+            r#"Clears the compacted summary, allowing /compact to be used again.
 
 Alias: /clearcompact
 
 Use when:
   - Need to compact again after first use
   - Compacted summary is outdated
-  - Starting a new major phase"#,
+  - Starting a new major phase"#
+        }
 
-        "undo" => r#"Undoes the last agent turn by reverting file changes.
+        "undo" => {
+            r#"Undoes the last agent turn by reverting file changes.
 
 Requires: --track-changes flag
 
@@ -734,27 +1075,33 @@ Use when:
   - Want to retry with a different prompt
   - Reverting experimental modifications
 
-Note: Requires checkpoint tracking to be enabled."#,
+Note: Requires checkpoint tracking to be enabled."#
+        }
 
-        "diff" => r#"Shows changes from the last agent turn.
+        "diff" => {
+            r#"Shows changes from the last agent turn.
 
 Requires: --track-changes flag
 
 Use when:
   - Reviewing what the agent changed
   - Preparing to commit changes
-  - Understanding agent modifications"#,
+  - Understanding agent modifications"#
+        }
 
-        "log" => r#"Shows agent turn history.
+        "log" => {
+            r#"Shows agent turn history.
 
 Requires: --track-changes flag
 
 Use when:
   - Reviewing session timeline
   - Finding specific turns
-  - Auditing agent actions"#,
+  - Auditing agent actions"#
+        }
 
-        "commit" => r#"Commits agent changes to your git repository.
+        "commit" => {
+            r#"Commits agent changes to your git repository.
 
 Requires: --track-changes flag
 
@@ -767,9 +1114,11 @@ Use when:
   - Finalizing a completed task
 
 Example:
-  /commit "fix: resolve authentication bug""#,
+  /commit "fix: resolve authentication bug""#
+        }
 
-        "expand" => r#"Shows a previously snipped code block.
+        "expand" => {
+            r#"Shows a previously snipped code block.
 
 Usage:
   /expand N - Show code block number N
@@ -777,9 +1126,11 @@ Usage:
 Use when:
   - Need to review truncated output
   - Agent snipped long code blocks
-  - Checking specific sections of output"#,
+  - Checking specific sections of output"#
+        }
 
-        "checkpoint" | "checkpoint-list" | "checkpoint list" => r#"Lists available checkpoints with timestamps.
+        "checkpoint" | "checkpoint-list" | "checkpoint list" => {
+            r#"Lists available checkpoints with timestamps.
 
 Requires: --track-changes flag
 
@@ -788,9 +1139,11 @@ Aliases: /checkpoint-list, /checkpoint list
 Use when:
   - Finding restore points
   - Reviewing checkpoint history
-  - Identifying specific turns to restore"#,
+  - Identifying specific turns to restore"#
+        }
 
-        "checkpoint-restore" | "checkpoint restore" => r#"Restores files to a specific checkpoint state.
+        "checkpoint-restore" | "checkpoint restore" => {
+            r#"Restores files to a specific checkpoint state.
 
 Requires: --track-changes flag
 
@@ -804,9 +1157,11 @@ Use when:
   - Undoing multiple turns at once
   - Experimenting with different approaches
 
-Warning: Reverts all files to checkpoint state."#,
+Warning: Reverts all files to checkpoint state."#
+        }
 
-        "checkpoint-undo" | "checkpoint undo" => r#"Undoes last turn using checkpoint (reverts files + trims history).
+        "checkpoint-undo" | "checkpoint undo" => {
+            r#"Undoes last turn using checkpoint (reverts files + trims history).
 
 Requires: --track-changes flag
 
@@ -815,9 +1170,13 @@ Aliases: /checkpoint-undo, /checkpoint undo
 Use when:
   - Complete undo of last agent action
   - Both file and history rollback needed
-  - More thorough than /undo alone"#,
+  - More thorough than /undo alone"#
+        }
 
-        _ => &format!("Unknown command: /{}\n\nUse /help to see all available commands.", cmd),
+        _ => &format!(
+            "Unknown command: /{}\n\nUse /help to see all available commands.",
+            cmd
+        ),
     };
 
     format!("{}\n\n{}", banner, help_text)
@@ -1452,13 +1811,13 @@ mod tests {
         // Test checkpoint commands show aliases
         let checkpoint_list = format_help_for_command("checkpoint list");
         assert!(checkpoint_list.contains("Aliases: /checkpoint-list, /checkpoint list"));
-        
+
         let checkpoint_restore = format_help_for_command("checkpoint restore");
         assert!(checkpoint_restore.contains("Aliases: /checkpoint-restore, /checkpoint restore"));
-        
+
         let checkpoint_undo = format_help_for_command("checkpoint undo");
         assert!(checkpoint_undo.contains("Aliases: /checkpoint-undo, /checkpoint undo"));
-        
+
         // Test resetcompact shows alias
         let resetcompact = format_help_for_command("resetcompact");
         assert!(resetcompact.contains("Alias: /clearcompact"));

@@ -351,7 +351,9 @@ impl SymbolIndexService {
                     return None;
                 };
 
-                let Ok(symbols) = extract_symbols_for_indexing(absolute_str, &content, &language_parsers) else {
+                let Ok(symbols) =
+                    extract_symbols_for_indexing(absolute_str, &content, &language_parsers)
+                else {
                     return None;
                 };
 
@@ -952,7 +954,8 @@ mod tests {
         {
             let mut f = fs::File::create(&db_path).unwrap();
             // Write garbage that is not a valid SQLite database
-            f.write_all(b"This is not a valid SQLite database file").unwrap();
+            f.write_all(b"This is not a valid SQLite database file")
+                .unwrap();
         }
 
         // Create service and attempt to open with persistence

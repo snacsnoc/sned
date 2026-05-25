@@ -317,7 +317,9 @@ pub fn print_horizontal_rule() {
 pub fn print_horizontal_rule_writer(writer: &crate::cli::output::OutputWriterArc) {
     use crate::cli::output::OutputEvent;
     if stderr_colors_disabled() {
-        writer.emit(OutputEvent::RawAnsi("────────────────────────────────────────\n".to_string()));
+        writer.emit(OutputEvent::RawAnsi(
+            "────────────────────────────────────────\n".to_string(),
+        ));
     } else {
         writer.emit(OutputEvent::RawAnsi(format!(
             "{}────────────────────────────────────────{}\n",

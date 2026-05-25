@@ -49,7 +49,11 @@ impl OpenAiProvider {
             .provider_name
             .clone()
             .unwrap_or_else(|| "OpenAI".to_string());
-        Ok(Self { config, client, provider_name })
+        Ok(Self {
+            config,
+            client,
+            provider_name,
+        })
     }
 
     fn build_headers(&self) -> anyhow::Result<HeaderMap> {
@@ -253,12 +257,17 @@ impl OpenAiProvider {
             body["tools"] = json!(openai_tools);
             // Tool choice: respect request.tool_choice if provided
             // OpenAI format: "auto"|"required"|"none" or {"type": "function", "function": {"name": "..."}}
-            let tool_choice = request.tool_choice.as_ref().unwrap_or(&crate::providers::ToolChoice::Auto);
+            let tool_choice = request
+                .tool_choice
+                .as_ref()
+                .unwrap_or(&crate::providers::ToolChoice::Auto);
             body["tool_choice"] = match tool_choice {
                 crate::providers::ToolChoice::Auto => json!("auto"),
                 crate::providers::ToolChoice::Required => json!("required"),
                 crate::providers::ToolChoice::None => json!("none"),
-                crate::providers::ToolChoice::Named(name) => json!({"type": "function", "function": {"name": name}}),
+                crate::providers::ToolChoice::Named(name) => {
+                    json!({"type": "function", "function": {"name": name}})
+                }
             };
         }
 
@@ -664,7 +673,11 @@ async fn process_openai_sse_line(
 
         if let Some(usage) = chunk.usage {
             // Calculate cache tokens and avoid double-counting in input_tokens
-            let cached_tokens = usage.prompt_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
+            let cached_tokens = usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0);
             let cache_write_tokens = usage.prompt_cache_miss_tokens.unwrap_or(0);
             // OpenAI counts cached tokens in prompt_tokens, so subtract to get uncached input
             let uncached_input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
@@ -679,8 +692,13 @@ async fn process_openai_sse_line(
                 // Cost for uncached input tokens
                 let input_cost = input_price * (uncached_input_tokens as f64 / 1_000_000.0);
                 // Cost for output tokens (including reasoning)
-                let reasoning_tokens = usage.completion_tokens_details.as_ref().and_then(|d| d.reasoning_tokens).unwrap_or(0);
-                let output_cost = output_price * ((usage.completion_tokens + reasoning_tokens) as f64 / 1_000_000.0);
+                let reasoning_tokens = usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens)
+                    .unwrap_or(0);
+                let output_cost = output_price
+                    * ((usage.completion_tokens + reasoning_tokens) as f64 / 1_000_000.0);
                 // Cost for cache reads (discounted)
                 let cache_read_cost = if cached_tokens > 0 {
                     cache_reads_price * (cached_tokens as f64 / 1_000_000.0)
@@ -704,7 +722,9 @@ async fn process_openai_sse_line(
                     output_tokens: usage.completion_tokens,
                     cache_write_tokens: usage.prompt_cache_miss_tokens,
                     cache_read_tokens: Some(cached_tokens),
-                    reasoning_tokens: usage.completion_tokens_details.and_then(|d| d.reasoning_tokens),
+                    reasoning_tokens: usage
+                        .completion_tokens_details
+                        .and_then(|d| d.reasoning_tokens),
                     thoughts_token_count: None,
                     total_cost,
                     stop_reason: last_stop_reason.clone(),
@@ -822,7 +842,9 @@ impl Provider for OpenAiProvider {
             let status = response.status();
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderHttpError::new(&self.provider_name, url, status, text, headers).into());
+            return Err(
+                ProviderHttpError::new(&self.provider_name, url, status, text, headers).into(),
+            );
         }
 
         let stream = response.bytes_stream();
@@ -1855,7 +1877,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
-        
+
         // Use model info with pricing
         let model_info = Some(crate::providers::OpenAiCompatibleModelInfo {
             base: crate::providers::ModelInfo {
@@ -1865,13 +1887,13 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
                 supports_images: Some(true),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(false),
-                input_price: Some(10.0), // $10 per 1M tokens
+                input_price: Some(10.0),  // $10 per 1M tokens
                 output_price: Some(30.0), // $30 per 1M tokens
                 image_output_price: None,
                 thinking_config: None,
                 supports_global_endpoint: None,
                 cache_writes_price: Some(5.0), // $5 per 1M tokens
-                cache_reads_price: Some(0.5), // $0.50 per 1M tokens (discounted)
+                cache_reads_price: Some(0.5),  // $0.50 per 1M tokens (discounted)
                 description: None,
                 tiers: None,
                 temperature: None,
@@ -1912,24 +1934,42 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
         }
 
         // Find the usage chunk
-        let usage_chunk = chunks.iter().find_map(|c| match c {
-            ApiStreamChunk::Usage(u) => Some(u),
-            _ => None,
-        }).expect("Should have usage chunk");
+        let usage_chunk = chunks
+            .iter()
+            .find_map(|c| match c {
+                ApiStreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("Should have usage chunk");
 
         // Verify input_tokens excludes cached tokens (1000 - 800 = 200)
-        assert_eq!(usage_chunk.input_tokens, 200, "input_tokens should exclude cached tokens");
-        
+        assert_eq!(
+            usage_chunk.input_tokens, 200,
+            "input_tokens should exclude cached tokens"
+        );
+
         // Verify cache_read_tokens is reported separately
-        assert_eq!(usage_chunk.cache_read_tokens, Some(800), "cache_read_tokens should be 800");
-        
+        assert_eq!(
+            usage_chunk.cache_read_tokens,
+            Some(800),
+            "cache_read_tokens should be 800"
+        );
+
         // Verify cost calculation:
         // input_cost = 200 * $10 / 1M = $0.002
         // output_cost = 100 * $30 / 1M = $0.003
         // cache_read_cost = 800 * $0.50 / 1M = $0.0004
         // total = $0.0054
-        let expected_cost = (200.0 * 10.0 / 1_000_000.0) + (100.0 * 30.0 / 1_000_000.0) + (800.0 * 0.5 / 1_000_000.0);
-        assert!(usage_chunk.total_cost.is_some(), "total_cost should be calculated");
-        assert!((usage_chunk.total_cost.unwrap() - expected_cost).abs() < 0.0001, "cost should be correct");
+        let expected_cost = (200.0 * 10.0 / 1_000_000.0)
+            + (100.0 * 30.0 / 1_000_000.0)
+            + (800.0 * 0.5 / 1_000_000.0);
+        assert!(
+            usage_chunk.total_cost.is_some(),
+            "total_cost should be calculated"
+        );
+        assert!(
+            (usage_chunk.total_cost.unwrap() - expected_cost).abs() < 0.0001,
+            "cost should be correct"
+        );
     }
 }

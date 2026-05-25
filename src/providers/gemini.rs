@@ -197,7 +197,9 @@ impl GeminiProvider {
                     if let Some(obj) = params.as_object_mut() {
                         obj.remove("additionalProperties");
                         // Also strip from nested property schemas
-                        if let Some(props) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
+                        if let Some(props) =
+                            obj.get_mut("properties").and_then(|v| v.as_object_mut())
+                        {
                             for (_, prop) in props.iter_mut() {
                                 if let Some(prop_obj) = prop.as_object_mut() {
                                     prop_obj.remove("additionalProperties");
@@ -241,12 +243,17 @@ impl GeminiProvider {
         if !tools.is_empty() {
             // Tool choice: respect request.tool_choice if provided
             // Gemini format: functionCallingConfig.mode = "AUTO"|"ANY"|"NONE" or "ANY" with allowedFunctionNames
-            let tool_choice = request.tool_choice.as_ref().unwrap_or(&crate::providers::ToolChoice::Auto);
+            let tool_choice = request
+                .tool_choice
+                .as_ref()
+                .unwrap_or(&crate::providers::ToolChoice::Auto);
             let function_calling_config = match tool_choice {
                 crate::providers::ToolChoice::Auto => json!({"mode": "AUTO"}),
                 crate::providers::ToolChoice::Required => json!({"mode": "ANY"}),
                 crate::providers::ToolChoice::None => json!({"mode": "NONE"}),
-                crate::providers::ToolChoice::Named(name) => json!({"mode": "ANY", "allowedFunctionNames": [name]}),
+                crate::providers::ToolChoice::Named(name) => {
+                    json!({"mode": "ANY", "allowedFunctionNames": [name]})
+                }
             };
 
             let tool_config = json!({
@@ -1093,9 +1100,12 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         let func = &tools[0]["functionDeclarations"].as_array().unwrap()[0];
         let params = &func["parameters"];
-        
+
         // Verify additionalProperties was stripped
-        assert!(params.get("additionalProperties").is_none(), "additionalProperties should be stripped for Gemini");
+        assert!(
+            params.get("additionalProperties").is_none(),
+            "additionalProperties should be stripped for Gemini"
+        );
         // Verify other fields are preserved
         assert_eq!(params["type"], "object");
         assert!(params["properties"].is_object());
@@ -1136,7 +1146,11 @@ mod tests {
         assert_eq!(info_pro.context_window, Some(1048576));
         assert_eq!(info_pro.temperature, Some(1.0));
         assert_eq!(
-            info_pro.thinking_config.as_ref().unwrap().gemini_thinking_level,
+            info_pro
+                .thinking_config
+                .as_ref()
+                .unwrap()
+                .gemini_thinking_level,
             Some("high".to_string())
         );
 
@@ -1144,7 +1158,11 @@ mod tests {
         assert_eq!(info_flash.temperature, Some(1.0));
         // Gemini 3 Flash should default to minimal thinking level
         assert_eq!(
-            info_flash.thinking_config.as_ref().unwrap().gemini_thinking_level,
+            info_flash
+                .thinking_config
+                .as_ref()
+                .unwrap()
+                .gemini_thinking_level,
             Some("minimal".to_string())
         );
 

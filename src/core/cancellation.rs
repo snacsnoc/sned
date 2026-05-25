@@ -8,8 +8,8 @@ use crate::storage::disk;
 use crate::storage::state_manager::StateManager;
 #[cfg(unix)]
 use libc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;

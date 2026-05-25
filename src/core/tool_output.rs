@@ -67,7 +67,8 @@ pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> Strin
         ),
         Some(SnedTool::ExecuteCommand) => {
             // Handle all three parameter forms: "commands" (array), "command" (singular), "script"
-            let cmd_text = if let Some(commands) = params.get("commands").and_then(|v| v.as_array()) {
+            let cmd_text = if let Some(commands) = params.get("commands").and_then(|v| v.as_array())
+            {
                 // Primary form: array of commands, join with " && "
                 let cmds: Vec<&str> = commands
                     .iter()

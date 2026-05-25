@@ -279,7 +279,7 @@ impl HookManager {
                         tracing::warn!(
                             dir = %dir.display(),
                             hook = %hook_file,
-"Skipping unverified workspace hook. Create .agents/hooks/.signed to enable."
+                        "Skipping unverified workspace hook. Create .agents/hooks/.signed to enable."
                         );
                         return;
                     }
