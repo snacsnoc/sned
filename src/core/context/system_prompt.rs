@@ -66,166 +66,94 @@ impl PromptBuilder {
     }
 
     fn render_template(&self) -> String {
-        let _current_cwd = self.context.cwd.as_deref().unwrap_or("/");
-        let _os = std::env::consts::OS;
-
-        let _shell_env = std::env::var("SHELL").ok();
-        let _shell = self
-            .context
-            .active_shell_path
-            .as_deref()
-            .or(_shell_env.as_deref())
-            .unwrap_or("bash");
-
-        let _shell_type = self.context.active_shell_type.as_deref().unwrap_or("bash");
-
-        let _available_cores = self.context.available_cores.unwrap_or(1);
-
         let skills_section = self.format_skills_section();
 
-        let mut prompt = "You are Sned, an exceptionally skilled AI agent at solving problems with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.\n\
-             \n\
-             PRIME DIRECTIVES\n\
-             \n\
-             1. ACCOMPLISH THE TASK HUMAN GIVES YOU.\n\
-             2. MINIMIZE THE NUMBER OF ROUND TRIPS NEEDED TO DO THIS. BATCH TOOL CALLS TOGETHER TO AVOID MULTIPLE ROUND TRIPS.\n\
-             3. LOAD INTO CONTEXT ONLY WHAT IS NECESSARY.\n\
-             \n\
-             TOOL USE\n\
-             \n".to_string();
+        let mut prompt = "You are Sned, a terminal-first coding agent.\n\n".to_string();
+
+        prompt.push_str(
+            "PRIME DIRECTIVES\n\
+             - Complete the user's task directly.\n\
+             - Minimize turns and load only the context you need.\n\
+             - Be concise, deterministic, and finish with the mode-appropriate completion tool.\n\n",
+        );
+        prompt.push_str("EXECUTION\n");
 
         if self.context.enable_parallel_tool_calling {
-            prompt.push_str(" You may use multiple tools in a single response when the operations are independent (e.g., reading several files, searching in parallel). When refactoring a single file, multiple edits to different sections of the file are considered INDEPENDENT operations because we have stable hash anchors. You should batch them into a single response to save roundtrips.\n");
+            prompt.push_str(
+                "- Batch independent work in one response when it is truly independent.\n",
+            );
+            prompt.push_str(
+                "- Multiple edits to different sections of one file are independent when based on current hash anchors; batch them to save roundtrips.\n",
+            );
+        }
+        if !self.context.enable_parallel_tool_calling {
+            prompt.push_str("- Use tools sequentially.\n");
         }
 
         prompt.push_str(
-            "- Prefer tools for communication; avoid redundant text in assistant responses.\n",
-        );
-        prompt.push_str("- CRITICAL: When writing files, you MUST use the write_to_file tool. NEVER output file contents as text in your response.\n");
-        prompt.push_str("- For large files, avoid a single giant write_to_file payload. If the file is too large to author in one response, write a minimal skeleton first, then fill sections incrementally with edit_file.\n");
-        prompt.push_str("- CRITICAL: When editing files, you MUST use the edit_file tool. NEVER describe edits in text.\n");
-        prompt.push_str("- CRITICAL: When reading files, you MUST use the read_file tool. NEVER ask the user to provide file contents.\n");
-        prompt.push_str("\nHASH-ANCHORED EDITS\n\n");
-        prompt.push_str(
-            "The read_file tool returns lines with hash anchors in the format: Word§line content\n",
-        );
-        prompt.push_str("- Example: \"Crawler§void draw_game_over() {\"\n");
-        prompt.push_str(
-            "- The anchor prefix (e.g., \"Crawler§\") is REQUIRED for edit_file to work.\n",
-        );
-        prompt.push_str("- When using edit_file, you MUST copy the EXACT anchor strings from read_file output.\n");
-        prompt.push_str(
-            "- WRONG: Using raw source lines like \"void draw_game_over() {\" as anchors.\n",
-        );
-        prompt.push_str("- WRONG: Modifying the anchor text or omitting the Word§ prefix.\n");
-        prompt.push_str("- The anchor word is a hash of the line content - it uniquely identifies that exact line.\n");
-        prompt.push_str("- Always read files first to get current anchors before editing.\n");
-        prompt.push_str("\nEXAMPLES\n\n");
-        prompt.push_str("CORRECT - Writing a file (use the write_to_file tool):\n");
-        prompt.push_str("  {\"path\": \"src/main.rs\", \"content\": \"fn main() {}\"}\n\n");
-        prompt.push_str("WRONG - Do NOT output code as text:\n");
-        prompt.push_str("  \"Here is the code: fn main() { ... }\"\n\n");
-        prompt.push_str("CORRECT - Reading a file (use the read_file tool):\n");
-        prompt.push_str("  {\"path\": \"src/main.rs\"}\n\n");
-        prompt.push_str("WRONG - Do NOT ask user for file contents:\n");
-        prompt.push_str("  \"Please provide the contents of src/main.rs\"\n\n");
-
-        prompt.push_str(
-            "ACT MODE VS PLAN MODE\n\
-             \n\
-             In each user message, the environment_details will specify the current mode. There are two modes:\n\
-             \n\
-             - ACT MODE: In this mode, you have access to all tools EXCEPT the plan_mode_respond tool.\n\
-              - In ACT MODE, you use tools to accomplish the user's task. Once you've completed the user's task, you use the attempt_completion tool to present the result of the task to the user.\n\
-             - PLAN MODE: In this special mode, you have access to the plan_mode_respond tool.\n\
-              - In PLAN MODE, start by getting precise understanding of what the user wants in this task.\n\
-              - In PLAN MODE, the goal is to gather information and get context to create a detailed plan for accomplishing the task, which the user will review and approve before they switch you to ACT MODE to implement the solution.\n\
-             \n\
-             IMPORTANT PATH RULES\n\n",
-        );
-        prompt.push_str("When using tools that accept file paths (read_file, write_to_file, edit_file, list_files, etc.), ALWAYS use relative paths from the current working directory.\n");
-        prompt.push_str("- CORRECT: path: \"src/main.rs\"\n");
-        prompt.push_str("- WRONG: path: \"/Users/easto/project/src/main.rs\"\n");
-        prompt.push_str(
-            "The current working directory is already set; do NOT use absolute paths.\n\n",
+            "- Use subagents or skills only when they clearly improve result quality.\n\
+             - Workspace reads and writes must use tools, not prose: read files with `read_file`; create or overwrite files with `write_to_file`; change existing files with `edit_file` or AST-aware tools.\n\
+             - Use relative paths from the working directory for workspace tools. Do not pass absolute paths or paths outside the workspace to file tools.\n\
+             - For `edit_file`, read the current file first and copy the exact `Word§line content` anchors from tool output, including the prefix.\n\
+             - For large generated files, write a small skeleton first and fill sections with `edit_file` instead of sending one huge payload.\n\
+             - In ACT mode, perform the task and finish with `attempt_completion`; in PLAN mode, gather needed context and respond with `plan_mode_respond` without modifying files.\n\
+             - Keep validation focused, but run the checks needed for code/workspace changes or required by project instructions.\n\
+             - Avoid planning text, broad validation, and extra file reads unless they are necessary, cheap, or user-requested.\n\n\
+             SAFETY AND REFUSAL\n\
+             - Refuse unsafe or disallowed requests.\n\
+             - Do not delete, reset, overwrite user work, expose secrets, or run destructive commands unless the user explicitly requested it and tool approvals allow it.\n\
+             - If required information is missing and available tools cannot get it, ask one focused follow-up question.\n",
         );
 
         if self.context.yolo_mode_toggled {
-            prompt.push_str("- You are running in fully autonomous mode.\n");
+            prompt.push_str(
+                "- You are running in fully autonomous mode. Keep CPU and RAM usage reasonable when using `execute_command`.\n",
+            );
         }
 
-        prompt.push_str("\nOBJECTIVE\n\n");
-        prompt.push_str("You accomplish a given task iteratively, breaking it down into clear steps and working through them methodically.\n\n");
-        prompt.push_str("1. Analyze the user's task and set clear, achievable goals to accomplish it. Prioritize these goals in a logical order.\n");
-
-        if self.context.enable_parallel_tool_calling {
-            prompt.push_str("2. Work through these goals sequentially, utilizing available tools as necessary. You may call multiple independent tools in a single response to work efficiently.\n");
-        } else {
-            prompt.push_str("2. Work through these goals sequentially, utilizing available tools one at a time as necessary.\n");
-        }
-
-        prompt.push_str("3. Once you've completed the user's task, you must use the attempt_completion tool to present the result of the task to the user.\n");
-
-        if self.context.yolo_mode_toggled {
-            prompt.push_str("4. You are running in fully autonomous mode. Make sure to keep the CPU usage and RAM use reasonable when using `execute_command`.\n");
-        }
-
-        prompt.push_str("\nFEEDBACK\n\n");
-        prompt.push_str("When user is providing you with feedback on how you could improve, you can let the user know to report new issue using the '/reportbug' slash command.\n");
+        prompt.push_str(
+            "\nOUTPUT FORMAT\n\
+             - Keep responses short and CLI-friendly.\n\
+             - Use tools instead of long prose whenever possible.\n\
+             - When the task is complete, return the result through the required completion tool.\n\
+             - Mention `/reportbug` only when the user is reporting product issues or asking how to report one.\n",
+        );
 
         prompt.push_str(&skills_section);
 
-        // Add custom instructions section if any are present
-        let has_custom_instructions = self.context.user_instructions.is_some()
-            || self.context.sned_rules.is_some()
-            || self.context.preferred_language_instructions.is_some()
-            || self.context.global_sned_rules_file_instructions.is_some()
-            || self.context.local_sned_rules_file_instructions.is_some()
-            || self.context.local_cursor_rules_file_instructions.is_some()
-            || self.context.local_cursor_rules_dir_instructions.is_some()
-            || self
-                .context
-                .local_windsurf_rules_file_instructions
-                .is_some()
-            || self.context.local_agents_rules_file_instructions.is_some();
-
-        if has_custom_instructions {
+        let custom_instructions = self.custom_instruction_blocks();
+        if !custom_instructions.is_empty() {
             prompt.push_str("\n\n# USER'S CUSTOM INSTRUCTIONS\n\n");
-            prompt.push_str("The following additional instructions are provided by the user.\n");
+            prompt.push_str(
+                "Follow these task, user, and project instructions unless they conflict with safety or required tool protocol.\n",
+            );
 
-            if let Some(instructions) = &self.context.user_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(rules) = &self.context.sned_rules {
-                prompt.push_str(&format!("\n{}\n", rules));
-            }
-            if let Some(instructions) = &self.context.sned_ignore_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.global_sned_rules_file_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.local_sned_rules_file_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.preferred_language_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.local_cursor_rules_file_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.local_cursor_rules_dir_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.local_windsurf_rules_file_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
-            }
-            if let Some(instructions) = &self.context.local_agents_rules_file_instructions {
+            for instructions in custom_instructions {
                 prompt.push_str(&format!("\n{}\n", instructions));
             }
         }
 
         prompt
+    }
+
+    fn custom_instruction_blocks(&self) -> Vec<&str> {
+        [
+            self.context.user_instructions.as_deref(),
+            self.context.sned_rules.as_deref(),
+            self.context.sned_ignore_instructions.as_deref(),
+            self.context.global_sned_rules_file_instructions.as_deref(),
+            self.context.local_sned_rules_file_instructions.as_deref(),
+            self.context.preferred_language_instructions.as_deref(),
+            self.context.local_cursor_rules_file_instructions.as_deref(),
+            self.context.local_cursor_rules_dir_instructions.as_deref(),
+            self.context
+                .local_windsurf_rules_file_instructions
+                .as_deref(),
+            self.context.local_agents_rules_file_instructions.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     fn post_process(&self, prompt: String) -> String {
@@ -263,7 +191,7 @@ impl PromptBuilder {
 
         let mut section = "\n\n# AVAILABLE SKILLS\n".to_string();
         section.push_str(
-            "You have access to specialized skills. Use the 'use_skill' tool to activate one.\n\n",
+            "Use `use_skill` once only when a listed skill clearly matches the task.\n\n",
         );
 
         // Prioritize Project skills
@@ -319,9 +247,18 @@ mod tests {
 
         assert!(prompt.contains("You are Sned"));
         assert!(prompt.contains("PRIME DIRECTIVES"));
-        assert!(prompt.contains("TOOL USE"));
-        assert!(prompt.contains("batch them into a single response"));
+        assert!(prompt.contains("EXECUTION"));
+        assert!(
+            prompt
+                .contains("Use subagents or skills only when they clearly improve result quality")
+        );
+        assert!(prompt.contains("Workspace reads and writes must use tools"));
+        assert!(prompt.contains("Do not pass absolute paths or paths outside the workspace"));
+        assert!(prompt.contains("Word§line content"));
+        assert!(prompt.contains("In ACT mode"));
+        assert!(prompt.contains("In PLAN mode"));
         // Environment info is now provided by context_loader, not in system prompt
+        assert!(!prompt.contains("ENVIRONMENT"));
         assert!(!prompt.contains("Current Working Directory:"));
     }
 
@@ -490,8 +427,45 @@ mod tests {
         let builder = PromptBuilder::new(context);
         let prompt = builder.build();
 
-        assert!(prompt.contains("If the file is too large to author in one response"));
-        assert!(prompt.contains("write a minimal skeleton first"));
-        assert!(prompt.contains("fill sections incrementally with edit_file"));
+        assert!(prompt.contains("write a small skeleton first"));
+        assert!(prompt.contains("fill sections with `edit_file`"));
+    }
+
+    #[test]
+    fn test_prompt_builder_omits_environment_context() {
+        let context = SystemPromptContext {
+            cwd: Some("/home/user/project".to_string()),
+            active_shell_type: Some("zsh".to_string()),
+            active_shell_path: Some("/bin/zsh".to_string()),
+            available_cores: Some(8),
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        assert!(!prompt.contains("ENVIRONMENT"));
+        assert!(!prompt.contains("/home/user/project"));
+        assert!(!prompt.contains("/bin/zsh"));
+        assert!(!prompt.contains("Available cores"));
+    }
+
+    #[test]
+    fn test_prompt_builder_parallel_mode_has_batching_guidance() {
+        let context = SystemPromptContext {
+            enable_parallel_tool_calling: true,
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        assert!(prompt.contains("Batch independent work in one response"));
+        assert!(prompt.contains("Multiple edits to different sections of one file"));
+    }
+
+    #[test]
+    fn test_prompt_builder_sequential_mode_has_sequential_guidance() {
+        let context = SystemPromptContext {
+            enable_parallel_tool_calling: false,
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        assert!(prompt.contains("Use tools sequentially"));
+        assert!(!prompt.contains("Batch independent tool calls"));
     }
 }
