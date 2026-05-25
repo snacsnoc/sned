@@ -526,10 +526,7 @@ async fn process_gemini_sse_line(
 
     // Emit tool calls when we have finish_reason or at stream end
     if let Some(finish) = last_stop_reason.as_ref()
-        && !matches!(
-            finish.as_str(),
-            "RECITATION" | "BLOCKED"
-        )
+        && !matches!(finish.as_str(), "RECITATION" | "BLOCKED")
     {
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
             if !completed_tool_call_ids.contains(call_id) {
@@ -1537,7 +1534,15 @@ mod tests {
     fn test_finish_reason_allows_tool_calls() {
         // Test which finish reasons allow tool call emission
         // Per Gemini docs: emit on all reasons except RECITATION and BLOCKED
-        let allowed = ["STOP", "MAX_TOKENS", "SAFETY", "OTHER", "MALFORMED_FUNCTION_CALL", "LANGUAGE", "FAILURE"];
+        let allowed = [
+            "STOP",
+            "MAX_TOKENS",
+            "SAFETY",
+            "OTHER",
+            "MALFORMED_FUNCTION_CALL",
+            "LANGUAGE",
+            "FAILURE",
+        ];
         let blocked = ["RECITATION", "BLOCKED"];
 
         for reason in allowed.iter() {
@@ -1605,10 +1610,9 @@ mod tests {
 
         // Receive all chunks
         let mut count = 0;
-        while let Ok(Some(chunk)) = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            rx.recv(),
-        ).await {
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+        {
             count += 1;
             if let ApiStreamChunk::Text(text_chunk) = chunk {
                 assert_eq!(text_chunk.text, format!("chunk {}", count - 1));
