@@ -127,39 +127,44 @@ impl UseSubagentsHandler {
             cmd.arg(turns.to_string());
         }
 
-        let child_result = timeout(
+        // Spawn once, capture PID, then timeout around wait (matches execute_command.rs pattern)
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return SubagentResult {
+                    status: "failed".to_string(),
+                    error: Some(format!("spawn failed: {}", e)),
+                    ..Default::default()
+                }
+            }
+        };
+
+        #[cfg(unix)]
+        let child_pid = child.id().unwrap_or(0) as i32;
+
+        // Read stdout/stderr in parallel with wait
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+
+        if let Some(ref mut fd) = child.stdout {
+            let _ = fd.read_to_string(&mut stdout_buf).await;
+        }
+        if let Some(ref mut fd) = child.stderr {
+            let _ = fd.read_to_string(&mut stderr_buf).await;
+        }
+
+        let wait_result = timeout(
             Duration::from_secs(timeout_secs),
-            async move {
-                let mut child = match cmd.spawn() {
-                    Ok(c) => c,
-                    Err(e) => return Err(format!("spawn failed: {}", e)),
-                };
-
-                let mut stdout_buf = String::new();
-                let mut stderr_buf = String::new();
-
-                if let Some(ref mut fd) = child.stdout {
-                    let _ = fd.read_to_string(&mut stdout_buf).await;
-                }
-                if let Some(ref mut fd) = child.stderr {
-                    let _ = fd.read_to_string(&mut stderr_buf).await;
-                }
-
-                let status = match child.wait().await {
-                    Ok(s) => s,
-                    Err(e) => return Err(format!("wait failed: {}", e)),
-                };
-                Ok((child, status.success(), stdout_buf, stderr_buf))
-            },
+            child.wait(),
         )
         .await;
 
-        match child_result {
-            Ok(Ok((_child, success, stdout, stderr))) => {
-                if success {
+        match wait_result {
+            Ok(Ok(status)) => {
+                if status.success() {
                     SubagentResult {
                         status: "completed".to_string(),
-                        result: Some(stdout.trim().to_string()),
+                        result: Some(stdout_buf.trim().to_string()),
                         error: None,
                         ..Default::default()
                     }
@@ -167,19 +172,33 @@ impl UseSubagentsHandler {
                     SubagentResult {
                         status: "failed".to_string(),
                         result: None,
-                        error: Some(stderr.trim().to_string()),
+                        error: Some(stderr_buf.trim().to_string()),
                         ..Default::default()
                     }
                 }
             }
             Ok(Err(e)) => SubagentResult {
                 status: "failed".to_string(),
-                error: Some(e),
+                error: Some(format!("wait failed: {}", e)),
                 ..Default::default()
             },
             Err(_) => {
-                // Timeout — process_group(0) ensures the entire process tree is killed
-                // by the OS when the inner future is dropped. No manual kill needed.
+                // Timeout — explicitly kill the child process group.
+                // process_group(0) creates a new process group, but we must explicitly
+                // kill it; dropping the Child handle does NOT send any signal.
+                #[cfg(unix)]
+                {
+                    // Check liveness first to avoid signaling recycled PIDs
+                    if unsafe { libc::kill(-child_pid, 0) } == 0 {
+                        let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill().await;
+                }
+                // Reap the child to prevent zombies
+                let _ = child.wait().await;
                 SubagentResult {
                     status: "failed".to_string(),
                     error: Some(format!("Subagent timed out after {} seconds", timeout_secs)),
