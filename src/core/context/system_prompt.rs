@@ -115,6 +115,7 @@ impl PromptBuilder {
             "\nOUTPUT FORMAT\n\
               - Keep responses short and CLI-friendly.\n\
               - Use tools instead of long prose whenever possible.\n\
+              - If no tools are needed or available, answer directly in text and keep it brief.\n\
               - When the task is complete, return the result through the required completion tool.\n\
               - Mention `/reportbug` only when the user is reporting product issues or asking how to report one.\n\n\
               CODE GENERATION\n\
@@ -259,6 +260,7 @@ mod tests {
         );
         assert!(prompt.contains("Workspace reads and writes must use tools"));
         assert!(prompt.contains("Do not pass absolute paths or paths outside the workspace"));
+        assert!(prompt.contains("If no tools are needed or available, answer directly in text"));
         assert!(prompt.contains("Word§line content"));
         assert!(prompt.contains("In ACT mode"));
         assert!(prompt.contains("PLAN mode"));

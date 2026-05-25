@@ -1154,7 +1154,13 @@ impl AgentLoop {
                 p
             }
         };
-        let tools = Some(crate::core::tools::definitions::get_tool_definitions_for_profile(profile));
+        let tool_definitions =
+            crate::core::tools::definitions::get_tool_definitions_for_profile(profile);
+        let tools = if tool_definitions.is_empty() {
+            None
+        } else {
+            Some(tool_definitions)
+        };
 
         let mut request = ProviderRequest {
             system_prompt: system_prompt.clone(),

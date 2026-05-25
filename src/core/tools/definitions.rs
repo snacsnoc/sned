@@ -762,10 +762,9 @@ impl ToolProfile {
     pub fn tools(self) -> &'static [SnedTool] {
         match self {
             ToolProfile::DirectAnswer => &[],
-            ToolProfile::AnswerOnly => &[
-                SnedTool::AttemptCompletion,
-                SnedTool::AskFollowupQuestion,
-            ],
+            ToolProfile::AnswerOnly => {
+                &[SnedTool::AttemptCompletion, SnedTool::AskFollowupQuestion]
+            }
             ToolProfile::WriteOnly => &[
                 SnedTool::WriteToFile,
                 SnedTool::AttemptCompletion,
@@ -877,7 +876,7 @@ pub fn select_tool_profile(prompt: &str, mode: &str) -> ToolProfile {
         return ToolProfile::WriteOnly;
     }
     if is_answer_only && !is_write_only && !is_edit_task {
-        return ToolProfile::AnswerOnly;
+        return ToolProfile::DirectAnswer;
     }
 
     ToolProfile::Full
@@ -1063,7 +1062,10 @@ mod tests {
         }
         eprintln!("  {:30} {:6} bytes", "TOTAL", total);
         let sys_prompt_approx = 1500;
-        eprintln!("\n  System prompt (approx):         {:6} bytes", sys_prompt_approx);
+        eprintln!(
+            "\n  System prompt (approx):         {:6} bytes",
+            sys_prompt_approx
+        );
         eprintln!(
             "  Tool schemas as % of prompt:    {:5.1}%",
             (total as f64 / (total + sys_prompt_approx) as f64) * 100.0
@@ -1157,13 +1159,41 @@ mod tests {
         let full_bytes = json_bytes(&full);
 
         eprintln!("\nTool profile byte budgets:");
-        eprintln!("  DirectAnswer:  {} bytes ({} tools)", direct_bytes, direct.len());
-        eprintln!("  AnswerOnly:   {} bytes ({} tools)", answer_bytes, answer.len());
-        eprintln!("  WriteOnly:    {} bytes ({} tools)", write_bytes, write.len());
-        eprintln!("  CoreEdit:     {} bytes ({} tools)", core_bytes, core.len());
-        eprintln!("  Validate:     {} bytes ({} tools)", validate_bytes, validate.len());
-        eprintln!("  Symbol:       {} bytes ({} tools)", symbol_bytes, symbol.len());
-        eprintln!("  Full:         {} bytes ({} tools)", full_bytes, full.len());
+        eprintln!(
+            "  DirectAnswer:  {} bytes ({} tools)",
+            direct_bytes,
+            direct.len()
+        );
+        eprintln!(
+            "  AnswerOnly:   {} bytes ({} tools)",
+            answer_bytes,
+            answer.len()
+        );
+        eprintln!(
+            "  WriteOnly:    {} bytes ({} tools)",
+            write_bytes,
+            write.len()
+        );
+        eprintln!(
+            "  CoreEdit:     {} bytes ({} tools)",
+            core_bytes,
+            core.len()
+        );
+        eprintln!(
+            "  Validate:     {} bytes ({} tools)",
+            validate_bytes,
+            validate.len()
+        );
+        eprintln!(
+            "  Symbol:       {} bytes ({} tools)",
+            symbol_bytes,
+            symbol.len()
+        );
+        eprintln!(
+            "  Full:         {} bytes ({} tools)",
+            full_bytes,
+            full.len()
+        );
 
         assert_eq!(direct_bytes, 0, "DirectAnswer should have 0 bytes");
         assert!(
@@ -1222,40 +1252,31 @@ mod tests {
             ToolProfile::CoreEdit.escalate(),
             Some(ToolProfile::Validate)
         );
-        assert_eq!(
-            ToolProfile::Validate.escalate(),
-            Some(ToolProfile::Full)
-        );
+        assert_eq!(ToolProfile::Validate.escalate(), Some(ToolProfile::Full));
         assert_eq!(ToolProfile::Full.escalate(), None);
-        assert_eq!(
-            ToolProfile::Symbol.escalate(),
-            Some(ToolProfile::Full)
-        );
+        assert_eq!(ToolProfile::Symbol.escalate(), Some(ToolProfile::Full));
     }
 
     #[test]
-    fn test_select_tool_profile_answer_only() {
+    fn test_select_tool_profile_direct_answer() {
         assert_eq!(
             select_tool_profile("What is 2 + 2?", "act"),
-            ToolProfile::AnswerOnly
+            ToolProfile::DirectAnswer
         );
         assert_eq!(
             select_tool_profile("how many legs does a dog have?", "act"),
-            ToolProfile::AnswerOnly
+            ToolProfile::DirectAnswer
         );
         assert_eq!(
             select_tool_profile("is Rust memory safe?", "act"),
-            ToolProfile::AnswerOnly
+            ToolProfile::DirectAnswer
         );
     }
 
     #[test]
     fn test_select_tool_profile_write_only() {
         assert_eq!(
-            select_tool_profile(
-                "Create a Rust source file named `even_sum.rs`.",
-                "act"
-            ),
+            select_tool_profile("Create a Rust source file named `even_sum.rs`.", "act"),
             ToolProfile::WriteOnly
         );
         assert_eq!(
@@ -1298,7 +1319,10 @@ mod tests {
     #[test]
     fn test_select_tool_profile_symbol() {
         assert_eq!(
-            select_tool_profile("Rename `get_user` to `fetch_user` across the codebase", "act"),
+            select_tool_profile(
+                "Rename `get_user` to `fetch_user` across the codebase",
+                "act"
+            ),
             ToolProfile::Symbol
         );
         assert_eq!(
