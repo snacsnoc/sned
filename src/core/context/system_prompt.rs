@@ -119,8 +119,11 @@ impl PromptBuilder {
               - When the task is complete, return the result through the required completion tool.\n\
               - Mention `/reportbug` only when the user is reporting product issues or asking how to report one.\n\n\
               CODE GENERATION\n\
-              - For generated source, implement the smallest correct solution that satisfies the request.\n\
-              - Do not add optional retries, custom errors, wrappers, config objects, or extra abstractions unless requested.\n\
+              - Only create the files and abstractions explicitly requested.\n\
+              - Do not add docstrings unless requested.\n\
+              - Do not add sync wrappers for async code unless requested.\n\
+              - Do not add main()/CLI entry points unless requested.\n\
+              - Do not add extra helpers, config objects, or custom error types unless needed to satisfy the prompt.\n\
               - Prefer standard library solutions over hand-rolled utilities.\n\
               - Match the requested shape exactly: if asked for a function, write a function, not a framework.\n",
         );
