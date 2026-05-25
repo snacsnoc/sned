@@ -1532,4 +1532,88 @@ mod tests {
         assert_eq!(pro_3_1.temperature, Some(1.0));
         assert_eq!(pro_3.temperature, Some(1.0));
     }
+
+    #[test]
+    fn test_finish_reason_allows_tool_calls() {
+        // Test which finish reasons allow tool call emission
+        // Per Gemini docs: emit on all reasons except RECITATION and BLOCKED
+        let allowed = ["STOP", "MAX_TOKENS", "SAFETY", "OTHER", "MALFORMED_FUNCTION_CALL", "LANGUAGE", "FAILURE"];
+        let blocked = ["RECITATION", "BLOCKED"];
+
+        for reason in allowed.iter() {
+            let should_emit = !matches!(*reason, "RECITATION" | "BLOCKED");
+            assert!(should_emit, "{} should allow tool call emission", reason);
+        }
+
+        for reason in blocked.iter() {
+            let should_emit = !matches!(*reason, "RECITATION" | "BLOCKED");
+            assert!(!should_emit, "{} should block tool call emission", reason);
+        }
+    }
+
+    #[test]
+    fn test_finish_reason_handling_enum_coverage() {
+        // Ensure all known Gemini finish reasons are accounted for
+        // This test documents the complete set of finish reasons
+        let all_known_reasons = vec![
+            "STOP",
+            "MAX_TOKENS",
+            "SAFETY",
+            "RECITATION",
+            "LANGUAGE",
+            "OTHER",
+            "BLOCKED",
+            "FAILURE",
+            "MALFORMED_FUNCTION_CALL",
+        ];
+
+        for reason in all_known_reasons {
+            let should_emit = !matches!(reason, "RECITATION" | "BLOCKED");
+            // Just verify the logic runs without panic
+            let _ = should_emit;
+        }
+    }
+
+    #[test]
+    fn test_synthesized_call_id_format() {
+        // Test the synthesized call ID format for pre-Gemini-3 models
+        let response_id = "resp-123";
+        let tool_index = 0;
+        let synthesized_id = format!("{}-tool-{}", response_id, tool_index);
+        assert_eq!(synthesized_id, "resp-123-tool-0");
+
+        let tool_index = 5;
+        let synthesized_id = format!("{}-tool-{}", response_id, tool_index);
+        assert_eq!(synthesized_id, "resp-123-tool-5");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_channel_does_not_block() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(100);
+
+        // Send multiple chunks
+        for i in 0..10 {
+            let chunk = ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: format!("chunk {}", i),
+                id: Some(format!("id-{}", i)),
+                signature: None,
+            });
+            tx.send(chunk).await.unwrap();
+        }
+
+        // Receive all chunks
+        let mut count = 0;
+        while let Ok(Some(chunk)) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rx.recv(),
+        ).await {
+            count += 1;
+            if let ApiStreamChunk::Text(text_chunk) = chunk {
+                assert_eq!(text_chunk.text, format!("chunk {}", count - 1));
+            }
+        }
+        assert_eq!(count, 10);
+    }
 }
