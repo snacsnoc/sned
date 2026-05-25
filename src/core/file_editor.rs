@@ -1789,7 +1789,6 @@ mod tests {
     #[test]
     fn test_task_level_lru_eviction() {
         // Test that task-level eviction follows true LRU order
-        // Per TODO A32: insert A, B, C, access A, then evict — verify B is evicted (not A)
         let anchor_mgr = AnchorStateManager::new();
 
         // Set up a low limit for testing

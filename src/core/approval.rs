@@ -14,12 +14,7 @@
 //! - Non-read-only tools prompt with "Execute this tool? (y/n/always)".
 //! - Per-path auto-approval: local vs external file paths can have different
 //!   approval levels, ported from `autoApprove.ts:126-180`.
-//!
-//! ## Phase 3.2 TODO
-//! The approval prompt uses `eprint!()` for output and `libc::read()` for input.
-//! During ratatui execution these writes are invisible (behind alternate screen).
-//! Fix: suspend ratatui before approval (restore/init) or route through channel.
-//! Until then, test with `--yolo` (auto-approves everything).
+//! - Approval prompt routes through `output_writer.emit()` for TUI visibility.
 
 use crate::core::tools::{SnedTool, ToolCategory};
 use parking_lot::Mutex;
