@@ -78,6 +78,8 @@ pub fn get_xai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         description: None,
         tiers: None,
         temperature: Some(0.7),
+        top_p: None,
+        top_k: None,
         supports_tools: Some(true),
         api_format: None,
     };

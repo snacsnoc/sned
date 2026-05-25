@@ -162,6 +162,8 @@ impl Provider for MockProvider {
                 description: Some("Mock model for testing".to_string()),
                 tiers: None,
                 temperature: None,
+                top_p: None,
+                top_k: None,
                 supports_tools: Some(true),
                 api_format: None,
             },

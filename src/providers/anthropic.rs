@@ -680,6 +680,8 @@ fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
             description: None,
             tiers: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
             supports_tools: Some(true),
             api_format: None,
         }
@@ -701,6 +703,8 @@ fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
             description: None,
             tiers: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
             supports_tools: Some(true),
             api_format: None,
         }
@@ -723,6 +727,8 @@ fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
             description: None,
             tiers: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
             supports_tools: Some(true),
             api_format: None,
         }
@@ -1208,6 +1214,8 @@ mod tests {
                 description: None,
                 tiers: None,
                 temperature: None,
+                top_p: None,
+                top_k: None,
                 supports_tools: None,
                 api_format: None,
             }),

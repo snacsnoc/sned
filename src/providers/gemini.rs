@@ -817,6 +817,8 @@ fn get_gemini_model_info(model_id: &str) -> ModelInfo {
         description: None,
         tiers: None,
         temperature: None,
+        top_p: None,
+        top_k: None,
         supports_tools: Some(true),
         api_format: Some("gemini".to_string()),
     };

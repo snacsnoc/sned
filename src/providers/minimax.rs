@@ -107,22 +107,19 @@ impl MinimaxProvider {
 
     fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
         let model_id = self.canonical_model_id();
+        let model_info = self.get_model_info();
         let native_tools_on = request
             .tools
             .as_ref()
             .map(|t| !t.is_empty())
             .unwrap_or(false);
 
-        // Convert messages to OpenAI chat format
-        // Each internal message may map to multiple OpenAI messages
-        // (e.g., tool results are separate messages with role="tool")
         let mut messages: Vec<serde_json::Value> = request
             .messages
             .iter()
             .flat_map(convert_message_to_openai)
             .collect();
 
-        // Prepend system prompt if provided
         if !request.system_prompt.is_empty() {
             messages.insert(
                 0,
@@ -141,14 +138,22 @@ impl MinimaxProvider {
 
         if let Some(max_tokens) = request
             .max_tokens
-            .or_else(|| self.get_model_info().max_tokens)
+            .or(model_info.max_tokens)
             .filter(|m| *m > 0)
         {
-            // MiniMax uses max_completion_tokens (OpenAI-compatible API)
             body["max_completion_tokens"] = json!(max_tokens);
         }
 
-        // Tools in MiniMax OpenAI-compatible format (requires "type": "function")
+        if let Some(temperature) = model_info.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = model_info.top_p {
+            body["top_p"] = json!(top_p);
+        }
+        if let Some(top_k) = model_info.top_k {
+            body["top_k"] = json!(top_k);
+        }
+
         if native_tools_on && let Some(tools) = request.tools.as_ref() {
             let tools_json: Vec<serde_json::Value> = tools
                 .iter()
@@ -164,8 +169,6 @@ impl MinimaxProvider {
                 })
                 .collect();
             body["tools"] = json!(tools_json);
-            // Tool choice: respect request.tool_choice if provided
-            // MiniMax uses OpenAI-compatible format: "auto"|"required"|"none" or {"type": "function", ...}
             let tool_choice = request
                 .tool_choice
                 .as_ref()
@@ -180,10 +183,7 @@ impl MinimaxProvider {
             };
         }
 
-        // Reasoning config: only enable for models that support reasoning
-        // reasoning_split must be a top-level parameter, not nested in extra_body
-        // (extra_body is an OpenAI Python SDK convenience that merges into the request body)
-        if self.get_model_info().supports_reasoning.unwrap_or(false) {
+        if model_info.supports_reasoning.unwrap_or(false) {
             body["reasoning_split"] = json!(true);
         }
 
@@ -220,6 +220,8 @@ impl MinimaxProvider {
                 ),
                 tiers: None,
                 temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(40),
                 supports_tools: Some(true),
                 api_format: None,
             },
@@ -248,6 +250,8 @@ impl MinimaxProvider {
                 ),
                 tiers: None,
                 temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(40),
                 supports_tools: Some(true),
                 api_format: None,
             },
@@ -277,6 +281,8 @@ impl MinimaxProvider {
                 ),
                 tiers: None,
                 temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(40),
                 supports_tools: Some(true),
                 api_format: None,
             },
@@ -305,6 +311,8 @@ impl MinimaxProvider {
                 ),
                 tiers: None,
                 temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(40),
                 supports_tools: Some(true),
                 api_format: None,
             },
@@ -334,6 +342,8 @@ impl MinimaxProvider {
                 ),
                 tiers: None,
                 temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(40),
                 supports_tools: Some(true),
                 api_format: None,
             },
@@ -360,6 +370,8 @@ impl MinimaxProvider {
                 description: Some("MiniMax M2.1 highspeed: Faster and more agile.".to_string()),
                 tiers: None,
                 temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(40),
                 supports_tools: Some(true),
                 api_format: None,
             },
@@ -388,6 +400,8 @@ impl MinimaxProvider {
                 ),
                 tiers: None,
                 temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(20),
                 supports_tools: Some(true),
                 api_format: None,
             },
@@ -408,6 +422,8 @@ impl MinimaxProvider {
                 description: None,
                 tiers: None,
                 temperature: Some(1.0),
+                top_p: None,
+                top_k: None,
                 supports_tools: Some(true),
                 api_format: None,
             },
@@ -1235,7 +1251,6 @@ mod tests {
         let body = provider.build_request_body(&request).unwrap();
         assert_eq!(body["model"], "MiniMax-M2.7");
         assert_eq!(body["stream"], true);
-        // System prompt + user message = 2 messages
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(
@@ -1244,6 +1259,134 @@ mod tests {
         );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_build_request_body_sampling_params_m27() {
+        let config = MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "MiniMax-M2.7".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+        };
+        let provider = MinimaxProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["top_p"], 0.95);
+        assert_eq!(body["top_k"], 40);
+        assert!(
+            body.get("topP").is_none(),
+            "camelCase topP should be absent"
+        );
+        assert!(
+            body.get("topK").is_none(),
+            "camelCase topK should be absent"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_sampling_params_m2() {
+        let config = MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "MiniMax-M2".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+        };
+        let provider = MinimaxProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["top_p"], 0.95);
+        assert_eq!(body["top_k"], 20);
+    }
+
+    #[test]
+    fn test_build_request_body_sampling_params_unknown_model() {
+        let config = MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "some-unknown-model".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+        };
+        let provider = MinimaxProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        assert_eq!(body["temperature"], 1.0);
+        assert!(
+            body.get("top_p").is_none(),
+            "unknown model should not send top_p"
+        );
+        assert!(
+            body.get("top_k").is_none(),
+            "unknown model should not send top_k"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_sampling_and_reasoning_invariants() {
+        let config = MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "MiniMax-M2.7".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+        };
+        let provider = MinimaxProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: Some(1024),
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(
+            body.get("max_tokens").is_none(),
+            "must use max_completion_tokens, not max_tokens"
+        );
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["top_p"], 0.95);
+        assert_eq!(body["top_k"], 40);
+        assert_eq!(body["reasoning_split"], true);
+        assert!(
+            body.get("extra_body").is_none(),
+            "reasoning_split must be top-level, not in extra_body"
+        );
     }
 
     #[test]

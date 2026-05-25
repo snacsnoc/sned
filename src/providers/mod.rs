@@ -366,6 +366,8 @@ pub struct ModelInfo {
     pub description: Option<String>,
     pub tiers: Option<Vec<ModelTier>>,
     pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
     pub supports_tools: Option<bool>,
     pub api_format: Option<String>,
 }
@@ -1035,6 +1037,8 @@ mod tests {
                 cache_reads_price: Some(0.3),
             }]),
             temperature: None,
+            top_p: None,
+            top_k: None,
             supports_tools: Some(true),
             api_format: None,
         };
