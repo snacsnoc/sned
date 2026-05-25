@@ -24,7 +24,6 @@ use crate::core::context::{
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::provider_retry::{RetryConfig, create_message_with_retry};
 use crate::core::tools::SnedTool;
-use crate::core::tools::definitions::get_active_tool_definitions;
 use crate::core::tools::{ToolContext, ToolRegistry, coerce_string_array, tool_result_to_text};
 use crate::providers::{
     ApiStreamChunk, ApiStreamToolCall, AssistantContentBlock, MessageContent, MessageRole,
@@ -225,6 +224,7 @@ struct AgentLoopDeps {
     hook_manager: Option<Arc<crate::core::hooks::HookManager>>,
     approval_manager: Option<Arc<tokio::sync::Mutex<crate::core::approval::ApprovalManager>>>,
     checkpoint_manager: Option<crate::core::checkpoints::TaskCheckpointManager>,
+    tool_profile: Option<crate::core::tools::definitions::ToolProfile>,
 }
 
 impl AgentLoopDeps {
@@ -238,6 +238,7 @@ impl AgentLoopDeps {
             hook_manager: None,
             approval_manager: None,
             checkpoint_manager: None,
+            tool_profile: None,
         }
     }
 
@@ -1131,8 +1132,25 @@ impl AgentLoop {
                 .await;
         }
 
-        // 3. Send request and handle stream
-        let tools = Some(get_active_tool_definitions());
+        // 3. Select tool profile and build tool definitions
+        let profile = self.deps.tool_profile.unwrap_or_else(|| {
+            let mode_str = match self.config.mode {
+                crate::core::agent_types::AgentMode::Plan => "plan",
+                crate::core::agent_types::AgentMode::Act => "act",
+            };
+            let prompt = pruned_history
+                .iter()
+                .find(|m| m.role == crate::providers::MessageRole::User)
+                .and_then(|m| match &m.content {
+                    crate::providers::MessageContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            let p = crate::core::tools::definitions::select_tool_profile(prompt, mode_str);
+            tracing::info!(profile = ?p, prompt_len = prompt.len(), "selected tool profile");
+            p
+        });
+        let tools = Some(crate::core::tools::definitions::get_tool_definitions_for_profile(profile));
 
         let mut request = ProviderRequest {
             system_prompt: system_prompt.clone(),
@@ -1944,17 +1962,49 @@ impl AgentLoop {
 
                 if first_turn_direct_answer || text_only_turns > 1 {
                     text_only_completes_task = true;
-                } else {
-                    history.push(StorageMessage {
-                        id: None,
-                        role: MessageRole::User,
-                        content: MessageContent::Text(
-                            String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
-                        ),
-                        model_info: None,
-                        metrics: None,
-                        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-                    });
+                } else if text_only_turns == 1 {
+                    if let Some(profile) = self.deps.tool_profile {
+                        if let Some(next) = profile.escalate() {
+                            tracing::info!(
+                                ?profile,
+                                ?next,
+                                "escalating tool profile after text-only response"
+                            );
+                            self.deps.tool_profile = Some(next);
+                            history.push(StorageMessage {
+                                id: None,
+                                role: MessageRole::User,
+                                content: MessageContent::Text(
+                                    String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
+                                ),
+                                model_info: None,
+                                metrics: None,
+                                ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                            });
+                        } else {
+                            history.push(StorageMessage {
+                                id: None,
+                                role: MessageRole::User,
+                                content: MessageContent::Text(
+                                    String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
+                                ),
+                                model_info: None,
+                                metrics: None,
+                                ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                            });
+                        }
+                    } else {
+                        history.push(StorageMessage {
+                            id: None,
+                            role: MessageRole::User,
+                            content: MessageContent::Text(
+                                String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
+                            ),
+                            model_info: None,
+                            metrics: None,
+                            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                        });
+                    }
                 }
             }
         }

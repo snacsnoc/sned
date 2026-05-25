@@ -113,10 +113,15 @@ impl PromptBuilder {
 
         prompt.push_str(
             "\nOUTPUT FORMAT\n\
-             - Keep responses short and CLI-friendly.\n\
-             - Use tools instead of long prose whenever possible.\n\
-             - When the task is complete, return the result through the required completion tool.\n\
-             - Mention `/reportbug` only when the user is reporting product issues or asking how to report one.\n",
+              - Keep responses short and CLI-friendly.\n\
+              - Use tools instead of long prose whenever possible.\n\
+              - When the task is complete, return the result through the required completion tool.\n\
+              - Mention `/reportbug` only when the user is reporting product issues or asking how to report one.\n\n\
+              CODE GENERATION\n\
+              - For generated source, implement the smallest correct solution that satisfies the request.\n\
+              - Do not add optional retries, custom errors, wrappers, config objects, or extra abstractions unless requested.\n\
+              - Prefer standard library solutions over hand-rolled utilities.\n\
+              - Match the requested shape exactly: if asked for a function, write a function, not a framework.\n",
         );
 
         prompt.push_str(&skills_section);
