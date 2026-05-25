@@ -126,8 +126,17 @@ impl GeminiProvider {
                     0.7
                 }
             }),
-            "topP": 0.8,
         });
+
+        // topP: only send if explicitly set in ModelInfo; otherwise let the API use its default
+        if let Some(top_p) = info.and_then(|i| i.top_p) {
+            generation_config["topP"] = json!(top_p);
+        }
+
+        // topK: only send if explicitly set in ModelInfo
+        if let Some(top_k) = info.and_then(|i| i.top_k) {
+            generation_config["topK"] = json!(top_k);
+        }
 
         // Max output tokens
         if let Some(max_tokens) = request
@@ -196,6 +205,7 @@ impl GeminiProvider {
                     let mut params = t.function.parameters.clone();
                     if let Some(obj) = params.as_object_mut() {
                         obj.remove("additionalProperties");
+                        obj.remove("$schema");
                         // Also strip from nested property schemas
                         if let Some(props) =
                             obj.get_mut("properties").and_then(|v| v.as_object_mut())
@@ -203,6 +213,7 @@ impl GeminiProvider {
                             for (_, prop) in props.iter_mut() {
                                 if let Some(prop_obj) = prop.as_object_mut() {
                                     prop_obj.remove("additionalProperties");
+                                    prop_obj.remove("$schema");
                                 }
                             }
                         }
@@ -515,7 +526,10 @@ async fn process_gemini_sse_line(
 
     // Emit tool calls when we have finish_reason or at stream end
     if let Some(finish) = last_stop_reason.as_ref()
-        && (finish == "STOP" || finish == "MAX_TOKENS" || finish == "SAFETY")
+        && !matches!(
+            finish.as_str(),
+            "RECITATION" | "BLOCKED"
+        )
     {
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
             if !completed_tool_call_ids.contains(call_id) {
@@ -1112,6 +1126,196 @@ mod tests {
         assert_eq!(params["type"], "object");
         assert!(params["properties"].is_object());
         assert_eq!(params["required"], json!(["path"]));
+    }
+
+    #[test]
+    fn test_build_request_body_strips_dollar_schema() {
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-3-flash-preview".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![],
+            tools: Some(vec![ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "test_tool".to_string(),
+                    description: "A test tool".to_string(),
+                    parameters: json!({
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                                "description": "File path"
+                            }
+                        },
+                        "required": ["path"],
+                    }),
+                },
+            }]),
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        let func = &tools[0]["functionDeclarations"].as_array().unwrap()[0];
+        let params = &func["parameters"];
+
+        assert!(
+            params.get("$schema").is_none(),
+            "$schema should be stripped from top-level parameters"
+        );
+        let path_prop = &params["properties"]["path"];
+        assert!(
+            path_prop.get("$schema").is_none(),
+            "$schema should be stripped from nested property schemas"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_no_hardcoded_top_p() {
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-3-flash-preview".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: crate::providers::MessageContent::Text("Hello".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        let gc = &body["generationConfig"];
+        assert!(
+            gc.get("topP").is_none(),
+            "topP should not be sent when ModelInfo has no top_p"
+        );
+        assert!(
+            gc.get("topK").is_none(),
+            "topK should not be sent when ModelInfo has no top_k"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_top_p_from_model_info() {
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-3-flash-preview".to_string(),
+            model_info: Some(ModelInfo {
+                name: Some("gemini-3-flash-preview".to_string()),
+                max_tokens: None,
+                context_window: None,
+                supports_images: None,
+                supports_prompt_cache: false,
+                supports_reasoning: None,
+                input_price: None,
+                output_price: None,
+                image_output_price: None,
+                thinking_config: None,
+                supports_global_endpoint: None,
+                cache_writes_price: None,
+                cache_reads_price: None,
+                description: None,
+                tiers: None,
+                temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(40),
+                supports_tools: None,
+                api_format: None,
+            }),
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: crate::providers::MessageContent::Text("Hello".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        let gc = &body["generationConfig"];
+        assert_eq!(gc["temperature"], 1.0);
+        assert_eq!(gc["topP"], 0.95);
+        assert_eq!(gc["topK"], 40);
+    }
+
+    #[test]
+    fn test_build_request_body_gemini_3_temperature_default() {
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-3-flash-preview".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: crate::providers::MessageContent::Text("Hello".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        assert_eq!(
+            body["generationConfig"]["temperature"], 1.0,
+            "Gemini 3 models must default to temperature 1.0"
+        );
     }
 
     #[test]

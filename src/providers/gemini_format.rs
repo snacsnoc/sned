@@ -300,7 +300,7 @@ fn convert_content_to_gemini_parts(
                         parts.push(GeminiPart {
                             text: None,
                             thought: None,
-                            thought_signature: tr.shared.signature.clone(),
+                            thought_signature: None,
                             function_call: None,
                             function_response: Some(GeminiFunctionResponse {
                                 name: function_name,
@@ -726,5 +726,156 @@ mod tests {
         assert!(part.function_response.is_some());
         // Tool response should not have thought_signature
         assert_eq!(part.thought_signature, None);
+    }
+
+    #[test]
+    fn test_thought_signature_round_trip() {
+        // Full round-trip: thought → tool_use → tool_result → next turn
+        // Per Gemini 3 docs, thought_signature must be preserved on functionCall,
+        // must NOT appear on functionResponse, and must survive across turns.
+        let thinking = AssistantContentBlock::Thinking(crate::providers::ThinkingBlock {
+            thinking: "I need to check the weather.".to_string(),
+            signature: "think_sig_round_trip".to_string(),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: None,
+            },
+            summary: None,
+        });
+
+        let tool_use = AssistantContentBlock::ToolUse(ToolUseBlock {
+            id: "call_weather_001".to_string(),
+            name: "get_weather".to_string(),
+            input: serde_json::json!({"city": "Paris"}),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: Some("think_sig_round_trip".to_string()),
+            },
+            reasoning_details: None,
+        });
+
+        let tool_result = UserContentBlock::ToolResult(ToolResultBlock {
+            tool_use_id: "call_weather_001".to_string(),
+            content: ToolResultContent::Text("Sunny, 22C".to_string()),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: Some("should_be_ignored".to_string()),
+            },
+        });
+
+        let next_user_msg = UserContentBlock::Text(TextContentBlock {
+            text: "Thanks!".to_string(),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: None,
+            },
+            reasoning_details: None,
+        });
+
+        let messages = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![thinking, tool_use]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![tool_result]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![next_user_msg]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+
+        let gemini = convert_to_gemini_contents(&messages);
+        assert_eq!(gemini.len(), 3);
+
+        // Turn 1: Assistant — thinking + functionCall
+        let turn1 = &gemini[0];
+        assert_eq!(turn1.role, "model");
+        assert_eq!(turn1.parts.len(), 2);
+
+        // Thinking part
+        let think_part = &turn1.parts[0];
+        assert_eq!(think_part.thought, Some(true));
+        assert_eq!(
+            think_part.thought_signature,
+            Some("think_sig_round_trip".to_string())
+        );
+
+        // FunctionCall part — must have signature
+        let fc_part = &turn1.parts[1];
+        assert!(fc_part.function_call.is_some());
+        assert_eq!(
+            fc_part.thought_signature,
+            Some("think_sig_round_trip".to_string())
+        );
+        let fc = fc_part.function_call.as_ref().unwrap();
+        assert_eq!(fc.name, "get_weather");
+        assert_eq!(fc.id, Some("call_weather_001".to_string()));
+
+        // Turn 2: User — functionResponse — must NOT have thought_signature
+        let turn2 = &gemini[1];
+        assert_eq!(turn2.role, "user");
+        let fr_part = &turn2.parts[0];
+        assert!(fr_part.function_response.is_some());
+        assert_eq!(
+            fr_part.thought_signature, None,
+            "functionResponse must NEVER have thought_signature"
+        );
+        let fr = fr_part.function_response.as_ref().unwrap();
+        assert_eq!(fr.id, Some("call_weather_001".to_string()));
+        assert_eq!(fr.name, "get_weather");
+
+        // Turn 3: User — plain text
+        let turn3 = &gemini[2];
+        assert_eq!(turn3.role, "user");
+        assert_eq!(turn3.parts[0].text, Some("Thanks!".to_string()));
+    }
+
+    #[test]
+    fn test_tool_response_signature_always_none_even_when_shared_has_signature() {
+        // Regression test: the storage layer may store signatures on ToolResult,
+        // but the Gemini functionResponse must NEVER include them.
+        let tool_result = UserContentBlock::ToolResult(ToolResultBlock {
+            tool_use_id: "call_abc123".to_string(),
+            content: ToolResultContent::Text("result".to_string()),
+            shared: SharedContentFields {
+                call_id: None,
+                signature: Some("leaked_signature".to_string()),
+            },
+        });
+
+        let messages = vec![StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![tool_result]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+
+        let gemini = convert_to_gemini_contents(&messages);
+        let part = &gemini[0].parts[0];
+        assert!(
+            part.function_response.is_some(),
+            "Should have functionResponse"
+        );
+        assert_eq!(
+            part.thought_signature, None,
+            "thought_signature must be None on functionResponse even when shared.signature is Some"
+        );
     }
 }
