@@ -272,68 +272,64 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 
 ### `tui-smoke-test.sh`
 
-**What:** Automated smoke test for the interactive shell TUI state machine. Uses `expect` to drive sned through every state transition defined in `docs/TUI_STATE_MACHINE.md`. Automatically rebuilds sned before testing to catch compile errors and test the latest code.
+**What:** Canonical smoke test for the ratatui interactive shell and nearby CLI dispatch. It rebuilds sned, starts the TUI in a pty with `SNED_NO_ALTERNATE_SCREEN=1`, verifies the startup banner renders, sends `/exit`, and checks clean shutdown. It uses the mock provider, so no API key or network is required.
 
 **Usage:**
 ```bash
-# Run all 12 tests (requires MINIMAX_API_KEY)
+# Run all tests
 ./user-scripts/tui-smoke-test.sh
 
-# Run with verbose output (shows expect interactions — use for debugging)
+# Run with captured pty/command output
 ./user-scripts/tui-smoke-test.sh --verbose
 
 # Run a single test (use when one test fails to isolate the issue)
-./user-scripts/tui-smoke-test.sh --test idle-keystroke
-./user-scripts/tui-smoke-test.sh --test busy-enter-queue
+./user-scripts/tui-smoke-test.sh --test tui-startup-exit
 
-# List all test names and their state transitions
+# List all test names
 ./user-scripts/tui-smoke-test.sh --list
 ```
 
 **When to Use (LLM Agent Decision Tree):**
 - ✅ **After ANY change to `src/cli/interactive.rs`** → Run all tests
+- ✅ **After ANY change to `src/cli/tui/`** → Run all tests
 - ✅ **After ANY change to `src/terminal/input.rs`** → Run all tests
-- ✅ **After scroll region changes** → Run all tests
-- ✅ **After cursor visibility changes** → Run all tests
+- ✅ **After output-routing changes (`OutputWriter`, approval prompts, agent output)** → Run all tests
 - ✅ **Before committing TUI work** → Run all tests
-- ✅ **User reports TUI display bugs** → Run `--test <specific>` matching the bug
+- ✅ **User reports TUI startup/display bugs** → Run `--test tui-startup-exit --verbose`
 - ❌ **Not needed for**: Non-TUI changes (storage, providers, tools, etc.)
 
 **Why Use It:**
-- **Catches regressions**: Each test verifies one cell of the state machine table
-- **Prevents "fix X, break Y"**: Tests all transitions holistically, not one path at a time
-- **Automated**: No manual terminal interaction needed — `expect` drives the shell
+- **Catches startup regressions**: Verifies ratatui can initialize in a pty and render the banner
+- **Catches dispatch regressions**: Verifies help/version/error/json/yolo CLI paths still work
+- **Agent-safe**: Uses temp `SNED_DIR`/`SNED_DATA_DIR`, mock provider, and no live network
 - **Always builds first**: Runs `cargo build` automatically so you test latest changes
-- **Isolated tests**: Each test runs in a separate expect process with its own pty
-- **Reference document**: `docs/TUI_STATE_MACHINE.md` defines every expected behavior
+- **Reference document**: `docs/TUI_STATE_MACHINE.md` defines the state machine and manual checks
 
 **How It Works:**
 1. Runs `cargo build` to compile the latest sned binary
-2. Each test spawns sned inside `expect` via `sned-pty-helper` (sets pty window size to 80x24)
-3. `expect` sends keystrokes and reads output, checking for the `❯` prompt and pass/fail markers
-4. Each test runs in an isolated subprocess — no cross-contamination between tests
-5. Results are collected and summarized with actionable failure diagnostics
+2. The TUI test spawns sned inside a Python pty via `sned-pty-helper` (sets pty size to 80x24)
+3. The harness answers crossterm's cursor-position query (`ESC[6n`) with `ESC[1;1R`
+4. Once the startup banner renders, the harness sends `/exit`
+5. CLI dispatch tests run with isolated temp state
 
-**Test Matrix (12 tests):**
+**Test Matrix:**
 
-| Test Name | State Transition | What It Verifies |
-|-----------|-----------------|------------------|
-| `idle-keystroke` | IDLE → keystroke → IDLE | Input renders, cursor visible |
-| `idle-enter-nonempty` | IDLE → Enter → AGENT_BUSY → done → IDLE | Prompt echoes, agent runs, cursor returns |
-| `idle-enter-empty` | IDLE → Enter (empty) → IDLE | No submission on empty input |
-| `idle-ctrl-c-empty` | IDLE → Ctrl+C (empty) → SHUTDOWN | Clean exit, terminal restored |
-| `idle-ctrl-c-nonempty` | IDLE → Ctrl+C (text) → IDLE | Input clears, does not exit |
-| `idle-resize` | IDLE → resize → IDLE | Scroll region updates, input re-renders |
-| `busy-keystroke` | AGENT_BUSY → keystroke → AGENT_BUSY | Input visible at bottom, cursor hidden |
-| `busy-enter-queue` | AGENT_BUSY → Enter (queue) → done → IDLE | Message echoed to scroll region |
-| `busy-ctrl-c` | AGENT_BUSY → Ctrl+C → IDLE | Agent aborted, cursor visible |
-| `agent-done` | AGENT_BUSY → agent done → IDLE | Cursor visible after completion |
-| `multi-turn` | Multiple IDLE↔AGENT_BUSY cycles | Cursor toggles correctly each time |
-| `startup-banner` | Startup → IDLE | Banner and prompt render correctly |
+| Test Name | What It Verifies |
+|-----------|------------------|
+| `tui-startup-exit` | Ratatui starts in a pty, banner renders, `/exit` exits cleanly |
+| `help` | `--help` shows usage |
+| `version` | `--version` shows version |
+| `invalid-flag` | Invalid flag returns an error |
+| `yolo-help` | `--yolo` is accepted by CLI parsing |
+| `json-no-prompt` | `--json` with no prompt does not start the TUI |
+
+**Known Limits:**
+- This is a smoke test, not the old full state-machine suite.
+- It does not automate busy-state queueing, approval keystrokes, resize, or multi-turn agent behavior.
+- Those remain manual checks from `docs/TUI_STATE_MACHINE.md` or future Rust integration-test work.
 
 **Prerequisites:**
-- `expect` installed (`brew install expect`)
-- `MINIMAX_API_KEY` environment variable set
+- `python3`
 - `sned-pty-helper` binary in `user-scripts/` (built from `sned-pty-helper.c`)
 
 **If `sned-pty-helper` is missing:**
@@ -347,43 +343,36 @@ chmod +x user-scripts/sned-pty-helper
 Building sned (debug)...
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.25s
 
-═══════════════════════════════════════════
-  sned TUI State Machine Smoke Test
-═══════════════════════════════════════════
+==========================================
+  sned Ratatui TUI Smoke Test
+==========================================
 
-═══════════════════════════════════════════
+==========================================
   Results
-═══════════════════════════════════════════
-  PASS  idle-keystroke
-  PASS  idle-enter-nonempty
-  PASS  idle-enter-empty
-  PASS  idle-ctrl-c-empty
-  PASS  idle-ctrl-c-nonempty
-  PASS  idle-resize
-  PASS  busy-keystroke
-  PASS  busy-enter-queue
-  PASS  busy-ctrl-c
-  PASS  agent-done
-  PASS  multi-turn
-  PASS  startup-banner
+==========================================
+  PASS  tui-startup-exit
+  PASS  help
+  PASS  version
+  PASS  invalid-flag
+  PASS  yolo-help
+  PASS  json-no-prompt
 
-  12 passed, 0 failed
+  6 passed, 0 failed
 ```
 
 **Failure Diagnostics:**
 When tests fail, the output includes:
 - The specific test name and reason
 - Per-test `--verbose --test <name>` commands to re-run with full output
-- Common root causes (cursor visibility, scroll region, prompt echo)
-- Links to `docs/TUI_STATE_MACHINE.md` and `render_input_line()` invariants
+- Likely source file for the failing surface
 
 **Related:** See `docs/TUI_STATE_MACHINE.md` for the full state machine definition.
 
 ### `sned-pty-helper` / `sned-pty-helper.c`
 
-**What:** Small C helper that sets the pty window size (TIOCSWINSZ ioctl) then execs sned. Required by `tui-smoke-test.sh` because `expect`'s pty defaults to 0x0 window size, which causes `crossterm::terminal::size()` to return `(0, 0)` and triggers a `div_ceil(0)` panic in `render_input_line()`.
+**What:** Small C helper that sets the pty window size (TIOCSWINSZ ioctl) then execs sned. Used by `tui-smoke-test.sh` so ratatui has a stable 80x24 viewport.
 
-**Not for direct use** — called internally by `tui-smoke-test.sh` via `expect`.
+**Not for direct use** — called internally by `tui-smoke-test.sh` from the Python pty harness.
 
 **Rebuild if missing:**
 ```bash
@@ -391,7 +380,7 @@ gcc -o user-scripts/sned-pty-helper user-scripts/sned-pty-helper.c
 chmod +x user-scripts/sned-pty-helper
 ```
 
-**Dependencies:** `expect`, gcc/clang
+**Dependencies:** python3, gcc/clang only when rebuilding the helper
 
 ---
 
