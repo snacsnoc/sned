@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -95,135 +94,6 @@ pub fn env_var_to_settings_key() -> HashMap<&'static str, &'static str> {
     map.insert("AWS_BEDROCK_MODEL_PLAN", "planModeApiModelId");
     map.insert("AWS_REGION", "awsRegion");
     map
-}
-
-/// Get secrets from environment variables
-pub fn get_secrets_from_env() -> HashMap<String, String> {
-    let mut secrets = HashMap::with_capacity(16);
-    let env_map = env_var_to_secret_key();
-
-    for (env_var, secret_key) in env_map.iter() {
-        if let Ok(value) = env::var(env_var) {
-            secrets.insert(secret_key.to_string(), value);
-        }
-    }
-
-    // Special case: OPENAI_API_KEY also maps to openAiNativeApiKey if not already set
-    if let Ok(value) = env::var("OPENAI_API_KEY")
-        && !secrets.contains_key("openAiNativeApiKey")
-    {
-        secrets.insert("openAiNativeApiKey".to_string(), value);
-    }
-
-    // OPENAI_COMPATIBLE_CUSTOM_KEY or OPENAI_API_BASE maps to openAiApiKey if not set
-    let custom_key = env::var("OPENAI_COMPATIBLE_CUSTOM_KEY")
-        .or_else(|_| env::var("OPENAI_API_BASE"))
-        .ok();
-    if let Some(value) = custom_key
-        && !secrets.contains_key("openAiApiKey")
-    {
-        secrets.insert("openAiApiKey".to_string(), value);
-    }
-
-    secrets
-}
-
-/// Get settings from environment variables
-pub fn get_settings_from_env() -> HashMap<String, String> {
-    let mut settings = HashMap::with_capacity(8);
-    let env_map = env_var_to_settings_key();
-
-    for (env_var, settings_key) in env_map.iter() {
-        if let Ok(value) = env::var(env_var) {
-            settings.insert(settings_key.to_string(), value);
-        }
-    }
-
-    // Special case: AWS_BEDROCK_MODEL maps to both act and plan modes if not overridden
-    if let Ok(value) = env::var("AWS_BEDROCK_MODEL") {
-        if env::var("AWS_BEDROCK_MODEL_ACT").is_err() {
-            settings.insert("actModeApiModelId".to_string(), value.clone());
-        }
-        if env::var("AWS_BEDROCK_MODEL_PLAN").is_err() {
-            settings.insert("planModeApiModelId".to_string(), value);
-        }
-    }
-
-    settings
-}
-
-/// Get provider from environment variables (matching getProviderFromEnv() priority)
-pub fn get_provider_from_env() -> Option<String> {
-    if env::var("ANTHROPIC_API_KEY").is_ok() {
-        return Some("anthropic".to_string());
-    }
-    if env::var("OPENROUTER_API_KEY").is_ok() {
-        return Some("openrouter".to_string());
-    }
-    if env::var("OPENAI_API_KEY").is_ok() {
-        return Some("openai-native".to_string());
-    }
-    if env::var("GEMINI_API_KEY").is_ok() {
-        return Some("gemini".to_string());
-    }
-    if env::var("GOOGLE_CLOUD_PROJECT").is_ok() || env::var("GCP_PROJECT").is_ok() {
-        return Some("vertex".to_string());
-    }
-    if env::var("AWS_ACCESS_KEY_ID").is_ok() || env::var("AWS_BEDROCK_MODEL").is_ok() {
-        return Some("bedrock".to_string());
-    }
-    if env::var("GROQ_API_KEY").is_ok() {
-        return Some("groq".to_string());
-    }
-    if env::var("XAI_API_KEY").is_ok() {
-        return Some("xai".to_string());
-    }
-    if env::var("MISTRAL_API_KEY").is_ok() {
-        return Some("mistral".to_string());
-    }
-    if env::var("MOONSHOT_API_KEY").is_ok() {
-        return Some("moonshot".to_string());
-    }
-    if env::var("HF_TOKEN").is_ok() {
-        return Some("huggingface".to_string());
-    }
-    if env::var("ZAI_API_KEY").is_ok() {
-        return Some("zai".to_string());
-    }
-    if env::var("MINIMAX_API_KEY").is_ok() || env::var("MINIMAX_CN_API_KEY").is_ok() {
-        return Some("minimax".to_string());
-    }
-    if env::var("CEREBRAS_API_KEY").is_ok() {
-        return Some("cerebras".to_string());
-    }
-    if env::var("AI_GATEWAY_API_KEY").is_ok() {
-        return Some("vercel-ai-gateway".to_string());
-    }
-    if env::var("OPENCODE_API_KEY").is_ok() {
-        return Some("openai-native".to_string());
-    }
-    if env::var("KIMI_API_KEY").is_ok() {
-        return Some("moonshot".to_string());
-    }
-    if env::var("DEEPSEEK_API_KEY").is_ok() {
-        return Some("deepseek".to_string());
-    }
-    if env::var("QWEN_API_KEY").is_ok() {
-        return Some("qwen".to_string());
-    }
-    if env::var("TOGETHER_API_KEY").is_ok() {
-        return Some("together".to_string());
-    }
-    if env::var("FIREWORKS_API_KEY").is_ok() {
-        return Some("fireworks".to_string());
-    }
-    if env::var("NEBIUS_API_KEY").is_ok() {
-        return Some("nebius".to_string());
-    }
-    if env::var("OPENAI_COMPATIBLE_CUSTOM_KEY").is_ok() || env::var("OPENAI_API_BASE").is_ok() {
-        return Some("openai".to_string());
-    }
-    None
 }
 
 /// Secrets store for secret storage (uses Keychain/Credential Manager with file fallback)
@@ -403,15 +273,6 @@ mod tests {
         let map = env_var_to_settings_key();
         assert_eq!(map.get("GOOGLE_CLOUD_PROJECT"), Some(&"vertexProjectId"));
         assert_eq!(map.get("AWS_REGION"), Some(&"awsRegion"));
-    }
-
-    #[test]
-    fn test_get_provider_from_env() {
-        // This test is limited since we can't easily set env vars in tests
-        // without affecting the test environment
-        let provider = get_provider_from_env();
-        // Just verify it doesn't panic
-        let _ = provider;
     }
 
     #[test]
