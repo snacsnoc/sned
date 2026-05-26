@@ -192,7 +192,6 @@ pub enum OperationType {
 }
 
 #[derive(Debug)]
-#[expect(dead_code)]
 pub struct MigrationExecutionReport {
     pub source_root: PathBuf,
     pub destination_root: PathBuf,
