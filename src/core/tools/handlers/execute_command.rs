@@ -117,7 +117,6 @@ impl ExecuteCommandHandler {
             false,
             None,
             false,
-            false,
             &output_writer,
         )
         .await
@@ -134,7 +133,6 @@ impl ExecuteCommandHandler {
         cwd: Option<&Path>,
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
-        raw_output: bool,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
@@ -144,7 +142,6 @@ impl ExecuteCommandHandler {
             None,
             explicitly_approved,
             task_state,
-            raw_output,
             json_output,
             output_writer,
         )
@@ -158,7 +155,6 @@ impl ExecuteCommandHandler {
         timeout_override: Option<Duration>,
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
-        _raw_output: bool,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
@@ -766,7 +762,6 @@ impl ExecuteCommandHandler {
 
         let script = params["script"].as_str();
         let language = params["language"].as_str().unwrap_or("bash");
-        let raw_output = params["raw_output"].as_bool().unwrap_or(false);
 
         let result = if let Some(cmds) = commands {
             self.execute_commands_with_safety(
@@ -774,7 +769,6 @@ impl ExecuteCommandHandler {
                 cwd,
                 explicitly_approved,
                 task_state,
-                raw_output,
                 json_output,
                 output_writer,
             )
@@ -886,7 +880,6 @@ mod tests {
                 Some(Duration::from_millis(100)),
                 false,
                 None,
-                false,
                 false,
                 &output_writer,
             )
@@ -1079,7 +1072,6 @@ mod tests {
                 false,
                 None,
                 false,
-                false,
                 &output_writer,
             )
             .await;
@@ -1137,7 +1129,6 @@ mod tests {
                     Some(Duration::from_millis(100)),
                     false,
                     None,
-                    false,
                     false,
                     &output_writer,
                 )

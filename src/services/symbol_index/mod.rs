@@ -4,7 +4,6 @@
 
 pub mod db;
 
-use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// A symbol location in a file.
@@ -46,7 +45,6 @@ pub struct SymbolIndexService {
 
 pub const INDEX_DIR: &str = ".sned-symbol-index";
 pub const DB_FILENAME: &str = "data.db";
-const FILES_PER_BATCH: usize = 50;
 
 impl SymbolIndexService {
     pub fn new(project_root: String) -> Self {
@@ -108,10 +106,14 @@ impl SymbolIndexService {
             return;
         }
 
-        self.store_indexed_files(vec![(rel_path, mtime, size, symbols)]);
+        self.files.insert(rel_path.clone(), FileIndexEntry { mtime, size, symbols: symbols.clone() });
+        
+        if let Some(ref mut db) = self.db {
+            let _ = db.update_file_symbols(&rel_path, mtime, size, &symbols);
+        }
     }
 
-    pub fn get_symbols(
+    pub(crate) fn get_symbols(
         &self,
         symbol: &str,
         symbol_type: Option<SymbolType>,
@@ -149,308 +151,17 @@ impl SymbolIndexService {
         results
     }
 
-    pub fn get_references(&self, symbol: &str, limit: Option<usize>) -> Vec<SymbolLocation> {
+    pub(crate) fn get_references(&self, symbol: &str, limit: Option<usize>) -> Vec<SymbolLocation> {
         self.get_symbols(symbol, Some(SymbolType::Reference), limit)
     }
 
-    pub fn get_definitions(&self, symbol: &str, limit: Option<usize>) -> Vec<SymbolLocation> {
+    pub(crate) fn get_definitions(&self, symbol: &str, limit: Option<usize>) -> Vec<SymbolLocation> {
         self.get_symbols(symbol, Some(SymbolType::Definition), limit)
     }
 
-    pub fn remove_file(&mut self, rel_path: &str) {
-        if self.disabled {
-            return;
-        }
-
-        if let Some(ref mut db) = self.db
-            && let Err(e) = db.remove_file(rel_path)
-        {
-            tracing::warn!(error = %e, "symbol_index failed to remove file from DB");
-        }
-        self.files.remove(rel_path);
-    }
-
-    pub fn get_project_root(&self) -> &str {
+   pub fn get_project_root(&self) -> &str {
         &self.project_root
     }
-
-    pub fn get_file_metadata(&self, rel_path: &str) -> Option<(u64, u64)> {
-        if self.disabled {
-            return None;
-        }
-
-        if let Some(ref db) = self.db {
-            return db.get_file_metadata(rel_path);
-        }
-        self.files.get(rel_path).map(|e| (e.mtime, e.size))
-    }
-
-    pub fn symbol_count(&self) -> usize {
-        if self.disabled {
-            return 0;
-        }
-
-        if let Some(ref db) = self.db {
-            return db.symbol_count();
-        }
-        self.files.values().map(|e| e.symbols.len()).sum()
-    }
-
-    pub fn get_file_symbols(&self, rel_path: &str) -> Vec<SymbolLocation> {
-        if self.disabled {
-            return Vec::new();
-        }
-
-        if let Some(ref db) = self.db {
-            return db.get_file_symbols(rel_path);
-        }
-        self.files
-            .get(rel_path)
-            .map(|e| e.symbols.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn file_count(&self) -> usize {
-        if self.disabled {
-            return 0;
-        }
-
-        if let Some(ref db) = self.db {
-            return db.file_count();
-        }
-        self.files.len()
-    }
-
-    pub fn vacuum(&self) {
-        if self.disabled {
-            return;
-        }
-
-        if let Some(ref db) = self.db {
-            db.vacuum();
-        }
-    }
-
-    pub fn initialize(&mut self) -> anyhow::Result<()> {
-        if self.disabled {
-            return Ok(());
-        }
-
-        if self.db.is_none() {
-            return Ok(());
-        }
-
-        let root = std::path::Path::new(&self.project_root);
-        let index_dir = root.join(INDEX_DIR);
-        let index_dir_str = index_dir.to_str().unwrap_or("");
-
-        let mut files_to_update: Vec<(std::path::PathBuf, String)> = Vec::new();
-
-        for result in ignore::WalkBuilder::new(root)
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .build()
-        {
-            let entry = match result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            let abs_str = match path.to_str() {
-                Some(s) => s,
-                None => continue,
-            };
-
-            if abs_str.starts_with(index_dir_str) {
-                continue;
-            }
-
-            if !should_index_file(abs_str) {
-                continue;
-            }
-
-            let rel = path.strip_prefix(root).unwrap_or(path);
-            let rel_str = rel.to_str().unwrap_or("").to_string();
-
-            let needs_update = match self.db.as_ref() {
-                Some(db) => {
-                    let meta = match std::fs::metadata(path) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let size = meta.len();
-
-                    match db.get_file_metadata(&rel_str) {
-                        Some((db_mtime, db_size)) => db_mtime != mtime || db_size != size,
-                        None => true,
-                    }
-                }
-                None => true,
-            };
-
-            if needs_update {
-                files_to_update.push((path.to_path_buf(), rel_str));
-            }
-        }
-
-        for batch in files_to_update.chunks(FILES_PER_BATCH) {
-            self.index_files_batch(batch)?;
-        }
-
-        if let Some(ref db) = self.db {
-            db.vacuum();
-        }
-
-        Ok(())
-    }
-
-    fn index_files_batch(
-        &mut self,
-        files_to_update: &[(std::path::PathBuf, String)],
-    ) -> anyhow::Result<()> {
-        if self.disabled {
-            return Ok(());
-        }
-
-        if files_to_update.is_empty() {
-            return Ok(());
-        }
-
-        let absolute_paths: Vec<String> = files_to_update
-            .iter()
-            .filter_map(|(path, _)| path.to_str().map(|s| s.to_string()))
-            .collect();
-
-        let language_parsers =
-            match crate::services::tree_sitter::load_required_language_parsers(&absolute_paths) {
-                Ok(parsers) => parsers,
-                Err(_) => return Ok(()),
-            };
-
-        // Use rayon for parallel file indexing with automatic work-stealing
-        let indexed_entries: Vec<(usize, String, u64, u64, Vec<SymbolLocation>)> = files_to_update
-            .par_iter()
-            .enumerate()
-            .filter_map(|(index, (absolute_path, rel_path))| {
-                let absolute_str = absolute_path.to_str()?;
-
-                let Ok(content) = std::fs::read_to_string(absolute_path) else {
-                    return None;
-                };
-
-                let Ok(symbols) =
-                    extract_symbols_for_indexing(absolute_str, &content, &language_parsers)
-                else {
-                    return None;
-                };
-
-                let meta = std::fs::metadata(absolute_path).ok();
-                let mtime = meta
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let size = meta.map(|m| m.len()).unwrap_or(0);
-
-                Some((index, rel_path.clone(), mtime, size, symbols))
-            })
-            .collect();
-
-        self.store_indexed_files(
-            indexed_entries
-                .into_iter()
-                .map(|(_, rel_path, mtime, size, symbols)| (rel_path, mtime, size, symbols))
-                .collect(),
-        );
-        Ok(())
-    }
-
-    fn store_indexed_files(&mut self, entries: Vec<(String, u64, u64, Vec<SymbolLocation>)>) {
-        if self.disabled {
-            return;
-        }
-
-        if entries.is_empty() {
-            return;
-        }
-
-        if let Some(ref mut db) = self.db
-            && let Err(e) = db.update_files_symbols_batch(&entries)
-        {
-            tracing::warn!(error = %e, "symbol_index failed to batch update symbols");
-        }
-
-        for (rel_path, mtime, size, symbols) in entries {
-            self.files.insert(
-                rel_path,
-                FileIndexEntry {
-                    mtime,
-                    size,
-                    symbols,
-                },
-            );
-        }
-    }
-
-    pub fn update_file(&mut self, absolute_path: &str) -> anyhow::Result<()> {
-        if self.disabled {
-            return Ok(());
-        }
-
-        let root = std::path::Path::new(&self.project_root);
-        let abs_path = std::path::Path::new(absolute_path);
-        let rel = abs_path.strip_prefix(root).unwrap_or(abs_path);
-        let rel_str = rel.to_str().unwrap_or("").to_string();
-
-        if !should_index_file(absolute_path) {
-            return Ok(());
-        }
-
-        let content = std::fs::read_to_string(absolute_path)?;
-        let parsers =
-            crate::services::tree_sitter::load_required_language_parsers(&[absolute_path])?;
-        let symbols = extract_symbols_for_indexing(absolute_path, &content, &parsers)?;
-
-        let meta = std::fs::metadata(absolute_path)?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let size = meta.len();
-
-        self.index_file(rel_str, mtime, size, symbols);
-        Ok(())
-    }
-}
-
-const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb", "php",
-    "swift",
-];
-
-fn should_index_file(path: &str) -> bool {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    SUPPORTED_EXTENSIONS.contains(&ext.as_str())
 }
 
 /// Extract symbols from file content for indexing.
@@ -643,160 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn test_symbol_index_remove_file() {
-        let mut service = SymbolIndexService::new("/tmp/test".to_string());
-        service.index_file(
-            "src/main.rs".to_string(),
-            1234567890,
-            100,
-            vec![make_symbol("test", 1, SymbolType::Definition)],
-        );
-        assert_eq!(service.get_definitions("test", None).len(), 1);
-        service.remove_file("src/main.rs");
-        assert!(service.get_definitions("test", None).is_empty());
-    }
-
-    #[test]
-    fn test_with_persistence() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap().to_string();
-        let mut service = SymbolIndexService::new(root.clone())
-            .with_persistence()
-            .unwrap();
-
-        let symbols = vec![make_symbol("persisted", 1, SymbolType::Definition)];
-        service.index_file("src/lib.rs".to_string(), 100, 50, symbols);
-        assert_eq!(service.symbol_count(), 1);
-        assert_eq!(service.file_count(), 1);
-
-        let results = service.get_symbols("persisted", None, None);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].path.as_deref(), Some("src/lib.rs"));
-    }
-
-    #[test]
-    fn test_disabled_mode_never_indexes_or_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let src_dir = root.join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        let file_path = src_dir.join("lib.rs");
-        std::fs::write(&file_path, "fn should_not_be_indexed() {}\n").unwrap();
-
-        let mut service = SymbolIndexService::new(root.to_string_lossy().to_string()).disabled();
-        assert!(service.is_disabled());
-
-        service = service.with_persistence().unwrap();
-        assert!(!root.join(INDEX_DIR).exists());
-
-        service.initialize().unwrap();
-        assert_eq!(service.file_count(), 0);
-        assert_eq!(service.symbol_count(), 0);
-        assert!(
-            service
-                .get_definitions("should_not_be_indexed", None)
-                .is_empty()
-        );
-        assert!(service.get_file_symbols("src/lib.rs").is_empty());
-        assert_eq!(service.get_file_metadata("src/lib.rs"), None);
-
-        service.index_file(
-            "src/manual.rs".to_string(),
-            1,
-            10,
-            vec![make_symbol("manual", 1, SymbolType::Definition)],
-        );
-        service.update_file("/path/that/does/not/exist.rs").unwrap();
-        service.remove_file("src/manual.rs");
-
-        assert_eq!(service.file_count(), 0);
-        assert_eq!(service.symbol_count(), 0);
-        assert!(service.get_symbols("manual", None, None).is_empty());
-        assert!(!root.join(INDEX_DIR).exists());
-    }
-
-    #[test]
-    fn test_memory_mode_indexes_without_persisting() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let src_dir = root.join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        let file_path = src_dir.join("lib.rs");
-        std::fs::write(&file_path, "fn in_memory_symbol() {}\n").unwrap();
-
-        let mut service = SymbolIndexService::new(root.to_string_lossy().to_string());
-        service.update_file(file_path.to_str().unwrap()).unwrap();
-
-        let defs = service.get_definitions("in_memory_symbol", None);
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].path.as_deref(), Some("src/lib.rs"));
-        assert_eq!(service.file_count(), 1);
-        assert!(service.symbol_count() >= 1);
-        assert!(!root.join(INDEX_DIR).exists());
-    }
-
-    #[test]
-    fn test_store_indexed_files_batch_updates_cache_and_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap().to_string();
-        let mut service = SymbolIndexService::new(root).with_persistence().unwrap();
-
-        let entries = vec![
-            (
-                "src/a.rs".to_string(),
-                100,
-                50,
-                vec![make_symbol("alpha", 1, SymbolType::Definition)],
-            ),
-            (
-                "src/b.rs".to_string(),
-                200,
-                60,
-                vec![make_symbol("beta", 2, SymbolType::Reference)],
-            ),
-        ];
-
-        service.store_indexed_files(entries);
-
-        assert_eq!(service.file_count(), 2);
-        assert_eq!(service.symbol_count(), 2);
-
-        let alpha = service.get_definitions("alpha", None);
-        assert_eq!(alpha.len(), 1);
-        assert_eq!(alpha[0].path.as_deref(), Some("src/a.rs"));
-
-        let beta = service.get_references("beta", None);
-        assert_eq!(beta.len(), 1);
-        assert_eq!(beta[0].path.as_deref(), Some("src/b.rs"));
-    }
-
-    #[test]
-    fn test_index_files_batch_handles_more_than_one_scan_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let src_dir = root.join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-
-        let mut service = SymbolIndexService::new(root.to_str().unwrap().to_string())
-            .with_persistence()
-            .unwrap();
-
-        let mut entries = Vec::new();
-        for i in 0..60 {
-            let file_path = src_dir.join(format!("file_{i}.rs"));
-            std::fs::write(&file_path, format!("fn file_{i}() {{}}\n")).unwrap();
-            entries.push((file_path, format!("src/file_{i}.rs")));
-        }
-
-        service.index_files_batch(&entries).unwrap();
-
-        assert_eq!(service.file_count(), 60);
-        assert_eq!(service.get_definitions("file_0", None).len(), 1);
-        assert_eq!(service.get_definitions("file_59", None).len(), 1);
-        assert!(service.symbol_count() >= 60);
-    }
-
-    #[test]
     fn test_db_backed_get_returns_path() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap().to_string();
@@ -820,16 +377,6 @@ mod tests {
         let paths: Vec<_> = results.iter().filter_map(|r| r.path.clone()).collect();
         assert!(paths.contains(&"src/a.rs".to_string()));
         assert!(paths.contains(&"src/b.rs".to_string()));
-    }
-
-    #[test]
-    fn test_should_index_file() {
-        assert!(should_index_file("src/main.rs"));
-        assert!(should_index_file("lib.ts"));
-        assert!(should_index_file("app.py"));
-        assert!(!should_index_file("README.md"));
-        assert!(!should_index_file("config.json"));
-        assert!(!should_index_file("Makefile"));
     }
 
     #[test]
@@ -895,47 +442,6 @@ mod tests {
             "service should be functional after panic: can add new symbols"
         );
         assert_eq!(post_defs[0].start_line, 5);
-    }
-
-    #[test]
-    fn test_mtime_comparison_no_spurious_reindex() {
-        use crate::services::symbol_index::db::SymbolIndexDatabase;
-        use std::fs;
-
-        let temp_dir = "/tmp/test_mtime_comparison";
-        let _ = fs::remove_dir_all(temp_dir);
-        fs::create_dir_all(temp_dir).unwrap();
-        let db_path = std::path::PathBuf::from(format!("{}/symbols.db", temp_dir));
-
-        let mut db = SymbolIndexDatabase::open(&db_path).unwrap();
-
-        let test_mtime: u64 = 1234567890;
-        let test_size: u64 = 1024;
-
-        db.update_file_symbols("test.rs", test_mtime, test_size, &[])
-            .unwrap();
-
-        let (stored_mtime, stored_size) = db.get_file_metadata("test.rs").unwrap();
-
-        assert_eq!(
-            stored_mtime, test_mtime,
-            "DB should store mtime in seconds, not milliseconds"
-        );
-        assert_eq!(stored_size, test_size);
-
-        let needs_update = stored_mtime != test_mtime || stored_size != test_size;
-        assert!(
-            !needs_update,
-            "File with same mtime/size should not need update (no spurious re-index)"
-        );
-
-        let needs_update_different = stored_mtime != (test_mtime + 1) || stored_size != test_size;
-        assert!(
-            needs_update_different,
-            "File with different mtime should need update"
-        );
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]

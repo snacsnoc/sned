@@ -367,8 +367,6 @@ impl UseSubagentsHandler {
         let mut successes = 0usize;
         let mut failures = 0usize;
         let mut total_tool_calls = 0u32;
-        let mut _total_input_tokens = 0u32;
-        let mut _total_output_tokens = 0u32;
         let mut total_cache_writes = 0u32;
         let mut total_cache_reads = 0u32;
         let mut max_context_tokens = 0u32;
@@ -419,8 +417,6 @@ impl UseSubagentsHandler {
             }
 
             total_tool_calls += result.tool_calls;
-            _total_input_tokens += result.input_tokens;
-            _total_output_tokens += result.output_tokens;
             total_cache_writes += result.cache_write_tokens;
             total_cache_reads += result.cache_read_tokens;
             max_context_tokens = max_context_tokens.max(result.context_tokens);

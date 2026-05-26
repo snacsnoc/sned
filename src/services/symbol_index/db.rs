@@ -57,16 +57,6 @@ impl SymbolIndexDatabase {
         Ok(Self { conn, dirty: false })
     }
 
-    pub fn get_file_metadata(&self, rel_path: &str) -> Option<(u64, u64)> {
-        self.conn
-            .query_row(
-                "SELECT mtime, size FROM files WHERE path = ?1",
-                params![rel_path],
-                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
-            )
-            .ok()
-    }
-
     pub fn update_file_symbols(
         &mut self,
         rel_path: &str,
@@ -151,13 +141,6 @@ impl SymbolIndexDatabase {
         Ok(())
     }
 
-    pub fn remove_file(&mut self, rel_path: &str) -> rusqlite::Result<()> {
-        self.conn
-            .execute("DELETE FROM files WHERE path = ?1", params![rel_path])?;
-        self.dirty = true;
-        Ok(())
-    }
-
     pub fn get_symbols_by_name(
         &self,
         name: &str,
@@ -221,29 +204,6 @@ impl SymbolIndexDatabase {
         }
     }
 
-    pub fn get_file_symbols(&self, rel_path: &str) -> Vec<SymbolLocation> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT file_path, name, type, kind, start_line, start_column, end_line, end_column FROM symbols WHERE file_path = ?1"
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "symbol_index failed to prepare file symbols query");
-                return Vec::new();
-            }
-        };
-        match stmt.query_map(params![rel_path], row_to_symbol_location) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, "symbol_index file symbols query failed");
-                Vec::new()
-            }
-        }
-    }
-
-    pub fn vacuum(&self) {
-        let _ = self.conn.execute_batch("VACUUM");
-    }
-
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -252,22 +212,7 @@ impl SymbolIndexDatabase {
         self.dirty = dirty;
     }
 
-    pub fn file_count(&self) -> usize {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM files", [], |row| {
-                row.get::<_, usize>(0)
-            })
-            .unwrap_or(0)
     }
-
-    pub fn symbol_count(&self) -> usize {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM symbols", [], |row| {
-                row.get::<_, usize>(0)
-            })
-            .unwrap_or(0)
-    }
-}
 
 fn row_to_symbol_location(row: &rusqlite::Row) -> rusqlite::Result<SymbolLocation> {
     let file_path: String = row.get(0)?;
@@ -302,9 +247,7 @@ mod tests {
 
     #[test]
     fn test_db_open_and_schema() {
-        let db = SymbolIndexDatabase::open_in_memory().unwrap();
-        assert_eq!(db.file_count(), 0);
-        assert_eq!(db.symbol_count(), 0);
+        let _db = SymbolIndexDatabase::open_in_memory().unwrap();
     }
 
     #[test]
@@ -323,8 +266,6 @@ mod tests {
         }];
 
         let _ = db.update_file_symbols("src/main.rs", 123456, 1024, &symbols);
-        assert_eq!(db.file_count(), 1);
-        assert_eq!(db.symbol_count(), 1);
         assert!(db.is_dirty());
     }
 
@@ -373,29 +314,6 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_file() {
-        let mut db = SymbolIndexDatabase::open_in_memory().unwrap();
-
-        let symbols = vec![SymbolLocation {
-            path: None,
-            name: "test".to_string(),
-            start_line: 1,
-            start_column: 0,
-            end_line: 1,
-            end_column: 4,
-            symbol_type: SymbolType::Definition,
-            kind: None,
-        }];
-
-        let _ = db.update_file_symbols("src/a.rs", 100, 50, &symbols);
-        assert_eq!(db.symbol_count(), 1);
-
-        let _ = db.remove_file("src/a.rs");
-        assert_eq!(db.file_count(), 0);
-        assert_eq!(db.symbol_count(), 0);
-    }
-
-    #[test]
     fn test_batch_update() {
         let mut db = SymbolIndexDatabase::open_in_memory().unwrap();
 
@@ -433,23 +351,10 @@ mod tests {
         ];
 
         let _ = db.update_files_symbols_batch(&entries);
-        assert_eq!(db.file_count(), 2);
-        assert_eq!(db.symbol_count(), 2);
 
         let alpha = db.get_symbols_by_name("alpha", None, None);
         assert_eq!(alpha.len(), 1);
         assert_eq!(alpha[0].path.as_deref(), Some("src/a.rs"));
-    }
-
-    #[test]
-    fn test_file_metadata() {
-        let mut db = SymbolIndexDatabase::open_in_memory().unwrap();
-        assert!(db.get_file_metadata("src/main.rs").is_none());
-
-        let _ = db.update_file_symbols("src/main.rs", 123456, 1024, &[]);
-        let meta = db.get_file_metadata("src/main.rs").unwrap();
-        assert_eq!(meta.0, 123456);
-        assert_eq!(meta.1, 1024);
     }
 
     #[test]
@@ -468,7 +373,6 @@ mod tests {
         }];
 
         let _ = db.update_file_symbols("src/lib.rs", 100, 50, &symbols_v1);
-        assert_eq!(db.symbol_count(), 1);
 
         let symbols_v2 = vec![SymbolLocation {
             path: None,
@@ -482,7 +386,6 @@ mod tests {
         }];
 
         let _ = db.update_file_symbols("src/lib.rs", 200, 55, &symbols_v2);
-        assert_eq!(db.symbol_count(), 1);
 
         let results = db.get_symbols_by_name("old_name", None, None);
         assert!(results.is_empty());
@@ -545,7 +448,6 @@ mod tests {
                 kind: None,
             }];
             let _ = db.update_file_symbols("src/lib.rs", 100, 50, &symbols);
-            db.vacuum();
         }
 
         let db = SymbolIndexDatabase::open(&db_path).unwrap();

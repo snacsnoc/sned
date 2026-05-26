@@ -66,48 +66,6 @@ mod tests {
     }
 
     #[test]
-    fn test_categorize_cli_error_input() {
-        assert_eq!(
-            categorize_error(&anyhow::anyhow!(CliError::input("invalid prompt"))),
-            EXIT_INPUT
-        );
-        assert_eq!(
-            categorize_error(&anyhow::anyhow!(CliError::input("bad flag provided"))),
-            EXIT_INPUT
-        );
-        assert_eq!(
-            categorize_error(&anyhow::anyhow!(CliError::input(
-                "use --continue without a prompt"
-            ))),
-            EXIT_INPUT
-        );
-    }
-
-    #[test]
-    fn test_categorize_cli_error_interrupted() {
-        assert_eq!(
-            categorize_error(&anyhow::anyhow!(CliError::Interrupted)),
-            EXIT_INTERRUPTED
-        );
-    }
-
-    #[test]
-    fn test_categorize_cli_error_tool() {
-        assert_eq!(
-            categorize_error(&anyhow::anyhow!(CliError::tool("command failed"))),
-            EXIT_TOOL
-        );
-    }
-
-    #[test]
-    fn test_categorize_cli_error_general() {
-        assert_eq!(
-            categorize_error(&anyhow::anyhow!(CliError::general("unknown"))),
-            EXIT_ERROR
-        );
-    }
-
-    #[test]
     fn test_categorize_anyhow_error_defaults_to_exit_error() {
         assert_eq!(
             categorize_error(&anyhow::anyhow!("Unknown error")),

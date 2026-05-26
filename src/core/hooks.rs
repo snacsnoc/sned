@@ -221,16 +221,6 @@ impl HookManager {
         self.cancel_token = Some(token);
     }
 
-    /// Get the runtime hooks directory if set.
-    pub fn get_runtime_hooks_dir(&self) -> Option<&PathBuf> {
-        self.runtime_hooks_dir.as_ref()
-    }
-
-    /// Get the workspace hooks directories.
-    pub fn get_workspace_hooks_dirs(&self) -> &[PathBuf] {
-        &self.workspace_hooks_dirs
-    }
-
     /// Get the global hooks directory if set.
     pub fn get_global_hooks_dir(&self) -> Option<&PathBuf> {
         self.global_hooks_dir.as_ref()
@@ -892,38 +882,6 @@ impl HookManager {
     }
 }
 
-/// Get hooks directories from the filesystem.
-/// Priority: runtime (--hooks-dir) > workspace (.agents/hooks) > global
-pub fn get_hooks_dirs(runtime_dir: Option<&Path>, workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    // Runtime hooks directory (--hooks-dir)
-    if let Some(dir) = runtime_dir
-        && dir.exists()
-    {
-        dirs.push(dir.to_path_buf());
-    }
-
-    // Workspace hooks directories
-    for root in workspace_roots {
-        let workspace_hooks = root.join(".agents").join("hooks");
-        if workspace_hooks.exists() {
-            dirs.push(workspace_hooks);
-        }
-    }
-
-    // Global hooks directory
-    let global_hooks = dirs::home_dir()
-        .map(|h| h.join("Documents").join("Sned").join("Hooks"))
-        .unwrap_or_else(|| PathBuf::from(".sned").join("hooks"));
-
-    if global_hooks.exists() {
-        dirs.push(global_hooks);
-    }
-
-    dirs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,31 +1020,6 @@ mod tests {
         assert_eq!(hooks[0], runtime_dir.join("PreToolUse"));
         assert_eq!(hooks[1], workspace_dir.join("PreToolUse"));
         assert_eq!(hooks[2], global_dir.join("PreToolUse"));
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_get_hooks_dirs() {
-        let temp_dir = std::env::temp_dir().join("sned_test_get_hooks");
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        let runtime_dir = temp_dir.join("runtime");
-        let workspace_root = temp_dir.join("workspace");
-        let workspace_hooks = workspace_root.join(".agents").join("hooks");
-
-        fs::create_dir_all(&runtime_dir).unwrap();
-        fs::create_dir_all(&workspace_hooks).unwrap();
-
-        let dirs = get_hooks_dirs(Some(&runtime_dir), &[workspace_root]);
-
-        // Should contain at least runtime and workspace dirs
-        // (global dir may or may not exist on the system)
-        assert!(dirs.len() >= 2);
-        assert!(dirs.contains(&runtime_dir));
-        assert!(dirs.contains(&workspace_hooks));
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);

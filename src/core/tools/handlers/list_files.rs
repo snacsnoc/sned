@@ -45,22 +45,6 @@ impl ListFilesHandler {
         Self
     }
 
-    /// List files in one or more directories.
-    ///
-    #[allow(dead_code)]
-    async fn list_files(&self, paths: Vec<String>, recursive: bool) -> Vec<ListFilesResult> {
-        let mut results = Vec::with_capacity(paths.len());
-
-        for path in paths {
-            let result = self
-                .list_directory_with_line_counts(&path, recursive, true)
-                .await;
-            results.push(result);
-        }
-
-        results
-    }
-
     /// List files in a single directory.
     async fn list_directory_with_line_counts(
         &self,

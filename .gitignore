@@ -52,44 +52,20 @@ package-lock.json
 .sned-symbol-index/
 .sned/
 
-# Secrets and local config
 opencode.json
 .qwen/
 
-# Local/private docs removed from public history
 .agents/
 BUILD_SPEC.md
-NEW_NAMES.md
-insight-2026-05-18.html
 llm-openai-docs/
 
-# Prebuilt vendor binaries
 vendor/
 
-# Example terminals (large binaries)
-example_libghostty_terminals/
 
-# Agent launcher prompts (internal, not for public tracking)
-USER_PROMPT*
-._USER_PROMPT*
-
-# Agent-generated docs (read from disk, not tracked — snapshots drift)
-LLM_AGENT_OPTIMIZATIONS.md
-PROJECT_BRIEF.md
-DEBUG_MEMORY_LEAK_TESTING.md
-PROVIDER_MATRIX_SNAPSHOT.md
-STORAGE_LAYOUT_SNAPSHOT.md
-STORAGE_RECONCILIATION.md
-TOOL_INVENTORY_SNAPSHOT.md
-
-# Profiling output
 dhat-heap.json
 
-# Backup files
 *.bak
 
-# Hooks (internal workflow, not for public tracking)
 .snedrules/hooks/
 
-# Submodule references (not used)
-libghostty-rs/
+.internal/

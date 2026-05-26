@@ -57,41 +57,6 @@ impl WriteToFileHandler {
         Ok(format!("Successfully wrote to {}", path))
     }
 
-    /// Write a new file, failing if it already exists.
-    #[allow(dead_code)]
-    async fn write_new_file(&self, path: &str, content: &str) -> anyhow::Result<String> {
-        use std::path::Path;
-
-        let path_obj = Path::new(path);
-
-        if tokio::fs::metadata(path_obj).await.is_ok() {
-            return Err(anyhow::anyhow!("File already exists: {}", path));
-        }
-
-        if let Some(parent) = path_obj.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path_obj)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    anyhow::anyhow!("File already exists: {}", path)
-                } else {
-                    anyhow::anyhow!("Failed to create file {}: {}", path, e)
-                }
-            })?;
-        use tokio::io::AsyncWriteExt;
-        let mut writer = tokio::io::BufWriter::new(file);
-        writer.write_all(content.as_bytes()).await?;
-        writer.flush().await?;
-
-        Ok(format!("Successfully wrote to {}", path))
-    }
-
     async fn execute_without_state(&self, params: serde_json::Value) -> Result<String, ToolError> {
         let path = params["path"]
             .as_str()
@@ -268,25 +233,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fs::read_to_string(file_path).unwrap(), "nested");
-    }
-
-    #[tokio::test]
-    async fn test_write_new_file_exists() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("exists.txt");
-        fs::write(&file_path, "original").unwrap();
-
-        let handler = WriteToFileHandler::new();
-        let result = handler
-            .write_new_file(file_path.to_str().unwrap(), "new")
-            .await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("File already exists")
-        );
     }
 
     #[tokio::test]
