@@ -324,7 +324,7 @@ pub fn run_migration(source_dir: &str, dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn print_dry_run_report(report: &crate::storage::migration::DryRunMigrationReport) {
+pub(crate) fn print_dry_run_report(report: &crate::storage::migration::DryRunMigrationReport) {
     if !report.has_changes() {
         println!("No migration needed - directories are in sync.");
         return;
@@ -454,7 +454,7 @@ pub fn print_dry_run_report(report: &crate::storage::migration::DryRunMigrationR
     );
 }
 
-pub fn print_execution_report(report: &crate::storage::migration::MigrationExecutionReport) {
+pub(crate) fn print_execution_report(report: &crate::storage::migration::MigrationExecutionReport) {
     if !report.has_changes() {
         println!("No migration needed - directories were already in sync.");
         return;

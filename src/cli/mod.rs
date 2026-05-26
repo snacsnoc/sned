@@ -19,7 +19,7 @@ pub use interactive::{
     should_start_interactive_shell,
 };
 pub use subcommands::{
-    format_config_output, parse_config_assignment, print_dry_run_report, run_auth, run_config,
+    format_config_output, parse_config_assignment, run_auth, run_config,
     run_doctor, run_history, run_migration,
 };
 

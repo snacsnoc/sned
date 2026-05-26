@@ -7,7 +7,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JsonObjectMigration {
+pub(crate) struct JsonObjectMigration {
     pub relative_path: PathBuf,
     pub source_keys: Vec<String>,
     pub destination_keys: Vec<String>,
@@ -23,7 +23,7 @@ impl JsonObjectMigration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskHistoryMigration {
+pub(crate) struct TaskHistoryMigration {
     pub relative_path: PathBuf,
     pub source_count: usize,
     pub destination_count: usize,
@@ -33,17 +33,13 @@ pub struct TaskHistoryMigration {
 }
 
 impl TaskHistoryMigration {
-    pub fn merged_count(&self) -> usize {
-        self.destination_count + self.copied_ids.len()
-    }
-
     pub fn is_in_sync(&self) -> bool {
         self.copied_ids.is_empty() && self.conflicting_ids.is_empty()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskDirectoryMigration {
+pub(crate) struct TaskDirectoryMigration {
     pub task_id: String,
     pub source_file_count: usize,
     pub destination_file_count: usize,
@@ -59,7 +55,7 @@ impl TaskDirectoryMigration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DryRunMigrationReport {
+pub(crate) struct DryRunMigrationReport {
     pub source_root: PathBuf,
     pub destination_root: PathBuf,
     pub endpoints: Option<JsonObjectMigration>,
@@ -114,7 +110,7 @@ impl DryRunMigrationReport {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum MigrationError {
+pub(crate) enum MigrationError {
     #[error("failed to read {path}: {source}")]
     Io {
         path: PathBuf,
@@ -133,7 +129,7 @@ pub enum MigrationError {
     RollbackFailed { message: String },
 }
 
-pub fn plan_dry_run_migration(
+pub(crate) fn plan_dry_run_migration(
     source_root: impl AsRef<Path>,
     destination_root: impl AsRef<Path>,
 ) -> Result<DryRunMigrationReport, MigrationError> {
@@ -181,14 +177,14 @@ pub fn plan_dry_run_migration(
 }
 
 #[derive(Debug, Clone)]
-pub struct ExecutedOperation {
+pub(crate) struct ExecutedOperation {
     pub file_path: PathBuf,
     pub backup_path: Option<PathBuf>,
     pub operation_type: OperationType,
 }
 
 #[derive(Debug, Clone)]
-pub enum OperationType {
+pub(crate) enum OperationType {
     CreateFile,
     UpdateFile,
     CopyFile,
@@ -196,7 +192,8 @@ pub enum OperationType {
 }
 
 #[derive(Debug)]
-pub struct MigrationExecutionReport {
+#[expect(dead_code)]
+pub(crate) struct MigrationExecutionReport {
     pub source_root: PathBuf,
     pub destination_root: PathBuf,
     pub endpoints: Option<JsonObjectMigration>,
@@ -244,11 +241,12 @@ impl MigrationEngine {
         }
     }
 
-    pub fn plan(&self) -> Result<DryRunMigrationReport, MigrationError> {
+    #[expect(dead_code)]
+    pub(crate) fn plan(&self) -> Result<DryRunMigrationReport, MigrationError> {
         plan_dry_run_migration(&self.source_root, &self.destination_root)
     }
 
-    pub fn execute(&mut self) -> Result<MigrationExecutionReport, MigrationError> {
+    pub(crate) fn execute(&mut self) -> Result<MigrationExecutionReport, MigrationError> {
         self.executed_operations.clear();
 
         let endpoints =
@@ -290,7 +288,7 @@ impl MigrationEngine {
         })
     }
 
-    pub fn rollback(&mut self) -> Result<(), MigrationError> {
+    pub(crate) fn rollback(&mut self) -> Result<(), MigrationError> {
         let mut errors = Vec::new();
 
         for op in self.executed_operations.iter().rev() {
