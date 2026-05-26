@@ -7,7 +7,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JsonObjectMigration {
+pub struct JsonObjectMigration {
     pub relative_path: PathBuf,
     pub source_keys: Vec<String>,
     pub destination_keys: Vec<String>,
@@ -23,7 +23,7 @@ impl JsonObjectMigration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TaskHistoryMigration {
+pub struct TaskHistoryMigration {
     pub relative_path: PathBuf,
     pub source_count: usize,
     pub destination_count: usize,
@@ -39,7 +39,7 @@ impl TaskHistoryMigration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TaskDirectoryMigration {
+pub struct TaskDirectoryMigration {
     pub task_id: String,
     pub source_file_count: usize,
     pub destination_file_count: usize,
@@ -55,7 +55,7 @@ impl TaskDirectoryMigration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DryRunMigrationReport {
+pub struct DryRunMigrationReport {
     pub source_root: PathBuf,
     pub destination_root: PathBuf,
     pub endpoints: Option<JsonObjectMigration>,
@@ -110,7 +110,7 @@ impl DryRunMigrationReport {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum MigrationError {
+pub enum MigrationError {
     #[error("failed to read {path}: {source}")]
     Io {
         path: PathBuf,
@@ -129,7 +129,7 @@ pub(crate) enum MigrationError {
     RollbackFailed { message: String },
 }
 
-pub(crate) fn plan_dry_run_migration(
+pub fn plan_dry_run_migration(
     source_root: impl AsRef<Path>,
     destination_root: impl AsRef<Path>,
 ) -> Result<DryRunMigrationReport, MigrationError> {
@@ -177,14 +177,14 @@ pub(crate) fn plan_dry_run_migration(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExecutedOperation {
+pub struct ExecutedOperation {
     pub file_path: PathBuf,
     pub backup_path: Option<PathBuf>,
     pub operation_type: OperationType,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum OperationType {
+pub enum OperationType {
     CreateFile,
     UpdateFile,
     CopyFile,
@@ -193,7 +193,7 @@ pub(crate) enum OperationType {
 
 #[derive(Debug)]
 #[expect(dead_code)]
-pub(crate) struct MigrationExecutionReport {
+pub struct MigrationExecutionReport {
     pub source_root: PathBuf,
     pub destination_root: PathBuf,
     pub endpoints: Option<JsonObjectMigration>,
@@ -246,7 +246,7 @@ impl MigrationEngine {
         plan_dry_run_migration(&self.source_root, &self.destination_root)
     }
 
-    pub(crate) fn execute(&mut self) -> Result<MigrationExecutionReport, MigrationError> {
+    pub fn execute(&mut self) -> Result<MigrationExecutionReport, MigrationError> {
         self.executed_operations.clear();
 
         let endpoints =
@@ -288,7 +288,7 @@ impl MigrationEngine {
         })
     }
 
-    pub(crate) fn rollback(&mut self) -> Result<(), MigrationError> {
+    pub fn rollback(&mut self) -> Result<(), MigrationError> {
         let mut errors = Vec::new();
 
         for op in self.executed_operations.iter().rev() {

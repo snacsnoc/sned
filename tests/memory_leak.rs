@@ -91,18 +91,36 @@ async fn test_anchor_pool_size_capped() {
 /// Verifies symbol_index doesn't leak database connections.
 #[tokio::test]
 async fn test_symbol_index_db_connections_closed() {
-    use sned::services::symbol_index::SymbolIndexService;
+    use sned::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
     use tempfile::TempDir;
 
     let temp_dir = TempDir::new().unwrap();
 
     // Create and use symbol index
     {
-        let mut index = SymbolIndexService::new(temp_dir.path().to_string_lossy().to_string());
-        index.initialize().unwrap();
+        let mut index = SymbolIndexService::new(temp_dir.path().to_string_lossy().to_string())
+            .with_persistence()
+            .unwrap();
+
+        // Add a test symbol
+        index.index_file(
+            "test.rs".to_string(),
+            1234567890,
+            100,
+            vec![SymbolLocation {
+                path: None,
+                name: "test_func".to_string(),
+                start_line: 10,
+                start_column: 0,
+                end_line: 10,
+                end_column: 9,
+                symbol_type: SymbolType::Definition,
+                kind: Some("function".to_string()),
+            }],
+        );
 
         // Query symbols (should not panic or hang)
-        let _symbols = index.get_symbols("main", None, None);
+        let _symbols = index.get_symbols("test_func", None, None);
 
         // Drop index (should close DB connection)
         drop(index);
@@ -110,9 +128,11 @@ async fn test_symbol_index_db_connections_closed() {
 
     // Reopen should succeed (proves previous connection was closed)
     {
-        let mut index2 = SymbolIndexService::new(temp_dir.path().to_string_lossy().to_string());
-        index2.initialize().unwrap();
-        let _symbols = index2.get_symbols("main", None, None);
+        let mut index2 =
+            SymbolIndexService::new(temp_dir.path().to_string_lossy().to_string())
+                .with_persistence()
+                .unwrap();
+        let _symbols = index2.get_symbols("test_func", None, None);
     }
 }
 

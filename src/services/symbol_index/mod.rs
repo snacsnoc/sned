@@ -113,7 +113,7 @@ impl SymbolIndexService {
         }
     }
 
-    pub(crate) fn get_symbols(
+    pub fn get_symbols(
         &self,
         symbol: &str,
         symbol_type: Option<SymbolType>,

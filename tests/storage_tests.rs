@@ -1,4 +1,5 @@
 use sned::storage::*;
+use sned::providers::env_auth::get_provider_from_env;
 use std::fs;
 use std::path::PathBuf;
 
@@ -97,7 +98,7 @@ fn test_secrets_from_env() {
 #[test]
 fn test_provider_from_env() {
     // Test that the function doesn't panic when no env vars are set
-    let provider = sned::storage::secrets::get_provider_from_env();
+    let provider = get_provider_from_env();
     // It might return None or Some depending on the test environment
     let _ = provider;
 }
