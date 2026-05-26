@@ -322,19 +322,10 @@ pub fn load_global_state() -> GlobalState {
     }
 }
 
-pub fn get_sned_home_path() -> PathBuf {
+fn get_sned_home_path() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join(".sned"))
         .unwrap_or_else(|| PathBuf::from(".sned"))
-}
-
-/// Get the global storage directory (~/.sned/data)
-pub fn get_global_storage_dir(subdirs: &[&str]) -> PathBuf {
-    let mut path = get_sned_home_path().join("data");
-    for subdir in subdirs {
-        path = path.join(subdir);
-    }
-    path
 }
 
 #[cfg(test)]
