@@ -1145,7 +1145,9 @@ async fn build_task_components(
             .file_name()
             .and_then(|n| n.to_str().map(String::from))
     });
-    let available_cores = num_cpus::get() as u32;
+    let available_cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from));

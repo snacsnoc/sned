@@ -607,7 +607,7 @@ impl AgentLoop {
 
         // Record environment snapshot for task metadata
         if let Some(ref tracker) = self.env_tracker {
-            let _ = tracker.record_environment().await;
+            let _ = tracker.record_environment();
         }
 
         // Initialize shadow git repo for change tracking
@@ -1127,9 +1127,7 @@ impl AgentLoop {
                 crate::core::agent_types::AgentMode::Plan => "plan",
                 crate::core::agent_types::AgentMode::Act => "act",
             };
-            let _ = tracker
-                .record_model_usage(provider_id, model_id, mode)
-                .await;
+            let _ = tracker.record_model_usage(provider_id, model_id, mode);
         }
 
         // 3. Select tool profile and build tool definitions

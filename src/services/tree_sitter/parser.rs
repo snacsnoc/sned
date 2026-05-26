@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 use tree_sitter::{Language, Query};
@@ -44,7 +43,7 @@ pub fn load_required_language_parsers(
     let mut parsers: LanguageParserMap = HashMap::with_capacity(8);
 
     for file_path in file_paths {
-        let ext = get_extension(file_path.as_ref());
+        let ext = super::get_extension(file_path.as_ref());
         if parsers.contains_key(&ext) {
             continue;
         }
@@ -203,26 +202,9 @@ pub fn create_test_parser_entry(ext: &str) -> Result<LanguageParserEntry, Langua
     load_language_parser(ext)
 }
 
-/// Extracts the lowercase file extension without the leading dot.
-fn get_extension(file_path: &str) -> String {
-    Path::new(file_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_get_extension() {
-        assert_eq!(get_extension("file.rs"), "rs");
-        assert_eq!(get_extension("file.JS"), "js");
-        assert_eq!(get_extension("/path/to/file.py"), "py");
-        assert_eq!(get_extension("no_extension"), "");
-    }
 
     #[test]
     fn test_load_rust_parser() {

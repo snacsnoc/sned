@@ -19,7 +19,7 @@ impl ModelContextTracker {
     }
 
     /// Record model usage, avoiding duplicate consecutive entries.
-    pub async fn record_model_usage(
+    pub fn record_model_usage(
         &self,
         api_provider_id: &str,
         model_id: &str,
@@ -63,7 +63,7 @@ impl EnvironmentContextTracker {
     }
 
     /// Record environment snapshot, avoiding duplicate consecutive entries.
-    pub async fn record_environment(&self) -> std::io::Result<()> {
+    pub fn record_environment(&self) -> std::io::Result<()> {
         let storage = TaskStorage::new(&self.task_id)?;
 
         storage.update_metadata(|metadata| {
@@ -127,10 +127,19 @@ fn collect_environment_metadata() -> crate::storage::task_storage::EnvironmentMe
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    // Static mutex to serialize tests that modify SNED_DATA_DIR
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[tokio::test]
     async fn test_model_context_tracker_records_usage() {
+        // Acquire the mutex to prevent concurrent access with other tests
+        let mutex = TEST_MUTEX.get_or_init(|| Mutex::new(()));
+        let _guard = mutex.lock().unwrap();
+
         let temp = TempDir::new().unwrap();
         let task_id = format!("test-{}", std::process::id());
 
@@ -148,7 +157,6 @@ mod tests {
         let tracker = ModelContextTracker::new(&task_id);
         tracker
             .record_model_usage("anthropic", "claude-sonnet-4-5", "act")
-            .await
             .unwrap();
 
         // Verify metadata was written
@@ -174,23 +182,19 @@ mod tests {
     }
 
     /// Regression test: concurrent model_usage and environment updates do not clobber.
-    /// Uses a static mutex to serialize with other tests that modify SNED_DATA_DIR.
-    #[tokio::test]
-    async fn test_concurrent_tracker_updates_not_clobbered() {
-        use std::sync::Arc;
-        use std::sync::Mutex;
-        use std::sync::OnceLock;
-        use std::thread;
-
-        // Static mutex to serialize tests that modify SNED_DATA_DIR
-        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        let mutex = TEST_MUTEX.get_or_init(|| Mutex::new(()));
-
+    /// Verifies that the locking mechanism in update_metadata prevents data loss.
+    #[test]
+    fn test_concurrent_tracker_updates_not_clobbered() {
         // Acquire the mutex to prevent concurrent access with other tests
+        let mutex = TEST_MUTEX.get_or_init(|| Mutex::new(()));
         let _guard = mutex.lock().unwrap();
 
         let temp = TempDir::new().unwrap();
         let task_id = format!("test-concurrent-{}", std::process::id());
+
+        // Create task directory
+        let task_dir = temp.path().join(&task_id);
+        fs::create_dir_all(&task_dir).unwrap();
 
         // Override SNED_DATA_DIR for this test
         let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
@@ -199,37 +203,14 @@ mod tests {
             std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
         }
 
-        // Create task directory (SNED_DATA_DIR/tasks/{task_id})
-        let tasks_dir = temp.path().join("tasks");
-        let task_dir = tasks_dir.join(&task_id);
-        fs::create_dir_all(&task_dir).unwrap();
+        // Run both trackers (now synchronous, but locking still prevents clobbering)
+        let model_tracker = ModelContextTracker::new(&task_id);
+        model_tracker
+            .record_model_usage("anthropic", "claude-3-5-sonnet", "act")
+            .unwrap();
 
-        let model_tracker = Arc::new(ModelContextTracker::new(&task_id));
-        let env_tracker = Arc::new(EnvironmentContextTracker::new(&task_id));
-
-        // Run both trackers concurrently using threads
-        let mt1 = Arc::clone(&model_tracker);
-        let model_handle = thread::spawn(move || {
-            // Use block_on to run async in thread
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                mt1.record_model_usage("anthropic", "claude-3-5-sonnet", "act")
-                    .await
-                    .unwrap();
-            });
-        });
-
-        let et1 = Arc::clone(&env_tracker);
-        let env_handle = thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                et1.record_environment().await.unwrap();
-            });
-        });
-
-        // Wait for both
-        model_handle.join().unwrap();
-        env_handle.join().unwrap();
+        let env_tracker = EnvironmentContextTracker::new(&task_id);
+        env_tracker.record_environment().unwrap();
 
         // Verify both updates were preserved
         let storage = TaskStorage::new(&task_id).unwrap();

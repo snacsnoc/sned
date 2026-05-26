@@ -1,7 +1,7 @@
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 
 /// Cache entry with timestamp for TTL-based invalidation
@@ -13,9 +13,8 @@ struct FileSearchCacheEntry {
 
 /// Global cache for workspace file listings, keyed by workspace path
 /// TTL: 5 seconds - balances freshness vs performance for @-mention autocomplete
-static FILE_SEARCH_CACHE: once_cell::sync::Lazy<
-    Arc<RwLock<HashMap<String, FileSearchCacheEntry>>>,
-> = once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(HashMap::with_capacity(4))));
+static FILE_SEARCH_CACHE: LazyLock<Arc<RwLock<HashMap<String, FileSearchCacheEntry>>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(HashMap::with_capacity(4))));
 
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
