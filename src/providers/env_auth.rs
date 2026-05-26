@@ -20,61 +20,17 @@ pub fn get_provider_from_env() -> Option<&'static str> {
     if std::env::var("GEMINI_API_KEY").is_ok() {
         return Some("gemini");
     }
-
-    if std::env::var("GOOGLE_CLOUD_PROJECT").is_ok() || std::env::var("GCP_PROJECT").is_ok() {
-        return Some("vertex");
-    }
-    if std::env::var("AWS_ACCESS_KEY_ID").is_ok() || std::env::var("AWS_BEDROCK_MODEL").is_ok() {
-        return Some("bedrock");
-    }
     if std::env::var("GROQ_API_KEY").is_ok() {
         return Some("groq");
     }
     if std::env::var("XAI_API_KEY").is_ok() {
         return Some("xai");
     }
-    if std::env::var("MISTRAL_API_KEY").is_ok() {
-        return Some("mistral");
-    }
-    if std::env::var("MOONSHOT_API_KEY").is_ok() {
-        return Some("moonshot");
-    }
-    if std::env::var("HF_TOKEN").is_ok() {
-        return Some("huggingface");
-    }
-    if std::env::var("ZAI_API_KEY").is_ok() {
-        return Some("zai");
-    }
     if std::env::var("MINIMAX_API_KEY").is_ok() || std::env::var("MINIMAX_CN_API_KEY").is_ok() {
         return Some("minimax");
     }
-    if std::env::var("CEREBRAS_API_KEY").is_ok() {
-        return Some("cerebras");
-    }
-    if std::env::var("AI_GATEWAY_API_KEY").is_ok() {
-        return Some("vercel-ai-gateway");
-    }
-    // KIMI_API_KEY is Moonshot AI's API key (Kimi is their product)
-    if std::env::var("OPENCODE_API_KEY").is_ok() {
-        return Some("openai-native");
-    }
-    if std::env::var("KIMI_API_KEY").is_ok() {
-        return Some("moonshot");
-    }
     if std::env::var("DEEPSEEK_API_KEY").is_ok() {
         return Some("deepseek");
-    }
-    if std::env::var("QWEN_API_KEY").is_ok() {
-        return Some("qwen");
-    }
-    if std::env::var("TOGETHER_API_KEY").is_ok() {
-        return Some("together");
-    }
-    if std::env::var("FIREWORKS_API_KEY").is_ok() {
-        return Some("fireworks");
-    }
-    if std::env::var("NEBIUS_API_KEY").is_ok() {
-        return Some("nebius");
     }
     None
 }
@@ -91,29 +47,13 @@ mod tests {
             "GEMINI_API_KEY",
             "GROQ_API_KEY",
             "XAI_API_KEY",
-            "MISTRAL_API_KEY",
-            "MOONSHOT_API_KEY",
-            "HF_TOKEN",
-            "ZAI_API_KEY",
             "MINIMAX_API_KEY",
             "MINIMAX_CN_API_KEY",
-            "CEREBRAS_API_KEY",
-            "AI_GATEWAY_API_KEY",
-            "OPENCODE_API_KEY",
-            "KIMI_API_KEY",
             "DEEPSEEK_API_KEY",
-            "QWEN_API_KEY",
-            "TOGETHER_API_KEY",
-            "FIREWORKS_API_KEY",
-            "NEBIUS_API_KEY",
             "OPENROUTER_API_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_BEDROCK_MODEL",
-            "GOOGLE_CLOUD_PROJECT",
-            "GCP_PROJECT",
         ];
         for var in &vars {
-            // SAFETY: single-threaded test; clearing env before each assertion
+            // SAFETY: single-threaded test; sequential env mutation
             unsafe {
                 env::remove_var(var);
             }
@@ -141,13 +81,6 @@ mod tests {
 
         clear_test_env_vars();
 
-        // Test AWS Bedrock detection
-        // SAFETY: single-threaded test; sequential env mutation
-        unsafe { env::set_var("AWS_ACCESS_KEY_ID", "AKIA...") };
-        assert_eq!(get_provider_from_env(), Some("bedrock"));
-
-        clear_test_env_vars();
-
         // Test no provider
         assert_eq!(get_provider_from_env(), None);
 
@@ -161,15 +94,8 @@ mod tests {
             ("GEMINI_API_KEY", "gemini"),
             ("GROQ_API_KEY", "groq"),
             ("XAI_API_KEY", "xai"),
-            ("MISTRAL_API_KEY", "mistral"),
-            ("MOONSHOT_API_KEY", "moonshot"),
-            ("HF_TOKEN", "huggingface"),
-            ("ZAI_API_KEY", "zai"),
+            ("MINIMAX_API_KEY", "minimax"),
             ("DEEPSEEK_API_KEY", "deepseek"),
-            ("QWEN_API_KEY", "qwen"),
-            ("TOGETHER_API_KEY", "together"),
-            ("FIREWORKS_API_KEY", "fireworks"),
-            ("NEBIUS_API_KEY", "nebius"),
         ];
 
         for (env_var, expected_provider) in test_cases {
@@ -191,20 +117,6 @@ mod tests {
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("MINIMAX_CN_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("minimax"));
-
-        clear_test_env_vars();
-
-        // KIMI_API_KEY maps to moonshot (Kimi is Moonshot AI's product)
-        // SAFETY: single-threaded test; sequential env mutation
-        unsafe { env::set_var("KIMI_API_KEY", "test-key") };
-        assert_eq!(get_provider_from_env(), Some("moonshot"));
-
-        clear_test_env_vars();
-
-        // GCP_PROJECT maps to vertex
-        // SAFETY: single-threaded test; sequential env mutation
-        unsafe { env::set_var("GCP_PROJECT", "my-project") };
-        assert_eq!(get_provider_from_env(), Some("vertex"));
 
         clear_test_env_vars();
     }
