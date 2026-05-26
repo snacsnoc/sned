@@ -56,7 +56,6 @@ impl GetFileSkeletonHandler {
                             &content,
                             language_parsers.as_ref(),
                             None,
-                            None,
                         ) {
                             Ok(Some(skeleton)) => {
                                 format!(

@@ -12,7 +12,6 @@ use streaming_iterator::StreamingIterator;
 
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
-use crate::core::workspace::SnedIgnoreController;
 
 /// A parsed definition from a source file.
 ///
@@ -22,8 +21,6 @@ pub struct ParsedDefinition {
     pub line_index: usize,
     pub text: String,
     pub indentation: String,
-    pub line_count: Option<usize>,
-    pub calls: Option<Vec<String>>,
 }
 
 /// Parses a file and extracts definitions using tree-sitter queries.
@@ -32,8 +29,6 @@ pub fn parse_file(
     file_path: &str,
     file_content: &str,
     language_parsers: &LanguageParserMap,
-    _sned_ignore_controller: Option<&SnedIgnoreController>,
-    options: Option<&ParseOptions>,
 ) -> Result<Option<Vec<ParsedDefinition>>, LanguageParserError> {
     let ext = get_extension(file_path);
 
@@ -55,43 +50,6 @@ pub fn parse_file(
     let mut definitions: Vec<ParsedDefinition> = Vec::new();
     let root_node = tree.root_node();
 
-    // Collect all defined names for the call graph
-    let mut defined_names = HashSet::new();
-    let mut all_references: Vec<(tree_sitter::Node, String, usize)> = Vec::new();
-
-    // Pre-identify definition blocks
-    let mut definition_nodes: HashMap<usize, String> = HashMap::with_capacity(16);
-
-    let mut query_cursor = tree_sitter::QueryCursor::new();
-    let mut captures = query_cursor.captures(&entry.query, root_node, file_content.as_bytes());
-
-    while let Some((match_, capture_index)) = captures.next() {
-        let capture = match_.captures[*capture_index];
-        let capture_name = entry.query.capture_names()[capture.index as usize];
-
-        if capture_name.contains("definition") && !capture_name.contains("name.definition") {
-            definition_nodes.insert(capture.node.id(), capture_name.to_string());
-        }
-
-        if options.as_ref().is_some_and(|o| o.show_call_graph) {
-            if capture_name.contains("name.definition.function")
-                || capture_name.contains("name.definition.method")
-            {
-                if let Ok(text) = capture.node.utf8_text(file_content.as_bytes()) {
-                    defined_names.insert(text.to_string());
-                }
-            } else if capture_name.contains("name.reference")
-                && let Ok(text) = capture.node.utf8_text(file_content.as_bytes())
-            {
-                all_references.push((
-                    capture.node,
-                    text.to_string(),
-                    capture.node.start_position().row,
-                ));
-            }
-        }
-    }
-
     // Collect name.definition captures and sort by line
     let mut name_captures: Vec<(tree_sitter::Node, &str)> = Vec::new();
     let mut query_cursor2 = tree_sitter::QueryCursor::new();
@@ -111,7 +69,7 @@ pub fn parse_file(
     let lines: Vec<&str> = file_content.lines().collect();
     let mut last_line_added: i32 = -1;
 
-    for (node, capture_name) in name_captures {
+    for (node, _capture_name) in name_captures {
         let start_line = node.start_position().row;
 
         if start_line >= lines.len() {
@@ -125,70 +83,13 @@ pub fn parse_file(
                 .take_while(|c| c.is_whitespace())
                 .collect();
 
-            let mut def = ParsedDefinition {
+            let def = ParsedDefinition {
                 line_index: start_line,
                 text: line_text.to_string(),
                 indentation,
-                line_count: None,
-                calls: None,
             };
 
             last_line_added = start_line as i32;
-
-            // Add line count and optionally call graph
-            if options.as_ref().is_some_and(|o| o.show_call_graph) {
-                // Find the actual definition node
-                let mut definition_node: Option<tree_sitter::Node> = None;
-                let mut current = Some(node);
-                while let Some(n) = current {
-                    if definition_nodes.contains_key(&n.id()) {
-                        definition_node = Some(n);
-                        break;
-                    }
-                    current = n.parent();
-                }
-
-                if let Some(def_node) = definition_node {
-                    let start_row = def_node.start_position().row;
-                    let end_row = def_node.end_position().row;
-                    let line_count = end_row - start_row + 1;
-
-                    if capture_name.contains("name.definition.function")
-                        || capture_name.contains("name.definition.method")
-                        || capture_name.contains("name.definition.class")
-                        || capture_name.contains("name.definition.interface")
-                    {
-                        def.line_count = Some(line_count);
-                    }
-
-                    if capture_name.contains("name.definition.function")
-                        || capture_name.contains("name.definition.method")
-                    {
-                        let mut local_calls = HashSet::new();
-
-                        let node_text = node
-                            .utf8_text(file_content.as_bytes())
-                            .unwrap_or("")
-                            .to_string();
-
-                        for (ref_node, ref_text, ref_line) in &all_references {
-                            if *ref_line >= start_row
-                                && *ref_line <= end_row
-                                && defined_names.contains(ref_text)
-                                && *ref_text != node_text
-                                && is_call_node(*ref_node)
-                            {
-                                local_calls.insert(ref_text.clone());
-                            }
-                        }
-
-                        if !local_calls.is_empty() {
-                            def.calls = Some(local_calls.into_iter().collect());
-                        }
-                    }
-                }
-            }
-
             definitions.push(def);
         }
     }
@@ -200,42 +101,7 @@ pub fn parse_file(
     }
 }
 
-/// Options for parsing a file.
-#[derive(Debug, Clone, Default)]
-pub struct ParseOptions {
-    pub show_call_graph: bool,
-}
 
-/// Checks if a reference node is a call node.
-fn is_call_node(node: tree_sitter::Node) -> bool {
-    if let Some(parent) = node.parent() {
-        let call_types = [
-            "call",
-            "call_expression",
-            "method_invocation",
-            "function_call_expression",
-            "member_call_expression",
-            "invocation_expression",
-        ];
-        if call_types.contains(&parent.kind()) {
-            return true;
-        }
-
-        let member_types = [
-            "member_expression",
-            "member_access_expression",
-            "property_access",
-            "member_call_expression",
-        ];
-        if member_types.contains(&parent.kind())
-            && let Some(grandparent) = parent.parent()
-            && call_types.contains(&grandparent.kind())
-        {
-            return true;
-        }
-    }
-    false
-}
 
 /// Gets the file extension in lowercase.
 fn get_extension(file_path: &str) -> String {
@@ -254,10 +120,9 @@ pub fn get_file_skeleton(
     file_content: &str,
     language_parsers: &LanguageParserMap,
     task_id: Option<&str>,
-    options: Option<&ParseOptions>,
 ) -> Result<Option<String>, LanguageParserError> {
     let definitions =
-        match parse_file(absolute_path, file_content, language_parsers, None, options)? {
+        match parse_file(absolute_path, file_content, language_parsers)? {
             Some(d) => d,
             None => return Ok(None),
         };
@@ -279,26 +144,6 @@ pub fn get_file_skeleton(
             let anchor = anchors.get(start_line).cloned().unwrap_or_default();
             formatted_output.push_str(&format!("│{}\n", format_line_with_hash(&def.text, &anchor)));
             last_line_added = start_line as i32;
-
-            if let Some(opts) = options
-                && opts.show_call_graph
-            {
-                if let Some(line_count) = def.line_count {
-                    formatted_output.push_str(&format!(
-                        "│{}    # Lines: {}\n",
-                        def.indentation, line_count
-                    ));
-                }
-                if let Some(ref calls) = def.calls {
-                    let mut sorted_calls: Vec<String> = calls.clone();
-                    sorted_calls.sort();
-                    formatted_output.push_str(&format!(
-                        "│{}    # Calls: [{}]\n",
-                        def.indentation,
-                        sorted_calls.join(", ")
-                    ));
-                }
-            }
         }
     }
 
