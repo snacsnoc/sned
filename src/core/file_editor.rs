@@ -33,27 +33,6 @@ pub enum FileEditorError {
     #[error("Edit validation failed: {0}")]
     ValidationError(String),
 
-    #[error("Anchor not found: {anchor}")]
-    AnchorNotFound { anchor: String },
-
-    #[error("Anchor format invalid: {anchor}")]
-    InvalidAnchorFormat { anchor: String },
-
-    #[error(
-        "Anchor content mismatch: anchor '{anchor}' exists but provided line does not match. Expected: '{expected}', found: '{found}'"
-    )]
-    AnchorMismatch {
-        anchor: String,
-        expected: String,
-        found: String,
-    },
-
-    #[error("End anchor '{end}' must not appear before start anchor '{start}'")]
-    EndAnchorBeforeStart { start: String, end: String },
-
-    #[error("Edit application failed: {message}")]
-    EditApplicationFailed { message: String },
-
     #[error("Overlapping edit ranges: {message}")]
     OverlappingEdits { message: String },
 }
@@ -62,22 +41,6 @@ impl FileEditorError {
     /// Return an actionable display string with a suggestion for fixing the error.
     pub fn actionable_display(&self) -> String {
         match self {
-            Self::AnchorNotFound { anchor } | Self::InvalidAnchorFormat { anchor } => {
-                crate::cli::actionable_errors::edit_anchor_mismatch("", anchor).display()
-            }
-            Self::AnchorMismatch {
-                anchor,
-                expected,
-                found,
-            } => {
-                let base = format!(
-                    "Anchor content mismatch: anchor '{}' exists but provided line does not match. Expected: '{}', found: '{}'",
-                    anchor, expected, found
-                );
-                let suggestion = "The file may have changed since it was last read. \
-                     Re-read the file to get updated anchors, then retry the edit with the correct line content.";
-                format!("{}\n  Suggestion: {}", base, suggestion)
-            }
             Self::AllEditsFailed { message } => {
                 let suggestion = "Check that the file content matches the anchors. \
                      Re-read the file to get fresh anchors before editing.";
@@ -1644,52 +1607,6 @@ mod tests {
                 DiffChange::Removed(1),
                 DiffChange::Unchanged(1)
             ]
-        );
-    }
-
-    #[test]
-    fn test_file_editor_error_display_messages() {
-        assert_eq!(
-            FileEditorError::AnchorNotFound {
-                anchor: "Apple".to_string(),
-            }
-            .to_string(),
-            "Anchor not found: Apple"
-        );
-
-        assert_eq!(
-            FileEditorError::InvalidAnchorFormat {
-                anchor: "Apple§".to_string(),
-            }
-            .to_string(),
-            "Anchor format invalid: Apple§"
-        );
-
-        assert_eq!(
-            FileEditorError::AnchorMismatch {
-                anchor: "Apple".to_string(),
-                expected: "expected".to_string(),
-                found: "found".to_string(),
-            }
-            .to_string(),
-            "Anchor content mismatch: anchor 'Apple' exists but provided line does not match. Expected: 'expected', found: 'found'"
-        );
-
-        assert_eq!(
-            FileEditorError::EndAnchorBeforeStart {
-                start: "Banana".to_string(),
-                end: "Apple".to_string(),
-            }
-            .to_string(),
-            "End anchor 'Apple' must not appear before start anchor 'Banana'"
-        );
-
-        assert_eq!(
-            FileEditorError::EditApplicationFailed {
-                message: "boom".to_string(),
-            }
-            .to_string(),
-            "Edit application failed: boom"
         );
     }
 

@@ -129,8 +129,6 @@ pub enum MigrationError {
     },
     #[error("unsupported JSON structure in {path}: {message}")]
     UnsupportedJson { path: PathBuf, message: String },
-    #[error("migration failed: {message}")]
-    MigrationFailed { message: String },
     #[error("rollback failed: {message}")]
     RollbackFailed { message: String },
 }

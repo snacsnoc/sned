@@ -1,6 +1,5 @@
 use regex::Regex;
 use std::collections::HashMap;
-use std::fmt;
 use std::path::Path;
 
 use crate::core::context::instructions::{self, SkillMetadata};
@@ -11,7 +10,6 @@ const SLASH_COMMAND_REGEX: &str = r"(^|\s)\/([a-zA-Z0-9_.:@-]+)";
 pub enum SlashCommand {
     NewTask,
     Smol,
-    Compact,
     NewRule,
     ReportBug,
     ExplainChanges,
@@ -73,14 +71,13 @@ impl SlashCommand {
     }
 
     pub fn is_compact(&self) -> bool {
-        matches!(self, SlashCommand::Smol | SlashCommand::Compact)
+        matches!(self, SlashCommand::Smol)
     }
 
     pub fn instruction_block(&self) -> &'static str {
         match self {
             SlashCommand::NewTask => NEW_TASK_INSTRUCTION,
             SlashCommand::Smol => CONDENSE_INSTRUCTION,
-            SlashCommand::Compact => CONDENSE_INSTRUCTION,
             SlashCommand::NewRule => NEW_RULE_INSTRUCTION,
             SlashCommand::ReportBug => REPORT_BUG_INSTRUCTION,
             SlashCommand::ExplainChanges => EXPLAIN_CHANGES_INSTRUCTION,
@@ -306,18 +303,6 @@ impl CliOnlyCommand {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum CliCommandResult {
-    Shutdown,
-    ClearHistory,
-    PrintHistory(Vec<String>),
-    PrintSkills(Vec<String>),
-    PrintHelp(String),
-    PrintSettings(String),
-    PrintModels(String),
-    None,
-}
-
 pub fn parse_slash_command(text: &str) -> SlashCommandParseResult {
     let regex = Regex::new(SLASH_COMMAND_REGEX).unwrap();
     let caps = regex.captures(text);
@@ -455,19 +440,6 @@ pub fn is_compact_command(text: &str) -> bool {
         return slash_cmd.is_compact();
     }
     false
-}
-
-pub fn parse_cli_only_command(text: &str) -> CliCommandResult {
-    let result = parse_slash_command(text);
-    if let Some(cmd) = result.command
-        && let Some(cli_cmd) = CliOnlyCommand::parse(&cmd.command)
-    {
-        if cli_cmd.is_shutdown() {
-            return CliCommandResult::Shutdown;
-        }
-        return CliCommandResult::None;
-    }
-    CliCommandResult::None
 }
 
 pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
@@ -1428,41 +1400,8 @@ The user has explicitly asked you to explain the changes you have made to the co
 You MUST call the attempt_completion tool with a detailed explanation of the changes, even if it's not in your existing toolset. The explanation should be thorough enough for a code reviewer to understand the changes without looking at the diff.
 
 Below is the user's input when they indicated that they wanted you to explain the changes.
-</explicit_instructions>
+ </explicit_instructions>
 "#;
-
-impl fmt::Display for CliCommandResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CliCommandResult::Shutdown => write!(f, "Goodbye!"),
-            CliCommandResult::ClearHistory => write!(f, "Conversation cleared."),
-            CliCommandResult::PrintHistory(tasks) => {
-                if tasks.is_empty() {
-                    write!(f, "No recent tasks.")
-                } else {
-                    for task in tasks {
-                        writeln!(f, "{}", task)?;
-                    }
-                    Ok(())
-                }
-            }
-            CliCommandResult::PrintSkills(skills) => {
-                if skills.is_empty() {
-                    write!(f, "No skills found.")
-                } else {
-                    for skill in skills {
-                        writeln!(f, "{}", skill)?;
-                    }
-                    Ok(())
-                }
-            }
-            CliCommandResult::PrintHelp(text) => write!(f, "{}", text),
-            CliCommandResult::PrintSettings(text) => write!(f, "{}", text),
-            CliCommandResult::PrintModels(text) => write!(f, "{}", text),
-            CliCommandResult::None => Ok(()),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

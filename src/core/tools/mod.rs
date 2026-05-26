@@ -370,8 +370,6 @@ pub enum ToolError {
     InvalidInput(String),
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
-    #[error("Cancelled")]
-    Cancelled,
 }
 
 /// Convert a tool result value into plain text for conversation history.

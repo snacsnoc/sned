@@ -839,10 +839,6 @@ pub struct HookExecution {
 pub enum HookError {
     #[error("No active hook execution")]
     NoActiveHook,
-    #[error("Hook cancellation timeout")]
-    Timeout,
-    #[error("Hook cancelled the operation")]
-    HookCancelled,
     #[error("{0}")]
     Other(String),
 }

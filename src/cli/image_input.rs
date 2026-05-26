@@ -25,8 +25,6 @@ pub enum ImageLoadError {
     NotImage(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Invalid image data: {0}")]
-    InvalidData(String),
 }
 
 /// Check if a file path has a supported image extension.

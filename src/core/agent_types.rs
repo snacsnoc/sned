@@ -297,8 +297,6 @@ pub enum AgentError {
     MaxTurnsExceeded,
     #[error("Execution error: {0}")]
     ExecutionError(String),
-    #[error("Provider error: {0}")]
-    ProviderError(String),
     #[error("Cancelled")]
     Cancelled,
 }
