@@ -150,12 +150,19 @@ impl App {
         self.input.set_block(theme::input_block(input_title, self.agent_busy));
 
         // Output pane with themed border and padding
-        let visible_height = output_area.height.saturating_sub(2) as usize; // subtract border top/bottom
+        let visible_height = output_area.height as usize;
         let total_lines = self.output_lines.len();
         let scroll_y = if self.auto_scroll {
             total_lines.saturating_sub(visible_height) as u16
         } else {
-            self.scroll_offset
+            // Re-enable auto-scroll if user has scrolled to bottom
+            let max_scroll = total_lines.saturating_sub(visible_height) as u16;
+            if self.scroll_offset >= max_scroll && max_scroll > 0 {
+                self.auto_scroll = true;
+                total_lines.saturating_sub(visible_height) as u16
+            } else {
+                self.scroll_offset
+            }
         };
 
         let output = Paragraph::new(self.output_lines.clone())

@@ -550,8 +550,7 @@ async fn handle_key_event(
         }
         if key.code == KeyCode::Down {
             app.scroll_offset = app.scroll_offset.saturating_add(1);
-            // Re-enable auto-scroll if scrolled to bottom
-            app.auto_scroll = true;
+            // Auto-scroll will be re-enabled in render if at bottom
             return Ok(None);
         }
     }
