@@ -72,6 +72,7 @@ pub async fn create_message_with_retry(
     retry_config: RetryConfig,
     json_output: bool,
     output_writer: Option<crate::cli::output::OutputWriterArc>,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<ApiStream, ProviderError> {
     // Validate context window before sending request
     if let Err(msg) = context_window::validate_context_window(&request, provider.as_ref()) {
@@ -106,7 +107,25 @@ pub async fn create_message_with_retry(
                 if !json_output {
                     log_retry_status(retry_attempt, delay, &error, output_writer.as_ref());
                 }
-                sleep(delay).await;
+
+                // Sleep with cancellation check — poll in small intervals to remain responsive to Ctrl+C
+                if let Some(cancelled) = &cancelled {
+                    let remaining = delay;
+                    let poll_interval = Duration::from_millis(100);
+                    let mut elapsed = Duration::ZERO;
+                    while elapsed < remaining {
+                        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                            return Err(ProviderError::NetworkError(
+                                "cancelled by user during retry delay".to_string(),
+                            ));
+                        }
+                        tokio::time::sleep(poll_interval.min(remaining - elapsed)).await;
+                        elapsed += poll_interval;
+                    }
+                } else {
+                    sleep(delay).await;
+                }
+
                 retry_attempt += 1;
             }
         }
@@ -369,6 +388,7 @@ mod tests {
             state.clone(),
             RetryConfig::default(),
             false,
+            None,
             None,
         )
         .await

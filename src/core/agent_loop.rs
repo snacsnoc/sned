@@ -1343,6 +1343,7 @@ impl AgentLoop {
             retry_config,
             self.config.json_output,
             Some(self.config.output_writer.clone()),
+            Some(self.cancelled.clone()),
         )
         .await
         {
