@@ -171,6 +171,13 @@ impl App {
         };
         self.input.set_block(theme::input_block(input_title, self.agent_busy));
 
+        // Update placeholder text based on agent state
+        if self.agent_busy {
+            self.input.set_placeholder_text("⟳ Agent working...");
+        } else {
+            self.input.set_placeholder_text("❯ ");
+        }
+
         // Output pane with themed border and padding
         let visible_height = output_area.height as usize;
         // Content height excludes border (1 line top + 1 line bottom)

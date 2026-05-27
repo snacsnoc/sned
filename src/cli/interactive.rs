@@ -503,8 +503,17 @@ async fn handle_key_event(
         // Normal submit - expand all paste markers before sending
         let text = app.get_input_with_expanded_pastes();
         if !text.is_empty() {
-            // Turn separator before user message
-            app.push_turn_separator();
+            // Turn separator before user message (only if a previous turn completed)
+            // Check if output already has a turn separator (from previous agent completion)
+            if !app.output_lines.is_empty()
+                && app.output_lines.last().is_some_and(|line| {
+                    line.spans.first().is_some_and(|span| {
+                        span.content.as_ref().starts_with('─')
+                    })
+                })
+            {
+                app.push_turn_separator();
+            }
             // Echo prompt to output pane
             app.push_user_message(&text);
             // Clear textarea and paste tracking
@@ -1383,6 +1392,8 @@ async fn run_main_loop(
                                     app.agent_busy = true;
                                 }
                                 // Render immediately to show user message before agent starts streaming
+                                app.auto_scroll = true;
+                                app.scroll_offset = 0;
                                 terminal.draw(|f| app.render(f))?;
                             }
                         }
