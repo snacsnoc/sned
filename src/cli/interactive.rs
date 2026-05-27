@@ -457,17 +457,12 @@ async fn cancel_agent(
     Ok(())
 }
 
-/// Handle key events in ratatui loop.
+/// Handle key events in ratatui loop (non-Ctrl+C keys).
 async fn handle_key_event(
     key: KeyEvent,
     app: &mut App,
     _session: &Arc<Mutex<InteractiveSession>>,
     task_id: &str,
-    _agent_busy: &AtomicBool,
-    _agent_done: &Arc<tokio::sync::Notify>,
-    _agent_start_time: &Arc<Mutex<Option<Instant>>>,
-    _state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
-    _agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
 
@@ -1276,18 +1271,24 @@ async fn run_main_loop(
                         // If agent is busy, cancel it
                         if agent_busy.load(Ordering::Relaxed) {
                             cancel_agent(&state_handle, &agent_task, &agent_done).await?;
-                            app.push_plain("^C");
+                            app.agent_busy = false;
+                            app.push_plain("^C cancelled");
+                            app.push_styled(
+                                "Press Ctrl+C again to quit.",
+                                Style::default().fg(Color::Yellow),
+                            );
                             continue;
                         }
                         
-                        // If input is empty, exit
-                        if app.input.lines().join("\n").is_empty() {
-                            return Ok(());
+                        // Not busy: clear input or hint about quitting
+                        if !app.input.lines().join("\n").is_empty() {
+                            app.push_plain("^C");
+                            app.input = App::new_textarea(Vec::new());
                         }
-                        
-                        // Clear input with visual feedback
-                        app.push_plain("^C");
-                        app.input = App::new_textarea(Vec::new());
+                        app.push_styled(
+                            "Press Ctrl+C again to quit.",
+                            Style::default().fg(Color::Yellow),
+                        );
                         continue;
                     }
 
@@ -1296,11 +1297,6 @@ async fn run_main_loop(
                         app,
                         &session,
                         &task_id,
-                        &agent_busy,
-                        &agent_done,
-                        &agent_start_time,
-                        &state_handle,
-                        &agent_task,
                     )
                     .await?
                     {

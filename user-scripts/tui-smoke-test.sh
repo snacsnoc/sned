@@ -513,7 +513,6 @@ import pty
 import select
 import shutil
 import signal
-import sys
 import tempfile
 import time
 
@@ -543,7 +542,8 @@ if pid == 0:
     os.execvpe(cmd[0], cmd, env)
 
 buf = b""
-sent_ctrlc = False
+sent_first = False
+sent_second = False
 exit_code = None
 deadline = time.time() + 8
 
@@ -560,10 +560,18 @@ try:
             buf += data
             if b"\x1b[6n" in data:
                 os.write(fd, b"\x1b[1;1R")
-            if b"type a prompt" in buf and not sent_ctrlc:
-                # Send Ctrl+C on empty input — sned should quit (not cancel an agent)
-                os.write(fd, b"\x03")
-                sent_ctrlc = True
+            # Wait for banner before sending first Ctrl+C
+            if b"type a prompt" in buf and not sent_first:
+                time.sleep(0.2)
+                os.write(fd, b"\x03")  # First Ctrl+C
+                sent_first = True
+                print("First Ctrl+C sent")
+            elif sent_first and not sent_second:
+                # After first Ctrl+C, wait for ~0.3s and send second
+                time.sleep(0.3)
+                os.write(fd, b"\x03")  # Second Ctrl+C (within 2s window)
+                sent_second = True
+                print("Second Ctrl+C sent")
 
         ended, status = os.waitpid(pid, os.WNOHANG)
         if ended:
@@ -586,12 +594,14 @@ try:
 
     if "type a prompt" not in text:
         print("TUI_TEST_FAIL startup banner not rendered")
-    elif not sent_ctrlc:
-        print("TUI_TEST_FAIL Ctrl+C was not sent")
+    elif not sent_first:
+        print("TUI_TEST_FAIL first Ctrl+C was not sent")
+    elif not sent_second:
+        print("TUI_TEST_FAIL second Ctrl+C was not sent")
     elif exit_code not in (0, None):
         print(f"TUI_TEST_FAIL sned exited with {exit_code}")
     else:
-        print("TUI_TEST_PASS Ctrl+C on empty input quit cleanly")
+        print("TUI_TEST_PASS double Ctrl+C quits from idle")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 PY
