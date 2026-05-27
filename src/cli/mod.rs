@@ -637,13 +637,14 @@ fn build_symbol_index_service(
 fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
     use crate::providers::env_auth::get_provider_from_env;
 
-    // Determine provider: --provider flag > auto-detection from env > custom base_url+api_key > error
+    // Determine provider: --provider flag > auto-detection from env > custom base_url (with api_key from flag/env) > error
     let (provider_name, was_auto_detected) = if let Some(explicit) = &task_opts.provider {
         (explicit.as_str(), false)
     } else if let Some(detected) = get_provider_from_env() {
         (detected, true)
-    } else if task_opts.base_url.is_some() && task_opts.api_key.is_some() {
-        // Custom OpenAI-compatible endpoint with explicit credentials
+    } else if task_opts.base_url.is_some() {
+        // Custom OpenAI-compatible endpoint with explicit base URL
+        // API key will be resolved from --api-key flag or OPENAI_API_KEY env var
         ("openai", false)
     } else {
         // No provider flag and no auto-detected keys - show helpful error
@@ -745,6 +746,12 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 .clone()
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                 .unwrap_or_default();
+            if api_key.is_empty() {
+                anyhow::bail!(
+                    "No API key found for OpenAI-compatible provider. \n\
+                     Set OPENAI_API_KEY environment variable or use --api-key flag."
+                );
+            }
             let base_url = task_opts
                 .base_url
                 .clone()
@@ -2263,9 +2270,15 @@ mod tests {
             "test prompt",
         ])
         .unwrap();
-        let provider = create_provider(&cli.task_opts).expect("custom base_url+api_key should work");
-        assert_eq!(provider.name(), "openai");
+        match create_provider(&cli.task_opts) {
+            Ok(provider) => {
+                assert_eq!(provider.name(), "openai");
+            }
+            Err(err) => panic!("custom base_url+api_key should work: {}", err),
+        }
     }
+
+    // Note: OPENAI_API_BASE env var detection tested in providers::env_auth::tests
 
     #[test]
     fn test_utf8_cursor_movement() {

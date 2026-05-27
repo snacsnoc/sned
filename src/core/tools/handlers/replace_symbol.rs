@@ -315,7 +315,15 @@ async fn process_batch(
                         }
                     }
                 }
-                result
+                // Fall back to tree-sitter if index found no match
+                result.or_else(|| {
+                    find_symbol_via_tree_sitter(
+                        r,
+                        &batch.absolute_path,
+                        &original_content,
+                        &language_parsers,
+                    ).ok().flatten()
+                })
             }
             None => find_symbol_via_tree_sitter(
                 r,

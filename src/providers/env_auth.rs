@@ -32,6 +32,9 @@ pub fn get_provider_from_env() -> Option<&'static str> {
     if std::env::var("DEEPSEEK_API_KEY").is_ok() {
         return Some("deepseek");
     }
+    if std::env::var("OPENAI_API_BASE").is_ok() {
+        return Some("openai");
+    }
     None
 }
 
@@ -117,6 +120,13 @@ mod tests {
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("MINIMAX_CN_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("minimax"));
+
+        clear_test_env_vars();
+
+        // Test OPENAI_API_BASE alone
+        // SAFETY: single-threaded test; sequential env mutation
+        unsafe { env::set_var("OPENAI_API_BASE", "https://custom.example.com/v1") };
+        assert_eq!(get_provider_from_env(), Some("openai"));
 
         clear_test_env_vars();
     }

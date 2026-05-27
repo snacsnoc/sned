@@ -12,6 +12,7 @@ use crate::providers::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc::error::TrySendError;
@@ -842,8 +843,31 @@ impl Provider for OpenAiProvider {
             let status = response.status();
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
+            
+            // Add helpful hint for common model/provider mismatches
+            let error_body = if status == StatusCode::NOT_FOUND || status.as_u16() == 404 {
+                let model_lower = self.config.model_id.to_lowercase();
+                if model_lower.starts_with("claude-") {
+                    format!(
+                        "{}\n\nHint: Model '{}' looks like an Anthropic Claude model. \
+                         If you intended to use Claude, set ANTHROPIC_API_KEY or use --provider anthropic.",
+                        text, self.config.model_id
+                    )
+                } else if model_lower.starts_with("gemini-") {
+                    format!(
+                        "{}\n\nHint: Model '{}' looks like a Google Gemini model. \
+                         If you intended to use Gemini, set GEMINI_API_KEY or use --provider gemini.",
+                        text, self.config.model_id
+                    )
+                } else {
+                    text
+                }
+            } else {
+                text
+            };
+            
             return Err(
-                ProviderHttpError::new(&self.provider_name, url, status, text, headers).into(),
+                ProviderHttpError::new(&self.provider_name, url, status, error_body, headers).into(),
             );
         }
 
