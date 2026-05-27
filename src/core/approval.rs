@@ -26,9 +26,6 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-
 const SAFE_BASE_COMMANDS: &[&str] = &[
     "ls", "pwd", "date", "whoami", "uname", "cat", "grep", "find", "head", "tail", "cd", "clear",
     "echo", "hostname", "df", "du", "ps", "free", "uptime", "wc", "sort", "uniq", "file", "stat",
@@ -731,90 +728,22 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
     }
 }
 
-/// RAII guard to restore terminal settings on drop (Unix only).
-#[cfg(unix)]
-struct TermiosGuard {
-    fd: std::os::unix::io::RawFd,
-    original: libc::termios,
+/// Channel sender for approval responses. The prompt function creates
+/// a channel, stores the sender here, and blocks on the receiver. The
+/// TUI loop reads the key event and sends the result through this sender.
+static APPROVAL_SENDER: LazyLock<Mutex<Option<std::sync::mpsc::Sender<ApprovalResult>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Store the sender for an approval response.
+pub fn set_approval_sender(sender: std::sync::mpsc::Sender<ApprovalResult>) {
+    let mut guard = APPROVAL_SENDER.lock();
+    *guard = Some(sender);
 }
 
-#[cfg(unix)]
-impl Drop for TermiosGuard {
-    fn drop(&mut self) {
-        // SAFETY: self.original is a valid termios struct we previously read
-        // from this fd. tcsetattr is async-signal-safe and we own the fd.
-        unsafe {
-            let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original);
-        }
-    }
-}
-
-/// Read a single character from stdin in raw mode (VMIN=1, VTIME=0).
-/// Echoes the character so the user sees their choice.
-/// Returns the character or an error if reading fails.
-#[cfg(unix)]
-fn read_single_char_raw() -> io::Result<char> {
-    let stdin = io::stdin();
-    let stdin_fd = stdin.as_raw_fd();
-
-    // Save original terminal settings
-    // SAFETY: std::mem::zeroed() is safe for libc::termios (all-zero is valid)
-    let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: stdin_fd is a valid fd from io::stdin().as_raw_fd().
-    // tcgetattr reads into our owned termios struct.
-    let restore_guard = unsafe {
-        if libc::tcgetattr(stdin_fd, &mut original_termios) == 0 {
-            Some(TermiosGuard {
-                fd: stdin_fd,
-                original: original_termios,
-            })
-        } else {
-            None
-        }
-    };
-
-    // Set raw mode: disable canonical mode, echo, and signal generation
-    let mut raw_termios = original_termios;
-    raw_termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
-    raw_termios.c_cc[libc::VMIN] = 1;
-    raw_termios.c_cc[libc::VTIME] = 0;
-
-    // SAFETY: raw_termios is a valid termios struct we just initialized.
-    // stdin_fd is valid, TCSAFLUSH is a valid selector.
-    if unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_termios) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Read single character directly from fd (avoids borrow checker issue with stdin())
-    let mut buf = [0u8; 1];
-    // SAFETY: stdin_fd is valid, buf is properly initialized and sized.
-    // Casting to *mut c_void is required by libc::read signature.
-    let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if n == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin closed"));
-    }
-    let c = buf[0] as char;
-
-    drop(restore_guard);
-    Ok(c)
-}
-
-/// Read a single character from stdin in raw mode (fallback for non-Unix).
-#[cfg(not(unix))]
-fn read_single_char_raw() -> io::Result<char> {
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-
-    let _ = enable_raw_mode();
-    let mut buf = [0u8; 1];
-    let result = match io::stdin().read_exact(&mut buf) {
-        Ok(()) => Ok(buf[0] as char),
-        Err(_) => Ok('n'),
-    };
-    let _ = disable_raw_mode();
-    result
+/// Take the stored approval sender (TUI loop consumes it).
+pub fn take_approval_sender() -> Option<std::sync::mpsc::Sender<ApprovalResult>> {
+    let mut guard = APPROVAL_SENDER.lock();
+    guard.take()
 }
 
 /// Prompt the user for approval of a tool execution.
@@ -840,11 +769,9 @@ pub fn prompt_for_approval(
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
-        // Non-interactive mode: auto-approve
         return Ok(ApprovalResult::Approved);
     }
 
-    // Format parameters with rich formatting based on tool type
     let params_str = format_tool_parameters(tool_name, params);
 
     let prompt = build_tool_approval_prompt(
@@ -859,25 +786,20 @@ pub fn prompt_for_approval(
     use crate::cli::output::OutputEvent;
     output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
 
-    // The TUI loop skips its stdin read while APPROVAL_PROMPT_ACTIVE is set,
-    // avoiding an fd race with this blocking libc::read().
-    //
-    // INVARIANT: set_approval_prompt_active(false) must always run, even on
-    // error. If the flag stays true, the TUI loop permanently skips stdin
-    // and the shell becomes unresponsive. We ensure this by deferring the ?
-    // until after the flag is cleared (no early-return between set and clear).
+    // Channel-based: store sender, set flag, block on receiver.
+    // The TUI loop reads the key event and sends the result through the channel.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    set_approval_sender(sender);
     set_approval_prompt_active(true);
-    let input = read_single_char_raw();
-    set_approval_prompt_active(false);
-    let input = input?;
 
-    match input {
-        'y' | 'Y' => Ok(ApprovalResult::Approved),
-        'n' | 'N' => Ok(ApprovalResult::Denied),
-        'a' | 'A' => Ok(ApprovalResult::Always),
-        _ => Ok(ApprovalResult::Denied),
-    }
+    let result = receiver
+        .recv()
+        .map_err(|_| io::Error::other("approval channel closed"))?;
+
+    set_approval_prompt_active(false);
+    Ok(result)
 }
+
 
 /// Flag indicating if an approval prompt is currently active and waiting for input.
 /// When true, the CLI main loop routes the next line of input to the approval prompt
@@ -962,14 +884,7 @@ pub async fn prompt_for_approval_async(
 }
 
 /// Prompt the user for combined approval of multiple file edits.
-///
-/// Shows a diff preview and asks for approval.
-/// Returns `ApprovalResult::Approved` if the user approves.
-///
-/// ## Implementation
-///
-/// - If a TUI loop is active, uses channel-based forwarding (TUI loop reads stdin).
-/// - If no TUI loop is active (one-shot mode), uses direct raw-mode stdin reading.
+/// Shows a diff preview and asks for approval via the TUI channel.
 pub async fn prompt_for_combined_approval(
     file_count: usize,
     edit_count: usize,
@@ -1000,22 +915,16 @@ pub async fn prompt_for_combined_approval(
     use crate::cli::output::OutputEvent;
     output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
 
-    // See prompt_for_approval for the APPROVAL_PROMPT_ACTIVE invariant.
-    // Here spawn_blocking captures errors in `result` without ?, so the
-    // clear always executes even on failure.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    set_approval_sender(sender);
     set_approval_prompt_active(true);
-    let input = tokio::task::spawn_blocking(read_single_char_raw)
-        .await
-        .map_err(|_| ())
-        .and_then(|r| r.map_err(|_| ()));
-    set_approval_prompt_active(false);
 
-    match input {
-        Ok('y' | 'Y') => Ok(ApprovalResult::Approved),
-        Ok('n' | 'N') => Ok(ApprovalResult::Denied),
-        Ok('a' | 'A') => Ok(ApprovalResult::Always),
-        _ => Ok(ApprovalResult::Denied),
-    }
+    let result = receiver
+        .recv()
+        .map_err(|_| io::Error::other("approval channel closed"))?;
+
+    set_approval_prompt_active(false);
+    Ok(result)
 }
 
 fn build_tool_approval_prompt(

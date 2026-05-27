@@ -1335,6 +1335,7 @@ impl AgentLoop {
         };
         let mut snipped_blocks_this_turn: Vec<SnippedCodeBlock> = Vec::new();
         let mut reasoning_preview_shown = false;
+        let mut stream_errored = false;
         let mut in_thinking_tag = false;
 
         // Track time to first token for UX feedback on slow connections
@@ -1625,23 +1626,35 @@ impl AgentLoop {
                         context_window: Some(context_window),
                         context_usage_percentage: Some(context_usage_pct),
                     });
-                    // Update cumulative session stats using MERGED values
-                    // (not raw chunk values - prevents double-counting when
-                    // providers send multiple usage chunks per response)
-                    state.cumulative_tokens_in =
-                        state.cumulative_tokens_in.saturating_add(tokens_in);
-                    state.cumulative_tokens_out =
-                        state.cumulative_tokens_out.saturating_add(tokens_out);
-                    state.cumulative_cache_writes = state
-                        .cumulative_cache_writes
-                        .saturating_add(usage_chunk.cache_write_tokens.unwrap_or(0));
-                    state.cumulative_cache_reads = state
-                        .cumulative_cache_reads
-                        .saturating_add(usage_chunk.cache_read_tokens.unwrap_or(0));
-                    state.cumulative_reasoning_tokens = state
-                        .cumulative_reasoning_tokens
-                        .saturating_add(usage_chunk.reasoning_tokens.unwrap_or(0));
-                    state.cumulative_cost += usage_chunk.total_cost.unwrap_or(0.0);
+                    if usage_chunk.input_tokens > 0 {
+                        state.cumulative_tokens_in =
+                            state.cumulative_tokens_in.saturating_add(usage_chunk.input_tokens);
+                    }
+                    if usage_chunk.output_tokens > 0 {
+                        state.cumulative_tokens_out =
+                            state.cumulative_tokens_out.saturating_add(usage_chunk.output_tokens);
+                    }
+                    if let Some(cache_writes) = usage_chunk.cache_write_tokens {
+                        if cache_writes > 0 {
+                            state.cumulative_cache_writes =
+                                state.cumulative_cache_writes.saturating_add(cache_writes);
+                        }
+                    }
+                    if let Some(cache_reads) = usage_chunk.cache_read_tokens {
+                        if cache_reads > 0 {
+                            state.cumulative_cache_reads =
+                                state.cumulative_cache_reads.saturating_add(cache_reads);
+                        }
+                    }
+                    if let Some(reasoning_tokens) = usage_chunk.reasoning_tokens {
+                        if reasoning_tokens > 0 {
+                            state.cumulative_reasoning_tokens =
+                                state.cumulative_reasoning_tokens.saturating_add(reasoning_tokens);
+                        }
+                    }
+                    if let Some(cost) = usage_chunk.total_cost {
+                        state.cumulative_cost += cost;
+                    }
 
                     // Display compact token usage after receiving usage data
                     if !self.config.json_output {
@@ -1784,6 +1797,7 @@ impl AgentLoop {
                 }
                 ApiStreamChunk::Error(err) => {
                     tracing::error!(error = %err, "received error chunk from provider stream");
+                    stream_errored = true;
                     if self.config.json_output {
                         tracing::info!(
                             target: "json_output",
@@ -1851,6 +1865,14 @@ impl AgentLoop {
             return TurnResult::Error(actionable.display());
         }
 
+        // If stream errored mid-response, discard partial content and return error
+        if stream_errored {
+            return TurnResult::Error(
+                "Provider stream error - partial response discarded. Retry the request."
+                    .to_string(),
+            );
+        }
+
         if !snipped_blocks_this_turn.is_empty() {
             let mut state = self.state.lock().await;
             state.snipped_code_blocks.extend(snipped_blocks_this_turn);
@@ -1871,7 +1893,7 @@ impl AgentLoop {
             "stream complete"
         );
 
-        if accumulated_text.is_empty() && prepared_tool_calls.is_empty() {
+        if accumulated_text.is_empty() && prepared_tool_calls.is_empty() && accumulated_reasoning.is_empty() {
             let mut state = state_clone.lock().await;
             state.consecutive_mistakes += 1;
             tracing::warn!(

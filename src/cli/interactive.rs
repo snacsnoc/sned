@@ -7,7 +7,7 @@ use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines};
 use crate::cli::{RootOnlyOptions, TaskOptions};
-use crate::core::approval::is_approval_prompt_active;
+use crate::core::approval::{is_approval_prompt_active, take_approval_sender, ApprovalResult};
 use futures::FutureExt;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -1202,11 +1202,24 @@ async fn run_main_loop(
         terminal.draw(|f| app.render(f))?;
 
         // 3. Poll for events (blocking, 50ms timeout)
-        // Always poll to provide delay; skip stdin read while approval is active to avoid fd race
         let has_event = ratatui::crossterm::event::poll(Duration::from_millis(50))?;
-        if has_event && !is_approval_prompt_active() {
+        if has_event {
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {
+                    // Approval prompt: route y/n/a to approval channel
+                    if is_approval_prompt_active() {
+                        if let Some(sender) = take_approval_sender() {
+                            let result = match key.code {
+                                KeyCode::Char('y' | 'Y') => ApprovalResult::Approved,
+                                KeyCode::Char('n' | 'N') => ApprovalResult::Denied,
+                                KeyCode::Char('a' | 'A') => ApprovalResult::Always,
+                                KeyCode::Esc => ApprovalResult::Denied,
+                                _ => return Ok(()),
+                            };
+                            let _ = sender.send(result);
+                        }
+                        return Ok(());
+                    }
                     if let Some(action) = handle_key_event(
                         key,
                         app,
