@@ -485,6 +485,21 @@ async fn handle_key_event(
         }
     }
 
+    // Tab or Enter with active file picker -> insert selection (must come before Enter handler)
+    if app.picker_active && !app.picker_results.is_empty() && (key.code == KeyCode::Tab || key.code == KeyCode::Enter) {
+        let result = &app.picker_results[app.picker_index];
+        let text = app.input.lines().join("");
+        let mq = crate::core::file_search::extract_mention_query(&text);
+        if mq.in_mention_mode {
+            let new_text =
+                crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
+            app.input = App::new_textarea(vec![new_text]);
+            app.picker_active = false;
+            app.picker_results.clear();
+        }
+        return Ok(None);
+    }
+
     // Enter key - intercept before passing to textarea
     if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
         // Check for followup question (used by /undo, /commit, /checkpoint-restore)
@@ -548,8 +563,6 @@ async fn handle_key_event(
     }
 
     // Up/Down for file picker navigation (when picker is active)
-
-    // Up/Down for file picker navigation (when picker is active)
     if app.picker_active && !app.picker_results.is_empty() {
         if key.code == KeyCode::Up {
             app.picker_index = app.picker_index.saturating_sub(1);
@@ -559,21 +572,6 @@ async fn handle_key_event(
             app.picker_index = (app.picker_index + 1).min(app.picker_results.len() - 1);
             return Ok(None);
         }
-    }
-
-    // Tab key with active file picker -> insert selection
-    if key.code == KeyCode::Tab && app.picker_active && !app.picker_results.is_empty() {
-        let result = &app.picker_results[app.picker_index];
-        let text = app.input.lines().join("");
-        let mq = crate::core::file_search::extract_mention_query(&text);
-        if mq.in_mention_mode {
-            let new_text =
-                crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
-            app.input = App::new_textarea(vec![new_text]);
-            app.picker_active = false;
-            app.picker_results.clear();
-        }
-        return Ok(None);
     }
 
     // All other keys go to textarea
