@@ -786,16 +786,23 @@ pub fn prompt_for_approval(
     use crate::cli::output::OutputEvent;
     output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
 
-    // Channel-based: store sender, set flag, block on receiver.
+    // Channel-based: store sender, set flag, block on receiver with timeout.
     // The TUI loop reads the key event and sends the result through the channel.
+    // Timeout prevents hanging forever if user walks away or terminal crashes.
     let (sender, receiver) = std::sync::mpsc::channel();
     set_approval_sender(sender);
     set_approval_prompt_active(true);
     let _guard = ApprovalPromptGuard;
 
     let result = receiver
-        .recv()
-        .map_err(|_| io::Error::other("approval channel closed"))?;
+        .recv_timeout(std::time::Duration::from_secs(300))
+        .map_err(|e| {
+            if e == std::sync::mpsc::RecvTimeoutError::Timeout {
+                io::Error::other("approval prompt timed out (5 minutes)")
+            } else {
+                io::Error::other("approval channel closed")
+            }
+        })?;
 
     Ok(result)
 }
@@ -923,8 +930,14 @@ pub async fn prompt_for_combined_approval(
         let _guard = ApprovalPromptGuard;
 
         let result = receiver
-            .recv()
-            .map_err(|_| io::Error::other("approval channel closed"))?;
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .map_err(|e| {
+                if e == std::sync::mpsc::RecvTimeoutError::Timeout {
+                    io::Error::other("approval prompt timed out (5 minutes)")
+                } else {
+                    io::Error::other("approval channel closed")
+                }
+            })?;
 
         Ok(result)
     })
