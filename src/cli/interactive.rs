@@ -368,9 +368,7 @@ impl InteractiveSession {
 
 /// Action returned by key event handler.
 enum Action {
-    Quit,
     Submit(String),
-    CancelAgent,
 }
 
 /// Drain output channel into app buffer.
@@ -465,36 +463,13 @@ async fn handle_key_event(
     app: &mut App,
     _session: &Arc<Mutex<InteractiveSession>>,
     task_id: &str,
-    agent_busy: &AtomicBool,
-    agent_done: &Arc<tokio::sync::Notify>,
+    _agent_busy: &AtomicBool,
+    _agent_done: &Arc<tokio::sync::Notify>,
     _agent_start_time: &Arc<Mutex<Option<Instant>>>,
-    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
-    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    _state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    _agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
-
-    // Ctrl+C handling
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        // Dismiss picker first if active
-        if app.picker_active {
-            app.picker_active = false;
-            app.picker_results.clear();
-            return Ok(None);
-        }
-        if agent_busy.load(Ordering::Relaxed) {
-            // Cancel agent
-            cancel_agent(state_handle, agent_task, agent_done).await?;
-            return Ok(Some(Action::CancelAgent));
-        } else if app.input.lines().join("\n").is_empty() {
-            // Exit cleanly
-            return Ok(Some(Action::Quit));
-        } else {
-            // Clear input with visual feedback
-            app.push_plain("^C");
-            app.input = App::new_textarea(Vec::new());
-            return Ok(None);
-        }
-    }
 
     // Tab or Enter with active file picker -> insert selection (must come before Enter handler)
     if app.picker_active && !app.picker_results.is_empty() && (key.code == KeyCode::Tab || key.code == KeyCode::Enter) {
@@ -1205,6 +1180,9 @@ async fn run_main_loop(
     task_opts: &TaskOptions,
     auto_approve: bool,
 ) -> anyhow::Result<()> {
+    use std::sync::Mutex as StdMutex;
+    let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
+
     loop {
         // 1. Drain channel into app
         drain_output(output_rx, app);
@@ -1264,6 +1242,55 @@ async fn run_main_loop(
                         }
                         continue;
                     }
+
+                    // Global Ctrl+C handling
+                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        let now = std::time::Instant::now();
+                        let is_double_tap = {
+                            let last = last_ctrlc.lock().unwrap();
+                            last.is_some_and(|prev| now.duration_since(prev).as_secs() < 2)
+                        };
+                        
+                        if is_double_tap {
+                            // Force exit on second Ctrl+C
+                            if app.picker_active {
+                                app.picker_active = false;
+                                app.picker_results.clear();
+                            }
+                            return Ok(());
+                        }
+                        
+                        // First Ctrl+C - update timestamp
+                        {
+                            let mut last = last_ctrlc.lock().unwrap();
+                            *last = Some(now);
+                        }
+                        
+                        // Dismiss picker if active
+                        if app.picker_active {
+                            app.picker_active = false;
+                            app.picker_results.clear();
+                            continue;
+                        }
+                        
+                        // If agent is busy, cancel it
+                        if agent_busy.load(Ordering::Relaxed) {
+                            cancel_agent(&state_handle, &agent_task, &agent_done).await?;
+                            app.push_plain("^C");
+                            continue;
+                        }
+                        
+                        // If input is empty, exit
+                        if app.input.lines().join("\n").is_empty() {
+                            return Ok(());
+                        }
+                        
+                        // Clear input with visual feedback
+                        app.push_plain("^C");
+                        app.input = App::new_textarea(Vec::new());
+                        continue;
+                    }
+
                     if let Some(action) = handle_key_event(
                         key,
                         app,
@@ -1278,7 +1305,6 @@ async fn run_main_loop(
                     .await?
                     {
                         match action {
-                            Action::Quit => return Ok(()),
                             Action::Submit(text) => {
                                 // Save to command history and reset navigation
                                 append_to_history(&text);
@@ -1362,10 +1388,6 @@ async fn run_main_loop(
                                 }
                                 // Render immediately to show user message before agent starts streaming
                                 terminal.draw(|f| app.render(f))?;
-                            }
-                            Action::CancelAgent => {
-                                app.push_plain("^C");
-                                app.agent_busy = false;
                             }
                         }
                     }
