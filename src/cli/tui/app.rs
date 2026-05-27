@@ -8,7 +8,7 @@ use crate::core::file_search::FileSearchResult;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
@@ -128,6 +128,28 @@ impl App {
         self.push_output(Line::from(Span::styled(text.into(), style)));
     }
 
+    /// Push a turn separator line.
+    pub fn push_turn_separator(&mut self) {
+        self.push_output(Line::from(Span::styled(
+            "─".repeat(40),
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+
+    /// Push a user message with proper formatting (splits on newlines).
+    pub fn push_user_message(&mut self, text: &str) {
+        let style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        for (i, line) in text.split('\n').enumerate() {
+            if i == 0 {
+                self.push_styled(format!("❯ {}", line), style);
+            } else {
+                self.push_styled(format!("  {}", line), style);
+            }
+        }
+    }
+
     /// Render the application state to the frame.
     pub fn render(&mut self, frame: &mut Frame) {
         let [output_area, status_area, input_area] =
@@ -155,9 +177,9 @@ impl App {
         let scroll_y = if self.auto_scroll {
             total_lines.saturating_sub(visible_height) as u16
         } else {
-            // Re-enable auto-scroll if user has scrolled to bottom
-            let max_scroll = total_lines.saturating_sub(visible_height) as u16;
-            if self.scroll_offset >= max_scroll && max_scroll > 0 {
+            // Re-enable auto-scroll if user is near bottom (within 2 lines)
+            let distance_from_bottom = total_lines.saturating_sub(self.scroll_offset as usize + visible_height);
+            if distance_from_bottom <= 2 {
                 self.auto_scroll = true;
                 total_lines.saturating_sub(visible_height) as u16
             } else {

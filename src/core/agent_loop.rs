@@ -37,6 +37,7 @@ use crate::storage::global_state::HistoryItem;
 use crate::storage::state_manager::StateManager;
 use crate::storage::task_storage::TaskStorage;
 use futures::future::FutureExt;
+use ratatui::style::{Color, Modifier, Style};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1383,6 +1384,14 @@ impl AgentLoop {
         // Buffer flush timing to reduce syscalls on high-latency connections (P9)
         let mut last_flush_time = Instant::now();
         let flush_interval = std::time::Duration::from_millis(50);
+
+        // Emit assistant turn indicator
+        self.config.output_writer.emit(OutputEvent::styled(
+            "✦ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
 
         while let Some(chunk) = rx.recv().await {
             // Check for cancellation during stream processing so Ctrl+C

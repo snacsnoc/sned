@@ -517,6 +517,8 @@ async fn handle_key_event(
         if is_followup_question_active(task_id) {
             if let Some(sender) = take_followup_sender(task_id) {
                 let text = app.get_input_with_expanded_pastes();
+                // Echo followup response to output pane
+                app.push_user_message(&text);
                 let _ = sender.send(text);
                 app.input = App::new_textarea(Vec::new());
             }
@@ -526,13 +528,10 @@ async fn handle_key_event(
         // Normal submit - expand all paste markers before sending
         let text = app.get_input_with_expanded_pastes();
         if !text.is_empty() {
+            // Turn separator before user message
+            app.push_turn_separator();
             // Echo prompt to output pane
-            app.push_styled(
-                format!("❯ {}", text),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            );
+            app.push_user_message(&text);
             // Clear textarea and paste tracking
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
@@ -1223,8 +1222,20 @@ async fn run_main_loop(
                                     continue;
                                 }
                             };
-                            let _ = sender.send(result);
+                            let _ = sender.send(result.clone());
                             app.output_lines.truncate(prompt_lines);
+                            // Echo approval decision
+                            app.push_styled(
+                                format!(
+                                    "  ↳ {}",
+                                    match result {
+                                        ApprovalResult::Approved => "approved",
+                                        ApprovalResult::Denied => "denied",
+                                        ApprovalResult::Always => "always approve",
+                                    }
+                                ),
+                                Style::default().fg(Color::Cyan),
+                            );
                             app.auto_scroll = true;
                             app.scroll_offset = 0;
                         }
@@ -1283,6 +1294,8 @@ async fn run_main_loop(
                                     && let Some(qh) = queue_handle.lock().await.as_ref()
                                     && !processed.is_empty()
                                 {
+                                    // Echo queued message to output pane
+                                    app.push_user_message(&processed);
                                     qh.enqueue_text_message(processed).await;
                                     let count = qh.queued_message_count().await;
                                     app.push_styled(
@@ -1328,7 +1341,6 @@ async fn run_main_loop(
                 Event::Mouse(mouse_event) => {
                     match mouse_event.kind {
                         ratatui::crossterm::event::MouseEventKind::ScrollDown => {
-                            app.auto_scroll = false;
                             app.scroll_offset = app.scroll_offset.saturating_add(3);
                         }
                         ratatui::crossterm::event::MouseEventKind::ScrollUp => {
@@ -1355,6 +1367,8 @@ async fn run_main_loop(
                     format!("⏱ Elapsed: {}", format_duration(elapsed)),
                     Style::default().add_modifier(Modifier::DIM),
                 );
+                // Turn separator after agent completion
+                app.push_turn_separator();
             }
         }
 
