@@ -1249,6 +1249,7 @@ async fn run_main_loop(
                             }
                             Action::CancelAgent => {
                                 app.push_plain("^C");
+                                app.agent_busy = false;
                             }
                         }
                     }
