@@ -46,12 +46,12 @@ echo "   SHA256: ${SHA256}"
 
 cat > "${FORMULA_PATH}" <<EOF
 class Sned < Formula
-  desc "AI coding assistant in your terminal"
-  homepage "https://github.com/sned-run/sned"
+  desc "Rust CLI for code editing"
+  homepage "https://github.com/snacsnoc/sned"
   version "${VERSION}"
-  url "https://github.com/sned-run/sned/releases/download/v#{version}/sned-#{version}-macos-universal.tar.gz"
+  url "https://github.com/snacsnoc/sned/releases/download/v#{version}/sned-#{version}-macos-universal.tar.gz"
   sha256 "${SHA256}"
-  license "MIT"
+  license any_of: ["GPL-3.0-only", "Apache-2.0"]
 
   depends_on arch: [:x86_64, :arm64]
   depends_on macos: ">= :catalina"
@@ -62,7 +62,7 @@ class Sned < Formula
 
   test do
     assert_match "Sned CLI", shell_output("#{bin}/sned --help")
-    assert_match "0.1.0", shell_output("#{bin}/sned --version")
+    assert_match version.to_s, shell_output("#{bin}/sned --version")
   end
 end
 EOF

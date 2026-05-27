@@ -1,6 +1,6 @@
 # sned
 
-LLM CLI in Rust, no Node, no MCP, no runtime garbage. 
+Rust CLI for code editing, no Node, no MCP, no runtime garbage.
 
 hash-anchored edits / AST-native precision / multi-file batching / auto context / shadow git / hooks / command safety
 
@@ -26,7 +26,7 @@ cargo install sccache && export RUSTC_WRAPPER=sccache
 
 You give it a task. It opens a session, reads your workspace, calls tools, gets results, decides next step. The model drives the loop. You approve or deny.
 
-Edits are hash-anchored. Every line gets a content hash on read. Before writing, sned re-hashes. If anything shifted, the edit fails. You get a conflict report, the agent retries. No silent wrong-line patching.
+Edits are hash-anchored. Every line gets a content hash on read. Before writing, sned re-hashes. If anything shifted, the edit fails. You get a conflict report, and the runner retries. No silent wrong-line patching.
 
 Context is managed automatically. Tracks what's been read, what changed, what's stale. Compacts before each API call instead of naively truncating.
 
@@ -83,7 +83,7 @@ Auto-condenses before API calls. Tracks what's been read, edited, stale. Not nai
 
 ## shadow git
 
-`--track-changes` maintains a shadow git repo at `.sned/.git-agent/`. Every agent turn is a real commit. Your real `.git/` is never touched.
+`--track-changes` maintains a shadow git repo at `.sned/.git-agent/`. Every turn is a real commit. Your real `.git/` is never touched.
 
 Turns are real git commits. You can diff, log, undo, or checkpoint-restore to any turn. `/commit "message"` pushes the last turn to your real repo when you're satisfied. No more "please undo all that crap you just wrote".
 

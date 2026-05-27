@@ -3,12 +3,12 @@ name = "sned"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
-description = "Rust CLI agent for LLM-powered code editing"
+description = "Rust CLI for code editing"
 license = "GPL-3.0-only OR Apache-2.0"
 authors = ["Easton Elliott <easton@geekness.eu>"]
 repository = "https://github.com/snacsnoc/sned"
 homepage = "https://github.com/snacsnoc/sned"
-keywords = ["ai", "cli", "coding-assistant", "code-editing", "llm"]
+keywords = ["cli", "code-editing", "development-tools"]
 categories = ["command-line-utilities", "development-tools::code-assist"]
 
 # Dependency Policy:
