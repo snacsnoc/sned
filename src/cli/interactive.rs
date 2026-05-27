@@ -549,6 +549,7 @@ async fn handle_key_event(
         return Ok(None);
     }
     if key.code == KeyCode::PageDown {
+        app.auto_scroll = false;
         app.scroll_offset = app.scroll_offset.saturating_add(10);
         return Ok(None);
     }
@@ -1216,6 +1217,7 @@ async fn run_main_loop(
                                 let _ = sender.send(ApprovalResult::Denied);
                                 app.output_lines.truncate(prompt_lines);
                                 app.auto_scroll = true;
+                                app.scroll_offset = 0;
                                 cancel_agent(&state_handle, &agent_task, &agent_done).await?;
                                 app.push_plain("^C");
                                 app.agent_busy = false;
@@ -1236,6 +1238,7 @@ async fn run_main_loop(
                             let _ = sender.send(result);
                             app.output_lines.truncate(prompt_lines);
                             app.auto_scroll = true;
+                            app.scroll_offset = 0;
                         }
                         continue;
                     }
