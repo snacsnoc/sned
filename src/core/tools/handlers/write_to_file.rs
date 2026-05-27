@@ -49,20 +49,21 @@ impl WriteToFileHandler {
         use crate::core::file_editor::FileEditGuard;
         use tokio::fs;
 
-        let path_obj = Path::new(path);
-
         // Acquire exclusive file lock to prevent concurrent writes
         let _guard = FileEditGuard::acquire(path).await;
+
+        // Canonicalize workspace root once for consistent comparison
+        let canonical_workspace = fs::canonicalize(workspace_root).await
+            .unwrap_or_else(|_| workspace_root.to_path_buf());
+
+        let path_obj = Path::new(path);
 
         // Create parent directories if they don't exist
         if let Some(parent) = path_obj.parent() {
             fs::create_dir_all(parent).await?;
             
-            // SECURITY: Re-verify parent directory after creation to catch symlink race (TOCTOU)
-            // An attacker could replace a directory with a symlink between resolve and create
+            // Re-verify parent directory after creation to catch symlink race
             let canonical_parent = fs::canonicalize(parent).await?;
-            let canonical_workspace = fs::canonicalize(workspace_root).await
-                .unwrap_or_else(|_| workspace_root.to_path_buf());
             
             if !canonical_parent.starts_with(&canonical_workspace) {
                 anyhow::bail!(
@@ -74,8 +75,28 @@ impl WriteToFileHandler {
             }
         }
 
+        // Final canonicalization check immediately before write
+        // Use parent + filename if file doesn't exist yet
+        let final_canonical = if path_obj.exists() {
+            fs::canonicalize(path).await.unwrap_or_else(|_| PathBuf::from(path))
+        } else {
+            // File doesn't exist yet - canonicalize parent and append filename
+            let parent = path_obj.parent().unwrap_or(Path::new("."));
+            let canonical_parent = fs::canonicalize(parent).await.unwrap_or_else(|_| PathBuf::from(parent));
+            canonical_parent.join(path_obj.file_name().unwrap_or_default())
+        };
+        
+        if !final_canonical.starts_with(&canonical_workspace) {
+            anyhow::bail!(
+                "Path {} resolved to {} which is outside workspace {} (symlink detected)",
+                path,
+                final_canonical.display(),
+                canonical_workspace.display()
+            );
+        }
+
         // Write the file atomically using async I/O (avoids spawn_blocking overhead)
-        crate::storage::disk::atomic_write_file_async(path_obj, content).await?;
+        crate::storage::disk::atomic_write_file_async(&final_canonical, content).await?;
 
         Ok(format!("Successfully wrote to {}", path))
     }

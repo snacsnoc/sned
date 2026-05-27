@@ -436,8 +436,8 @@ impl EditFileHandler {
             prepared_batches.push((batch, prepared));
         }
 
-        // Phase 2: Combined approval check (skip in silent mode or when explicitly approved)
-        if !prepared_batches.is_empty() && !silent && !explicitly_approved {
+        // Phase 2: Combined approval check (skip only when explicitly approved)
+        if !prepared_batches.is_empty() && !explicitly_approved {
             let should_prompt = if let Some(ref am) = self.approval_manager {
                 let mgr = am.lock().await;
                 // EditFile doesn't use command fingerprint (only for execute_command)
@@ -663,40 +663,32 @@ impl EditFileHandler {
 
                 let lock_result = std_file.try_lock();
 
-                // Always check mtime before write to detect external modifications (TOCTOU protection)
-                let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
-                    match tokio::fs::metadata(&item.absolute_path).await {
-                        Ok(current_metadata) => match current_metadata.modified() {
-                            Ok(current_mtime) => &current_mtime == initial_mtime,
-                            Err(_) => true,
-                        },
-                        Err(_) => true,
-                    }
-                } else {
-                    true
-                };
-
-                if !mtime_ok {
-                    let _ = std_file.unlock();
-                    for path in written_paths.iter().rev() {
-                        if let Some(orig) = original_contents.get(path)
-                            && let Err(re) = std::fs::write(path, orig)
-                        {
-                            tracing::error!("Failed to rollback file {}: {}", path, re);
-                        }
-                    }
-                    Self::mark_must_reread(state, &item.absolute_path);
-                    return Err(Self::external_modification_error(
-                        &item.display_path,
-                        &item.absolute_path,
-                    ));
-                }
-
                 if lock_result.is_err() {
                     tracing::debug!(
                         "File {} locked by another process, skipping exclusive lock",
                         item.display_path
                     );
+
+                    // Re-check mtime immediately before write to close TOCTOU window
+                    let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
+                        match tokio::fs::metadata(&item.absolute_path).await {
+                            Ok(current_metadata) => match current_metadata.modified() {
+                                Ok(current_mtime) => &current_mtime == initial_mtime,
+                                Err(_) => true,
+                            },
+                            Err(_) => true,
+                        }
+                    } else {
+                        true
+                    };
+
+                    if !mtime_ok {
+                        Self::mark_must_reread(state, &item.absolute_path);
+                        return Err(Self::external_modification_error(
+                            &item.display_path,
+                            &item.absolute_path,
+                        ));
+                    }
 
                     state.insert_file_content(
                         item.absolute_path.clone(),
@@ -725,7 +717,28 @@ impl EditFileHandler {
                         }
                     }
                 } else {
-                    // Lock acquired successfully, mtime already checked above
+                    // Re-check mtime immediately before write to close TOCTOU window
+                    let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
+                        match tokio::fs::metadata(&item.absolute_path).await {
+                            Ok(current_metadata) => match current_metadata.modified() {
+                                Ok(current_mtime) => &current_mtime == initial_mtime,
+                                Err(_) => true,
+                            },
+                            Err(_) => true,
+                        }
+                    } else {
+                        true
+                    };
+
+                    if !mtime_ok {
+                        let _ = std_file.unlock();
+                        Self::mark_must_reread(state, &item.absolute_path);
+                        return Err(Self::external_modification_error(
+                            &item.display_path,
+                            &item.absolute_path,
+                        ));
+                    }
+
                     state.insert_file_content(
                         item.absolute_path.clone(),
                         item.final_content.clone(),
@@ -1717,7 +1730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_mode_skips_approval_and_applies_edits() {
+    async fn test_silent_mode_suppresses_diff_preview_but_still_requires_approval() {
         let _guard = TEST_MUTEX.lock().await;
         let approval_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::core::approval::ApprovalManager::new().with_yolo(false),
@@ -1733,7 +1746,6 @@ mod tests {
         let raw_content = "Line 1\nLine 2\nLine 3\n";
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
-        // Canonicalize paths to match handler's resolve_sanitized_path behavior
         let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
         let file_path = file_path.canonicalize().unwrap_or(file_path);
 
@@ -1741,7 +1753,6 @@ mod tests {
         let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
-        // Use relative path from workspace root to match handler's path resolution
         let relative_path = file_path
             .strip_prefix(&temp_dir)
             .unwrap()
@@ -1767,13 +1778,13 @@ mod tests {
             false,
             "test-task".to_string(),
             None,
-            false,
+            true, // explicitly_approved required — silent no longer bypasses approval
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
             result.is_ok(),
-            "Silent mode should succeed: {:?}",
+            "Silent mode with explicit approval should succeed: {:?}",
             result.err()
         );
         let result_text = result.unwrap().as_str().unwrap().to_string();
@@ -1781,7 +1792,7 @@ mod tests {
         let final_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert!(
             final_content.contains("Modified Line 2"),
-            "File should be modified in silent mode"
+            "File should be modified when explicitly approved"
         );
 
         assert!(
