@@ -927,12 +927,12 @@ impl AgentLoop {
                     // Record task in history for `sned history` and `--continue` support
                     let task = task_text.as_deref().unwrap_or("");
                     let state_guard = self.state.lock().await;
-                    let api_req_info = state_guard.last_api_req_info.as_ref();
-                    let tokens_in = api_req_info.and_then(|r| r.tokens_in).unwrap_or(0) as i32;
-                    let tokens_out = api_req_info.and_then(|r| r.tokens_out).unwrap_or(0) as i32;
-                    let cache_writes = api_req_info.and_then(|r| r.cache_writes).map(|v| v as i32);
-                    let cache_reads = api_req_info.and_then(|r| r.cache_reads).map(|v| v as i32);
-                    let cost = api_req_info.and_then(|r| r.cost).unwrap_or(0.0);
+                    // Use cumulative tokens/cost for the entire session, not just last turn
+                    let tokens_in = state_guard.cumulative_tokens_in as i32;
+                    let tokens_out = state_guard.cumulative_tokens_out as i32;
+                    let cache_writes = Some(state_guard.cumulative_cache_writes as i32);
+                    let cache_reads = Some(state_guard.cumulative_cache_reads as i32);
+                    let cost = state_guard.cumulative_cost;
                     drop(state_guard);
 
                     let workspace_root = self.resolve_workspace_root();
@@ -1652,7 +1652,9 @@ impl AgentLoop {
                         state.cumulative_reasoning_tokens =
                             state.cumulative_reasoning_tokens.saturating_add(reasoning_tokens);
                     }
-                    if let Some(cost) = usage_chunk.total_cost {
+                    if let Some(cost) = usage_chunk.total_cost
+                        && cost > 0.0
+                    {
                         state.cumulative_cost += cost;
                     }
                 }
@@ -1787,10 +1789,8 @@ impl AgentLoop {
                             })
                         );
                     } else {
-                        tracing::error!(
-                            "{}",
-                            crate::cli::colors::error(&format!("Stream error: {}", err))
-                        );
+                        // Emit to output_writer so TUI users see the error in the output pane
+                        self.config.output_writer.emit(OutputEvent::plain(format!("Error: {}", err)));
                     }
                 }
             }
@@ -3250,7 +3250,7 @@ impl AgentLoop {
         // Token, cost, turns, duration with 📊 icon
         let total_tokens = state.cumulative_tokens_in + state.cumulative_tokens_out;
         let tokens_str = if total_tokens >= 1000 {
-            format!("{}K", total_tokens / 1000)
+            format!("{:.1}K", total_tokens as f64 / 1000.0)
         } else {
             format!("{}", total_tokens)
         };

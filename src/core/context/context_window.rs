@@ -155,8 +155,9 @@ pub fn get_context_window_info(provider: &dyn Provider) -> ContextWindowInfo {
 
 /// Calculates context usage percentage based on total tokens used.
 ///
-/// For OpenAI-compatible providers, `tokens_in` already includes cache tokens,
-/// so cache_writes/cache_reads are not added separately.
+/// For OpenAI-compatible providers (OpenAI, MiniMax, DeepSeek, Groq, xAI, OpenRouter),
+/// `tokens_in` already includes cache tokens, so cache_writes/cache_reads are not added separately.
+/// For Gemini, `input_tokens` has cache reads already subtracted by the provider.
 /// For Anthropic, cache tokens are reported separately and are added.
 ///
 /// Returns percentage (0.0-100.0) of context window consumed.
@@ -168,7 +169,10 @@ pub fn calculate_context_usage_percentage(
     context_window: u64,
     provider_name: &str,
 ) -> f64 {
-    let cache_tokens = if provider_name == "openai" || provider_name == "minimax" {
+    // OpenAI-compatible providers already include cache tokens in tokens_in
+    // Gemini already subtracts cache reads from input_tokens
+    let no_cache_add = ["openai", "minimax", "deepseek", "groq", "xai", "openrouter", "gemini"];
+    let cache_tokens = if no_cache_add.contains(&provider_name) {
         0
     } else {
         cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64
