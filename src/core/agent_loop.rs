@@ -1217,15 +1217,52 @@ impl AgentLoop {
 
             // Keep only the last 20 messages (10 turns) + system prompt
             // This should always fit within any reasonable context window
+            // CRITICAL: Preserve tool_use/tool_result pairs — never split a tool result
+            // from its corresponding tool use. If a tool_result would be kept but its
+            // tool_use was pruned, extend the keep region backwards to include the tool_use.
             let emergency_keep = 20;
             let mut history = self.conversation_history.lock().await;
             if history.len() > emergency_keep {
-                let dropped = history.len() - emergency_keep;
-                history.drain(0..dropped);
+                // Build a map of tool_use_id → message index for all tool_uses in history
+                let mut tool_use_index: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::with_capacity(16);
+                for (idx, msg) in history.iter().enumerate() {
+                    if let MessageContent::AssistantBlocks(blocks) = &msg.content {
+                        for block in blocks {
+                            if let AssistantContentBlock::ToolUse(tu) = block {
+                                tool_use_index.insert(tu.id.clone(), idx);
+                            }
+                        }
+                    }
+                }
+
+                // Start with the most recent N messages
+                let keep_from_base = history.len().saturating_sub(emergency_keep);
+
+                // Scan the kept region for tool_results whose tool_use was pruned
+                // For each orphan, extend keep_from backwards to include the tool_use
+                let mut keep_from = keep_from_base;
+                for msg in history.iter().skip(keep_from_base) {
+                    if let MessageContent::UserBlocks(blocks) = &msg.content {
+                        for block in blocks {
+                            if let UserContentBlock::ToolResult(tr) = block
+                                && let Some(&tool_use_idx) = tool_use_index.get(&tr.tool_use_id)
+                                && tool_use_idx < keep_from
+                            {
+                                // This tool_use would be pruned but its result is kept — orphan!
+                                // Extend keep_from backwards to include the tool_use
+                                keep_from = keep_from.min(tool_use_idx);
+                            }
+                        }
+                    }
+                }
+
+                let dropped = keep_from;
+                history.drain(0..keep_from);
                 tracing::info!(
-                    "Emergency truncation: dropped {} oldest messages, keeping last {}",
+                    "Emergency truncation: dropped {} oldest messages, keeping last {} (adjusted for tool_use/tool_result pairs)",
                     dropped,
-                    emergency_keep
+                    history.len()
                 );
 
                 // Rebuild request with truncated history
@@ -1289,6 +1326,7 @@ impl AgentLoop {
             state_clone.clone(),
             retry_config,
             self.config.json_output,
+            Some(self.config.output_writer.clone()),
         )
         .await
         {
@@ -1901,16 +1939,8 @@ impl AgentLoop {
             return TurnResult::Continue;
         }
 
-        // Reset consecutive mistakes on successful response.
-        // Tool handlers manage their own consecutive_mistakes tracking
-        // based on execution success/failure, so we only reset here
-        // when the model returned a valid response with no tool failures.
-        // If tools were called, the handlers will reset on success.
-        // CRITICAL: Reset for text-only responses too, not just tool success.
-        {
-            let mut state = state_clone.lock().await;
-            state.consecutive_mistakes = 0;
-        }
+        // CRITICAL: Do NOT reset consecutive_mistakes here - tool execution may fail.
+        // Reset happens after tool execution if all tools succeed.
 
         // 6. Add assistant message to history
         let mut text_only_completes_task = false;
@@ -2510,6 +2540,10 @@ impl AgentLoop {
                 .filter_map(|i| result_map.remove(&i))
                 .collect();
 
+            // Track tool execution statistics for consecutive_mistakes tracking
+            let tools_called = !parallel_results.is_empty();
+            let tool_failure_count = parallel_results.iter().filter(|r| r.is_error).count();
+
             // Phase 3: Collect results in order, then push as ONE StorageMessage
             let mut parallel_results_iter = parallel_results.into_iter();
             let mut tool_result_blocks: Vec<UserContentBlock> = Vec::new();
@@ -2635,20 +2669,43 @@ impl AgentLoop {
                 });
             }
 
-            // Check if consecutive mistakes threshold is reached after tool execution
+            // Track consecutive mistakes for tool failures (denied approval, parse error, etc.)
+            // This ensures repeated tool failures trigger the same safety net as empty responses
+            if tools_called {
+                // Tools were called - check if they succeeded
+                if tool_failure_count > 0 {
+                    let mut state = self.state.lock().await;
+                    state.consecutive_mistakes += 1;
+                    tracing::warn!(
+                        consecutive_mistakes = state.consecutive_mistakes,
+                        max_allowed = self.config.max_consecutive_mistakes,
+                        tool_failures = tool_failure_count,
+                        "Tool execution failures detected"
+                    );
+
+                    if state.consecutive_mistakes >= self.config.max_consecutive_mistakes {
+                        return TurnResult::Error(format!(
+                            "Max consecutive mistakes ({}) reached. The model is repeatedly failing.",
+                            self.config.max_consecutive_mistakes
+                        ));
+                    }
+                } else {
+                    // All tools succeeded - reset consecutive mistakes
+                    let mut state = self.state.lock().await;
+                    state.consecutive_mistakes = 0;
+                }
+            } else {
+                // No tools were called (text-only response) - reset consecutive mistakes
+                let mut state = self.state.lock().await;
+                state.consecutive_mistakes = 0;
+            }
+
+            // Inject hint when approaching the mistake limit
             let mistakes_count;
             {
                 let state = self.state.lock().await;
                 mistakes_count = state.consecutive_mistakes;
-                if mistakes_count >= self.config.max_consecutive_mistakes {
-                    return TurnResult::Error(format!(
-                        "Max consecutive mistakes ({}) reached. The model is repeatedly failing.",
-                        self.config.max_consecutive_mistakes
-                    ));
-                }
             }
-
-            // Inject hint when approaching the mistake limit
             if mistakes_count >= self.config.max_consecutive_mistakes.saturating_sub(1) {
                 let hint = {
                     let state = self.state.lock().await;

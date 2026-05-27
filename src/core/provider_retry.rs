@@ -3,6 +3,7 @@
 //! The agent loop owns retry state so it can keep task-level flags accurate and
 //! avoid duplicating request orchestration inside each provider implementation.
 
+use crate::cli::output::OutputEvent;
 use crate::core::agent_types::TaskState;
 use crate::core::context::context_window;
 use crate::providers::{ApiStream, Provider, ProviderError, ProviderRequest};
@@ -12,8 +13,13 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::warn;
 
-/// Log a retry status message (visible in logs, not terminal during TUI)
-fn log_retry_status(retry_attempt: usize, delay: Duration, error: &ProviderError) {
+/// Log a retry status message (visible in logs and TUI output pane)
+fn log_retry_status(
+    retry_attempt: usize,
+    delay: Duration,
+    error: &ProviderError,
+    output_writer: Option<&crate::cli::output::OutputWriterArc>,
+) {
     let delay_secs = delay.as_secs_f64();
     let error_summary = match error {
         ProviderError::NetworkError(_) => "network error",
@@ -23,12 +29,17 @@ fn log_retry_status(retry_attempt: usize, delay: Duration, error: &ProviderError
         ProviderError::ApiError(_) => "API error",
         ProviderError::UnexpectedError(_) => "unexpected error",
     };
-    tracing::info!(
-        attempt = retry_attempt + 1,
-        delay_secs = delay_secs,
-        "⚠️ {} — retrying",
-        error_summary
+    let msg = format!(
+        "⚠️ {} — retrying (attempt {}/{}, delay: {:.1}s)",
+        error_summary,
+        retry_attempt + 1,
+        retry_attempt + 1,
+        delay_secs
     );
+    tracing::info!("{}", msg);
+    if let Some(writer) = output_writer {
+        writer.emit(OutputEvent::dim_yellow(&msg));
+    }
 }
 
 /// Retry policy for provider API requests.
@@ -59,7 +70,8 @@ pub async fn create_message_with_retry(
     request: ProviderRequest,
     task_state: Arc<Mutex<TaskState>>,
     retry_config: RetryConfig,
-    _json_output: bool,
+    json_output: bool,
+    output_writer: Option<crate::cli::output::OutputWriterArc>,
 ) -> Result<ApiStream, ProviderError> {
     // Validate context window before sending request
     if let Err(msg) = context_window::validate_context_window(&request, provider.as_ref()) {
@@ -91,7 +103,9 @@ pub async fn create_message_with_retry(
                     error = %error,
                     "provider request failed; retrying"
                 );
-                log_retry_status(retry_attempt, delay, &error);
+                if !json_output {
+                    log_retry_status(retry_attempt, delay, &error, output_writer.as_ref());
+                }
                 sleep(delay).await;
                 retry_attempt += 1;
             }
@@ -355,6 +369,7 @@ mod tests {
             state.clone(),
             RetryConfig::default(),
             false,
+            None,
         )
         .await
         .unwrap();

@@ -612,10 +612,19 @@ impl Provider for AnthropicProvider {
                         .await;
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, "Anthropic SSE bytes_stream error");
+                        let error_msg = format!("Anthropic SSE stream error: {}", e);
+                        let is_retryable = e.to_string().contains("timeout")
+                            || e.to_string().contains("connection")
+                            || e.to_string().contains("incomplete")
+                            || e.to_string().contains("decode");
+                        tracing::debug!(error = %e, retryable = is_retryable, "Anthropic SSE bytes_stream error");
                         try_send_chunk(
                             &tx,
-                            ApiStreamChunk::Error(format!("Anthropic SSE stream error: {}", e)),
+                            ApiStreamChunk::Error(format!(
+                                "{}{}",
+                                error_msg,
+                                if is_retryable { " (retryable)" } else { "" }
+                            )),
                             "error",
                         );
                         break;
