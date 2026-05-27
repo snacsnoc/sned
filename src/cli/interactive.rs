@@ -1267,6 +1267,7 @@ async fn run_main_loop(
             app.agent_busy = false;
             if let Some(start) = agent_start_time.lock().await.take() {
                 let elapsed = start.elapsed();
+                app.elapsed = Some(elapsed);
                 app.push_styled(
                     format!("⏱ Elapsed: {}", format_duration(elapsed)),
                     Style::default().add_modifier(Modifier::DIM),
@@ -1274,7 +1275,12 @@ async fn run_main_loop(
             }
         }
 
-        // 5. Tick spinner
+        // 5. Update elapsed time for status bar
+        if app.agent_busy && let Some(start) = app.start_time {
+            app.elapsed = Some(start.elapsed());
+        }
+
+        // 6. Tick spinner
         app.tick_spinner();
     }
 }
@@ -1327,6 +1333,18 @@ pub async fn run_interactive_shell_inner(
         let sess = session.lock().await;
         sess.agent_loop.task_id().to_string()
     };
+
+    // Set status bar fields from session info
+    {
+        let sess = session.lock().await;
+        let provider = sess.agent_loop.get_provider();
+        let model = provider.get_model();
+        app.provider_name = provider.name().to_string();
+        app.model_name = sess.task_opts.model.as_deref().unwrap_or(&model.id).to_string();
+        app.task_id = task_id.clone();
+        app.mode = if sess.task_opts.plan { "PLAN" } else { "ACT" }.to_string();
+        app.start_time = Some(Instant::now());
+    }
 
     // 4. Startup banner → app.push_output()
     {

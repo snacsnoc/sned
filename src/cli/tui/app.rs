@@ -3,15 +3,16 @@
 //! This is the main application state for the ratatui render loop.
 
 use super::history::FileHistory;
+use super::theme;
 use crate::core::file_search::FileSearchResult;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -59,6 +60,18 @@ pub struct App {
     pub paste_chunks: Vec<PasteChunk>,
     /// Threshold for folding pastes (in characters)
     pub paste_fold_threshold: usize,
+    /// Provider name for status bar
+    pub provider_name: String,
+    /// Model name for status bar
+    pub model_name: String,
+    /// Task ID for status bar
+    pub task_id: String,
+    /// Mode (PLAN/ACT) for status bar
+    pub mode: String,
+    /// Session elapsed time for status bar
+    pub elapsed: Option<Duration>,
+    /// Scrollbar state for output pane
+    pub scrollbar_state: ScrollbarState,
 }
 
 impl App {
@@ -87,6 +100,12 @@ impl App {
             history: FileHistory::load(),
             paste_chunks: Vec::new(),
             paste_fold_threshold: 500, // Fold pastes > 500 chars
+            provider_name: String::new(),
+            model_name: String::new(),
+            task_id: String::new(),
+            mode: String::new(),
+            elapsed: None,
+            scrollbar_state: ScrollbarState::new(0),
         }
     }
 
@@ -111,18 +130,36 @@ impl App {
 
     /// Render the application state to the frame.
     pub fn render(&mut self, frame: &mut Frame) {
-        let [output_area, input_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(frame.area());
+        let [output_area, status_area, input_area] =
+            Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .areas(frame.area());
 
-        // Update input block title with spinner when busy
-        let title = if self.agent_busy {
-            format!(" {} Working ", self.spinner_char())
+        // Update input block with themed border and styled title
+        let input_title = if self.agent_busy {
+            Line::from(vec![
+                Span::styled(self.spinner_char().to_string(), theme::spinner_style()),
+                Span::raw(" Working "),
+            ])
         } else {
-            " Input ".to_string()
+            Line::from(" Input ")
         };
-        self.input.set_block(Block::bordered().title(title));
+        let mut input_block = theme::input_block(input_title, self.agent_busy);
+        // Add right-aligned cwd (truncated to fit)
+        if !self.cwd.is_empty() {
+            let cwd_display = if self.cwd.len() > 30 {
+                format!("...{}", &self.cwd[self.cwd.len() - 27..])
+            } else {
+                self.cwd.clone()
+            };
+            input_block = input_block.title(Line::from(cwd_display).right_aligned());
+        }
+        self.input.set_block(input_block);
 
-        // Output pane
+        // Output pane with themed border and padding
         let visible_height = output_area.height as usize;
         let total_lines = self.output_lines.len();
         let scroll_y = if self.auto_scroll {
@@ -133,8 +170,59 @@ impl App {
 
         let output = Paragraph::new(self.output_lines.clone())
             .wrap(Wrap { trim: false })
-            .scroll((scroll_y, 0));
+            .scroll((scroll_y, 0))
+            .block(
+                theme::border_block(" sned ")
+                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
+            );
         frame.render_widget(output, output_area);
+
+        // Scrollbar on output pane
+        self.scrollbar_state = self
+            .scrollbar_state
+            .content_length(total_lines)
+            .viewport_content_length(visible_height);
+        frame.render_stateful_widget(
+            Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓"))
+                .style(theme::scrollbar_style())
+                .thumb_style(theme::scrollbar_thumb_style()),
+            output_area.inner(ratatui::layout::Margin {
+                horizontal: 1,
+                vertical: 1,
+            }),
+            &mut self.scrollbar_state.clone(),
+        );
+
+        // Status bar
+        let status_left = format!(
+            " {} / {} | {} | {} ",
+            self.provider_name, self.model_name, self.task_id, self.mode
+        );
+        let status_right = if let Some(elapsed) = self.elapsed {
+            format!("⏱ {} ", format_duration(elapsed))
+        } else if !self.cwd.is_empty() {
+            let cwd_display = if self.cwd.len() > 40 {
+                format!("...{}", &self.cwd[self.cwd.len() - 37..])
+            } else {
+                self.cwd.clone()
+            };
+            format!(" {} ", cwd_display)
+        } else {
+            String::new()
+        };
+        let spacer_len = status_area
+            .width
+            .saturating_sub((status_left.len() + status_right.len()) as u16);
+        let status = Paragraph::new(Line::from(vec![
+            Span::styled(status_left, theme::status_style()),
+            Span::raw(" ".repeat(spacer_len as usize)),
+            Span::styled(status_right, theme::status_style()),
+        ]))
+        .style(theme::status_style());
+        frame.render_widget(status, status_area);
 
         // Input pane
         frame.render_widget(&self.input, input_area);
@@ -168,13 +256,7 @@ impl App {
                 };
                 let label = format!("{} {}", icon, result.label);
                 if i == self.picker_index {
-                    Line::from(Span::styled(
-                        label,
-                        Style::default()
-                            .bg(Color::Blue)
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ))
+                    Line::from(Span::styled(label, theme::picker_selected_style()))
                 } else {
                     Line::from(label)
                 }
@@ -182,8 +264,7 @@ impl App {
             .collect();
 
         let picker = Paragraph::new(rows)
-            .block(Block::bordered().title(format!(" Files ({}) ", self.picker_results.len())))
-            .style(Style::default().bg(Color::Black));
+            .block(theme::overlay_block(format!(" Files ({}) ", self.picker_results.len())));
 
         frame.render_widget(Clear, overlay_area);
         frame.render_widget(picker, overlay_area);
@@ -246,6 +327,19 @@ impl App {
     /// Get current spinner character.
     pub fn spinner_char(&self) -> char {
         SPINNER_FRAMES[self.spinner_index]
+    }
+}
+
+/// Format a duration as a human-readable string (e.g., "0:42", "1:05:30").
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    if hours > 0 {
+        format!("{}:{:02}:{:02}", hours, mins, secs)
+    } else {
+        format!("{}:{:02}", mins, secs)
     }
 }
 
