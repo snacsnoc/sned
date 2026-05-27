@@ -10,7 +10,7 @@ use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::{is_approval_prompt_active, take_approval_sender, ApprovalResult};
 use futures::FutureExt;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
 };
 use ratatui::crossterm::execute;
 use ratatui::style::{Color, Modifier, Style};
@@ -25,8 +25,8 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Disable bracketed paste mode before restoring terminal
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        // Disable bracketed paste and mouse capture before restoring terminal
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         ratatui::restore();
     }
 }
@@ -1320,6 +1320,19 @@ async fn run_main_loop(
                 Event::Resize(_, _) => {
                     // Ratatui handles resize automatically on next draw
                 }
+                Event::Mouse(mouse_event) => {
+                    match mouse_event.kind {
+                        ratatui::crossterm::event::MouseEventKind::ScrollDown => {
+                            app.auto_scroll = false;
+                            app.scroll_offset = app.scroll_offset.saturating_add(3);
+                        }
+                        ratatui::crossterm::event::MouseEventKind::ScrollUp => {
+                            app.auto_scroll = false;
+                            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -1369,8 +1382,8 @@ pub async fn run_interactive_shell_inner(
         ratatui::init()
     };
 
-    // Enable bracketed paste mode for proper paste handling
-    execute!(std::io::stdout(), EnableBracketedPaste)?;
+    // Enable bracketed paste mode and mouse capture for proper paste handling and scroll wheel support
+    execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
 
     crate::core::cancellation::TERMINAL_INITIALIZED
         .store(true, std::sync::atomic::Ordering::Release);

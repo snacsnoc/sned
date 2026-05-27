@@ -190,7 +190,7 @@ impl App {
                 horizontal: 0,
                 vertical: 1,
             }),
-            &mut self.scrollbar_state.clone(),
+            &mut self.scrollbar_state,
         );
 
         // Status bar
