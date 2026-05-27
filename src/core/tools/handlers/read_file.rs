@@ -80,7 +80,24 @@ impl ReadFileHandler {
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
     ) -> FileReadResult {
-        let metadata = match tokio::fs::metadata(path).await {
+        // SECURITY: Re-verify path is still valid and not a symlink race (TOCTOU protection)
+        // The path was already resolved by resolve_sanitized_path, but we re-canonicalize
+        // to catch any filesystem changes between resolution and read
+        let canonical_path = match tokio::fs::canonicalize(path).await {
+            Ok(p) => p,
+            Err(e) => {
+                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                return FileReadResult {
+                    path: path.to_string(),
+                    content: String::new(),
+                    hash: String::new(),
+                    success: false,
+                    error: Some(err.display()),
+                };
+            }
+        };
+
+        let metadata = match tokio::fs::metadata(&canonical_path).await {
             Ok(m) => m,
             Err(e) => {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
@@ -110,12 +127,12 @@ impl ReadFileHandler {
 
         let (content_for_hash, sliced_lines, clamping_note, full_lines, range_start, range_end) =
             if start_line.is_some() || end_line.is_some() {
-                match self.read_lines_range(path, start_line, end_line).await {
+                match self.read_lines_range(&canonical_path.to_string_lossy(), start_line, end_line).await {
                     Ok(v) => v,
                     Err(e) => return e,
                 }
             } else if metadata.len() > max_file_read_size() as u64 {
-                match self.read_truncated(path, max_file_read_size()).await {
+                match self.read_truncated(&canonical_path.to_string_lossy(), max_file_read_size()).await {
                     Ok((content, lines)) => {
                         let size_kb = metadata.len() / 1024;
                         let max_kb = max_file_read_size() as u64 / 1024;
@@ -223,7 +240,22 @@ impl ReadFileHandler {
         ),
         FileReadResult,
     > {
-        let content = match tokio::fs::read_to_string(path).await {
+        // SECURITY: Re-canonicalize path to catch symlink race (TOCTOU)
+        let canonical_path = match tokio::fs::canonicalize(path).await {
+            Ok(p) => p,
+            Err(e) => {
+                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                return Err(FileReadResult {
+                    path: path.to_string(),
+                    content: String::new(),
+                    hash: String::new(),
+                    success: false,
+                    error: Some(err.display()),
+                });
+            }
+        };
+
+        let content = match tokio::fs::read_to_string(&canonical_path).await {
             Ok(c) => c,
             Err(e) => {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
@@ -322,7 +354,23 @@ impl ReadFileHandler {
         max_bytes: usize,
     ) -> Result<(String, Vec<String>), FileReadResult> {
         use tokio::io::AsyncReadExt;
-        let mut file = match tokio::fs::File::open(path).await {
+        
+        // SECURITY: Re-canonicalize path to catch symlink race (TOCTOU)
+        let canonical_path = match tokio::fs::canonicalize(path).await {
+            Ok(p) => p,
+            Err(e) => {
+                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                return Err(FileReadResult {
+                    path: path.to_string(),
+                    content: String::new(),
+                    hash: String::new(),
+                    success: false,
+                    error: Some(err.display()),
+                });
+            }
+        };
+
+        let mut file = match tokio::fs::File::open(&canonical_path).await {
             Ok(f) => f,
             Err(e) => {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());

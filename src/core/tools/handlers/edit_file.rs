@@ -663,34 +663,36 @@ impl EditFileHandler {
 
                 let lock_result = std_file.try_lock();
 
-                if lock_result.is_err() {
-                    let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
-                        match tokio::fs::metadata(&item.absolute_path).await {
-                            Ok(current_metadata) => match current_metadata.modified() {
-                                Ok(current_mtime) => &current_mtime == initial_mtime,
-                                Err(_) => true,
-                            },
+                // Always check mtime before write to detect external modifications (TOCTOU protection)
+                let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
+                    match tokio::fs::metadata(&item.absolute_path).await {
+                        Ok(current_metadata) => match current_metadata.modified() {
+                            Ok(current_mtime) => &current_mtime == initial_mtime,
                             Err(_) => true,
-                        }
-                    } else {
-                        true
-                    };
-
-                    if !mtime_ok {
-                        for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path)
-                                && let Err(re) = std::fs::write(path, orig)
-                            {
-                                tracing::error!("Failed to rollback file {}: {}", path, re);
-                            }
-                        }
-                        Self::mark_must_reread(state, &item.absolute_path);
-                        return Err(Self::external_modification_error(
-                            &item.display_path,
-                            &item.absolute_path,
-                        ));
+                        },
+                        Err(_) => true,
                     }
+                } else {
+                    true
+                };
 
+                if !mtime_ok {
+                    let _ = std_file.unlock();
+                    for path in written_paths.iter().rev() {
+                        if let Some(orig) = original_contents.get(path)
+                            && let Err(re) = std::fs::write(path, orig)
+                        {
+                            tracing::error!("Failed to rollback file {}: {}", path, re);
+                        }
+                    }
+                    Self::mark_must_reread(state, &item.absolute_path);
+                    return Err(Self::external_modification_error(
+                        &item.display_path,
+                        &item.absolute_path,
+                    ));
+                }
+
+                if lock_result.is_err() {
                     tracing::debug!(
                         "File {} locked by another process, skipping exclusive lock",
                         item.display_path
@@ -723,26 +725,7 @@ impl EditFileHandler {
                         }
                     }
                 } else {
-                    if let Some(initial_mtime) = &item.initial_mtime
-                        && let Ok(current_metadata) = tokio::fs::metadata(&item.absolute_path).await
-                        && let Ok(current_mtime) = current_metadata.modified()
-                        && &current_mtime != initial_mtime
-                    {
-                        let _ = std_file.unlock();
-                        for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path)
-                                && let Err(re) = std::fs::write(path, orig)
-                            {
-                                tracing::error!("Failed to rollback file {}: {}", path, re);
-                            }
-                        }
-                        Self::mark_must_reread(state, &item.absolute_path);
-                        return Err(Self::external_modification_error(
-                            &item.display_path,
-                            &item.absolute_path,
-                        ));
-                    }
-
+                    // Lock acquired successfully, mtime already checked above
                     state.insert_file_content(
                         item.absolute_path.clone(),
                         item.final_content.clone(),

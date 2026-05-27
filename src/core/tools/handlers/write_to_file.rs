@@ -40,7 +40,12 @@ impl WriteToFileHandler {
 
     /// Write content to a file.
     ///
-    pub async fn write_file(&self, path: &str, content: &str) -> anyhow::Result<String> {
+    pub async fn write_file(
+        &self,
+        path: &str,
+        content: &str,
+        workspace_root: &Path,
+    ) -> anyhow::Result<String> {
         use crate::core::file_editor::FileEditGuard;
         use tokio::fs;
 
@@ -52,6 +57,21 @@ impl WriteToFileHandler {
         // Create parent directories if they don't exist
         if let Some(parent) = path_obj.parent() {
             fs::create_dir_all(parent).await?;
+            
+            // SECURITY: Re-verify parent directory after creation to catch symlink race (TOCTOU)
+            // An attacker could replace a directory with a symlink between resolve and create
+            let canonical_parent = fs::canonicalize(parent).await?;
+            let canonical_workspace = fs::canonicalize(workspace_root).await
+                .unwrap_or_else(|_| workspace_root.to_path_buf());
+            
+            if !canonical_parent.starts_with(&canonical_workspace) {
+                anyhow::bail!(
+                    "Parent directory {} resolved to {} which is outside workspace {}",
+                    parent.display(),
+                    canonical_parent.display(),
+                    canonical_workspace.display()
+                );
+            }
         }
 
         // Write the file atomically using async I/O (avoids spawn_blocking overhead)
@@ -60,7 +80,11 @@ impl WriteToFileHandler {
         Ok(format!("Successfully wrote to {}", path))
     }
 
-    async fn execute_without_state(&self, params: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute_with_workspace(
+        &self,
+        params: serde_json::Value,
+        workspace_root: &Path,
+    ) -> Result<String, ToolError> {
         let path = params["path"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("Missing 'path' parameter".to_string()))?;
@@ -73,7 +97,7 @@ impl WriteToFileHandler {
             ));
         }
 
-        self.write_file(path, content).await.map_err(|e| {
+        self.write_file(path, content, workspace_root).await.map_err(|e| {
             if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                 match io_err.kind() {
                     std::io::ErrorKind::PermissionDenied => ToolError::ExecutionFailedWithMetadata(
@@ -137,7 +161,9 @@ impl ToolHandler for WriteToFileHandler {
             return Err(ToolError::InvalidInput(message));
         }
 
-        let result = self.execute_without_state(resolved_params).await;
+        let result = self
+            .execute_with_workspace(resolved_params, ctx.workspace_root.as_path())
+            .await;
         match result {
             Ok(text) => {
                 let mut state = ctx.state.lock().await;
@@ -221,7 +247,7 @@ mod tests {
         let handler = WriteToFileHandler::new();
 
         let result = handler
-            .write_file(file_path.to_str().unwrap(), "hello world")
+            .write_file(file_path.to_str().unwrap(), "hello world", temp_dir.path())
             .await
             .unwrap();
         assert!(result.contains("Successfully wrote to"));
@@ -236,7 +262,7 @@ mod tests {
 
         let content = "a1b2c3d4: line 1\na5b6c7d8: line 2";
         handler
-            .write_file(file_path.to_str().unwrap(), content)
+            .write_file(file_path.to_str().unwrap(), content, temp_dir.path())
             .await
             .unwrap();
         assert_eq!(fs::read_to_string(file_path).unwrap(), content);
@@ -249,7 +275,7 @@ mod tests {
         let handler = WriteToFileHandler::new();
 
         handler
-            .write_file(file_path.to_str().unwrap(), "nested")
+            .write_file(file_path.to_str().unwrap(), "nested", temp_dir.path())
             .await
             .unwrap();
         assert_eq!(fs::read_to_string(file_path).unwrap(), "nested");
@@ -267,8 +293,9 @@ mod tests {
             let handler = handler.clone();
             let path = file_path.to_str().unwrap().to_string();
             let content = format!("content-{}", i);
+            let workspace = temp_dir.path().to_path_buf();
             handles.push(tokio::spawn(async move {
-                handler.write_file(&path, &content).await.unwrap();
+                handler.write_file(&path, &content, &workspace).await.unwrap();
             }));
         }
 
@@ -302,7 +329,7 @@ mod tests {
             let path = temp_dir.path().join(name);
             let content = "x".repeat(size);
             handler
-                .write_file(path.to_str().unwrap(), &content)
+                .write_file(path.to_str().unwrap(), &content, temp_dir.path())
                 .await
                 .unwrap();
             let written = fs::read_to_string(path).unwrap();
