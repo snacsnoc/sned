@@ -221,9 +221,12 @@ impl App {
         let max_height = 10.min(self.picker_results.len() as u16);
         let width = 50.min(output_area.width);
 
+        // Position picker at bottom of output area, just above status bar
         let overlay_area = Rect {
             x: output_area.x + 2,
-            y: output_area.y + 2,
+            y: output_area
+                .y
+                .saturating_add(output_area.height.saturating_sub(max_height + 4)),
             width,
             height: max_height + 2, // +2 for border
         };
