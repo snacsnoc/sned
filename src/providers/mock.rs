@@ -148,7 +148,7 @@ impl Provider for MockProvider {
             info: ModelInfo {
                 name: Some("Mock Model".to_string()),
                 max_tokens: Some(4096),
-                context_window: Some(8192),
+                context_window: Some(200_000),
                 supports_images: Some(false),
                 supports_prompt_cache: false,
                 supports_reasoning: Some(false),

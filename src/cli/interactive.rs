@@ -134,6 +134,11 @@ impl InteractiveSession {
         self.agent_loop.message_queue_handle()
     }
 
+    /// Get the message queue handle for checking queued messages.
+    pub fn message_queue_handle(&self) -> Option<crate::core::agent_loop::MessageQueueHandle> {
+        Some(self.agent_loop.message_queue_handle())
+    }
+
     fn state_handle(&self) -> Arc<tokio::sync::Mutex<crate::core::agent_types::TaskState>> {
         self.agent_loop.state_handle()
     }
@@ -548,7 +553,6 @@ async fn handle_key_event(
         return Ok(None);
     }
     if key.code == KeyCode::PageDown {
-        app.auto_scroll = false;
         app.scroll_offset = app.scroll_offset.saturating_add(10);
         return Ok(None);
     }
@@ -663,20 +667,13 @@ async fn handle_cli_only_command(
         format_settings_text, format_stats_text,
     };
 
-    if agent_busy.load(Ordering::Relaxed) {
-        let busy_cmds = [
-            CliOnlyCommand::Exit,
-            CliOnlyCommand::Quit,
-            CliOnlyCommand::Clear,
-            CliOnlyCommand::History,
-        ];
-        if !busy_cmds.contains(&cli_cmd) {
-            app.push_styled(
-                "Agent is busy. Wait for it to finish before running this command.",
-                Style::default().fg(Color::Yellow),
-            );
-            return Ok(false);
-        }
+    // Local commands execute immediately; only agent-required commands are blocked
+    if agent_busy.load(Ordering::Relaxed) && !cli_cmd.is_local_command() {
+        app.push_styled(
+            "Agent is busy. Wait for it to finish before running this command.",
+            Style::default().fg(Color::Yellow),
+        );
+        return Ok(false);
     }
 
     match cli_cmd {
@@ -773,6 +770,32 @@ async fn handle_cli_only_command(
             let state = sh.lock().await;
             let changes = format_changes_text(&state);
             app.push_plain(changes);
+        }
+        CliOnlyCommand::Queue => {
+            let sess = session.lock().await;
+            if let Some(qh) = sess.message_queue_handle() {
+                let count = qh.queued_message_count().await;
+                if count == 0 {
+                    app.push_plain("No messages queued.");
+                } else {
+                    app.push_plain(format!("{} message(s) queued:", count));
+                    // Show queue preview (first few messages)
+                    let messages = qh.peek_queued_messages(3).await;
+                    for (i, msg) in messages.iter().enumerate() {
+                        let preview = if msg.len() > 60 {
+                            format!("{}...", &msg[..60])
+                        } else {
+                            msg.clone()
+                        };
+                        app.push_plain(format!("  {}. {}", i + 1, preview));
+                    }
+                    if count > 3 {
+                        app.push_plain(format!("  ... and {} more", count - 3));
+                    }
+                }
+            } else {
+                app.push_plain("No message queue available.");
+            }
         }
         CliOnlyCommand::Undo | CliOnlyCommand::CheckpointUndo => {
             let sess = session.lock().await;
@@ -1265,24 +1288,47 @@ async fn run_main_loop(
                                 if let Some(cli_cmd) =
                                     crate::cli::slash_commands::get_cli_only_command(&text)
                                 {
-                                    let should_exit = handle_cli_only_command(
-                                        cli_cmd,
-                                        &text,
-                                        app,
-                                        &session,
-                                        &task_id,
-                                        &agent_busy,
-                                        &agent_start_time,
-                                        &agent_task,
-                                        &state_handle,
-                                        task_opts,
-                                        auto_approve,
-                                    )
-                                    .await?;
-                                    if should_exit {
-                                        return Ok(());
+                                    // Local commands execute immediately even when agent is busy
+                                    if cli_cmd.is_local_command() {
+                                        let should_exit = handle_cli_only_command(
+                                            cli_cmd,
+                                            &text,
+                                            app,
+                                            &session,
+                                            &task_id,
+                                            &agent_busy,
+                                            &agent_start_time,
+                                            &agent_task,
+                                            &state_handle,
+                                            task_opts,
+                                            auto_approve,
+                                        )
+                                        .await?;
+                                        if should_exit {
+                                            return Ok(());
+                                        }
+                                        continue;
                                     }
-                                    continue;
+
+                                    // Agent-required commands: check if agent is busy
+                                    if agent_busy.load(Ordering::Relaxed)
+                                        && cli_cmd.requires_agent_idle()
+                                    {
+                                        // Queue the command
+                                        if let Some(qh) = queue_handle.lock().await.as_ref() {
+                                            qh.enqueue_text_message(text.clone()).await;
+                                            let count = qh.queued_message_count().await;
+                                            app.push_user_message(&text);
+                                            app.push_styled(
+                                                format!(
+                                                    "Command queued ({} in queue): {}",
+                                                    count, text
+                                                ),
+                                                Style::default().add_modifier(Modifier::DIM),
+                                            );
+                                        }
+                                        continue;
+                                    }
                                 }
 
                                 // Process model-side slash commands (e.g., /compact, /plan)

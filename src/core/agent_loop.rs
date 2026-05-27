@@ -328,6 +328,21 @@ impl MessageQueueHandle {
     pub async fn has_queued_messages(&self) -> bool {
         !self.queue.lock().await.is_empty()
     }
+
+    pub async fn peek_queued_messages(&self, limit: usize) -> Vec<String> {
+        let queue = self.queue.lock().await;
+        queue
+            .iter()
+            .take(limit)
+            .filter_map(|msg| {
+                if let MessageContent::Text(text) = &msg.content {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// The core agent loop that orchestrates provider requests, stream handling,
@@ -1387,7 +1402,7 @@ impl AgentLoop {
 
         // Emit assistant turn indicator
         self.config.output_writer.emit(OutputEvent::styled(
-            "✦ ",
+            "♦ ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

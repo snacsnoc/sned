@@ -254,6 +254,7 @@ pub enum CliOnlyCommand {
     Expand,
     Changes,
     HelpOption(String),
+    Queue,
 }
 
 impl CliOnlyCommand {
@@ -279,6 +280,7 @@ impl CliOnlyCommand {
             "checkpoint-undo" | "checkpoint undo" => Some(CliOnlyCommand::CheckpointUndo),
             "expand" => Some(CliOnlyCommand::Expand),
             "changes" => Some(CliOnlyCommand::Changes),
+            "queue" => Some(CliOnlyCommand::Queue),
             _ => None,
         }
     }
@@ -300,6 +302,41 @@ impl CliOnlyCommand {
 
     pub fn is_reset_compact(&self) -> bool {
         matches!(self, CliOnlyCommand::ResetCompact)
+    }
+
+    /// Returns true if this command can execute locally without the agent.
+    pub fn is_local_command(&self) -> bool {
+        matches!(
+            self,
+            CliOnlyCommand::Exit
+                | CliOnlyCommand::Quit
+                | CliOnlyCommand::Clear
+                | CliOnlyCommand::History
+                | CliOnlyCommand::Skills
+                | CliOnlyCommand::Help
+                | CliOnlyCommand::HelpOption(_)
+                | CliOnlyCommand::Settings
+                | CliOnlyCommand::Models
+                | CliOnlyCommand::ResetCompact
+                | CliOnlyCommand::Stats
+                | CliOnlyCommand::Expand
+                | CliOnlyCommand::Changes
+                | CliOnlyCommand::Queue
+        )
+    }
+
+    /// Returns true if this command requires the agent to be idle.
+    pub fn requires_agent_idle(&self) -> bool {
+        matches!(
+            self,
+            CliOnlyCommand::Undo
+                | CliOnlyCommand::Diff
+                | CliOnlyCommand::Log
+                | CliOnlyCommand::Commit
+                | CliOnlyCommand::CheckpointList
+                | CliOnlyCommand::CheckpointRestore
+                | CliOnlyCommand::CheckpointUndo
+        )
     }
 }
 
@@ -731,6 +768,26 @@ pub fn format_help_text() -> String {
     s.push_str(&format!("  {}{}{}  - {}Undo last turn using checkpoint (reverts files + trims history, alias: /checkpoint-undo) {}{}{}\n\n", style::CYAN, "/checkpoint undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
 
     s.push_str(&format!(
+        "{}{}Queue Management:{}\n",
+        style::BOLD,
+        style::CYAN,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "{}─────────────────────────────{}\n",
+        style::DIM,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Show pending queued messages{}\n\n",
+        style::CYAN,
+        "/queue",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+
+    s.push_str(&format!(
         "{}{}Keyboard Shortcuts:{}\n",
         style::BOLD,
         style::CYAN,
@@ -1141,6 +1198,17 @@ Use when:
   - Complete undo of last action
   - Both file and history rollback needed
   - More thorough than /undo alone"#
+        }
+
+        "queue" => {
+            r#"Shows pending queued messages waiting for the agent to become idle.
+
+Use when:
+  - Agent is busy and you've queued commands
+  - Want to review what's waiting to execute
+  - Checking queue order and count
+
+Note: Local commands (/help, /stats, etc.) execute immediately even when the agent is busy."#
         }
 
         _ => &format!(

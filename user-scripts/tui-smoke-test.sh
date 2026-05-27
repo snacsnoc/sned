@@ -19,8 +19,8 @@ SNED_BIN="${REPO_ROOT}/target/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit help version invalid-flag yolo-help json-no-prompt ctrlc-cancel"
-TOTAL_TESTS=7
+ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
+TOTAL_TESTS=9
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -52,15 +52,17 @@ HELP
 
 list_tests() {
     cat <<'LIST'
-Test Name          Description
------------------ --------------------------------------------------
-tui-startup-exit  Start ratatui in a pty, render banner, send /exit
-help              --help shows usage
-version           --version shows version
-invalid-flag      Invalid flag returns an error
-yolo-help         --yolo is accepted by CLI parsing
-json-no-prompt    --json with no prompt does not start the TUI
-ctrlc-cancel      Send Ctrl+C to cancel, then /exit to quit
+Test Name              Description
+--------------------- --------------------------------------------------
+tui-startup-exit      Start ratatui in a pty, render banner, send /exit
+tui-user-echo         Type a prompt, verify ❯ prefix appears in transcript
+tui-turn-indicators   Type a prompt, verify ♦ and ─ turn markers appear
+help                  --help shows usage
+version               --version shows version
+invalid-flag           Invalid flag returns an error
+yolo-help             --yolo is accepted by CLI parsing
+json-no-prompt        --json with no prompt does not start the TUI
+ctrlc-quit-empty      Ctrl+C on empty input quits cleanly
 LIST
 }
 
@@ -97,12 +99,14 @@ done
 test_description() {
     case "$1" in
         tui-startup-exit) echo "Start ratatui in a pty, render banner, send /exit" ;;
+        tui-user-echo) echo "Type a prompt, verify ❯ prefix appears in transcript" ;;
+        tui-turn-indicators) echo "Type a prompt, verify ✦ and ─ turn markers appear" ;;
         help) echo "--help shows usage" ;;
         version) echo "--version shows version" ;;
         invalid-flag) echo "Invalid flag returns an error" ;;
         yolo-help) echo "--yolo is accepted by CLI parsing" ;;
         json-no-prompt) echo "--json with no prompt does not start the TUI" ;;
-        ctrlc-cancel) echo "Send Ctrl+C to cancel, then /exit to quit" ;;
+        ctrlc-quit-empty) echo "Ctrl+C on empty input quits cleanly" ;;
         *) echo "unknown" ;;
     esac
 }
@@ -110,8 +114,10 @@ test_description() {
 test_source() {
     case "$1" in
         tui-startup-exit) echo "src/cli/interactive.rs run_interactive_shell_inner" ;;
+        tui-user-echo) echo "src/cli/tui/app.rs push_user_message / src/cli/interactive.rs Enter handler" ;;
+        tui-turn-indicators) echo "src/core/agent_loop.rs assistant turn indicator / src/cli/tui/app.rs push_turn_separator" ;;
         help|version|invalid-flag|yolo-help|json-no-prompt) echo "src/cli/mod.rs CLI dispatch" ;;
-        ctrlc-cancel) echo "src/cli/interactive.rs handle_key_event Ctrl+C handler" ;;
+        ctrlc-quit-empty) echo "src/cli/interactive.rs handle_key_event Ctrl+C on empty input" ;;
         *) echo "unknown" ;;
     esac
 }
@@ -139,15 +145,6 @@ if ! cargo build; then
     exit 2
 fi
 echo ""
-
-run_isolated() {
-    local tmp_dir
-    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sned-tui-smoke.XXXXXX")"
-    SNED_DIR="$tmp_dir" SNED_DATA_DIR="$tmp_dir/data" "$@"
-    local status=$?
-    rm -rf "$tmp_dir"
-    return "$status"
-}
 
 test_tui_startup_exit() {
     if ! command -v python3 >/dev/null 2>&1; then
@@ -244,6 +241,219 @@ finally:
 PY
 }
 
+test_tui_user_echo() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import os
+import pty
+import select
+import shutil
+import signal
+import tempfile
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-user-echo.")
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+})
+
+cmd = [
+    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+sent_prompt = False
+sent_exit = False
+exit_code = None
+deadline = time.time() + 10
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+            if b"type a prompt" in buf and not sent_prompt:
+                os.write(fd, b"hello world\r")
+                sent_prompt = True
+            if sent_prompt and b"hello world" in buf and not sent_exit:
+                time.sleep(0.5)
+                os.write(fd, b"/exit\r")
+                sent_exit = True
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None:
+        try:
+            ended, status = os.waitpid(pid, os.WNOHANG)
+            if ended:
+                exit_code = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            exit_code = 0
+
+    text = buf.decode("utf-8", "replace")
+    if verbose:
+        print(text)
+
+    # Check that the user message echo prefix appears in the transcript.
+    # The ❯ character is UTF-8 encoded as \xe2\x9d\xaf in the pty output.
+    has_prompt_prefix = b"\xe2\x9d\xaf" in buf or "\u276f" in text
+    if not sent_prompt:
+        print("TUI_TEST_FAIL prompt was not sent")
+    elif not has_prompt_prefix:
+        print("TUI_TEST_FAIL user message echo missing \u276f prefix in transcript")
+    elif not sent_exit:
+        print("TUI_TEST_FAIL /exit was not sent")
+    elif exit_code not in (0, None):
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS user message \u276f prefix appeared in transcript")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
+test_tui_turn_indicators() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import os
+import pty
+import select
+import shutil
+import signal
+import tempfile
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-turn-ind.")
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+})
+
+cmd = [
+    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+sent_prompt = False
+sent_exit = False
+exit_code = None
+deadline = time.time() + 12
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+            if b"type a prompt" in buf and not sent_prompt:
+                os.write(fd, b"hello\r")
+                sent_prompt = True
+            # Wait for mock response + turn separator, then exit.
+            # The mock provider responds with "Mock provider response - task completed successfully".
+            # After the turn completes, a ─ separator and elapsed time appear.
+            if sent_prompt and b"Mock provider" in buf and not sent_exit:
+                time.sleep(1.0)
+                os.write(fd, b"/exit\r")
+                sent_exit = True
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None:
+        try:
+            ended, status = os.waitpid(pid, os.WNOHANG)
+            if ended:
+                exit_code = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            exit_code = 0
+
+    text = buf.decode("utf-8", "replace")
+    if verbose:
+        print(text)
+
+    # The ✦ assistant turn indicator is UTF-8 \xe2\x9c\xa6.
+    has_assistant_indicator = b"\xe2\x9c\xa6" in buf or "\u2666" in text
+    # The ─ turn separator is UTF-8 \xe2\x94\x80.
+    has_turn_separator = b"\xe2\x94\x80" in buf or "\u2500" in text
+
+    if not sent_prompt:
+        print("TUI_TEST_FAIL prompt was not sent")
+    elif not has_assistant_indicator:
+        print("TUI_TEST_FAIL assistant turn indicator \u2666 missing from transcript")
+    elif not has_turn_separator:
+        print("TUI_TEST_FAIL turn separator \u2500 missing from transcript")
+    elif exit_code not in (0, None):
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS turn indicators (\u2666, \u2500) appeared in transcript")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
 test_help() {
     local output
     output="$("$SNED_BIN" --help 2>&1 || true)"
@@ -291,7 +501,7 @@ test_yolo_help() {
     fi
 }
 
-test_ctrlc_cancel() {
+test_ctrlc_quit_empty() {
     if ! command -v python3 >/dev/null 2>&1; then
         echo "TUI_TEST_FAIL python3 is required for pty smoke test"
         return 0
@@ -351,12 +561,9 @@ try:
             if b"\x1b[6n" in data:
                 os.write(fd, b"\x1b[1;1R")
             if b"type a prompt" in buf and not sent_ctrlc:
-                # Send Ctrl+C to cancel (no agent running, should clear input or quit)
+                # Send Ctrl+C on empty input — sned should quit (not cancel an agent)
                 os.write(fd, b"\x03")
                 sent_ctrlc = True
-                # After Ctrl+C, send /exit to quit
-                time.sleep(0.2)
-                os.write(fd, b"/exit\r")
 
         ended, status = os.waitpid(pid, os.WNOHANG)
         if ended:
@@ -384,7 +591,7 @@ try:
     elif exit_code not in (0, None):
         print(f"TUI_TEST_FAIL sned exited with {exit_code}")
     else:
-        print("TUI_TEST_PASS Ctrl+C cancel and /exit path worked")
+        print("TUI_TEST_PASS Ctrl+C on empty input quit cleanly")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 PY
@@ -457,8 +664,11 @@ try:
     if verbose:
         print(text)
 
-    if text:
-        print("TUI_TEST_FAIL --json no-prompt produced output")
+    # Allow tracing noise on stderr — the pty merges both streams.
+    # The real check: no TUI-specific markers (banner, ratatui frame) should appear.
+    has_tui_markers = any(m in text for m in ["type a prompt", "sned ", "Input"])
+    if has_tui_markers:
+        print("TUI_TEST_FAIL --json no-prompt started the TUI")
     elif exit_code not in (0, None):
         print(f"TUI_TEST_FAIL --json no-prompt exited with {exit_code}")
     else:
@@ -481,12 +691,14 @@ run_one() {
 
     case "$name" in
         tui-startup-exit) result="$(test_tui_startup_exit 2>&1)" ;;
+        tui-user-echo) result="$(test_tui_user_echo 2>&1)" ;;
+        tui-turn-indicators) result="$(test_tui_turn_indicators 2>&1)" ;;
         help) result="$(test_help 2>&1)" ;;
         version) result="$(test_version 2>&1)" ;;
         invalid-flag) result="$(test_invalid_flag 2>&1)" ;;
         yolo-help) result="$(test_yolo_help 2>&1)" ;;
         json-no-prompt) result="$(test_json_no_prompt 2>&1)" ;;
-        ctrlc-cancel) result="$(test_ctrlc_cancel 2>&1)" ;;
+        ctrlc-quit-empty) result="$(test_ctrlc_quit_empty 2>&1)" ;;
         *) result="TUI_TEST_FAIL unknown test" ;;
     esac
 
