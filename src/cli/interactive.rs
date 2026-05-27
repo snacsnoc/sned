@@ -470,6 +470,12 @@ async fn handle_key_event(
 
     // Ctrl+C handling
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Dismiss picker first if active
+        if app.picker_active {
+            app.picker_active = false;
+            app.picker_results.clear();
+            return Ok(None);
+        }
         if agent_busy.load(Ordering::Relaxed) {
             // Cancel agent
             cancel_agent(state_handle, agent_task, agent_done).await?;
@@ -487,17 +493,21 @@ async fn handle_key_event(
 
     // Tab or Enter with active file picker -> insert selection (must come before Enter handler)
     if app.picker_active && !app.picker_results.is_empty() && (key.code == KeyCode::Tab || key.code == KeyCode::Enter) {
-        let result = &app.picker_results[app.picker_index];
-        let text = app.input.lines().join("");
+        let text = app.input.lines().join("\n");
         let mq = crate::core::file_search::extract_mention_query(&text);
         if mq.in_mention_mode {
+            let result = &app.picker_results[app.picker_index];
             let new_text =
                 crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
             app.input = App::new_textarea(vec![new_text]);
             app.picker_active = false;
             app.picker_results.clear();
+            return Ok(None);
         }
-        return Ok(None);
+        // Picker active but mention mode lost — dismiss picker and fall through
+        app.picker_active = false;
+        app.picker_results.clear();
+        // Fall through to normal Enter/Tab handling
     }
 
     // Enter key - intercept before passing to textarea
@@ -546,14 +556,14 @@ async fn handle_key_event(
         }
     }
 
-    // Up/Down for command history navigation
-    if key.code == KeyCode::Up && app.input.cursor().0 == 0 && app.input.cursor().1 == 0 {
+    // Up/Down for command history navigation (only when picker is not active)
+    if key.code == KeyCode::Up && !app.picker_active && app.input.cursor().0 == 0 && app.input.cursor().1 == 0 {
         if let Some(entry) = app.history.navigate_up() {
             app.input = App::new_textarea(vec![entry.to_string()]);
         }
         return Ok(None);
     }
-    if key.code == KeyCode::Down && app.history.is_navigating() {
+    if key.code == KeyCode::Down && !app.picker_active && app.history.is_navigating() {
         if let Some(entry) = app.history.navigate_down() {
             app.input = App::new_textarea(vec![entry.to_string()]);
         } else {
@@ -574,12 +584,19 @@ async fn handle_key_event(
         }
     }
 
+    // Escape key - dismiss picker or clear input mode
+    if key.code == KeyCode::Esc && app.picker_active {
+        app.picker_active = false;
+        app.picker_results.clear();
+        return Ok(None);
+    }
+
     // All other keys go to textarea
     use tui_textarea::Input;
     app.input.input(Input::from(key));
 
     // Check for @ mention mode - show file picker overlay
-    let input_text = app.input.lines().join("");
+    let input_text = app.input.lines().join("\n");
     let mq = crate::core::file_search::extract_mention_query(&input_text);
     if mq.in_mention_mode && !app.cwd.is_empty() {
         let query = mq.query.clone();
