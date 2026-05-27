@@ -1209,6 +1209,7 @@ async fn run_main_loop(
                     // Approval prompt: route y/n/a to approval channel
                     if is_approval_prompt_active() {
                         if let Some(sender) = take_approval_sender() {
+                            let prompt_lines = app.output_lines.len();
                             let result = match key.code {
                                 KeyCode::Char('y' | 'Y') => ApprovalResult::Approved,
                                 KeyCode::Char('n' | 'N') => ApprovalResult::Denied,
@@ -1220,6 +1221,7 @@ async fn run_main_loop(
                                 }
                             };
                             let _ = sender.send(result);
+                            app.output_lines.truncate(prompt_lines);
                         }
                         continue;
                     }
