@@ -4573,7 +4573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_approval_manager_non_interactive_auto_approves() {
+    async fn test_approval_manager_non_interactive_denies_by_default() {
         use crate::core::approval::ApprovalManager;
         use crate::core::tools::ToolRegistry;
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
@@ -4613,13 +4613,13 @@ mod tests {
             .with_tools(Arc::new(registry))
             .with_approval_manager(approval_manager);
 
-        // Execute one turn - in non-interactive mode (tests), execute_command should be auto-approved
+        // Execute one turn - in non-interactive mode (tests), tools should be DENIED by default (F-01 fix)
         let result = agent.execute_turn().await;
 
-        // Should continue (tool result needs to be sent back to provider)
+        // Should continue (tool result needs to be added to history)
         assert!(
             matches!(result, TurnResult::Continue),
-            "Expected Continue after tool execution, got {:?}",
+            "Expected Continue after tool denial, got {:?}",
             result
         );
 
@@ -4633,17 +4633,17 @@ mod tests {
         // Last message should be tool result
         if let Some(last) = history.last() {
             assert_eq!(last.role, MessageRole::User);
-            // In non-interactive mode, the command should execute (not be denied)
+            // In non-interactive mode, the command should be DENIED (F-01 security fix)
             if let MessageContent::UserBlocks(blocks) = &last.content {
                 if let Some(UserContentBlock::ToolResult(result)) = blocks.first() {
                     let content_text = match &result.content {
                         ToolResultContent::Text(t) => t.clone(),
                         _ => String::new(),
                     };
-                    // Should NOT be a denial message
+                    // Should BE a denial message (F-01: non-interactive stdin denies by default)
                     assert!(
-                        !content_text.contains("was denied by user"),
-                        "Tool should not be denied in non-interactive mode: {}",
+                        content_text.contains("was denied by user"),
+                        "Tool should be denied in non-interactive mode (F-01): {}",
                         content_text
                     );
                 } else {

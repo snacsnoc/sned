@@ -1610,10 +1610,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_with_approval_manager_non_interactive_auto_approves() {
+    async fn test_edit_with_approval_manager_yolo_mode() {
         let _guard = TEST_MUTEX.lock().await;
+        // Yolo mode should skip approval prompts
         let approval_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::core::approval::ApprovalManager::new(),
+            crate::core::approval::ApprovalManager::new().with_yolo(true),
         ));
         let handler = EditFileHandler::new().with_approval_manager(approval_mgr.clone());
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
@@ -1622,7 +1623,7 @@ mod tests {
         let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
             .take(8)
             .collect();
-        let file_path = temp_dir.join(format!("test_non_interactive_edit_{}.txt", rand_suffix));
+        let file_path = temp_dir.join(format!("test_yolo_edit_{}.txt", rand_suffix));
         let raw_content = "Hello World\nThis is a test\n";
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
@@ -1665,13 +1666,13 @@ mod tests {
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
             result.is_ok(),
-            "Edit should auto-approve in non-interactive mode"
+            "Edit should succeed in yolo mode"
         );
         let result_text = result.unwrap();
         let result_str = result_text.as_str().unwrap();
         assert!(
             result_str.contains("Goodbye World"),
-            "Edit should be applied after auto-approval"
+            "Edit should be applied in yolo mode"
         );
 
         let _ = tokio::fs::remove_file(&file_path).await;
