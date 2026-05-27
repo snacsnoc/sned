@@ -2235,10 +2235,17 @@ impl AgentLoop {
                                 self.deps.approval_manager
                             {
                                 let mgr = approval_mgr.lock().await;
-                                if action_paths
-                                    .iter()
-                                    .any(|p| mgr.should_prompt_with_path(tool, Some(p.as_str())))
-                                {
+                                // Check if any action paths require prompting
+                                let needs_prompt = if action_paths.is_empty() {
+                                    // No paths (e.g., execute_command): check tool-level approval
+                                    mgr.should_prompt(tool)
+                                } else {
+                                    // Has paths: check per-path approval
+                                    action_paths
+                                        .iter()
+                                        .any(|p| mgr.should_prompt_with_path(tool, Some(p.as_str())))
+                                };
+                                if needs_prompt {
                                     drop(mgr); // Drop lock before async call
                                     user_prompted = true;
                                     match crate::core::approval::prompt_for_approval_async(
