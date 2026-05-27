@@ -1655,27 +1655,6 @@ impl AgentLoop {
                     if let Some(cost) = usage_chunk.total_cost {
                         state.cumulative_cost += cost;
                     }
-
-                    // Display compact token usage after receiving usage data
-                    if !self.config.json_output {
-                        let total_tokens = tokens_in + tokens_out;
-                        let cost = usage_chunk.total_cost.unwrap_or(0.0);
-                        self.config.output_writer.emit(OutputEvent::dim(format!(
-                            "  📊 {} tokens{} | ${:.4} | {:.0}% context",
-                            if total_tokens >= 1000 {
-                                format!("{:.1}K", total_tokens as f64 / 1000.0)
-                            } else {
-                                total_tokens.to_string()
-                            },
-                            if usage_chunk.reasoning_tokens.unwrap_or(0) > 0 {
-                                format!(" ({} reasoning)", usage_chunk.reasoning_tokens.unwrap())
-                            } else {
-                                String::new()
-                            },
-                            cost,
-                            context_usage_pct
-                        )));
-                    }
                 }
                 ApiStreamChunk::ToolCalls(tool_chunk) => {
                     // Print separator when first tool call is detected
