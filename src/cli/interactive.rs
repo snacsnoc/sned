@@ -1214,11 +1214,14 @@ async fn run_main_loop(
                                 KeyCode::Char('n' | 'N') => ApprovalResult::Denied,
                                 KeyCode::Char('a' | 'A') => ApprovalResult::Always,
                                 KeyCode::Esc => ApprovalResult::Denied,
-                                _ => return Ok(()),
+                                _ => {
+                                    // Ignore unrecognized keys; keep waiting
+                                    continue;
+                                }
                             };
                             let _ = sender.send(result);
                         }
-                        return Ok(());
+                        continue;
                     }
                     if let Some(action) = handle_key_event(
                         key,

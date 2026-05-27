@@ -734,9 +734,13 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
 static APPROVAL_SENDER: LazyLock<Mutex<Option<std::sync::mpsc::Sender<ApprovalResult>>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// Store the sender for an approval response.
+/// Store the sender for an approval response. If a sender is already pending,
+/// drain it first so its receiver gets a closed signal.
 pub fn set_approval_sender(sender: std::sync::mpsc::Sender<ApprovalResult>) {
     let mut guard = APPROVAL_SENDER.lock();
+    if let Some(old) = guard.take() {
+        drop(old);
+    }
     *guard = Some(sender);
 }
 

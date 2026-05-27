@@ -1865,12 +1865,25 @@ impl AgentLoop {
             return TurnResult::Error(actionable.display());
         }
 
-        // If stream errored mid-response, discard partial content and return error
+        // If stream errored mid-response, note the partial content in the error
         if stream_errored {
-            return TurnResult::Error(
-                "Provider stream error - partial response discarded. Retry the request."
-                    .to_string(),
-            );
+            let partial_note = if !accumulated_text.is_empty() || !accumulated_reasoning.is_empty() {
+                format!(
+                    " (partial response of {} text chars{} discarded)",
+                    accumulated_text.len(),
+                    if !accumulated_reasoning.is_empty() {
+                        format!(" + {} reasoning chars", accumulated_reasoning.len())
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                String::new()
+            };
+            return TurnResult::Error(format!(
+                "Provider stream error{} - retry the request.",
+                partial_note
+            ));
         }
 
         if !snipped_blocks_this_turn.is_empty() {
