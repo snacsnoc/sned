@@ -1215,6 +1215,7 @@ async fn run_main_loop(
                             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                                 let _ = sender.send(ApprovalResult::Denied);
                                 app.output_lines.truncate(prompt_lines);
+                                app.auto_scroll = true;
                                 cancel_agent(&state_handle, &agent_task, &agent_done).await?;
                                 app.push_plain("^C");
                                 app.agent_busy = false;
@@ -1234,6 +1235,7 @@ async fn run_main_loop(
                             };
                             let _ = sender.send(result);
                             app.output_lines.truncate(prompt_lines);
+                            app.auto_scroll = true;
                         }
                         continue;
                     }

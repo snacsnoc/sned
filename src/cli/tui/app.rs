@@ -178,7 +178,8 @@ impl App {
         self.scrollbar_state = self
             .scrollbar_state
             .content_length(total_lines)
-            .viewport_content_length(visible_height);
+            .viewport_content_length(visible_height)
+            .position(scroll_y as usize);
         frame.render_stateful_widget(
             Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
