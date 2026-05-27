@@ -518,6 +518,8 @@ impl ApprovalManager {
     }
 
     /// Check whether a path is local (within the workspace root).
+    /// SECURITY (F-04): For non-existent paths, canonicalize the parent directory
+    /// to detect symlink escapes even when the target file doesn't exist yet.
     fn is_path_local(&self, path: &str) -> bool {
         if let Some(ref root) = self.workspace_root {
             let p = Path::new(path);
@@ -546,16 +548,29 @@ impl ApprovalManager {
                 }
             }
 
-            // Canonicalize to resolve symlinks (if path exists)
-            if normalized_path.exists()
-                && let Ok(canonical) = std::fs::canonicalize(&normalized_path)
-            {
-                let canonical_root = std::fs::canonicalize(&normalized_root)
-                    .unwrap_or_else(|_| normalized_root.clone());
-                return canonical.starts_with(&canonical_root);
-            }
+            // Canonicalize to resolve symlinks
+            // F-04 fix: For non-existent paths, canonicalize the parent directory
+            let canonical_path = if normalized_path.exists() {
+                std::fs::canonicalize(&normalized_path).unwrap_or_else(|_| normalized_path.clone())
+            } else {
+                // Path doesn't exist - canonicalize parent directory
+                normalized_path
+                    .parent()
+                    .and_then(|parent| {
+                        if parent.exists() {
+                            std::fs::canonicalize(parent).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .map(|canonical_parent| canonical_parent.join(normalized_path.file_name().unwrap_or_default()))
+                    .unwrap_or_else(|| normalized_path.clone())
+            };
 
-            normalized_path.starts_with(&normalized_root)
+            let canonical_root = std::fs::canonicalize(&normalized_root)
+                .unwrap_or_else(|_| normalized_root.clone());
+
+            canonical_path.starts_with(&canonical_root)
         } else {
             false
         }
@@ -1391,6 +1406,45 @@ mod tests {
                 Some("/home/user/project/src/main.rs"),
             )
         );
+    }
+
+    #[test]
+    fn test_is_path_local_canonicalizes_non_existent_paths() {
+        // SECURITY TEST (F-04): Non-existent paths should have their parent
+        // directory canonicalized to detect symlink escapes.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        
+        // Create workspace root
+        let workspace = temp_dir.path().join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        
+        // Create a directory outside workspace
+        let external_dir = temp_dir.path().join("external");
+        fs::create_dir(&external_dir).expect("create external dir");
+        
+        // Create a symlink INSIDE workspace that points OUTSIDE
+        let symlink_in_workspace = workspace.join("escape_symlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external_dir, &symlink_in_workspace).expect("create symlink");
+
+        // Non-existent file via the escape symlink (should be detected as external)
+        let non_existent_via_symlink = symlink_in_workspace.join("secret.txt");
+
+        let manager = ApprovalManager::new()
+            .with_workspace_root(workspace.to_string_lossy().to_string());
+
+        // The non-existent file via escape symlink should NOT be considered local
+        // because the symlink resolves outside the workspace root
+        #[cfg(unix)]
+        assert!(!manager.is_path_local(&non_existent_via_symlink.to_string_lossy()));
+        
+        // A normal non-existent file inside workspace SHOULD be local
+        let normal_non_existent = workspace.join("new_file.txt");
+        #[cfg(unix)]
+        assert!(manager.is_path_local(&normal_non_existent.to_string_lossy()));
     }
 
     #[test]
