@@ -147,20 +147,10 @@ impl App {
         } else {
             Line::from(" Input ")
         };
-        let mut input_block = theme::input_block(input_title, self.agent_busy);
-        // Add right-aligned cwd (truncated to fit)
-        if !self.cwd.is_empty() {
-            let cwd_display = if self.cwd.len() > 30 {
-                format!("...{}", &self.cwd[self.cwd.len() - 27..])
-            } else {
-                self.cwd.clone()
-            };
-            input_block = input_block.title(Line::from(cwd_display).right_aligned());
-        }
-        self.input.set_block(input_block);
+        self.input.set_block(theme::input_block(input_title, self.agent_busy));
 
         // Output pane with themed border and padding
-        let visible_height = output_area.height as usize;
+        let visible_height = output_area.height.saturating_sub(2) as usize; // subtract border top/bottom
         let total_lines = self.output_lines.len();
         let scroll_y = if self.auto_scroll {
             total_lines.saturating_sub(visible_height) as u16
@@ -173,11 +163,11 @@ impl App {
             .scroll((scroll_y, 0))
             .block(
                 theme::border_block(" sned ")
-                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
+                    .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
             );
         frame.render_widget(output, output_area);
 
-        // Scrollbar on output pane
+        // Scrollbar on output pane (render inside the border)
         self.scrollbar_state = self
             .scrollbar_state
             .content_length(total_lines)
@@ -190,7 +180,7 @@ impl App {
                 .style(theme::scrollbar_style())
                 .thumb_style(theme::scrollbar_thumb_style()),
             output_area.inner(ratatui::layout::Margin {
-                horizontal: 1,
+                horizontal: 0,
                 vertical: 1,
             }),
             &mut self.scrollbar_state.clone(),
@@ -203,25 +193,18 @@ impl App {
         );
         let status_right = if let Some(elapsed) = self.elapsed {
             format!("⏱ {} ", format_duration(elapsed))
-        } else if !self.cwd.is_empty() {
-            let cwd_display = if self.cwd.len() > 40 {
-                format!("...{}", &self.cwd[self.cwd.len() - 37..])
-            } else {
-                self.cwd.clone()
-            };
-            format!(" {} ", cwd_display)
         } else {
             String::new()
         };
         let spacer_len = status_area
             .width
-            .saturating_sub((status_left.len() + status_right.len()) as u16);
-        let status = Paragraph::new(Line::from(vec![
+            .saturating_sub((status_left.len() + status_right.len()) as u16) as usize;
+        let status_line = Line::from(vec![
             Span::styled(status_left, theme::status_style()),
-            Span::raw(" ".repeat(spacer_len as usize)),
+            Span::raw(" ".repeat(spacer_len)),
             Span::styled(status_right, theme::status_style()),
-        ]))
-        .style(theme::status_style());
+        ]);
+        let status = Paragraph::new(status_line);
         frame.render_widget(status, status_area);
 
         // Input pane

@@ -6,17 +6,14 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders};
 
-/// Border color - subtle dark gray that doesn't compete with content.
-pub const BORDER_FG: Color = Color::DarkGray;
+/// Border color - visible on dark terminals.
+pub const BORDER_FG: Color = Color::Gray;
 
 /// Accent color for active states (spinner, busy borders).
 pub const ACCENT: Color = Color::Cyan;
 
-/// Status bar background.
-pub const STATUS_BG: Color = Color::DarkGray;
-
-/// Status bar foreground.
-pub const STATUS_FG: Color = Color::White;
+/// Status bar foreground (dim for subtle appearance).
+pub const STATUS_FG: Color = Color::DarkGray;
 
 /// Prompt echo color (user input confirmation).
 pub const PROMPT_FG: Color = Color::Green;
@@ -92,7 +89,7 @@ pub fn overlay_block(title: impl Into<String>) -> Block<'static> {
 
 /// Style for status bar text.
 pub fn status_style() -> Style {
-    Style::default().fg(STATUS_FG).bg(STATUS_BG)
+    Style::default().fg(STATUS_FG)
 }
 
 /// Style for dim text (hints, metadata).
@@ -118,12 +115,12 @@ pub fn picker_selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Style for scrollbar.
+/// Style for scrollbar track.
 pub fn scrollbar_style() -> Style {
-    Style::default().fg(BORDER_FG)
+    Style::default().fg(Color::DarkGray)
 }
 
 /// Style for scrollbar thumb (the movable part).
 pub fn scrollbar_thumb_style() -> Style {
-    Style::default().fg(ACCENT)
+    Style::default().fg(BORDER_FG)
 }
