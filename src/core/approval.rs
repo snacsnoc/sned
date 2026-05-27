@@ -728,6 +728,16 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
     }
 }
 
+/// RAII guard that resets the approval prompt flag on drop.
+/// Ensures `set_approval_prompt_active(false)` runs even on early return.
+struct ApprovalPromptGuard;
+
+impl Drop for ApprovalPromptGuard {
+    fn drop(&mut self) {
+        set_approval_prompt_active(false);
+    }
+}
+
 /// Channel sender for approval responses. The prompt function creates
 /// a channel, stores the sender here, and blocks on the receiver. The
 /// TUI loop reads the key event and sends the result through this sender.
@@ -781,12 +791,12 @@ pub fn prompt_for_approval(
     let (sender, receiver) = std::sync::mpsc::channel();
     set_approval_sender(sender);
     set_approval_prompt_active(true);
+    let _guard = ApprovalPromptGuard;
 
     let result = receiver
         .recv()
         .map_err(|_| io::Error::other("approval channel closed"))?;
 
-    set_approval_prompt_active(false);
     Ok(result)
 }
 
@@ -910,12 +920,12 @@ pub async fn prompt_for_combined_approval(
         let (sender, receiver) = std::sync::mpsc::channel();
         set_approval_sender(sender);
         set_approval_prompt_active(true);
+        let _guard = ApprovalPromptGuard;
 
         let result = receiver
             .recv()
             .map_err(|_| io::Error::other("approval channel closed"))?;
 
-        set_approval_prompt_active(false);
         Ok(result)
     })
     .await

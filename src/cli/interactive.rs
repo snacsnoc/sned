@@ -1210,13 +1210,25 @@ async fn run_main_loop(
                     if is_approval_prompt_active() {
                         if let Some(sender) = take_approval_sender() {
                             let prompt_lines = app.output_lines.len();
+
+                            // Ctrl+C during approval: deny, cancel agent
+                            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                                let _ = sender.send(ApprovalResult::Denied);
+                                app.output_lines.truncate(prompt_lines);
+                                cancel_agent(&state_handle, &agent_task, &agent_done).await?;
+                                app.push_plain("^C");
+                                app.agent_busy = false;
+                                continue;
+                            }
+
                             let result = match key.code {
                                 KeyCode::Char('y' | 'Y') => ApprovalResult::Approved,
                                 KeyCode::Char('n' | 'N') => ApprovalResult::Denied,
                                 KeyCode::Char('a' | 'A') => ApprovalResult::Always,
                                 KeyCode::Esc => ApprovalResult::Denied,
                                 _ => {
-                                    // Ignore unrecognized keys; keep waiting
+                                    // Put sender back so user can retry with y/n/a/Esc
+                                    crate::core::approval::set_approval_sender(sender);
                                     continue;
                                 }
                             };
