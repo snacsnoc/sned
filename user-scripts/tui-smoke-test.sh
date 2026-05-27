@@ -19,8 +19,8 @@ SNED_BIN="${REPO_ROOT}/target/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit help version invalid-flag yolo-help json-no-prompt"
-TOTAL_TESTS=6
+ALL_TEST_NAMES="tui-startup-exit help version invalid-flag yolo-help json-no-prompt ctrlc-cancel"
+TOTAL_TESTS=7
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -60,6 +60,7 @@ version           --version shows version
 invalid-flag      Invalid flag returns an error
 yolo-help         --yolo is accepted by CLI parsing
 json-no-prompt    --json with no prompt does not start the TUI
+ctrlc-cancel      Send Ctrl+C to cancel, then /exit to quit
 LIST
 }
 
@@ -101,6 +102,7 @@ test_description() {
         invalid-flag) echo "Invalid flag returns an error" ;;
         yolo-help) echo "--yolo is accepted by CLI parsing" ;;
         json-no-prompt) echo "--json with no prompt does not start the TUI" ;;
+        ctrlc-cancel) echo "Send Ctrl+C to cancel, then /exit to quit" ;;
         *) echo "unknown" ;;
     esac
 }
@@ -109,6 +111,7 @@ test_source() {
     case "$1" in
         tui-startup-exit) echo "src/cli/interactive.rs run_interactive_shell_inner" ;;
         help|version|invalid-flag|yolo-help|json-no-prompt) echo "src/cli/mod.rs CLI dispatch" ;;
+        ctrlc-cancel) echo "src/cli/interactive.rs handle_key_event Ctrl+C handler" ;;
         *) echo "unknown" ;;
     esac
 }
@@ -288,6 +291,105 @@ test_yolo_help() {
     fi
 }
 
+test_ctrlc_cancel() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import os
+import pty
+import select
+import shutil
+import signal
+import sys
+import tempfile
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-ctrlc-smoke.")
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+})
+
+cmd = [
+    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+sent_ctrlc = False
+exit_code = None
+deadline = time.time() + 8
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+            if b"type a prompt" in buf and not sent_ctrlc:
+                # Send Ctrl+C to cancel (no agent running, should clear input or quit)
+                os.write(fd, b"\x03")
+                sent_ctrlc = True
+                # After Ctrl+C, send /exit to quit
+                time.sleep(0.2)
+                os.write(fd, b"/exit\r")
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None:
+        try:
+            ended, status = os.waitpid(pid, os.WNOHANG)
+            if ended:
+                exit_code = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            exit_code = 0
+
+    text = buf.decode("utf-8", "replace")
+    if verbose:
+        print(text)
+
+    if "type a prompt" not in text:
+        print("TUI_TEST_FAIL startup banner not rendered")
+    elif not sent_ctrlc:
+        print("TUI_TEST_FAIL Ctrl+C was not sent")
+    elif exit_code not in (0, None):
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS Ctrl+C cancel and /exit path worked")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
 test_json_no_prompt() {
     if ! command -v python3 >/dev/null 2>&1; then
         echo "TUI_TEST_FAIL python3 is required for pty smoke test"
@@ -384,6 +486,7 @@ run_one() {
         invalid-flag) result="$(test_invalid_flag 2>&1)" ;;
         yolo-help) result="$(test_yolo_help 2>&1)" ;;
         json-no-prompt) result="$(test_json_no_prompt 2>&1)" ;;
+        ctrlc-cancel) result="$(test_ctrlc_cancel 2>&1)" ;;
         *) result="TUI_TEST_FAIL unknown test" ;;
     esac
 
