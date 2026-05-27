@@ -1314,6 +1314,8 @@ async fn run_main_loop(
                                     .await?;
                                     app.agent_busy = true;
                                 }
+                                // Render immediately to show user message before agent starts streaming
+                                terminal.draw(|f| app.render(f))?;
                             }
                             Action::CancelAgent => {
                                 app.push_plain("^C");
