@@ -173,15 +173,17 @@ impl App {
 
         // Output pane with themed border and padding
         let visible_height = output_area.height as usize;
+        // Content height excludes border (1 line top + 1 line bottom)
+        let content_height = visible_height.saturating_sub(2);
         let total_lines = self.output_lines.len();
         let scroll_y = if self.auto_scroll {
-            total_lines.saturating_sub(visible_height) as u16
+            total_lines.saturating_sub(content_height) as u16
         } else {
             // Re-enable auto-scroll if user is near bottom (within 2 lines)
-            let distance_from_bottom = total_lines.saturating_sub(self.scroll_offset as usize + visible_height);
+            let distance_from_bottom = total_lines.saturating_sub(self.scroll_offset as usize + content_height);
             if distance_from_bottom <= 2 {
                 self.auto_scroll = true;
-                total_lines.saturating_sub(visible_height) as u16
+                total_lines.saturating_sub(content_height) as u16
             } else {
                 self.scroll_offset
             }
@@ -200,7 +202,7 @@ impl App {
         self.scrollbar_state = self
             .scrollbar_state
             .content_length(total_lines)
-            .viewport_content_length(visible_height)
+            .viewport_content_length(content_height.max(1))
             .position(scroll_y as usize);
         frame.render_stateful_widget(
             Scrollbar::default()
