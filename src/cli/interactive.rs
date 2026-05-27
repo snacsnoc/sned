@@ -497,9 +497,10 @@ async fn handle_key_event(
         let mq = crate::core::file_search::extract_mention_query(&text);
         if mq.in_mention_mode {
             let result = &app.picker_results[app.picker_index];
-            let new_text =
+            let (new_text, cursor_pos) =
                 crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
             app.input = App::new_textarea(vec![new_text]);
+            app.input.move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
             app.picker_active = false;
             app.picker_results.clear();
             return Ok(None);
@@ -538,6 +539,17 @@ async fn handle_key_event(
             // Submit to agent
             return Ok(Some(Action::Submit(text)));
         }
+        return Ok(None);
+    }
+
+    // PageUp/PageDown for scrolling
+    if key.code == KeyCode::PageUp {
+        app.auto_scroll = false;
+        app.scroll_offset = app.scroll_offset.saturating_sub(10);
+        return Ok(None);
+    }
+    if key.code == KeyCode::PageDown {
+        app.scroll_offset = app.scroll_offset.saturating_add(10);
         return Ok(None);
     }
 
@@ -587,6 +599,26 @@ async fn handle_key_event(
     if key.code == KeyCode::Esc && app.picker_active {
         app.picker_active = false;
         app.picker_results.clear();
+        return Ok(None);
+    }
+
+    // Ctrl+L - clear output screen
+    if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.output_lines.clear();
+        app.scroll_offset = 0;
+        app.auto_scroll = true;
+        return Ok(None);
+    }
+
+    // Ctrl+A - move cursor to start of line
+    if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.input.move_cursor(tui_textarea::CursorMove::Head);
+        return Ok(None);
+    }
+
+    // Ctrl+E - move cursor to end of line
+    if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.input.move_cursor(tui_textarea::CursorMove::End);
         return Ok(None);
     }
 

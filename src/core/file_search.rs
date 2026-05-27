@@ -362,7 +362,7 @@ pub struct MentionQuery {
     pub at_index: isize,
 }
 
-pub fn insert_mention(text: &str, at_index: usize, file_path: &str) -> String {
+pub fn insert_mention(text: &str, at_index: usize, file_path: &str) -> (String, usize) {
     let after_at = text[at_index..].find(' ');
     let end = after_at.map(|i| at_index + i).unwrap_or(text.len());
 
@@ -378,12 +378,14 @@ pub fn insert_mention(text: &str, at_index: usize, file_path: &str) -> String {
         format!("@{}", normalized)
     };
 
-    format!(
+    let cursor_pos = at_index + mention.len() + 1; // +1 for trailing space
+    let new_text = format!(
         "{}{} {}",
         &text[..at_index],
         mention,
         text[end..].trim_start()
-    )
+    );
+    (new_text, cursor_pos)
 }
 
 #[cfg(test)]
@@ -426,14 +428,16 @@ mod tests {
 
     #[test]
     fn test_insert_mention_simple() {
-        let result = insert_mention("hello @", 6, "src/main.rs");
+        let (result, cursor_pos) = insert_mention("hello @", 6, "src/main.rs");
         assert_eq!(result, "hello @/src/main.rs ");
+        assert_eq!(cursor_pos, 20); // after "@/src/main.rs "
     }
 
     #[test]
     fn test_insert_mention_spaces() {
-        let result = insert_mention("hello @", 6, "/src/my file.rs");
+        let (result, cursor_pos) = insert_mention("hello @", 6, "/src/my file.rs");
         assert_eq!(result, "hello @\"/src/my file.rs\" ");
+        assert_eq!(cursor_pos, 25); // after "@/src/my file.rs "
     }
 
     #[test]
