@@ -281,7 +281,7 @@ impl EditFileHandler {
             }
 
             if stale_warning.is_some() {
-                state.file_content_cache.remove(&batch.absolute_path);
+                state.file_content_cache.pop(&batch.absolute_path);
             }
 
             // Warn if editing a file not read this session
@@ -601,7 +601,7 @@ impl EditFileHandler {
                     }
                 };
 
-                let lock_result = fs2::FileExt::try_lock_exclusive(&std_file);
+                let lock_result = std_file.try_lock();
 
                 if lock_result.is_err() {
                     let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
@@ -668,7 +668,7 @@ impl EditFileHandler {
                         && let Ok(current_mtime) = current_metadata.modified()
                         && &current_mtime != initial_mtime
                     {
-                        let _ = fs2::FileExt::unlock(&std_file);
+                        let _ = std_file.unlock();
                         for path in written_paths.iter().rev() {
                             if let Some(orig) = original_contents.get(path)
                                 && let Err(re) = std::fs::write(path, orig)
@@ -694,7 +694,7 @@ impl EditFileHandler {
                     )
                     .await;
 
-                    let _ = fs2::FileExt::unlock(&std_file);
+                    let _ = std_file.unlock();
 
                     match write_result {
                         Ok(()) => {

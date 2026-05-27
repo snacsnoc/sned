@@ -4,6 +4,8 @@
 
 use crate::core::context::context_manager::ApiReqInfo;
 use crate::providers::Provider;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// Maximum consecutive mistakes before asking user.
@@ -89,7 +91,7 @@ pub struct TaskState {
     pub turns_since_save: u32,
     /// File content cache for cross-call coordination within a single turn.
     /// Maps absolute file paths to their latest content after edits in this turn.
-    pub file_content_cache: std::collections::HashMap<String, String>,
+    pub file_content_cache: LruCache<String, String>,
     pub first_tool_result_printed: bool,
     /// Current compacted summary (inserted into conversation history).
     pub compacted_summary: Option<crate::core::context::context_manager::CompactedSummary>,
@@ -154,7 +156,10 @@ impl Default for TaskState {
             subagents_enabled: false,
             is_subagent_execution: false,
             turns_since_save: 0,
-            file_content_cache: std::collections::HashMap::with_capacity(16),
+            file_content_cache: LruCache::new(
+                NonZeroUsize::new(MAX_FILE_CONTENT_CACHE_ENTRIES)
+                    .expect("file content cache entry limit must be non-zero"),
+            ),
             first_tool_result_printed: false,
             compacted_summary: None,
             session_start_time: None,
@@ -266,27 +271,28 @@ impl TaskState {
     /// Evicts oldest entries when cache exceeds size or entry limits.
     pub fn insert_file_content(&mut self, path: String, content: String) {
         let content_size = content.len();
+        let replaced_size = self
+            .file_content_cache
+            .peek(&path)
+            .map_or(0, |existing| existing.len());
+        let mut total_size = self.file_content_cache_size().saturating_sub(replaced_size);
 
-        // Evict if adding would exceed limits
-        while self.file_content_cache.len() >= MAX_FILE_CONTENT_CACHE_ENTRIES
-            || self
-                .file_content_cache
-                .values()
-                .map(|c| c.len())
-                .sum::<usize>()
-                + content_size
-                > MAX_FILE_CONTENT_CACHE_SIZE
-        {
-            // Remove oldest entry (first in HashMap iteration order)
-            if let Some((key, _)) = self.file_content_cache.iter().next() {
-                let key = key.clone();
-                self.file_content_cache.remove(&key);
+        while total_size + content_size > MAX_FILE_CONTENT_CACHE_SIZE {
+            if let Some((_key, evicted_content)) = self.file_content_cache.pop_lru() {
+                total_size = total_size.saturating_sub(evicted_content.len());
             } else {
                 break;
             }
         }
 
-        self.file_content_cache.insert(path, content);
+        self.file_content_cache.put(path, content);
+    }
+
+    fn file_content_cache_size(&self) -> usize {
+        self.file_content_cache
+            .iter()
+            .map(|(_, content)| content.len())
+            .sum()
     }
 }
 
@@ -299,4 +305,62 @@ pub enum AgentError {
     ExecutionError(String),
     #[error("Cancelled")]
     Cancelled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_insert_file_content_preserves_recently_used_entries() {
+        let mut state = TaskState::default();
+
+        for idx in 0..MAX_FILE_CONTENT_CACHE_ENTRIES {
+            state.insert_file_content(format!("file-{idx}"), format!("content-{idx}"));
+        }
+
+        assert!(
+            state
+                .file_content_cache
+                .get(&"file-0".to_string())
+                .is_some()
+        );
+
+        state.insert_file_content("file-new".to_string(), "content-new".to_string());
+
+        assert!(
+            state
+                .file_content_cache
+                .peek(&"file-0".to_string())
+                .is_some()
+        );
+        assert!(
+            state
+                .file_content_cache
+                .peek(&"file-1".to_string())
+                .is_none()
+        );
+        assert!(
+            state
+                .file_content_cache
+                .peek(&"file-new".to_string())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_insert_file_content_respects_total_size_limit_with_lru_eviction() {
+        let mut state = TaskState::default();
+        let four_mb = "a".repeat(4 * 1024 * 1024);
+
+        state.insert_file_content("a".to_string(), four_mb.clone());
+        state.insert_file_content("b".to_string(), four_mb.clone());
+        assert!(state.file_content_cache.get(&"a".to_string()).is_some());
+        state.insert_file_content("c".to_string(), four_mb);
+
+        assert!(state.file_content_cache.peek(&"a".to_string()).is_some());
+        assert!(state.file_content_cache.peek(&"b".to_string()).is_none());
+        assert!(state.file_content_cache.peek(&"c".to_string()).is_some());
+        assert!(state.file_content_cache_size() <= MAX_FILE_CONTENT_CACHE_SIZE);
+    }
 }

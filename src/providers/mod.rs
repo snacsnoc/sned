@@ -847,25 +847,9 @@ impl From<reqwest::Error> for ProviderError {
 
 impl From<anyhow::Error> for ProviderError {
     fn from(e: anyhow::Error) -> Self {
-        if let Some(http_err) = e.downcast_ref::<ProviderHttpError>() {
-            if http_err.status.is_client_error() {
-                if http_err.status == StatusCode::UNAUTHORIZED
-                    || http_err.status == StatusCode::FORBIDDEN
-                {
-                    ProviderError::AuthenticationError(http_err.to_string())
-                } else if http_err.status == StatusCode::TOO_MANY_REQUESTS {
-                    ProviderError::RateLimitError {
-                        message: http_err.to_string(),
-                        retry_delay_ms: http_err.retry_delay_ms,
-                    }
-                } else {
-                    ProviderError::InvalidRequest(http_err.to_string())
-                }
-            } else {
-                ProviderError::ApiError(http_err.to_string())
-            }
-        } else {
-            ProviderError::UnexpectedError(e.to_string())
+        match e.downcast::<ProviderHttpError>() {
+            Ok(http_err) => ProviderError::from(http_err),
+            Err(err) => ProviderError::UnexpectedError(err.to_string()),
         }
     }
 }
@@ -1121,6 +1105,27 @@ mod tests {
                 assert_eq!(retry_delay_ms, Some(5000));
             }
             _ => panic!("Expected RateLimitError"),
+        }
+    }
+
+    #[test]
+    fn test_provider_error_from_anyhow_delegates_http_mapping() {
+        let headers = HeaderMap::new();
+        let http_error = ProviderHttpError::new(
+            "openai",
+            "https://api.example.com".to_string(),
+            StatusCode::UNAUTHORIZED,
+            "{}".to_string(),
+            headers,
+        );
+
+        let provider_error = ProviderError::from(anyhow::Error::new(http_error));
+
+        match provider_error {
+            ProviderError::AuthenticationError(message) => {
+                assert!(message.contains("401"));
+            }
+            _ => panic!("Expected AuthenticationError"),
         }
     }
 

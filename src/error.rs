@@ -31,6 +31,3 @@ impl CliError {
         Self::Config(msg.into())
     }
 }
-
-/// Result type alias for CliError
-pub type Result<T> = std::result::Result<T, CliError>;

@@ -1,4 +1,3 @@
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fs;
@@ -15,7 +14,7 @@ pub struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self._file);
+        let _ = self._file.unlock();
     }
 }
 
@@ -456,7 +455,7 @@ impl TaskStorage {
             .truncate(false)
             .open(&lock_path)?;
 
-        file.try_lock_exclusive()
+        file.try_lock()
             .map_err(|e| io::Error::other(format!("Task is locked by another process: {}", e)))?;
 
         Ok(LockGuard { _file: file })
@@ -474,7 +473,7 @@ impl TaskStorage {
             .truncate(false)
             .open(&lock_path)?;
 
-        file.lock_exclusive()
+        file.lock()
             .map_err(|e| io::Error::other(format!("Failed to acquire lock: {}", e)))?;
 
         Ok(LockGuard { _file: file })

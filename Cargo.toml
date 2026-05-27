@@ -80,7 +80,6 @@ keyring = "3.6"  # Updated from 3.0.0, 4.0 has breaking API changes
 url = "2"
 serde_yml = "0.0.12"
 notify = "8.2"  # Updated from 7.0.0
-fs2 = "0.4.3"
 parking_lot = "0.12"
 rusqlite = { version = "0.37", features = ["bundled"] }  # Updated from 0.32, 0.39+ removed u64/usize FromSql/ToSql
 dhat = { version = "0.3", optional = true }
