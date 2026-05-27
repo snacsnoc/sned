@@ -768,8 +768,10 @@ pub fn prompt_for_approval(
     output_writer: &OutputWriterArc,
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
+    // SECURITY (F-01): Non-interactive stdin DENIES by default to prevent
+    // piped input attacks. Require explicit --yolo or --auto-approve-all flag.
     if !stdin.is_terminal() {
-        return Ok(ApprovalResult::Approved);
+        return Ok(ApprovalResult::Denied);
     }
 
     let params_str = format_tool_parameters(tool_name, params);
@@ -899,8 +901,9 @@ pub async fn prompt_for_combined_approval(
     output_writer: &OutputWriterArc,
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
+    // SECURITY (F-01): Non-interactive stdin DENIES by default
     if !stdin.is_terminal() {
-        return Ok(ApprovalResult::Approved);
+        return Ok(ApprovalResult::Denied);
     }
 
     let file_names = if file_count == 1 {
@@ -1109,10 +1112,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires interactive stdin - tested manually"]
-    fn test_prompt_non_interactive_approves() {
-        // In non-interactive mode (stdin is not a tty), the tool is auto-approved
-        // This is the common case in tests since cargo test redirects stdin
+    fn test_non_interactive_stdin_denies_by_default() {
+        // SECURITY TEST (F-01): Non-interactive stdin (piped input, CI, scripts)
+        // should DENY tool execution by default to prevent automated attacks.
+        // User must explicitly pass --yolo or --auto-approve-all for non-interactive use.
         let output_writer: crate::cli::output::OutputWriterArc =
             std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
         let result = prompt_for_approval(
@@ -1121,7 +1124,7 @@ mod tests {
             &output_writer,
         )
         .expect("prompt should succeed");
-        assert_eq!(result, ApprovalResult::Approved);
+        assert_eq!(result, ApprovalResult::Denied, "Non-interactive stdin should deny by default (F-01)");
     }
 
     #[test]
