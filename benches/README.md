@@ -503,7 +503,7 @@ See `DEBUG_MEMORY_LEAK_TESTING.md` at repo root for complete memory profiling gu
   - `edit_application.rs` — 5 benchmarks for edit application
 - All benchmarks passing with expected performance characteristics
 - HTML reports generated in `target/criterion/`
-- Baseline log saved to `benches/baseline-2026-05-13.txt`
+- Baseline log archived with the private benchmark artifacts
 - Performance budgets defined for all operations
 
 ### Original 4 Suites (2026-05-13)
