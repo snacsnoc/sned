@@ -1408,6 +1408,13 @@ async fn run_main_loop(
         if agent_done.notified().now_or_never().is_some() {
             agent_busy.store(false, Ordering::Relaxed);
             app.agent_busy = false;
+            // Check if task was cancelled — if so, allow user to exit
+            let task_was_cancelled = if let Some(state_arc) = state_handle.lock().await.as_ref() {
+                let state = state_arc.lock().await;
+                state.is_cancelled
+            } else {
+                false
+            };
             if let Some(start) = agent_start_time.lock().await.take() {
                 let elapsed = start.elapsed();
                 app.elapsed = Some(elapsed);
@@ -1417,6 +1424,13 @@ async fn run_main_loop(
                 );
                 // Turn separator after agent completion
                 app.push_turn_separator();
+            }
+            // If task was cancelled, show message and allow immediate exit via /exit or Ctrl+C
+            if task_was_cancelled {
+                app.push_styled(
+                    "Task cancelled. Type /exit to quit.",
+                    Style::default().fg(Color::Yellow),
+                );
             }
         }
 
