@@ -747,21 +747,7 @@ pub fn take_approval_sender() -> Option<std::sync::mpsc::Sender<ApprovalResult>>
 }
 
 /// Prompt the user for approval of a tool execution.
-///
-/// Prints the tool name and parameters, then reads a single character from stdin
-/// and interprets it:
-/// - 'y' or 'Y' -> Approved
-/// - 'n' or 'N' -> Denied
-/// - 'a' or 'A' -> Always (auto-approve this tool for the session)
-///
-/// If stdin is not a terminal, the tool is auto-approved.
-///
-/// ## Input method
-///
-/// Uses `read_single_char_raw` so the user can type y/n/a without pressing Enter.
-/// We avoid the TUI channel path: it requires cooked (line-buffered) stdin, which
-/// blocks all approvals during agent execution because raw mode is dropped before
-/// the agent runs (`interactive.rs:1498`).
+/// Blocks on a channel until the TUI loop sends a y/n/a response.
 pub fn prompt_for_approval(
     tool_name: &str,
     params: &serde_json::Value,
@@ -915,16 +901,21 @@ pub async fn prompt_for_combined_approval(
     use crate::cli::output::OutputEvent;
     output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
 
-    let (sender, receiver) = std::sync::mpsc::channel();
-    set_approval_sender(sender);
-    set_approval_prompt_active(true);
+    // Wrap blocking channel recv in spawn_blocking to avoid blocking the tokio runtime
+    tokio::task::spawn_blocking(move || {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        set_approval_sender(sender);
+        set_approval_prompt_active(true);
 
-    let result = receiver
-        .recv()
-        .map_err(|_| io::Error::other("approval channel closed"))?;
+        let result = receiver
+            .recv()
+            .map_err(|_| io::Error::other("approval channel closed"))?;
 
-    set_approval_prompt_active(false);
-    Ok(result)
+        set_approval_prompt_active(false);
+        Ok(result)
+    })
+    .await
+    .map_err(|e| io::Error::other(format!("spawn_blocking failed: {}", e)))?
 }
 
 fn build_tool_approval_prompt(

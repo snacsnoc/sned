@@ -1634,23 +1634,23 @@ impl AgentLoop {
                         state.cumulative_tokens_out =
                             state.cumulative_tokens_out.saturating_add(usage_chunk.output_tokens);
                     }
-                    if let Some(cache_writes) = usage_chunk.cache_write_tokens {
-                        if cache_writes > 0 {
-                            state.cumulative_cache_writes =
-                                state.cumulative_cache_writes.saturating_add(cache_writes);
-                        }
+                    if let Some(cache_writes) = usage_chunk.cache_write_tokens
+                        && cache_writes > 0
+                    {
+                        state.cumulative_cache_writes =
+                            state.cumulative_cache_writes.saturating_add(cache_writes);
                     }
-                    if let Some(cache_reads) = usage_chunk.cache_read_tokens {
-                        if cache_reads > 0 {
-                            state.cumulative_cache_reads =
-                                state.cumulative_cache_reads.saturating_add(cache_reads);
-                        }
+                    if let Some(cache_reads) = usage_chunk.cache_read_tokens
+                        && cache_reads > 0
+                    {
+                        state.cumulative_cache_reads =
+                            state.cumulative_cache_reads.saturating_add(cache_reads);
                     }
-                    if let Some(reasoning_tokens) = usage_chunk.reasoning_tokens {
-                        if reasoning_tokens > 0 {
-                            state.cumulative_reasoning_tokens =
-                                state.cumulative_reasoning_tokens.saturating_add(reasoning_tokens);
-                        }
+                    if let Some(reasoning_tokens) = usage_chunk.reasoning_tokens
+                        && reasoning_tokens > 0
+                    {
+                        state.cumulative_reasoning_tokens =
+                            state.cumulative_reasoning_tokens.saturating_add(reasoning_tokens);
                     }
                     if let Some(cost) = usage_chunk.total_cost {
                         state.cumulative_cost += cost;
