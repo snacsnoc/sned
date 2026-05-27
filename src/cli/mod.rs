@@ -637,11 +637,14 @@ fn build_symbol_index_service(
 fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
     use crate::providers::env_auth::get_provider_from_env;
 
-    // Determine provider: --provider flag > auto-detection from env > error
+    // Determine provider: --provider flag > auto-detection from env > custom base_url+api_key > error
     let (provider_name, was_auto_detected) = if let Some(explicit) = &task_opts.provider {
         (explicit.as_str(), false)
     } else if let Some(detected) = get_provider_from_env() {
         (detected, true)
+    } else if task_opts.base_url.is_some() && task_opts.api_key.is_some() {
+        // Custom OpenAI-compatible endpoint with explicit credentials
+        ("openai", false)
     } else {
         // No provider flag and no auto-detected keys - show helpful error
         anyhow::bail!(
@@ -2245,6 +2248,23 @@ mod tests {
             cli_err,
             crate::error::CliError::Config(message) if message == "Unsupported provider: nope"
         ));
+    }
+
+    #[test]
+    fn test_create_provider_custom_base_url_and_api_key() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--base-url",
+            "https://custom.example.com/v1",
+            "--api-key",
+            "sk-test123",
+            "--model",
+            "custom-model",
+            "test prompt",
+        ])
+        .unwrap();
+        let provider = create_provider(&cli.task_opts).expect("custom base_url+api_key should work");
+        assert_eq!(provider.name(), "openai");
     }
 
     #[test]
