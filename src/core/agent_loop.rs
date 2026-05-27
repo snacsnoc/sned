@@ -1035,6 +1035,11 @@ impl AgentLoop {
                     return Ok(());
                 }
                 TurnResult::Error(e) => {
+                    // Emit error to output (visible in TUI and logged)
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::error(&e));
+
                     // Rollback the user message that was never processed by the model.
                     // Only rollback for context-window errors to prevent compounding failure.
                     // For other errors (rate limit, auth, etc.), keep the message so the user
