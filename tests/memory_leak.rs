@@ -128,10 +128,9 @@ async fn test_symbol_index_db_connections_closed() {
 
     // Reopen should succeed (proves previous connection was closed)
     {
-        let mut index2 =
-            SymbolIndexService::new(temp_dir.path().to_string_lossy().to_string())
-                .with_persistence()
-                .unwrap();
+        let index2 = SymbolIndexService::new(temp_dir.path().to_string_lossy().to_string())
+            .with_persistence()
+            .unwrap();
         let _symbols = index2.get_symbols("test_func", None, None);
     }
 }

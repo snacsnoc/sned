@@ -86,11 +86,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }  # Updated from 0.32, 0.
 dhat = { version = "0.3", optional = true }
 
 ulid = "1"
-rayon = "1.10"
 base64 = "0.22"
 clap_complete = "4.6"  # Updated to 4.6.x
 vte = "0.15.0"
-unicode-width = "0.2"
 indexmap = { version = "2", features = ["serde"] }
 # libghostty-vt removed (unused dependency)
 

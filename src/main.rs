@@ -33,13 +33,6 @@ fn categorize_error(err: &anyhow::Error) -> i32 {
         return cli_err.exit_code();
     }
 
-    let message = err.to_string();
-    if message.starts_with("Unsupported provider:") {
-        return sned::exit_codes::EXIT_CONFIG;
-    }
-
-    // For non-CliError anyhow errors, use sensible defaults based on error type
-    // Default to general error for unknown anyhow errors
     sned::exit_codes::EXIT_ERROR
 }
 
@@ -78,14 +71,6 @@ mod tests {
         assert_eq!(
             categorize_error(&anyhow::anyhow!("Network timeout")),
             EXIT_ERROR
-        );
-    }
-
-    #[test]
-    fn test_categorize_unsupported_provider_as_config_error() {
-        assert_eq!(
-            categorize_error(&anyhow::anyhow!("Unsupported provider: nope")),
-            EXIT_CONFIG
         );
     }
 }

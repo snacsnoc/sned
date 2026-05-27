@@ -110,25 +110,6 @@ impl ReadFileHandler {
             };
         }
 
-        // Check if it's a regular file (not a pipe, socket, device, etc.)
-        if !metadata.is_file() {
-            let err = crate::cli::actionable_errors::file_not_found(
-                path,
-                &format!(
-                    "{} is not a regular file (type: {:?})",
-                    path,
-                    metadata.file_type()
-                ),
-            );
-            return FileReadResult {
-                path: path.to_string(),
-                content: String::new(),
-                hash: String::new(),
-                success: false,
-                error: Some(err.display()),
-            };
-        }
-
         let (content_for_hash, sliced_lines, clamping_note, full_lines, range_start, range_end) =
             if start_line.is_some() || end_line.is_some() {
                 match self.read_lines_range(path, start_line, end_line).await {

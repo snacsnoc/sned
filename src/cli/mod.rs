@@ -882,7 +882,13 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 "Mock provider response - task completed successfully",
             ),
         ),
-        _ => anyhow::bail!("Unsupported provider: {}", provider_name),
+        _ => {
+            return Err(crate::error::CliError::config(format!(
+                "Unsupported provider: {}",
+                provider_name
+            ))
+            .into());
+        }
     };
 
     Ok(provider)
@@ -2265,6 +2271,23 @@ mod tests {
 
         // SAFETY: single-threaded test; cleaning up env after assertion
         unsafe { env::remove_var("ANTHROPIC_API_KEY") };
+    }
+
+    #[test]
+    fn test_create_provider_returns_typed_config_error_for_unsupported_provider() {
+        let cli = Cli::try_parse_from(["sned", "--provider", "nope", "test prompt"]).unwrap();
+        let err = match create_provider(&cli.task_opts) {
+            Ok(_) => panic!("unsupported provider should fail"),
+            Err(err) => err,
+        };
+
+        let cli_err = err
+            .downcast_ref::<crate::error::CliError>()
+            .expect("unsupported provider should be a typed CliError");
+        assert!(matches!(
+            cli_err,
+            crate::error::CliError::Config(message) if message == "Unsupported provider: nope"
+        ));
     }
 
     #[test]

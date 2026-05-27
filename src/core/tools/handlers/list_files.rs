@@ -128,11 +128,6 @@ impl ListFilesHandler {
         let mut file_index = 0;
 
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
-                *hit_limit = true;
-                break;
-            }
-
             let path = entry.path();
             let is_directory = path.is_dir();
 
@@ -151,6 +146,11 @@ impl ListFilesHandler {
             // Skip common ignored files
             if !is_directory && should_ignore_file(&path) {
                 continue;
+            }
+
+            if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
+                *hit_limit = true;
+                break;
             }
 
             if is_directory {
@@ -204,16 +204,12 @@ impl ListFilesHandler {
         let walk_result = tokio::task::spawn_blocking({
             let dir = dir.to_path_buf();
             move || {
-                let walker = walkdir::WalkDir::new(&dir).follow_links(false).into_iter();
+                let mut walker = walkdir::WalkDir::new(&dir).follow_links(false).into_iter();
                 let mut file_paths: Vec<(usize, std::path::PathBuf)> = Vec::new();
                 let mut dir_entries: Vec<FileInfo> = Vec::new();
                 let mut file_index = 0;
 
-                for entry in walker {
-                    if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
-                        return (file_paths, dir_entries, true);
-                    }
-
+                while let Some(entry) = walker.next() {
                     let entry = match entry {
                         Ok(e) => e,
                         Err(_) => continue,
@@ -231,18 +227,24 @@ impl ListFilesHandler {
                         && name.to_string_lossy().starts_with(".")
                         && entry.file_type().is_dir()
                     {
-                        continue; // Skip hidden directories
+                        walker.skip_current_dir();
+                        continue;
                     }
                     // For hidden files, still include them if not in a hidden dir
 
                     // Skip common ignored directories
                     if entry.file_type().is_dir() && should_ignore_directory(path) {
+                        walker.skip_current_dir();
                         continue;
                     }
 
                     // Skip common ignored files
                     if entry.file_type().is_file() && should_ignore_file(path) {
                         continue;
+                    }
+
+                    if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
+                        return (file_paths, dir_entries, true);
                     }
 
                     if entry.file_type().is_dir() {
@@ -499,6 +501,60 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.files.len(), MAX_FILES_LIMIT);
         assert!(result.hit_limit);
+    }
+
+    #[tokio::test]
+    async fn test_list_files_limit_ignores_hidden_and_ignored_entries_top_level() {
+        let temp_dir = TempDir::new().unwrap();
+        for i in 0..MAX_FILES_LIMIT {
+            fs::write(temp_dir.path().join(format!(".hidden{i}.txt")), "content").unwrap();
+        }
+        fs::create_dir(temp_dir.path().join("node_modules")).unwrap();
+        fs::write(
+            temp_dir.path().join("node_modules").join("ignored.js"),
+            "content",
+        )
+        .unwrap();
+        let visible_path = temp_dir.path().join("visible.txt");
+        fs::write(&visible_path, "content").unwrap();
+
+        let handler = ListFilesHandler::new();
+        let result = handler
+            .list_directory_with_line_counts(temp_dir.path().to_str().unwrap(), false, false)
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, visible_path.to_string_lossy());
+        assert!(!result.hit_limit);
+    }
+
+    #[tokio::test]
+    async fn test_list_files_limit_ignores_hidden_and_ignored_entries_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        let hidden_dir = temp_dir.path().join(".hidden-dir");
+        fs::create_dir(&hidden_dir).unwrap();
+        for i in 0..MAX_FILES_LIMIT {
+            fs::write(hidden_dir.join(format!("hidden{i}.txt")), "content").unwrap();
+        }
+        fs::create_dir(temp_dir.path().join("node_modules")).unwrap();
+        fs::write(
+            temp_dir.path().join("node_modules").join("ignored.js"),
+            "content",
+        )
+        .unwrap();
+        let visible_path = temp_dir.path().join("visible.txt");
+        fs::write(&visible_path, "content").unwrap();
+
+        let handler = ListFilesHandler::new();
+        let result = handler
+            .list_directory_with_line_counts(temp_dir.path().to_str().unwrap(), true, false)
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, visible_path.to_string_lossy());
+        assert!(!result.hit_limit);
     }
 
     #[tokio::test]
