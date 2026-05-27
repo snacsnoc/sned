@@ -389,7 +389,6 @@ pub fn process_slash_command_with_context(
                     skill_name, content
                 );
 
-                // Check if text after slash command is empty (TS behavior)
                 let text_after = &result.processed_text;
                 let is_empty = text_after.trim().is_empty();
 
@@ -486,7 +485,6 @@ pub fn parse_checkpoint_restore(text: &str) -> Option<usize> {
     let result = parse_slash_command(text);
     let cmd = result.command?;
 
-    // Build the full command for matching (handles both /checkpoint-restore N and /checkpoint restore N)
     let full_command = if result.processed_text.is_empty() {
         cmd.command.clone()
     } else {
@@ -535,7 +533,7 @@ pub fn format_help_text() -> String {
     ));
 
     s.push_str(&format!(
-        "{}{}Base Commands (sent to AI):{}\n",
+        "{}{}Base Commands:{}\n",
         style::BOLD,
         style::CYAN,
         style::RESET
@@ -663,7 +661,7 @@ pub fn format_help_text() -> String {
         style::DIM
     ));
     s.push_str(&format!(
-        "  {}{}{}  - {}Undo the last agent turn {}{}{}\n",
+        "  {}{}{}  - {}Undo the last turn {}{}{}\n",
         style::CYAN,
         "/undo",
         style::DIM,
@@ -683,7 +681,7 @@ pub fn format_help_text() -> String {
         style::DIM
     ));
     s.push_str(&format!(
-        "  {}{}{}  - {}Show agent turn history {}{}{}\n",
+        "  {}{}{}  - {}Show turn history {}{}{}\n",
         style::CYAN,
         "/log",
         style::DIM,
@@ -693,7 +691,7 @@ pub fn format_help_text() -> String {
         style::DIM
     ));
     s.push_str(&format!(
-        "  {}{}{}  - {}Commit agent changes to your git repo {}{}{}\n",
+        "  {}{}{}  - {}Commit changes to your git repo {}{}{}\n",
         style::CYAN,
         "/commit \"msg\"",
         style::DIM,
@@ -844,7 +842,7 @@ pub fn format_help_text() -> String {
         style::DIM
     ));
     s.push_str(&format!(
-        "  {}{}{}  - {}Undo last agent turn {}{}{}\n",
+        "  {}{}{}  - {}Undo last turn {}{}{}\n",
         style::CYAN,
         "/undo",
         style::DIM,
@@ -964,7 +962,7 @@ Use when:
 Use when:
   - Starting fresh without context
   - Privacy concerns require clearing history
-  - Resetting a confused AI session
+  - Resetting a confused session
 
 Warning: This action cannot be undone."#
         }
@@ -1038,12 +1036,12 @@ Use when:
         }
 
         "undo" => {
-            r#"Undoes the last agent turn by reverting file changes.
+            r#"Undoes the last turn by reverting file changes.
 
 Requires: --track-changes flag
 
 Use when:
-  - Agent made incorrect changes
+  - This turn made incorrect changes
   - Want to retry with a different prompt
   - Reverting experimental modifications
 
@@ -1051,29 +1049,29 @@ Note: Requires checkpoint tracking to be enabled."#
         }
 
         "diff" => {
-            r#"Shows changes from the last agent turn.
+            r#"Shows changes from the last turn.
 
 Requires: --track-changes flag
 
 Use when:
-  - Reviewing what the agent changed
+  - Reviewing what changed
   - Preparing to commit changes
-  - Understanding agent modifications"#
+  - Understanding modifications"#
         }
 
         "log" => {
-            r#"Shows agent turn history.
+            r#"Shows turn history.
 
 Requires: --track-changes flag
 
 Use when:
   - Reviewing session timeline
   - Finding specific turns
-  - Auditing agent actions"#
+  - Auditing actions"#
         }
 
         "commit" => {
-            r#"Commits agent changes to your git repository.
+            r#"Commits changes to your git repository.
 
 Requires: --track-changes flag
 
@@ -1081,7 +1079,7 @@ Usage:
   /commit "message" - Commit with a custom message
 
 Use when:
-  - Ready to save agent changes
+  - Ready to save changes
   - Creating version control checkpoints
   - Finalizing a completed task
 
@@ -1140,7 +1138,7 @@ Requires: --track-changes flag
 Aliases: /checkpoint-undo, /checkpoint undo
 
 Use when:
-  - Complete undo of last agent action
+  - Complete undo of last action
   - Both file and history rollback needed
   - More thorough than /undo alone"#
         }
@@ -1715,7 +1713,7 @@ mod tests {
         // Separators between sections
         assert!(text.contains("─────────────────────────────"));
         // Section headers
-        assert!(text.contains("Base Commands (sent to AI):"));
+        assert!(text.contains("Base Commands:"));
         assert!(text.contains("CLI-Only Commands (handled locally):"));
         assert!(text.contains("Keyboard Shortcuts:"));
         assert!(text.contains("Examples:"));
@@ -1733,9 +1731,7 @@ mod tests {
     #[test]
     fn test_format_help_text_shows_track_changes_badge() {
         let text = format_help_text();
-        // Commands requiring --track-changes should have yellow badge
         assert!(text.contains("[requires --track-changes]"));
-        // Check multiple commands have the badge
         assert!(text.contains("/undo"));
         assert!(text.contains("/diff"));
         assert!(text.contains("/log"));
@@ -1747,7 +1743,6 @@ mod tests {
 
     #[test]
     fn test_format_help_for_command_shows_aliases() {
-        // Test checkpoint commands show aliases
         let checkpoint_list = format_help_for_command("checkpoint list");
         assert!(checkpoint_list.contains("Aliases: /checkpoint-list, /checkpoint list"));
 
@@ -1757,7 +1752,6 @@ mod tests {
         let checkpoint_undo = format_help_for_command("checkpoint undo");
         assert!(checkpoint_undo.contains("Aliases: /checkpoint-undo, /checkpoint undo"));
 
-        // Test resetcompact shows alias
         let resetcompact = format_help_for_command("resetcompact");
         assert!(resetcompact.contains("Alias: /clearcompact"));
     }
@@ -1892,8 +1886,6 @@ mod tests {
             source: SkillSource::Project,
         }];
 
-        // Mock: we can't easily mock get_skill_content_for_command, but we can test the flow
-        // This test verifies the command is parsed correctly
         let result = SlashCommand::parse_with_skills_and_workflows(
             "test-skill",
             &skills,
@@ -1911,8 +1903,6 @@ mod tests {
 
     #[test]
     fn test_process_slash_command_with_skill_injects_content() {
-        // This tests that process_slash_command_with_context correctly formats skill content
-        // Since we can't easily mock get_skill_content_for_command, we test the format
         let text = "/test-skill do something";
         let result = parse_slash_command(text);
         assert!(result.command.is_some());

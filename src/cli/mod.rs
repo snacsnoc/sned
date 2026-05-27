@@ -1,7 +1,3 @@
-//! CLI argument parsing – 100% compatible with existing Sned flags.
-//!
-//! Every flag, subcommand, and alias is preserved from the TypeScript CLI.
-
 pub mod actionable_errors;
 pub mod colors;
 pub mod image_input;
@@ -19,8 +15,8 @@ pub use interactive::{
     should_start_interactive_shell,
 };
 pub use subcommands::{
-    format_config_output, parse_config_assignment, run_auth, run_config,
-    run_doctor, run_history, run_migration,
+    format_config_output, parse_config_assignment, run_auth, run_config, run_doctor, run_history,
+    run_migration,
 };
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -197,7 +193,7 @@ pub struct TaskOptions {
     #[arg(long)]
     pub double_check_completion: bool,
 
-    /// Enable AI-powered context compaction instead of mechanical truncation (enabled by default)
+    /// Enable adaptive context compaction instead of mechanical truncation (enabled by default)
     #[arg(long, default_value_t = true)]
     pub auto_condense: bool,
 
@@ -425,9 +421,6 @@ pub enum DevSubcommand {
     Log,
 }
 
-/// Sned CLI - AI coding assistant in your terminal.
-///
-///
 /// For custom OpenAI-compatible providers: set OPENAI_API_KEY + OPENAI_API_BASE env vars, or use --api-key + --base-url flags
 ///
 /// Exit Codes:
@@ -445,7 +438,7 @@ pub enum DevSubcommand {
         env!("GIT_COMMIT_HASH"),
         env!("BUILD_PROFILE")
     ),
-    about = "Sned CLI - AI coding assistant in your terminal",
+    about = "Sned CLI for code editing in your terminal",
     after_help = "Exit Codes: 0=Success, 1=General error, 2=Config error, 3=Input error, 4=Tool error, 5=Interrupted"
 )]
 pub struct Cli {
@@ -1450,8 +1443,6 @@ mod tests {
 
     #[test]
     fn test_run_interactive_shell_exists() {
-        // Compile-time guard: verify run_interactive_shell function exists
-        // This prevents accidental removal or signature changes
         let _ = run_interactive_shell as fn(TaskOptions, RootOnlyOptions) -> anyhow::Result<()>;
     }
 
@@ -1813,11 +1804,9 @@ mod tests {
         use std::io::Write;
         use tempfile::TempDir;
 
-        // Create a temporary directory with rule files
         let temp_dir = TempDir::new().unwrap();
         let cwd = temp_dir.path();
 
-        // Create AGENTS.md
         let mut agents_file = std::fs::File::create(cwd.join("AGENTS.md")).unwrap();
         writeln!(
             agents_file,
@@ -1825,15 +1814,12 @@ mod tests {
         )
         .unwrap();
 
-        // Create .cursorrules
         let mut cursor_file = std::fs::File::create(cwd.join(".cursorrules")).unwrap();
         writeln!(cursor_file, "Use snake_case for variables.").unwrap();
 
-        // Create .windsurfrules
         let mut windsurf_file = std::fs::File::create(cwd.join(".windsurfrules")).unwrap();
         writeln!(windsurf_file, "Max line length: 100.").unwrap();
 
-        // Create .cursor/rules directory with a rule
         let cursor_rules_dir = cwd.join(".cursor/rules");
         std::fs::create_dir_all(&cursor_rules_dir).unwrap();
         let mut cursor_dir_file = std::fs::File::create(cursor_rules_dir.join("rust.mdc")).unwrap();
@@ -1841,7 +1827,6 @@ mod tests {
 
         let empty_toggles = RuleToggles::new();
 
-        // Test agents rules discovery
         let agents_rules = get_local_agents_rules(cwd, &empty_toggles);
         assert!(agents_rules.is_some(), "Should discover AGENTS.md");
         let agents = agents_rules.unwrap();
@@ -1850,7 +1835,6 @@ mod tests {
             "Should contain agents rules content"
         );
 
-        // Test cursor rules discovery
         let cursor_rules = get_local_cursor_rules(cwd, &empty_toggles);
         assert_eq!(
             cursor_rules.len(),
@@ -1866,7 +1850,6 @@ mod tests {
             "Should contain cursor dir rules"
         );
 
-        // Test windsurf rules discovery
         let windsurf_rules = get_local_windsurf_rules(cwd, &empty_toggles);
         assert!(windsurf_rules.is_some(), "Should discover .windsurfrules");
         let windsurf = windsurf_rules.unwrap();
@@ -1885,16 +1868,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let cwd = temp_dir.path();
 
-        // Create AGENTS.md
         let mut agents_file = std::fs::File::create(cwd.join("AGENTS.md")).unwrap();
         writeln!(agents_file, "# Project Rules\n\nAlways document.").unwrap();
 
-        // Create toggles with AGENTS.md disabled
         let mut toggles = RuleToggles::new();
         let agents_path = cwd.join("AGENTS.md").to_string_lossy().into_owned();
         toggles.insert(agents_path, false);
 
-        // Test that disabled rules are excluded
         let agents_rules = get_local_agents_rules(cwd, &toggles);
         assert!(agents_rules.is_none(), "Disabled rules should be excluded");
     }
@@ -1914,27 +1894,14 @@ mod tests {
 
     #[test]
     fn test_tracing_init_with_verbose_flag() {
-        // Smoke test: verify tracing initializes correctly with verbose flag
-        // This test ensures the double-init bug is fixed and --verbose controls log level
-
-        // Test 1: Default (non-verbose) mode should init with WARN level
         let cli = Cli::try_parse_from(["sned", "test prompt"]).unwrap();
         assert!(!cli.task_opts.verbose, "Default should be non-verbose");
 
-        // Test 2: Verbose mode should init with DEBUG level
         let cli_verbose = Cli::try_parse_from(["sned", "--verbose", "test prompt"]).unwrap();
         assert!(
             cli_verbose.task_opts.verbose,
             "--verbose flag should be set"
         );
-
-        // Note: We cannot actually test that tracing::init() succeeds here because
-        // tracing can only be initialized once per process. The fact that this test
-        // compiles and the CLI parses correctly verifies the fix:
-        // - main.rs no longer calls .init()
-        // - cli/mod.rs calls .init() after parsing --verbose
-        // - JsonOutputLayer is available in cli/mod.rs
-        // - Log level is computed from cli.task_opts.verbose
     }
 
     #[test]
@@ -1970,7 +1937,6 @@ mod tests {
         let _ = fs::remove_dir_all(temp_dir);
         fs::create_dir_all(temp_dir).unwrap();
 
-        // Create corrupted DB file
         let db_dir = std::path::Path::new(temp_dir).join(crate::services::symbol_index::INDEX_DIR);
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = db_dir.join(crate::services::symbol_index::DB_FILENAME);
@@ -1980,7 +1946,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Build service with persisted mode - should fallback to memory
         let service = build_symbol_index_service(temp_dir.to_string(), SymbolIndexMode::Persisted);
         assert!(
             service.is_ok(),
@@ -2043,23 +2008,19 @@ mod tests {
             }
         }
 
-        // Test 1: No env vars - should return None
         clear_env();
         assert_eq!(get_provider_from_env(), None);
 
-        // Test 2: ANTHROPIC_API_KEY set - should detect anthropic
         clear_env();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("ANTHROPIC_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("anthropic"));
 
-        // Test 3: OPENAI_API_KEY set - should detect openai-native
         clear_env();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("OPENAI_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("openai-native"));
 
-        // Test 4: Multiple keys - priority order (anthropic > openrouter > openai)
         clear_env();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe {
@@ -2068,25 +2029,21 @@ mod tests {
         }
         assert_eq!(get_provider_from_env(), Some("anthropic"));
 
-        // Test 5: Groq provider
         clear_env();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("GROQ_API_KEY", "groq-key") };
         assert_eq!(get_provider_from_env(), Some("groq"));
 
-        // Test 6: xAI provider
         clear_env();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("XAI_API_KEY", "xai-key") };
         assert_eq!(get_provider_from_env(), Some("xai"));
 
-        // Test 7: OpenRouter provider
         clear_env();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("OPENROUTER_API_KEY", "or-key") };
         assert_eq!(get_provider_from_env(), Some("openrouter"));
 
-        // Test 8: DeepSeek provider
         clear_env();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("DEEPSEEK_API_KEY", "ds-key") };

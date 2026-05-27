@@ -317,7 +317,7 @@ fn html_to_text(html: &str) -> String {
 
     let text = text.trim();
 
-    // Limit to reasonable size for LLM context
+    // Limit to reasonable size for model context
     const MAX_LENGTH: usize = 50_000;
     if text.len() > MAX_LENGTH {
         // Use floor_char_boundary to avoid splitting multi-byte UTF-8 characters

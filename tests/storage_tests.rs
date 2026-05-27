@@ -1,5 +1,5 @@
-use sned::storage::*;
 use sned::providers::env_auth::get_provider_from_env;
+use sned::storage::*;
 use std::fs;
 use std::path::PathBuf;
 

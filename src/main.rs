@@ -1,11 +1,3 @@
-//! sned CLI – AI coding assistant in your terminal.
-//!
-//! This is the native Rust port of Sned, preserving the core differentiators:
-//! - Hash-anchored edits
-//! - AST-native structural tools
-//! - Anchored multi-file batching
-//! - Curated high-bandwidth context
-
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -26,9 +18,7 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-/// Categorize an error into an exit code using typed error matching
 fn categorize_error(err: &anyhow::Error) -> i32 {
-    // Try to downcast to CliError for typed exit code classification
     if let Some(cli_err) = err.downcast_ref::<sned::error::CliError>() {
         return cli_err.exit_code();
     }

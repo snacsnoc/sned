@@ -101,8 +101,6 @@ pub fn parse_file(
     }
 }
 
-
-
 /// Gets the file extension in lowercase.
 fn get_extension(file_path: &str) -> String {
     std::path::Path::new(file_path)
@@ -121,11 +119,10 @@ pub fn get_file_skeleton(
     language_parsers: &LanguageParserMap,
     task_id: Option<&str>,
 ) -> Result<Option<String>, LanguageParserError> {
-    let definitions =
-        match parse_file(absolute_path, file_content, language_parsers)? {
-            Some(d) => d,
-            None => return Ok(None),
-        };
+    let definitions = match parse_file(absolute_path, file_content, language_parsers)? {
+        Some(d) => d,
+        None => return Ok(None),
+    };
 
     let lines: Vec<String> = file_content.lines().map(|s| s.to_string()).collect();
     let anchors = anchor_mgr.reconcile(absolute_path, &lines, task_id);

@@ -2465,7 +2465,7 @@ impl AgentLoop {
                     }
                 }
 
-                // LLM-visible hint: always append to result_text regardless of json_output mode
+                // Model-visible hint: always append to result_text regardless of json_output mode
                 if tool_name == "edit_file" {
                     let is_error = result_text.contains("Error")
                         || result_text.contains("Failed")

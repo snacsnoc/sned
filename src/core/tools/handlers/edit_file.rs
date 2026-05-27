@@ -93,7 +93,6 @@ impl EditFileHandler {
                     .and_then(|t| t.as_str())
                     .unwrap_or("replace");
 
-                // Validate edit_type is one of the allowed values
                 Self::validate_edit_type(edit_type)?;
 
                 let end_anchor = edit_raw.get("end_anchor").and_then(|e| e.as_str());
@@ -136,7 +135,7 @@ impl EditFileHandler {
 
     /// Validate that all anchors contain the hash delimiter.
     ///
-    /// This is a pre-validation check that runs BEFORE sending to the LLM.
+    /// This is a pre-validation check that runs BEFORE sending to the model.
     /// It catches the common mistake of calling edit_file without read_file first.
     fn validate_anchors(&self, files: &[serde_json::Value]) -> Result<(), ToolError> {
         let mut invalid_anchors = Vec::new();
@@ -156,7 +155,6 @@ impl EditFileHandler {
             for edit in edits {
                 let anchor = edit.get("anchor").and_then(|a| a.as_str()).unwrap_or("");
 
-                // Check if anchor contains the delimiter
                 if !anchor.contains(ANCHOR_DELIMITER) {
                     invalid_anchors.push(format!(
                         "  - File '{}': anchor '{}' is missing the '{}' delimiter",
@@ -170,7 +168,6 @@ impl EditFileHandler {
                     ));
                 }
 
-                // Also check end_anchor if present
                 if let Some(end_anchor) = edit.get("end_anchor").and_then(|a| a.as_str())
                     && !end_anchor.contains(ANCHOR_DELIMITER)
                 {
@@ -216,7 +213,6 @@ impl EditFileHandler {
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
-        // Parse files parameter
         let files = params
             .get("files")
             .and_then(|f| f.as_array())
@@ -228,14 +224,11 @@ impl EditFileHandler {
             return Err(ToolError::InvalidInput("No files provided".to_string()));
         }
 
-        // Pre-validate anchors BEFORE any processing
-        // This catches the common mistake of calling edit_file without read_file first
         self.validate_anchors(files)?;
 
         let parsed = self.parse_edits(files)?;
         let processor = BatchProcessor::new(DiffMode::Full);
 
-        // Check for silent mode (skip diff preview and approval)
         let silent = params
             .get("silent")
             .and_then(|s| s.as_bool())
@@ -271,7 +264,6 @@ impl EditFileHandler {
                 .file_context_tracker
                 .mark_file_as_edited_by_sned(Path::new(&batch.absolute_path));
 
-            // Check for stale context before editing
             let stale_warning = state
                 .file_context_tracker
                 .check_stale(Path::new(&batch.absolute_path))
@@ -773,7 +765,6 @@ impl EditFileHandler {
                 continue;
             }
 
-            // Build diagnostics result from batch post-diagnostics
             let diagnostics = if any_pre_errors {
                 let post_diagnostics = post_diagnostics_by_file
                     .get(&file_result.batch_absolute_path)
@@ -934,7 +925,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
 
-    // Tests that use AnchorStateManager must run serially because it uses global state
     static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -1000,7 +990,6 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
-        // Test with anchors missing the § delimiter (simulating edit_file called without read_file first)
         let params = serde_json::json!({
             "files": [{
                 "path": "test.rs",
@@ -1041,7 +1030,6 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
-        // Test with valid anchor but invalid end_anchor
         let params = serde_json::json!({
             "files": [{
                 "path": "test.rs",
@@ -1577,18 +1565,15 @@ mod tests {
         let _guard = TEST_MUTEX.lock().await;
         let handler = EditFileHandler::new();
 
-        // Use workspace temp directory to avoid path validation errors
         let workspace_root = tempfile::TempDir::new().unwrap();
         let file_path = workspace_root.path().join("test_concurrent_edit.txt");
         let raw_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n";
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
-        // Create anchor manager and get anchors for the file
         let anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
-        // Spawn 5 concurrent edit tasks, each editing a different line
         let mut handles = Vec::new();
         for (i, anchor) in anchors.iter().enumerate().take(5) {
             let handler = handler.clone();
@@ -1627,11 +1612,8 @@ mod tests {
             handles.push(handle);
         }
 
-        // Wait for all tasks to complete
         let results = futures::future::join_all(handles).await;
 
-        // All tasks should complete (some may fail due to anchor mismatch, which is expected)
-        // The key is that the file should not be corrupted
         for (i, result) in results.iter().enumerate() {
             match result {
                 Ok(Ok(_)) => println!("Task {} succeeded", i),
@@ -1640,11 +1622,9 @@ mod tests {
             }
         }
 
-        // Verify file content is valid (not corrupted)
         let final_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         let final_lines: Vec<&str> = final_content.lines().collect();
 
-        // Should have exactly 5 lines (not corrupted)
         assert_eq!(
             final_lines.len(),
             5,
@@ -1652,7 +1632,6 @@ mod tests {
             final_content
         );
 
-        // Each line should be either original or modified (not garbled)
         for (i, line) in final_lines.iter().enumerate() {
             assert!(
                 line.starts_with("Line") || line.starts_with("Modified"),
@@ -1661,8 +1640,6 @@ mod tests {
                 line
             );
         }
-
-        // TempDir auto-cleans on drop
     }
 
     /// Test that file locking prevents TOCTOU race during external modification
@@ -1671,7 +1648,6 @@ mod tests {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
-        // Create a temp file with initial content
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "Line 1").unwrap();
         writeln!(temp_file, "Line 2").unwrap();
@@ -1695,14 +1671,10 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
-        // Get the initial anchor from the file
         let initial_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         let lines: Vec<&str> = initial_content.lines().collect();
         let anchor = format!("{}§Line 2", crate::core::hash_utils::content_hash(lines[1]));
 
-        // Simulate external modification by modifying file between mtime check and write
-        // This is a race condition test - we modify the file immediately after
-        // the handler reads it but before it writes
         let params = serde_json::json!({
             "files": [{
                 "path": file_path,
@@ -1713,12 +1685,9 @@ mod tests {
             }]
         });
 
-        // Spawn a task that modifies the file right after a short delay
-        // to simulate external modification during the edit operation
         let file_path_clone = file_path.clone();
         let modifier_handle = tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            // Modify the file externally
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .truncate(true)
@@ -1729,18 +1698,12 @@ mod tests {
             writeln!(file, "Line 3").unwrap();
         });
 
-        // Execute the edit
         let result = EditFileHandler::execute(&handler, &ctx, params).await;
 
-        // Wait for modifier to complete
         modifier_handle.await.unwrap();
 
-        // The edit should either:
-        // 1. Succeed (if modification happened after our write)
-        // 2. Fail with external modification error (if detected)
         match result {
             Ok(_output) => {
-                // If it succeeded, verify the file is not corrupted
                 let final_content = tokio::fs::read_to_string(&file_path).await.unwrap();
                 assert!(
                     final_content.contains("Modified Line 2")
@@ -1750,7 +1713,6 @@ mod tests {
                 );
             }
             Err(e) => {
-                // If it failed, it should be due to external modification detection
                 let err_msg = e.to_string();
                 assert!(
                     err_msg.contains("modified externally") || err_msg.contains("Error"),
@@ -1768,12 +1730,10 @@ mod tests {
 
         let _guard = TEST_MUTEX.lock().await;
 
-        // Create a temp Rust project inside the workspace
         let temp_dir = "test_batch_diagnostics_tmp";
         let _ = fs::remove_dir_all(temp_dir);
         fs::create_dir_all(temp_dir).unwrap();
 
-        // Create Cargo.toml
         let cargo_toml = r#"[package]
 name = "test_batch"
 version = "0.1.0"
@@ -1781,11 +1741,8 @@ edition = "2021"
 "#;
         fs::write(format!("{}/Cargo.toml", temp_dir), cargo_toml).unwrap();
 
-        // Create src directory
         fs::create_dir_all(format!("{}/src", temp_dir)).unwrap();
 
-        // Create two files with intentional errors (undefined function)
-        // Use hash-anchored format: content§line
         let file1_content =
             "func1§pub fn func1() {\nbad_call§    nonexistent_function();\nclose§}\n";
         let file2_content =
@@ -1793,17 +1750,14 @@ edition = "2021"
         fs::write(format!("{}/src/file1.rs", temp_dir), file1_content).unwrap();
         fs::write(format!("{}/src/file2.rs", temp_dir), file2_content).unwrap();
 
-        // Create lib.rs that includes both files
         let lib_content = "lib§mod file1;\nlib2§mod file2;\n";
         fs::write(format!("{}/src/lib.rs", temp_dir), lib_content).unwrap();
 
-        // Verify cargo check produces errors (pre-errors exist)
         let _check_output = Command::new("cargo")
             .args(["check", "--message-format=short"])
             .current_dir(temp_dir)
             .output();
 
-        // Create handler and execute edit on both files
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
@@ -1818,7 +1772,6 @@ edition = "2021"
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
-        // Edit both files to fix the errors using hash-anchored format
         let params = serde_json::json!({
             "files": [
                 {
@@ -1840,9 +1793,6 @@ edition = "2021"
 
         let result = ToolHandler::execute(&handler, &ctx, params).await;
 
-        // The edit should succeed and use batch diagnostics (not 2 separate cargo checks)
-        // We can't easily verify the number of cargo check invocations, but we can
-        // verify the edits were applied and the result includes diagnostics info
         assert!(result.is_ok(), "Edit should succeed: {:?}", result);
 
         let output = result.unwrap().as_str().unwrap().to_string();

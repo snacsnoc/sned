@@ -110,16 +110,8 @@ impl ExecuteCommandHandler {
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
         // Default: apply safety checks (not explicitly approved)
-        self.execute_commands_with_timeout(
-            commands,
-            cwd,
-            None,
-            false,
-            None,
-            false,
-            &output_writer,
-        )
-        .await
+        self.execute_commands_with_timeout(commands, cwd, None, false, None, false, &output_writer)
+            .await
     }
 
     /// Execute commands with optional safety checking.

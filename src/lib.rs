@@ -1,5 +1,3 @@
-//! sned CLI – AI coding assistant in your terminal.
-
 #![deny(clippy::all)]
 #![allow(
     clippy::too_many_arguments,

@@ -1,6 +1,6 @@
 //! Provider trait and shared types for sned CLI.
 //!
-//! Defines the core abstractions that all LLM providers must implement,
+//! Defines the core abstractions that all model providers must implement,
 //! along with message/content types compatible with the TypeScript source schema.
 
 pub mod anthropic;
@@ -18,8 +18,8 @@ pub mod xai;
 use reqwest::StatusCode;
 
 /// Maximum size for tool call arguments (128KB).
-/// Modern LLMs send 10-100KB tool calls, so this limit prevents memory exhaustion
-/// while allowing legitimate large tool arguments. Enforced during streaming assembly.
+/// Cap arguments to prevent a single tool call from exhausting memory while
+/// still allowing large but legitimate payloads.
 pub const MAX_TOOL_ARGUMENT_SIZE: usize = 131072;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -796,7 +796,7 @@ fn repair_close_braces(args: &str) -> String {
     repaired
 }
 
-/// Error types for LLM provider operations.
+/// Error types for model provider operations.
 #[derive(thiserror::Error, Debug)]
 pub enum ProviderError {
     #[error("network error: {0}")]
@@ -854,16 +854,13 @@ impl From<anyhow::Error> for ProviderError {
     }
 }
 
-/// Core trait that all LLM providers must implement.
+/// Core trait that all model providers must implement.
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
-    /// Create a streaming chat completion.
     async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError>;
 
-    /// Get the current model information.
     fn get_model(&self) -> ProviderModel;
 
-    /// Get the provider name (e.g., "anthropic", "openai", "minimax").
     fn name(&self) -> &str;
 }
 

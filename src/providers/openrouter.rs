@@ -117,7 +117,7 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
             info.cache_reads_price = Some(0.3);
             info.supports_reasoning = Some(true);
             info.description = Some(
-                "Claude Sonnet 4.5 - superior intelligence across coding and AI agents".to_string(),
+                "Claude Sonnet 4.5 - superior intelligence across coding workflows".to_string(),
             );
         } else if model_id.contains("claude-sonnet-4") || model_id.contains("claude-4-sonnet") {
             info.max_tokens = Some(64_000);

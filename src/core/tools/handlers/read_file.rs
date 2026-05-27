@@ -80,7 +80,6 @@ impl ReadFileHandler {
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
     ) -> FileReadResult {
-        // Check if file exists and get metadata
         let metadata = match tokio::fs::metadata(path).await {
             Ok(m) => m,
             Err(e) => {
@@ -95,7 +94,6 @@ impl ReadFileHandler {
             }
         };
 
-        // Check if it's a file (not a directory)
         if !metadata.is_file() {
             let err = crate::cli::actionable_errors::file_not_found(
                 path,
@@ -650,11 +648,8 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_truncated_utf8_boundary() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        // Fill with 2-byte UTF-8 characters (e.g. ¢ = U+00A2 = 2 bytes in UTF-8)
-        // Use a 3-byte character to make the boundary issue more likely
         let ch: char = '€'; // U+20AC = 3 bytes in UTF-8
         let ch_str: String = ch.to_string();
-        // Create content where truncation at 100KB boundary will split a 3-byte char
         let repeat_count = (101 * 1024) / ch_str.len() + 1;
         let data: String = ch_str.repeat(repeat_count);
         temp_file.write_all(data.as_bytes()).unwrap();
@@ -889,7 +884,7 @@ mod tests {
         let anchor_mgr = AnchorStateManager::new();
         let task_id = "test-partial-anchor-task";
 
-        // Read only lines 10-20 (11 lines visible to LLM)
+        // Read only lines 10-20 (11 lines visible to the model)
         let result = handler
             .read_file(
                 temp_file.path().to_str().unwrap(),
@@ -929,7 +924,7 @@ mod tests {
         );
 
         // Verify that an anchor from outside the visible range (e.g., line 50) exists
-        // in the tracked state. This proves the LLM could later edit line 50 even
+        // in the tracked state. This proves the model could later edit line 50 even
         // though it only saw lines 10-20.
         let line_50_anchor = &anchors[49]; // 0-indexed
         assert!(

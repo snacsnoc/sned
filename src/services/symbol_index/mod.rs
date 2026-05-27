@@ -106,8 +106,15 @@ impl SymbolIndexService {
             return;
         }
 
-        self.files.insert(rel_path.clone(), FileIndexEntry { mtime, size, symbols: symbols.clone() });
-        
+        self.files.insert(
+            rel_path.clone(),
+            FileIndexEntry {
+                mtime,
+                size,
+                symbols: symbols.clone(),
+            },
+        );
+
         if let Some(ref mut db) = self.db {
             let _ = db.update_file_symbols(&rel_path, mtime, size, &symbols);
         }
@@ -155,11 +162,15 @@ impl SymbolIndexService {
         self.get_symbols(symbol, Some(SymbolType::Reference), limit)
     }
 
-    pub(crate) fn get_definitions(&self, symbol: &str, limit: Option<usize>) -> Vec<SymbolLocation> {
+    pub(crate) fn get_definitions(
+        &self,
+        symbol: &str,
+        limit: Option<usize>,
+    ) -> Vec<SymbolLocation> {
         self.get_symbols(symbol, Some(SymbolType::Definition), limit)
     }
 
-   pub fn get_project_root(&self) -> &str {
+    pub fn get_project_root(&self) -> &str {
         &self.project_root
     }
 }

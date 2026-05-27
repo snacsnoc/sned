@@ -211,8 +211,7 @@ impl SymbolIndexDatabase {
     pub fn set_dirty(&mut self, dirty: bool) {
         self.dirty = dirty;
     }
-
-    }
+}
 
 fn row_to_symbol_location(row: &rusqlite::Row) -> rusqlite::Result<SymbolLocation> {
     let file_path: String = row.get(0)?;
