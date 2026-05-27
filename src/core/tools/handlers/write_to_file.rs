@@ -2,6 +2,7 @@
 //!
 
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
+use crate::cli::actionable_errors;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
@@ -72,7 +73,23 @@ impl WriteToFileHandler {
 
         self.write_file(path, content)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
+            .map_err(|e| {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    match io_err.kind() {
+                        std::io::ErrorKind::PermissionDenied => {
+                            ToolError::ExecutionFailed(
+                                actionable_errors::permission_denied(path, "write to").to_string(),
+                            )
+                        }
+                        _ => ToolError::ExecutionFailed(format!(
+                            "Failed to write '{}': {}",
+                            path, io_err
+                        )),
+                    }
+                } else {
+                    ToolError::ExecutionFailed(e.to_string())
+                }
+            })
     }
     pub fn new() -> Self {
         Self

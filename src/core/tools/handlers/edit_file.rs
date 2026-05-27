@@ -395,7 +395,8 @@ impl EditFileHandler {
                 {
                     Ok(crate::core::approval::ApprovalResult::Denied) => {
                         return Ok(format!(
-                            "Tool '{}' was denied by user.",
+                            "Tool '{}' was denied by user. Ask the user what approach they would prefer. \
+                             Do not attempt to bypass this denial with alternative tools.",
                             SnedTool::EditFile.name()
                         ));
                     }

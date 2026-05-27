@@ -2129,7 +2129,11 @@ impl AgentLoop {
                                 .await
                                 {
                                     Ok(crate::core::approval::ApprovalResult::Denied) => {
-                                        Some(format!("Tool '{}' was denied by user.", tool_name))
+                                        Some(format!(
+                                            "Tool '{}' was denied by user. Ask the user what approach they would prefer. \
+                                             Do not attempt to bypass this denial with alternative tools.",
+                                            tool_name
+                                        ))
                                     }
                                     Ok(crate::core::approval::ApprovalResult::Always) => {
                                         if let Some(ref am) = self.deps.approval_manager {
@@ -2175,7 +2179,11 @@ impl AgentLoop {
                                     .await
                                     {
                                         Ok(crate::core::approval::ApprovalResult::Denied) => Some(
-                                            format!("Tool '{}' was denied by user.", tool_name),
+                                            format!(
+                                                "Tool '{}' was denied by user. Ask the user what approach they would prefer. \
+                                                 Do not attempt to bypass this denial with alternative tools.",
+                                                tool_name
+                                            ),
                                         ),
                                         Ok(crate::core::approval::ApprovalResult::Always) => {
                                             // User approved unsafe command — future

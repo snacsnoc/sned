@@ -96,9 +96,18 @@ impl ListFilesHandler {
         if recursive {
             self.collect_files_recursive(path_obj, &mut files, &mut hit_limit, include_line_counts)
                 .await;
-        } else {
-            self.collect_files_top_level(path_obj, &mut files, &mut hit_limit, include_line_counts)
-                .await;
+        } else if let Err(e) = self.collect_files_top_level(path_obj, &mut files, &mut hit_limit, include_line_counts)
+                .await {
+            return ListFilesResult {
+                path: path.to_string(),
+                files: Vec::new(),
+                hit_limit: false,
+                success: false,
+                error: Some(format!(
+                    "{}\n  Suggestion: Check permissions, or try list_files on the parent directory.",
+                    e
+                )),
+            };
         }
 
         ListFilesResult {
@@ -116,11 +125,10 @@ impl ListFilesHandler {
         files: &mut Vec<FileInfo>,
         hit_limit: &mut bool,
         include_line_counts: bool,
-    ) {
-        let mut entries = match tokio::fs::read_dir(dir).await {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
+    ) -> Result<(), String> {
+        let mut entries = tokio::fs::read_dir(dir)
+            .await
+            .map_err(|e| format!("Error listing files in {}: {}", dir.display(), e))?;
 
         // Collect file paths first, respecting limit and filters
         let mut file_paths: Vec<(usize, std::path::PathBuf, bool)> = Vec::new();
@@ -191,6 +199,8 @@ impl ListFilesHandler {
             (false, true) => std::cmp::Ordering::Greater,
             _ => a.path.cmp(&b.path),
         });
+
+        Ok(())
     }
 
     async fn collect_files_recursive(
