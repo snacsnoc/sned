@@ -440,7 +440,8 @@ impl EditFileHandler {
         if !prepared_batches.is_empty() && !silent && !explicitly_approved {
             let should_prompt = if let Some(ref am) = self.approval_manager {
                 let mgr = am.lock().await;
-                mgr.should_prompt(SnedTool::EditFile)
+                // EditFile doesn't use command fingerprint (only for execute_command)
+                mgr.should_prompt(SnedTool::EditFile, None)
             } else {
                 // No approval manager configured; skip approval
                 false
@@ -464,7 +465,8 @@ impl EditFileHandler {
                     Ok(crate::core::approval::ApprovalResult::Always) => {
                         if let Some(ref am) = self.approval_manager {
                             let mut mgr = am.lock().await;
-                            mgr.auto_approve(SnedTool::EditFile);
+                            // EditFile doesn't need command fingerprint (only for execute_command)
+                            mgr.auto_approve(SnedTool::EditFile, None);
                         }
                     }
                     Ok(crate::core::approval::ApprovalResult::Approved) => {

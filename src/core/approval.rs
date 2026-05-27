@@ -326,7 +326,11 @@ use crate::cli::output::OutputWriterArc;
 #[derive(Clone, Debug, Default)]
 pub struct ApprovalManager {
     /// Tool names that the user has chosen to auto-approve for this session.
+    /// For execute_command, this means ALL commands are approved (use session_auto_approve_commands instead).
     session_auto_approve: HashSet<String>,
+    /// For execute_command: specific command fingerprints that are auto-approved.
+    /// This provides per-command granularity instead of approving all commands.
+    session_auto_approve_commands: HashSet<String>,
     /// When true, skip all approval prompts (yolo mode).
     yolo_mode: bool,
     /// When true, skip prompts but keep interactive mode.
@@ -392,7 +396,8 @@ impl ApprovalManager {
     ///
     /// Read-only tools and tools already in the session auto-approve list
     /// do not require a prompt. Yolo mode and auto-approve-all also skip prompts.
-    pub fn should_prompt(&self, tool: SnedTool) -> bool {
+    /// For execute_command, command_fingerprint should be provided for per-command approval (F-02 fix).
+    pub fn should_prompt(&self, tool: SnedTool, command_fingerprint: Option<&str>) -> bool {
         let category = tool.category();
         if matches!(category, ToolCategory::ReadOnly | ToolCategory::ReadFiles) {
             return false;
@@ -401,7 +406,8 @@ impl ApprovalManager {
             return false;
         }
         let tool_name = tool.name();
-        !self.session_auto_approve.contains(tool_name)
+        // For execute_command, check per-command approval; otherwise check tool-name approval
+        !self.is_auto_approved(tool_name, command_fingerprint)
     }
 
     /// Check if a tool should prompt for approval, taking the action path
@@ -556,13 +562,28 @@ impl ApprovalManager {
     }
 
     /// Mark a tool as session-auto-approved.
-    pub fn auto_approve(&mut self, tool: SnedTool) {
-        self.session_auto_approve.insert(tool.name().to_string());
+    /// For execute_command, also store the command fingerprint for per-command approval.
+    pub fn auto_approve(&mut self, tool: SnedTool, command_fingerprint: Option<&str>) {
+        let tool_name = tool.name();
+        if tool_name == "execute_command" && let Some(fp) = command_fingerprint {
+            // For execute_command, store the specific command fingerprint (F-02 fix)
+            self.session_auto_approve_commands.insert(fp.to_string());
+        } else {
+            // For other tools, store the tool name (approves all instances of this tool)
+            self.session_auto_approve.insert(tool_name.to_string());
+        }
     }
 
     /// Check if a tool is in the session auto-approve list.
-    pub fn is_auto_approved(&self, tool_name: &str) -> bool {
-        self.session_auto_approve.contains(tool_name)
+    /// For execute_command, also check the command fingerprint.
+    pub fn is_auto_approved(&self, tool_name: &str, command_fingerprint: Option<&str>) -> bool {
+        if tool_name == "execute_command" && let Some(fp) = command_fingerprint {
+            // For execute_command, check if this specific command was approved (F-02 fix)
+            self.session_auto_approve_commands.contains(fp)
+        } else {
+            // For other tools, check if the tool name is approved
+            self.session_auto_approve.contains(tool_name)
+        }
     }
 
     /// Check if yolo mode is enabled.
@@ -1024,22 +1045,22 @@ mod tests {
     #[test]
     fn test_read_only_tools_never_prompt() {
         let manager = ApprovalManager::new();
-        assert!(!manager.should_prompt(SnedTool::ReadFile));
-        assert!(!manager.should_prompt(SnedTool::ListFiles));
-        assert!(!manager.should_prompt(SnedTool::SearchFiles));
-        assert!(!manager.should_prompt(SnedTool::GetFunction));
-        assert!(!manager.should_prompt(SnedTool::DiagnosticsScan));
-        assert!(!manager.should_prompt(SnedTool::UseSkill));
+        assert!(!manager.should_prompt(SnedTool::ReadFile, None));
+        assert!(!manager.should_prompt(SnedTool::ListFiles, None));
+        assert!(!manager.should_prompt(SnedTool::SearchFiles, None));
+        assert!(!manager.should_prompt(SnedTool::GetFunction, None));
+        assert!(!manager.should_prompt(SnedTool::DiagnosticsScan, None));
+        assert!(!manager.should_prompt(SnedTool::UseSkill, None));
     }
 
     #[test]
     fn test_write_tools_prompt_by_default() {
         let manager = ApprovalManager::new();
-        assert!(manager.should_prompt(SnedTool::WriteToFile));
-        assert!(manager.should_prompt(SnedTool::EditFile));
-        assert!(manager.should_prompt(SnedTool::ExecuteCommand));
-        assert!(manager.should_prompt(SnedTool::ReplaceSymbol));
-        assert!(manager.should_prompt(SnedTool::RenameSymbol));
+        assert!(manager.should_prompt(SnedTool::WriteToFile, None));
+        assert!(manager.should_prompt(SnedTool::EditFile, None));
+        assert!(manager.should_prompt(SnedTool::ExecuteCommand, None));
+        assert!(manager.should_prompt(SnedTool::ReplaceSymbol, None));
+        assert!(manager.should_prompt(SnedTool::RenameSymbol, None));
     }
 
     #[test]
@@ -1098,10 +1119,32 @@ mod tests {
     #[test]
     fn test_auto_approve_skips_prompt() {
         let mut manager = ApprovalManager::new();
-        manager.auto_approve(SnedTool::ExecuteCommand);
-        assert!(!manager.should_prompt(SnedTool::ExecuteCommand));
+        // For non-execute_command tools, pass None as fingerprint
+        manager.auto_approve(SnedTool::EditFile, None);
+        assert!(!manager.should_prompt(SnedTool::EditFile, None));
         // Other tools still prompt
-        assert!(manager.should_prompt(SnedTool::WriteToFile));
+        assert!(manager.should_prompt(SnedTool::WriteToFile, None));
+    }
+
+    #[test]
+    fn test_execute_command_per_command_approval() {
+        // SECURITY TEST (F-02): "always approve" should be per-command, not per-tool
+        let mut manager = ApprovalManager::new();
+        
+        // Auto-approve a specific command
+        let cmd1_fp = "ls -la";
+        manager.auto_approve(SnedTool::ExecuteCommand, Some(cmd1_fp));
+        
+        // This specific command should not prompt
+        assert!(!manager.should_prompt(SnedTool::ExecuteCommand, Some(cmd1_fp)));
+        
+        // But a different command SHOULD still prompt
+        let cmd2_fp = "rm -rf /tmp/test";
+        assert!(manager.should_prompt(SnedTool::ExecuteCommand, Some(cmd2_fp)));
+        
+        // Approve the second command
+        manager.auto_approve(SnedTool::ExecuteCommand, Some(cmd2_fp));
+        assert!(!manager.should_prompt(SnedTool::ExecuteCommand, Some(cmd2_fp)));
     }
 
     #[test]
@@ -1170,58 +1213,58 @@ mod tests {
     fn test_yolo_mode_skips_prompts() {
         let manager = ApprovalManager::new().with_yolo(true);
         // Read-only tools still don't prompt
-        assert!(!manager.should_prompt(SnedTool::ReadFile));
+        assert!(!manager.should_prompt(SnedTool::ReadFile, None));
         // Write tools should NOT prompt in yolo mode
-        assert!(!manager.should_prompt(SnedTool::WriteToFile));
-        assert!(!manager.should_prompt(SnedTool::EditFile));
-        assert!(!manager.should_prompt(SnedTool::ExecuteCommand));
-        assert!(!manager.should_prompt(SnedTool::ReplaceSymbol));
-        assert!(!manager.should_prompt(SnedTool::RenameSymbol));
+        assert!(!manager.should_prompt(SnedTool::WriteToFile, None));
+        assert!(!manager.should_prompt(SnedTool::EditFile, None));
+        assert!(!manager.should_prompt(SnedTool::ExecuteCommand, None));
+        assert!(!manager.should_prompt(SnedTool::ReplaceSymbol, None));
+        assert!(!manager.should_prompt(SnedTool::RenameSymbol, None));
     }
 
     #[test]
     fn test_auto_approve_all_skips_all_prompts() {
         let manager = ApprovalManager::new().with_auto_approve_all(true);
         // Read-only tools still don't prompt
-        assert!(!manager.should_prompt(SnedTool::ReadFile));
+        assert!(!manager.should_prompt(SnedTool::ReadFile, None));
         // Write tools should NOT prompt in auto-approve-all mode
-        assert!(!manager.should_prompt(SnedTool::WriteToFile));
-        assert!(!manager.should_prompt(SnedTool::EditFile));
-        assert!(!manager.should_prompt(SnedTool::ExecuteCommand));
-        assert!(!manager.should_prompt(SnedTool::ReplaceSymbol));
-        assert!(!manager.should_prompt(SnedTool::RenameSymbol));
+        assert!(!manager.should_prompt(SnedTool::WriteToFile, None));
+        assert!(!manager.should_prompt(SnedTool::EditFile, None));
+        assert!(!manager.should_prompt(SnedTool::ExecuteCommand, None));
+        assert!(!manager.should_prompt(SnedTool::ReplaceSymbol, None));
+        assert!(!manager.should_prompt(SnedTool::RenameSymbol, None));
     }
 
     #[test]
     fn test_non_yolo_mode_prompts_for_write_tools() {
         let manager = ApprovalManager::new().with_yolo(false);
-        assert!(manager.should_prompt(SnedTool::ExecuteCommand));
-        assert!(manager.should_prompt(SnedTool::WriteToFile));
+        assert!(manager.should_prompt(SnedTool::ExecuteCommand, None));
+        assert!(manager.should_prompt(SnedTool::WriteToFile, None));
     }
 
     #[test]
     fn test_non_auto_approve_all_mode_prompts_for_write_tools() {
         let manager = ApprovalManager::new().with_auto_approve_all(false);
-        assert!(manager.should_prompt(SnedTool::ExecuteCommand));
-        assert!(manager.should_prompt(SnedTool::WriteToFile));
+        assert!(manager.should_prompt(SnedTool::ExecuteCommand, None));
+        assert!(manager.should_prompt(SnedTool::WriteToFile, None));
     }
 
     #[test]
     fn test_yolo_mode_does_not_affect_read_only() {
         let manager = ApprovalManager::new().with_yolo(true);
         // Read-only tools were already not prompting
-        assert!(!manager.should_prompt(SnedTool::ReadFile));
-        assert!(!manager.should_prompt(SnedTool::ListFiles));
-        assert!(!manager.should_prompt(SnedTool::SearchFiles));
+        assert!(!manager.should_prompt(SnedTool::ReadFile, None));
+        assert!(!manager.should_prompt(SnedTool::ListFiles, None));
+        assert!(!manager.should_prompt(SnedTool::SearchFiles, None));
     }
 
     #[test]
     fn test_session_auto_approve_plus_yolo() {
         // Session auto-approve + yolo: yolo wins, but both work
         let mut manager = ApprovalManager::new().with_yolo(true);
-        manager.auto_approve(SnedTool::ExecuteCommand);
-        assert!(!manager.should_prompt(SnedTool::ExecuteCommand));
-        assert!(!manager.should_prompt(SnedTool::WriteToFile));
+        manager.auto_approve(SnedTool::ExecuteCommand, None);
+        assert!(!manager.should_prompt(SnedTool::ExecuteCommand, None));
+        assert!(!manager.should_prompt(SnedTool::WriteToFile, None));
     }
 
     #[test]
@@ -1354,7 +1397,7 @@ mod tests {
     fn test_per_path_session_auto_approve_respected() {
         let mut manager =
             ApprovalManager::new().with_workspace_root("/home/user/project".to_string());
-        manager.auto_approve(SnedTool::EditFile);
+        manager.auto_approve(SnedTool::EditFile, None);
         // Session auto-approve for local write: no prompt
         assert!(
             !manager.should_prompt_with_path(

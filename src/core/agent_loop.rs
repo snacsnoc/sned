@@ -2238,7 +2238,13 @@ impl AgentLoop {
                                 // Check if any action paths require prompting
                                 let needs_prompt = if action_paths.is_empty() {
                                     // No paths (e.g., execute_command): check tool-level approval
-                                    mgr.should_prompt(tool)
+                                    // For execute_command, pass command fingerprint for per-command approval (F-02 fix)
+                                    let cmd_fp = if tool_name == "execute_command" {
+                                        Some(params_fingerprint.as_str())
+                                    } else {
+                                        None
+                                    };
+                                    mgr.should_prompt(tool, cmd_fp)
                                 } else {
                                     // Has paths: check per-path approval
                                     action_paths
@@ -2280,7 +2286,13 @@ impl AgentLoop {
                                         Ok(crate::core::approval::ApprovalResult::Always) => {
                                             if let Some(ref am) = self.deps.approval_manager {
                                                 let mut mgr = am.lock().await;
-                                                mgr.auto_approve(tool);
+                                                // For execute_command, pass command fingerprint for per-command approval (F-02 fix)
+                                                let cmd_fp = if tool_name == "execute_command" {
+                                                    Some(params_fingerprint.as_str())
+                                                } else {
+                                                    None
+                                                };
+                                                mgr.auto_approve(tool, cmd_fp);
                                             }
                                             None // Proceed to execute
                                         }
@@ -2352,7 +2364,13 @@ impl AgentLoop {
                                                 // auto-approves skip safety for this tool.
                                                 if let Some(ref am) = self.deps.approval_manager {
                                                     let mut mgr = am.lock().await;
-                                                    mgr.auto_approve(tool);
+                                                    // For execute_command, pass command fingerprint for per-command approval (F-02 fix)
+                                                    let cmd_fp = if tool_name == "execute_command" {
+                                                        Some(params_fingerprint.as_str())
+                                                    } else {
+                                                        None
+                                                    };
+                                                    mgr.auto_approve(tool, cmd_fp);
                                                 }
                                                 None
                                             }
