@@ -12,10 +12,13 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
 use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits};
-use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard};
+use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard, FileEditorError};
 use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes};
 use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
-use crate::core::tools::{SnedTool, ToolContext, ToolError, ToolHandler};
+use crate::core::tools::{
+    SnedTool, ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
+    ToolRequiredNextStep,
+};
 use crate::services::symbol_index::SymbolIndexService;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -137,14 +140,22 @@ impl EditFileHandler {
     ///
     /// This is a pre-validation check that runs BEFORE sending to the model.
     /// It catches the common mistake of calling edit_file without read_file first.
-    fn validate_anchors(&self, files: &[serde_json::Value]) -> Result<(), ToolError> {
+    fn validate_anchors(
+        &self,
+        files: &[serde_json::Value],
+        workspace_root: &Path,
+    ) -> Result<(), ToolError> {
         let mut invalid_anchors = Vec::new();
+        let mut affected_paths = Vec::new();
 
         for file in files {
             let path = file
                 .get("path")
                 .and_then(|p| p.as_str())
                 .unwrap_or("unknown");
+            if let Ok(resolved) = self.resolve_path(workspace_root, path) {
+                affected_paths.push(resolved);
+            }
 
             let edits = file
                 .get("edits")
@@ -194,10 +205,52 @@ impl EditFileHandler {
             message.push_str(&invalid_anchors.join("\n"));
             message.push_str("\n\nExample of CORRECT anchor: \"Crawler§void draw_game_over() {\"");
             message.push_str("\nExample of WRONG anchor: \"void draw_game_over() {\"");
-            return Err(ToolError::InvalidInput(message));
+            affected_paths.sort();
+            affected_paths.dedup();
+            return Err(ToolError::InvalidInputWithMetadata(
+                message,
+                ToolFailureMetadata {
+                    class: ToolFailureClass::AnchorInvalid,
+                    affected_paths,
+                    required_next_step: Some(ToolRequiredNextStep::ReadFile),
+                },
+            ));
         }
 
         Ok(())
+    }
+
+    fn mark_must_reread(state: &mut TaskState, path: &str) {
+        state.must_reread_before_edit.insert(path.to_string());
+        state.file_content_cache.pop(path);
+    }
+
+    fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
+        ToolError::ExecutionFailedWithMetadata(
+            format!(
+                "You must re-read {} before retrying edit_file. A previous edit attempt proved the anchors or file state were stale.",
+                display_path
+            ),
+            ToolFailureMetadata {
+                class: ToolFailureClass::AnchorInvalid,
+                affected_paths: vec![absolute_path.to_string()],
+                required_next_step: Some(ToolRequiredNextStep::ReadFile),
+            },
+        )
+    }
+
+    fn external_modification_error(display_path: &str, absolute_path: &str) -> ToolError {
+        ToolError::ExecutionFailedWithMetadata(
+            format!(
+                "File {} was modified externally during edit operation. Aborting write to prevent data loss. Re-read the file and retry.",
+                display_path
+            ),
+            ToolFailureMetadata {
+                class: ToolFailureClass::AnchorInvalid,
+                affected_paths: vec![absolute_path.to_string()],
+                required_next_step: Some(ToolRequiredNextStep::ReadFile),
+            },
+        )
     }
 }
 
@@ -224,7 +277,7 @@ impl EditFileHandler {
             return Err(ToolError::InvalidInput("No files provided".to_string()));
         }
 
-        self.validate_anchors(files)?;
+        self.validate_anchors(files, workspace_root)?;
 
         let parsed = self.parse_edits(files)?;
         let processor = BatchProcessor::new(DiffMode::Full);
@@ -256,6 +309,13 @@ impl EditFileHandler {
 
         // Phase 1: Prepare all batches and collect diff previews
         for batch in batches {
+            if state.must_reread_before_edit.contains(&batch.absolute_path) {
+                return Err(Self::reread_required_error(
+                    &batch.display_path,
+                    &batch.absolute_path,
+                ));
+            }
+
             // Acquire exclusive file lock to prevent concurrent edits
             let _file_guard = FileEditGuard::acquire(&batch.absolute_path).await;
 
@@ -350,6 +410,9 @@ impl EditFileHandler {
             ) {
                 Ok(p) => p,
                 Err(e) => {
+                    if matches!(e, FileEditorError::AllEditsFailed { .. }) {
+                        Self::mark_must_reread(state, &batch.absolute_path);
+                    }
                     all_results.push(format!(
                         "Error preparing edits for {}: {}",
                         batch.display_path, e
@@ -394,10 +457,8 @@ impl EditFileHandler {
                 .await
                 {
                     Ok(crate::core::approval::ApprovalResult::Denied) => {
-                        return Ok(format!(
-                            "Tool '{}' was denied by user. Ask the user what approach they would prefer. \
-                             Do not attempt to bypass this denial with alternative tools.",
-                            SnedTool::EditFile.name()
+                        return Ok(crate::core::approval::format_denial_message(
+                            SnedTool::EditFile.name(),
                         ));
                     }
                     Ok(crate::core::approval::ApprovalResult::Always) => {
@@ -499,6 +560,10 @@ impl EditFileHandler {
         for (batch, mut prepared) in prepared_batches {
             let result =
                 processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
+
+            if !prepared.failed_edits.is_empty() {
+                Self::mark_must_reread(state, &batch.absolute_path);
+            }
 
             total_applied += result.resolved_count;
             total_failed += result.failed_count;
@@ -617,11 +682,11 @@ impl EditFileHandler {
                                 tracing::error!("Failed to rollback file {}: {}", path, re);
                             }
                         }
-                        return Err(ToolError::ExecutionFailed(format!(
-                            "File {} was modified externally during edit operation. \
-                             Aborting write to prevent data loss. Re-read the file and retry.",
-                            item.display_path
-                        )));
+                        Self::mark_must_reread(state, &item.absolute_path);
+                        return Err(Self::external_modification_error(
+                            &item.display_path,
+                            &item.absolute_path,
+                        ));
                     }
 
                     tracing::debug!(
@@ -669,11 +734,11 @@ impl EditFileHandler {
                                 tracing::error!("Failed to rollback file {}: {}", path, re);
                             }
                         }
-                        return Err(ToolError::ExecutionFailed(format!(
-                            "File {} was modified externally during edit operation. \
-                             Aborting write to prevent data loss. Re-read the file and retry.",
-                            item.display_path
-                        )));
+                        Self::mark_must_reread(state, &item.absolute_path);
+                        return Err(Self::external_modification_error(
+                            &item.display_path,
+                            &item.absolute_path,
+                        ));
                     }
 
                     state.insert_file_content(

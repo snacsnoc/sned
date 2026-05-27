@@ -8,7 +8,10 @@
 //! - Return formatted file listing
 
 use crate::core::agent_loop::TaskState;
-use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use crate::core::tools::{
+    ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
+    resolve_sanitized_path,
+};
 use async_trait::async_trait;
 use futures::future::join_all;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -34,6 +37,7 @@ struct ListFilesResult {
     hit_limit: bool,
     success: bool,
     error: Option<String>,
+    warning: Option<String>,
 }
 
 /// List files tool handler.
@@ -65,6 +69,7 @@ impl ListFilesHandler {
                     "Error listing files in {}: path does not exist",
                     path
                 )),
+                warning: None,
             };
         }
 
@@ -86,6 +91,7 @@ impl ListFilesHandler {
                 hit_limit: false,
                 success: true,
                 error: None,
+                warning: None,
             };
         }
 
@@ -93,11 +99,18 @@ impl ListFilesHandler {
         let mut files = Vec::new();
         let mut hit_limit = false;
 
-        if recursive {
+        let warning = if recursive {
             self.collect_files_recursive(path_obj, &mut files, &mut hit_limit, include_line_counts)
-                .await;
-        } else if let Err(e) = self.collect_files_top_level(path_obj, &mut files, &mut hit_limit, include_line_counts)
-                .await {
+                .await
+        } else {
+            self.collect_files_top_level(path_obj, &mut files, &mut hit_limit, include_line_counts)
+                .await
+                .map(|()| None)
+        };
+
+        let warning = match warning {
+            Ok(warning) => warning,
+            Err(e) => {
             return ListFilesResult {
                 path: path.to_string(),
                 files: Vec::new(),
@@ -107,8 +120,10 @@ impl ListFilesHandler {
                     "{}\n  Suggestion: Check permissions, or try list_files on the parent directory.",
                     e
                 )),
+                warning: None,
             };
-        }
+            }
+        };
 
         ListFilesResult {
             path: path.to_string(),
@@ -116,6 +131,7 @@ impl ListFilesHandler {
             hit_limit,
             success: true,
             error: None,
+            warning,
         }
     }
 
@@ -135,7 +151,18 @@ impl ListFilesHandler {
         let mut dir_entries: Vec<FileInfo> = Vec::new();
         let mut file_index = 0;
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(format!(
+                        "Error reading entry in {}: {}",
+                        dir.display(),
+                        e
+                    ));
+                }
+            };
             let path = entry.path();
             let is_directory = path.is_dir();
 
@@ -209,7 +236,7 @@ impl ListFilesHandler {
         files: &mut Vec<FileInfo>,
         hit_limit: &mut bool,
         include_line_counts: bool,
-    ) {
+    ) -> Result<Option<String>, String> {
         // Wrap blocking walkdir traversal in spawn_blocking to avoid blocking tokio worker
         let walk_result = tokio::task::spawn_blocking({
             let dir = dir.to_path_buf();
@@ -218,11 +245,23 @@ impl ListFilesHandler {
                 let mut file_paths: Vec<(usize, std::path::PathBuf)> = Vec::new();
                 let mut dir_entries: Vec<FileInfo> = Vec::new();
                 let mut file_index = 0;
+                let mut walk_error: Option<String> = None;
+                let mut root_failed = false;
 
                 while let Some(entry) = walker.next() {
                     let entry = match entry {
                         Ok(e) => e,
-                        Err(_) => continue,
+                        Err(e) => {
+                            // Only record the first error; keep walking to collect what we can
+                            if walk_error.is_none() {
+                                walk_error = Some(format!(
+                                    "Error reading directory entry: {}",
+                                    e
+                                ));
+                                root_failed = file_paths.is_empty() && dir_entries.is_empty();
+                            }
+                            continue;
+                        }
                     };
 
                     let path = entry.path();
@@ -254,7 +293,7 @@ impl ListFilesHandler {
                     }
 
                     if file_paths.len() + dir_entries.len() >= MAX_FILES_LIMIT {
-                        return (file_paths, dir_entries, true);
+                        return (file_paths, dir_entries, true, walk_error, root_failed);
                     }
 
                     if entry.file_type().is_dir() {
@@ -269,15 +308,24 @@ impl ListFilesHandler {
                     }
                 }
 
-                (file_paths, dir_entries, false)
+                (file_paths, dir_entries, false, walk_error, root_failed)
             }
         })
         .await
         .unwrap_or_default();
 
-        let (file_paths, dir_entries, hit_limit_walk) = walk_result;
+        let (file_paths, dir_entries, hit_limit_walk, walk_error, root_failed) = walk_result;
         if hit_limit_walk {
             *hit_limit = true;
+        }
+        if root_failed {
+            let err = walk_error.unwrap_or_else(|| {
+                format!(
+                    "Error listing files in {}: recursive traversal failed at the root",
+                    dir.display()
+                )
+            });
+            return Err(err);
         }
 
         // Parallel line counting for files
@@ -306,11 +354,19 @@ impl ListFilesHandler {
             (false, true) => std::cmp::Ordering::Greater,
             _ => a.path.cmp(&b.path),
         });
+
+        Ok(walk_error.map(|err| {
+            format!(
+                "Warning: Recursive listing skipped one or more entries in {}: {}",
+                dir.display(),
+                err
+            )
+        }))
     }
 
     /// Format files list as a string.
     ///
-    fn format_files_list(&self, files: &[FileInfo], hit_limit: bool) -> String {
+    fn format_files_list(&self, files: &[FileInfo], hit_limit: bool, warning: Option<&str>) -> String {
         if files.is_empty() {
             return "(empty directory)".to_string();
         }
@@ -339,6 +395,10 @@ impl ListFilesHandler {
                 "\n(Listing limited to {} files. Use recursive listing or refine your search.)",
                 MAX_FILES_LIMIT
             ));
+        }
+
+        if let Some(warning) = warning {
+            lines.push(format!("\n({warning})"));
         }
 
         lines.join("\n")
@@ -373,10 +433,19 @@ impl ListFilesHandler {
             )
             .await;
         if result.success {
-            Ok(self.format_files_list(&result.files, result.hit_limit))
+            Ok(self.format_files_list(
+                &result.files,
+                result.hit_limit,
+                result.warning.as_deref(),
+            ))
         } else {
-            Err(ToolError::ExecutionFailed(
+            Err(ToolError::ExecutionFailedWithMetadata(
                 result.error.unwrap_or_else(|| "Unknown error".to_string()),
+                ToolFailureMetadata {
+                    class: ToolFailureClass::RootListingFailed,
+                    affected_paths: vec![sanitized_path.to_string_lossy().to_string()],
+                    required_next_step: None,
+                },
             ))
         }
     }
@@ -456,6 +525,8 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn test_list_files_top_level() {
@@ -595,6 +666,49 @@ mod tests {
         assert!(result.error.is_some());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_recursive_root_failure_returns_explicit_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let blocked_dir = temp_dir.path().join("blocked");
+        fs::create_dir(&blocked_dir).unwrap();
+        fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let handler = ListFilesHandler::new();
+        let result = handler
+            .list_directory_with_line_counts(blocked_dir.to_str().unwrap(), true, false)
+            .await;
+
+        fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert!(result.warning.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_recursive_partial_traversal_reports_warning() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("visible.txt"), "content").unwrap();
+        let blocked_dir = temp_dir.path().join("blocked");
+        fs::create_dir(&blocked_dir).unwrap();
+        fs::write(blocked_dir.join("hidden.txt"), "content").unwrap();
+        fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let handler = ListFilesHandler::new();
+        let result = handler
+            .list_directory_with_line_counts(temp_dir.path().to_str().unwrap(), true, false)
+            .await;
+
+        fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.files.len(), 2);
+        assert!(result.warning.is_some());
+        assert!(result.files.iter().any(|f| f.path.ends_with("visible.txt")));
+    }
+
     #[test]
     fn test_format_files_list() {
         let handler = ListFilesHandler::new();
@@ -611,7 +725,7 @@ mod tests {
             },
         ];
 
-        let formatted = handler.format_files_list(&files, false);
+        let formatted = handler.format_files_list(&files, false, None);
         assert!(formatted.contains("📁 dir"));
         assert!(formatted.contains("📄 file.txt"));
         assert!(formatted.contains("(42 lines)"));
@@ -620,7 +734,7 @@ mod tests {
     #[test]
     fn test_format_files_list_empty() {
         let handler = ListFilesHandler::new();
-        let formatted = handler.format_files_list(&[], false);
+        let formatted = handler.format_files_list(&[], false, None);
         assert_eq!(formatted, "(empty directory)");
     }
 
@@ -770,5 +884,45 @@ mod tests {
             Some(Some(6))
         );
         assert!(file_counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_files_permission_denied_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let locked_dir = temp_dir.path().join("locked");
+        fs::create_dir(&locked_dir).unwrap();
+
+        // Remove read permission
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let handler = ListFilesHandler::new();
+        let result = handler
+            .list_directory_with_line_counts(locked_dir.to_str().unwrap(), false, true)
+            .await;
+
+        // Restore permissions so TempDir can clean up
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert!(!result.success, "should fail on permission-denied directory");
+        assert!(result.error.is_some(), "should have an error message");
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("Permission denied") || err.contains("denied") || err.contains("Error listing"),
+            "error should describe the failure: {}",
+            err
+        );
+        assert!(
+            err.contains("Suggestion"),
+            "error should include actionable suggestion: {}",
+            err
+        );
     }
 }

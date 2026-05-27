@@ -590,6 +590,17 @@ pub enum ApprovalResult {
     Always,
 }
 
+/// Format the standard denial message for a tool.
+///
+/// Centralizes the wording so agent_loop and tool handlers stay in sync.
+pub fn format_denial_message(tool_name: &str) -> String {
+    format!(
+        "Tool '{}' was denied by user. Ask the user what approach they would prefer. \
+         Do not attempt to bypass this denial with alternative tools.",
+        tool_name
+    )
+}
+
 /// Format tool parameters for display in approval prompts.
 ///
 /// Returns a multi-line string with human-readable parameter formatting
