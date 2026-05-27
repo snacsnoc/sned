@@ -73,30 +73,26 @@ impl WriteToFileHandler {
             ));
         }
 
-        self.write_file(path, content)
-            .await
-            .map_err(|e| {
-                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    match io_err.kind() {
-                        std::io::ErrorKind::PermissionDenied => {
-                            ToolError::ExecutionFailedWithMetadata(
-                                actionable_errors::permission_denied(path, "write to").to_string(),
-                                ToolFailureMetadata {
-                                    class: ToolFailureClass::PermissionDenied,
-                                    affected_paths: vec![path.to_string()],
-                                    required_next_step: None,
-                                },
-                            )
-                        }
-                        _ => ToolError::ExecutionFailed(format!(
-                            "Failed to write '{}': {}",
-                            path, io_err
-                        )),
-                    }
-                } else {
-                    ToolError::ExecutionFailed(e.to_string())
+        self.write_file(path, content).await.map_err(|e| {
+            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                match io_err.kind() {
+                    std::io::ErrorKind::PermissionDenied => ToolError::ExecutionFailedWithMetadata(
+                        actionable_errors::permission_denied(path, "write to").to_string(),
+                        ToolFailureMetadata {
+                            class: ToolFailureClass::PermissionDenied,
+                            affected_paths: vec![path.to_string()],
+                            required_next_step: None,
+                        },
+                    ),
+                    _ => ToolError::ExecutionFailed(format!(
+                        "Failed to write '{}': {}",
+                        path, io_err
+                    )),
                 }
-            })
+            } else {
+                ToolError::ExecutionFailed(e.to_string())
+            }
+        })
     }
     pub fn new() -> Self {
         Self

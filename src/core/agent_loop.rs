@@ -2217,7 +2217,10 @@ impl AgentLoop {
                                             None // Proceed to execute
                                         }
                                         Err(e) => Some(ToolExecutionOutput::error(
-                                            format!("Approval error for tool '{}': {}", tool_name, e),
+                                            format!(
+                                                "Approval error for tool '{}': {}",
+                                                tool_name, e
+                                            ),
                                             None,
                                         )),
                                     }
@@ -2228,20 +2231,17 @@ impl AgentLoop {
                                     // shouldAutoApprove = isSafe && autoApproveEnabled).
                                     let commands =
                                         coerce_string_array(&tool_params, "commands", "command");
-                                    let script =
-                                        tool_params.get("script").and_then(|s| s.as_str());
+                                    let script = tool_params.get("script").and_then(|s| s.as_str());
                                     let yolo = mgr.is_yolo_mode();
                                     let user_safe = mgr.get_user_safe_commands().clone();
                                     let checker =
                                         crate::core::approval::CommandSafetyChecker::new()
                                             .with_yolo(yolo)
                                             .with_user_safe_commands(user_safe);
-                                    let any_unsafe = commands
-                                        .iter()
-                                        .any(|cmd| {
-                                            !cmd.is_empty() && checker.is_safe(cmd).is_err()
-                                        })
-                                        || script.is_some_and(|s| checker.is_safe(s).is_err());
+                                    let any_unsafe = commands.iter().any(|cmd| {
+                                        !cmd.is_empty() && checker.is_safe(cmd).is_err()
+                                    }) || script
+                                        .is_some_and(|s| checker.is_safe(s).is_err());
                                     if any_unsafe {
                                         // Auto-approved but unsafe — override auto-approval and prompt the user
                                         drop(mgr);
@@ -2259,8 +2259,8 @@ impl AgentLoop {
                                                     crate::core::agent_types::DeniedToolAction {
                                                         tool_name: tool_name.clone(),
                                                         action_paths: action_paths.clone(),
-                                                        params_fingerprint:
-                                                            params_fingerprint.clone(),
+                                                        params_fingerprint: params_fingerprint
+                                                            .clone(),
                                                     },
                                                 );
                                                 Some(ToolExecutionOutput::error(
@@ -2402,7 +2402,10 @@ impl AgentLoop {
             // Each edit_file call is stored with ALL its paths to detect overlaps
             type EditGroup = (
                 std::collections::HashSet<String>,
-                Vec<(usize, futures::future::BoxFuture<'static, ToolExecutionOutput>)>,
+                Vec<(
+                    usize,
+                    futures::future::BoxFuture<'static, ToolExecutionOutput>,
+                )>,
             );
             let mut edit_groups: Vec<EditGroup> = Vec::new();
             for (i, (_, tool_name, _, task, edit_file_paths)) in tool_tasks.iter_mut().enumerate() {
@@ -2501,14 +2504,9 @@ impl AgentLoop {
                     result_text
                 } else {
                     // Parallel execution result
-                    parallel_results_iter
-                        .next()
-                        .unwrap_or_else(|| {
-                            ToolExecutionOutput::error(
-                                "Tool execution failed".to_string(),
-                                None,
-                            )
-                        })
+                    parallel_results_iter.next().unwrap_or_else(|| {
+                        ToolExecutionOutput::error("Tool execution failed".to_string(), None)
+                    })
                 };
 
                 // Display compact tool result in TTY mode
@@ -3003,9 +3001,9 @@ impl AgentLoop {
                     .collect();
                 serde_json::Value::Object(ordered.into_iter().collect())
             }
-            serde_json::Value::Array(items) => serde_json::Value::Array(
-                items.iter().map(Self::canonicalize_tool_params).collect(),
-            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(Self::canonicalize_tool_params).collect())
+            }
             other => other.clone(),
         }
     }
@@ -5097,6 +5095,39 @@ mod tests {
         let params = serde_json::json!({});
         let paths = AgentLoop::extract_action_path(SnedTool::ReadFile, &params);
         assert_eq!(paths, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_tool_params_fingerprint_is_stable_across_object_key_order() {
+        let left = serde_json::json!({
+            "path": "src/main.rs",
+            "options": {"end": 10, "start": 1}
+        });
+        let right = serde_json::json!({
+            "options": {"start": 1, "end": 10},
+            "path": "src/main.rs"
+        });
+
+        assert_eq!(
+            AgentLoop::tool_params_fingerprint(&left),
+            AgentLoop::tool_params_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn test_reread_recovery_hint_lists_stale_paths() {
+        let mut state = TaskState::default();
+        state
+            .must_reread_before_edit
+            .insert("/tmp/a.rs".to_string());
+        state
+            .must_reread_before_edit
+            .insert("/tmp/b.rs".to_string());
+
+        let hint = AgentLoop::reread_recovery_hint(&state).expect("hint should be present");
+        assert!(hint.contains("read_file"));
+        assert!(hint.contains("/tmp/a.rs"));
+        assert!(hint.contains("/tmp/b.rs"));
     }
 
     #[test]

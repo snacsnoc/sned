@@ -1259,6 +1259,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_edit_file_blocks_path_marked_for_reread() {
+        let _guard = TEST_MUTEX.lock().await;
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir().canonicalize().unwrap();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_edit_reread_block_{}.txt", rand_suffix));
+        let raw_content = "Hello World\nThis is a test\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(file_path.to_string_lossy().to_string());
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path.strip_prefix(&temp_dir).unwrap().to_string_lossy().to_string(),
+                "edits": [{
+                    "anchor": format!("{}§Hello World", anchors[0]),
+                    "end_anchor": format!("{}§Hello World", anchors[0]),
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state,
+            None,
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        let err = result.expect_err("edit_file should block until read_file clears reread state");
+        assert!(err.to_string().contains("must re-read"));
+        assert_eq!(
+            err.metadata().map(|metadata| &metadata.class),
+            Some(&ToolFailureClass::AnchorInvalid)
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_marks_reread_after_anchor_invalidation() {
+        let _guard = TEST_MUTEX.lock().await;
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir().canonicalize().unwrap();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_edit_anchor_invalid_{}.txt", rand_suffix));
+        let raw_content = "Hello World\nThis is a test\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        tokio::fs::write(&file_path, "Changed\nThis is a test\n")
+            .await
+            .unwrap();
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path.strip_prefix(&temp_dir).unwrap().to_string_lossy().to_string(),
+                "edits": [{
+                    "anchor": format!("{}§Hello World", anchors[0]),
+                    "end_anchor": format!("{}§Hello World", anchors[0]),
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await.unwrap();
+        assert!(result.as_str().unwrap().contains("Error preparing edits"));
+        assert!(
+            state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&file_path.to_string_lossy().to_string())
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_stale_warning_does_not_block_valid_anchors() {
+        let _guard = TEST_MUTEX.lock().await;
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir().canonicalize().unwrap();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_edit_stale_warning_{}.txt", rand_suffix));
+        let raw_content = "Hello World\nThis is a test\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        {
+            let mut state_guard = state.lock().await;
+            state_guard.file_context_tracker.track_file_read(&file_path);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        tokio::fs::write(&file_path, "Hello World\nThis is a test\nTrailing line\n")
+            .await
+            .unwrap();
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path.strip_prefix(&temp_dir).unwrap().to_string_lossy().to_string(),
+                "edits": [{
+                    "anchor": format!("{}§Hello World", anchors[0]),
+                    "end_anchor": format!("{}§Hello World", anchors[0]),
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            temp_dir,
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await.unwrap();
+        assert!(
+            result
+                .as_str()
+                .unwrap()
+                .contains("Applied 1 edit(s) successfully")
+        );
+        assert!(
+            !state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&file_path.to_string_lossy().to_string())
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
     async fn test_consecutive_mistakes_unchanged_when_no_edits() {
         let _guard = TEST_MUTEX.lock().await;
         let handler = EditFileHandler::new();

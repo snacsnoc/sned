@@ -111,17 +111,17 @@ impl ListFilesHandler {
         let warning = match warning {
             Ok(warning) => warning,
             Err(e) => {
-            return ListFilesResult {
-                path: path.to_string(),
-                files: Vec::new(),
-                hit_limit: false,
-                success: false,
-                error: Some(format!(
-                    "{}\n  Suggestion: Check permissions, or try list_files on the parent directory.",
-                    e
-                )),
-                warning: None,
-            };
+                return ListFilesResult {
+                    path: path.to_string(),
+                    files: Vec::new(),
+                    hit_limit: false,
+                    success: false,
+                    error: Some(format!(
+                        "{}\n  Suggestion: Check permissions, or try list_files on the parent directory.",
+                        e
+                    )),
+                    warning: None,
+                };
             }
         };
 
@@ -156,11 +156,7 @@ impl ListFilesHandler {
                 Ok(Some(entry)) => entry,
                 Ok(None) => break,
                 Err(e) => {
-                    return Err(format!(
-                        "Error reading entry in {}: {}",
-                        dir.display(),
-                        e
-                    ));
+                    return Err(format!("Error reading entry in {}: {}", dir.display(), e));
                 }
             };
             let path = entry.path();
@@ -254,10 +250,7 @@ impl ListFilesHandler {
                         Err(e) => {
                             // Only record the first error; keep walking to collect what we can
                             if walk_error.is_none() {
-                                walk_error = Some(format!(
-                                    "Error reading directory entry: {}",
-                                    e
-                                ));
+                                walk_error = Some(format!("Error reading directory entry: {}", e));
                                 root_failed = file_paths.is_empty() && dir_entries.is_empty();
                             }
                             continue;
@@ -366,7 +359,12 @@ impl ListFilesHandler {
 
     /// Format files list as a string.
     ///
-    fn format_files_list(&self, files: &[FileInfo], hit_limit: bool, warning: Option<&str>) -> String {
+    fn format_files_list(
+        &self,
+        files: &[FileInfo],
+        hit_limit: bool,
+        warning: Option<&str>,
+    ) -> String {
         if files.is_empty() {
             return "(empty directory)".to_string();
         }
@@ -433,11 +431,7 @@ impl ListFilesHandler {
             )
             .await;
         if result.success {
-            Ok(self.format_files_list(
-                &result.files,
-                result.hit_limit,
-                result.warning.as_deref(),
-            ))
+            Ok(self.format_files_list(&result.files, result.hit_limit, result.warning.as_deref()))
         } else {
             Err(ToolError::ExecutionFailedWithMetadata(
                 result.error.unwrap_or_else(|| "Unknown error".to_string()),
@@ -524,9 +518,9 @@ async fn count_lines_fast(path: &Path) -> Option<usize> {
 mod tests {
     use super::*;
     use std::fs;
-    use tempfile::TempDir;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_list_files_top_level() {
@@ -911,11 +905,16 @@ mod tests {
             fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        assert!(!result.success, "should fail on permission-denied directory");
+        assert!(
+            !result.success,
+            "should fail on permission-denied directory"
+        );
         assert!(result.error.is_some(), "should have an error message");
         let err = result.error.unwrap();
         assert!(
-            err.contains("Permission denied") || err.contains("denied") || err.contains("Error listing"),
+            err.contains("Permission denied")
+                || err.contains("denied")
+                || err.contains("Error listing"),
             "error should describe the failure: {}",
             err
         );

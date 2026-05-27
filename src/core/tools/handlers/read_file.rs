@@ -382,6 +382,7 @@ impl ReadFileHandler {
             if res.success {
                 let path = std::path::Path::new(path_str);
                 state.file_context_tracker.track_file_read(path);
+                state.must_reread_before_edit.remove(path_str);
             }
         }
     }
@@ -572,6 +573,49 @@ mod tests {
         assert!(
             warning.is_some(),
             "expected dispatched read_file to record the file for stale-context tracking"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatched_read_file_clears_reread_requirement() {
+        let workspace_root = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::tempdir_in(&workspace_root).unwrap();
+        let file_path = temp_dir.path().join("test_reread_clear.txt");
+        std::fs::write(&file_path, "Hello, world!\n").unwrap();
+
+        let handler = ReadFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(file_path.to_string_lossy().to_string());
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            workspace_root,
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let _ = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({"paths": [file_path.to_str().unwrap()]}),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&file_path.to_string_lossy().to_string())
         );
     }
 

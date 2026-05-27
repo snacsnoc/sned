@@ -5,6 +5,7 @@
 use crate::core::context::context_manager::ApiReqInfo;
 use crate::providers::Provider;
 use lru::LruCache;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -29,6 +30,14 @@ pub struct SnippedCodeBlock {
     pub index: usize,
     pub language: String,
     pub code: String,
+}
+
+/// Exact denied tool action fingerprint for the current recovery context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeniedToolAction {
+    pub tool_name: String,
+    pub action_paths: Vec<String>,
+    pub params_fingerprint: String,
 }
 
 /// The mode the agent is operating in.
@@ -121,6 +130,10 @@ pub struct TaskState {
         std::collections::HashMap<String, crate::core::agent_types::FileChangeStats>,
     /// The last command executed (for session summary display).
     pub last_executed_command: Option<String>,
+    /// Exact file paths that must be re-read before the next edit attempt.
+    pub must_reread_before_edit: HashSet<String>,
+    /// Exact denied tool calls for the current recovery context.
+    pub denied_tool_actions: Vec<DeniedToolAction>,
 }
 
 /// Stats for a single file's changes in a session.
@@ -174,6 +187,8 @@ impl Default for TaskState {
             snipped_code_blocks: Vec::new(),
             session_file_changes: std::collections::HashMap::with_capacity(8),
             last_executed_command: None,
+            must_reread_before_edit: HashSet::new(),
+            denied_tool_actions: Vec::new(),
         }
     }
 }
@@ -294,6 +309,30 @@ impl TaskState {
             .map(|(_, content)| content.len())
             .sum()
     }
+
+    pub fn record_denied_tool_action(&mut self, action: DeniedToolAction) {
+        if !self
+            .denied_tool_actions
+            .iter()
+            .any(|existing| existing == &action)
+        {
+            self.denied_tool_actions.push(action);
+        }
+    }
+
+    pub fn is_denied_tool_action(
+        &self,
+        tool_name: &str,
+        params_fingerprint: &str,
+    ) -> Option<&DeniedToolAction> {
+        self.denied_tool_actions.iter().find(|action| {
+            action.tool_name == tool_name && action.params_fingerprint == params_fingerprint
+        })
+    }
+
+    pub fn clear_denied_tool_actions(&mut self) {
+        self.denied_tool_actions.clear();
+    }
 }
 
 /// Errors that can occur during agent execution.
@@ -362,5 +401,40 @@ mod tests {
         assert!(state.file_content_cache.peek(&"b".to_string()).is_none());
         assert!(state.file_content_cache.peek(&"c".to_string()).is_some());
         assert!(state.file_content_cache_size() <= MAX_FILE_CONTENT_CACHE_SIZE);
+    }
+
+    #[test]
+    fn test_denied_tool_action_matches_exact_fingerprint_only() {
+        let mut state = TaskState::default();
+        state.record_denied_tool_action(DeniedToolAction {
+            tool_name: "edit_file".to_string(),
+            action_paths: vec!["/tmp/file.rs".to_string()],
+            params_fingerprint: r#"{"files":[{"path":"file.rs"}]}"#.to_string(),
+        });
+
+        assert!(
+            state
+                .is_denied_tool_action("edit_file", r#"{"files":[{"path":"file.rs"}]}"#)
+                .is_some()
+        );
+        assert!(
+            state
+                .is_denied_tool_action("edit_file", r#"{"files":[{"path":"other.rs"}]}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_clear_denied_tool_actions_resets_recovery_context() {
+        let mut state = TaskState::default();
+        state.record_denied_tool_action(DeniedToolAction {
+            tool_name: "write_to_file".to_string(),
+            action_paths: vec!["/tmp/file.rs".to_string()],
+            params_fingerprint: r#"{"path":"file.rs","content":"x"}"#.to_string(),
+        });
+        assert_eq!(state.denied_tool_actions.len(), 1);
+
+        state.clear_denied_tool_actions();
+        assert!(state.denied_tool_actions.is_empty());
     }
 }

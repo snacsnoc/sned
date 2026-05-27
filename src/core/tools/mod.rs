@@ -228,6 +228,32 @@ impl ToolContext {
     }
 }
 
+/// Internal next-step guidance for runtime recovery handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolRequiredNextStep {
+    AskUser,
+    ReadFile,
+    NarrowRead,
+}
+
+/// Internal failure classes for tool/runtime recovery handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolFailureClass {
+    ApprovalDenied,
+    PermissionDenied,
+    AnchorInvalid,
+    RangeInsufficient,
+    RootListingFailed,
+}
+
+/// Internal failure metadata carried with tool errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFailureMetadata {
+    pub class: ToolFailureClass,
+    pub affected_paths: Vec<String>,
+    pub required_next_step: Option<ToolRequiredNextStep>,
+}
+
 /// Sanitize and resolve a path relative to the workspace root.
 ///
 /// Rejects path traversal attempts (`..` sequences) and absolute paths
@@ -370,6 +396,20 @@ pub enum ToolError {
     InvalidInput(String),
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
+    #[error("Invalid input: {0}")]
+    InvalidInputWithMetadata(String, ToolFailureMetadata),
+    #[error("Execution failed: {0}")]
+    ExecutionFailedWithMetadata(String, ToolFailureMetadata),
+}
+
+impl ToolError {
+    pub fn metadata(&self) -> Option<&ToolFailureMetadata> {
+        match self {
+            Self::InvalidInputWithMetadata(_, metadata)
+            | Self::ExecutionFailedWithMetadata(_, metadata) => Some(metadata),
+            Self::InvalidInput(_) | Self::ExecutionFailed(_) => None,
+        }
+    }
 }
 
 /// Convert a tool result value into plain text for conversation history.
