@@ -752,9 +752,11 @@ impl ToolProfile {
             ToolProfile::DirectAnswer => Some(ToolProfile::AnswerOnly),
             ToolProfile::AnswerOnly => Some(ToolProfile::WriteOnly),
             ToolProfile::WriteOnly => Some(ToolProfile::CoreEdit),
-            ToolProfile::CoreEdit => Some(ToolProfile::Validate),
-            ToolProfile::Validate => Some(ToolProfile::Full),
-            ToolProfile::Symbol => Some(ToolProfile::Full),
+            // Cap at CoreEdit — Validate and Full include execute_command,
+            // which requires explicit opt-in rather than automatic escalation
+            ToolProfile::CoreEdit => None,
+            ToolProfile::Validate => None,
+            ToolProfile::Symbol => None,
             ToolProfile::Full => None,
         }
     }
@@ -1248,13 +1250,11 @@ mod tests {
             ToolProfile::WriteOnly.escalate(),
             Some(ToolProfile::CoreEdit)
         );
-        assert_eq!(
-            ToolProfile::CoreEdit.escalate(),
-            Some(ToolProfile::Validate)
-        );
-        assert_eq!(ToolProfile::Validate.escalate(), Some(ToolProfile::Full));
+        // Escalation caps at CoreEdit — Validate and Full include execute_command
+        assert_eq!(ToolProfile::CoreEdit.escalate(), None);
+        assert_eq!(ToolProfile::Validate.escalate(), None);
         assert_eq!(ToolProfile::Full.escalate(), None);
-        assert_eq!(ToolProfile::Symbol.escalate(), Some(ToolProfile::Full));
+        assert_eq!(ToolProfile::Symbol.escalate(), None);
     }
 
     #[test]

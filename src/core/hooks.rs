@@ -705,20 +705,25 @@ impl HookManager {
                 ));
             }
             
-            // F-03: Detect imperative instructions that could override user intent
-            // Look for patterns that attempt to command the agent
+            // Detect imperative instructions that could override user intent.
+            // Keep the list broad enough to catch direct prompt-injection patterns.
             let injection_patterns = [
                 "ignore previous",
-                "disregard",
+                "ignore all",
                 "forget all",
+                "disregard",
+                "disregard safety",
+                "disregard previous",
                 "override",
+                "override safety",
                 "bypass",
+                "bypass validation",
+                "delete",
                 "skip validation",
                 "disable security",
                 "execute this command",
                 "run this",
                 "write to",
-                "delete",
                 "rm -rf",
                 "curl | bash",
                 "wget | bash",

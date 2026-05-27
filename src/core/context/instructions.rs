@@ -8,6 +8,38 @@ use tracing;
 /// Rule toggles: maps rule file path to enabled/disabled state
 pub type RuleToggles = HashMap<String, bool>;
 
+/// Patterns that indicate prompt injection when found in repo-controlled content.
+/// Only multi-word patterns to minimize false positives on legitimate instructions.
+const INJECTION_PATTERNS: &[&str] = &[
+    "ignore previous",
+    "ignore all",
+    "forget all",
+    "disregard safety",
+    "disregard previous",
+    "override safety",
+    "bypass validation",
+    "skip validation",
+    "disable security",
+    "curl | bash",
+    "wget | bash",
+    "download and execute",
+];
+
+/// Check repo-controlled content for injection patterns and log warnings.
+/// Does not reject content — only warns so the user can review.
+fn warn_if_injection_patterns_detected(content: &str, source: &str) {
+    let lower = content.to_lowercase();
+    for pattern in INJECTION_PATTERNS {
+        if lower.contains(pattern) {
+            tracing::warn!(
+                source = source,
+                pattern = pattern,
+                "Repo-controlled content contains injection-like pattern"
+            );
+        }
+    }
+}
+
 /// Skill metadata
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillMetadata {
@@ -127,6 +159,7 @@ pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Strin
     }
 
     let combined = parts.join("\n\n");
+    warn_if_injection_patterns_detected(&combined, "AGENTS.md");
     Some(format!("# AGENTS.md Rules\n\n{}", combined))
 }
 
@@ -150,6 +183,7 @@ pub fn get_local_windsurf_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Str
             if content.is_empty() {
                 None
             } else {
+                warn_if_injection_patterns_detected(content, ".windsurfrules");
                 Some(format!("# Windsurf Rules\n\n{}", content))
             }
         }
@@ -180,6 +214,7 @@ pub fn get_local_cursor_rules(cwd: &Path, toggles: &RuleToggles) -> Vec<Option<S
             Ok(content) => {
                 let content = content.trim();
                 if !content.is_empty() {
+                    warn_if_injection_patterns_detected(content, ".cursorrules");
                     results.push(Some(format!("# Cursor Rules\n\n{}", content)));
                 } else {
                     results.push(None);
@@ -230,6 +265,7 @@ pub fn get_local_cursor_rules(cwd: &Path, toggles: &RuleToggles) -> Vec<Option<S
 
                 if !parts.is_empty() {
                     let combined = parts.join("\n\n");
+                    warn_if_injection_patterns_detected(&combined, ".cursor/rules");
                     results.push(Some(format!("# Cursor Rules Directory\n\n{}", combined)));
                 }
             }
@@ -434,6 +470,8 @@ fn load_skill_metadata(
     let name = frontmatter.get("name")?.as_str()?;
     let description = frontmatter.get("description")?.as_str()?;
 
+    warn_if_injection_patterns_detected(description, &format!("skill:{}:description", skill_name));
+
     // Name must match directory name
     if name != skill_name {
         tracing::warn!(
@@ -486,6 +524,8 @@ fn load_skill_from_md_file(
     let (name, description) = if had_frontmatter {
         let name = frontmatter.get("name")?.as_str()?;
         let description = frontmatter.get("description")?.as_str()?;
+
+        warn_if_injection_patterns_detected(description, &format!("skill:{}:description", skill_name));
 
         // Name must match filename (without .md extension)
         if name != skill_name {
@@ -629,13 +669,16 @@ pub fn get_skill_content(
     };
 
     let (_, body, _, _) = parse_yaml_frontmatter(&file_content);
+    let instructions = body.trim().to_string();
+
+    warn_if_injection_patterns_detected(&instructions, &format!("skill:{}", skill_name));
 
     Some(SkillContent {
         name: skill.name.clone(),
         description: skill.description.clone(),
         path: skill.path.clone(),
         source: skill.source.clone(),
-        instructions: body.trim().to_string(),
+        instructions,
     })
 }
 
