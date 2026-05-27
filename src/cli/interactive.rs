@@ -480,7 +480,7 @@ async fn handle_key_event(
         } else {
             // Clear input with visual feedback
             app.push_plain("^C");
-            app.input = tui_textarea::TextArea::new(Vec::new());
+            app.input = App::new_textarea(Vec::new());
             return Ok(None);
         }
     }
@@ -492,7 +492,7 @@ async fn handle_key_event(
             if let Some(sender) = take_followup_sender(task_id) {
                 let text = app.get_input_with_expanded_pastes();
                 let _ = sender.send(text);
-                app.input = tui_textarea::TextArea::new(Vec::new());
+                app.input = App::new_textarea(Vec::new());
             }
             return Ok(None);
         }
@@ -508,7 +508,7 @@ async fn handle_key_event(
                     .add_modifier(Modifier::BOLD),
             );
             // Clear textarea and paste tracking
-            app.input = tui_textarea::TextArea::new(Vec::new());
+            app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
             // Submit to agent
             return Ok(Some(Action::Submit(text)));
@@ -534,15 +534,15 @@ async fn handle_key_event(
     // Up/Down for command history navigation
     if key.code == KeyCode::Up && app.input.cursor().0 == 0 && app.input.cursor().1 == 0 {
         if let Some(entry) = app.history.navigate_up() {
-            app.input = tui_textarea::TextArea::new(vec![entry.to_string()]);
+            app.input = App::new_textarea(vec![entry.to_string()]);
         }
         return Ok(None);
     }
     if key.code == KeyCode::Down && app.history.is_navigating() {
         if let Some(entry) = app.history.navigate_down() {
-            app.input = tui_textarea::TextArea::new(vec![entry.to_string()]);
+            app.input = App::new_textarea(vec![entry.to_string()]);
         } else {
-            app.input = tui_textarea::TextArea::new(Vec::new());
+            app.input = App::new_textarea(Vec::new());
         }
         return Ok(None);
     }
@@ -569,7 +569,7 @@ async fn handle_key_event(
         if mq.in_mention_mode {
             let new_text =
                 crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
-            app.input = tui_textarea::TextArea::new(vec![new_text]);
+            app.input = App::new_textarea(vec![new_text]);
             app.picker_active = false;
             app.picker_results.clear();
         }
@@ -1260,7 +1260,9 @@ async fn run_main_loop(
         }
 
         // 4. Check agent completion (non-blocking)
-        if agent_busy.load(Ordering::Relaxed) && agent_done.notified().now_or_never().is_some() {
+        // Always check notification to avoid race condition where agent_busy is already false
+        // but app.agent_busy hasn't been updated yet
+        if agent_done.notified().now_or_never().is_some() {
             agent_busy.store(false, Ordering::Relaxed);
             app.agent_busy = false;
             if let Some(start) = agent_start_time.lock().await.take() {

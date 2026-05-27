@@ -62,13 +62,19 @@ pub struct App {
 }
 
 impl App {
+    /// Create a new TextArea with default styling (no underline on cursor line).
+    pub fn new_textarea(lines: Vec<String>) -> TextArea<'static> {
+        let mut input = TextArea::new(lines);
+        input.set_placeholder_text("❯ ");
+        input.set_cursor_line_style(Style::default());
+        input
+    }
+
     /// Create a new App instance.
     pub fn new() -> Self {
-        let mut input = TextArea::new(Vec::new());
-        input.set_placeholder_text("❯ ");
         Self {
             output_lines: Vec::new(),
-            input,
+            input: Self::new_textarea(Vec::new()),
             agent_busy: false,
             scroll_offset: 0,
             auto_scroll: true,
