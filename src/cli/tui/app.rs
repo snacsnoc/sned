@@ -15,7 +15,7 @@ use ratatui::{
 use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 
-const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+use crate::cli::colors::spinner_frame;
 
 /// Tracks a pasted chunk of text that was folded into a marker.
 #[derive(Debug, Clone)]
@@ -314,13 +314,13 @@ impl App {
     /// Increment spinner frame (call on each render tick when agent_busy).
     pub fn tick_spinner(&mut self) {
         if self.agent_busy {
-            self.spinner_index = (self.spinner_index + 1) % SPINNER_FRAMES.len();
+            self.spinner_index = (self.spinner_index + 1) % 10;
         }
     }
 
     /// Get current spinner character.
     pub fn spinner_char(&self) -> char {
-        SPINNER_FRAMES[self.spinner_index]
+        spinner_frame(self.spinner_index)
     }
 }
 

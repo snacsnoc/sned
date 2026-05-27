@@ -777,14 +777,10 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Undo | CliOnlyCommand::CheckpointUndo => {
             let sess = session.lock().await;
-            let checkpoint_mgr = sess.agent_loop().checkpoint_manager();
-
-            if checkpoint_mgr.is_none() {
-                app.push_plain("Checkpoint manager is not initialized.");
-                return Ok(false);
-            }
-
-            let checkpoint_mgr = checkpoint_mgr.unwrap();
+            let checkpoint_mgr = sess
+                .agent_loop()
+                .checkpoint_manager()
+                .expect("checkpoint manager should be initialized");
             let checkpoints = match checkpoint_mgr.list_checkpoints().await {
                 Ok(cps) => cps,
                 Err(e) => {
@@ -994,14 +990,10 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::CheckpointList => {
             let sess = session.lock().await;
-            let checkpoint_mgr = sess.agent_loop().checkpoint_manager();
-
-            if checkpoint_mgr.is_none() {
-                app.push_plain("Checkpoint manager is not initialized.");
-                return Ok(false);
-            }
-
-            let checkpoint_mgr = checkpoint_mgr.unwrap();
+            let checkpoint_mgr = sess
+                .agent_loop()
+                .checkpoint_manager()
+                .expect("checkpoint manager should be initialized");
             match checkpoint_mgr.list_checkpoints().await {
                 Ok(checkpoints) => {
                     if checkpoints.is_empty() {
@@ -1022,14 +1014,10 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::CheckpointRestore => {
             let sess = session.lock().await;
-            let checkpoint_mgr = sess.agent_loop().checkpoint_manager();
-
-            if checkpoint_mgr.is_none() {
-                app.push_plain("Checkpoint manager is not initialized.");
-                return Ok(false);
-            }
-
-            let checkpoint_mgr = checkpoint_mgr.unwrap();
+            let checkpoint_mgr = sess
+                .agent_loop()
+                .checkpoint_manager()
+                .expect("checkpoint manager should be initialized");
             let checkpoints = match checkpoint_mgr.list_checkpoints().await {
                 Ok(cps) => cps,
                 Err(e) => {
