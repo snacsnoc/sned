@@ -116,6 +116,39 @@ export SNED_SAFE_COMMANDS="npm,pnpm,yarn,cargo,make"
 
 Some commands are always denied regardless of SNED_SAFE_COMMANDS or explicit approval: rm, dd, mkfs, curl, wget, nc, ncat, netcat, ssh, sudo, chmod, chown, kill, killall, reboot, shutdown, poweroff, insmod, rmmod, modprobe, apt-get, yum, dnf, apt. This list cannot be bypassed. Not by settings, not by --yolo, not by explicit user approval. Hardcoded deny-only.
 
+## environment sandbox
+
+Commands run by the model execute in a sandboxed environment. Only a base allowlist of safe vars is passed through: `PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TERM`, `TERM_PROGRAM`, `TZ`, `SHELL`, `PWD`, `TMPDIR`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `EDITOR`, `VISUAL`, `PAGER`, `LESS`, `MORE`, `LOGNAME`, `HOSTNAME`, `DOCKER_HOST`, `CARGO_HOME`, `RUSTUP_HOME`, `GOPATH`, `PYTHONPATH`, `NODE_PATH`, `NPM_CONFIG_PREFIX`.
+
+API keys, tokens, secrets, and other sensitive env vars are **not** available to model-executed commands. If a command needs a specific env var (e.g. an API key), it will fail with a note like:
+
+```
+[Sandbox: 12 env vars filtered (e.g. API_KEY, AWS_ACCESS_KEY_ID). Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]
+```
+
+To allow additional env vars through the sandbox:
+```bash
+export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
+```
+
+`SNED_*` internal vars are silently dropped and never shown in the filtered list.
+
+## env vars
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `SNED_ALLOW_ENV` | Comma-separated env vars to pass through sandbox | (none) |
+| `SNED_SAFE_COMMANDS` | Comma-separated commands to auto-approve | (none) |
+| `SNED_STREAM_OUTPUT_LINES` | Live streaming output line limit | `20` |
+| `SNED_COMMAND_OUTPUT_LIMIT` | Command output truncation limit (bytes) | `10240` |
+| `SNED_SEARCH_TIMEOUT_SECS` | File search timeout | `30` |
+| `SNED_FETCH_TIMEOUT_SECS` | Web fetch timeout | `30` |
+| `SNED_HOOK_TIMEOUT_MS` | Hook execution timeout | `60000` |
+| `SNED_DIR` | Config directory | `~/.sned` |
+| `SNED_DATA_DIR` | Data directory | `~/.sned/data` |
+| `SNED_NO_ALTERNATE_SCREEN` | Use inline viewport (no alternate screen) | (not set) |
+| `RUST_LOG` | Log level filter | `sned=warn` |
+
 ## providers
 
 | Provider | Env Var | Example Models |

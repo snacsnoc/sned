@@ -180,6 +180,7 @@ impl ExecuteCommandHandler {
         use libc;
 
         let mut combined_output = String::new();
+        let mut all_filtered_names: Vec<String> = Vec::new();
 
         for cmd_str in commands {
             // Safety check: validate command against safe list and patterns
@@ -208,25 +209,11 @@ impl ExecuteCommandHandler {
                 c
             };
 
-            // Sandbox environment: clear inherited env vars and only allow safe ones through.
-            // Prevents model from reading API keys, tokens, and other secrets.
-            cmd.env_clear()
-                .envs(std::env::vars().filter(|(k, _)| {
-                    matches!(
-                        k.as_str(),
-                        "PATH"
-                            | "HOME"
-                            | "USER"
-                            | "LANG"
-                            | "LC_ALL"
-                            | "TERM"
-                            | "TERM_PROGRAM"
-                            | "TZ"
-                            | "SHELL"
-                            | "PWD"
-                            | "TMPDIR"
-                    )
-                }));
+            let (sandboxed_env, filtered_names) = Self::build_sandbox_env(cwd);
+            cmd.env_clear().envs(sandboxed_env);
+            if !filtered_names.is_empty() {
+                all_filtered_names.extend(filtered_names);
+            }
 
             if let Some(dir) = cwd {
                 if !dir.exists() || !dir.is_dir() {
@@ -236,8 +223,6 @@ impl ExecuteCommandHandler {
                     return Err(anyhow::anyhow!("{}", err.display()));
                 }
                 cmd.current_dir(dir);
-                // Update PWD to reflect the working directory
-                cmd.env("PWD", dir);
             }
 
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -524,6 +509,25 @@ impl ExecuteCommandHandler {
             }
         }
 
+        if !all_filtered_names.is_empty() {
+            all_filtered_names.sort();
+            all_filtered_names.dedup();
+            let sample: Vec<&str> = all_filtered_names.iter().take(5).map(|s| s.as_str()).collect();
+            let note = if all_filtered_names.len() > 5 {
+                format!(
+                    "\n[Sandbox: {} env vars filtered (e.g. {}). Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
+                    all_filtered_names.len(),
+                    sample.join(", ")
+                )
+            } else {
+                format!(
+                    "\n[Sandbox: env vars filtered: {}. Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
+                    sample.join(", ")
+                )
+            };
+            combined_output.push_str(&note);
+        }
+
         let truncated = combined_output.len() > 10 * 1024;
         tracing::info!(
             output_len = combined_output.len(),
@@ -602,21 +606,16 @@ impl ExecuteCommandHandler {
             }
         };
 
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new(shell);
-            for arg in args {
-                c.arg(arg);
-            }
-            c
-        } else {
-            let mut c = Command::new(shell);
-            for arg in args {
-                c.arg(arg);
-            }
+        let (sandboxed_env, filtered_names) = Self::build_sandbox_env(cwd);
+        let mut cmd = Command::new(shell);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        if !cfg!(target_os = "windows") {
             #[cfg(unix)]
-            c.process_group(0);
-            c
-        };
+            cmd.process_group(0);
+        }
+        cmd.env_clear().envs(sandboxed_env);
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
@@ -728,6 +727,23 @@ impl ExecuteCommandHandler {
             combined.push_str(&format!("\n{}", err.display()));
         }
 
+        if !filtered_names.is_empty() {
+            let sample: Vec<&str> = filtered_names.iter().take(5).map(|s| s.as_str()).collect();
+            let note = if filtered_names.len() > 5 {
+                format!(
+                    "\n[Sandbox: {} env vars filtered (e.g. {}). Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
+                    filtered_names.len(),
+                    sample.join(", ")
+                )
+            } else {
+                format!(
+                    "\n[Sandbox: env vars filtered: {}. Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
+                    sample.join(", ")
+                )
+            };
+            combined.push_str(&note);
+        }
+
         if !combined.is_empty() {
             use crate::cli::output::OutputEvent;
             output_writer.emit(OutputEvent::RawAnsi(combined.clone()));
@@ -735,6 +751,76 @@ impl ExecuteCommandHandler {
 
         Ok(combined)
     }
+    fn build_sandbox_env(cwd: Option<&Path>) -> (std::collections::HashMap<String, String>, Vec<String>) {
+        use std::collections::HashMap;
+
+        static BASE_ALLOWLIST: &[&str] = &[
+            "PATH",
+            "HOME",
+            "USER",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "TERM_PROGRAM",
+            "TZ",
+            "SHELL",
+            "PWD",
+            "TMPDIR",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "EDITOR",
+            "VISUAL",
+            "PAGER",
+            "LESS",
+            "MORE",
+            "LOGNAME",
+            "HOSTNAME",
+            "DOCKER_HOST",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "GOPATH",
+            "PYTHONPATH",
+            "NODE_PATH",
+            "NPM_CONFIG_PREFIX",
+        ];
+
+        static SNED_ALLOW_ENV: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let extra = SNED_ALLOW_ENV.get_or_init(|| {
+            std::env::var("SNED_ALLOW_ENV")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        });
+
+        let allow_set: HashMap<&str, bool> = BASE_ALLOWLIST
+            .iter()
+            .copied()
+            .chain(extra.iter().map(|s| s.as_str()))
+            .map(|k| (k, true))
+            .collect();
+
+        let mut env = HashMap::new();
+        let mut filtered = Vec::new();
+
+        for (k, v) in std::env::vars() {
+            if allow_set.contains_key(k.as_str()) {
+                env.insert(k, v);
+            } else if !k.starts_with("SNED_") {
+                filtered.push(k);
+            }
+        }
+
+        if let Some(dir) = cwd {
+            env.insert("PWD".to_string(), dir.display().to_string());
+        }
+
+        (env, filtered)
+    }
+
     pub fn new() -> Self {
         Self {
             safety_checker: CommandSafetyChecker::new(),
@@ -1327,5 +1413,73 @@ mod tests {
         assert_eq!(env_val, 20, "invalid env should fall back to default");
         // SAFETY: single-threaded test; restoring env after test
         unsafe { std::env::remove_var("SNED_STREAM_OUTPUT_LINES") };
+    }
+
+    #[test]
+    fn test_sandbox_allows_base_vars() {
+        let (env, filtered) = ExecuteCommandHandler::build_sandbox_env(None);
+        assert!(env.contains_key("PATH"), "PATH should be allowed");
+        assert!(env.contains_key("HOME"), "HOME should be allowed");
+        assert!(!filtered.iter().any(|k| k == "PATH"), "PATH should not be in filtered list");
+    }
+
+    #[test]
+    fn test_sandbox_filters_sensitive_vars() {
+        let (env, _filtered) = ExecuteCommandHandler::build_sandbox_env(None);
+        for key in &["API_KEY", "SECRET_TOKEN", "MY_PASSWORD", "AWS_SECRET_ACCESS_KEY"] {
+            assert!(
+                !env.contains_key(*key),
+                "{} should be filtered out",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_sandbox_silently_drops_sned_internal() {
+        let (env, filtered) = ExecuteCommandHandler::build_sandbox_env(None);
+        for key in &["SNED_PROVIDER", "SNED_API_KEY", "SNED_DIR"] {
+            assert!(!env.contains_key(*key), "SNED_* internal should not leak");
+            assert!(
+                !filtered.iter().any(|f| f == *key),
+                "SNED_* should be silently dropped, not reported as filtered"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sandbox_notification_appears_in_output() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handler = ExecuteCommandHandler::new();
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let result = rt.block_on(handler.execute_commands_with_timeout(
+            vec!["echo $HOME".to_string()],
+            None,
+            None,
+            false,
+            None,
+            false,
+            &output_writer,
+        )).unwrap();
+
+        if std::env::vars().any(|(k, _)| !k.starts_with("SNED_")
+            && !matches!(
+                k.as_str(),
+                "PATH" | "HOME" | "USER" | "LANG" | "LC_ALL" | "TERM"
+                | "TERM_PROGRAM" | "TZ" | "SHELL" | "PWD" | "TMPDIR"
+                | "XDG_CACHE_HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME"
+                | "XDG_STATE_HOME" | "EDITOR" | "VISUAL" | "PAGER" | "LESS"
+                | "MORE" | "LOGNAME" | "HOSTNAME" | "DOCKER_HOST"
+                | "CARGO_HOME" | "RUSTUP_HOME" | "GOPATH" | "PYTHONPATH"
+                | "NODE_PATH" | "NPM_CONFIG_PREFIX"
+            ))
+        {
+            assert!(
+                result.contains("[Sandbox:"),
+                "output should contain sandbox notification when env vars are filtered, got: {}",
+                result
+            );
+        }
     }
 }
