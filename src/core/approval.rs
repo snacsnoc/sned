@@ -133,6 +133,10 @@ impl CommandSafetyChecker {
         if normalized.contains("$(") || normalized.contains('`') {
             return Err(CommandUnsafe::new("Command substitution is not allowed"));
         }
+        // Block ${var} style variable expansion (more flexible than $var alone)
+        if normalized.contains("${") {
+            return Err(CommandUnsafe::new("Variable expansion ${...} is not allowed"));
+        }
         Ok(())
     }
 
@@ -153,6 +157,11 @@ impl CommandSafetyChecker {
 
         if normalized.contains("<<") {
             return Err(CommandUnsafe::new("Heredoc is not allowed"));
+        }
+
+        // Block brace expansion which can be used for path traversal
+        if normalized.contains('{') && normalized.contains('}') && normalized.contains(',') {
+            return Err(CommandUnsafe::new("Brace expansion is not allowed"));
         }
 
         let mut stripped = normalized.to_string();

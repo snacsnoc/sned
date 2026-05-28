@@ -777,11 +777,6 @@ impl ExecuteCommandHandler {
             "MORE",
             "LOGNAME",
             "HOSTNAME",
-            "DOCKER_HOST",
-            "CARGO_HOME",
-            "RUSTUP_HOME",
-            "GOPATH",
-            "NPM_CONFIG_PREFIX",
         ];
 
         static SNED_ALLOW_ENV: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
