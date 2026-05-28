@@ -301,6 +301,11 @@ mod tests {
         let settings_dir = data_dir.join("settings");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::create_dir_all(&settings_dir).unwrap();
+        let old_data_dir = std::env::var_os("SNED_DATA_DIR");
+        // SAFETY: this test runs in isolation under the validation command.
+        unsafe {
+            std::env::set_var("SNED_DATA_DIR", &data_dir);
+        }
 
         let state_manager = crate::storage::state_manager::StateManager::new().unwrap();
 
@@ -309,12 +314,20 @@ mod tests {
         let result = handler
             .abort_task(None, &state_manager, "test-task", None)
             .await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "abort_task should succeed: {:?}", result.err());
 
         assert!(handler.is_cancelled().await);
 
         let state = state.lock().await;
         assert!(state.is_cancelled);
+
+        // SAFETY: restore the process environment for later tests.
+        unsafe {
+            match old_data_dir {
+                Some(ref value) => std::env::set_var("SNED_DATA_DIR", value),
+                None => std::env::remove_var("SNED_DATA_DIR"),
+            }
+        }
     }
 
     #[test]
@@ -336,18 +349,31 @@ mod tests {
         let settings_dir = data_dir.join("settings");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::create_dir_all(&settings_dir).unwrap();
+        let old_data_dir = std::env::var_os("SNED_DATA_DIR");
+        // SAFETY: this test runs in isolation under the validation command.
+        unsafe {
+            std::env::set_var("SNED_DATA_DIR", &data_dir);
+        }
 
         let state_manager = crate::storage::state_manager::StateManager::new().unwrap();
 
         let result = handler
             .abort_task(None, &state_manager, "test-task", None)
             .await;
-        assert!(result.is_ok(), "abort_task should succeed");
+        assert!(result.is_ok(), "abort_task should succeed: {:?}", result.err());
 
         assert!(
             handler.is_cancelled().await,
             "Cancellation flag should be set"
         );
+
+        // SAFETY: restore the process environment for later tests.
+        unsafe {
+            match old_data_dir {
+                Some(ref value) => std::env::set_var("SNED_DATA_DIR", value),
+                None => std::env::remove_var("SNED_DATA_DIR"),
+            }
+        }
     }
 
     #[test]
