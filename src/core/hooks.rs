@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 /// Hook names matching TypeScript hook types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HookName {
@@ -387,8 +390,13 @@ impl HookManager {
         cmd.arg(hook_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("SNED_VERSION", &self.sned_version)
+            .stderr(Stdio::piped());
+        
+        // Create new process group so we can kill all children on timeout/cancel
+        #[cfg(unix)]
+        cmd.process_group(0);
+        
+        cmd.env("SNED_VERSION", &self.sned_version)
             .env("SNED_USER_ID", &self.user_id)
             // Remove sensitive environment variables for sandboxing
             .env_clear()
@@ -415,7 +423,19 @@ impl HookManager {
             .spawn()
             .map_err(|e| format!("Failed to spawn hook process: {}", e))?;
 
-        // Track active execution
+        // Write input to stdin BEFORE registering PID for cancellation
+        // This prevents timeout/cancel from firing while stdin is being written
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to open stdin for hook process".to_string())?;
+        use std::io::Write;
+        stdin
+            .write_all(input_json.as_bytes())
+            .map_err(|e| format!("Failed to write hook input to stdin: {}", e))?;
+        drop(stdin);
+
+        // Track active execution AFTER stdin is written
         let hook_name = hook_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -434,17 +454,6 @@ impl HookManager {
         // Reset cancellation flag
         self.cancelled
             .store(false, std::sync::atomic::Ordering::SeqCst);
-
-        // Write input to stdin
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Failed to open stdin for hook process".to_string())?;
-        use std::io::Write;
-        stdin
-            .write_all(input_json.as_bytes())
-            .map_err(|e| format!("Failed to write hook input to stdin: {}", e))?;
-        drop(stdin);
 
         // Read stdout and stderr before waiting (avoids pipe buffer deadlock)
         let stdout_pipe = child.stdout.take();
@@ -599,14 +608,15 @@ impl HookManager {
                 if pid > 0 {
                     #[cfg(unix)]
                     {
+                        // Kill entire process group (negative PID)
                         let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::unistd::Pid::from_raw(-(pid as i32)),
                             nix::sys::signal::Signal::SIGTERM,
                         );
                         let kill_start = std::time::Instant::now();
                         while kill_start.elapsed() < std::time::Duration::from_secs(5) {
                             match nix::sys::wait::waitpid(
-                                nix::unistd::Pid::from_raw(pid as i32),
+                                nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
                                 Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
@@ -615,7 +625,7 @@ impl HookManager {
                             }
                         }
                         let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::unistd::Pid::from_raw(-(pid as i32)),
                             nix::sys::signal::Signal::SIGKILL,
                         );
                     }
@@ -634,14 +644,15 @@ impl HookManager {
                 if pid > 0 {
                     #[cfg(unix)]
                     {
+                        // Kill entire process group (negative PID)
                         let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::unistd::Pid::from_raw(-(pid as i32)),
                             nix::sys::signal::Signal::SIGTERM,
                         );
                         let kill_start = std::time::Instant::now();
                         while kill_start.elapsed() < std::time::Duration::from_secs(5) {
                             match nix::sys::wait::waitpid(
-                                nix::unistd::Pid::from_raw(pid as i32),
+                                nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
                                 Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
@@ -650,7 +661,7 @@ impl HookManager {
                             }
                         }
                         let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::unistd::Pid::from_raw(-(pid as i32)),
                             nix::sys::signal::Signal::SIGKILL,
                         );
                     }
