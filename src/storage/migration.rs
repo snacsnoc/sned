@@ -6,6 +6,43 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use walkdir::WalkDir;
 
+/// Set restrictive permissions on backup files (contain sensitive data)
+#[cfg(unix)]
+fn set_backup_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+/// Set restrictive permissions on backup files (Windows relies on parent directory ACLs)
+#[cfg(not(unix))]
+fn set_backup_permissions(_path: &Path) -> io::Result<()> {
+    // On Windows, permissions are inherited from parent directory
+    // Parent should be created with restrictive permissions
+    Ok(())
+}
+
+/// Sanitize a relative path to prevent path traversal attacks
+/// Returns None if the path contains ".." components or is absolute
+fn sanitize_relative_path(path: &str) -> Option<PathBuf> {
+    let pb = PathBuf::from(path);
+    
+    // Reject absolute paths
+    if pb.is_absolute() {
+        return None;
+    }
+    
+    // Reject paths with ".." components
+    for component in pb.components() {
+        match component {
+            std::path::Component::ParentDir => return None,
+            std::path::Component::RootDir => return None,
+            _ => {}
+        }
+    }
+    
+    Some(pb)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonObjectMigration {
     pub relative_path: PathBuf,
@@ -357,8 +394,15 @@ impl MigrationEngine {
         relative_path: &str,
         _report_path: PathBuf,
     ) -> Result<Option<JsonObjectMigration>, MigrationError> {
-        let source_path = self.source_root.join(relative_path);
-        let destination_path = self.destination_root.join(relative_path);
+        // Sanitize relative path to prevent path traversal attacks
+        let sanitized_path = sanitize_relative_path(relative_path)
+            .ok_or_else(|| MigrationError::UnsupportedJson {
+                path: PathBuf::from(relative_path),
+                message: "invalid path: contains path traversal (..) or is absolute".to_string(),
+            })?;
+        
+        let source_path = self.source_root.join(&sanitized_path);
+        let destination_path = self.destination_root.join(&sanitized_path);
 
         if !source_path.exists() {
             return Ok(None);
@@ -419,12 +463,7 @@ impl MigrationEngine {
                 path: destination_path.clone(),
                 source,
             })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                let _ = fs::set_permissions(&backup, perms);
-            }
+            let _ = set_backup_permissions(&backup);  // Ignore errors - backup still useful
             Some(backup)
         } else {
             if let Some(parent) = destination_path.parent() {
@@ -432,6 +471,11 @@ impl MigrationEngine {
                     path: parent.to_path_buf(),
                     source,
                 })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                }
             }
             None
         };
@@ -444,7 +488,7 @@ impl MigrationEngine {
                 }
             })?;
 
-        fs::write(&destination_path, json_str).map_err(|source| MigrationError::Io {
+        crate::storage::disk::atomic_write_file(&destination_path, &json_str).map_err(|source| MigrationError::Io {
             path: destination_path.clone(),
             source,
         })?;
@@ -556,12 +600,7 @@ impl MigrationEngine {
                 path: destination_path.clone(),
                 source,
             })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                let _ = fs::set_permissions(&backup, perms);
-            }
+            let _ = set_backup_permissions(&backup);
             Some(backup)
         } else {
             if let Some(parent) = destination_path.parent() {
@@ -569,6 +608,11 @@ impl MigrationEngine {
                     path: parent.to_path_buf(),
                     source,
                 })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                }
             }
             None
         };
@@ -581,7 +625,7 @@ impl MigrationEngine {
                 }
             })?;
 
-        fs::write(&destination_path, json_str).map_err(|source| MigrationError::Io {
+        crate::storage::disk::atomic_write_file(&destination_path, &json_str).map_err(|source| MigrationError::Io {
             path: destination_path.clone(),
             source,
         })?;
@@ -762,12 +806,7 @@ impl MigrationEngine {
                     path: destination_file.clone(),
                     source,
                 })?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o600);
-                    let _ = fs::set_permissions(&backup, perms);
-                }
+                let _ = set_backup_permissions(&backup);
                 Some(backup)
             } else {
                 None
@@ -856,12 +895,7 @@ impl MigrationEngine {
                                 source,
                             }
                         })?;
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let perms = std::fs::Permissions::from_mode(0o600);
-                            let _ = fs::set_permissions(&backup, perms);
-                        }
+                        let _ = set_backup_permissions(&backup);
                         Some(backup)
                     } else {
                         None

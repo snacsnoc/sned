@@ -101,13 +101,6 @@ impl TaskStorage {
                 Err(e) => {
                     // Create backup of corrupted file before discarding
                     if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
-                        eprintln!(
-                            "WARNING: Corrupted API conversation history at '{}'. \
-                             Backed up to '{}' for potential recovery. \
-                             Starting with empty history.",
-                            file_path.display(),
-                            backup_path.display()
-                        );
                         tracing::warn!(
                             file_path = %file_path.display(),
                             backup_path = %backup_path.display(),
@@ -115,11 +108,6 @@ impl TaskStorage {
                             "Created backup of corrupted API conversation history JSON"
                         );
                     } else {
-                        eprintln!(
-                            "WARNING: Corrupted API conversation history at '{}'. \
-                             Failed to create backup. Starting with empty history.",
-                            file_path.display()
-                        );
                         tracing::warn!(
                             file_path = %file_path.display(),
                             error = %e,
@@ -173,13 +161,6 @@ impl TaskStorage {
                 Err(e) => {
                     // Create backup of corrupted file before discarding
                     if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
-                        eprintln!(
-                            "WARNING: Corrupted compacted summary at '{}'. \
-                             Backed up to '{}' for potential recovery. \
-                             Starting without summary.",
-                            file_path.display(),
-                            backup_path.display()
-                        );
                         tracing::warn!(
                             file_path = %file_path.display(),
                             backup_path = %backup_path.display(),
@@ -187,11 +168,6 @@ impl TaskStorage {
                             "Created backup of corrupted compacted summary JSON"
                         );
                     } else {
-                        eprintln!(
-                            "WARNING: Corrupted compacted summary at '{}'. \
-                             Failed to create backup. Starting without summary.",
-                            file_path.display()
-                        );
                         tracing::warn!(
                             file_path = %file_path.display(),
                             error = %e,
@@ -244,13 +220,6 @@ impl TaskStorage {
                 Err(e) => {
                     // Create backup of corrupted file before discarding
                     if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
-                        eprintln!(
-                            "WARNING: Corrupted context history at '{}'. \
-                             Backed up to '{}' for potential recovery. \
-                             Starting with empty history.",
-                            file_path.display(),
-                            backup_path.display()
-                        );
                         tracing::warn!(
                             file_path = %file_path.display(),
                             backup_path = %backup_path.display(),
@@ -258,11 +227,6 @@ impl TaskStorage {
                             "Created backup of corrupted context history JSON"
                         );
                     } else {
-                        eprintln!(
-                            "WARNING: Corrupted context history at '{}'. \
-                             Failed to create backup. Starting with empty history.",
-                            file_path.display()
-                        );
                         tracing::warn!(
                             file_path = %file_path.display(),
                             error = %e,

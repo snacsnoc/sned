@@ -123,7 +123,7 @@ pub fn picker_selected_style() -> Style {
 
 /// Style for scrollbar track.
 pub fn scrollbar_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(STATUS_FG)
 }
 
 /// Style for scrollbar thumb (the movable part).

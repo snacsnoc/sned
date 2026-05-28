@@ -41,7 +41,7 @@ const DANGEROUS_FIND_FLAGS: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "
 const HARD_CODED_DENY_LIST: &[&str] = &[
     "rm", "dd", "mkfs", "curl", "wget", "nc", "ncat", "netcat", "ssh", "sudo", "chmod", "chown",
     "kill", "killall", "reboot", "shutdown", "poweroff", "insmod", "rmmod", "modprobe", "apt-get",
-    "yum", "dnf", "apt",
+    "yum", "dnf", "apt", "eval", "exec", "source",
 ];
 
 #[derive(Debug, Clone)]
@@ -110,7 +110,33 @@ impl CommandSafetyChecker {
         if self.yolo_mode {
             return Ok(());
         }
+        self.check_common(command)?;
+        self.check_shell_syntax(command)?;
+        self.check_deny_list(command)?;
+        Ok(())
+    }
 
+    /// Check safety for non-shell languages (Python, Node).
+    /// Skips shell-specific syntax checks (pipes, redirects, heredocs, etc.)
+    /// that would cause false positives in non-shell code.
+    pub fn is_safe_non_shell(&self, command: &str) -> Result<(), CommandUnsafe> {
+        if self.yolo_mode {
+            return Ok(());
+        }
+        self.check_common(command)?;
+        self.check_deny_list(command)?;
+        Ok(())
+    }
+
+    fn check_common(&self, command: &str) -> Result<(), CommandUnsafe> {
+        let normalized = command.trim();
+        if normalized.contains("$(") || normalized.contains('`') {
+            return Err(CommandUnsafe::new("Command substitution is not allowed"));
+        }
+        Ok(())
+    }
+
+    fn check_shell_syntax(&self, command: &str) -> Result<(), CommandUnsafe> {
         let mut normalized = command.trim();
 
         if let Some(stripped) = normalized.strip_suffix("2>/dev/null") {
@@ -129,10 +155,11 @@ impl CommandSafetyChecker {
             return Err(CommandUnsafe::new("Heredoc is not allowed"));
         }
 
+        let mut stripped = normalized.to_string();
         let mut search_from = 0;
-        while let Some(start) = normalized[search_from..].find("$'") {
+        while let Some(start) = stripped[search_from..].find("$'") {
             let abs_start = search_from + start;
-            let after = &normalized[abs_start + 2..];
+            let after = &stripped[abs_start + 2..];
             let mut depth = 0;
             let mut end_pos = None;
             for (i, ch) in after.char_indices() {
@@ -157,18 +184,27 @@ impl CommandSafetyChecker {
                         "ANSI-C quoting with embedded newlines is not allowed",
                     ));
                 }
-                search_from = abs_start + 2 + end + 1;
+                let replace_start = abs_start;
+                let replace_end = abs_start + 2 + end + 1;
+                let replace_len = replace_end.min(stripped.len()) - replace_start;
+                stripped.replace_range(replace_start..replace_start + replace_len, &" ".repeat(replace_len));
+                search_from = replace_end;
             } else {
                 break;
             }
         }
 
-        if normalized.contains('>') || normalized.contains('<') {
+        if stripped.contains('>') || stripped.contains('<') {
             return Err(CommandUnsafe::new(
                 "Output redirection to disk is not allowed",
             ));
         }
 
+        Ok(())
+    }
+
+    fn check_deny_list(&self, command: &str) -> Result<(), CommandUnsafe> {
+        let normalized = command.trim();
         let segments: Vec<&str> = normalized.split(['|', '&', ';', '\n', '\r']).collect();
 
         for segment in segments.iter() {
@@ -444,11 +480,16 @@ impl ApprovalManager {
         if matches!(category, ToolCategory::ReadOnly | ToolCategory::ReadFiles) {
             return false;
         }
-        if self.yolo_mode || self.auto_approve_all {
+        if self.yolo_mode {
+            return false;
+        }
+        if category == ToolCategory::ExecuteCommand && self.auto_approve_all {
+            return true;
+        }
+        if self.auto_approve_all {
             return false;
         }
         let tool_name = tool.name();
-        // For execute_command, check per-command approval; otherwise check tool-name approval
         !self.is_auto_approved(tool_name, command_fingerprint)
     }
 
@@ -1304,7 +1345,8 @@ mod tests {
         // Write tools should NOT prompt in auto-approve-all mode
         assert!(!manager.should_prompt(SnedTool::WriteToFile, None));
         assert!(!manager.should_prompt(SnedTool::EditFile, None));
-        assert!(!manager.should_prompt(SnedTool::ExecuteCommand, None));
+        // ExecuteCommand ALWAYS prompts in auto-approve-all mode (command injection protection)
+        assert!(manager.should_prompt(SnedTool::ExecuteCommand, None));
         assert!(!manager.should_prompt(SnedTool::ReplaceSymbol, None));
         assert!(!manager.should_prompt(SnedTool::RenameSymbol, None));
     }

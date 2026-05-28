@@ -73,6 +73,8 @@ pub struct App {
     pub elapsed: Option<Duration>,
     /// Scrollbar state for output pane
     pub scrollbar_state: ScrollbarState,
+    /// Last known content height from render (used by key handlers)
+    pub last_content_height: usize,
     /// Pending clear confirmation (stores the trigger: "slash" or "ctrl_l")
     pub pending_clear: Option<String>,
     /// Saved draft input before history navigation
@@ -111,6 +113,7 @@ impl App {
             mode: String::new(),
             elapsed: None,
             scrollbar_state: ScrollbarState::new(0),
+            last_content_height: 0,
             pending_clear: None,
             history_draft: None,
         }
@@ -190,6 +193,7 @@ impl App {
         let visible_height = output_area.height as usize;
         // Content height excludes border (1 line top + 1 line bottom)
         let content_height = visible_height.saturating_sub(2);
+        self.last_content_height = content_height;
         let total_lines = self.output_lines.len();
         
         let scroll_y = if self.auto_scroll {

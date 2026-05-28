@@ -185,8 +185,13 @@ impl SearchFilesHandler {
             ));
         }
 
-        let nesting = regex.chars().filter(|&c| c == '(').count();
-        if nesting > 10 {
+        let chars: Vec<char> = regex.chars().collect();
+        let group_count = chars
+            .iter()
+            .enumerate()
+            .filter(|&(ref i, &c)| c == '(' && (*i == 0 || chars[*i - 1] != '\\'))
+            .count();
+        if group_count > 10 {
             return Err(ToolError::InvalidInput(
                 "Regex pattern too complex (max 10 groups)".to_string(),
             ));

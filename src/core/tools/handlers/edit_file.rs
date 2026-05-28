@@ -665,6 +665,8 @@ impl EditFileHandler {
 
             // Track which files were successfully written for rollback
             let mut written_paths: Vec<String> = Vec::new();
+            // Collect rollback failures to report to user
+            let mut rollback_errors: Vec<String> = Vec::new();
 
             for item in &write_items {
                 let std_file = match std::fs::OpenOptions::new()
@@ -674,12 +676,25 @@ impl EditFileHandler {
                     Ok(f) => f,
                     Err(e) => {
                         // Rollback all previously written files
+                        // Note: previously written files were already unlocked after their atomic writes
                         for path in written_paths.iter().rev() {
                             if let Some(orig) = original_contents.get(path)
-                                && let Err(re) = std::fs::write(path, orig)
+                                && let Err(re) =
+                                    crate::storage::disk::atomic_write_file(path, orig)
                             {
-                                tracing::error!("Failed to rollback file {}: {}", path, re);
+                                rollback_errors.push(format!(
+                                    "Failed to rollback {}: {}",
+                                    path, re
+                                ));
                             }
+                        }
+                        if !rollback_errors.is_empty() {
+                            return Err(ToolError::ExecutionFailed(format!(
+                                "Failed to open file {} for locking: {}. Rollback incomplete: {}",
+                                item.display_path,
+                                e,
+                                rollback_errors.join(", ")
+                            )));
                         }
                         return Err(ToolError::ExecutionFailed(format!(
                             "Failed to open file {} for locking: {}",
@@ -722,25 +737,41 @@ impl EditFileHandler {
                         item.final_content.clone(),
                     );
 
-                    match crate::storage::disk::atomic_write_file_async(
+                    let write_result = crate::storage::disk::atomic_write_file_async(
                         &item.absolute_path,
                         &item.final_content,
                     )
-                    .await
-                    {
+                    .await;
+
+                    match write_result {
                         Ok(()) => {
                             written_paths.push(item.absolute_path.clone());
                         }
                         Err(e) => {
                             for path in written_paths.iter().rev() {
                                 if let Some(orig) = original_contents.get(path)
-                                    && let Err(re) = std::fs::write(path, orig)
+                                    && let Err(re) =
+                                        crate::storage::disk::atomic_write_file(path, orig)
                                 {
-                                    tracing::error!("Failed to rollback file {}: {}", path, re);
+                                    rollback_errors.push(format!(
+                                        "Failed to rollback {}: {}",
+                                        path, re
+                                    ));
                                 }
                             }
-                            all_results
-                                .push(format!("Error writing file {}: {}", item.display_path, e));
+                            if !rollback_errors.is_empty() {
+                                all_results.push(format!(
+                                    "Error writing file {}: {}. Rollback incomplete: {}",
+                                    item.display_path,
+                                    e,
+                                    rollback_errors.join(", ")
+                                ));
+                            } else {
+                                all_results.push(format!(
+                                    "Error writing file {}: {}",
+                                    item.display_path, e
+                                ));
+                            }
                         }
                     }
                 } else {
@@ -786,13 +817,28 @@ impl EditFileHandler {
                         Err(e) => {
                             for path in written_paths.iter().rev() {
                                 if let Some(orig) = original_contents.get(path)
-                                    && let Err(re) = std::fs::write(path, orig)
+                                    && let Err(re) =
+                                        crate::storage::disk::atomic_write_file(path, orig)
                                 {
-                                    tracing::error!("Failed to rollback file {}: {}", path, re);
+                                    rollback_errors.push(format!(
+                                        "Failed to rollback {}: {}",
+                                        path, re
+                                    ));
                                 }
                             }
-                            all_results
-                                .push(format!("Error writing file {}: {}", item.display_path, e));
+                            if !rollback_errors.is_empty() {
+                                all_results.push(format!(
+                                    "Error writing file {}: {}. Rollback incomplete: {}",
+                                    item.display_path,
+                                    e,
+                                    rollback_errors.join(", ")
+                                ));
+                            } else {
+                                all_results.push(format!(
+                                    "Error writing file {}: {}",
+                                    item.display_path, e
+                                ));
+                            }
                         }
                     }
                 }

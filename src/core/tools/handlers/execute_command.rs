@@ -584,9 +584,16 @@ impl ExecuteCommandHandler {
         use tokio::process::Command;
         use tokio::time::timeout;
 
-        if !explicitly_approved && let Err(e) = self.safety_checker.is_safe(script) {
-            tracing::warn!(script = %script, reason = %e, "script rejected by safety checker");
-            return Err(anyhow::anyhow!("{}", e));
+        if !explicitly_approved {
+            let check = if matches!(language, "bash" | "sh" | "zsh") {
+                self.safety_checker.is_safe(script)
+            } else {
+                self.safety_checker.is_safe_non_shell(script)
+            };
+            if let Err(e) = check {
+                tracing::warn!(script = %script, reason = %e, "script rejected by safety checker");
+                return Err(anyhow::anyhow!("{}", e));
+            }
         }
 
         let (shell, args) = match language {
@@ -774,8 +781,6 @@ impl ExecuteCommandHandler {
             "CARGO_HOME",
             "RUSTUP_HOME",
             "GOPATH",
-            "PYTHONPATH",
-            "NODE_PATH",
             "NPM_CONFIG_PREFIX",
         ];
 
@@ -1486,8 +1491,8 @@ mod tests {
                 | "XDG_CACHE_HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME"
                 | "XDG_STATE_HOME" | "EDITOR" | "VISUAL" | "PAGER" | "LESS"
                 | "MORE" | "LOGNAME" | "HOSTNAME" | "DOCKER_HOST"
-                | "CARGO_HOME" | "RUSTUP_HOME" | "GOPATH" | "PYTHONPATH"
-                | "NODE_PATH" | "NPM_CONFIG_PREFIX"
+                | "CARGO_HOME" | "RUSTUP_HOME" | "GOPATH"
+                | "NPM_CONFIG_PREFIX"
             ))
         {
             assert!(

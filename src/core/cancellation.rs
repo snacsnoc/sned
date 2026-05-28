@@ -84,9 +84,10 @@ impl CancellationHandler {
                         // Check liveness first to avoid signaling recycled PIDs
                         // SAFETY: pid is from /proc parsing, checked for liveness with kill(pid, 0).
                         // SIGTERM is a valid signal constant.
-                        if unsafe { libc::kill(*pid, 0) } == 0 {
-                            let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
-                            tracing::debug!("Sent SIGTERM to PID {}", pid);
+                        // Use negative PID to kill entire process group (commands spawned with process_group(0))
+                        if unsafe { libc::kill(-*pid, 0) } == 0 {
+                            let _ = unsafe { libc::kill(-*pid, libc::SIGTERM) };
+                            tracing::debug!("Sent SIGTERM to PGID -{}", pid);
                         }
                     }
 
@@ -97,9 +98,10 @@ impl CancellationHandler {
                     for pid in &pids_to_kill {
                         // SAFETY: pid is from /proc parsing, checked for liveness with kill(pid, 0).
                         // SIGKILL is a valid signal constant.
-                        if unsafe { libc::kill(*pid, 0) } == 0 {
-                            let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
-                            tracing::debug!("Sent SIGKILL to PID {}", pid);
+                        // Use negative PID to kill entire process group
+                        if unsafe { libc::kill(-*pid, 0) } == 0 {
+                            let _ = unsafe { libc::kill(-*pid, libc::SIGKILL) };
+                            tracing::debug!("Sent SIGKILL to PGID -{}", pid);
                         }
                     }
                 }

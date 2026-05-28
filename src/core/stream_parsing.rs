@@ -105,9 +105,49 @@ pub fn truncate_json_arguments(args: &str, max_size: usize) -> TruncatedJson {
         }
 
         if let Some(pos) = last_quote {
-            // Truncate to just before the last quote (so we're not in a string)
+            // Truncate to just before the last quote, then close the string and structures
+            // The last_quote is the OPENING quote of a string value, so we need to add
+            // an empty string: two quotes ("")
+            let mut result = args[..args.floor_char_boundary(pos)].to_string();
+            result.push_str("\"\"");
+            // Close any open brackets/braces
+            let mut brace_count = 0i32;
+            let mut bracket_count = 0i32;
+            let mut in_str = false;
+            let mut escape_next = false;
+            for c in result.chars() {
+                if escape_next {
+                    escape_next = false;
+                    continue;
+                }
+                if c == '\\' {
+                    escape_next = true;
+                    continue;
+                }
+                if c == '"' {
+                    in_str = !in_str;
+                    continue;
+                }
+                if !in_str {
+                    match c {
+                        '{' => brace_count += 1,
+                        '}' => brace_count -= 1,
+                        '[' => bracket_count += 1,
+                        ']' => bracket_count -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            while bracket_count > 0 {
+                result.push(']');
+                bracket_count -= 1;
+            }
+            while brace_count > 0 {
+                result.push('}');
+                brace_count -= 1;
+            }
             return TruncatedJson {
-                value: args[..args.floor_char_boundary(pos)].to_string(),
+                value: result,
                 was_repaired: true,
             };
         } else {
@@ -380,5 +420,14 @@ mod tests {
         let result = truncate_json_arguments(args, 20);
         assert!(result.was_repaired);
         assert!(result.value.contains("/tmp/test"));
+    }
+
+    #[test]
+    fn test_truncate_json_arguments_closes_string_gracefully() {
+        let args = r#"{"path": "/very/long/path/to/file.txt", "other": "value"}"#;
+        let result = truncate_json_arguments(args, 25);
+        assert!(result.value.len() <= 30);
+        assert!(result.was_repaired);
+        assert!(serde_json::from_str::<serde_json::Value>(&result.value).is_ok());
     }
 }

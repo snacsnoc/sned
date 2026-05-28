@@ -102,8 +102,14 @@ pub fn should_compact_context_window(
     threshold_percentage: Option<f64>,
     provider_name: &str,
 ) -> bool {
+    // OpenAI-compatible providers (openai, minimax, groq, xai, deepseek, openrouter)
+    // report input_tokens EXCLUDING cached tokens (prompt_tokens - cached_tokens).
+    // The actual prompt size is input_tokens + cache_read_tokens, so we must add
+    // cache_read_tokens back to get the true context window usage.
+    // Anthropic/Gemini report input_tokens excluding cache but add cache separately,
+    // and their tokens_in already represents the full prompt footprint.
     let cache_tokens = if provider_name == "openai" || provider_name == "minimax" {
-        0
+        api_req_info.cache_reads.unwrap_or(0) as u64
     } else {
         api_req_info.cache_writes.unwrap_or(0) as u64 + api_req_info.cache_reads.unwrap_or(0) as u64
     };
@@ -137,9 +143,11 @@ pub fn get_new_context_messages_and_metadata(
         // Only count input tokens (tokens_in) for truncation decision.
         // Output tokens (tokens_out) are from previous responses and don't
         // contribute to the current request size that validate_context_window checks.
-        // Include cache tokens for Anthropic (tokens_in already includes cache for OpenAI/MiniMax)
+        // Include cache tokens for accurate context window compaction decisions.
+        // OpenAI-compatible providers: input_tokens already excludes cache, so add cache_read_tokens back.
+        // Anthropic/Gemini: input_tokens excludes cache, add both cache_write and cache_read.
         let cache_tokens = if provider_name == "openai" || provider_name == "minimax" {
-            0
+            info.cache_reads.unwrap_or(0) as u64
         } else {
             info.cache_writes.unwrap_or(0) as u64 + info.cache_reads.unwrap_or(0) as u64
         };
@@ -816,5 +824,51 @@ mod tests {
             "anthropic",
         );
         assert!(result.updated_conversation_history_deleted_range);
+    }
+
+    #[test]
+    fn test_openai_cache_tokens_included_in_compaction_threshold() {
+        let info = ApiReqInfo {
+            tokens_in: Some(100_000),
+            cache_reads: Some(70_000),
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+
+        // OpenAI: tokens_in excludes cache, so actual prompt size = 100k + 70k = 170k
+        // 170k/200k = 85% > 80% no-auto-condense threshold
+        assert!(
+            should_compact_context_window(&info, 200_000, 160_000, None, "openai"),
+            "OpenAI: 100k input + 70k cache = 170k should trigger at 80% of 200k"
+        );
+
+        // Without cache: 100k/200k = 50% < 80%, should NOT trigger
+        let info_no_cache = ApiReqInfo {
+            tokens_in: Some(100_000),
+            cache_reads: None,
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+        assert!(
+            !should_compact_context_window(&info_no_cache, 200_000, 160_000, None, "openai"),
+            "OpenAI: 100k input with no cache should not trigger at 80% of 200k"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_cache_tokens_included_in_compaction_threshold() {
+        let info = ApiReqInfo {
+            tokens_in: Some(100_000),
+            cache_writes: Some(20_000),
+            cache_reads: Some(30_000),
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+
+        // Anthropic: tokens_in is uncached, total = 100k + 20k + 30k = 150k
+        assert!(
+            should_compact_context_window(&info, 200_000, 160_000, None, "anthropic"),
+            "Anthropic: 100k input + 20k cache_write + 30k cache_read = 150k should trigger"
+        );
     }
 }

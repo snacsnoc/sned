@@ -1,9 +1,9 @@
-//! Output abstraction for ratatui migration.
+//! Output abstraction for agent output routing.
 //!
 //! This module provides the `OutputEvent` enum and `OutputWriter` trait that
-//! allow agent output to be decoupled from the terminal. During the migration,
-//! output flows through an `mpsc` channel, allowing the TUI render loop to be
-//! the sole writer to the terminal.
+//! decouple agent output from the terminal. In interactive mode, output flows
+//! through an `mpsc` channel to the ratatui render loop. In one-shot/piped
+//! mode, output goes directly to stderr.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};

@@ -158,7 +158,7 @@ impl ReadFileHandler {
                     Err(e) => return e,
                 }
             } else {
-                match self.read_full_file(path).await {
+                match self.read_full_file(&canonical_path.to_string_lossy()).await {
                     Ok((content, lines)) => (
                         content,
                         lines.clone(),

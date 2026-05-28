@@ -405,32 +405,51 @@ async fn spawn_agent_task(
 }
 
 /// Cancel running agent task.
+///
+/// Uses the same graceful shutdown sequence as CancellationHandler::abort_task:
+/// SIGTERM → 100ms wait → SIGKILL. This gives running commands a chance to
+/// clean up (flush output, close files, etc.) before being force-killed.
 async fn cancel_agent(
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     agent_done: &Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<()> {
-    // Set cancellation flag
     if let Some(sh) = state_handle.lock().await.as_ref() {
         let mut state = sh.lock().await;
         state.is_cancelled = true;
         state.is_cancelled_atomic.store(true, Ordering::Release);
 
-        // Kill running PIDs
         #[cfg(unix)]
-        for &pid in &state.running_command_pids.clone() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+        {
+            let pids = state.running_command_pids.clone();
+
+            for pid in &pids {
+                if unsafe { libc::kill(-*pid, 0) } == 0 {
+                    let _ = unsafe { libc::kill(-*pid, libc::SIGTERM) };
+                }
+            }
+
+            drop(state);
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let mut state = sh.lock().await;
+            for pid in &pids {
+                if unsafe { libc::kill(-*pid, 0) } == 0 {
+                    let _ = unsafe { libc::kill(-*pid, libc::SIGKILL) };
+                }
+            }
+            state.running_command_pids.clear();
         }
-        state.running_command_pids.clear();
+
+        #[cfg(not(unix))]
+        {
+            state.running_command_pids.clear();
+        }
     }
 
-    // Abort agent task
     if let Some(task) = agent_task.lock().await.take() {
         task.abort();
-        // Wait briefly for cleanup
         tokio::time::timeout(Duration::from_secs(2), async {
             agent_done.notified().await
         })
@@ -511,11 +530,19 @@ async fn handle_key_event(
 
     // PageUp/PageDown for scrolling
     if key.code == KeyCode::PageUp {
+        if app.auto_scroll {
+            let total = app.output_lines.len();
+            app.scroll_offset = total.saturating_sub(app.last_content_height) as u16;
+        }
         app.auto_scroll = false;
         app.scroll_offset = app.scroll_offset.saturating_sub(10);
         return Ok(None);
     }
     if key.code == KeyCode::PageDown {
+        if app.auto_scroll {
+            let total = app.output_lines.len();
+            app.scroll_offset = total.saturating_sub(app.last_content_height) as u16;
+        }
         app.auto_scroll = false;
         app.scroll_offset = app.scroll_offset.saturating_add(10);
         return Ok(None);
@@ -539,13 +566,20 @@ async fn handle_key_event(
     // Shift+Up/Down for manual scroll
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         if key.code == KeyCode::Up {
+            if app.auto_scroll {
+                let total = app.output_lines.len();
+                app.scroll_offset = total.saturating_sub(app.last_content_height) as u16;
+            }
             app.auto_scroll = false;
             app.scroll_offset = app.scroll_offset.saturating_sub(1);
             return Ok(None);
         }
         if key.code == KeyCode::Down {
+            if app.auto_scroll {
+                let total = app.output_lines.len();
+                app.scroll_offset = total.saturating_sub(app.last_content_height) as u16;
+            }
             app.scroll_offset = app.scroll_offset.saturating_add(1);
-            // Auto-scroll will be re-enabled in render if at bottom
             return Ok(None);
         }
     }

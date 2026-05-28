@@ -480,7 +480,11 @@ async fn process_gemini_sse_line(
                         // Enforce MAX_TOOL_ARGUMENT_SIZE — Gemini receives
                         // complete args in one chunk rather than streaming deltas,
                         // but the size limit still applies.
-                        let args_str = fc.args.as_ref().map(|a| a.to_string()).unwrap_or_default();
+                        let args_str = match fc.args.as_ref() {
+                            Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => fc.args.as_ref().unwrap().to_string(),
+                            Some(_) => "{}".to_string(),
+                            None => "{}".to_string(),
+                        };
                         let args_str = if args_str.len() <= crate::providers::MAX_TOOL_ARGUMENT_SIZE
                         {
                             args_str
@@ -1633,5 +1637,57 @@ mod tests {
             }
         }
         assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn test_function_call_args_null_normalizes_to_empty_object() {
+        let fc = GeminiResponseFunctionCall {
+            name: "read_file".to_string(),
+            args: Some(serde_json::Value::Null),
+            id: Some("call-1".to_string()),
+        };
+        let args_str = match fc.args.as_ref() {
+            Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => {
+                fc.args.as_ref().unwrap().to_string()
+            }
+            Some(_) => "{}".to_string(),
+            None => "{}".to_string(),
+        };
+        assert_eq!(args_str, "{}");
+    }
+
+    #[test]
+    fn test_function_call_args_object_passes_through() {
+        let fc = GeminiResponseFunctionCall {
+            name: "read_file".to_string(),
+            args: Some(serde_json::json!({"path": "/foo.rs"})),
+            id: Some("call-1".to_string()),
+        };
+        let args_str = match fc.args.as_ref() {
+            Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => {
+                fc.args.as_ref().unwrap().to_string()
+            }
+            Some(_) => "{}".to_string(),
+            None => "{}".to_string(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&args_str).unwrap();
+        assert_eq!(parsed["path"], "/foo.rs");
+    }
+
+    #[test]
+    fn test_function_call_args_none_defaults_to_empty_object() {
+        let fc = GeminiResponseFunctionCall {
+            name: "read_file".to_string(),
+            args: None,
+            id: None,
+        };
+        let args_str = match fc.args.as_ref() {
+            Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => {
+                fc.args.as_ref().unwrap().to_string()
+            }
+            Some(_) => "{}".to_string(),
+            None => "{}".to_string(),
+        };
+        assert_eq!(args_str, "{}");
     }
 }
