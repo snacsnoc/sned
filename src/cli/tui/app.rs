@@ -187,18 +187,6 @@ impl App {
         let content_height = visible_height.saturating_sub(2);
         let total_lines = self.output_lines.len();
         
-        // Add loading indicator line when agent is busy
-        let output_lines_to_render = if self.agent_busy {
-            let mut lines = self.output_lines.clone();
-            lines.push(Line::from(Span::styled(
-                format!("{} Agent processing...", self.spinner_char()),
-                theme::spinner_style(),
-            )));
-            lines
-        } else {
-            self.output_lines.clone()
-        };
-        
         let scroll_y = if self.auto_scroll {
             total_lines.saturating_sub(content_height) as u16
         } else {
@@ -212,14 +200,59 @@ impl App {
             }
         };
 
-        let output = Paragraph::new(output_lines_to_render)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y, 0))
-            .block(
-                theme::border_block(" sned ")
-                    .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
+        // Virtual scrolling: only render visible lines + small buffer (2x visible height)
+        // This avoids cloning 10,000 lines every frame and reduces Paragraph processing
+        let buffer_multiplier = 2;
+        let buffer_size = content_height * buffer_multiplier;
+        let start = scroll_y as usize;
+        let end = (start + buffer_size).min(total_lines);
+        
+        // Render loading indicator as a separate widget when agent is busy
+        if self.agent_busy {
+            // Render output pane with visible lines only (virtual scrolling)
+            let visible_lines: Vec<Line> = if start < end {
+                self.output_lines[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            let output = Paragraph::new(visible_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((0, 0))  // No scroll - we already sliced to visible window
+                .block(
+                    theme::border_block(" sned ")
+                        .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
+                );
+            frame.render_widget(output, output_area);
+            
+            // Render loading indicator at bottom of output area
+            let loading_area = Rect::new(
+                output_area.x,
+                output_area.y + output_area.height.saturating_sub(1),
+                output_area.width,
+                1,
             );
-        frame.render_widget(output, output_area);
+            let loading = Paragraph::new(Line::from(Span::styled(
+                format!("{} Agent processing...", self.spinner_char()),
+                theme::spinner_style(),
+            )))
+            .style(theme::status_style());
+            frame.render_widget(loading, loading_area);
+        } else {
+            // No loading indicator - render output pane normally
+            let visible_lines: Vec<Line> = if start < end {
+                self.output_lines[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            let output = Paragraph::new(visible_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((0, 0))  // No scroll - we already sliced to visible window
+                .block(
+                    theme::border_block(" sned ")
+                        .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
+                );
+            frame.render_widget(output, output_area);
+        }
 
         // Scrollbar on output pane (render inside the border)
         self.scrollbar_state = self
