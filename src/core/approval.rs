@@ -427,8 +427,14 @@ impl ApprovalManager {
             return false;
         }
 
+        // In auto-approve-all mode, suppress prompts for local operations only.
+        // External writes/reads ALWAYS require approval (security boundary).
+        if self.auto_approve_all && is_local {
+            return false;
+        }
+
         // Safety policy: reads/writes outside workspace always require approval
-        // (ported from autoApprove.ts:159-162)
+        // regardless of auto_approve_all setting. Only yolo_mode bypasses this.
         if action_path.is_some()
             && !is_local
             && matches!(category, ToolCategory::EditFiles | ToolCategory::ReadFiles)

@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::error::TrySendError;
 
 /// Configuration for the Gemini provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeminiConfig {
     pub api_key: String,
     pub base_url: Option<String>,
@@ -33,6 +33,20 @@ pub struct GeminiConfig {
     pub thinking_budget_tokens: Option<u32>,
     pub reasoning_effort: Option<String>,
     pub search_enabled: bool,
+}
+
+impl std::fmt::Debug for GeminiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeminiConfig")
+            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field("base_url", &self.base_url)
+            .field("model_id", &self.model_id)
+            .field("model_info", &self.model_info)
+            .field("thinking_budget_tokens", &self.thinking_budget_tokens)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("search_enabled", &self.search_enabled)
+            .finish()
+    }
 }
 
 /// Gemini API thinking level enum.

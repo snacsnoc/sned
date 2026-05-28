@@ -10,11 +10,21 @@ use crate::providers::{
 use anyhow::Result;
 
 /// Configuration for the xAI provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct XaiConfig {
     pub api_key: String,
     pub model_id: String,
     pub model_info: Option<OpenAiCompatibleModelInfo>,
+}
+
+impl std::fmt::Debug for XaiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XaiConfig")
+            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field("model_id", &self.model_id)
+            .field("model_info", &self.model_info)
+            .finish()
+    }
 }
 
 /// xAI (Grok) provider (OpenAI-compatible with custom base URL).

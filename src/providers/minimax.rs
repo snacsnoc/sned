@@ -34,7 +34,7 @@ use serde_json::json;
 use tokio::sync::mpsc::error::TrySendError;
 
 /// Configuration for the MiniMax provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MinimaxConfig {
     pub api_key: String,
     /// "china" for China API, anything else for global
@@ -42,6 +42,18 @@ pub struct MinimaxConfig {
     pub model_id: String,
     pub model_info: Option<ModelInfo>,
     pub thinking_budget_tokens: Option<u32>,
+}
+
+impl std::fmt::Debug for MinimaxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MinimaxConfig")
+            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field("api_line", &self.api_line)
+            .field("model_id", &self.model_id)
+            .field("model_info", &self.model_info)
+            .field("thinking_budget_tokens", &self.thinking_budget_tokens)
+            .finish()
+    }
 }
 
 /// MiniMax API provider.

@@ -18,7 +18,7 @@ use serde_json::json;
 use tokio::sync::mpsc::error::TrySendError;
 
 /// Configuration for the OpenAI provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiConfig {
     pub api_key: String,
     pub base_url: Option<String>,
@@ -29,6 +29,20 @@ pub struct OpenAiConfig {
     /// Provider name for error messages (defaults to "OpenAI" if not set).
     /// Used by OpenAI-compatible providers (OpenRouter, DeepSeek, Groq, xAI) to identify themselves in errors.
     pub provider_name: Option<String>,
+}
+
+impl std::fmt::Debug for OpenAiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiConfig")
+            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field("base_url", &self.base_url)
+            .field("model_id", &self.model_id)
+            .field("model_info", &self.model_info)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("custom_headers", &self.custom_headers)
+            .field("provider_name", &self.provider_name)
+            .finish()
+    }
 }
 
 /// OpenAI-compatible provider (covers generic OpenAI, Azure, and custom base URL).

@@ -12,7 +12,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 /// Configuration for the OpenRouter provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenRouterConfig {
     pub api_key: String,
     pub model_id: String,
@@ -20,6 +20,18 @@ pub struct OpenRouterConfig {
     pub provider_sort: Option<String>,
     /// Provider name for error messages (defaults to "openrouter" if not set).
     pub provider_name: Option<String>,
+}
+
+impl std::fmt::Debug for OpenRouterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenRouterConfig")
+            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field("model_id", &self.model_id)
+            .field("model_info", &self.model_info)
+            .field("provider_sort", &self.provider_sort)
+            .field("provider_name", &self.provider_name)
+            .finish()
+    }
 }
 
 /// OpenRouter provider (OpenAI-compatible with custom headers and base URL).
