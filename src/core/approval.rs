@@ -520,8 +520,19 @@ impl ApprovalManager {
     /// Check whether a path is local (within the workspace root).
     /// SECURITY (F-04): For non-existent paths, canonicalize the parent directory
     /// to detect symlink escapes even when the target file doesn't exist yet.
+    /// 
+    /// @-mentions produce workspace-relative paths like `/AGENTS.md` (single `/` prefix).
+    /// These must be resolved relative to workspace_root, not filesystem root.
     fn is_path_local(&self, path: &str) -> bool {
         if let Some(ref root) = self.workspace_root {
+            // @-mention paths: `/AGENTS.md` → workspace-relative, strip leading `/`
+            // Absolute paths: `/home/user/project/file` → keep as-is
+            let path = if path.starts_with('/') && !path[1..].contains('/') {
+                &path[1..]
+            } else {
+                path
+            };
+            
             let p = Path::new(path);
             let r = Path::new(root);
 
