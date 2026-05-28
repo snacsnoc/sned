@@ -5,6 +5,7 @@
 //! output flows through an `mpsc` channel, allowing the TUI render loop to be
 //! the sole writer to the terminal.
 
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::fmt;
 use std::io::Write;
@@ -21,125 +22,101 @@ pub enum OutputEvent {
 }
 
 impl OutputEvent {
-    /// Create a plain text line.
     pub fn plain(text: impl Into<String>) -> Self {
         OutputEvent::Line(Line::from(text.into()))
     }
 
-    /// Create a styled line with the given style.
     pub fn styled(text: impl Into<String>, style: ratatui::style::Style) -> Self {
         OutputEvent::Line(Line::from(Span::styled(text.into(), style)))
     }
 
-    /// Create a dim yellow line (e.g., slow connection warning).
     pub fn dim_yellow(text: impl Into<String>) -> Self {
-        use ratatui::style::{Color, Modifier, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(theme::WARNING_FG).add_modifier(Modifier::DIM),
         )))
     }
 
-    /// Create a dim line (e.g., hints, metadata).
     pub fn dim(text: impl Into<String>) -> Self {
-        use ratatui::style::{Modifier, Style};
-        OutputEvent::Line(Line::from(Span::styled(
-            text.into(),
-            Style::default().add_modifier(Modifier::DIM),
-        )))
+        use crate::cli::tui::theme;
+        OutputEvent::Line(Line::from(Span::styled(text.into(), theme::dim_style())))
     }
 
-    /// Create a cyan line (e.g., model output).
     pub fn cyan(text: impl Into<String>) -> Self {
-        use ratatui::style::{Color, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme::ACCENT),
         )))
     }
 
-    /// Create a magenta line (e.g., tool calls).
     pub fn magenta(text: impl Into<String>) -> Self {
-        use ratatui::style::{Color, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(theme::TOOL_CALL_FG),
         )))
     }
 
-    /// Create a red line for errors or green for success.
     pub fn error_or_success(text: impl Into<String>, is_error: bool) -> Self {
-        use ratatui::style::{Color, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(if is_error { Color::Red } else { Color::Green }),
+            Style::default().fg(if is_error { theme::ERROR_FG } else { theme::PROMPT_FG }),
         )))
     }
 
-    /// Create a bold line (e.g., section headers).
     pub fn bold(text: impl Into<String>) -> Self {
-        use ratatui::style::{Modifier, Style};
-        OutputEvent::Line(Line::from(Span::styled(
-            text.into(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )))
+        use crate::cli::tui::theme;
+        OutputEvent::Line(Line::from(Span::styled(text.into(), theme::bold_style())))
     }
 
-    /// Create a yellow warning line.
     pub fn yellow(text: impl Into<String>) -> Self {
-        use ratatui::style::{Color, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARNING_FG),
         )))
     }
 
-    /// Create an error line (red styling).
     pub fn error(text: impl fmt::Display) -> Self {
-        use ratatui::style::{Color, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             format!("[sned] ERROR: {}", text),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme::ERROR_FG),
         )))
     }
 
-    /// Create a warning line (yellow styling).
     pub fn warning(text: impl fmt::Display) -> Self {
-        use ratatui::style::{Color, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             format!("[sned] Warning: {}", text),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARNING_FG),
         )))
     }
 
-    /// Create an info line (dim styling).
     pub fn info(text: impl fmt::Display) -> Self {
-        use ratatui::style::{Color, Modifier, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             format!("[sned] {}", text),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(theme::INFO_FG).add_modifier(Modifier::DIM),
         )))
     }
 
-    /// Create a styled line with magenta color (for tool calls).
     pub fn tool_call(text: impl Into<String>) -> Self {
-        use ratatui::style::{Color, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(theme::TOOL_CALL_FG),
         )))
     }
 
-    /// Create a styled line with cyan color (for model output).
     pub fn model_output(text: impl Into<String>) -> Self {
-        use ratatui::style::{Color, Style};
+        use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme::ACCENT),
         )))
     }
 }

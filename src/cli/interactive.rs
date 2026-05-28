@@ -5,7 +5,7 @@
 
 use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
 use crate::cli::tui::history::append_to_history;
-use crate::cli::tui::{App, ansi_to_ratatui_lines, theme};
+use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::{is_approval_prompt_active, take_approval_sender, ApprovalResult};
 use futures::FutureExt;
@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
 };
 use ratatui::crossterm::execute;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -28,22 +28,6 @@ impl Drop for TerminalGuard {
         // Disable bracketed paste and mouse capture before restoring terminal
         let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         ratatui::restore();
-    }
-}
-
-/// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m")
-fn format_duration(duration: Duration) -> String {
-    let total_secs = duration.as_secs();
-    if total_secs >= 3600 {
-        let hours = total_secs / 3600;
-        let mins = (total_secs % 3600) / 60;
-        format!("{}h {}m", hours, mins)
-    } else if total_secs >= 60 {
-        let mins = total_secs / 60;
-        let secs = total_secs % 60;
-        format!("{}m {}s", mins, secs)
-    } else {
-        format!("{}s", total_secs)
     }
 }
 
@@ -506,7 +490,7 @@ async fn handle_key_event(
             // Turn separator before user message (only if a previous turn completed)
             // Check if output already has a turn separator (from previous agent completion)
             if !app.output_lines.is_empty()
-                && app.output_lines.last().is_some_and(|line| {
+                && app.output_lines.back().is_some_and(|line| {
                     line.spans.first().is_some_and(|span| {
                         span.content.as_ref().starts_with('─')
                     })
@@ -532,6 +516,7 @@ async fn handle_key_event(
         return Ok(None);
     }
     if key.code == KeyCode::PageDown {
+        app.auto_scroll = false;
         app.scroll_offset = app.scroll_offset.saturating_add(10);
         return Ok(None);
     }
@@ -546,7 +531,7 @@ async fn handle_key_event(
             app.push_plain(format!("Conversation cleared (confirmed via {}).", trigger));
         } else {
             app.pending_clear = None;
-            app.push_plain("Clear cancelled.");
+            app.push_styled("Clear cancelled.", theme::dim_style());
         }
         return Ok(None);
     }
@@ -568,6 +553,9 @@ async fn handle_key_event(
     // Up/Down for command history navigation (only when picker is not active)
     // Always allow history navigation regardless of cursor position
     if key.code == KeyCode::Up && !app.picker_active {
+        if !app.history.is_navigating() {
+            app.history_draft = Some(app.input.lines().join("\n"));
+        }
         if let Some(entry) = app.history.navigate_up() {
             app.input = App::new_textarea(vec![entry.to_string()]);
         }
@@ -577,7 +565,12 @@ async fn handle_key_event(
         if let Some(entry) = app.history.navigate_down() {
             app.input = App::new_textarea(vec![entry.to_string()]);
         } else {
-            app.input = App::new_textarea(Vec::new());
+            let draft = app.history_draft.take().unwrap_or_default();
+            app.input = if draft.is_empty() {
+                App::new_textarea(Vec::new())
+            } else {
+                App::new_textarea(draft.split('\n').map(|s| s.to_string()).collect())
+            };
         }
         return Ok(None);
     }
@@ -604,7 +597,7 @@ async fn handle_key_event(
     // Ctrl+L - clear output screen (with confirmation)
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.pending_clear = Some("ctrl_l".to_string());
-        app.push_plain("Clear output? (y to confirm, any other key to cancel): ");
+        app.push_styled("Clear output? (y to confirm, any other key to cancel): ", Style::default().fg(theme::WARNING_FG));
         return Ok(None);
     }
 
@@ -676,7 +669,7 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Clear => {
             app.pending_clear = Some("slash".to_string());
-            app.push_plain("Clear output? (y to confirm, any other key to cancel): ");
+            app.push_styled("Clear output? (y to confirm, any other key to cancel): ", Style::default().fg(theme::WARNING_FG));
         }
         CliOnlyCommand::History => {
             let last_n: Vec<String> = app
@@ -850,12 +843,12 @@ async fn handle_cli_only_command(
 
                 // Timeout or error: default to cancel (safe default)
                 if confirm.trim().is_empty() {
-                    app.push_plain("Confirmation timeout — cancelled.");
+                    app.push_styled("Confirmation timeout — cancelled.", Style::default().fg(theme::WARNING_FG));
                     return Ok(false);
                 }
 
                 if confirm.trim().to_lowercase() == "y" {
-                    app.push_plain("Undo cancelled.");
+                    app.push_styled("Undo cancelled.", Style::default().fg(theme::WARNING_FG));
                     return Ok(false);
                 }
             }
@@ -980,7 +973,7 @@ async fn handle_cli_only_command(
 
                                     // Timeout or error: default to cancel (safe default)
                                     if confirm.trim().is_empty() {
-                                        app.push_plain("Confirmation timeout — cancelled.");
+                                        app.push_styled("Confirmation timeout — cancelled.", Style::default().fg(theme::WARNING_FG));
                                     } else if confirm.trim().to_lowercase() == "y" {
                                         match crate::core::shadow_git::commit_to_real_git(
                                             &workspace_root,
@@ -997,7 +990,7 @@ async fn handle_cli_only_command(
                                             }
                                         }
                                     } else {
-                                        app.push_plain("Commit cancelled.");
+                                        app.push_styled("Commit cancelled.", Style::default().fg(theme::WARNING_FG));
                                     }
                                 }
                             }
@@ -1132,12 +1125,12 @@ async fn handle_cli_only_command(
 
                             // Timeout or error: default to cancel (safe default)
                             if confirm.trim().is_empty() {
-                                app.push_plain("Confirmation timeout — cancelled.");
+                                app.push_styled("Confirmation timeout — cancelled.", Style::default().fg(theme::WARNING_FG));
                                 return Ok(false);
                             }
 
                             if confirm.trim().to_lowercase() == "y" {
-                                app.push_plain("Restore cancelled.");
+                                app.push_styled("Restore cancelled.", Style::default().fg(theme::WARNING_FG));
                                 return Ok(false);
                             }
                         }
@@ -1235,7 +1228,7 @@ async fn run_main_loop(
                             // Ctrl+C during approval: deny, cancel agent
                             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                                 let _ = sender.send(ApprovalResult::Denied);
-                                app.output_lines.truncate(prompt_lines);
+                                app.output_lines.drain(prompt_lines..);
                                 app.auto_scroll = true;
                                 app.scroll_offset = 0;
                                 cancel_agent(&state_handle, &agent_task, &agent_done).await?;
@@ -1256,7 +1249,7 @@ async fn run_main_loop(
                                 }
                             };
                             let _ = sender.send(result.clone());
-                            app.output_lines.truncate(prompt_lines);
+                            app.output_lines.drain(prompt_lines..);
                             // Echo approval decision
                             app.push_styled(
                                 format!(
@@ -1267,7 +1260,7 @@ async fn run_main_loop(
                                         ApprovalResult::Always => "always approve",
                                     }
                                 ),
-                                Style::default().fg(Color::Cyan),
+                                Style::default().fg(theme::ACCENT),
                             );
                             app.auto_scroll = true;
                             app.scroll_offset = 0;
@@ -1309,7 +1302,7 @@ async fn run_main_loop(
                         if agent_busy.load(Ordering::Relaxed) {
                             cancel_agent(&state_handle, &agent_task, &agent_done).await?;
                             app.agent_busy = false;
-                            app.push_plain("^C cancelled");
+                            app.push_styled("^C cancelled", Style::default().fg(theme::WARNING_FG));
                             app.push_styled(
                                 "Press Ctrl+C again to quit.",
                                 Style::default().fg(theme::WARNING_FG),
@@ -1383,7 +1376,7 @@ async fn run_main_loop(
                                                     "Command queued ({} in queue): {}",
                                                     count, text
                                                 ),
-                                                Style::default().add_modifier(Modifier::DIM),
+                                                theme::dim_style(),
                                             );
                                         }
                                         continue;
@@ -1405,7 +1398,7 @@ async fn run_main_loop(
                                     let count = qh.queued_message_count().await;
                                     app.push_styled(
                                         format!("Message queued ({} in queue)", count),
-                                        Style::default().add_modifier(Modifier::DIM),
+                                        theme::dim_style(),
                                     );
                                 } else {
                                     spawn_agent_task(
@@ -1436,7 +1429,7 @@ async fn run_main_loop(
                                 "Large paste folded ({} chars) - will expand on submit",
                                 content.len()
                             ),
-                            Style::default().add_modifier(Modifier::DIM),
+                            theme::dim_style(),
                         );
                     }
                 }
@@ -1477,7 +1470,7 @@ async fn run_main_loop(
                 app.elapsed = Some(elapsed);
                 app.push_styled(
                     format!("⏱ Elapsed: {}", format_duration(elapsed)),
-                    Style::default().add_modifier(Modifier::DIM),
+                    theme::dim_style(),
                 );
                 // Turn separator after agent completion
                 app.push_turn_separator();
@@ -1572,11 +1565,11 @@ pub async fn run_interactive_shell_inner(
             }
             app.push_styled(
                 "type a prompt and press Enter; type /exit to leave",
-                Style::default().add_modifier(Modifier::DIM),
+                theme::dim_style(),
             );
             app.push_styled(
                 "type /help for slash commands, @ to search and mention files",
-                Style::default().add_modifier(Modifier::DIM),
+                theme::dim_style(),
             );
         }
     }

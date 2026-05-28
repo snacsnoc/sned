@@ -24,6 +24,12 @@ pub const WARNING_FG: Color = Color::Yellow;
 /// Error color.
 pub const ERROR_FG: Color = Color::Red;
 
+/// Tool call color (e.g., execute_command, file operations).
+pub const TOOL_CALL_FG: Color = Color::Magenta;
+
+/// Info/subtle color (dim white for status messages).
+pub const INFO_FG: Color = Color::White;
+
 /// File picker selected row background.
 pub const PICKER_SELECTED_BG: Color = Color::Blue;
 

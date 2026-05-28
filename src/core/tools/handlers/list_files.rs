@@ -58,17 +58,15 @@ impl ListFilesHandler {
     ) -> ListFilesResult {
         let path_obj = Path::new(path);
 
-        // Check if path exists
+        // Check if path exists (simple exists check is sufficient here since
+        // path sanitization is done by resolve_sanitized_path before handler is called)
         if !path_obj.exists() {
             return ListFilesResult {
                 path: path.to_string(),
                 files: Vec::new(),
                 hit_limit: false,
                 success: false,
-                error: Some(format!(
-                    "Error listing files in {}: path does not exist",
-                    path
-                )),
+                error: Some(format!("Error listing files in {}: path does not exist", path)),
                 warning: None,
             };
         }
@@ -76,7 +74,7 @@ impl ListFilesHandler {
         // If path is a file, return info for just that file
         if path_obj.is_file() {
             let line_count = if include_line_counts {
-                count_lines_fast(path_obj).await
+                count_lines_fast(&path_obj).await
             } else {
                 None
             };
@@ -95,15 +93,15 @@ impl ListFilesHandler {
             };
         }
 
-        // Collect files
+        // Collect files using original path to preserve format in output
         let mut files = Vec::new();
         let mut hit_limit = false;
 
         let warning = if recursive {
-            self.collect_files_recursive(path_obj, &mut files, &mut hit_limit, include_line_counts)
+            self.collect_files_recursive(&path_obj, &mut files, &mut hit_limit, include_line_counts)
                 .await
         } else {
-            self.collect_files_top_level(path_obj, &mut files, &mut hit_limit, include_line_counts)
+            self.collect_files_top_level(&path_obj, &mut files, &mut hit_limit, include_line_counts)
                 .await
                 .map(|()| None)
         };

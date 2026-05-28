@@ -12,6 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 
@@ -33,7 +34,7 @@ pub struct PasteChunk {
 /// Application state for the ratatui TUI.
 pub struct App {
     /// Output lines buffer (agent output, submitted prompts, etc.)
-    pub output_lines: Vec<Line<'static>>,
+    pub output_lines: VecDeque<Line<'static>>,
     /// Input textarea (live user input)
     pub input: TextArea<'static>,
     /// Whether the agent is currently busy
@@ -74,6 +75,8 @@ pub struct App {
     pub scrollbar_state: ScrollbarState,
     /// Pending clear confirmation (stores the trigger: "slash" or "ctrl_l")
     pub pending_clear: Option<String>,
+    /// Saved draft input before history navigation
+    pub history_draft: Option<String>,
 }
 
 impl App {
@@ -88,7 +91,7 @@ impl App {
     /// Create a new App instance.
     pub fn new() -> Self {
         Self {
-            output_lines: Vec::new(),
+            output_lines: VecDeque::new(),
             input: Self::new_textarea(Vec::new()),
             agent_busy: false,
             scroll_offset: 0,
@@ -109,15 +112,17 @@ impl App {
             elapsed: None,
             scrollbar_state: ScrollbarState::new(0),
             pending_clear: None,
+            history_draft: None,
         }
     }
 
     /// Push an output line to the buffer.
     pub fn push_output(&mut self, line: Line<'static>) {
-        self.output_lines.push(line);
-        // Cap at 10K lines to avoid O(n) render cost
+        self.output_lines.push_back(line);
         if self.output_lines.len() > 10_000 {
-            self.output_lines.drain(..self.output_lines.len() - 10_000);
+            while self.output_lines.len() > 10_000 {
+                self.output_lines.pop_front();
+            }
         }
     }
 
@@ -135,7 +140,7 @@ impl App {
     pub fn push_turn_separator(&mut self) {
         self.push_output(Line::from(Span::styled(
             "─".repeat(40),
-            Style::default().add_modifier(Modifier::DIM),
+            theme::dim_style(),
         )));
     }
 
@@ -211,7 +216,7 @@ impl App {
         if self.agent_busy {
             // Render output pane with visible lines only (virtual scrolling)
             let visible_lines: Vec<Line> = if start < end {
-                self.output_lines[start..end].to_vec()
+                self.output_lines.iter().skip(start).take(end - start).cloned().collect()
             } else {
                 Vec::new()
             };
@@ -240,7 +245,7 @@ impl App {
         } else {
             // No loading indicator - render output pane normally
             let visible_lines: Vec<Line> = if start < end {
-                self.output_lines[start..end].to_vec()
+                self.output_lines.iter().skip(start).take(end - start).cloned().collect()
             } else {
                 Vec::new()
             };
@@ -405,7 +410,7 @@ impl App {
 }
 
 /// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m").
-fn format_duration(duration: Duration) -> String {
+pub fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
     if total_secs >= 3600 {
         let hours = total_secs / 3600;
