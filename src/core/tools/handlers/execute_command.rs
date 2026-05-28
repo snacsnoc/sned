@@ -208,6 +208,26 @@ impl ExecuteCommandHandler {
                 c
             };
 
+            // Sandbox environment: clear inherited env vars and only allow safe ones through.
+            // Prevents model from reading API keys, tokens, and other secrets.
+            cmd.env_clear()
+                .envs(std::env::vars().filter(|(k, _)| {
+                    matches!(
+                        k.as_str(),
+                        "PATH"
+                            | "HOME"
+                            | "USER"
+                            | "LANG"
+                            | "LC_ALL"
+                            | "TERM"
+                            | "TERM_PROGRAM"
+                            | "TZ"
+                            | "SHELL"
+                            | "PWD"
+                            | "TMPDIR"
+                    )
+                }));
+
             if let Some(dir) = cwd {
                 if !dir.exists() || !dir.is_dir() {
                     let err = crate::cli::actionable_errors::directory_not_found(
@@ -216,6 +236,8 @@ impl ExecuteCommandHandler {
                     return Err(anyhow::anyhow!("{}", err.display()));
                 }
                 cmd.current_dir(dir);
+                // Update PWD to reflect the working directory
+                cmd.env("PWD", dir);
             }
 
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
