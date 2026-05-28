@@ -86,23 +86,34 @@ impl SearchFilesHandler {
         };
 
         if let Some(pattern) = file_pattern {
-            // Block shell injection characters - but allow spaces/tabs for legitimate paths like "My Documents"
-            if pattern.contains(',')
-                || pattern.contains('"')
-                || pattern.contains('\'')
-                || pattern.contains(';')
-                || pattern.contains('|')
-                || pattern.contains('&')
-                || pattern.contains('$')
-                || pattern.contains('`')
-            {
-                return Err(anyhow::anyhow!(
-                    "file_pattern contains disallowed characters (commas, quotes, shell metacharacters). Spaces and tabs are allowed for paths like 'My Documents'."
-                ));
-            }
             if use_ripgrep {
+                if pattern.contains('"')
+                    || pattern.contains('\'')
+                    || pattern.contains(';')
+                    || pattern.contains('|')
+                    || pattern.contains('&')
+                    || pattern.contains('$')
+                    || pattern.contains('`')
+                {
+                    return Err(anyhow::anyhow!(
+                        "file_pattern contains disallowed shell metacharacters"
+                    ));
+                }
                 cmd.arg("--glob").arg(pattern);
             } else {
+                if pattern.contains(',')
+                    || pattern.contains('"')
+                    || pattern.contains('\'')
+                    || pattern.contains(';')
+                    || pattern.contains('|')
+                    || pattern.contains('&')
+                    || pattern.contains('$')
+                    || pattern.contains('`')
+                {
+                    return Err(anyhow::anyhow!(
+                        "file_pattern contains disallowed characters (commas, quotes, shell metacharacters)"
+                    ));
+                }
                 cmd.arg("--include").arg(pattern);
             }
         }

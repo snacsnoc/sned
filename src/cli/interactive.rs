@@ -1228,7 +1228,8 @@ async fn run_main_loop(
                             // Ctrl+C during approval: deny, cancel agent
                             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                                 let _ = sender.send(ApprovalResult::Denied);
-                                app.output_lines.drain(prompt_lines..);
+                                let drain_start = prompt_lines.min(app.output_lines.len());
+                                app.output_lines.drain(drain_start..);
                                 app.auto_scroll = true;
                                 app.scroll_offset = 0;
                                 cancel_agent(&state_handle, &agent_task, &agent_done).await?;
@@ -1249,7 +1250,8 @@ async fn run_main_loop(
                                 }
                             };
                             let _ = sender.send(result.clone());
-                            app.output_lines.drain(prompt_lines..);
+                            let drain_start = prompt_lines.min(app.output_lines.len());
+                            app.output_lines.drain(drain_start..);
                             // Echo approval decision
                             app.push_styled(
                                 format!(

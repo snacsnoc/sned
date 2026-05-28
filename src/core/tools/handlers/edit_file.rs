@@ -366,8 +366,8 @@ impl EditFileHandler {
             let (content, initial_mtime) =
                 if let Some(cached_content) = state.file_content_cache.get(&batch.absolute_path) {
                     // SECURITY: Re-verify file is still valid (not swapped with symlink) even when using cache
-                    match tokio::fs::metadata(&batch.absolute_path).await {
-                        Ok(metadata) if metadata.is_file() => {
+                    match tokio::fs::symlink_metadata(&batch.absolute_path).await {
+                        Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => {
                             tracing::debug!("Using cached content for {} (symlink check passed)", batch.display_path);
                             (cached_content.clone(), None)
                         }
@@ -467,10 +467,10 @@ impl EditFileHandler {
         if !prepared_batches.is_empty() && !explicitly_approved {
             let should_prompt = if let Some(ref am) = self.approval_manager {
                 let mgr = am.lock().await;
-                // EditFile doesn't use command fingerprint (only for execute_command)
-                mgr.should_prompt(SnedTool::EditFile, None)
+                prepared_batches.iter().any(|b| {
+                    mgr.should_prompt_with_path(SnedTool::EditFile, Some(&b.0.display_path))
+                })
             } else {
-                // No approval manager configured; skip approval
                 false
             };
 

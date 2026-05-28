@@ -117,12 +117,6 @@ impl CommandSafetyChecker {
             normalized = stripped.trim();
         }
 
-        if normalized.contains('>') || normalized.contains('<') {
-            return Err(CommandUnsafe::new(
-                "Output redirection to disk is not allowed",
-            ));
-        }
-
         if normalized.contains("$(") || normalized.contains('`') {
             return Err(CommandUnsafe::new("Command substitution is not allowed"));
         }
@@ -135,21 +129,44 @@ impl CommandSafetyChecker {
             return Err(CommandUnsafe::new("Heredoc is not allowed"));
         }
 
-        if let Some(start) = normalized.find("$'") {
-            let after = &normalized[start + 2..];
-            if let Some(end) = after.find('\'') {
+        let mut search_from = 0;
+        while let Some(start) = normalized[search_from..].find("$'") {
+            let abs_start = search_from + start;
+            let after = &normalized[abs_start + 2..];
+            let mut depth = 0;
+            let mut end_pos = None;
+            for (i, ch) in after.char_indices() {
+                if ch == '\\' {
+                    depth += 1;
+                    continue;
+                }
+                if depth % 2 == 1 {
+                    depth = 0;
+                    continue;
+                }
+                depth = 0;
+                if ch == '\'' {
+                    end_pos = Some(i);
+                    break;
+                }
+            }
+            if let Some(end) = end_pos {
                 let content = &after[..end];
                 if content.contains("\\n") || content.contains("\\r") || content.contains("\\0") {
                     return Err(CommandUnsafe::new(
                         "ANSI-C quoting with embedded newlines is not allowed",
                     ));
                 }
+                search_from = abs_start + 2 + end + 1;
+            } else {
+                break;
             }
         }
 
-        // Block shell history expansion (!) which can execute previous commands
-        if normalized.contains('!') {
-            return Err(CommandUnsafe::new("Shell history expansion (!) is not allowed"));
+        if normalized.contains('>') || normalized.contains('<') {
+            return Err(CommandUnsafe::new(
+                "Output redirection to disk is not allowed",
+            ));
         }
 
         let segments: Vec<&str> = normalized.split(['|', '&', ';', '\n', '\r']).collect();
