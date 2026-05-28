@@ -1002,8 +1002,13 @@ async fn process_minimax_sse_line(
         }
 
         if let Some(usage) = event.usage {
+            let cached_tokens = usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0);
             let input_tokens = if usage.prompt_tokens > 0 {
-                usage.prompt_tokens
+                usage.prompt_tokens.saturating_sub(cached_tokens)
             } else {
                 usage.total_tokens
             };

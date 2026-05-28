@@ -86,15 +86,49 @@ impl CompactedSummary {
     }
 }
 
+/// How a provider reports cache tokens relative to `input_tokens`.
+enum CacheTokenStrategy {
+    /// input_tokens excludes cache_reads but includes cache_writes; add cache_reads only.
+    InputExcludesCacheReads,
+    /// input_tokens excludes both cache_writes and cache_reads; add both.
+    InputExcludesAllCache,
+}
+
+fn cache_token_strategy(provider_name: &str) -> CacheTokenStrategy {
+    match provider_name {
+        // OpenAI-compatible providers subtract cached_tokens from prompt_tokens,
+        // so input_tokens = prompt_tokens - cached_tokens. Add cache_reads back.
+        "openai" | "minimax" | "groq" | "xai" | "deepseek" | "openrouter" => {
+            CacheTokenStrategy::InputExcludesCacheReads
+        }
+        // Anthropic and Gemini: input_tokens excludes all cache tokens.
+        // Add both cache_writes and cache_reads for full prompt size.
+        _ => CacheTokenStrategy::InputExcludesAllCache,
+    }
+}
+
+fn effective_cache_tokens(info: &ApiReqInfo, provider_name: &str) -> u64 {
+    match cache_token_strategy(provider_name) {
+        CacheTokenStrategy::InputExcludesCacheReads => {
+            info.cache_reads.unwrap_or(0) as u64
+        }
+        CacheTokenStrategy::InputExcludesAllCache => {
+            info.cache_writes.unwrap_or(0) as u64 + info.cache_reads.unwrap_or(0) as u64
+        }
+    }
+}
+
 /// Determines whether we should compact the context window based on token counts.
 ///
 /// Only counts input tokens (tokens_in) since that's what determines whether the
 /// next request will exceed the context window. Output tokens from previous turns
 /// don't contribute to the current request size.
 ///
-/// For OpenAI-compatible providers, `tokens_in` already includes cache tokens,
-/// so cache_writes/cache_reads are not added separately.
-/// For Anthropic, cache tokens are reported separately and are added.
+/// Cache token handling varies by provider:
+/// - OpenAI-compatible (openai, minimax, groq, xai, deepseek, openrouter):
+///   input_tokens excludes cache_reads — add cache_reads back for true prompt size.
+/// - Anthropic/Gemini: input_tokens excludes all cache tokens — add both
+///   cache_writes and cache_reads.
 pub fn should_compact_context_window(
     api_req_info: &ApiReqInfo,
     context_window: u64,
@@ -102,17 +136,7 @@ pub fn should_compact_context_window(
     threshold_percentage: Option<f64>,
     provider_name: &str,
 ) -> bool {
-    // OpenAI-compatible providers (openai, minimax, groq, xai, deepseek, openrouter)
-    // report input_tokens EXCLUDING cached tokens (prompt_tokens - cached_tokens).
-    // The actual prompt size is input_tokens + cache_read_tokens, so we must add
-    // cache_read_tokens back to get the true context window usage.
-    // Anthropic/Gemini report input_tokens excluding cache but add cache separately,
-    // and their tokens_in already represents the full prompt footprint.
-    let cache_tokens = if provider_name == "openai" || provider_name == "minimax" {
-        api_req_info.cache_reads.unwrap_or(0) as u64
-    } else {
-        api_req_info.cache_writes.unwrap_or(0) as u64 + api_req_info.cache_reads.unwrap_or(0) as u64
-    };
+    let cache_tokens = effective_cache_tokens(api_req_info, provider_name);
 
     // Only count input tokens - output tokens don't affect the next request size
     let total_tokens = api_req_info.tokens_in.unwrap_or(0) as u64 + cache_tokens;
@@ -143,14 +167,7 @@ pub fn get_new_context_messages_and_metadata(
         // Only count input tokens (tokens_in) for truncation decision.
         // Output tokens (tokens_out) are from previous responses and don't
         // contribute to the current request size that validate_context_window checks.
-        // Include cache tokens for accurate context window compaction decisions.
-        // OpenAI-compatible providers: input_tokens already excludes cache, so add cache_read_tokens back.
-        // Anthropic/Gemini: input_tokens excludes cache, add both cache_write and cache_read.
-        let cache_tokens = if provider_name == "openai" || provider_name == "minimax" {
-            info.cache_reads.unwrap_or(0) as u64
-        } else {
-            info.cache_writes.unwrap_or(0) as u64 + info.cache_reads.unwrap_or(0) as u64
-        };
+        let cache_tokens = effective_cache_tokens(info, provider_name);
         let total_tokens = (info.tokens_in.unwrap_or(0) as u64) + cache_tokens;
 
         let threshold_pct = if use_auto_condense { 0.7 } else { 0.8 };
@@ -856,6 +873,24 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_compatible_cache_tokens_included() {
+        let info = ApiReqInfo {
+            tokens_in: Some(100_000),
+            cache_reads: Some(70_000),
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+
+        // All OpenAI-compatible providers should use the same cache strategy
+        for name in &["groq", "xai", "deepseek", "openrouter", "minimax"] {
+            assert!(
+                should_compact_context_window(&info, 200_000, 160_000, None, name),
+                "{}: 100k input + 70k cache = 170k should trigger", name
+            );
+        }
+    }
+
+    #[test]
     fn test_anthropic_cache_tokens_included_in_compaction_threshold() {
         let info = ApiReqInfo {
             tokens_in: Some(100_000),
@@ -871,5 +906,42 @@ mod tests {
             should_compact_context_window(&info, 200_000, 160_000, None, "anthropic"),
             "Anthropic: 100k input + 30k cache_write + 40k cache_read = 170k should trigger"
         );
+    }
+
+    #[test]
+    fn test_gemini_cache_tokens_included_in_compaction_threshold() {
+        let info = ApiReqInfo {
+            tokens_in: Some(100_000),
+            cache_reads: Some(70_000),
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+
+        // Gemini: tokens_in excludes cache, total = 100k + 0 + 70k = 170k
+        // (Gemini has no cache_writes)
+        assert!(
+            should_compact_context_window(&info, 200_000, 160_000, None, "gemini"),
+            "Gemini: 100k input + 70k cache_read = 170k should trigger"
+        );
+    }
+
+    #[test]
+    fn test_effective_cache_tokens_by_provider() {
+        let info = ApiReqInfo {
+            tokens_in: Some(100_000),
+            cache_writes: Some(10_000),
+            cache_reads: Some(20_000),
+            ..Default::default()
+        };
+
+        // OpenAI-compatible: only cache_reads
+        for name in &["openai", "minimax", "groq", "xai", "deepseek", "openrouter"] {
+            assert_eq!(effective_cache_tokens(&info, name), 20_000, "{}", name);
+        }
+
+        // Anthropic/Gemini: cache_writes + cache_reads
+        for name in &["anthropic", "gemini"] {
+            assert_eq!(effective_cache_tokens(&info, name), 30_000, "{}", name);
+        }
     }
 }
