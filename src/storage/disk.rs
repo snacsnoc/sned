@@ -144,6 +144,10 @@ fn should_fsync() -> bool {
 /// Note: Does NOT fall back to non-atomic write on rename failure, as this
 /// could cause data corruption if the process crashes mid-write.
 pub fn atomic_write_file<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result<()> {
+    atomic_write_file_bytes(file_path, data.as_bytes())
+}
+
+pub fn atomic_write_file_bytes<P: AsRef<Path>>(file_path: P, data: &[u8]) -> io::Result<()> {
     let _write_guard = AtomicWriteGuard::begin(&ATOMIC_WRITES);
     let file_path = file_path.as_ref();
     let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
@@ -169,7 +173,7 @@ pub fn atomic_write_file<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result
             .create_new(true)
             .mode(0o600)
             .open(&tmp_path)?;
-        file.write_all(data.as_bytes())?;
+        file.write_all(data)?;
         if should_fsync() {
             file.sync_data()?;
         }
@@ -183,7 +187,7 @@ pub fn atomic_write_file<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result
             .write(true)
             .create_new(true)
             .open(&tmp_path)?;
-        file.write_all(data.as_bytes())?;
+        file.write_all(data)?;
         if should_fsync() {
             file.sync_data()?;
         }
@@ -196,7 +200,7 @@ pub fn atomic_write_file<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result
             .write(true)
             .create_new(true)
             .open(&tmp_path)?;
-        file.write_all(data.as_bytes())?;
+        file.write_all(data)?;
         if should_fsync() {
             file.sync_data()?;
         }

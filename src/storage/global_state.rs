@@ -280,7 +280,15 @@ pub struct BrowserSettings {
 }
 
 /// Load global state from the default path (~/.sned/data/settings/global_settings.json)
+/// Uses integrity validation (SHA256 checksum) when available.
 pub fn load_global_state() -> GlobalState {
+    load_global_state_with_integrity()
+}
+
+/// Load global state from legacy format (no integrity validation)
+/// Only used for backward compatibility or testing.
+#[allow(dead_code)]
+fn load_global_state_legacy() -> GlobalState {
     let path = get_sned_home_path()
         .join("data")
         .join("settings")

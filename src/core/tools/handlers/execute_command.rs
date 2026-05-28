@@ -781,9 +781,19 @@ impl ExecuteCommandHandler {
 
         static SNED_ALLOW_ENV: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         let extra = SNED_ALLOW_ENV.get_or_init(|| {
-            static SECRET_PATTERNS: &[&str] = &[
-                "KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "PRIVATE",
-            ];
+            // Block vars ending with secret-like suffixes (more precise than contains())
+            fn is_secret_like(name: &str) -> bool {
+                let upper = name.to_uppercase();
+                upper.ends_with("_KEY")
+                    || upper.ends_with("_SECRET")
+                    || upper.ends_with("_TOKEN")
+                    || upper.ends_with("_PASSWORD")
+                    || upper.ends_with("_PASSWD")
+                    || upper.ends_with("_CREDENTIAL")
+                    || upper.ends_with("_PRIVATE_KEY")
+                    || upper == "KEY" || upper == "SECRET" || upper == "TOKEN" || upper == "PASSWORD"
+            }
+            
             std::env::var("SNED_ALLOW_ENV")
                 .unwrap_or_default()
                 .split(',')
@@ -792,9 +802,8 @@ impl ExecuteCommandHandler {
                     if s.is_empty() || s.starts_with("SNED_") {
                         return false;
                     }
-                    let upper = s.to_uppercase();
-                    if SECRET_PATTERNS.iter().any(|p| upper.contains(p)) {
-                        tracing::warn!(var = %s, "SNED_ALLOW_ENV entry blocked (secret-like name)");
+                    if is_secret_like(s) {
+                        tracing::warn!(var = %s, "SNED_ALLOW_ENV entry blocked (secret-like name ending)");
                         return false;
                     }
                     true

@@ -66,8 +66,9 @@ impl ReadFileHandler {
             .map(|path| self.read_file(path, start_line, end_line, anchor_mgr, task_id))
             .collect();
 
+        // Buffer concurrent reads to prevent OOM on bulk operations (12 = reasonable parallelism)
         let results: Vec<FileReadResult> = futures::stream::iter(read_futures)
-            .buffered(4)
+            .buffered(12)
             .collect()
             .await;
 
