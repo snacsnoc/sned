@@ -142,7 +142,7 @@ impl App {
     /// Push a user message with proper formatting (splits on newlines).
     pub fn push_user_message(&mut self, text: &str) {
         let style = Style::default()
-            .fg(Color::Green)
+            .fg(theme::PROMPT_FG)
             .add_modifier(Modifier::BOLD);
         for (i, line) in text.split('\n').enumerate() {
             if i == 0 {
@@ -186,6 +186,19 @@ impl App {
         // Content height excludes border (1 line top + 1 line bottom)
         let content_height = visible_height.saturating_sub(2);
         let total_lines = self.output_lines.len();
+        
+        // Add loading indicator line when agent is busy
+        let output_lines_to_render = if self.agent_busy {
+            let mut lines = self.output_lines.clone();
+            lines.push(Line::from(Span::styled(
+                format!("{} Agent processing...", self.spinner_char()),
+                theme::spinner_style(),
+            )));
+            lines
+        } else {
+            self.output_lines.clone()
+        };
+        
         let scroll_y = if self.auto_scroll {
             total_lines.saturating_sub(content_height) as u16
         } else {
@@ -199,7 +212,7 @@ impl App {
             }
         };
 
-        let output = Paragraph::new(self.output_lines.clone())
+        let output = Paragraph::new(output_lines_to_render)
             .wrap(Wrap { trim: false })
             .scroll((scroll_y, 0))
             .block(
@@ -358,16 +371,19 @@ impl App {
     }
 }
 
-/// Format a duration as a human-readable string (e.g., "0:42", "1:05:30").
+/// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m").
 fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-    if hours > 0 {
-        format!("{}:{:02}:{:02}", hours, mins, secs)
+    if total_secs >= 3600 {
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        format!("{}h {}m", hours, mins)
+    } else if total_secs >= 60 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{}m {}s", mins, secs)
     } else {
-        format!("{}:{:02}", mins, secs)
+        format!("{}s", total_secs)
     }
 }
 

@@ -372,7 +372,7 @@ enum Action {
 }
 
 /// Drain output channel into app buffer.
-fn drain_output(rx: &mut mpsc::UnboundedReceiver<OutputEvent>, app: &mut App) {
+fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     while let Ok(event) = rx.try_recv() {
         match event {
             OutputEvent::Line(line) => app.push_output(line),
@@ -665,7 +665,7 @@ async fn handle_cli_only_command(
     if agent_busy.load(Ordering::Relaxed) && !cli_cmd.is_local_command() {
         app.push_styled(
             "Agent is busy. Wait for it to finish before running this command.",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARNING_FG),
         );
         return Ok(false);
     }
@@ -824,7 +824,7 @@ async fn handle_cli_only_command(
             if !changed_files.is_empty() {
                 app.push_styled(
                     "/undo will revert the following files to the previous checkpoint:",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme::WARNING_FG),
                 );
                 for f in &changed_files {
                     app.push_plain(format!("  - {}", f));
@@ -848,7 +848,13 @@ async fn handle_cli_only_command(
                     Ok(Err(_)) | Err(_) => String::new(),
                 };
 
-                if !confirm.trim().is_empty() && confirm.trim().to_lowercase() == "y" {
+                // Timeout or error: default to cancel (safe default)
+                if confirm.trim().is_empty() {
+                    app.push_plain("Confirmation timeout — cancelled.");
+                    return Ok(false);
+                }
+
+                if confirm.trim().to_lowercase() == "y" {
                     app.push_plain("Undo cancelled.");
                     return Ok(false);
                 }
@@ -944,7 +950,7 @@ async fn handle_cli_only_command(
                                 } else {
                                     app.push_styled(
                                         "Changes to commit:",
-                                        Style::default().fg(Color::Cyan),
+                                        Style::default().fg(theme::ACCENT),
                                     );
                                     for line in ansi_to_ratatui_lines(&diff) {
                                         app.push_output(line);
@@ -972,9 +978,10 @@ async fn handle_cli_only_command(
                                         Ok(Err(_)) | Err(_) => String::new(),
                                     };
 
-                                    if confirm.trim().is_empty()
-                                        || confirm.trim().to_lowercase() == "y"
-                                    {
+                                    // Timeout or error: default to cancel (safe default)
+                                    if confirm.trim().is_empty() {
+                                        app.push_plain("Confirmation timeout — cancelled.");
+                                    } else if confirm.trim().to_lowercase() == "y" {
                                         match crate::core::shadow_git::commit_to_real_git(
                                             &workspace_root,
                                             &msg,
@@ -1099,7 +1106,7 @@ async fn handle_cli_only_command(
                         if !changed_files.is_empty() {
                             app.push_styled(
                                 "Files that will be restored:",
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(theme::WARNING_FG),
                             );
                             for file in &changed_files {
                                 app.push_plain(format!("  - {}", file));
@@ -1123,7 +1130,13 @@ async fn handle_cli_only_command(
                                 Ok(Err(_)) | Err(_) => String::new(),
                             };
 
-                            if !confirm.trim().is_empty() && confirm.trim().to_lowercase() == "y" {
+                            // Timeout or error: default to cancel (safe default)
+                            if confirm.trim().is_empty() {
+                                app.push_plain("Confirmation timeout — cancelled.");
+                                return Ok(false);
+                            }
+
+                            if confirm.trim().to_lowercase() == "y" {
                                 app.push_plain("Restore cancelled.");
                                 return Ok(false);
                             }
@@ -1187,7 +1200,7 @@ async fn handle_cli_only_command(
 async fn run_main_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    output_rx: &mut mpsc::Receiver<OutputEvent>,
     session: Arc<Mutex<InteractiveSession>>,
     task_id: String,
     agent_busy: Arc<AtomicBool>,
@@ -1299,7 +1312,7 @@ async fn run_main_loop(
                             app.push_plain("^C cancelled");
                             app.push_styled(
                                 "Press Ctrl+C again to quit.",
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(theme::WARNING_FG),
                             );
                             continue;
                         }
@@ -1311,7 +1324,7 @@ async fn run_main_loop(
                         }
                         app.push_styled(
                             "Press Ctrl+C again to quit.",
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(theme::WARNING_FG),
                         );
                         continue;
                     }
@@ -1420,7 +1433,7 @@ async fn run_main_loop(
                     if folded {
                         app.push_styled(
                             format!(
-                                "Large paste folded ({} chars) - press Ctrl+E to expand",
+                                "Large paste folded ({} chars) - will expand on submit",
                                 content.len()
                             ),
                             Style::default().add_modifier(Modifier::DIM),
@@ -1473,7 +1486,7 @@ async fn run_main_loop(
             if task_was_cancelled {
                 app.push_styled(
                     "Task cancelled. Type /exit to quit.",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme::WARNING_FG),
                 );
             }
         }
@@ -1518,8 +1531,8 @@ pub async fn run_interactive_shell_inner(
         app.cwd = cwd.to_string_lossy().to_string();
     }
 
-    // 2. Create output channel (Phase 1 infrastructure, now drains to App)
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    // 2. Create output channel (bounded to prevent memory exhaustion during output floods)
+    let (output_tx, mut output_rx) = mpsc::channel(4096);
     let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(output_tx));
 
     // 3. Build session

@@ -184,12 +184,12 @@ impl OutputWriter for StderrOutputWriter {
 ///
 /// The channel is unbounded; the render loop drains it on each frame tick.
 pub struct ChannelOutputWriter {
-    tx: mpsc::UnboundedSender<OutputEvent>,
+    tx: mpsc::Sender<OutputEvent>,
 }
 
 impl ChannelOutputWriter {
-    /// Create a new channel output writer.
-    pub fn new(tx: mpsc::UnboundedSender<OutputEvent>) -> Self {
+    /// Create a new ChannelOutputWriter with a bounded channel.
+    pub fn new(tx: mpsc::Sender<OutputEvent>) -> Self {
         Self { tx }
     }
 }

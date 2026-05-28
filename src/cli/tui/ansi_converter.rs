@@ -19,6 +19,7 @@ struct RatatuiPerformer {
     current_style: Style,
     lines: Vec<Line<'static>>,
     current_spans: Vec<Span<'static>>,
+    current_text: String,
 }
 
 impl RatatuiPerformer {
@@ -27,10 +28,19 @@ impl RatatuiPerformer {
             current_style: Style::default(),
             lines: Vec::new(),
             current_spans: Vec::new(),
+            current_text: String::new(),
+        }
+    }
+
+    fn flush_current_text(&mut self) {
+        if !self.current_text.is_empty() {
+            self.current_spans
+                .push(Span::styled(std::mem::take(&mut self.current_text), self.current_style));
         }
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
+        self.flush_current_text();
         if !self.current_spans.is_empty() {
             self.lines
                 .push(Line::from(std::mem::take(&mut self.current_spans)));
@@ -41,13 +51,13 @@ impl RatatuiPerformer {
 
 impl Perform for RatatuiPerformer {
     fn print(&mut self, c: char) {
-        self.current_spans
-            .push(Span::styled(c.to_string(), self.current_style));
+        self.current_text.push(c);
     }
 
     fn execute(&mut self, byte: u8) {
         if byte == 0x0A {
             // newline
+            self.flush_current_text();
             self.lines
                 .push(Line::from(std::mem::take(&mut self.current_spans)));
         }
@@ -62,6 +72,8 @@ impl Perform for RatatuiPerformer {
     ) {
         if action == 'm' {
             // SGR — Select Graphic Rendition
+            // Flush accumulated text before changing style
+            self.flush_current_text();
             for param in params.iter() {
                 match param {
                     [0] => self.current_style = Style::default(),
@@ -87,6 +99,35 @@ impl Perform for RatatuiPerformer {
                     [95] => self.current_style = self.current_style.fg(Color::Magenta),
                     [96] => self.current_style = self.current_style.fg(Color::Cyan),
                     [97] => self.current_style = self.current_style.fg(Color::White),
+                    // Background colors: 40-47
+                    [40] => self.current_style = self.current_style.bg(Color::Black),
+                    [41] => self.current_style = self.current_style.bg(Color::Red),
+                    [42] => self.current_style = self.current_style.bg(Color::Green),
+                    [43] => self.current_style = self.current_style.bg(Color::Yellow),
+                    [44] => self.current_style = self.current_style.bg(Color::Blue),
+                    [45] => self.current_style = self.current_style.bg(Color::Magenta),
+                    [46] => self.current_style = self.current_style.bg(Color::Cyan),
+                    [47] => self.current_style = self.current_style.bg(Color::White),
+                    // Bright background colors: 100-107
+                    [100] => self.current_style = self.current_style.bg(Color::DarkGray),
+                    [101] => self.current_style = self.current_style.bg(Color::Red),
+                    [102] => self.current_style = self.current_style.bg(Color::Green),
+                    [103] => self.current_style = self.current_style.bg(Color::Yellow),
+                    [104] => self.current_style = self.current_style.bg(Color::Blue),
+                    [105] => self.current_style = self.current_style.bg(Color::Magenta),
+                    [106] => self.current_style = self.current_style.bg(Color::Cyan),
+                    [107] => self.current_style = self.current_style.bg(Color::White),
+                    // Blinking
+                    [5] => self.current_style = self.current_style.add_modifier(Modifier::SLOW_BLINK),
+                    // Reverse video
+                    [7] => self.current_style = self.current_style.add_modifier(Modifier::REVERSED),
+                    // Modifier resets
+                    [22] => {
+                        self.current_style = self.current_style.remove_modifier(Modifier::BOLD);
+                        self.current_style = self.current_style.remove_modifier(Modifier::DIM);
+                    }
+                    [23] => self.current_style = self.current_style.remove_modifier(Modifier::ITALIC),
+                    [24] => self.current_style = self.current_style.remove_modifier(Modifier::UNDERLINED),
                     // 256-color: [38, 5, N] → Color::Indexed(N)
                     [38, 5, n] => {
                         self.current_style = self.current_style.fg(Color::Indexed(*n as u8))
