@@ -356,8 +356,7 @@ pub fn load_global_state_with_integrity() -> GlobalState {
             let checksum_line = lines.next().unwrap_or("");
             
             // Check if file has checksum prefix (format: "sha256:<hash>")
-            let (expected_checksum, json_data) = if checksum_line.starts_with("sha256:") {
-                let checksum = &checksum_line[7..];
+            let (expected_checksum, json_data) = if let Some(checksum) = checksum_line.strip_prefix("sha256:") {
                 let json_data = lines.collect::<Vec<_>>().join("\n");
                 (Some(checksum), json_data)
             } else {
@@ -366,13 +365,13 @@ pub fn load_global_state_with_integrity() -> GlobalState {
             };
             
             // Validate checksum if present
-            if let Some(expected) = expected_checksum {
-                if !validate_checksum(&json_data, expected) {
+            if let Some(expected) = expected_checksum
+                && !validate_checksum(&json_data, expected)
+            {
                     tracing::warn!(
                         file_path = %path.display(),
                         "Global state checksum mismatch - file may be corrupted or tampered"
                     );
-                    // Create backup and return default
                     if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
                         eprintln!(
                             "WARNING: Global state integrity check failed at '{}'. \
@@ -383,7 +382,6 @@ pub fn load_global_state_with_integrity() -> GlobalState {
                     }
                     return GlobalState::default();
                 }
-            }
             
             // Parse JSON
             match serde_json::from_str(&json_data) {
@@ -421,7 +419,7 @@ pub fn save_global_state_with_integrity(state: &GlobalState) -> std::io::Result<
         .join("global_settings.json");
     
     let json_data = serde_json::to_string_pretty(state)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     
     let checksum = compute_checksum(&json_data);
     let contents = format!("sha256:{}\n{}", checksum, json_data);

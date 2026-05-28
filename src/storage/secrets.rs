@@ -228,8 +228,7 @@ impl SecretsStore {
                      Secret '{}' cannot be stored. Please ensure your OS keychain is available.",
                     key
                 );
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "OS keychain unavailable and SNED_REQUIRE_KEYCHAIN is set"
                 ));
             }
