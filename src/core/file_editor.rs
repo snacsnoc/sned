@@ -202,7 +202,11 @@ impl FileLockManager {
     /// Called from Drop impl of FileEditGuard.
     fn release(&self, path: &str) {
         let mut locks = self.locks.lock();
-        locks.remove(path);
+        if let Some(arc) = locks.get(path)
+            && Arc::strong_count(arc) <= 1
+        {
+            locks.remove(path);
+        }
     }
 }
 

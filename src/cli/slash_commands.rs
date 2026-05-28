@@ -142,7 +142,7 @@ fn build_workflows_list(
                 let file_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map(|s| s.trim_end_matches(".md").to_string())
+                    .map(|s| s.strip_suffix(".md").unwrap_or(s).to_string())
                     .unwrap_or_default();
 
                 if local_workflow_toggles
@@ -174,7 +174,7 @@ fn build_workflows_list(
                 let file_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map(|s| s.trim_end_matches(".md").to_string())
+                    .map(|s| s.strip_suffix(".md").unwrap_or(s).to_string())
                     .unwrap_or_default();
 
                 if global_workflow_toggles

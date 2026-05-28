@@ -899,15 +899,26 @@ impl HookManager {
         };
 
         if let Some(pid) = pid {
-            // Set cancellation flag so the wait loop knows this was an external cancellation
             self.cancelled
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             #[cfg(unix)]
             {
                 use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
-                kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
-                    .map_err(|e| HookError::Other(format!("Failed to kill process: {}", e)))?;
+                kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM)
+                    .map_err(|e| HookError::Other(format!("Failed to kill process group: {}", e)))?;
+                let kill_start = std::time::Instant::now();
+                while kill_start.elapsed() < std::time::Duration::from_millis(500) {
+                    match nix::sys::wait::waitpid(
+                        Pid::from_raw(-(pid as i32)),
+                        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                    ) {
+                        Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+                        | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                        _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    }
+                }
+                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
             }
             #[cfg(not(unix))]
             {

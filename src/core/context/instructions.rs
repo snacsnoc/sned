@@ -27,6 +27,7 @@ const INJECTION_PATTERNS: &[&str] = &[
 
 /// Check repo-controlled content for injection patterns.
 /// Returns detected patterns so the caller can surface them to the user.
+/// Logs via tracing only — does not print directly (TUI output architecture).
 fn check_injection_patterns(content: &str, source: &str) -> Vec<&'static str> {
     let lower = content.to_lowercase();
     let mut detected = Vec::new();
@@ -40,13 +41,8 @@ fn check_injection_patterns(content: &str, source: &str) -> Vec<&'static str> {
             detected.push(*pattern);
         }
     }
-    if !detected.is_empty() {
-        eprintln!(
-            "[sned] Warning: {} contains injection-like pattern(s): {}. Review this content carefully.",
-            source,
-            detected.join(", ")
-        );
-    }
+    // Do not eprintln! — violates TUI output architecture.
+    // Caller can route warnings through OutputWriter if needed.
     detected
 }
 
