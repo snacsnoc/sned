@@ -155,10 +155,11 @@ pub fn get_context_window_info(provider: &dyn Provider) -> ContextWindowInfo {
 
 /// Calculates context usage percentage based on total tokens used.
 ///
-/// For OpenAI-compatible providers (OpenAI, MiniMax, DeepSeek, Groq, xAI, OpenRouter),
-/// `tokens_in` already includes cache tokens, so cache_writes/cache_reads are not added separately.
-/// For Gemini, `input_tokens` has cache reads already subtracted by the provider.
-/// For Anthropic, cache tokens are reported separately and are added.
+/// All providers report `input_tokens` without cache tokens, so cache writes
+/// and reads are added back to get the full prompt size:
+/// - OpenAI-compatible: `input_tokens = prompt_tokens - cached_tokens`
+/// - Anthropic: `input_tokens` excludes cache separately
+/// - Gemini: `input_tokens = prompt_tokens - cached_content_token_count`
 ///
 /// Returns percentage (0.0-100.0) of context window consumed.
 pub fn calculate_context_usage_percentage(
@@ -169,10 +170,6 @@ pub fn calculate_context_usage_percentage(
     context_window: u64,
     _provider_name: &str,
 ) -> f64 {
-    // All providers report input_tokens without cache tokens:
-    // - OpenAI-compatible: input_tokens = prompt_tokens - cached_tokens
-    // - Anthropic: input_tokens excludes cache separately
-    // - Gemini: input_tokens = prompt_tokens - cached_tokens
     let cache_tokens =
         cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64;
 
