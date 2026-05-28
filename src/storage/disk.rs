@@ -27,7 +27,10 @@ pub fn create_backup<P: AsRef<Path>>(original_path: P) -> io::Result<PathBuf> {
             .unwrap_or_default()
     ));
 
-    fs::copy(original, &backup_path)?;
+    // Read original content first, then write atomically to prevent corruption
+    // if crash occurs during backup. fs::copy() is not atomic.
+    let content = fs::read(original)?;
+    atomic_write_file(&backup_path, &String::from_utf8_lossy(&content))?;
     Ok(backup_path)
 }
 

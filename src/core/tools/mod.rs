@@ -351,15 +351,23 @@ pub fn resolve_sanitized_path(
     }
 
     if let Some(parent) = normalized.parent()
-        && parent.exists()
     {
-        let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
-            ToolError::InvalidInput(format!(
-                "Failed to resolve parent path: {} ({})",
-                parent.display(),
-                e
-            ))
-        })?;
+        // Canonicalize directly without exists() check to prevent TOCTOU race.
+        // If parent doesn't exist, canonicalize will fail with NotFound error.
+        let canonical_parent = match std::fs::canonicalize(parent) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Parent doesn't exist - that's OK, file will be created
+                return Ok(normalized);
+            }
+            Err(e) => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Failed to resolve parent path: {} ({})",
+                    parent.display(),
+                    e
+                )));
+            }
+        };
 
         if !canonical_parent.starts_with(&canonical_root) {
             return Err(ToolError::InvalidInput(format!(
