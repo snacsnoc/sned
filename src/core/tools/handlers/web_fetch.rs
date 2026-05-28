@@ -6,7 +6,7 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use url::Url;
 
 /// Maximum redirect count to prevent redirect loops and open redirect attacks
@@ -132,74 +132,189 @@ impl WebFetchHandler {
                         ip
                     )));
                 }
+                // fc00::/7 — unique local addresses (IPv6 equivalent of private IPv4)
+                if ipv6.is_unique_local() {
+                    return Err(ToolError::InvalidInput(format!(
+                        "Access to unique local address {} is not allowed",
+                        ip
+                    )));
+                }
+                // IPv4-mapped IPv6 (::ffff:x.x.x.x) — kernel routes to the embedded IPv4
+                if let Some(mapped) = ipv6.to_ipv4_mapped() {
+                    return Self::validate_ip(&IpAddr::V4(mapped));
+                }
             }
         }
         Ok(())
+    }
+
+    /// Resolve hostname and validate all resolved IPs against SSRF rules.
+    ///
+    /// Returns the first validated socket address for connection pinning.
+    /// This prevents DNS rebinding attacks where a domain resolves to a
+    /// private IP after URL validation passes.
+    fn resolve_and_validate(url: &Url) -> Result<SocketAddr, ToolError> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| ToolError::InvalidInput("URL must have a valid hostname".to_string()))?;
+
+        let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+
+        // For bare IP addresses, validate directly without DNS resolution
+        let ip_str = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            Self::validate_ip(&ip)?;
+            return Ok(SocketAddr::new(ip, port));
+        }
+
+        // Resolve hostname — this is the actual DNS lookup that an attacker
+        // could race via rebinding. We validate every resolved IP.
+        let addrs: Vec<SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to resolve hostname '{}': {}", host, e)))?
+            .collect();
+
+        if addrs.is_empty() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "DNS resolution for '{}' returned no addresses",
+                host
+            )));
+        }
+
+        let mut first_valid = None;
+        for addr in &addrs {
+            Self::validate_ip(&addr.ip())?;
+            if first_valid.is_none() {
+                first_valid = Some(*addr);
+            }
+        }
+
+        // SAFETY: addrs is non-empty and we validated all entries, so first_valid is Some
+        Ok(first_valid.expect("at least one address must exist"))
     }
 
     /// Fetch a URL and convert HTML to plain text.
     async fn fetch_url(&self, url: &str) -> Result<String, ToolError> {
         let validated_url = Self::validate_url(url)?;
 
-        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS as usize {
-                attempt.stop()
-            } else {
-                match Self::validate_url(attempt.url().as_str()) {
-                    Ok(_) => attempt.follow(),
-                    Err(e) => {
-                        tracing::warn!("SSRF: blocking redirect to {}: {}", attempt.url(), e);
-                        attempt.stop()
-                    }
-                }
-            }
-        });
+        // Resolve DNS and validate all IPs before connecting — prevents DNS rebinding
+        let pinned_addr = Self::resolve_and_validate(&validated_url)?;
 
-        let client = reqwest::Client::builder()
+        let host = validated_url
+            .host_str()
+            .ok_or_else(|| ToolError::InvalidInput("URL must have a valid hostname".to_string()))?
+            .to_string();
+
+        // Disable automatic redirects — we handle them manually to validate DNS
+        // at each hop (reqwest's redirect policy can't do async DNS resolution)
+        let mut builder = reqwest::Client::builder()
             .timeout(fetch_timeout())
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-            .redirect(redirect_policy)
+            .redirect(reqwest::redirect::Policy::none());
+
+        // Pin DNS resolution to the validated address — reqwest will use this
+        // instead of performing its own DNS lookup, preventing rebinding
+        builder = builder.resolve(&host, pinned_addr);
+
+        let client = builder
             .build()
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create HTTP client: {}", e)))?;
 
-        let response = client
-            .get(validated_url.clone())
-            .send()
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to fetch URL: {}", e)))?;
+        // Manual redirect loop with DNS validation at each hop
+        let mut current_url = validated_url;
+        let mut current_client = client;
+        let mut redirect_count: u32 = 0;
 
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "HTTP error {} when fetching {}",
-                status, url
-            )));
-        }
+        loop {
+            let response = current_client
+                .get(current_url.clone())
+                .send()
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to fetch URL: {}", e)))?;
 
-        let mut bytes = response.bytes().await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to read response body: {}", e))
-        })?;
+            let status = response.status();
+            if status.is_redirection() {
+                if redirect_count >= MAX_REDIRECTS {
+                    return Err(ToolError::ExecutionFailed(
+                        "Too many redirects".to_string(),
+                    ));
+                }
 
-        let max_size = max_response_size();
-        let original_len = bytes.len();
-        let truncated = original_len > max_size;
-        if truncated {
-            bytes.truncate(max_size);
-        }
+                let location = response
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| {
+                        ToolError::ExecutionFailed(
+                            "Redirect response missing Location header".to_string(),
+                        )
+                    })?;
 
-        let html = String::from_utf8_lossy(&bytes).to_string();
-        let text = html_to_text(&html);
+                // Resolve relative redirects against current URL
+                let redirect_url = Url::parse(location)
+                    .or_else(|_| current_url.join(location))
+                    .map_err(|e| {
+                        ToolError::ExecutionFailed(format!("Invalid redirect URL '{}': {}", location, e))
+                    })?;
 
-        if truncated {
-            Ok(format!(
-                "Successfully fetched {} (response truncated at {} bytes, full size was {} bytes). Content:\n\n{}",
-                url, max_size, original_len, text
-            ))
-        } else {
-            Ok(format!(
-                "Successfully fetched {}. Content:\n\n{}",
-                url, text
-            ))
+                // Validate the redirect URL and resolve its DNS — prevents
+                // rebinding on redirect targets
+                let validated_redirect = Self::validate_url(redirect_url.as_str())?;
+                let redirect_addr = Self::resolve_and_validate(&validated_redirect)?;
+
+                // Build a new client pinned to the redirect target's resolved IP
+                let redirect_host = validated_redirect
+                    .host_str()
+                    .ok_or_else(|| {
+                        ToolError::InvalidInput("Redirect URL must have a hostname".to_string())
+                    })?
+                    .to_string();
+
+                current_client = reqwest::Client::builder()
+                    .timeout(fetch_timeout())
+                    .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+                    .redirect(reqwest::redirect::Policy::none())
+                    .resolve(&redirect_host, redirect_addr)
+                    .build()
+                    .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create HTTP client: {}", e)))?;
+
+                current_url = validated_redirect;
+                redirect_count += 1;
+                continue;
+            }
+
+            if !status.is_success() {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "HTTP error {} when fetching {}",
+                    status, url
+                )));
+            }
+
+            let mut bytes = response.bytes().await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to read response body: {}", e))
+            })?;
+
+            let max_size = max_response_size();
+            let original_len = bytes.len();
+            let truncated = original_len > max_size;
+            if truncated {
+                bytes.truncate(max_size);
+            }
+
+            let html = String::from_utf8_lossy(&bytes).to_string();
+            let text = html_to_text(&html);
+
+            return if truncated {
+                Ok(format!(
+                    "Successfully fetched {} (response truncated at {} bytes, full size was {} bytes). Content:\n\n{}",
+                    url, max_size, original_len, text
+                ))
+            } else {
+                Ok(format!(
+                    "Successfully fetched {}. Content:\n\n{}",
+                    url, text
+                ))
+            };
         }
     }
 
@@ -428,5 +543,23 @@ mod tests {
     #[test]
     fn test_validate_ip_v6_loopback() {
         assert!(WebFetchHandler::validate_url("http://[::1]").is_err());
+    }
+
+    #[test]
+    fn test_validate_ip_v6_unique_local() {
+        // fc00::/7 unique local addresses must be blocked
+        assert!(WebFetchHandler::validate_url("http://[fc00::1]").is_err());
+        assert!(WebFetchHandler::validate_url("http://[fd00::1]").is_err());
+        assert!(WebFetchHandler::validate_url("http://[fd12:3456:789a::1]").is_err());
+    }
+
+    #[test]
+    fn test_validate_ip_v4_mapped_v6() {
+        // IPv4-mapped IPv6 must be blocked when the embedded IPv4 is private
+        assert!(WebFetchHandler::validate_url("http://[::ffff:127.0.0.1]").is_err());
+        assert!(WebFetchHandler::validate_url("http://[::ffff:10.0.0.1]").is_err());
+        assert!(WebFetchHandler::validate_url("http://[::ffff:192.168.1.1]").is_err());
+        assert!(WebFetchHandler::validate_url("http://[::ffff:172.16.0.1]").is_err());
+        assert!(WebFetchHandler::validate_url("http://[::ffff:169.254.169.254]").is_err());
     }
 }
