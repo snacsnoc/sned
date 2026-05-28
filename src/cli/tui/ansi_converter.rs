@@ -108,15 +108,15 @@ impl Perform for RatatuiPerformer {
                     [45] => self.current_style = self.current_style.bg(Color::Magenta),
                     [46] => self.current_style = self.current_style.bg(Color::Cyan),
                     [47] => self.current_style = self.current_style.bg(Color::White),
-                    // Bright background colors: 100-107
-                    [100] => self.current_style = self.current_style.bg(Color::DarkGray),
-                    [101] => self.current_style = self.current_style.bg(Color::Red),
-                    [102] => self.current_style = self.current_style.bg(Color::Green),
-                    [103] => self.current_style = self.current_style.bg(Color::Yellow),
-                    [104] => self.current_style = self.current_style.bg(Color::Blue),
-                    [105] => self.current_style = self.current_style.bg(Color::Magenta),
-                    [106] => self.current_style = self.current_style.bg(Color::Cyan),
-                    [107] => self.current_style = self.current_style.bg(Color::White),
+                    // Bright background colors: 100-107 (use Indexed colors 8-15 for bright palette)
+                    [100] => self.current_style = self.current_style.bg(Color::Indexed(8)),   // Bright black
+                    [101] => self.current_style = self.current_style.bg(Color::Indexed(9)),   // Bright red
+                    [102] => self.current_style = self.current_style.bg(Color::Indexed(10)),  // Bright green
+                    [103] => self.current_style = self.current_style.bg(Color::Indexed(11)),  // Bright yellow
+                    [104] => self.current_style = self.current_style.bg(Color::Indexed(12)),  // Bright blue
+                    [105] => self.current_style = self.current_style.bg(Color::Indexed(13)),  // Bright magenta
+                    [106] => self.current_style = self.current_style.bg(Color::Indexed(14)),  // Bright cyan
+                    [107] => self.current_style = self.current_style.bg(Color::Indexed(15)),  // Bright white
                     // Blinking
                     [5] => self.current_style = self.current_style.add_modifier(Modifier::SLOW_BLINK),
                     // Reverse video

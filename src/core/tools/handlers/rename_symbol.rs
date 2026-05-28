@@ -79,7 +79,7 @@ impl RenameSymbolHandler {
                 "rename_symbol: missing required parameter 'paths'"
             );
             return Err(ToolError::InvalidInput(
-                error_guidance::missing_parameter("paths", 0),
+                error_guidance::missing_parameter("paths", state.consecutive_mistakes),
             ));
         }
         if existing_symbol.is_empty() {
@@ -89,7 +89,7 @@ impl RenameSymbolHandler {
                 "rename_symbol: missing required parameter 'existing_symbol'"
             );
             return Err(ToolError::InvalidInput(
-                error_guidance::missing_parameter("existing_symbol", 0),
+                error_guidance::missing_parameter("existing_symbol", state.consecutive_mistakes),
             ));
         }
         if new_symbol.is_empty() {
@@ -99,7 +99,7 @@ impl RenameSymbolHandler {
                 "rename_symbol: missing required parameter 'new_symbol'"
             );
             return Err(ToolError::InvalidInput(
-                error_guidance::missing_parameter("new_symbol", 0),
+                error_guidance::missing_parameter("new_symbol", state.consecutive_mistakes),
             ));
         }
 

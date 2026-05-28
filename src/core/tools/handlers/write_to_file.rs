@@ -152,9 +152,10 @@ impl ToolHandler for WriteToFileHandler {
         ctx: &ToolContext,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
+        let consecutive_mistakes = ctx.state.lock().await.consecutive_mistakes;
         let path = params["path"]
             .as_str()
-            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("path", 0)))?;
+            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("path", consecutive_mistakes)))?;
         let path = path.to_string();
         let resolved_path = Self::resolve_path(ctx.workspace_root.as_path(), &path)?;
         let mut resolved_params = params;
@@ -167,7 +168,7 @@ impl ToolHandler for WriteToFileHandler {
 
         let content = resolved_params["content"]
             .as_str()
-            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("content", 0)))?
+            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("content", consecutive_mistakes)))?
             .to_string();
         let lines_added = content.lines().count() as u32;
 
