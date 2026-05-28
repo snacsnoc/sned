@@ -167,16 +167,14 @@ pub fn calculate_context_usage_percentage(
     cache_writes: Option<u32>,
     cache_reads: Option<u32>,
     context_window: u64,
-    provider_name: &str,
+    _provider_name: &str,
 ) -> f64 {
-    // OpenAI-compatible providers already include cache tokens in tokens_in
-    // Gemini already subtracts cache reads from input_tokens
-    let no_cache_add = ["openai", "minimax", "deepseek", "groq", "xai", "openrouter", "gemini"];
-    let cache_tokens = if no_cache_add.contains(&provider_name) {
-        0
-    } else {
-        cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64
-    };
+    // All providers report input_tokens without cache tokens:
+    // - OpenAI-compatible: input_tokens = prompt_tokens - cached_tokens
+    // - Anthropic: input_tokens excludes cache separately
+    // - Gemini: input_tokens = prompt_tokens - cached_tokens
+    let cache_tokens =
+        cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64;
 
     let total_tokens = tokens_in as u64 + tokens_out as u64 + cache_tokens;
 
@@ -285,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_cache_double_counting_openai() {
+    fn test_cache_counted_for_openai() {
         let with_cache = calculate_context_usage_percentage(
             50_000,
             10_000,
@@ -296,9 +294,9 @@ mod tests {
         );
         let without_cache =
             calculate_context_usage_percentage(50_000, 10_000, None, None, 200_000, "openai");
-        assert_eq!(
-            with_cache, without_cache,
-            "for OpenAI, cache_writes/cache_reads are already in tokens_in and must not be double-counted"
+        assert!(
+            with_cache > without_cache,
+            "for OpenAI, cache tokens should be counted (input_tokens excludes cache)"
         );
     }
 

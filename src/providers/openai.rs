@@ -118,7 +118,10 @@ impl OpenAiProvider {
         let model_id = &self.config.model_id;
         let is_reasoning_family = ["o1", "o3", "o4", "gpt-5"]
             .iter()
-            .any(|prefix| model_id.contains(prefix) && !model_id.contains("chat"));
+            .any(|prefix| {
+                model_id.starts_with(prefix) || model_id.contains(&format!("/{}", prefix))
+            })
+            && !model_id.contains("chat");
 
         let mut messages = vec![];
 
@@ -706,14 +709,9 @@ async fn process_openai_sse_line(
 
                 // Cost for uncached input tokens
                 let input_cost = input_price * (uncached_input_tokens as f64 / 1_000_000.0);
-                // Cost for output tokens (including reasoning)
-                let reasoning_tokens = usage
-                    .completion_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.reasoning_tokens)
-                    .unwrap_or(0);
-                let output_cost = output_price
-                    * ((usage.completion_tokens + reasoning_tokens) as f64 / 1_000_000.0);
+                // Cost for output tokens — completion_tokens already includes reasoning tokens
+                let output_cost =
+                    output_price * (usage.completion_tokens as f64 / 1_000_000.0);
                 // Cost for cache reads (discounted)
                 let cache_read_cost = if cached_tokens > 0 {
                     cache_reads_price * (cached_tokens as f64 / 1_000_000.0)

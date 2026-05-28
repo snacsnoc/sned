@@ -585,7 +585,7 @@ async fn process_gemini_sse_line(
         let total_cost = model_info.as_ref().and_then(|info| {
             let mut input_price = info.input_price?;
             let mut output_price = info.output_price?;
-            let cache_reads_price = info.cache_reads_price.unwrap_or(0.0);
+            let mut cache_reads_price = info.cache_reads_price.unwrap_or(0.0);
 
             // Apply tiered pricing if available
             if let Some(tiers) = &info.tiers
@@ -595,6 +595,7 @@ async fn process_gemini_sse_line(
             {
                 input_price = tier.input_price.unwrap_or(input_price);
                 output_price = tier.output_price.unwrap_or(output_price);
+                cache_reads_price = tier.cache_reads_price.unwrap_or(cache_reads_price);
             }
 
             let cache_read = cache_read_tokens.unwrap_or(0);
