@@ -220,12 +220,27 @@ impl SecretsStore {
             }
             tracing::debug!("Stored secret '{}' in OS keychain", key);
         } else {
-            // Keychain unavailable or unverified — fall back to file storage
+            // Keychain unavailable or unverified
+            // Check if user requires keychain (fail closed)
+            if std::env::var("SNED_REQUIRE_KEYCHAIN").is_ok() {
+                tracing::error!(
+                    "OS keychain unavailable and SNED_REQUIRE_KEYCHAIN is set. \
+                     Secret '{}' cannot be stored. Please ensure your OS keychain is available.",
+                    key
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "OS keychain unavailable and SNED_REQUIRE_KEYCHAIN is set"
+                ));
+            }
+            
+            // Fall back to file storage with strong warning
             // WARN the user that secrets are stored in plaintext
             tracing::warn!(
                 "OS keychain unavailable. Secret '{}' stored in plaintext file at {}. \
-                 For better security, ensure your OS keychain is available or restrict \
-                 access to the containing directory.",
+                 For better security: (1) ensure your OS keychain is available, or \
+                 (2) set SNED_REQUIRE_KEYCHAIN=1 to fail closed, or \
+                 (3) restrict access to the containing directory.",
                 key,
                 self.file_path.display()
             );
