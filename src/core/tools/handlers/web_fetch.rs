@@ -5,6 +5,7 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
+use crate::core::tools::handlers::error_guidance;
 use async_trait::async_trait;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use url::Url;

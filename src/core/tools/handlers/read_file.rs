@@ -12,6 +12,7 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
+use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
 

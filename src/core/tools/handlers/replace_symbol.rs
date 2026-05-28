@@ -1,5 +1,6 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::hash_utils::strip_hashes;
+use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
 use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::{SymbolRange, get_symbol_range, load_required_language_parsers};
@@ -61,7 +62,7 @@ impl ReplaceSymbolHandler {
                 "replace_symbol: no replacements provided"
             );
             return Err(ToolError::InvalidInput(
-                "Missing required parameters: replacements".to_string(),
+                error_guidance::missing_parameter("replacements", 0),
             ));
         }
 
@@ -79,20 +80,53 @@ impl ReplaceSymbolHandler {
             match process_batch(batch, self.symbol_index_service.as_ref()).await {
                 Ok(result) => file_results.push(result),
                 Err(e) => {
-                    any_error = Some(e);
-                    break;
+                    // Continue processing remaining batches — don't discard
+                    // successful results. Collect the error but keep going.
+                    if any_error.is_none() {
+                        any_error = Some(e);
+                    }
+                    // Don't break — process all remaining batches
                 }
             }
         }
 
+        // If any error occurred, return an error that includes partial results
         if let Some(err) = any_error {
+            if file_results.is_empty() {
+                state.consecutive_mistakes += 1;
+                tracing::warn!(
+                    consecutive_mistakes = state.consecutive_mistakes,
+                    error = %err,
+                    "replace_symbol: batch processing failed"
+                );
+                return Err(err);
+            }
+
+            // Partial success: return results for files that succeeded,
+            // but also include the error so the model knows what failed.
             state.consecutive_mistakes += 1;
             tracing::warn!(
                 consecutive_mistakes = state.consecutive_mistakes,
                 error = %err,
-                "replace_symbol: batch processing failed"
+                partial_results = file_results.len(),
+                "replace_symbol: partial batch success"
             );
-            return Err(err);
+
+            let summaries: Vec<String> = file_results
+                .into_iter()
+                .map(|fr| {
+                    let symbol_list = fr.symbols.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ");
+                    format!("Successfully replaced symbols {} in {}.", symbol_list, fr.display_path)
+                })
+                .collect();
+
+            // Return partial results with error appended
+            let mut result = format!(
+                "{}\n\nError: {}\n\nSome replacements failed. Review the error above and retry only the failed files.",
+                summaries.join("\n\n"),
+                err
+            );
+            return Ok(result);
         }
 
         if file_results.is_empty() {
@@ -336,15 +370,9 @@ async fn process_batch(
         match resolved_range {
             Some(range) => resolved_replacements.push((r.clone(), range)),
             None => {
-                return Err(ToolError::ExecutionFailed(format!(
-                    "Symbol '{}'{} not found in {}.",
-                    r.symbol,
-                    r.symbol_type
-                        .as_ref()
-                        .map(|t| format!(" of type '{}'", t))
-                        .unwrap_or_default(),
-                    r.path
-                )));
+                return Err(ToolError::ExecutionFailed(
+                    error_guidance::symbol_not_found(&r.symbol, &r.path, 0),
+                ));
             }
         }
     }
@@ -353,12 +381,13 @@ async fn process_batch(
 
     for i in 0..resolved_replacements.len().saturating_sub(1) {
         if resolved_replacements[i].1.end_index > resolved_replacements[i + 1].1.start_index {
-            return Err(ToolError::ExecutionFailed(format!(
-                "Overlapping replacements detected for symbols '{}' and '{}' in {}.",
-                resolved_replacements[i].0.symbol,
-                resolved_replacements[i + 1].0.symbol,
-                batch.display_path
-            )));
+            let symbols = vec![
+                resolved_replacements[i].0.symbol.as_str(),
+                resolved_replacements[i + 1].0.symbol.as_str(),
+            ];
+            return Err(ToolError::ExecutionFailed(
+                error_guidance::overlapping_replacements(&symbols, &batch.display_path, 0),
+            ));
         }
     }
 

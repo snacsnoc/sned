@@ -2,6 +2,7 @@
 //!
 
 use crate::cli::actionable_errors;
+use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
 };
@@ -108,13 +109,13 @@ impl WriteToFileHandler {
     ) -> Result<String, ToolError> {
         let path = params["path"]
             .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("Missing 'path' parameter".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("path", 0)))?;
         let content = params["content"]
             .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("Missing 'content' parameter".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("content", 0)))?;
         if content.is_empty() {
             return Err(ToolError::InvalidInput(
-                "'content' parameter must not be empty".to_string(),
+                error_guidance::empty_content(path, 0),
             ));
         }
 
@@ -153,7 +154,7 @@ impl ToolHandler for WriteToFileHandler {
     ) -> Result<serde_json::Value, ToolError> {
         let path = params["path"]
             .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("Missing 'path' parameter".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("path", 0)))?;
         let path = path.to_string();
         let resolved_path = Self::resolve_path(ctx.workspace_root.as_path(), &path)?;
         let mut resolved_params = params;
@@ -166,7 +167,7 @@ impl ToolHandler for WriteToFileHandler {
 
         let content = resolved_params["content"]
             .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("Missing 'content' parameter".to_string()))?
+            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("content", 0)))?
             .to_string();
         let lines_added = content.lines().count() as u32;
 

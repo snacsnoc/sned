@@ -1,4 +1,5 @@
 use crate::core::agent_loop::TaskState;
+use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
 use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::load_required_language_parsers;
@@ -78,7 +79,7 @@ impl RenameSymbolHandler {
                 "rename_symbol: missing required parameter 'paths'"
             );
             return Err(ToolError::InvalidInput(
-                "Missing required parameter: paths".to_string(),
+                error_guidance::missing_parameter("paths", 0),
             ));
         }
         if existing_symbol.is_empty() {
@@ -88,7 +89,7 @@ impl RenameSymbolHandler {
                 "rename_symbol: missing required parameter 'existing_symbol'"
             );
             return Err(ToolError::InvalidInput(
-                "Missing required parameter: existing_symbol".to_string(),
+                error_guidance::missing_parameter("existing_symbol", 0),
             ));
         }
         if new_symbol.is_empty() {
@@ -98,7 +99,7 @@ impl RenameSymbolHandler {
                 "rename_symbol: missing required parameter 'new_symbol'"
             );
             return Err(ToolError::InvalidInput(
-                "Missing required parameter: new_symbol".to_string(),
+                error_guidance::missing_parameter("new_symbol", 0),
             ));
         }
 

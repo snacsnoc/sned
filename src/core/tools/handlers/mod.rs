@@ -3,6 +3,7 @@ pub mod attempt_completion;
 pub mod condense;
 pub mod diagnostics_scan;
 pub mod edit_file;
+pub mod error_guidance;
 pub mod execute_command;
 pub mod find_symbol_references;
 pub mod get_file_skeleton;

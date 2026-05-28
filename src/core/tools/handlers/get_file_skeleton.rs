@@ -1,3 +1,4 @@
+use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
 use crate::services::tree_sitter::get_file_skeleton;
 use crate::services::tree_sitter::load_required_language_parsers;

@@ -4,6 +4,7 @@
 use crate::cli::output::OutputEvent;
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
+use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_string_array};
 use async_trait::async_trait;
 use std::collections::VecDeque;

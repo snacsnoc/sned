@@ -15,6 +15,7 @@ use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, Prepa
 use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard, FileEditorError};
 use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes};
 use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
+use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{
     SnedTool, ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
     ToolRequiredNextStep,
@@ -72,14 +73,18 @@ impl EditFileHandler {
 
         for file in files {
             let path = file.get("path").and_then(|p| p.as_str()).ok_or_else(|| {
-                ToolError::InvalidInput("Missing required parameter: path".to_string())
+                ToolError::InvalidInput(error_guidance::missing_parameter("path", 0))
             })?;
 
             let edits_raw = file
                 .get("edits")
                 .and_then(|e| e.as_array())
                 .ok_or_else(|| {
-                    ToolError::InvalidInput(format!("Missing edits for file: {}", path))
+                    ToolError::InvalidInput(format!(
+                        "Missing 'edits' for file '{}'. {}",
+                        path,
+                        error_guidance::missing_parameter("edits", 0)
+                    ))
                 })?;
 
             let mut edits = Vec::new();
@@ -88,7 +93,11 @@ impl EditFileHandler {
                     .get("anchor")
                     .and_then(|a| a.as_str())
                     .ok_or_else(|| {
-                        ToolError::InvalidInput("Missing required parameter: anchor".to_string())
+                        ToolError::InvalidInput(format!(
+                            "Missing 'anchor' in edit for file '{}'. {}",
+                            path,
+                            error_guidance::missing_parameter("anchor", 0)
+                        ))
                     })?;
 
                 let edit_type = edit_raw
