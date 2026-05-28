@@ -18,9 +18,11 @@ fn max_response_size() -> usize {
     use std::sync::OnceLock;
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
+        let max_allowed = 100 * 1024 * 1024;
         std::env::var("SNED_MAX_FETCH_RESPONSE_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v <= max_allowed)
             .unwrap_or(1_048_576)
     })
 }

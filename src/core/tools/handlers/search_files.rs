@@ -86,10 +86,25 @@ impl SearchFilesHandler {
         };
 
         if let Some(pattern) = file_pattern {
+            if pattern.contains(',')
+                || pattern.contains('"')
+                || pattern.contains('\'')
+                || pattern.contains(' ')
+                || pattern.contains('\t')
+                || pattern.contains(';')
+                || pattern.contains('|')
+                || pattern.contains('&')
+                || pattern.contains('$')
+                || pattern.contains('`')
+            {
+                return Err(anyhow::anyhow!(
+                    "file_pattern contains disallowed characters (commas, quotes, shell metacharacters)"
+                ));
+            }
             if use_ripgrep {
                 cmd.arg("--glob").arg(pattern);
             } else {
-                cmd.arg(format!("--include={}", pattern));
+                cmd.arg("--include").arg(pattern);
             }
         }
 
@@ -153,6 +168,19 @@ impl SearchFilesHandler {
         let regex = params["regex"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("Missing 'regex' parameter".to_string()))?;
+
+        if regex.len() > 500 {
+            return Err(ToolError::InvalidInput(
+                "Regex pattern too long (max 500 characters)".to_string(),
+            ));
+        }
+
+        let nesting = regex.chars().filter(|&c| c == '(').count();
+        if nesting > 10 {
+            return Err(ToolError::InvalidInput(
+                "Regex pattern too complex (max 10 groups)".to_string(),
+            ));
+        }
         let path = params["path"].as_str();
         let file_pattern = params["file_pattern"].as_str();
 

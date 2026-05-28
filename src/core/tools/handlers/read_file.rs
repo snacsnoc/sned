@@ -13,6 +13,7 @@ use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
+use futures::StreamExt;
 use async_trait::async_trait;
 
 fn max_file_read_size() -> usize {
@@ -60,12 +61,17 @@ impl ReadFileHandler {
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
     ) -> Vec<FileReadResult> {
-        let read_futures = paths.into_iter().map(|path| async move {
-            self.read_file(&path, start_line, end_line, anchor_mgr, task_id)
-                .await
-        });
+        let read_futures: Vec<_> = paths
+            .iter()
+            .map(|path| self.read_file(path, start_line, end_line, anchor_mgr, task_id))
+            .collect();
 
-        futures::future::join_all(read_futures).await
+        let results: Vec<FileReadResult> = futures::stream::iter(read_futures)
+            .buffered(4)
+            .collect()
+            .await;
+
+        results
     }
 
     /// Read a single file with optional line range.

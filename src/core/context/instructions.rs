@@ -25,10 +25,11 @@ const INJECTION_PATTERNS: &[&str] = &[
     "download and execute",
 ];
 
-/// Check repo-controlled content for injection patterns and log warnings.
-/// Does not reject content — only warns so the user can review.
-fn warn_if_injection_patterns_detected(content: &str, source: &str) {
+/// Check repo-controlled content for injection patterns.
+/// Returns detected patterns so the caller can surface them to the user.
+fn check_injection_patterns(content: &str, source: &str) -> Vec<&'static str> {
     let lower = content.to_lowercase();
+    let mut detected = Vec::new();
     for pattern in INJECTION_PATTERNS {
         if lower.contains(pattern) {
             tracing::warn!(
@@ -36,8 +37,17 @@ fn warn_if_injection_patterns_detected(content: &str, source: &str) {
                 pattern = pattern,
                 "Repo-controlled content contains injection-like pattern"
             );
+            detected.push(*pattern);
         }
     }
+    if !detected.is_empty() {
+        eprintln!(
+            "[sned] Warning: {} contains injection-like pattern(s): {}. Review this content carefully.",
+            source,
+            detected.join(", ")
+        );
+    }
+    detected
 }
 
 /// Skill metadata
@@ -159,7 +169,7 @@ pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Strin
     }
 
     let combined = parts.join("\n\n");
-    warn_if_injection_patterns_detected(&combined, "AGENTS.md");
+    check_injection_patterns(&combined, "AGENTS.md");
     Some(format!("# AGENTS.md Rules\n\n{}", combined))
 }
 
@@ -183,7 +193,7 @@ pub fn get_local_windsurf_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Str
             if content.is_empty() {
                 None
             } else {
-                warn_if_injection_patterns_detected(content, ".windsurfrules");
+                check_injection_patterns(content, ".windsurfrules");
                 Some(format!("# Windsurf Rules\n\n{}", content))
             }
         }
@@ -214,7 +224,7 @@ pub fn get_local_cursor_rules(cwd: &Path, toggles: &RuleToggles) -> Vec<Option<S
             Ok(content) => {
                 let content = content.trim();
                 if !content.is_empty() {
-                    warn_if_injection_patterns_detected(content, ".cursorrules");
+                    check_injection_patterns(content, ".cursorrules");
                     results.push(Some(format!("# Cursor Rules\n\n{}", content)));
                 } else {
                     results.push(None);
@@ -265,7 +275,7 @@ pub fn get_local_cursor_rules(cwd: &Path, toggles: &RuleToggles) -> Vec<Option<S
 
                 if !parts.is_empty() {
                     let combined = parts.join("\n\n");
-                    warn_if_injection_patterns_detected(&combined, ".cursor/rules");
+                    check_injection_patterns(&combined, ".cursor/rules");
                     results.push(Some(format!("# Cursor Rules Directory\n\n{}", combined)));
                 }
             }
@@ -470,7 +480,7 @@ fn load_skill_metadata(
     let name = frontmatter.get("name")?.as_str()?;
     let description = frontmatter.get("description")?.as_str()?;
 
-    warn_if_injection_patterns_detected(description, &format!("skill:{}:description", skill_name));
+    check_injection_patterns(description, &format!("skill:{}:description", skill_name));
 
     // Name must match directory name
     if name != skill_name {
@@ -525,7 +535,7 @@ fn load_skill_from_md_file(
         let name = frontmatter.get("name")?.as_str()?;
         let description = frontmatter.get("description")?.as_str()?;
 
-        warn_if_injection_patterns_detected(description, &format!("skill:{}:description", skill_name));
+        check_injection_patterns(description, &format!("skill:{}:description", skill_name));
 
         // Name must match filename (without .md extension)
         if name != skill_name {
@@ -671,7 +681,7 @@ pub fn get_skill_content(
     let (_, body, _, _) = parse_yaml_frontmatter(&file_content);
     let instructions = body.trim().to_string();
 
-    warn_if_injection_patterns_detected(&instructions, &format!("skill:{}", skill_name));
+    check_injection_patterns(&instructions, &format!("skill:{}", skill_name));
 
     Some(SkillContent {
         name: skill.name.clone(),
