@@ -5,7 +5,7 @@
 
 use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
 use crate::cli::tui::history::append_to_history;
-use crate::cli::tui::{App, ansi_to_ratatui_lines};
+use crate::cli::tui::{App, ansi_to_ratatui_lines, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::{is_approval_prompt_active, take_approval_sender, ApprovalResult};
 use futures::FutureExt;
@@ -536,6 +536,21 @@ async fn handle_key_event(
         return Ok(None);
     }
 
+    // Handle pending clear confirmation
+    if app.pending_clear.is_some() {
+        if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') || key.code == KeyCode::Enter {
+            app.output_lines.clear();
+            app.scroll_offset = 0;
+            app.auto_scroll = true;
+            let trigger = app.pending_clear.take().unwrap();
+            app.push_plain(format!("Conversation cleared (confirmed via {}).", trigger));
+        } else {
+            app.pending_clear = None;
+            app.push_plain("Clear cancelled.");
+        }
+        return Ok(None);
+    }
+
     // Shift+Up/Down for manual scroll
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         if key.code == KeyCode::Up {
@@ -551,7 +566,8 @@ async fn handle_key_event(
     }
 
     // Up/Down for command history navigation (only when picker is not active)
-    if key.code == KeyCode::Up && !app.picker_active && app.input.cursor().0 == 0 && app.input.cursor().1 == 0 {
+    // Always allow history navigation regardless of cursor position
+    if key.code == KeyCode::Up && !app.picker_active {
         if let Some(entry) = app.history.navigate_up() {
             app.input = App::new_textarea(vec![entry.to_string()]);
         }
@@ -585,11 +601,10 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    // Ctrl+L - clear output screen
+    // Ctrl+L - clear output screen (with confirmation)
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.output_lines.clear();
-        app.scroll_offset = 0;
-        app.auto_scroll = true;
+        app.pending_clear = Some("ctrl_l".to_string());
+        app.push_plain("Clear output? (y to confirm, any other key to cancel): ");
         return Ok(None);
     }
 
@@ -660,8 +675,8 @@ async fn handle_cli_only_command(
             return Ok(true);
         }
         CliOnlyCommand::Clear => {
-            app.output_lines.clear();
-            app.push_plain("Conversation cleared.");
+            app.pending_clear = Some("slash".to_string());
+            app.push_plain("Clear output? (y to confirm, any other key to cancel): ");
         }
         CliOnlyCommand::History => {
             let last_n: Vec<String> = app
@@ -861,7 +876,7 @@ async fn handle_cli_only_command(
                     }
                 }
                 Err(e) => {
-                    app.push_plain(format!("Undo failed: {}", e));
+                    app.push_styled(format!("Undo failed: {}", e), Style::default().fg(theme::ERROR_FG));
                 }
             }
         }
@@ -881,7 +896,7 @@ async fn handle_cli_only_command(
                             }
                         }
                         Err(e) => {
-                            app.push_plain(format!("Failed to get diff: {}", e));
+                            app.push_styled(format!("Failed to get diff: {}", e), Style::default().fg(theme::ERROR_FG));
                         }
                     }
                 }
@@ -903,7 +918,7 @@ async fn handle_cli_only_command(
                             }
                         }
                         Err(e) => {
-                            app.push_plain(format!("Failed to get log: {}", e));
+                            app.push_styled(format!("Failed to get log: {}", e), Style::default().fg(theme::ERROR_FG));
                         }
                     }
                 }
@@ -971,7 +986,7 @@ async fn handle_cli_only_command(
                                                 ));
                                             }
                                             Err(e) => {
-                                                app.push_plain(format!("Commit failed: {}", e));
+                                                app.push_styled(format!("Commit failed: {}", e), Style::default().fg(theme::ERROR_FG));
                                             }
                                         }
                                     } else {
@@ -980,7 +995,7 @@ async fn handle_cli_only_command(
                                 }
                             }
                             Err(e) => {
-                                app.push_plain(format!("Failed to get diff: {}", e));
+                                app.push_styled(format!("Failed to get diff: {}", e), Style::default().fg(theme::ERROR_FG));
                             }
                         }
                     }
@@ -1194,8 +1209,8 @@ async fn run_main_loop(
         // 2. Render
         terminal.draw(|f| app.render(f))?;
 
-        // 3. Poll for events (blocking, 50ms timeout)
-        let has_event = ratatui::crossterm::event::poll(Duration::from_millis(50))?;
+        // 3. Poll for events (blocking, 16ms timeout for ~60fps responsiveness)
+        let has_event = ratatui::crossterm::event::poll(Duration::from_millis(16))?;
         if has_event {
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {

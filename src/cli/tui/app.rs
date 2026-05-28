@@ -72,6 +72,8 @@ pub struct App {
     pub elapsed: Option<Duration>,
     /// Scrollbar state for output pane
     pub scrollbar_state: ScrollbarState,
+    /// Pending clear confirmation (stores the trigger: "slash" or "ctrl_l")
+    pub pending_clear: Option<String>,
 }
 
 impl App {
@@ -106,6 +108,7 @@ impl App {
             mode: String::new(),
             elapsed: None,
             scrollbar_state: ScrollbarState::new(0),
+            pending_clear: None,
         }
     }
 
