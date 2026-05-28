@@ -127,6 +127,11 @@ impl CommandSafetyChecker {
             return Err(CommandUnsafe::new("Command substitution is not allowed"));
         }
 
+        // Block shell history expansion (!) which can execute previous commands
+        if normalized.contains('!') {
+            return Err(CommandUnsafe::new("Shell history expansion (!) is not allowed"));
+        }
+
         let segments: Vec<&str> = normalized.split(['|', '&', ';', '\n', '\r']).collect();
 
         for segment in segments.iter() {

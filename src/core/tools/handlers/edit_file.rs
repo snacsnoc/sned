@@ -365,8 +365,26 @@ impl EditFileHandler {
             // Read file content and capture mtime (check cache first for cross-call coordination)
             let (content, initial_mtime) =
                 if let Some(cached_content) = state.file_content_cache.get(&batch.absolute_path) {
-                    tracing::debug!("Using cached content for {}", batch.display_path);
-                    (cached_content.clone(), None)
+                    // SECURITY: Re-verify file is still valid (not swapped with symlink) even when using cache
+                    match tokio::fs::metadata(&batch.absolute_path).await {
+                        Ok(metadata) if metadata.is_file() => {
+                            tracing::debug!("Using cached content for {} (symlink check passed)", batch.display_path);
+                            (cached_content.clone(), None)
+                        }
+                        Ok(_) => {
+                            all_results.push(format!(
+                                "File {} is no longer a regular file (may be symlink)",
+                                batch.display_path
+                            ));
+                            total_failed += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            all_results.push(format!("Error verifying file {}: {}", batch.display_path, e));
+                            total_failed += 1;
+                            continue;
+                        }
+                    }
                 } else {
                     match tokio::fs::metadata(&batch.absolute_path).await {
                         Ok(metadata) => {

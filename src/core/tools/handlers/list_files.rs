@@ -74,7 +74,7 @@ impl ListFilesHandler {
         // If path is a file, return info for just that file
         if path_obj.is_file() {
             let line_count = if include_line_counts {
-                count_lines_fast(&path_obj).await
+                count_lines_fast(path_obj).await
             } else {
                 None
             };
@@ -98,10 +98,10 @@ impl ListFilesHandler {
         let mut hit_limit = false;
 
         let warning = if recursive {
-            self.collect_files_recursive(&path_obj, &mut files, &mut hit_limit, include_line_counts)
+            self.collect_files_recursive(path_obj, &mut files, &mut hit_limit, include_line_counts)
                 .await
         } else {
-            self.collect_files_top_level(&path_obj, &mut files, &mut hit_limit, include_line_counts)
+            self.collect_files_top_level(path_obj, &mut files, &mut hit_limit, include_line_counts)
                 .await
                 .map(|()| None)
         };
