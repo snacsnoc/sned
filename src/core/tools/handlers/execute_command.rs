@@ -542,7 +542,7 @@ impl ExecuteCommandHandler {
             let limit_bytes = std::env::var("SNED_COMMAND_OUTPUT_LIMIT")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&v| v > 0)
+                .filter(|&v| v > 0 && v <= 1024 * 1024)
                 .unwrap_or(10 * 1024);
 
             if combined_output.len() > limit_bytes {
@@ -584,14 +584,7 @@ impl ExecuteCommandHandler {
         use tokio::process::Command;
         use tokio::time::timeout;
 
-        // Apply safety checker for all script languages
-        if !explicitly_approved
-            && matches!(
-                language,
-                "bash" | "sh" | "zsh" | "python" | "python3" | "node" | "javascript"
-            )
-            && let Err(e) = self.safety_checker.is_safe(script)
-        {
+        if !explicitly_approved && let Err(e) = self.safety_checker.is_safe(script) {
             tracing::warn!(script = %script, reason = %e, "script rejected by safety checker");
             return Err(anyhow::anyhow!("{}", e));
         }
@@ -788,11 +781,24 @@ impl ExecuteCommandHandler {
 
         static SNED_ALLOW_ENV: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         let extra = SNED_ALLOW_ENV.get_or_init(|| {
+            static SECRET_PATTERNS: &[&str] = &[
+                "KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "PRIVATE",
+            ];
             std::env::var("SNED_ALLOW_ENV")
                 .unwrap_or_default()
                 .split(',')
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .filter(|s| {
+                    if s.is_empty() || s.starts_with("SNED_") {
+                        return false;
+                    }
+                    let upper = s.to_uppercase();
+                    if SECRET_PATTERNS.iter().any(|p| upper.contains(p)) {
+                        tracing::warn!(var = %s, "SNED_ALLOW_ENV entry blocked (secret-like name)");
+                        return false;
+                    }
+                    true
+                })
                 .collect::<Vec<_>>()
         });
 
@@ -807,7 +813,7 @@ impl ExecuteCommandHandler {
         let mut filtered = Vec::new();
 
         for (k, v) in std::env::vars() {
-            if allow_set.contains_key(k.as_str()) {
+            if allow_set.contains_key(k.as_str()) && !k.starts_with("SNED_") {
                 env.insert(k, v);
             } else if !k.starts_with("SNED_") {
                 filtered.push(k);

@@ -127,6 +127,26 @@ impl CommandSafetyChecker {
             return Err(CommandUnsafe::new("Command substitution is not allowed"));
         }
 
+        if normalized.contains("<(") || normalized.contains(">(") {
+            return Err(CommandUnsafe::new("Process substitution is not allowed"));
+        }
+
+        if normalized.contains("<<") {
+            return Err(CommandUnsafe::new("Heredoc is not allowed"));
+        }
+
+        if let Some(start) = normalized.find("$'") {
+            let after = &normalized[start + 2..];
+            if let Some(end) = after.find('\'') {
+                let content = &after[..end];
+                if content.contains("\\n") || content.contains("\\r") || content.contains("\\0") {
+                    return Err(CommandUnsafe::new(
+                        "ANSI-C quoting with embedded newlines is not allowed",
+                    ));
+                }
+            }
+        }
+
         // Block shell history expansion (!) which can execute previous commands
         if normalized.contains('!') {
             return Err(CommandUnsafe::new("Shell history expansion (!) is not allowed"));

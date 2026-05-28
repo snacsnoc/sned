@@ -107,7 +107,14 @@ impl WebFetchHandler {
                         ip
                     )));
                 }
-                if ipv4.octets() == [169, 254, 169, 254] {
+                // CGNAT/shared address space 100.64.0.0/10 — Alibaba Cloud metadata at 100.100.100.200
+                let octets = ipv4.octets();
+                if octets[0] == 100 && (octets[1] & 0xc0) == 0x40 {
+                    return Err(ToolError::InvalidInput(
+                        "Access to shared address space (CGNAT) is not allowed".to_string(),
+                    ));
+                }
+                if octets == [169, 254, 169, 254] {
                     return Err(ToolError::InvalidInput(
                         "Access to cloud metadata endpoint 169.254.169.254 is not allowed"
                             .to_string(),
