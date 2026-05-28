@@ -196,7 +196,8 @@ impl ChannelOutputWriter {
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
-        let _ = self.tx.send(event);
+        // Use try_send to avoid blocking; drop the result since we don't need it
+        let _ = self.tx.try_send(event);
     }
 
     fn flush(&self) {

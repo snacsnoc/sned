@@ -2,7 +2,6 @@
 //!
 
 use crate::core::agent_loop::TaskState;
-use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
 use async_trait::async_trait;
 use std::path::Path;

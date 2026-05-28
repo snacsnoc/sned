@@ -121,7 +121,7 @@ impl ReplaceSymbolHandler {
                 .collect();
 
             // Return partial results with error appended
-            let mut result = format!(
+            let result = format!(
                 "{}\n\nError: {}\n\nSome replacements failed. Review the error above and retry only the failed files.",
                 summaries.join("\n\n"),
                 err

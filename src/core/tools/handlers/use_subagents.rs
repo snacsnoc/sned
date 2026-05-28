@@ -5,7 +5,6 @@
 //! Each subagent gets a configured timeout (default 300s) and optional max turns.
 
 use crate::core::agent_loop::TaskState;
-use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
 use std::path::Path;

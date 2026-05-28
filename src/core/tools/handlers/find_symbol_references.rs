@@ -1,5 +1,4 @@
 use crate::core::hash_utils::format_line_with_hash;
-use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
 use crate::services::tree_sitter::load_required_language_parsers;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
