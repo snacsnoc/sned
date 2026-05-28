@@ -1,4 +1,5 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use sned::core::context::context_manager::{
     TruncationKeep, get_next_truncation_range, get_truncated_messages,
 };

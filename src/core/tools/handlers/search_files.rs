@@ -290,8 +290,12 @@ impl ToolHandler for SearchFilesHandler {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    // Mutex to serialize env var mutations across tests
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[tokio::test]
     async fn test_search_files_basic() {
@@ -349,6 +353,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_files_respects_max_count_per_file() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Explicitly set the env var to the default to avoid interference from parallel tests
+        // SAFETY: restoring env after test
+        unsafe {
+            std::env::set_var(SEARCH_MAX_LINES_ENV, "100");
+        }
+
         // Create a file with more matches than the default limit (100)
         let temp_dir = TempDir::new().unwrap();
         let content = (0..150)
@@ -375,13 +387,19 @@ mod tests {
             line_count
         );
         assert!(result.contains("Too many matches"));
+
+        // SAFETY: restoring env after test
+        unsafe {
+            std::env::remove_var(SEARCH_MAX_LINES_ENV);
+        }
     }
 
     #[tokio::test]
     async fn test_search_files_custom_max_count_via_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         // Test with custom limit via environment variable
-        // Use a unique value to avoid interference from other tests
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: restoring env after test
         unsafe {
             std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
         }
@@ -413,7 +431,7 @@ mod tests {
         );
         assert!(result.contains("Too many matches"));
 
-        // SAFETY: single-threaded test; restoring env after test
+        // SAFETY: restoring env after test
         unsafe {
             std::env::remove_var(SEARCH_MAX_LINES_ENV);
         }

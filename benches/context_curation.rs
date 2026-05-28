@@ -1,7 +1,8 @@
 // Context curation performance benchmark
 // Measures ContextManager operations at different message counts
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use std::time::Duration;
 
 use sned::core::context::context_manager::{

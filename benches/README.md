@@ -3,6 +3,7 @@
 Performance baseline established: **2026-05-13**
 Startup baseline established: **2026-05-15**
 Memory baseline established: **2026-05-15**
+Post-security-audit baseline: **2026-05-28**
 
 ## Quick Start
 
@@ -511,3 +512,20 @@ See `DEBUG_MEMORY_LEAK_TESTING.md` at repo root for complete memory profiling gu
 - `provider_serialization.rs` — 8 benchmarks
 - `symbol_indexing.rs` — 4 benchmarks
 - `file_context_tracking.rs` — 4 benchmarks
+
+---
+
+### 2026-05-28 - Post-Security-Audit Baseline
+
+All benchmarks re-run after 20 security audit commits. Results are within acceptable margins of variation from the 2026-05-15 baseline. No performance regressions detected from security hardening work.
+
+**All operations remain well within performance budgets:**
+- Startup: 621 µs target → actual 1.62 ms (still under 200ms target)
+- Anchor reconciliation: all within 2-5% of baseline
+- Context curation: unchanged (sub-nanosecond operations)
+- Edit application: within 3-6% of baseline
+- Provider streaming: within 2-6% of baseline
+
+**Fixed:** `symbol_indexing.rs` benchmark updated to use public API (`get_symbols` instead of private `get_definitions`/`symbol_count`).
+
+**Fixed:** All benchmarks migrated from deprecated `criterion::black_box` to `std::hint::black_box`.

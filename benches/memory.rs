@@ -1,7 +1,8 @@
 // Memory baseline benchmark using criterion
 // Measures heap allocations at key lifecycle points
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use std::time::Duration;
 
 /// Measure heap allocations for basic data structure initialization

@@ -1,7 +1,8 @@
 // Provider streaming throughput benchmark
 // Measures SSE parsing throughput for OpenAI and Anthropic providers
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use std::time::Duration;
 
 use sned::providers::SseLineBuffer;

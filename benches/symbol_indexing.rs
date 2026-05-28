@@ -1,4 +1,5 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use sned::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
 
 const RUST_SAMPLE: &str = r#"
@@ -101,7 +102,7 @@ fn bench_extract_symbols_rust(c: &mut Criterion) {
                 RUST_SAMPLE.len() as u64,
                 vec![], // symbols will be extracted internally
             );
-            black_box(service.symbol_count());
+            black_box(service.get_project_root());
         })
     });
 }
@@ -112,7 +113,7 @@ fn bench_extract_symbols_typescript(c: &mut Criterion) {
     c.bench_function("symbol_index_typescript", |b| {
         b.iter(|| {
             service.index_file("test.ts".to_string(), 0, TS_SAMPLE.len() as u64, vec![]);
-            black_box(service.symbol_count());
+            black_box(service.get_project_root());
         })
     });
 }
@@ -168,7 +169,7 @@ fn bench_symbol_lookup(c: &mut Criterion) {
 
     c.bench_function("symbol_lookup_by_name", |b| {
         b.iter(|| {
-            let result = service.get_definitions(black_box("Config"), None);
+            let result = service.get_symbols(black_box("Config"), Some(SymbolType::Definition), None);
             black_box(result);
         })
     });
