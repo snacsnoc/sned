@@ -859,16 +859,17 @@ mod tests {
     fn test_anthropic_cache_tokens_included_in_compaction_threshold() {
         let info = ApiReqInfo {
             tokens_in: Some(100_000),
-            cache_writes: Some(20_000),
-            cache_reads: Some(30_000),
+            cache_writes: Some(30_000),
+            cache_reads: Some(40_000),
             context_window: Some(200_000),
             ..Default::default()
         };
 
-        // Anthropic: tokens_in is uncached, total = 100k + 20k + 30k = 150k
+        // Anthropic: tokens_in is uncached, total = 100k + 30k + 40k = 170k
+        // 170k > 160k max_allowed_size
         assert!(
             should_compact_context_window(&info, 200_000, 160_000, None, "anthropic"),
-            "Anthropic: 100k input + 20k cache_write + 30k cache_read = 150k should trigger"
+            "Anthropic: 100k input + 30k cache_write + 40k cache_read = 170k should trigger"
         );
     }
 }

@@ -21,6 +21,25 @@ fn set_backup_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Create a backup path with timestamp to avoid extension conflicts.
+/// Uses format: `{filename}.{timestamp}.bak` instead of `.with_extension("bak")`
+/// to handle files that already have `.bak` extension or no extension.
+fn create_backup_path(original: &Path) -> PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs();
+    
+    let mut backup_name = original
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "backup".to_string());
+    
+    backup_name.push_str(&format!(".{}.bak", timestamp));
+    
+    original.with_file_name(backup_name)
+}
+
 /// Sanitize a relative path to prevent path traversal attacks
 /// Returns None if the path contains ".." components or is absolute
 fn sanitize_relative_path(path: &str) -> Option<PathBuf> {
@@ -285,43 +304,51 @@ impl MigrationEngine {
     pub fn execute(&mut self) -> Result<MigrationExecutionReport, MigrationError> {
         self.executed_operations.clear();
 
-        let endpoints =
-            self.execute_json_object_migration("endpoints.json", PathBuf::from("endpoints.json"))?;
+        let result = (|| -> Result<MigrationExecutionReport, MigrationError> {
+            let endpoints =
+                self.execute_json_object_migration("endpoints.json", PathBuf::from("endpoints.json"))?;
 
-        let global_settings = self.execute_json_object_migration(
-            "data/settings/global_settings.json",
-            PathBuf::from("data/settings/global_settings.json"),
-        )?;
+            let global_settings = self.execute_json_object_migration(
+                "data/settings/global_settings.json",
+                PathBuf::from("data/settings/global_settings.json"),
+            )?;
 
-        let secrets =
-            self.execute_json_object_migration(".secrets.json", PathBuf::from(".secrets.json"))?;
+            let secrets =
+                self.execute_json_object_migration(".secrets.json", PathBuf::from(".secrets.json"))?;
 
-        let task_history = self.execute_task_history_migration(
-            "data/state/taskHistory.json",
-            PathBuf::from("data/state/taskHistory.json"),
-        )?;
+            let task_history = self.execute_task_history_migration(
+                "data/state/taskHistory.json",
+                PathBuf::from("data/state/taskHistory.json"),
+            )?;
 
-        let tasks = self.execute_task_directories_migration()?;
+            let tasks = self.execute_task_directories_migration()?;
 
-        self.execute_agents_migration()?;
+            self.execute_agents_migration()?;
 
-        for op in &self.executed_operations {
-            if let Some(ref backup) = op.backup_path {
-                let _ = fs::remove_file(backup);
+            for op in &self.executed_operations {
+                if let Some(ref backup) = op.backup_path {
+                    let _ = fs::remove_file(backup);
+                }
             }
+
+            Ok(MigrationExecutionReport {
+                source_root: self.source_root.clone(),
+                destination_root: self.destination_root.clone(),
+                endpoints,
+                global_settings,
+                secrets,
+                task_history,
+                tasks,
+                executed_operations: std::mem::take(&mut self.executed_operations),
+                success: true,
+            })
+        })();
+
+        if result.is_err() {
+            let _ = self.rollback();
         }
 
-        Ok(MigrationExecutionReport {
-            source_root: self.source_root.clone(),
-            destination_root: self.destination_root.clone(),
-            endpoints,
-            global_settings,
-            secrets,
-            task_history,
-            tasks,
-            executed_operations: std::mem::take(&mut self.executed_operations),
-            success: true,
-        })
+        result
     }
 
     pub fn rollback(&mut self) -> Result<(), MigrationError> {
@@ -458,12 +485,12 @@ impl MigrationEngine {
         }
 
         let backup_path = if destination_path.exists() {
-            let backup = destination_path.with_extension("bak");
+            let backup = create_backup_path(&destination_path);
             fs::copy(&destination_path, &backup).map_err(|source| MigrationError::Io {
                 path: destination_path.clone(),
                 source,
             })?;
-            let _ = set_backup_permissions(&backup);  // Ignore errors - backup still useful
+            let _ = set_backup_permissions(&backup);
             Some(backup)
         } else {
             if let Some(parent) = destination_path.parent() {
@@ -595,7 +622,7 @@ impl MigrationEngine {
         }
 
         let backup_path = if destination_path.exists() {
-            let backup = destination_path.with_extension("bak");
+            let backup = create_backup_path(&destination_path);
             fs::copy(&destination_path, &backup).map_err(|source| MigrationError::Io {
                 path: destination_path.clone(),
                 source,
@@ -801,7 +828,7 @@ impl MigrationEngine {
             }
 
             let backup_path = if destination_file.exists() {
-                let backup = destination_file.with_extension("bak");
+                let backup = create_backup_path(&destination_file);
                 fs::copy(&destination_file, &backup).map_err(|source| MigrationError::Io {
                     path: destination_file.clone(),
                     source,
@@ -812,7 +839,11 @@ impl MigrationEngine {
                 None
             };
 
-            fs::copy(&source_file, &destination_file).map_err(|source| MigrationError::Io {
+            let content = fs::read(&source_file).map_err(|source| MigrationError::Io {
+                path: source_file.clone(),
+                source,
+            })?;
+            crate::storage::disk::atomic_write_file_bytes(&destination_file, &content).map_err(|source| MigrationError::Io {
                 path: destination_file.clone(),
                 source,
             })?;
@@ -888,7 +919,7 @@ impl MigrationEngine {
                     }
 
                     let backup_path = if destination_file.exists() {
-                        let backup = destination_file.with_extension("bak");
+                        let backup = create_backup_path(&destination_file);
                         fs::copy(&destination_file, &backup).map_err(|source| {
                             MigrationError::Io {
                                 path: destination_file.clone(),
@@ -901,7 +932,13 @@ impl MigrationEngine {
                         None
                     };
 
-                    fs::copy(source_file, &destination_file).map_err(|source| {
+                    let content = fs::read(source_file).map_err(|source| {
+                        MigrationError::Io {
+                            path: source_file.to_path_buf(),
+                            source,
+                        }
+                    })?;
+                    crate::storage::disk::atomic_write_file_bytes(&destination_file, &content).map_err(|source| {
                         MigrationError::Io {
                             path: destination_file.clone(),
                             source,
@@ -1537,5 +1574,40 @@ mod tests {
             rollback_result.is_ok(),
             "Rollback should succeed without error"
         );
+    }
+
+    #[test]
+    fn execute_rollback_on_partial_failure() {
+        use std::io::Write;
+
+        let source = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+
+        write_json(
+            &source.path().join("endpoints.json"),
+            &serde_json::json!({
+                "key1": "value1"
+            }),
+        );
+
+        write_json(
+            &destination.path().join("endpoints.json"),
+            &serde_json::json!({
+                "existing": "data"
+            }),
+        );
+
+        let mut engine = MigrationEngine::new(source.path(), destination.path());
+        let result = engine.execute();
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert!(report.success);
+
+        let endpoints_path = destination.path().join("endpoints.json");
+        let endpoints_content = fs::read_to_string(&endpoints_path).unwrap();
+        let endpoints: serde_json::Value = serde_json::from_str(&endpoints_content).unwrap();
+        assert!(endpoints.get("key1").is_some());
+        assert!(endpoints.get("existing").is_some());
     }
 }
