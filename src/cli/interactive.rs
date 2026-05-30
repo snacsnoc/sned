@@ -7,10 +7,11 @@ use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines};
 use crate::cli::{RootOnlyOptions, TaskOptions};
-use crate::core::approval::{is_approval_prompt_active, take_approval_sender, ApprovalResult};
+use crate::core::approval::{ApprovalResult, is_approval_prompt_active, take_approval_sender};
 use futures::FutureExt;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyModifiers,
 };
 use ratatui::crossterm::execute;
 use ratatui::style::{Color, Modifier, Style};
@@ -26,7 +27,11 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Disable bracketed paste and mouse capture before restoring terminal
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
         ratatui::restore();
     }
 }
@@ -492,7 +497,10 @@ async fn handle_key_event(
     }
 
     // Tab or Enter with active file picker -> insert selection (must come before Enter handler)
-    if app.picker_active && !app.picker_results.is_empty() && (key.code == KeyCode::Tab || key.code == KeyCode::Enter) {
+    if app.picker_active
+        && !app.picker_results.is_empty()
+        && (key.code == KeyCode::Tab || key.code == KeyCode::Enter)
+    {
         let text = app.input.lines().join("\n");
         let mq = crate::core::file_search::extract_mention_query(&text);
         if mq.in_mention_mode {
@@ -500,7 +508,8 @@ async fn handle_key_event(
             let (new_text, cursor_pos) =
                 crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
             app.input = App::new_textarea(vec![new_text]);
-            app.input.move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
+            app.input
+                .move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
             app.picker_active = false;
             app.picker_results.clear();
             return Ok(None);
@@ -569,7 +578,11 @@ async fn handle_key_event(
     }
 
     // Up/Down for command history navigation (only when picker is not active)
-    if key.code == KeyCode::Up && !app.picker_active && app.input.cursor().0 == 0 && app.input.cursor().1 == 0 {
+    if key.code == KeyCode::Up
+        && !app.picker_active
+        && app.input.cursor().0 == 0
+        && app.input.cursor().1 == 0
+    {
         if let Some(entry) = app.history.navigate_up() {
             app.input = App::new_textarea(vec![entry.to_string()]);
         }
@@ -1201,7 +1214,9 @@ async fn run_main_loop(
                             let prompt_lines = app.output_lines.len();
 
                             // Ctrl+C during approval: deny, cancel agent
-                            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
                                 let _ = sender.send(ApprovalResult::Denied);
                                 app.output_lines.truncate(prompt_lines);
                                 app.auto_scroll = true;
@@ -1325,19 +1340,17 @@ async fn run_main_loop(
                 Event::Resize(_, _) => {
                     // Ratatui handles resize automatically on next draw
                 }
-                Event::Mouse(mouse_event) => {
-                    match mouse_event.kind {
-                        ratatui::crossterm::event::MouseEventKind::ScrollDown => {
-                            app.auto_scroll = false;
-                            app.scroll_offset = app.scroll_offset.saturating_add(3);
-                        }
-                        ratatui::crossterm::event::MouseEventKind::ScrollUp => {
-                            app.auto_scroll = false;
-                            app.scroll_offset = app.scroll_offset.saturating_sub(3);
-                        }
-                        _ => {}
+                Event::Mouse(mouse_event) => match mouse_event.kind {
+                    ratatui::crossterm::event::MouseEventKind::ScrollDown => {
+                        app.auto_scroll = false;
+                        app.scroll_offset = app.scroll_offset.saturating_add(3);
                     }
-                }
+                    ratatui::crossterm::event::MouseEventKind::ScrollUp => {
+                        app.auto_scroll = false;
+                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -1359,7 +1372,9 @@ async fn run_main_loop(
         }
 
         // 5. Update elapsed time for status bar
-        if app.agent_busy && let Some(start) = app.start_time {
+        if app.agent_busy
+            && let Some(start) = app.start_time
+        {
             app.elapsed = Some(start.elapsed());
         }
 
@@ -1423,7 +1438,12 @@ pub async fn run_interactive_shell_inner(
         let provider = sess.agent_loop.get_provider();
         let model = provider.get_model();
         app.provider_name = provider.name().to_string();
-        app.model_name = sess.task_opts.model.as_deref().unwrap_or(&model.id).to_string();
+        app.model_name = sess
+            .task_opts
+            .model
+            .as_deref()
+            .unwrap_or(&model.id)
+            .to_string();
         app.task_id = task_id.clone();
         app.mode = if sess.task_opts.plan { "PLAN" } else { "ACT" }.to_string();
         app.start_time = Some(Instant::now());

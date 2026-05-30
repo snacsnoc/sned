@@ -11,8 +11,8 @@ use crate::providers::{
 };
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::StatusCode;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc::error::TrySendError;
@@ -843,7 +843,7 @@ impl Provider for OpenAiProvider {
             let status = response.status();
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            
+
             // Add helpful hint for common model/provider mismatches
             let error_body = if status == StatusCode::NOT_FOUND || status.as_u16() == 404 {
                 let model_lower = self.config.model_id.to_lowercase();
@@ -865,10 +865,15 @@ impl Provider for OpenAiProvider {
             } else {
                 text
             };
-            
-            return Err(
-                ProviderHttpError::new(&self.provider_name, url, status, error_body, headers).into(),
-            );
+
+            return Err(ProviderHttpError::new(
+                &self.provider_name,
+                url,
+                status,
+                error_body,
+                headers,
+            )
+            .into());
         }
 
         let stream = response.bytes_stream();

@@ -807,7 +807,6 @@ pub fn prompt_for_approval(
     Ok(result)
 }
 
-
 /// Flag indicating if an approval prompt is currently active and waiting for input.
 /// When true, the CLI main loop routes the next line of input to the approval prompt
 /// instead of treating it as a user message.

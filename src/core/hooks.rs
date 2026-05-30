@@ -435,18 +435,7 @@ impl HookManager {
         self.cancelled
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // Write input to stdin
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Failed to open stdin for hook process".to_string())?;
-        use std::io::Write;
-        stdin
-            .write_all(input_json.as_bytes())
-            .map_err(|e| format!("Failed to write hook input to stdin: {}", e))?;
-        drop(stdin);
-
-        // Read stdout and stderr before waiting (avoids pipe buffer deadlock)
+        // Spawn reader threads before writing stdin so pipes stay open if child exits quickly.
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
 
@@ -483,6 +472,17 @@ impl HookManager {
             }
             output
         });
+
+        // Write input to stdin (reader threads now hold stdout/stderr open)
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to open stdin for hook process".to_string())?;
+        use std::io::Write;
+        stdin
+            .write_all(input_json.as_bytes())
+            .map_err(|e| format!("Failed to write hook input to stdin: {}", e))?;
+        drop(stdin);
 
         // Wait with timeout and cancellation support
         let timeout = Duration::from_millis(self.timeout_ms);

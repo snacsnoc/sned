@@ -130,13 +130,12 @@ impl App {
 
     /// Render the application state to the frame.
     pub fn render(&mut self, frame: &mut Frame) {
-        let [output_area, status_area, input_area] =
-            Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-            ])
-            .areas(frame.area());
+        let [output_area, status_area, input_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .areas(frame.area());
 
         // Update input block with themed border and styled title
         let input_title = if self.agent_busy {
@@ -147,7 +146,8 @@ impl App {
         } else {
             Line::from(" Input ")
         };
-        self.input.set_block(theme::input_block(input_title, self.agent_busy));
+        self.input
+            .set_block(theme::input_block(input_title, self.agent_busy));
 
         // Output pane with themed border and padding
         let visible_height = output_area.height as usize;
@@ -169,8 +169,7 @@ impl App {
             .wrap(Wrap { trim: false })
             .scroll((scroll_y, 0))
             .block(
-                theme::border_block(" sned ")
-                    .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
+                theme::border_block(" sned ").padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
             );
         frame.render_widget(output, output_area);
 
@@ -206,7 +205,8 @@ impl App {
         };
         let spacer_len = status_area
             .width
-            .saturating_sub((status_left.len() + status_right.len()) as u16) as usize;
+            .saturating_sub((status_left.len() + status_right.len()) as u16)
+            as usize;
         let status_line = Line::from(vec![
             Span::styled(status_left, theme::status_style()),
             Span::raw(" ".repeat(spacer_len)),
@@ -257,8 +257,10 @@ impl App {
             })
             .collect();
 
-        let picker = Paragraph::new(rows)
-            .block(theme::overlay_block(format!(" Files ({}) ", self.picker_results.len())));
+        let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
+            " Files ({}) ",
+            self.picker_results.len()
+        )));
 
         frame.render_widget(Clear, overlay_area);
         frame.render_widget(picker, overlay_area);

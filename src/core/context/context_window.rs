@@ -171,7 +171,15 @@ pub fn calculate_context_usage_percentage(
 ) -> f64 {
     // OpenAI-compatible providers already include cache tokens in tokens_in
     // Gemini already subtracts cache reads from input_tokens
-    let no_cache_add = ["openai", "minimax", "deepseek", "groq", "xai", "openrouter", "gemini"];
+    let no_cache_add = [
+        "openai",
+        "minimax",
+        "deepseek",
+        "groq",
+        "xai",
+        "openrouter",
+        "gemini",
+    ];
     let cache_tokens = if no_cache_add.contains(&provider_name) {
         0
     } else {

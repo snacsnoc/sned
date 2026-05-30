@@ -559,7 +559,7 @@ mod tests {
     fn ensure_test_checkpoint_base_dir() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            let base_dir = PathBuf::from("/private/tmp/sned-checkpoints-tests");
+            let base_dir = PathBuf::from("/tmp/sned-checkpoints-tests");
             std::fs::create_dir_all(&base_dir).unwrap();
             // SAFETY: called once via Once; no concurrent env mutation possible
             unsafe { std::env::set_var("SNED_CHECKPOINTS_BASE_DIR", &base_dir) };
