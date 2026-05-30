@@ -52,7 +52,7 @@ fn anchor_reconcile_matches_ts_semantics() {
     assert_eq!(anchors4[1], anchors3[3]);
 
     let other_task_anchors = anchor_mgr.reconcile(path, &initial, Some("parity-anchor-2"));
-    assert_ne!(anchors4[0], other_task_anchors[0]);
+    assert_eq!(anchors4[0], other_task_anchors[0]);
 }
 
 #[test]

@@ -516,6 +516,7 @@ async fn process_openai_sse_line(
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
     model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
+    usage_sent: &mut bool,
 ) {
     let line = line.trim();
     if line.is_empty() || line == "data: [DONE]" {
@@ -673,6 +674,7 @@ async fn process_openai_sse_line(
         }
 
         if let Some(usage) = chunk.usage {
+            *usage_sent = true;
             // Calculate cache tokens and avoid double-counting in input_tokens
             let cached_tokens = usage
                 .prompt_tokens_details
@@ -746,6 +748,7 @@ pub async fn parse_openai_sse_to_chunks(
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
     model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
+    usage_sent: &mut bool,
 ) {
     for line in buffer.push_chunk(chunk) {
         process_openai_sse_line(
@@ -755,6 +758,7 @@ pub async fn parse_openai_sse_to_chunks(
             completed_tool_call_indices,
             last_stop_reason,
             model_info,
+            usage_sent,
         )
         .await;
     }
@@ -770,6 +774,7 @@ pub async fn finish_openai_sse_to_chunks(
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
     model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
+    usage_sent: &mut bool,
 ) {
     if let Some(line) = buffer.finish() {
         process_openai_sse_line(
@@ -779,6 +784,7 @@ pub async fn finish_openai_sse_to_chunks(
             completed_tool_call_indices,
             last_stop_reason,
             model_info,
+            usage_sent,
         )
         .await;
     }
@@ -812,6 +818,25 @@ pub async fn finish_openai_sse_to_chunks(
                 "tool_calls",
             );
         }
+    }
+
+    // Emit synthetic Usage chunk if no usage chunk was sent
+    if !*usage_sent {
+        try_send_chunk(
+            tx,
+            ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_write_tokens: Some(0),
+                cache_read_tokens: None,
+                reasoning_tokens: None,
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: last_stop_reason.clone(),
+                id: None,
+            }),
+            "usage",
+        );
     }
 }
 
@@ -894,6 +919,7 @@ impl Provider for OpenAiProvider {
             let mut completed_tool_call_indices: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             let mut last_stop_reason: Option<String> = None;
+            let mut usage_sent = false;
             let mut stream_errored = false;
 
             while let Some(result) = stream.next().await {
@@ -910,6 +936,7 @@ impl Provider for OpenAiProvider {
                             &mut completed_tool_call_indices,
                             &mut last_stop_reason,
                             &model_info,
+                            &mut usage_sent,
                         )
                         .await;
                     }
@@ -942,6 +969,7 @@ impl Provider for OpenAiProvider {
                     &mut completed_tool_call_indices,
                     &mut last_stop_reason,
                     &model_info,
+                    &mut usage_sent,
                 )
                 .await;
             }
@@ -1327,6 +1355,7 @@ mod tests {
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
         let model_info: Option<crate::providers::OpenAiCompatibleModelInfo> = None;
 
         process_openai_sse_line(
@@ -1336,6 +1365,7 @@ mod tests {
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
             &model_info,
+            &mut usage_sent,
         )
         .await;
 
@@ -1879,6 +1909,7 @@ data: [DONE]
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
         let model_info: Option<crate::providers::OpenAiCompatibleModelInfo> = None;
         parse_openai_sse_to_chunks(
             sse.as_bytes(),
@@ -1888,6 +1919,7 @@ data: [DONE]
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
             &model_info,
+            &mut usage_sent,
         )
         .await;
         finish_openai_sse_to_chunks(
@@ -1897,6 +1929,7 @@ data: [DONE]
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
             &model_info,
+            &mut usage_sent,
         )
         .await;
         drop(tx);
@@ -1922,6 +1955,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
 
         // Use model info with pricing
         let model_info = Some(crate::providers::OpenAiCompatibleModelInfo {
@@ -1962,6 +1996,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
             &model_info,
+            &mut usage_sent,
         )
         .await;
         finish_openai_sse_to_chunks(
@@ -1971,6 +2006,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
             &model_info,
+            &mut usage_sent,
         )
         .await;
         drop(tx);

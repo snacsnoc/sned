@@ -108,8 +108,9 @@ pub fn should_compact_context_window(
         api_req_info.cache_writes.unwrap_or(0) as u64 + api_req_info.cache_reads.unwrap_or(0) as u64
     };
 
-    // Only count input tokens - output tokens don't affect the next request size
-    let total_tokens = api_req_info.tokens_in.unwrap_or(0) as u64 + cache_tokens;
+    let total_tokens = api_req_info.tokens_in.unwrap_or(0) as u64
+        + api_req_info.tokens_out.unwrap_or(0) as u64
+        + cache_tokens;
 
     // Match TypeScript falsy behavior: 0 and 0.0 fall back to max_allowed_size
     let rounded_threshold = match threshold_percentage {
@@ -134,16 +135,15 @@ pub fn get_new_context_messages_and_metadata(
     let mut new_deleted_range = conversation_history_deleted_range;
 
     if let Some(info) = api_req_info {
-        // Only count input tokens (tokens_in) for truncation decision.
-        // Output tokens (tokens_out) are from previous responses and don't
-        // contribute to the current request size that validate_context_window checks.
         // Include cache tokens for Anthropic (tokens_in already includes cache for OpenAI/MiniMax)
         let cache_tokens = if provider_name == "openai" || provider_name == "minimax" {
             0
         } else {
             info.cache_writes.unwrap_or(0) as u64 + info.cache_reads.unwrap_or(0) as u64
         };
-        let total_tokens = (info.tokens_in.unwrap_or(0) as u64) + cache_tokens;
+        let total_tokens = (info.tokens_in.unwrap_or(0) as u64)
+            + (info.tokens_out.unwrap_or(0) as u64)
+            + cache_tokens;
 
         let threshold_pct = if use_auto_condense { 0.7 } else { 0.8 };
         let max_allowed_size = info
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_should_compact_provider_aware_cache_tokens() {
-        // tokens_in=140k + cache=30k = 170k for Anthropic (tokens_out no longer counted)
+        // tokens_in=140k + tokens_out=50k + cache=30k = 220k for Anthropic
         let info_with_cache = ApiReqInfo {
             tokens_in: Some(140_000),
             tokens_out: Some(50_000),
@@ -508,22 +508,22 @@ mod tests {
             should_compact_context_window(&info_with_cache, 200_000, 160_000, None, "anthropic");
         assert!(
             result_anthropic,
-            "Anthropic should count cache tokens (170k total >= 160k threshold)"
+            "Anthropic should count cache tokens (220k total >= 160k threshold)"
         );
 
-        // tokens_in=140k for OpenAI/MiniMax (cache not counted separately)
+        // tokens_in=140k + tokens_out=50k = 190k for OpenAI/MiniMax (cache included in tokens_in)
         let result_openai =
             should_compact_context_window(&info_with_cache, 200_000, 160_000, None, "openai");
         assert!(
-            !result_openai,
-            "OpenAI should NOT count cache tokens separately (140k total < 160k threshold)"
+            result_openai,
+            "OpenAI should count tokens_out (190k total >= 160k threshold, cache included in tokens_in)"
         );
 
         let result_minimax =
             should_compact_context_window(&info_with_cache, 200_000, 160_000, None, "minimax");
         assert!(
-            !result_minimax,
-            "MiniMax should NOT count cache tokens separately (140k total < 160k threshold)"
+            result_minimax,
+            "MiniMax should count tokens_out (190k total >= 160k threshold, cache included in tokens_in)"
         );
     }
 

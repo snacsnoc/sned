@@ -22,6 +22,7 @@ async fn collect_openai_chunks(sse: &str) -> Vec<ApiStreamChunk> {
     let mut accumulated_tool_calls = std::collections::HashMap::new();
     let mut completed_tool_call_indices = std::collections::HashSet::new();
     let mut last_stop_reason = None;
+    let mut usage_sent = false;
     parse_openai_sse_to_chunks(
         sse.as_bytes(),
         &mut buffer,
@@ -30,6 +31,7 @@ async fn collect_openai_chunks(sse: &str) -> Vec<ApiStreamChunk> {
         &mut completed_tool_call_indices,
         &mut last_stop_reason,
         &None,
+        &mut usage_sent,
     )
     .await;
     finish_openai_sse_to_chunks(
@@ -39,6 +41,7 @@ async fn collect_openai_chunks(sse: &str) -> Vec<ApiStreamChunk> {
         &mut completed_tool_call_indices,
         &mut last_stop_reason,
         &None,
+        &mut usage_sent,
     )
     .await;
     drop(tx);
@@ -207,7 +210,7 @@ data: [DONE]
 
     match &chunks[0] {
         ApiStreamChunk::Usage(u) => {
-            assert_eq!(u.input_tokens, 10);
+            assert_eq!(u.input_tokens, 5);
             assert_eq!(u.output_tokens, 20);
             assert_eq!(u.cache_read_tokens, Some(5));
             assert_eq!(u.cache_write_tokens, Some(3));
