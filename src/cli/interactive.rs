@@ -1228,8 +1228,145 @@ async fn handle_cli_only_command(
                 app.push_plain("Usage: /expand N");
             }
         }
+        CliOnlyCommand::Plan(_) | CliOnlyCommand::PlanApprove | CliOnlyCommand::PlanPause | CliOnlyCommand::PlanResume | CliOnlyCommand::PlanAbort => {
+            use crate::core::plan_state::{PlanStep, PlanStepStatus};
+            use crate::cli::slash_commands::PlanSubcommand;
+            let sess = session.lock().await;
+            let sh = sess.agent_loop().state_handle();
+            let mut state = sh.lock().await;
+            if let Some(plan) = &mut state.plan_state {
+                match cli_cmd {
+                    CliOnlyCommand::Plan(cmd) => match cmd {
+                        PlanSubcommand::Status => {
+                            if plan.steps.is_empty() {
+                                app.push_plain("No plan steps.");
+                            } else {
+                                for (i, step) in plan.steps.iter().enumerate() {
+                                    let status = match step.status {
+                                        PlanStepStatus::Pending => "○",
+                                        PlanStepStatus::Running => "→",
+                                        PlanStepStatus::Done => "✓",
+                                        PlanStepStatus::Failed => "✗",
+                                    };
+                                    app.push_plain(format!("  [{status}] {}. {}", i, step.description));
+                                }
+                            }
+                        }
+                        PlanSubcommand::Edit(step_idx, new_desc) => {
+                            if step_idx >= plan.steps.len() {
+                                app.push_plain(format!("Step index {} is out of range ({} steps).", step_idx, plan.steps.len()));
+                            } else if new_desc.trim().is_empty() {
+                                app.push_plain("Step description cannot be empty.");
+                            } else {
+                                plan.steps[step_idx].description = new_desc.trim().to_string();
+                                app.push_plain(format!("Step {} updated. ({} steps total).", step_idx, plan.steps.len()));
+                            }
+                        }
+                        PlanSubcommand::Add(after_idx, step_text) => {
+                            if step_text.trim().is_empty() {
+                                app.push_plain("Usage: /plan add \"step description\" [after N]");
+                            } else {
+                                let result = plan.insert_step_after(after_idx, step_text.trim().to_string());
+                                match result {
+                                    Ok(_idx) => {
+                                        if after_idx == 0 {
+                                            app.push_plain(format!("Step added ({} steps total).", plan.steps.len()));
+                                        } else {
+                                            app.push_plain(format!("Step added after step {}. ({} steps total).", after_idx, plan.steps.len()));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.push_plain(format!("Error adding step: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                        PlanSubcommand::Remove(step_idx) => {
+                            if step_idx >= plan.steps.len() {
+                                app.push_plain(format!("Step index {} is out of range ({} steps).", step_idx, plan.steps.len()));
+                            } else {
+                                plan.steps.remove(step_idx);
+                                app.push_plain(format!("Step {} removed. ({} steps remaining).", step_idx, plan.steps.len()));
+                            }
+                        }
+                        PlanSubcommand::Replace(plan_text) => {
+                            if plan_text.trim().is_empty() {
+                                app.push_plain("Plan text cannot be empty.");
+                            } else {
+                                let lines: Vec<&str> = plan_text.lines().collect();
+                                let new_steps: Vec<PlanStep> = lines.iter()
+                                    .filter(|line| !line.trim().is_empty())
+                                    .enumerate()
+                                    .map(|(i, line)| PlanStep {
+                                        index: i,
+                                        description: line.trim().to_string(),
+                                        status: PlanStepStatus::Pending,
+                                    })
+                                    .collect();
+                                if new_steps.is_empty() {
+                                    app.push_plain("No valid steps found in plan text.");
+                                } else {
+                                    plan.steps = new_steps;
+                                    plan.current_step_index = 0;
+                                    plan.approved = false;
+                                    app.push_plain(format!("Plan replaced ({} steps).", plan.steps.len()));
+                                }
+                            }
+                        }
+                    },
+                    CliOnlyCommand::PlanApprove => {
+                        if plan.approved {
+                            app.push_plain("Plan is already approved and running.");
+                        } else if plan.steps.is_empty() {
+                            app.push_plain("Cannot approve an empty plan.");
+                        } else {
+                            plan.approved = true;
+                            app.push_plain(format!(
+                                "Plan approved. Starting from step {}/{}: {}",
+                                plan.current_step_index,
+                                plan.steps.len(),
+                                plan.steps[plan.current_step_index].description
+                            ));
+                        }
+                    }
+                    CliOnlyCommand::PlanPause => {
+                        if plan.approved && plan.current_step_index < plan.steps.len() {
+                            app.push_plain("Plan paused. Use /plan resume to continue.");
+                        } else {
+                            app.push_plain("No active plan to pause.");
+                        }
+                    }
+                    CliOnlyCommand::PlanResume => {
+                        if plan.approved && plan.current_step_index < plan.steps.len() {
+                            app.push_plain(format!(
+                                "Resuming from step {}/{}: {}",
+                                plan.current_step_index,
+                                plan.steps.len(),
+                                plan.steps[plan.current_step_index].description
+                            ));
+                        } else if plan.approved {
+                            app.push_plain("Plan is already complete.");
+                        } else {
+                            app.push_plain("No active plan to resume.");
+                        }
+                    }
+                    CliOnlyCommand::PlanAbort => {
+                        if plan.steps.is_empty() || !plan.approved {
+                            app.push_plain("No active plan to abort.");
+                        } else {
+                            plan.approved = false;
+                            plan.current_step_index = plan.steps.len();
+                            app.push_plain("Plan aborted. Already-applied changes are kept.");
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                app.push_plain("No active plan.");
+            }
+        }
     }
-    Ok(false)
+Ok(false)
 }
 
 /// Main ratatui event loop.

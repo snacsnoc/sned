@@ -1,0 +1,583 @@
+//! Plan state for the interactive Plan -> Approve -> Act workflow.
+//!
+//! Tracks plan steps, approval status, execution progress, and pause/resume state.
+
+use std::fmt;
+
+/// Status of a single plan step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanStepStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+impl fmt::Display for PlanStepStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanStepStatus::Pending => write!(f, "pending"),
+            PlanStepStatus::Running => write!(f, "running"),
+            PlanStepStatus::Done => write!(f, "done"),
+            PlanStepStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// A single step in the plan.
+#[derive(Debug, Clone)]
+pub struct PlanStep {
+    pub index: usize,
+    pub description: String,
+    pub status: PlanStepStatus,
+}
+
+impl PlanStep {
+    pub fn status_icon(&self) -> &'static str {
+        match self.status {
+            PlanStepStatus::Pending => "○",
+            PlanStepStatus::Running => "→",
+            PlanStepStatus::Done => "✓",
+            PlanStepStatus::Failed => "✗",
+        }
+    }
+}
+
+/// State of the plan mode.
+#[derive(Debug, Clone)]
+pub struct PlanState {
+    /// The numbered plan steps.
+    pub steps: Vec<PlanStep>,
+    /// Index of the step currently being executed.
+    pub current_step_index: usize,
+    /// Whether the plan has been approved by the user.
+    pub approved: bool,
+    /// Whether the plan is paused.
+    pub paused: bool,
+    /// Whether the plan is complete.
+    pub complete: bool,
+}
+
+impl PlanState {
+    /// Create a new plan from step descriptions.
+    pub fn create_plan(step_descriptions: Vec<String>) -> Self {
+        let steps = step_descriptions
+            .into_iter()
+            .enumerate()
+            .map(|(i, desc)| PlanStep {
+                index: i,
+                description: desc,
+                status: PlanStepStatus::Pending,
+            })
+            .collect();
+
+        Self {
+            steps,
+            current_step_index: 0,
+            approved: false,
+            paused: false,
+            complete: false,
+        }
+    }
+
+    /// Update a step's description.
+    pub fn update_step(&mut self, index: usize, description: String) -> Result<(), String> {
+        let step = self
+            .steps
+            .get_mut(index)
+            .ok_or_else(|| format!("Step {} does not exist", index + 1))?;
+        step.description = description;
+        Ok(())
+    }
+
+    /// Insert a new step after the given index. Use index = usize::MAX to insert at the end.
+    pub fn insert_step_after(
+        &mut self,
+        after_index: usize,
+        description: String,
+    ) -> Result<(), String> {
+        let insert_pos = if after_index == usize::MAX {
+            self.steps.len()
+        } else {
+            after_index + 1
+        };
+        if insert_pos > self.steps.len() {
+            return Err(format!(
+                "Cannot insert after step {} (only {} steps)",
+                after_index + 1,
+                self.steps.len()
+            ));
+        }
+        self.steps.insert(
+            insert_pos,
+            PlanStep {
+                index: insert_pos,
+                description,
+                status: PlanStepStatus::Pending,
+            },
+        );
+        self.renumber();
+        Ok(())
+    }
+
+    /// Remove a step by index (0-based).
+    pub fn remove_step(&mut self, index: usize) -> Result<(), String> {
+        if index >= self.steps.len() {
+            return Err(format!("Step index {} out of range (0-{})", index, self.steps.len().saturating_sub(1)));
+        }
+        self.steps.remove(index);
+        self.renumber();
+        if self.current_step_index >= self.steps.len() && !self.steps.is_empty() {
+            self.current_step_index = self.steps.len() - 1;
+        }
+        Ok(())
+    }
+
+    /// Mark a step with a given status.
+    pub fn mark_step(&mut self, index: usize, status: PlanStepStatus) -> Result<(), String> {
+        let step = self
+            .steps
+            .get_mut(index)
+            .ok_or_else(|| format!("Step {} does not exist", index + 1))?;
+        step.status = status;
+        Ok(())
+    }
+
+    /// Get the current step.
+    pub fn current_step(&self) -> Option<&PlanStep> {
+        self.steps.get(self.current_step_index)
+    }
+
+    /// Advance to the next pending step. Returns the index of the new current step, or None if done.
+    pub fn advance(&mut self) -> Option<usize> {
+        if let Some(step) = self.steps.get_mut(self.current_step_index)
+            && step.status == PlanStepStatus::Running
+        {
+            step.status = PlanStepStatus::Done;
+        }
+
+        // Find next pending step
+        if let Some(next_idx) = self.steps.iter().position(|s| s.status == PlanStepStatus::Pending)
+        {
+            self.current_step_index = next_idx;
+            self.steps[next_idx].status = PlanStepStatus::Running;
+            Some(self.current_step_index)
+        } else {
+            self.complete = true;
+            None
+        }
+    }
+
+    /// Check if all steps are done.
+    pub fn is_complete(&self) -> bool {
+        !self.steps.is_empty() && self.steps.iter().all(|s| s.status == PlanStepStatus::Done)
+    }
+
+    /// Re-number all steps after insert/remove.
+    pub fn renumber(&mut self) {
+        for (i, step) in self.steps.iter_mut().enumerate() {
+            step.index = i;
+        }
+    }
+
+    /// Parse a plan response text into numbered step descriptions.
+    ///
+    /// Accepts formats:
+    /// - `1. First step`
+    /// - `1) First step`
+    /// - `- Step 1: First step`
+    pub fn parse_plan(text: &str) -> Option<Vec<String>> {
+        let mut steps = Vec::new();
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // Try "N. description" or "N) description"
+            if let Some(step) = parse_numbered_line(trimmed) {
+                steps.push(step);
+                continue;
+            }
+
+            // Try "- Step N: description" or "- description"
+            if let Some(step) = parse_bullet_line(trimmed) {
+                steps.push(step);
+            }
+        }
+
+        if steps.is_empty() {
+            None
+        } else {
+            Some(steps)
+        }
+    }
+
+    /// Format the plan state for model context injection.
+    pub fn format_state(&self) -> String {
+        let mut out = String::new();
+
+        out.push_str("Plan state:\n");
+        out.push_str(&format!("approved: {}\n", self.approved));
+        out.push_str(&format!("paused: {}\n", self.paused));
+        out.push_str(&format!("complete: {}\n", self.complete));
+        out.push_str(&format!(
+            "current_step_index: {}\n",
+            self.current_step_index
+        ));
+        out.push('\n');
+
+        out.push_str("Steps:\n");
+        for step in &self.steps {
+            out.push_str(&format!(
+                "{}. [{}] {}\n",
+                step.index + 1,
+                step.status,
+                step.description
+            ));
+        }
+
+        if let Some(current) = self.current_step() {
+            out.push_str(&format!(
+                "\nCurrent step:\n{}. {}\n",
+                current.index + 1,
+                current.description
+            ));
+        }
+
+        out
+    }
+
+    /// Format the plan for display in the TUI panel.
+    pub fn format_display(&self) -> String {
+        let mut out = String::new();
+
+        for step in &self.steps {
+            out.push_str(&format!(
+                "  {} {}. {}\n",
+                step.status_icon(),
+                step.index + 1,
+                step.description
+            ));
+        }
+
+        let done = self
+            .steps
+            .iter()
+            .filter(|s| s.status == PlanStepStatus::Done)
+            .count();
+        out.push_str(&format!(
+            "\n  Progress: {}/{} steps complete\n",
+            done,
+            self.steps.len()
+        ));
+
+        out
+    }
+
+    /// Get the status summary string for the status bar.
+    pub fn status_summary(&self) -> String {
+        let total = self.steps.len();
+        let current = self.current_step_index + 1;
+        let has_failed = self.steps.iter().any(|s| s.status == PlanStepStatus::Failed);
+        let complete = self.complete;
+        let paused = self.paused;
+        let approved = self.approved;
+
+        if complete {
+            format!("Plan: complete {}/{}", total, total)
+        } else if paused {
+            format!("Plan: paused at {}/{}", current, total)
+        } else if has_failed {
+            format!("Plan: failed at {}/{}", current, total)
+        } else if approved {
+            format!("Plan: {}/{} running", current, total)
+        } else {
+            "Plan: awaiting approval".to_string()
+        }
+    }
+}
+
+/// Parse a line like "1. description" or "1) description".
+fn parse_numbered_line(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+
+    // Skip leading digits
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+
+    if i == 0 || i >= bytes.len() {
+        return None;
+    }
+
+    // Must be followed by '.' or ')'
+    if bytes[i] != b'.' && bytes[i] != b')' {
+        return None;
+    }
+
+    i += 1;
+
+    // Must be followed by whitespace
+    if i >= bytes.len() || !bytes[i].is_ascii_whitespace() {
+        return None;
+    }
+
+    // Skip whitespace
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    let desc = line[i..].trim().to_string();
+    if desc.is_empty() {
+        return None;
+    }
+    Some(desc)
+}
+
+/// Parse a bullet line like "- description" or "- Step N: description".
+fn parse_bullet_line(line: &str) -> Option<String> {
+    if line.starts_with("- ") || line.starts_with("* ") {
+        let desc = line[2..].trim().to_string();
+        if !desc.is_empty() {
+            return Some(desc);
+        }
+    }
+    // Also handle "Step N: description" (no leading bullet)
+    if let Some(step) = parse_step_prefix_line(line) {
+        return Some(step);
+    }
+    None
+}
+
+/// Parse a line like "Step 1: description" or "Step 1. description".
+fn parse_step_prefix_line(line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    if !lower.starts_with("step ") {
+        return None;
+    }
+    let rest = &line[5..];
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    // Skip digits
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() {
+        return None;
+    }
+    // Must be followed by ':' or '.' or ')'
+    if bytes[i] != b':' && bytes[i] != b'.' && bytes[i] != b')' {
+        return None;
+    }
+    i += 1;
+    // Skip whitespace
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let desc = rest[i..].trim().to_string();
+    if desc.is_empty() {
+        return None;
+    }
+    Some(desc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_plan() {
+        let plan = PlanState::create_plan(vec![
+            "First step".to_string(),
+            "Second step".to_string(),
+            "Third step".to_string(),
+        ]);
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].description, "First step");
+        assert_eq!(plan.steps[1].description, "Second step");
+        assert_eq!(plan.steps[2].description, "Third step");
+        assert!(!plan.approved);
+        assert!(!plan.paused);
+        assert!(!plan.complete);
+    }
+
+    #[test]
+    fn test_update_step() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        plan.update_step(0, "Updated step one".to_string()).unwrap();
+        assert_eq!(plan.steps[0].description, "Updated step one");
+    }
+
+    #[test]
+    fn test_insert_step_after() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step three".to_string(),
+        ]);
+        plan.insert_step_after(0, "Step two".to_string()).unwrap();
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].description, "Step one");
+        assert_eq!(plan.steps[1].description, "Step two");
+        assert_eq!(plan.steps[2].description, "Step three");
+        // Check renumbering
+        assert_eq!(plan.steps[0].index, 0);
+        assert_eq!(plan.steps[1].index, 1);
+        assert_eq!(plan.steps[2].index, 2);
+    }
+
+    #[test]
+    fn test_insert_step_after_preserves_state() {
+        let mut plan = PlanState::create_plan(vec![
+            "First".to_string(),
+            "Second".to_string(),
+            "Third".to_string(),
+        ]);
+        assert!(plan.insert_step_after(0, "Inserted".to_string()).is_ok());
+        assert_eq!(plan.steps.len(), 4);
+        assert_eq!(plan.steps[1].description, "Inserted");
+        assert_eq!(plan.steps[1].index, 1);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Pending);
+        assert_eq!(plan.current_step_index, 0);
+    }
+
+    #[test]
+    fn test_insert_step_after_at_end() {
+        let mut plan = PlanState::create_plan(vec![
+            "First".to_string(),
+            "Second".to_string(),
+        ]);
+        assert!(plan.insert_step_after(usize::MAX, "Last".to_string()).is_ok());
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[2].description, "Last");
+        assert_eq!(plan.steps[2].index, 2);
+    }
+
+    #[test]
+    fn test_mark_step() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+    }
+
+    #[test]
+    fn test_advance() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+            "Step three".to_string(),
+        ]);
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+
+        let next_idx = plan.advance();
+        assert!(next_idx.is_some());
+        let idx = next_idx.unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(plan.steps[idx].description, "Step two");
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Done);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
+    }
+
+    #[test]
+    fn test_completion_detection() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        assert!(!plan.is_complete());
+
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.mark_step(1, PlanStepStatus::Done).unwrap();
+        assert!(plan.is_complete());
+    }
+
+    #[test]
+    fn test_parse_plan_dot_format() {
+        let text = "1. First step\n2. Second step\n3. Third step";
+        let steps = PlanState::parse_plan(text).unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], "First step");
+        assert_eq!(steps[1], "Second step");
+        assert_eq!(steps[2], "Third step");
+    }
+
+    #[test]
+    fn test_parse_plan_paren_format() {
+        let text = "1) First step\n2) Second step";
+        let steps = PlanState::parse_plan(text).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0], "First step");
+        assert_eq!(steps[1], "Second step");
+    }
+
+    #[test]
+    fn test_parse_plan_empty_returns_none() {
+        assert!(PlanState::parse_plan("").is_none());
+        assert!(PlanState::parse_plan("no numbers here").is_none());
+    }
+
+    #[test]
+    fn test_format_state() {
+        let plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        let state = plan.format_state();
+        assert!(state.contains("approved: false"));
+        assert!(state.contains("1. [pending] Step one"));
+        assert!(state.contains("2. [pending] Step two"));
+    }
+
+    #[test]
+    fn test_status_summary() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        assert_eq!(plan.status_summary(), "Plan: awaiting approval");
+
+        plan.approved = true;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        assert_eq!(plan.status_summary(), "Plan: 1/2 running");
+
+        plan.paused = true;
+        assert_eq!(plan.status_summary(), "Plan: paused at 1/2");
+
+        plan.paused = false;
+        plan.mark_step(0, PlanStepStatus::Failed).unwrap();
+        assert_eq!(plan.status_summary(), "Plan: failed at 1/2");
+
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.mark_step(1, PlanStepStatus::Done).unwrap();
+        plan.complete = true;
+        assert!(plan.is_complete());
+        assert_eq!(plan.status_summary(), "Plan: complete 2/2");
+    }
+
+    #[test]
+    fn test_parse_plan_step_prefix_format() {
+        let text = "Step 1: do this\nStep 2: do that";
+        let steps = PlanState::parse_plan(text).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0], "do this");
+        assert_eq!(steps[1], "do that");
+    }
+
+    #[test]
+    fn test_parse_plan_mixed_formats() {
+        let text = "1. First numbered step\n- A bullet step\nStep 3: A prefix step";
+        let steps = PlanState::parse_plan(text).unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], "First numbered step");
+        assert_eq!(steps[1], "A bullet step");
+        assert_eq!(steps[2], "A prefix step");
+    }
+}

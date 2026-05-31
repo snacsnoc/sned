@@ -514,6 +514,16 @@ impl AgentLoop {
         self.config.provider.as_ref()
     }
 
+    /// Get the current agent mode.
+    pub fn mode(&self) -> crate::core::agent_types::AgentMode {
+        self.config.mode
+    }
+
+    /// Set the agent mode (used for Plan -> Act transition after approval).
+    pub fn set_mode(&mut self, mode: crate::core::agent_types::AgentMode) {
+        self.config.mode = mode;
+    }
+
     /// Get the task ID.
     pub fn task_id(&self) -> &str {
         &self.config.task_id

@@ -255,6 +255,25 @@ pub enum CliOnlyCommand {
     Changes,
     HelpOption(String),
     Queue,
+    Plan(PlanSubcommand),
+    PlanApprove,
+    PlanPause,
+    PlanResume,
+    PlanAbort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanSubcommand {
+    /// Show current plan status
+    Status,
+    /// Edit a step: (step_number, new_description)
+    Edit(usize, String),
+    /// Add a step after: (after_step_number, description)
+    Add(usize, String),
+    /// Remove a step: (step_number)
+    Remove(usize),
+    /// Replace the entire plan: (full_plan_text)
+    Replace(String),
 }
 
 impl CliOnlyCommand {
@@ -281,6 +300,77 @@ impl CliOnlyCommand {
             "expand" => Some(CliOnlyCommand::Expand),
             "changes" => Some(CliOnlyCommand::Changes),
             "queue" => Some(CliOnlyCommand::Queue),
+            "plan" => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
+            "plan approve" => Some(CliOnlyCommand::PlanApprove),
+            "plan pause" => Some(CliOnlyCommand::PlanPause),
+            "plan resume" => Some(CliOnlyCommand::PlanResume),
+            "plan abort" => Some(CliOnlyCommand::PlanAbort),
+            _ => None,
+        }
+    }
+
+    /// Parse plan subcommands with arguments.
+    /// Called when the command is "plan" and there's additional text.
+    pub fn parse_plan_with_args(args: &str) -> Option<CliOnlyCommand> {
+        let args = args.trim();
+        if args.is_empty() {
+            return Some(CliOnlyCommand::Plan(PlanSubcommand::Status));
+        }
+
+        let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
+        match parts[0].to_lowercase().as_str() {
+            "approve" => Some(CliOnlyCommand::PlanApprove),
+            "pause" => Some(CliOnlyCommand::PlanPause),
+            "resume" => Some(CliOnlyCommand::PlanResume),
+            "abort" => Some(CliOnlyCommand::PlanAbort),
+            "edit" => {
+                if parts.len() >= 3 {
+                    if let Ok(step) = parts[1].parse::<usize>() {
+                        Some(CliOnlyCommand::Plan(PlanSubcommand::Edit(
+                            step,
+                            parts[2].to_string(),
+                        )))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            "add" => {
+                if parts.len() >= 3 {
+                    if let Ok(after_step) = parts[1].parse::<usize>() {
+                        Some(CliOnlyCommand::Plan(PlanSubcommand::Add(
+                            after_step,
+                            parts[2].to_string(),
+                        )))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            "remove" => {
+                if parts.len() >= 2 {
+                    if let Ok(step) = parts[1].parse::<usize>() {
+                        Some(CliOnlyCommand::Plan(PlanSubcommand::Remove(step)))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            "replace" => {
+                if parts.len() >= 2 {
+                    Some(CliOnlyCommand::Plan(PlanSubcommand::Replace(
+                        parts[1..].join(" "),
+                    )))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -322,6 +412,11 @@ impl CliOnlyCommand {
                 | CliOnlyCommand::Expand
                 | CliOnlyCommand::Changes
                 | CliOnlyCommand::Queue
+                | CliOnlyCommand::Plan(_)
+                | CliOnlyCommand::PlanApprove
+                | CliOnlyCommand::PlanPause
+                | CliOnlyCommand::PlanResume
+                | CliOnlyCommand::PlanAbort
         )
     }
 
@@ -336,6 +431,18 @@ impl CliOnlyCommand {
                 | CliOnlyCommand::CheckpointList
                 | CliOnlyCommand::CheckpointRestore
                 | CliOnlyCommand::CheckpointUndo
+        )
+    }
+
+    /// Returns true if this is a plan command.
+    pub fn is_plan_command(&self) -> bool {
+        matches!(
+            self,
+            CliOnlyCommand::Plan(_)
+                | CliOnlyCommand::PlanApprove
+                | CliOnlyCommand::PlanPause
+                | CliOnlyCommand::PlanResume
+                | CliOnlyCommand::PlanAbort
         )
     }
 }
@@ -481,6 +588,11 @@ pub fn is_compact_command(text: &str) -> bool {
 pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command {
+        // Special handling for /plan commands with subcommands
+        if cmd.command.eq_ignore_ascii_case("plan") {
+            return CliOnlyCommand::parse_plan_with_args(&result.processed_text);
+        }
+
         // Try the command with argument first (handles /help <command>, etc.)
         if !result.processed_text.is_empty()
             && let Some(parsed) =
@@ -766,6 +878,29 @@ pub fn format_help_text() -> String {
         style::DIM
     ));
     s.push_str(&format!("  {}{}{}  - {}Undo last turn using checkpoint (reverts files + trims history, alias: /checkpoint-undo) {}{}{}\n\n", style::CYAN, "/checkpoint undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
+
+    s.push_str(&format!(
+        "{}{}Plan Workflow:{}\n",
+        style::BOLD,
+        style::CYAN,
+        style::RESET
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}View the current plan status and steps{}\n",
+        style::CYAN,
+        "/plan",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Approve and begin execution of the current plan{}\n\n",
+        style::CYAN,
+        "/plan approve",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
 
     s.push_str(&format!(
         "{}{}Queue Management:{}\n",
@@ -1209,6 +1344,89 @@ Use when:
   - Checking queue order and count
 
 Note: Local commands (/help, /stats, etc.) execute immediately even when the agent is busy."#
+        }
+
+        "plan" => {
+            r#"Shows the current plan workflow state and steps.
+
+Use when:
+  - Checking plan progress
+  - Viewing current step status
+  - Reviewing planned actions
+
+Note: Plan state is stored in memory and not persisted to disk."#
+        }
+
+        "plan approve" => {
+            r#"Approves the current plan and begins step execution.
+
+Use when:
+  - You've reviewed the plan and want to start execution
+  - All steps look correct
+  - Ready to let the agent begin working
+
+Note: Plan steps are executed sequentially with batch approval."#
+        }
+
+        "plan pause" => {
+            r#"Pauses execution of the current plan.
+
+Use when:
+  - Need to review progress before continuing
+  - Want to edit remaining steps
+  - Need to take a break from plan execution"#
+        }
+
+        "plan resume" => {
+            r#"Resumes execution of a paused plan.
+
+Use when:
+  - Ready to continue plan execution
+  - After editing steps while paused"#
+        }
+
+        "plan abort" => {
+            r#"Aborts the current plan and clears plan state.
+
+Use when:
+  - Plan is no longer needed
+  - Want to start over with a new plan
+  - Plan has failed and you want to reset
+
+Note: Already-applied filesystem changes are kept."#
+        }
+
+        "plan edit" => {
+            r#"Edits a specific step in the plan.
+
+Usage:
+  /plan edit <step> <description>
+
+Use when:
+  - Need to correct a step before approval
+  - Want to refine a step while paused"#
+        }
+
+        "plan add" => {
+            r#"Adds a new step after a specified step.
+
+Usage:
+  /plan add <after_step> <description>
+
+Use when:
+  - Need to insert a missing step
+  - Want to break down a complex step"#
+        }
+
+        "plan remove" => {
+            r#"Removes a step from the plan.
+
+Usage:
+  /plan remove <step>
+
+Use when:
+  - A step is redundant
+  - Want to simplify the plan"#
         }
 
         _ => &format!(

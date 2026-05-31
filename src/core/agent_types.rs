@@ -132,6 +132,8 @@ pub struct TaskState {
     pub last_executed_command: Option<String>,
     /// Exact file paths that must be re-read before the next edit attempt.
     pub must_reread_before_edit: HashSet<String>,
+    /// Plan state for the interactive Plan -> Approve -> Act workflow.
+    pub plan_state: Option<crate::core::plan_state::PlanState>,
     /// Exact denied tool calls for the current recovery context.
     pub denied_tool_actions: Vec<DeniedToolAction>,
 }
@@ -188,6 +190,7 @@ impl Default for TaskState {
             session_file_changes: std::collections::HashMap::with_capacity(8),
             last_executed_command: None,
             must_reread_before_edit: HashSet::new(),
+            plan_state: None,
             denied_tool_actions: Vec::new(),
         }
     }

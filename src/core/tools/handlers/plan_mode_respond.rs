@@ -1,10 +1,11 @@
 //! Plan mode respond tool handler for sned CLI.
 //!
-//!
 //! Core behavior:
 //! - Validate response parameter
 //! - Print plan response to user
 //! - Return result indicating plan was received
+//! - Create PlanState when needs_more_exploration is false
+//! - Skip PlanState creation when needs_more_exploration is true
 
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
@@ -48,6 +49,31 @@ impl PlanModeRespondHandler {
             );
         }
 
+        // Parse plan text into step descriptions
+        let steps = crate::core::plan_state::PlanState::parse_plan(response);
+        let steps = steps.ok_or_else(|| {
+            ToolError::InvalidInput(
+                "Could not parse plan into numbered steps. Use format: 1. Step description".to_string(),
+            )
+        })?;
+
+        if steps.is_empty() {
+            return Err(ToolError::InvalidInput(
+                "Plan response contains no parseable steps".to_string(),
+            ));
+        }
+
+        // Accept plans with 1 or more steps
+
+        // Create PlanState with the parsed steps
+        let plan = crate::core::plan_state::PlanState::create_plan(steps);
+
+        // Store in TaskState
+        {
+            let mut state = ctx.state.lock().await;
+            state.plan_state = Some(plan);
+        }
+
         // Print plan response to user
         if ctx.json_output {
             tracing::info!(
@@ -62,7 +88,7 @@ impl PlanModeRespondHandler {
             use crate::cli::output::OutputEvent;
             use ratatui::style::{Color, Modifier, Style};
             ctx.output_writer.emit(OutputEvent::styled(
-                format!("\n{} {}\n{}\n", "📋", "Plan", response),
+                format!("\n{} {}\n{}\n", "Plan", "Generated Plan", response),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -142,10 +168,10 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = handler
-            .execute(&ctx, serde_json::json!({"response": "Step 1: do this"}))
+            .execute(&ctx, serde_json::json!({"response": "1. do this\n2. do that"}))
             .await;
         assert!(result.is_ok());
-        assert!(result.unwrap().contains("Step 1: do this"));
+        assert!(result.unwrap().contains("do this"));
     }
 
     #[tokio::test]

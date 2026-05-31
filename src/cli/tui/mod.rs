@@ -5,6 +5,7 @@
 pub mod ansi_converter;
 pub mod app;
 pub mod history;
+pub mod plan_panel;
 pub mod theme;
 
 pub use ansi_converter::ansi_to_ratatui_lines;

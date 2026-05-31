@@ -79,6 +79,8 @@ pub struct App {
     pub pending_clear: Option<String>,
     /// Saved draft input before history navigation
     pub history_draft: Option<String>,
+    /// Cached plan state for TUI rendering (updated from interactive loop)
+    pub plan_state_cache: Option<crate::core::plan_state::PlanState>,
 }
 
 impl App {
@@ -116,6 +118,7 @@ impl App {
             last_content_height: 0,
             pending_clear: None,
             history_draft: None,
+            plan_state_cache: None,
         }
     }
 
@@ -163,13 +166,94 @@ impl App {
 
     /// Render the application state to the frame.
     pub fn render(&mut self, frame: &mut Frame) {
-        let [output_area, status_area, input_area] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ])
-        .areas(frame.area());
+        let has_plan = self.plan_state_cache.is_some();
 
+        if has_plan {
+            // Layout with plan panel on the right
+            let [main_area, plan_area] = Layout::horizontal([
+                Constraint::Min(40),
+                Constraint::Length(35),
+            ])
+            .areas(frame.area());
+
+            let [output_area, status_area, input_area] = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .areas(main_area);
+
+            self.render_output(frame, output_area);
+            self.render_status_bar(frame, status_area);
+            self.render_input(frame, input_area);
+            self.render_plan_panel(frame, plan_area);
+        } else {
+            let [output_area, status_area, input_area] = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .areas(frame.area());
+
+            self.render_output(frame, output_area);
+            self.render_status_bar(frame, status_area);
+            self.render_input(frame, input_area);
+        }
+    }
+
+    fn render_plan_panel(&self, frame: &mut Frame, area: Rect) {
+        if let Some(ref plan) = self.plan_state_cache {
+            super::plan_panel::render_plan_panel(plan, frame, area);
+        }
+    }
+
+    fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
+        // Update input block with themed border and styled title
+        let input_title = if self.agent_busy {
+            Line::from(vec![
+                Span::styled(self.spinner_char().to_string(), theme::spinner_style()),
+                Span::raw(" Working "),
+            ])
+        } else {
+            Line::from(" Input ")
+        };
+        self.input
+            .set_block(theme::input_block(input_title, self.agent_busy));
+
+        // Update placeholder text based on agent state
+        if self.agent_busy {
+            self.input.set_placeholder_text("⟳ Agent working...");
+        } else {
+            self.input.set_placeholder_text("❯ ");
+        }
+
+        frame.render_widget(&self.input, input_area);
+    }
+
+    fn render_status_bar(&self, frame: &mut Frame, status_area: Rect) {
+        let status_left = format!(
+            " {} / {} | {} | {} ",
+            self.provider_name, self.model_name, self.task_id, self.mode
+        );
+        let status_right = if let Some(elapsed) = self.elapsed {
+            format!("⏱ {} ", format_duration(elapsed))
+        } else {
+            String::new()
+        };
+        let spacer_len = status_area
+            .width
+            .saturating_sub((status_left.len() + status_right.len()) as u16)
+            as usize;
+        let status_line = Line::from(vec![
+            Span::styled(status_left, theme::status_style()),
+            Span::raw(" ".repeat(spacer_len)),
+            Span::styled(status_right, theme::status_style()),
+        ]);
+        let status = Paragraph::new(status_line);
+        frame.render_widget(status, status_area);
+    }
+
+    fn render_output(&mut self, frame: &mut Frame, output_area: Rect) {
         // Update input block with themed border and styled title
         let input_title = if self.agent_busy {
             Line::from(vec![
@@ -215,25 +299,6 @@ impl App {
         let buffer_size = content_height * buffer_multiplier;
         let start = scroll_y as usize;
         let end = (start + buffer_size).min(total_lines);
-
-        // Update input block with themed border and styled title
-        let input_title = if self.agent_busy {
-            Line::from(vec![
-                Span::styled(self.spinner_char().to_string(), theme::spinner_style()),
-                Span::raw(" Working "),
-            ])
-        } else {
-            Line::from(" Input ")
-        };
-        self.input
-            .set_block(theme::input_block(input_title, self.agent_busy));
-
-        // Update placeholder text based on agent state
-        if self.agent_busy {
-            self.input.set_placeholder_text("⟳ Agent working...");
-        } else {
-            self.input.set_placeholder_text("❯ ");
-        }
 
         // Output pane with visible lines only (virtual scrolling)
         {
@@ -287,39 +352,10 @@ impl App {
             }),
             &mut self.scrollbar_state,
         );
-
-        // Status bar
-        let status_left = format!(
-            " {} / {} | {} | {} ",
-            self.provider_name, self.model_name, self.task_id, self.mode
-        );
-        let status_right = if let Some(elapsed) = self.elapsed {
-            format!("⏱ {} ", format_duration(elapsed))
-        } else {
-            String::new()
-        };
-        let spacer_len = status_area
-            .width
-            .saturating_sub((status_left.len() + status_right.len()) as u16)
-            as usize;
-        let status_line = Line::from(vec![
-            Span::styled(status_left, theme::status_style()),
-            Span::raw(" ".repeat(spacer_len)),
-            Span::styled(status_right, theme::status_style()),
-        ]);
-        let status = Paragraph::new(status_line);
-        frame.render_widget(status, status_area);
-
-        // Input pane
-        frame.render_widget(&self.input, input_area);
-
-        // File picker overlay (when active)
-        if self.picker_active && !self.picker_results.is_empty() {
-            self.render_picker_overlay(frame, output_area);
-        }
     }
 
     /// Render file picker overlay as a floating Table widget.
+    #[allow(dead_code)]
     fn render_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
         let max_height = 10.min(self.picker_results.len() as u16);
         let width = 50.min(output_area.width);
