@@ -57,12 +57,6 @@ impl PlanModeRespondHandler {
             )
         })?;
 
-        if steps.is_empty() {
-            return Err(ToolError::InvalidInput(
-                "Plan response contains no parseable steps".to_string(),
-            ));
-        }
-
         if steps.len() < 2 {
             return Err(ToolError::InvalidInput(
                 "Plan must have at least 2 steps".to_string(),

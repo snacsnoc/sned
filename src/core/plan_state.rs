@@ -129,6 +129,30 @@ impl PlanState {
         Ok(())
     }
 
+    /// Insert a new step at the beginning of the plan.
+    pub fn insert_step_at_beginning(&mut self, description: String) -> Result<(), String> {
+        let old_len = self.steps.len();
+        let old_current_step_index = self.current_step_index;
+
+        self.steps.insert(
+            0,
+            PlanStep {
+                index: 0,
+                description,
+                status: PlanStepStatus::Pending,
+            },
+        );
+        self.renumber();
+
+        if old_len == 0 || old_current_step_index >= old_len {
+            self.current_step_index = 0;
+        } else {
+            self.current_step_index = old_current_step_index + 1;
+        }
+
+        Ok(())
+    }
+
     /// Remove a step by index (0-based).
     pub fn remove_step(&mut self, index: usize) -> Result<(), String> {
         let old_len = self.steps.len();
@@ -172,7 +196,9 @@ impl PlanState {
     pub fn advance(&mut self) -> Option<usize> {
         // Bounds check: if current_step_index is out of range, treat as complete
         if self.current_step_index >= self.steps.len() {
-            self.complete = true;
+            if self.is_complete() {
+                self.complete = true;
+            }
             return None;
         }
 
@@ -1043,6 +1069,22 @@ mod tests {
         let mut plan = PlanState::create_plan(vec!["Step 1".to_string()]);
         plan.current_step_index = 99; // Out of bounds
         assert!(plan.advance().is_none());
-        assert!(plan.complete); // Flag is set even though is_complete() may be false
+        assert!(!plan.complete);
+    }
+
+    #[test]
+    fn test_insert_step_at_beginning() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+        ]);
+        plan.current_step_index = 1;
+        plan.insert_step_at_beginning("Inserted first".to_string()).unwrap();
+
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].description, "Inserted first");
+        assert_eq!(plan.steps[1].description, "Step 1");
+        assert_eq!(plan.steps[2].description, "Step 2");
+        assert_eq!(plan.current_step_index, 2);
     }
 }

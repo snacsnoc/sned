@@ -1379,26 +1379,30 @@ async fn handle_cli_only_command(
                                 } else if step_text.trim().is_empty() {
                                     app.push_plain("Usage: /plan add <after_step> <description>");
                                 } else {
-                                    let after_idx = if after_step == 0 {
-                                        usize::MAX
+                                    if after_step == 0 {
+                                        match plan.insert_step_at_beginning(step_text.trim().to_string()) {
+                                            Ok(()) => {
+                                                app.push_plain(format!(
+                                                    "Step added at the beginning. ({} steps total).",
+                                                    plan.steps.len()
+                                                ));
+                                            }
+                                            Err(e) => app.push_plain(format!("Error: {}", e)),
+                                        }
                                     } else {
-                                        after_step - 1
-                                    };
-                                    match plan
-                                        .insert_step_after(after_idx, step_text.trim().to_string())
-                                    {
-                                        Ok(()) => {
-                                            if after_step == 0 {
-                                                app.push_plain(format!("Step added at the beginning. ({} steps total).", plan.steps.len()));
-                                            } else {
+                                        let after_idx = after_step - 1;
+                                        match plan
+                                            .insert_step_after(after_idx, step_text.trim().to_string())
+                                        {
+                                            Ok(()) => {
                                                 app.push_plain(format!(
                                                     "Step added after step {}. ({} steps total).",
                                                     after_step,
                                                     plan.steps.len()
                                                 ));
                                             }
+                                            Err(e) => app.push_plain(format!("Error: {}", e)),
                                         }
-                                        Err(e) => app.push_plain(format!("Error: {}", e)),
                                     }
                                 }
                             }
@@ -1429,14 +1433,17 @@ async fn handle_cli_only_command(
                                     let parsed =
                                         crate::core::plan_state::PlanState::parse_plan(&plan_text);
                                     match parsed {
-                                    Some(steps) if steps.len() >= 2 => {
-                                        let new_plan = crate::core::plan_state::PlanState::create_plan(steps);
-                                        *plan = new_plan;
-                                        app.push_plain(format!("Plan replaced ({} steps).", plan.steps.len()));
+                                        Some(steps) if !steps.is_empty() => {
+                                            let new_plan = crate::core::plan_state::PlanState::create_plan(steps);
+                                            *plan = new_plan;
+                                            app.push_plain(format!(
+                                                "Plan replaced ({} steps).",
+                                                plan.steps.len()
+                                            ));
+                                        }
+                                        Some(_) => app.push_plain("Plan must have at least 1 step."),
+                                        None => app.push_plain("Could not parse plan text. Use numbered format: 1. Step description"),
                                     }
-                                    Some(_) => app.push_plain("Plan must have at least 2 steps."),
-                                    None => app.push_plain("Could not parse plan text. Use numbered format: 1. Step description"),
-                                }
                                 }
                             }
                             _ => unreachable!(
@@ -1462,9 +1469,22 @@ async fn handle_cli_only_command(
                                 })
                             };
                             let Some(start_index) = start_index else {
-                                app.push_plain(
-                                    "No pending step to approve. All steps are complete.",
-                                );
+                                if plan.is_complete() {
+                                    plan.complete = true;
+                                    app.push_plain("All steps are complete.");
+                                } else if plan.steps.iter().all(|s| {
+                                    s.status == crate::core::plan_state::PlanStepStatus::Failed
+                                }) {
+                                    app.push_plain("No pending step to approve. All steps failed.");
+                                } else if plan.steps.iter().any(|s| {
+                                    s.status == crate::core::plan_state::PlanStepStatus::Failed
+                                }) {
+                                    app.push_plain(
+                                        "No pending step to approve. Plan contains failed steps.",
+                                    );
+                                } else {
+                                    app.push_plain("No pending step to approve.");
+                                }
                                 return Ok(false);
                             };
                             plan.current_step_index = start_index;
@@ -1523,16 +1543,24 @@ async fn handle_cli_only_command(
                         } else if plan.complete {
                             app.push_plain("Plan is already complete.");
                         } else {
+                            let Some(current_step) = plan.steps.get(plan.current_step_index) else {
+                                app.push_plain(format!(
+                                    "Cannot resume plan: current step {} is out of range (1-{}).",
+                                    plan.current_step_index + 1,
+                                    plan.steps.len()
+                                ));
+                                return Ok(false);
+                            };
+                            let current_step_failed = current_step.status
+                                == crate::core::plan_state::PlanStepStatus::Failed;
+                            let step_desc = current_step.description.clone();
+                            let step_num = plan.current_step_index + 1;
+                            let step_total = plan.steps.len();
                             plan.paused = false;
-                            if plan.steps.get(plan.current_step_index).is_some_and(|s| {
-                                s.status == crate::core::plan_state::PlanStepStatus::Failed
-                            }) {
+                            if current_step_failed {
                                 plan.steps[plan.current_step_index].status =
                                     crate::core::plan_state::PlanStepStatus::Running;
                             }
-                            let step_num = plan.current_step_index + 1;
-                            let step_total = plan.steps.len();
-                            let step_desc = plan.steps[plan.current_step_index].description.clone();
                             drop(state);
                             drop(sess);
                             app.push_plain(format!(
