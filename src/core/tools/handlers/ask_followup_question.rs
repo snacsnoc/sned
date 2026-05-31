@@ -50,18 +50,20 @@ impl AskFollowupQuestionHandler {
             crate::core::approval::set_followup_question_active(&task_id, true);
             crate::core::approval::set_followup_sender(&task_id, sender);
 
-            // Wrap blocking recv() in spawn_blocking to avoid blocking tokio worker thread
-            let response_result = tokio::task::spawn_blocking(move || receiver.recv()).await;
+            // Use recv_timeout to avoid blocking the TUI event loop indefinitely.
+            // Same pattern as /undo, /commit, /checkpoint-restore followup prompts.
+            let response_result = tokio::task::spawn_blocking(move || {
+                receiver.recv_timeout(std::time::Duration::from_secs(30))
+            })
+            .await;
 
-            // Clean up regardless of result
+            // Clean up followup state regardless of outcome
             crate::core::approval::clear_followup_sender(&task_id);
             crate::core::approval::set_followup_question_active(&task_id, false);
 
             let response = match response_result {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) | Err(_) => {
-                    crate::core::approval::clear_followup_sender(&task_id);
-                    crate::core::approval::set_followup_question_active(&task_id, false);
                     return Ok("User provided no response.".to_string());
                 }
             };

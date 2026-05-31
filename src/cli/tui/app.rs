@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 
 use crate::cli::colors::spinner_frame;
+use crate::cli::output::{OutputEvent, OutputWriterArc};
 
 /// Tracks a pasted chunk of text that was folded into a marker.
 #[derive(Debug, Clone)]
@@ -92,6 +93,19 @@ impl App {
         input
     }
 
+    /// Update the textarea placeholder based on current mode.
+    pub fn update_placeholder(&mut self) {
+        if self.agent_busy {
+            self.input.set_placeholder_text("⟳ Agent working...");
+        } else if self.mode == "PLAN" {
+            self.input.set_placeholder_text("❯ [PLAN] ");
+        } else if self.mode == "ACT" {
+            self.input.set_placeholder_text("❯ [ACT] ");
+        } else {
+            self.input.set_placeholder_text("❯ ");
+        }
+    }
+
     /// Create a new App instance.
     pub fn new() -> Self {
         Self {
@@ -151,16 +165,14 @@ impl App {
     }
 
     /// Push a user message with proper formatting (splits on newlines).
-    pub fn push_user_message(&mut self, text: &str) {
+    pub fn push_user_message(&mut self, text: &str, writer: &OutputWriterArc) {
         let style = Style::default()
             .fg(theme::PROMPT_FG)
             .add_modifier(Modifier::BOLD);
         for (i, line) in text.split('\n').enumerate() {
-            if i == 0 {
-                self.push_styled(format!("❯ {}", line), style);
-            } else {
-                self.push_styled(format!("  {}", line), style);
-            }
+            let prefix = if i == 0 { "❯ " } else { "  " };
+            let content = format!("{}{}", prefix, line);
+            writer.emit(OutputEvent::styled(content, style));
         }
     }
 
@@ -220,12 +232,7 @@ impl App {
         self.input
             .set_block(theme::input_block(input_title, self.agent_busy));
 
-        // Update placeholder text based on agent state
-        if self.agent_busy {
-            self.input.set_placeholder_text("⟳ Agent working...");
-        } else {
-            self.input.set_placeholder_text("❯ ");
-        }
+        self.update_placeholder();
 
         frame.render_widget(&self.input, input_area);
     }
@@ -254,24 +261,7 @@ impl App {
     }
 
     fn render_output(&mut self, frame: &mut Frame, output_area: Rect) {
-        // Update input block with themed border and styled title
-        let input_title = if self.agent_busy {
-            Line::from(vec![
-                Span::styled(self.spinner_char().to_string(), theme::spinner_style()),
-                Span::raw(" Working "),
-            ])
-        } else {
-            Line::from(" Input ")
-        };
-        self.input
-            .set_block(theme::input_block(input_title, self.agent_busy));
-
-        // Update placeholder text based on agent state
-        if self.agent_busy {
-            self.input.set_placeholder_text("⟳ Agent working...");
-        } else {
-            self.input.set_placeholder_text("❯ ");
-        }
+        self.update_placeholder();
 
         // Output pane with themed border and padding
         let visible_height = output_area.height as usize;

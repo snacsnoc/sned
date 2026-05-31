@@ -295,16 +295,12 @@ pub fn parse_plan_subcommand(args: &str) -> Option<PlanSubcommand> {
         "abort" => Some(PlanSubcommand::Abort),
         "edit" if parts.len() >= 3 => {
             parts[1].parse::<usize>().ok()
-                .and_then(|step| {
-                    Some(PlanSubcommand::Edit(step, parts[2].to_string()))
-                })
+                .map(|step| PlanSubcommand::Edit(step, parts[2].to_string()))
         }
         "edit" => None,
         "add" if parts.len() >= 3 => {
             parts[1].parse::<usize>().ok()
-                .and_then(|after_step| {
-                    Some(PlanSubcommand::Add(after_step, parts[2].to_string()))
-                })
+                .map(|after_step| PlanSubcommand::Add(after_step, parts[2].to_string()))
         }
         "add" => None,
         "remove" if parts.len() >= 2 => {

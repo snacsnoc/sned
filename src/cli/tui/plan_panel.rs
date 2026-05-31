@@ -12,7 +12,7 @@ use super::theme;
 
 /// Render the plan panel within the given area.
 pub fn render_plan_panel(plan: &PlanState, frame: &mut Frame, area: Rect) {
-    let lines = build_plan_lines(plan);
+    let lines = build_plan_lines(plan, area);
 
     let block = Block::default()
         .borders(ratatui::widgets::Borders::ALL)
@@ -28,7 +28,7 @@ pub fn render_plan_panel(plan: &PlanState, frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn build_plan_lines(plan: &PlanState) -> Vec<Line<'static>> {
+fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     // Status line
@@ -54,7 +54,9 @@ fn build_plan_lines(plan: &PlanState) -> Vec<Line<'static>> {
     let done_count = plan.steps.iter().filter(|s| s.status == PlanStepStatus::Done).count();
     let total = plan.steps.len();
     let progress_pct = if total > 0 { (done_count as f64 / total as f64) * 100.0 } else { 0.0 };
-    let bar_width: usize = 20;
+    let text_overhead = 25; // "[{}] {:.0}% ({}/{})"
+    let available = area.width as i32 - 2 - text_overhead as i32; // 2 for block padding
+    let bar_width = if available > 0 { available as usize } else { 20 };
     let filled = (progress_pct / 100.0 * bar_width as f64) as usize;
     let bar_str: String = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
     lines.push(Line::from(Span::styled(

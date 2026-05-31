@@ -153,6 +153,12 @@ impl PlanState {
     /// NOTE: Returns `usize` instead of `&PlanStep` to avoid reference-escaping-the-mutex issues
     /// when called through `Arc<Mutex<Session>>`. This is a deliberate Rust-native adaptation.
     pub fn advance(&mut self) -> Option<usize> {
+        // Bounds check: if current_step_index is out of range, treat as complete
+        if self.current_step_index >= self.steps.len() {
+            self.complete = true;
+            return None;
+        }
+
         if let Some(step) = self.steps.get_mut(self.current_step_index)
             && step.status == PlanStepStatus::Running
         {
@@ -973,5 +979,13 @@ mod tests {
         let steps = PlanState::parse_plan(text).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0], "Only one step");
+    }
+
+    #[test]
+    fn test_advance_handles_out_of_bounds_index() {
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string()]);
+        plan.current_step_index = 99; // Out of bounds
+        assert!(plan.advance().is_none());
+        assert!(plan.complete); // Flag is set even though is_complete() may be false
     }
 }
