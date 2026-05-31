@@ -228,8 +228,11 @@ impl PlanState {
     pub fn format_state(&self) -> String {
         let mut out = String::new();
 
+        let has_failed = self.steps.iter().any(|s| s.status == PlanStepStatus::Failed);
         let mode_label = if self.complete {
             "COMPLETE"
+        } else if has_failed {
+            "FAILED"
         } else if self.paused {
             "PAUSED"
         } else if self.approved {
@@ -787,6 +790,66 @@ mod tests {
         plan.approved = false;
         assert!(!plan.approved);
         assert_eq!(plan.current_step_index, 2);
+    }
+
+    #[test]
+    fn test_format_state_approval_mode() {
+        let plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        let state = plan.format_state();
+        assert!(state.contains("mode: APPROVAL"));
+        assert!(state.contains("approved: false"));
+    }
+
+    #[test]
+    fn test_format_state_failed_mode() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        plan.approved = true;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        plan.mark_step(0, PlanStepStatus::Failed).unwrap();
+        let state = plan.format_state();
+        assert!(state.contains("mode: FAILED"));
+    }
+
+    #[test]
+    fn test_format_state_paused_mode() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        plan.approved = true;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        plan.paused = true;
+        let state = plan.format_state();
+        assert!(state.contains("mode: PAUSED"));
+    }
+
+    #[test]
+    fn test_format_state_act_mode() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        plan.approved = true;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        let state = plan.format_state();
+        assert!(state.contains("mode: ACT"));
+    }
+
+    #[test]
+    fn test_format_state_complete_mode() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step one".to_string(),
+            "Step two".to_string(),
+        ]);
+        plan.complete = true;
+        let state = plan.format_state();
+        assert!(state.contains("mode: COMPLETE"));
     }
 
     #[test]

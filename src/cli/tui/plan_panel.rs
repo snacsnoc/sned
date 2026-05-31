@@ -32,8 +32,11 @@ fn build_plan_lines(plan: &PlanState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     // Status line
+    let has_failed = plan.steps.iter().any(|s| s.status == PlanStepStatus::Failed);
     let status = if plan.complete {
         "complete".to_string()
+    } else if has_failed {
+        "failed".to_string()
     } else if plan.paused {
         "paused".to_string()
     } else if plan.approved {
