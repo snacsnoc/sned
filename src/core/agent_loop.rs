@@ -2788,9 +2788,10 @@ impl AgentLoop {
                             if *current_status != PlanStepStatus::Failed {
                                 plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
                                     .ok();
+                                plan.paused = true;
                                 tracing::info!(
                                     step_index = plan.current_step_index,
-                                    "Plan step failed. Execution stopped. User action required."
+                                    "Plan step failed. Execution paused. User action required."
                                 );
                                 if !self.config.json_output {
                                     step_fail_msg = Some(format!(
@@ -2841,6 +2842,9 @@ impl AgentLoop {
                             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         ));
                     }
+                    if plan_completed {
+                        self.set_mode(AgentMode::Act);
+                    }
                 }
             } else {
                 // No tools were called (text-only response) - reset consecutive mistakes
@@ -2857,9 +2861,10 @@ impl AgentLoop {
                         if *current_status != PlanStepStatus::Failed {
                             plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
                                 .ok();
+                            plan.paused = true;
                             tracing::info!(
                                 step_index = plan.current_step_index,
-                                "Plan step failed (no tool calls). Execution stopped."
+                                "Plan step failed (no tool calls). Execution paused."
                             );
                             if !self.config.json_output {
                                 step_fail_msg = Some(format!(

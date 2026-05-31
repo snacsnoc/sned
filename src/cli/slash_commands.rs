@@ -2250,4 +2250,137 @@ mod tests {
         assert!(text.contains("/checkpoint restore"));
         assert!(text.contains("/checkpoint undo"));
     }
+
+    // --- Plan Mode Tests ---
+
+    #[test]
+    fn test_parse_plan_subcommand_approve() {
+        let parsed = parse_plan_subcommand("approve");
+        assert!(parsed.is_some());
+        assert!(matches!(parsed.unwrap(), PlanSubcommand::Approve));
+    }
+
+    #[test]
+    fn test_parse_plan_subcommand_pause() {
+        let parsed = parse_plan_subcommand("pause");
+        assert!(parsed.is_some());
+        assert!(matches!(parsed.unwrap(), PlanSubcommand::Pause));
+    }
+
+    #[test]
+    fn test_parse_plan_subcommand_resume() {
+        let parsed = parse_plan_subcommand("resume");
+        assert!(parsed.is_some());
+        assert!(matches!(parsed.unwrap(), PlanSubcommand::Resume));
+    }
+
+    #[test]
+    fn test_parse_plan_subcommand_abort() {
+        let parsed = parse_plan_subcommand("abort");
+        assert!(parsed.is_some());
+        assert!(matches!(parsed.unwrap(), PlanSubcommand::Abort));
+    }
+
+    #[test]
+    fn test_parse_plan_subcommand_edit() {
+        let parsed = parse_plan_subcommand("edit 2 new description");
+        assert!(parsed.is_some());
+        let sub = parsed.unwrap();
+        assert!(matches!(sub, PlanSubcommand::Edit(2, ref d) if d == "new description"));
+    }
+
+    #[test]
+    fn test_parse_plan_subcommand_add() {
+        let parsed = parse_plan_subcommand("add 0 new step");
+        assert!(parsed.is_some());
+        let sub = parsed.unwrap();
+        assert!(matches!(sub, PlanSubcommand::Add(0, ref d) if d == "new step"));
+    }
+
+    #[test]
+    fn test_parse_plan_subcommand_remove() {
+        let parsed = parse_plan_subcommand("remove 1");
+        assert!(parsed.is_some());
+        let sub = parsed.unwrap();
+        assert!(matches!(sub, PlanSubcommand::Remove(1)));
+    }
+
+    #[test]
+    fn test_parse_plan_subcommand_replace() {
+        let parsed = parse_plan_subcommand("replace 1. step one\n2. step two");
+        assert!(parsed.is_some());
+        let sub = parsed.unwrap();
+        let expected_text = "1. step one\n2. step two";
+        assert!(matches!(sub, PlanSubcommand::Replace(ref t) if t == expected_text));
+    }
+
+    #[test]
+    fn test_parse_plan_subcommand_unknown() {
+        let parsed = parse_plan_subcommand("unknown");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_prompt() {
+        let result = get_cli_only_command("/plan describe the project");
+        assert!(result.is_some());
+        let cmd = result.unwrap();
+        assert!(matches!(cmd, CliOnlyCommand::PlanPrompt(ref x) if x == "describe the project"));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_approve() {
+        let result = get_cli_only_command("/plan approve");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::PlanApprove));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_pause() {
+        let result = get_cli_only_command("/plan pause");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::PlanPause));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_resume() {
+        let result = get_cli_only_command("/plan resume");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::PlanResume));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_abort() {
+        let result = get_cli_only_command("/plan abort");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::PlanAbort));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_edit() {
+        let result = get_cli_only_command("/plan edit 1 new description");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::Plan(_)));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_add() {
+        let result = get_cli_only_command("/plan add 0 new step");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::Plan(_)));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_remove() {
+        let result = get_cli_only_command("/plan remove 1");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::Plan(_)));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_replace() {
+        let result = get_cli_only_command("/plan replace 1. step one\n2. step two");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::Plan(_)));
+    }
 }

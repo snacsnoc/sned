@@ -580,4 +580,226 @@ mod tests {
         assert_eq!(steps[1], "A bullet step");
         assert_eq!(steps[2], "A prefix step");
     }
+
+    #[test]
+    fn test_remove_step() {
+        let mut plan = PlanState::create_plan(vec![
+            "First".to_string(),
+            "Second".to_string(),
+            "Third".to_string(),
+        ]);
+        plan.current_step_index = 1;
+        plan.remove_step(1).unwrap();
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].description, "First");
+        assert_eq!(plan.steps[1].description, "Third");
+        assert_eq!(plan.steps[0].index, 0);
+        assert_eq!(plan.steps[1].index, 1);
+        assert_eq!(plan.current_step_index, 1);
+    }
+
+    #[test]
+    fn test_remove_step_invalid_index() {
+        let mut plan = PlanState::create_plan(vec![
+            "First".to_string(),
+            "Second".to_string(),
+        ]);
+        let err = plan.remove_step(5).unwrap_err();
+        assert!(err.contains("out of range"));
+    }
+
+    #[test]
+    fn test_advance_to_completion() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+            "Step 3".to_string(),
+        ]);
+
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        assert_eq!(plan.advance().unwrap(), 1);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Done);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
+
+        assert_eq!(plan.advance().unwrap(), 2);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Done);
+        assert_eq!(plan.steps[2].status, PlanStepStatus::Running);
+
+        assert!(plan.advance().is_none());
+        assert!(plan.is_complete());
+        assert!(plan.complete);
+    }
+
+    #[test]
+    fn test_advance_only_runs_pending_steps() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+            "Step 3".to_string(),
+        ]);
+
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.mark_step(2, PlanStepStatus::Done).unwrap();
+        plan.current_step_index = 1;
+        plan.mark_step(1, PlanStepStatus::Running).unwrap();
+
+        assert_eq!(plan.advance().unwrap(), 1);
+        assert!(plan.is_complete());
+    }
+
+    #[test]
+    fn test_format_state_with_running_step() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+        ]);
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        plan.approved = true;
+        plan.paused = false;
+        let state = plan.format_state();
+        assert!(state.contains("approved: true"));
+        assert!(state.contains("paused: false"));
+        assert!(state.contains("[running] Step 1"));
+        assert!(state.contains("[pending] Step 2"));
+        assert!(state.contains("Current step:"));
+    }
+
+    #[test]
+    fn test_format_display() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+        ]);
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.mark_step(1, PlanStepStatus::Running).unwrap();
+        let display = plan.format_display();
+        assert!(display.contains("✓ 1. Step 1"));
+        assert!(display.contains("→ 2. Step 2"));
+        assert!(display.contains("Progress: 1/2"));
+    }
+
+    #[test]
+    fn test_status_summary_all_states() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+            "Step 3".to_string(),
+        ]);
+
+        assert_eq!(plan.status_summary(), "Plan: awaiting approval");
+
+        plan.approved = true;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        assert_eq!(plan.status_summary(), "Plan: 1/3 running");
+
+        plan.paused = true;
+        assert_eq!(plan.status_summary(), "Plan: paused at 1/3");
+
+        plan.paused = false;
+        plan.mark_step(0, PlanStepStatus::Failed).unwrap();
+        assert_eq!(plan.status_summary(), "Plan: failed at 1/3");
+
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.mark_step(1, PlanStepStatus::Done).unwrap();
+        plan.mark_step(2, PlanStepStatus::Done).unwrap();
+        plan.complete = true;
+        assert_eq!(plan.status_summary(), "Plan: complete 3/3");
+    }
+
+    #[test]
+    fn test_renumber_after_remove() {
+        let mut plan = PlanState::create_plan(vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ]);
+        plan.remove_step(1).unwrap();
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].index, 0);
+        assert_eq!(plan.steps[1].index, 1);
+        assert_eq!(plan.steps[2].index, 2);
+        assert_eq!(plan.steps[0].description, "A");
+        assert_eq!(plan.steps[1].description, "C");
+        assert_eq!(plan.steps[2].description, "D");
+    }
+
+    #[test]
+    fn test_renumber_after_insert() {
+        let mut plan = PlanState::create_plan(vec![
+            "A".to_string(),
+            "C".to_string(),
+        ]);
+        plan.insert_step_after(0, "B".to_string()).unwrap();
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].index, 0);
+        assert_eq!(plan.steps[1].index, 1);
+        assert_eq!(plan.steps[2].index, 2);
+    }
+
+    #[test]
+    fn test_plan_state_pause_resume_cycle() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+        ]);
+        plan.approved = true;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+
+        plan.paused = true;
+        assert!(plan.paused);
+
+        plan.paused = false;
+        assert!(!plan.paused);
+        assert!(plan.approved);
+    }
+
+    #[test]
+    fn test_abort_clears_plan() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+        ]);
+        plan.approved = true;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        plan.current_step_index = plan.steps.len();
+        plan.approved = false;
+        assert!(!plan.approved);
+        assert_eq!(plan.current_step_index, 2);
+    }
+
+    #[test]
+    fn test_current_step_returns_none_on_empty() {
+        let plan = PlanState::create_plan(vec![]);
+        assert!(plan.current_step().is_none());
+    }
+
+    #[test]
+    fn test_current_step_returns_running_step() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+        ]);
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        let step = plan.current_step().unwrap();
+        assert_eq!(step.index, 0);
+        assert_eq!(step.status, PlanStepStatus::Running);
+    }
+
+    #[test]
+    fn test_status_icon() {
+        let mut plan = PlanState::create_plan(vec![
+            "Pending step".to_string(),
+            "Running step".to_string(),
+            "Done step".to_string(),
+            "Failed step".to_string(),
+        ]);
+        assert_eq!(plan.steps[0].status_icon(), "○");
+        plan.mark_step(1, PlanStepStatus::Running).unwrap();
+        assert_eq!(plan.steps[1].status_icon(), "→");
+        plan.mark_step(2, PlanStepStatus::Done).unwrap();
+        assert_eq!(plan.steps[2].status_icon(), "✓");
+        plan.mark_step(3, PlanStepStatus::Failed).unwrap();
+        assert_eq!(plan.steps[3].status_icon(), "✗");
+    }
 }

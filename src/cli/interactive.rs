@@ -793,21 +793,21 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::Stats => {
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             let sh = sess.agent_loop().state_handle();
             let state = sh.lock().await;
             let stats = format_stats_text(&state);
             app.push_plain(stats);
         }
         CliOnlyCommand::Changes => {
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             let sh = sess.agent_loop().state_handle();
             let state = sh.lock().await;
             let changes = format_changes_text(&state);
             app.push_plain(changes);
         }
         CliOnlyCommand::Queue => {
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             if let Some(qh) = sess.message_queue_handle() {
                 let count = qh.queued_message_count().await;
                 if count == 0 {
@@ -833,7 +833,7 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::Undo | CliOnlyCommand::CheckpointUndo => {
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             let checkpoint_mgr = sess
                 .agent_loop()
                 .checkpoint_manager()
@@ -1053,7 +1053,7 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::CheckpointList => {
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             let checkpoint_mgr = sess
                 .agent_loop()
                 .checkpoint_manager()
@@ -1077,7 +1077,7 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::CheckpointRestore => {
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             let checkpoint_mgr = sess
                 .agent_loop()
                 .checkpoint_manager()
@@ -1206,7 +1206,7 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Expand => {
             if let Some(index) = crate::cli::slash_commands::parse_expand_index(text) {
-                let sess = session.lock().await;
+            let mut sess = session.lock().await;
                 let sh = sess.agent_loop().state_handle();
                 drop(sess);
                 let state = sh.lock().await;
@@ -1236,9 +1236,23 @@ async fn handle_cli_only_command(
         CliOnlyCommand::PlanPrompt(_) => {
             app.push_plain("Plan prompt should be handled by the main loop.");
         }
-        CliOnlyCommand::Plan(_) | CliOnlyCommand::PlanApprove | CliOnlyCommand::PlanPause | CliOnlyCommand::PlanResume | CliOnlyCommand::PlanAbort => {
+        CliOnlyCommand::PlanAbort => {
+            let mut sess = session.lock().await;
+            let sh = sess.agent_loop().state_handle();
+            let mut state = sh.lock().await;
+            if state.plan_state.is_some() {
+                state.plan_state = None;
+                drop(state);
+                sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
+                app.mode = "ACT".to_string();
+                app.push_plain("Plan aborted. Already-applied changes are kept.");
+            } else {
+                app.push_plain("No active plan to abort.");
+            }
+        }
+        CliOnlyCommand::Plan(_) | CliOnlyCommand::PlanApprove | CliOnlyCommand::PlanPause | CliOnlyCommand::PlanResume => {
             use crate::cli::slash_commands::PlanSubcommand;
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             let sh = sess.agent_loop().state_handle();
             let mut state = sh.lock().await;
             if let Some(plan) = &mut state.plan_state {
@@ -1314,17 +1328,24 @@ async fn handle_cli_only_command(
                         } else if plan.steps.is_empty() {
                             app.push_plain("Cannot approve an empty plan.");
                         } else {
+                            let current_step_index = plan.current_step_index;
+                            let steps_len = plan.steps.len();
+                            let step_desc = plan.steps[plan.current_step_index].description.clone();
                             plan.approved = true;
+                            drop(state);
+                            sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
+                            drop(sess);
                             app.push_plain(format!(
                                 "Plan approved. Starting from step {}/{}: {}",
-                                plan.current_step_index,
-                                plan.steps.len(),
-                                plan.steps[plan.current_step_index].description
+                                current_step_index + 1,
+                                steps_len,
+                                step_desc
                             ));
-            }
-        }
-        CliOnlyCommand::PlanPause => {
+                        }
+                    }
+                    CliOnlyCommand::PlanPause => {
                         if plan.approved && plan.current_step_index < plan.steps.len() {
+                            plan.paused = true;
                             app.push_plain("Plan paused. Use /plan resume to continue.");
                         } else {
                             app.push_plain("No active plan to pause.");
@@ -1345,15 +1366,7 @@ async fn handle_cli_only_command(
                             app.push_plain(format!("Plan resumed at step {}/{}: {}", plan.current_step_index + 1, plan.steps.len(), plan.steps[plan.current_step_index].description));
                         }
                     }
-CliOnlyCommand::PlanAbort => {
-                        if plan.steps.is_empty() || !plan.approved {
-                            app.push_plain("No active plan to abort.");
-                        } else {
-                            plan.approved = false;
-                            plan.current_step_index = plan.steps.len();
-                            app.push_plain("Plan aborted. Already-applied changes are kept.");
-                        }
-                    }
+                    
                     _ => unreachable!(),
                 }
             } else {
@@ -1386,6 +1399,14 @@ async fn run_main_loop(
     loop {
         // 1. Drain channel into app
         drain_output(output_rx, app);
+
+        // 1b. Sync plan state from TaskState to App TUI cache
+        {
+            if let Some(state_arc) = state_handle.lock().await.as_ref() {
+                let state = state_arc.lock().await;
+                app.plan_state_cache = state.plan_state.clone();
+            }
+        }
 
         // 2. Render
         terminal.draw(|f| app.render(f))?;
@@ -1519,6 +1540,35 @@ async fn run_main_loop(
                                 if let Some(cli_cmd) =
                                     crate::cli::slash_commands::get_cli_only_command(&text)
                                 {
+                                    // Handle /plan <prompt> specially: clear old plan, enter Plan mode, spawn agent
+                                    if let crate::cli::slash_commands::CliOnlyCommand::PlanPrompt(ref prompt_text) = cli_cmd {
+                                        // Clear old plan state
+                                        {
+                                            let state_arc = state_handle.lock().await;
+                                            if let Some(sh) = state_arc.as_ref() {
+                                                let mut state = sh.lock().await;
+                                                state.plan_state = None;
+                                            }
+                                        }
+                                        app.push_user_message(&text);
+                                        app.push_plain("Entering plan mode...");
+                                        app.mode = "PLAN".to_string();
+                                        // Spawn agent with the prompt
+                                        if agent_busy.load(Ordering::Relaxed) {
+                                            if let Some(qh) = queue_handle.lock().await.as_ref() {
+                                                qh.enqueue_text_message(prompt_text.clone()).await;
+                                                app.push_plain("Agent is busy. Plan prompt queued.");
+                                            }
+                                        } else {
+                                            spawn_agent_task(&session, prompt_text, &agent_busy, &agent_done, &agent_start_time, &agent_task).await?;
+                                            app.agent_busy = true;
+                                        }
+                                        app.auto_scroll = true;
+                                        app.scroll_offset = 0;
+                                        terminal.draw(|f| app.render(f))?;
+                                        continue;
+                                    }
+
                                     // Local commands execute immediately even when agent is busy
                                     if cli_cmd.is_local_command() {
                                         let should_exit = handle_cli_only_command(
@@ -1663,6 +1713,24 @@ async fn run_main_loop(
             }
         }
 
+        // 4b. Sync plan state from TaskState to App.plan_state_cache for TUI rendering
+        if let Some(state_arc) = state_handle.lock().await.as_ref() {
+            let state = state_arc.lock().await;
+            if let Some(ref plan) = state.plan_state {
+                app.plan_state_cache = Some(plan.clone());
+                // Sync mode from plan state: approved = ACT, unapproved = PLAN
+                if plan.approved {
+                    app.mode = "ACT".to_string();
+                } else {
+                    app.mode = "PLAN".to_string();
+                }
+            } else if app.plan_state_cache.is_some() {
+                // Clear cache when plan is cleared
+                app.plan_state_cache = None;
+                app.mode = "ACT".to_string();
+            }
+        }
+
         // 5. Update elapsed time for status bar
         if app.agent_busy
             && let Some(start) = app.start_time
@@ -1720,13 +1788,13 @@ pub async fn run_interactive_shell_inner(
     ));
 
     let task_id = {
-        let sess = session.lock().await;
+        let mut sess = session.lock().await;
         sess.agent_loop.task_id().to_string()
     };
 
     // Set status bar fields from session info
     {
-        let sess = session.lock().await;
+        let mut sess = session.lock().await;
         let provider = sess.agent_loop.get_provider();
         let model = provider.get_model();
         app.provider_name = provider.name().to_string();
@@ -1743,7 +1811,7 @@ pub async fn run_interactive_shell_inner(
 
     // 4. Startup banner → app.push_output()
     {
-        let sess = session.lock().await;
+        let mut sess = session.lock().await;
         if !sess.is_quiet() {
             let startup_info = sess.get_startup_info();
             for line in ansi_to_ratatui_lines(&startup_info) {
@@ -1775,7 +1843,7 @@ pub async fn run_interactive_shell_inner(
     app.history.reload();
 
     {
-        let sess = session.lock().await;
+        let mut sess = session.lock().await;
         let mut qh = queue_handle.lock().await;
         *qh = Some(sess.queue_handle());
         let mut sh = state_handle.lock().await;

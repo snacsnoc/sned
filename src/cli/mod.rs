@@ -1146,6 +1146,11 @@ async fn build_task_components(
         interactive_mode: false,
         output_writer: output_writer
             .unwrap_or_else(|| Arc::new(crate::cli::output::StderrOutputWriter)),
+        strict_plan_mode_enabled: state_manager
+            .get_global_state_key::<bool>(
+                crate::storage::state_manager::GlobalStateKey::StrictPlanModeEnabled,
+            )
+            .unwrap_or(true),
     };
 
     let shell_path = std::env::var("SHELL").ok();

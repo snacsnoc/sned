@@ -228,6 +228,7 @@ impl Default for AgentConfig {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         }
     }
 }
@@ -269,6 +270,8 @@ pub struct AgentConfig {
     pub interactive_mode: bool,
     /// Output writer for decoupled terminal output (ratatui migration).
     pub output_writer: crate::cli::output::OutputWriterArc,
+    /// Whether strict plan mode is enabled (blocks write tools in Plan mode).
+    pub strict_plan_mode_enabled: bool,
 }
 
 /// Result of a single turn in the agent loop.
