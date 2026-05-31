@@ -6393,7 +6393,6 @@ mod tests {
             plan.approved = true;
             plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
             state.plan_state = Some(plan);
-            state.double_check_completion_pending = true;
         }
 
         let result = agent.execute_turn().await;
@@ -6596,7 +6595,7 @@ mod tests {
             plan.approved = true;
             plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
             state.plan_state = Some(plan);
-            state.double_check_completion_enabled = false;
+            state.double_check_completion_pending = true;
         }
 
         let result = agent.execute_turn().await;
