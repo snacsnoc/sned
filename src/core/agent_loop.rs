@@ -3207,7 +3207,10 @@ impl AgentLoop {
 
     /// Check if a tool is restricted in plan mode.
     fn is_plan_mode_restricted(tool: SnedTool) -> bool {
-        matches!(tool, SnedTool::WriteToFile | SnedTool::EditFile)
+        matches!(
+            tool,
+            SnedTool::WriteToFile | SnedTool::EditFile | SnedTool::ExecuteCommand
+        )
     }
 
     /// Extract the first action path from tool params for per-path approval.
