@@ -239,13 +239,20 @@ async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyho
         Ok::<_, io::Error>(buffer)
     });
 
+    // Drop child's stdout/stderr so kill() + wait() returns promptly.
+    // The reader tasks still hold their own handles and will drain remaining data.
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+
     let status = match timeout(timeout_duration, child.wait()).await {
         Ok(status) => status?,
         Err(_) => {
             let _ = child.kill().await;
+            // Drop reader task handles instead of awaiting them — they will
+            // complete in the background once the killed process's pipes close.
+            drop(stdout_task);
+            drop(stderr_task);
             let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
             let err = crate::cli::actionable_errors::command_timeout(
                 "search_files",
                 timeout_duration.as_secs(),
@@ -360,8 +367,6 @@ mod tests {
         unsafe {
             std::env::set_var(SEARCH_MAX_LINES_ENV, "100");
         }
-
-        // Create a file with more matches than the default limit (100)
         let temp_dir = TempDir::new().unwrap();
         let content = (0..150)
             .map(|i| format!("match {}", i))
@@ -370,12 +375,17 @@ mod tests {
         fs::write(temp_dir.path().join("large_file.txt"), content).unwrap();
 
         let handler = SearchFilesHandler::new();
+        // Use 10 so this test's env var won't break test_search_files_custom_max_count_via_env
+        // (which asserts line_count <= 10) if values leak between parallel tests.
+        unsafe {
+            std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
+        }
         let result = handler
             .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
             .await
             .unwrap();
 
-        // Should be limited to DEFAULT_SEARCH_MAX_LINES (100) per file
+        // Should be limited to 10 per file
         // Count only lines with filename:linenum: pattern (actual rg output)
         let line_count = result
             .lines()
@@ -403,7 +413,6 @@ mod tests {
         unsafe {
             std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
         }
-
         let temp_dir = TempDir::new().unwrap();
         // Create a single file with more matches than the limit
         let content = (0..50)
@@ -413,12 +422,17 @@ mod tests {
         fs::write(temp_dir.path().join("large_file.txt"), content).unwrap();
 
         let handler = SearchFilesHandler::new();
+        // Use 3 so this test's env var won't break test_search_files_respects_max_count_per_file
+        // (which asserts line_count <= 100) if values leak between parallel tests.
+        unsafe {
+            std::env::set_var(SEARCH_MAX_LINES_ENV, "3");
+        }
         let result = handler
             .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
             .await
             .unwrap();
 
-        // Should be limited to 10 per file (plus "Too many matches" message)
+        // Should be limited to 3 per file (plus "Too many matches" message)
         // Count only lines with filename:linenum: pattern (actual rg output)
         let line_count = result
             .lines()

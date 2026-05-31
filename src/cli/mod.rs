@@ -534,7 +534,7 @@ fn open_path_in_default_app(path: &Path) -> anyhow::Result<()> {
         if !status.success() {
             anyhow::bail!("Failed to open log file");
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]

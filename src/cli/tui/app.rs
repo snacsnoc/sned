@@ -163,13 +163,12 @@ impl App {
 
     /// Render the application state to the frame.
     pub fn render(&mut self, frame: &mut Frame) {
-        let [output_area, status_area, input_area] =
-            Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-            ])
-            .areas(frame.area());
+        let [output_area, status_area, input_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .areas(frame.area());
 
         // Update input block with themed border and styled title
         let input_title = if self.agent_busy {
@@ -180,7 +179,8 @@ impl App {
         } else {
             Line::from(" Input ")
         };
-        self.input.set_block(theme::input_block(input_title, self.agent_busy));
+        self.input
+            .set_block(theme::input_block(input_title, self.agent_busy));
 
         // Update placeholder text based on agent state
         if self.agent_busy {
@@ -215,39 +215,28 @@ impl App {
         let buffer_size = content_height * buffer_multiplier;
         let start = scroll_y as usize;
         let end = (start + buffer_size).min(total_lines);
-        
-        // Render loading indicator as a separate widget when agent is busy
-        if self.agent_busy {
-            // Render output pane with visible lines only (virtual scrolling)
-            let visible_lines: Vec<Line> = if start < end {
-                self.output_lines.iter().skip(start).take(end - start).cloned().collect()
-            } else {
-                Vec::new()
-            };
-            let output = Paragraph::new(visible_lines)
-                .wrap(Wrap { trim: false })
-                .scroll((0, 0))  // No scroll - we already sliced to visible window
-                .block(
-                    theme::border_block(" sned ")
-                        .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
-                );
-            frame.render_widget(output, output_area);
-            
-            // Render loading indicator at bottom of output area
-            let loading_area = Rect::new(
-                output_area.x,
-                output_area.y + output_area.height.saturating_sub(1),
-                output_area.width,
-                1,
-            );
-            let loading = Paragraph::new(Line::from(Span::styled(
-                format!("{} Agent processing...", self.spinner_char()),
-                theme::spinner_style(),
-            )))
-            .style(theme::status_style());
-            frame.render_widget(loading, loading_area);
+
+        // Update input block with themed border and styled title
+        let input_title = if self.agent_busy {
+            Line::from(vec![
+                Span::styled(self.spinner_char().to_string(), theme::spinner_style()),
+                Span::raw(" Working "),
+            ])
         } else {
-            // No loading indicator - render output pane normally
+            Line::from(" Input ")
+        };
+        self.input
+            .set_block(theme::input_block(input_title, self.agent_busy));
+
+        // Update placeholder text based on agent state
+        if self.agent_busy {
+            self.input.set_placeholder_text("⟳ Agent working...");
+        } else {
+            self.input.set_placeholder_text("❯ ");
+        }
+
+        // Output pane with visible lines only (virtual scrolling)
+        {
             let visible_lines: Vec<Line> = if start < end {
                 self.output_lines.iter().skip(start).take(end - start).cloned().collect()
             } else {
@@ -261,6 +250,22 @@ impl App {
                         .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
                 );
             frame.render_widget(output, output_area);
+
+            // Render loading indicator at bottom of output area
+            if self.agent_busy {
+                let loading_area = Rect::new(
+                    output_area.x,
+                    output_area.y + output_area.height.saturating_sub(1),
+                    output_area.width,
+                    1,
+                );
+                let loading = Paragraph::new(Line::from(Span::styled(
+                    format!("{} Agent processing...", self.spinner_char()),
+                    theme::spinner_style(),
+                )))
+                .style(theme::status_style());
+                frame.render_widget(loading, loading_area);
+            }
         }
 
         // Scrollbar on output pane (render inside the border)
@@ -295,7 +300,8 @@ impl App {
         };
         let spacer_len = status_area
             .width
-            .saturating_sub((status_left.len() + status_right.len()) as u16) as usize;
+            .saturating_sub((status_left.len() + status_right.len()) as u16)
+            as usize;
         let status_line = Line::from(vec![
             Span::styled(status_left, theme::status_style()),
             Span::raw(" ".repeat(spacer_len)),
@@ -346,8 +352,10 @@ impl App {
             })
             .collect();
 
-        let picker = Paragraph::new(rows)
-            .block(theme::overlay_block(format!(" Files ({}) ", self.picker_results.len())));
+        let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
+            " Files ({}) ",
+            self.picker_results.len()
+        )));
 
         frame.render_widget(Clear, overlay_area);
         frame.render_widget(picker, overlay_area);

@@ -1685,12 +1685,14 @@ impl AgentLoop {
                         context_usage_percentage: Some(context_usage_pct),
                     });
                     if usage_chunk.input_tokens > 0 {
-                        state.cumulative_tokens_in =
-                            state.cumulative_tokens_in.saturating_add(usage_chunk.input_tokens);
+                        state.cumulative_tokens_in = state
+                            .cumulative_tokens_in
+                            .saturating_add(usage_chunk.input_tokens);
                     }
                     if usage_chunk.output_tokens > 0 {
-                        state.cumulative_tokens_out =
-                            state.cumulative_tokens_out.saturating_add(usage_chunk.output_tokens);
+                        state.cumulative_tokens_out = state
+                            .cumulative_tokens_out
+                            .saturating_add(usage_chunk.output_tokens);
                     }
                     if let Some(cache_writes) = usage_chunk.cache_write_tokens
                         && cache_writes > 0
@@ -1707,8 +1709,9 @@ impl AgentLoop {
                     if let Some(reasoning_tokens) = usage_chunk.reasoning_tokens
                         && reasoning_tokens > 0
                     {
-                        state.cumulative_reasoning_tokens =
-                            state.cumulative_reasoning_tokens.saturating_add(reasoning_tokens);
+                        state.cumulative_reasoning_tokens = state
+                            .cumulative_reasoning_tokens
+                            .saturating_add(reasoning_tokens);
                     }
                     if let Some(cost) = usage_chunk.total_cost
                         && cost > 0.0
@@ -1848,7 +1851,9 @@ impl AgentLoop {
                         );
                     } else {
                         // Emit to output_writer so TUI users see the error in the output pane
-                        self.config.output_writer.emit(OutputEvent::plain(format!("Error: {}", err)));
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::plain(format!("Error: {}", err)));
                     }
                 }
             }
@@ -1904,7 +1909,8 @@ impl AgentLoop {
 
         // If stream errored mid-response, note the partial content in the error
         if stream_errored {
-            let partial_note = if !accumulated_text.is_empty() || !accumulated_reasoning.is_empty() {
+            let partial_note = if !accumulated_text.is_empty() || !accumulated_reasoning.is_empty()
+            {
                 format!(
                     " (partial response of {} text chars{} discarded)",
                     accumulated_text.len(),
@@ -1943,7 +1949,10 @@ impl AgentLoop {
             "stream complete"
         );
 
-        if accumulated_text.is_empty() && prepared_tool_calls.is_empty() && accumulated_reasoning.is_empty() {
+        if accumulated_text.is_empty()
+            && prepared_tool_calls.is_empty()
+            && accumulated_reasoning.is_empty()
+        {
             let mut state = state_clone.lock().await;
             state.consecutive_mistakes += 1;
             tracing::warn!(
