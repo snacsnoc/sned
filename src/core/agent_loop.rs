@@ -39,6 +39,7 @@ use crate::storage::task_storage::TaskStorage;
 use futures::future::FutureExt;
 use ratatui::style::{Color, Modifier, Style};
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
@@ -817,6 +818,8 @@ impl AgentLoop {
                 {
                     drop(state);
                     self.config.output_writer.emit(OutputEvent::dim_yellow("Plan is paused. Type /plan resume to continue."));
+                    // Prevent CPU spinning on pause
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 }
                 drop(state);
@@ -1198,21 +1201,31 @@ impl AgentLoop {
             let _ = tracker.record_model_usage(provider_id, model_id, mode);
         }
 
-        // 2.7 Inject plan state into conversation history (FIX: model state injection)
-        let plan_state_text = {
+        // 2.7 Inject plan state into conversation history only when changed
+        let plan_state_entry = {
             let state = self.state.lock().await;
-            state.plan_state.as_ref().map(|ps| ps.format_state())
+            state.plan_state.as_ref().map(|ps| {
+                let text = ps.format_state();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&text, &mut hasher);
+                let hash = hasher.finish();
+                (text, hash)
+            })
         };
-        if let Some(ps_text) = plan_state_text {
+        if let Some((ps_text, hash)) = plan_state_entry {
             let mut history = self.conversation_history.lock().await;
-            history.push(StorageMessage {
-                id: None,
-                role: MessageRole::User,
-                content: MessageContent::Text(ps_text),
-                model_info: None,
-                metrics: None,
-                ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-            });
+            let last_hash = self.state.lock().await.last_injected_plan_state_hash;
+            if last_hash != Some(hash) {
+                history.push(StorageMessage {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text(ps_text),
+                    model_info: None,
+                    metrics: None,
+                    ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                });
+                self.state.lock().await.last_injected_plan_state_hash = Some(hash);
+            }
         }
 
         // 3. Select tool profile and build tool definitions
@@ -1585,7 +1598,9 @@ impl AgentLoop {
                                     code_block_full_buffer.push(code_line.clone());
                                     if code_block_lines > code_block_display_limit {
                                         code_block_snipped = true;
-                                        continue;
+                    // Prevent CPU spinning on pause
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
                                     }
 
                                     code_block_buffer.push(code_line);

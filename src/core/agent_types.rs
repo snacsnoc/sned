@@ -134,6 +134,8 @@ pub struct TaskState {
     pub must_reread_before_edit: HashSet<String>,
     /// Plan state for the interactive Plan -> Approve -> Act workflow.
     pub plan_state: Option<crate::core::plan_state::PlanState>,
+    /// Last injected plan state hash to avoid duplicate injections.
+    pub last_injected_plan_state_hash: Option<u64>,
     /// Exact denied tool calls for the current recovery context.
     pub denied_tool_actions: Vec<DeniedToolAction>,
 }
@@ -191,6 +193,7 @@ impl Default for TaskState {
             last_executed_command: None,
             must_reread_before_edit: HashSet::new(),
             plan_state: None,
+            last_injected_plan_state_hash: None,
             denied_tool_actions: Vec::new(),
         }
     }
