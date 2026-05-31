@@ -1,6 +1,7 @@
 //! Plan panel widget for displaying the interactive plan workflow.
 
 use crate::core::plan_state::{PlanState, PlanStepStatus};
+use super::theme;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -8,7 +9,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Paragraph, Wrap},
 };
-use super::theme;
 
 /// Render the plan panel within the given area.
 pub fn render_plan_panel(plan: &PlanState, frame: &mut Frame, area: Rect) {
@@ -40,7 +40,15 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
     } else if plan.paused {
         "paused".to_string()
     } else if plan.approved {
-        format!("{} / {}", plan.current_step_index + 1, plan.steps.len())
+        if plan.current_step_index < plan.steps.len() {
+            format!("{} / {}", plan.current_step_index + 1, plan.steps.len())
+        } else {
+            format!(
+                "error: current step index {} is out of range ({} steps)",
+                plan.current_step_index,
+                plan.steps.len()
+            )
+        }
     } else {
         "awaiting approval".to_string()
     };
@@ -93,4 +101,41 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_plan_lines_shows_error_when_current_step_is_out_of_range() {
+        let mut plan = PlanState::create_plan(vec![
+            "First step".to_string(),
+            "Second step".to_string(),
+        ]);
+        plan.approved = true;
+        plan.current_step_index = 99;
+
+        let lines = build_plan_lines(
+            &plan,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 10,
+            },
+        );
+
+        let status_line = lines
+            .first()
+            .expect("plan panel should render a status line");
+        let rendered_status = status_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered_status.contains("error: current step index 99 is out of range"));
+        assert!(!rendered_status.contains("100 / 2"));
+    }
 }
