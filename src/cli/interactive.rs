@@ -1321,18 +1321,7 @@ async fn handle_cli_only_command(
                                 }
                             }
                         }
-                        PlanSubcommand::Approve => {
-                            app.push_plain("Use /plan approve instead.");
-                        }
-                        PlanSubcommand::Pause => {
-                            app.push_plain("Use /plan pause instead.");
-                        }
-                        PlanSubcommand::Resume => {
-                            app.push_plain("Use /plan resume instead.");
-                        }
-                        PlanSubcommand::Abort => {
-                            app.push_plain("Use /plan abort instead.");
-                        }
+                        _ => unreachable!("PlanSubcommand::Approve/Pause/Resume/Abort are routed to CliOnlyCommand::PlanApprove/Pause/Resume/Abort"),
                     },
                     CliOnlyCommand::PlanApprove => {
                         if plan.approved {
@@ -1344,6 +1333,7 @@ async fn handle_cli_only_command(
                             let steps_len = plan.steps.len();
                             let step_desc = plan.steps[plan.current_step_index].description.clone();
                             plan.approved = true;
+                            plan.steps[plan.current_step_index].status = crate::core::plan_state::PlanStepStatus::Running;
                             drop(state);
                             sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
                             drop(sess);
@@ -1561,6 +1551,11 @@ async fn run_main_loop(
                                                 let mut state = sh.lock().await;
                                                 state.plan_state = None;
                                             }
+                                        }
+                                        // Switch agent mode to Plan so write/edit tools are restricted
+                                        {
+                                            let mut sess = session.lock().await;
+                                            sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Plan);
                                         }
                                         app.push_user_message(&text);
                                         app.push_plain("Entering plan mode...");
