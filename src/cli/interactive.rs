@@ -378,7 +378,12 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             }
         }
     }
-    // Only force scroll for the one-shot approval prompt.
+    // Keep approval prompts visible even if the user had manually scrolled away.
+    if crate::core::approval::is_approval_prompt_active() {
+        app.auto_scroll = true;
+        app.scroll_offset = 0;
+    }
+    // Also force the initial prompt render once even if it arrives between frames.
     if crate::core::approval::take_approval_prompt_scroll() {
         app.auto_scroll = true;
         app.scroll_offset = 0;
@@ -2048,6 +2053,24 @@ mod tests {
         app.scroll_offset = 7;
 
         drain_output(&mut rx, &mut app);
+
+        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_drain_output_forces_scroll_while_approval_prompt_is_active() {
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        crate::core::approval::set_approval_prompt_active(true);
+
+        let mut app = App::new();
+        app.auto_scroll = false;
+        app.scroll_offset = 7;
+
+        drain_output(&mut rx, &mut app);
+
+        crate::core::approval::set_approval_prompt_active(false);
 
         assert!(app.auto_scroll);
         assert_eq!(app.scroll_offset, 0);
