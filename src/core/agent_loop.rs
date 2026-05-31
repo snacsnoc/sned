@@ -2910,37 +2910,7 @@ impl AgentLoop {
                 // No tools were called (text-only response) - reset consecutive mistakes
                 let mut state = self.state.lock().await;
                 state.consecutive_mistakes = 0;
-
-                // Handle plan step failure: text-only response with tools available means step failed
-                let mut step_fail_msg = None;
-                if let Some(ref mut plan) = state.plan_state
-                    && plan.approved && !plan.complete
-                    && plan.current_step_index < plan.steps.len()
-                {
-                    let current_status = &plan.steps[plan.current_step_index].status;
-                    if *current_status != PlanStepStatus::Failed {
-                        plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
-                            .ok();
-                        plan.paused = true;
-                        tracing::info!(
-                            step_index = plan.current_step_index,
-                            "Plan step failed (no tool calls). Execution paused."
-                        );
-                        if !self.config.json_output {
-                            step_fail_msg = Some(format!(
-                                "Plan step {}/{} failed (no tool calls). Use /plan resume to retry or /plan abort to cancel.",
-                                plan.current_step_index + 1,
-                                plan.steps.len()
-                            ));
-                        }
-                    }
-                }
                 drop(state);
-
-                if let Some(msg) = step_fail_msg {
-                    self.config.output_writer.emit(OutputEvent::error(msg));
-                    return TurnResult::Continue;
-                }
             }
 
             // Inject hint when approaching the mistake limit
@@ -6168,5 +6138,157 @@ mod tests {
         // The fallback estimation happens at display time, not during turn execution
         // This test verifies that the state is correctly set up for fallback
         // The actual display logic is tested manually or via integration tests
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_respond_creates_plan_state() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::plan_mode_respond::PlanModeRespondHandler;
+
+        let plan_json = serde_json::json!({
+            "response": "1. Inspect the codebase\n2. Write the implementation\n3. Run tests",
+            "needs_more_exploration": false,
+        });
+
+        let responses = vec![
+            vec![
+                ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                    tool_call: ApiStreamToolCall {
+                        call_id: Some("call_plan".to_string()),
+                        function: crate::providers::ApiStreamToolCallFunction {
+                            id: None,
+                            name: Some("plan_mode_respond".to_string()),
+                            arguments: Some(plan_json.to_string()),
+                        },
+                        signature: None,
+                    },
+                    id: None,
+                    signature: None,
+                }),
+            ],
+            // Second turn: model responds with text after plan is created
+            vec![
+                ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "Plan created. Waiting for approval.".to_string(),
+                    id: None,
+                    signature: None,
+                }),
+            ],
+        ];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+
+        let config = AgentConfig {
+            provider,
+            mode: AgentMode::Plan,
+            task_id: "test-plan-respond".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::PlanModeRespond,
+            Arc::new(PlanModeRespondHandler::new()),
+        );
+
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry));
+
+        let result = agent.execute_turn().await;
+        assert!(
+            matches!(result, TurnResult::Continue) || matches!(result, TurnResult::Complete),
+            "Expected Continue or Complete, got {:?}",
+            result
+        );
+
+        let state = agent.state.lock().await;
+        assert!(state.plan_state.is_some(), "PlanState should be created");
+        let plan = state.plan_state.as_ref().unwrap();
+        assert_eq!(plan.steps.len(), 3);
+        assert!(!plan.approved);
+        assert!(plan.format_state().contains("mode: APPROVAL"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_advance_on_tool_success() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::plan_mode_respond::PlanModeRespondHandler;
+
+        // Create plan directly in state (skip PlanModeRespond call)
+        let responses = vec![vec![
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Executing step 1".to_string(),
+                id: None,
+                signature: None,
+            }),
+        ]];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+
+        let config = AgentConfig {
+            provider,
+            mode: AgentMode::Act,
+            task_id: "test-plan-advance".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: false,
+        };
+
+        let registry = ToolRegistry::new();
+
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry));
+
+        // Set up plan state manually: approved, step 0 running
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Step one".to_string(),
+                "Step two".to_string(),
+            ]);
+            plan.approved = true;
+            plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
+            state.plan_state = Some(plan);
+        }
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+
+        // After a text-only turn (no tools called), step should NOT be failed
+        let state = agent.state.lock().await;
+        let plan = state.plan_state.as_ref().unwrap();
+        assert_eq!(
+            plan.steps[0].status,
+            crate::core::plan_state::PlanStepStatus::Running,
+            "Text-only response should not fail the step"
+        );
     }
 }

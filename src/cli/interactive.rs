@@ -1476,7 +1476,18 @@ async fn run_main_loop(
                 let state = state_arc.lock().await;
                 app.plan_state_cache = state.plan_state.clone();
                 if let Some(ref plan) = state.plan_state {
-                    app.mode = if plan.approved { "ACT".to_string() } else { "PLAN".to_string() };
+                    let has_failed = plan.steps.iter().any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
+                    app.mode = if plan.complete {
+                        "COMPLETE".to_string()
+                    } else if has_failed {
+                        "FAILED".to_string()
+                    } else if plan.paused {
+                        "PAUSED".to_string()
+                    } else if plan.approved {
+                        "ACT".to_string()
+                    } else {
+                        "PLAN".to_string()
+                    };
                 }
             }
         }
