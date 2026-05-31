@@ -485,6 +485,14 @@ impl AgentLoop {
         }))
     }
 
+    async fn plan_execution_active(&self) -> bool {
+        let state = self.state.lock().await;
+        state
+            .plan_state
+            .as_ref()
+            .is_some_and(|plan| plan.approved && !plan.complete && !plan.paused)
+    }
+
     pub fn new(config: AgentConfig) -> Self {
         let is_subagent = config.is_subagent_execution;
         let state = TaskState {
@@ -2154,8 +2162,9 @@ impl AgentLoop {
                 let first_turn_direct_answer = first_task_turn
                     && self.config.mode == AgentMode::Act
                     && !self.config.interactive_mode;
+                let plan_active = self.plan_execution_active().await;
 
-                if first_turn_direct_answer || text_only_turns > 1 {
+                if (first_turn_direct_answer || text_only_turns > 1) && !plan_active {
                     text_only_completes_task = true;
                 } else if text_only_turns == 1 {
                     if let Some(profile) = self.deps.tool_profile {
@@ -2212,6 +2221,7 @@ impl AgentLoop {
         }
 
         // 8. Dispatch tools (parallel execution for independent tools)
+        let mut tool_failure_count = 0usize;
         if !prepared_tool_calls.is_empty() {
             let mut edit_files: Vec<(String, i32, i32)> = Vec::new();
 
@@ -2677,7 +2687,7 @@ impl AgentLoop {
 
             // Track tool execution statistics for consecutive_mistakes tracking
             let tools_called = !parallel_results.is_empty();
-            let tool_failure_count = parallel_results.iter().filter(|r| r.is_error).count();
+            tool_failure_count = parallel_results.iter().filter(|r| r.is_error).count();
 
             // Phase 3: Collect results in order, then push as ONE StorageMessage
             let mut parallel_results_iter = parallel_results.into_iter();
@@ -3051,13 +3061,21 @@ impl AgentLoop {
                 Some(SnedTool::AttemptCompletion)
             )
         });
-        let is_completion = text_only_completes_task
-            || prepared_tool_calls.iter().any(|prepared| {
+        let plan_active = self.plan_execution_active().await;
+        let is_completion = (text_only_completes_task && !plan_active)
+            || (prepared_tool_calls.iter().any(|prepared| {
                 matches!(
                     SnedTool::from_name(&prepared.tool_name),
-                    Some(SnedTool::AttemptCompletion) | Some(SnedTool::PlanModeRespond)
+                    Some(SnedTool::AttemptCompletion)
                 )
-            });
+            }) && !plan_active)
+            || (tool_failure_count == 0
+                && prepared_tool_calls.iter().any(|prepared| {
+                    matches!(
+                        SnedTool::from_name(&prepared.tool_name),
+                        Some(SnedTool::PlanModeRespond)
+                    )
+                }));
 
         if self.config.json_output
             && let Some(event) = Self::synthetic_json_completion_event(
@@ -6375,6 +6393,7 @@ mod tests {
             plan.approved = true;
             plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
             state.plan_state = Some(plan);
+            state.double_check_completion_enabled = false;
         }
 
         let result = agent.execute_turn().await;
@@ -6513,6 +6532,155 @@ mod tests {
                 "Mode should transition to Act"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_attempt_completion_during_active_plan_continues() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::attempt_completion::AttemptCompletionHandler;
+
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_complete".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("attempt_completion".to_string()),
+                    arguments: Some(
+                        serde_json::json!({"result": "Finished step 1"}).to_string(),
+                    ),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+
+        let config = AgentConfig {
+            provider,
+            mode: AgentMode::Act,
+            task_id: "test-plan-attempt-completion-active-plan".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: false,
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Step one".to_string(),
+                "Step two".to_string(),
+            ]);
+            plan.approved = true;
+            plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
+            state.plan_state = Some(plan);
+            state.double_check_completion_enabled = false;
+        }
+
+        let result = agent.execute_turn().await;
+        assert!(
+            matches!(result, TurnResult::Continue),
+            "Expected Continue when attempt_completion is used during an active plan, got {:?}",
+            result
+        );
+
+        let state = agent.state.lock().await;
+        let plan = state.plan_state.as_ref().unwrap();
+        assert!(!plan.complete, "Active plan should not be marked complete");
+        assert_eq!(plan.current_step_index, 1);
+        assert_eq!(
+            plan.steps[0].status,
+            crate::core::plan_state::PlanStepStatus::Done
+        );
+        assert_eq!(
+            plan.steps[1].status,
+            crate::core::plan_state::PlanStepStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_only_turns_during_active_plan_continues() {
+        let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+            text: "Still working on it.".to_string(),
+            id: None,
+            signature: None,
+        })]];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+
+        let config = AgentConfig {
+            provider,
+            mode: AgentMode::Act,
+            task_id: "test-plan-text-only-active-plan".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: false,
+        };
+
+        let registry = ToolRegistry::new();
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Step one".to_string(),
+                "Step two".to_string(),
+            ]);
+            plan.approved = true;
+            plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
+            state.plan_state = Some(plan);
+        }
+
+        let result = agent.execute_turn().await;
+        assert!(
+            matches!(result, TurnResult::Continue),
+            "Expected Continue when text-only output is returned during an active plan, got {:?}",
+            result
+        );
+
+        let state = agent.state.lock().await;
+        let plan = state.plan_state.as_ref().unwrap();
+        assert!(!plan.complete, "Active plan should not be marked complete");
+        assert_eq!(plan.current_step_index, 0);
+        assert_eq!(
+            plan.steps[0].status,
+            crate::core::plan_state::PlanStepStatus::Running
+        );
     }
 
     #[tokio::test]
