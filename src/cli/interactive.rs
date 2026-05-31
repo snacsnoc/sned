@@ -1329,17 +1329,26 @@ async fn handle_cli_only_command(
                         } else if plan.steps.is_empty() {
                             app.push_plain("Cannot approve an empty plan.");
                         } else {
-                            let current_step_index = plan.current_step_index;
+                            // Validate current_step_index points to a pending step; if not, find first pending
+                            let start_index = if plan.current_step_index < plan.steps.len()
+                                && plan.steps[plan.current_step_index].status == crate::core::plan_state::PlanStepStatus::Pending
+                            {
+                                plan.current_step_index
+                            } else {
+                                plan.steps.iter().position(|s| s.status == crate::core::plan_state::PlanStepStatus::Pending)
+                                    .unwrap_or(0)
+                            };
+                            plan.current_step_index = start_index;
                             let steps_len = plan.steps.len();
-                            let step_desc = plan.steps[plan.current_step_index].description.clone();
+                            let step_desc = plan.steps[start_index].description.clone();
                             plan.approved = true;
-                            plan.steps[plan.current_step_index].status = crate::core::plan_state::PlanStepStatus::Running;
+                            plan.steps[start_index].status = crate::core::plan_state::PlanStepStatus::Running;
                             drop(state);
                             sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
                             drop(sess);
                             app.push_plain(format!(
                                 "Plan approved. Starting from step {}/{}: {}",
-                                current_step_index + 1,
+                                start_index + 1,
                                 steps_len,
                                 step_desc
                             ));
