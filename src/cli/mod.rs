@@ -880,11 +880,17 @@ fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::pro
                 },
             )?)
         }
-        "mock" => Arc::new(
-            crate::providers::mock::MockProvider::single_text_response_repeat(
-                "Mock provider response - task completed successfully",
-            ),
-        ),
+        "mock" => {
+            if std::env::var_os("SNED_MOCK_APPROVAL_SCROLL").is_some() {
+                Arc::new(crate::providers::mock::MockProvider::approval_scroll_scenario())
+            } else {
+                Arc::new(
+                    crate::providers::mock::MockProvider::single_text_response_repeat(
+                        "Mock provider response - task completed successfully",
+                    ),
+                )
+            }
+        }
         _ => {
             return Err(crate::error::CliError::config(format!(
                 "Unsupported provider: {}",

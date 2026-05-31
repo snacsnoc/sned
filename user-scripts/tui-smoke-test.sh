@@ -19,8 +19,8 @@ SNED_BIN="${REPO_ROOT}/target/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
-TOTAL_TESTS=9
+ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
+TOTAL_TESTS=10
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -57,6 +57,7 @@ Test Name              Description
 tui-startup-exit      Start ratatui in a pty, render banner, send /exit
 tui-user-echo         Type a prompt, verify ❯ prefix appears in transcript
 tui-turn-indicators   Type a prompt, verify ♦ and ─ turn markers appear
+tui-approval-scroll   Scroll away, then verify approval prompt stays visible
 help                  --help shows usage
 version               --version shows version
 invalid-flag           Invalid flag returns an error
@@ -101,6 +102,7 @@ test_description() {
         tui-startup-exit) echo "Start ratatui in a pty, render banner, send /exit" ;;
         tui-user-echo) echo "Type a prompt, verify ❯ prefix appears in transcript" ;;
         tui-turn-indicators) echo "Type a prompt, verify ✦ and ─ turn markers appear" ;;
+        tui-approval-scroll) echo "Scroll away, then verify approval prompt stays visible" ;;
         help) echo "--help shows usage" ;;
         version) echo "--version shows version" ;;
         invalid-flag) echo "Invalid flag returns an error" ;;
@@ -116,6 +118,7 @@ test_source() {
         tui-startup-exit) echo "src/cli/interactive.rs run_interactive_shell_inner" ;;
         tui-user-echo) echo "src/cli/tui/app.rs push_user_message / src/cli/interactive.rs Enter handler" ;;
         tui-turn-indicators) echo "src/core/agent_loop.rs assistant turn indicator / src/cli/tui/app.rs push_turn_separator" ;;
+        tui-approval-scroll) echo "src/cli/interactive.rs drain_output approval scroll path / src/core/approval.rs begin_approval_prompt" ;;
         help|version|invalid-flag|yolo-help|json-no-prompt) echo "src/cli/mod.rs CLI dispatch" ;;
         ctrlc-quit-empty) echo "src/cli/interactive.rs handle_key_event Ctrl+C on empty input" ;;
         *) echo "unknown" ;;
@@ -454,6 +457,124 @@ finally:
 PY
 }
 
+test_tui_approval_scroll() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import os
+import pty
+import select
+import shutil
+import signal
+import tempfile
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-approval-scroll.")
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+    "SNED_MOCK_APPROVAL_SCROLL": "1",
+})
+
+cmd = [
+    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+sent_user_prompt = False
+sent_prompt = False
+sent_scroll = False
+sent_approve = False
+sent_exit = False
+exit_code = None
+deadline = time.time() + 18
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+            text = buf.decode("utf-8", "replace")
+            if "type a prompt" in text and not sent_user_prompt:
+                os.write(fd, b"trigger approval scroll\r")
+                sent_user_prompt = True
+            if "approval scroll line 15" in text and not sent_scroll:
+                os.write(fd, b"\x1b[5~\x1b[5~\x1b[5~")
+                sent_scroll = True
+            if "Execute this tool?" in text and not sent_approve:
+                os.write(fd, b"y\r")
+                sent_approve = True
+            if sent_approve and "Task Completed" in text and not sent_exit:
+                time.sleep(0.25)
+                os.write(fd, b"/exit\r")
+                sent_exit = True
+            if "approval scroll line 01" in text:
+                sent_prompt = True
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None:
+        try:
+            ended, status = os.waitpid(pid, os.WNOHANG)
+            if ended:
+                exit_code = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            exit_code = 0
+
+    text = buf.decode("utf-8", "replace")
+    if verbose:
+        print(text)
+
+    if not sent_user_prompt:
+        print("TUI_TEST_FAIL initial user prompt was not sent")
+    elif not sent_scroll:
+        print("TUI_TEST_FAIL PageUp was not sent")
+    elif "Execute this tool?" not in text:
+        print("TUI_TEST_FAIL approval prompt did not appear after scrolling")
+    elif not sent_approve:
+        print("TUI_TEST_FAIL approval prompt was not acknowledged")
+    elif "Task Completed" not in text:
+        print("TUI_TEST_FAIL completion box did not appear after approval")
+    elif exit_code not in (0, None):
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS approval prompt stayed visible after scrolling")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
 test_help() {
     local output
     output="$("$SNED_BIN" --help 2>&1 || true)"
@@ -703,6 +824,7 @@ run_one() {
         tui-startup-exit) result="$(test_tui_startup_exit 2>&1)" ;;
         tui-user-echo) result="$(test_tui_user_echo 2>&1)" ;;
         tui-turn-indicators) result="$(test_tui_turn_indicators 2>&1)" ;;
+        tui-approval-scroll) result="$(test_tui_approval_scroll 2>&1)" ;;
         help) result="$(test_help 2>&1)" ;;
         version) result="$(test_version 2>&1)" ;;
         invalid-flag) result="$(test_invalid_flag 2>&1)" ;;
