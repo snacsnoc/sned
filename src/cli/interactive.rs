@@ -1272,6 +1272,7 @@ async fn handle_cli_only_command(
             let mut state = sh.lock().await;
             if state.plan_state.is_some() {
                 state.plan_state = None;
+                state.strict_plan_mode_enabled = true;
                 drop(state);
                 sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
                 app.mode = "ACT".to_string();
@@ -1354,7 +1355,7 @@ async fn handle_cli_only_command(
                         }
                         _ => unreachable!("PlanSubcommand::Approve/Pause/Resume/Abort are routed to CliOnlyCommand::PlanApprove/Pause/Resume/Abort"),
                     },
-                    CliOnlyCommand::PlanApprove => {
+                       CliOnlyCommand::PlanApprove => {
                         if plan.approved {
                             app.push_plain("Plan is already approved and running.");
                         } else if plan.steps.is_empty() {
@@ -1364,10 +1365,13 @@ async fn handle_cli_only_command(
                             let start_index = if plan.current_step_index < plan.steps.len()
                                 && plan.steps[plan.current_step_index].status == crate::core::plan_state::PlanStepStatus::Pending
                             {
-                                plan.current_step_index
+                                Some(plan.current_step_index)
                             } else {
                                 plan.steps.iter().position(|s| s.status == crate::core::plan_state::PlanStepStatus::Pending)
-                                    .unwrap_or(0)
+                            };
+                            let Some(start_index) = start_index else {
+                                app.push_plain("No pending step to approve. All steps are complete.");
+                                return Ok(false);
                             };
                             plan.current_step_index = start_index;
                             let steps_len = plan.steps.len();
@@ -1635,17 +1639,18 @@ async fn run_main_loop(
                                 {
                                     // Handle /plan <prompt> specially: clear old plan, enter Plan mode, spawn agent
                                     if let crate::cli::slash_commands::CliOnlyCommand::PlanPrompt(ref prompt_text) = cli_cmd {
-                                        // Clear old plan state
+                                        // Clear old plan state and restore strict plan mode restrictions
                                         {
                                             let state_arc = state_handle.lock().await;
                                             if let Some(sh) = state_arc.as_ref() {
                                                 let mut state = sh.lock().await;
                                                 state.plan_state = None;
+                                                state.strict_plan_mode_enabled = true;
                                             }
                                         }
                                         // Switch agent mode to Plan so write/edit tools are restricted
                                         {
-            let mut sess = session.lock().await;
+                                            let mut sess = session.lock().await;
                                             sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Plan);
                                         }
                                          {
