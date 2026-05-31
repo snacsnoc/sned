@@ -446,4 +446,17 @@ mod tests {
         state.clear_denied_tool_actions();
         assert!(state.denied_tool_actions.is_empty());
     }
+
+    #[test]
+    fn test_strict_plan_mode_enabled_default_and_restore() {
+        let state = TaskState::default();
+        assert!(state.strict_plan_mode_enabled);
+
+        let mut state = TaskState::default();
+        state.strict_plan_mode_enabled = false;
+        assert!(!state.strict_plan_mode_enabled);
+
+        state.strict_plan_mode_enabled = true;
+        assert!(state.strict_plan_mode_enabled);
+    }
 }
