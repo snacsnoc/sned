@@ -148,8 +148,11 @@ impl PlanState {
         self.steps.get(self.current_step_index)
     }
 
-    /// Advance to the next pending step. Returns a reference to the new current step, or None if done.
-    pub fn advance(&mut self) -> Option<&PlanStep> {
+    /// Advance to the next pending step. Returns the index of the new current step, or None if done.
+    ///
+    /// NOTE: Returns `usize` instead of `&PlanStep` to avoid reference-escaping-the-mutex issues
+    /// when called through `Arc<Mutex<Session>>`. This is a deliberate Rust-native adaptation.
+    pub fn advance(&mut self) -> Option<usize> {
         if let Some(step) = self.steps.get_mut(self.current_step_index)
             && step.status == PlanStepStatus::Running
         {
@@ -168,7 +171,7 @@ impl PlanState {
         {
             self.current_step_index = next_idx;
             self.steps[next_idx].status = PlanStepStatus::Running;
-            self.steps.get(next_idx)
+            Some(self.current_step_index)
         } else {
             // Only mark complete if ALL steps are actually Done (not Failed)
             if self.is_complete() {
@@ -495,10 +498,9 @@ mod tests {
         ]);
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
 
-        let next_step = plan.advance();
-        assert!(next_step.is_some());
-        let step = next_step.unwrap();
-        assert_eq!(step.index, 1);
+        let next_idx = plan.advance();
+        assert!(next_idx.is_some());
+        assert_eq!(next_idx.unwrap(), 1);
         assert_eq!(plan.steps[1].description, "Step two");
         assert_eq!(plan.steps[0].status, PlanStepStatus::Done);
         assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
@@ -635,11 +637,11 @@ mod tests {
         ]);
 
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
-        assert_eq!(plan.advance().unwrap().index, 1);
+        assert_eq!(plan.advance().unwrap(), 1);
         assert_eq!(plan.steps[0].status, PlanStepStatus::Done);
         assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
 
-        assert_eq!(plan.advance().unwrap().index, 2);
+        assert_eq!(plan.advance().unwrap(), 2);
         assert_eq!(plan.steps[1].status, PlanStepStatus::Done);
         assert_eq!(plan.steps[2].status, PlanStepStatus::Running);
 
@@ -660,7 +662,7 @@ mod tests {
         plan.current_step_index = 1;
         plan.mark_step(1, PlanStepStatus::Running).unwrap();
 
-        assert_eq!(plan.advance().unwrap().index, 2);
+        assert_eq!(plan.advance().unwrap(), 2);
         assert_eq!(plan.steps[2].status, PlanStepStatus::Running);
         assert!(!plan.is_complete());
     }
