@@ -1344,6 +1344,11 @@ async fn handle_cli_only_command(
                             plan.approved = true;
                             plan.steps[start_index].status = crate::core::plan_state::PlanStepStatus::Running;
                             drop(state);
+                            {
+                                let state_handle = sess.agent_loop_mut().state_handle();
+                                let mut state = state_handle.lock().await;
+                                state.strict_plan_mode_enabled = false;
+                            }
                             sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
                             drop(sess);
                             app.push_plain(format!(
