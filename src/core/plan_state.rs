@@ -156,6 +156,13 @@ impl PlanState {
             step.status = PlanStepStatus::Done;
         }
 
+        // Check if current step is Failed — do NOT skip it
+        if let Some(step) = self.steps.get(self.current_step_index)
+            && step.status == PlanStepStatus::Failed
+        {
+            return None;
+        }
+
         // Find next pending step
         if let Some(next_idx) = self.steps.iter().position(|s| s.status == PlanStepStatus::Pending)
         {
@@ -163,7 +170,10 @@ impl PlanState {
             self.steps[next_idx].status = PlanStepStatus::Running;
             Some(self.current_step_index)
         } else {
-            self.complete = true;
+            // Only mark complete if ALL steps are actually Done (not Failed)
+            if self.is_complete() {
+                self.complete = true;
+            }
             None
         }
     }
@@ -218,7 +228,18 @@ impl PlanState {
     pub fn format_state(&self) -> String {
         let mut out = String::new();
 
+        let mode_label = if self.complete {
+            "COMPLETE"
+        } else if self.paused {
+            "PAUSED"
+        } else if self.approved {
+            "ACT"
+        } else {
+            "APPROVAL"
+        };
+
         out.push_str("Plan state:\n");
+        out.push_str(&format!("mode: {}\n", mode_label));
         out.push_str(&format!("approved: {}\n", self.approved));
         out.push_str(&format!("paused: {}\n", self.paused));
         out.push_str(&format!("complete: {}\n", self.complete));
