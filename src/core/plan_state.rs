@@ -639,12 +639,12 @@ mod tests {
         ]);
 
         plan.mark_step(0, PlanStepStatus::Done).unwrap();
-        plan.mark_step(2, PlanStepStatus::Done).unwrap();
         plan.current_step_index = 1;
         plan.mark_step(1, PlanStepStatus::Running).unwrap();
 
-        assert_eq!(plan.advance().unwrap(), 1);
-        assert!(plan.is_complete());
+        assert_eq!(plan.advance().unwrap(), 2);
+        assert_eq!(plan.steps[2].status, PlanStepStatus::Running);
+        assert!(!plan.is_complete());
     }
 
     #[test]

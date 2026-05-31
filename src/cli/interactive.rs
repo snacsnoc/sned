@@ -1321,6 +1321,18 @@ async fn handle_cli_only_command(
                                 }
                             }
                         }
+                        PlanSubcommand::Approve => {
+                            app.push_plain("Use /plan approve instead.");
+                        }
+                        PlanSubcommand::Pause => {
+                            app.push_plain("Use /plan pause instead.");
+                        }
+                        PlanSubcommand::Resume => {
+                            app.push_plain("Use /plan resume instead.");
+                        }
+                        PlanSubcommand::Abort => {
+                            app.push_plain("Use /plan abort instead.");
+                        }
                     },
                     CliOnlyCommand::PlanApprove => {
                         if plan.approved {

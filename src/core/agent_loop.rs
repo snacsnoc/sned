@@ -3830,6 +3830,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         }
     }
 
@@ -3870,6 +3871,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let mut agent = AgentLoop::new(config);
@@ -3912,6 +3914,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let mut agent = AgentLoop::new(config);
@@ -3944,6 +3947,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let mut agent = AgentLoop::new(config);
@@ -4002,6 +4006,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let mut agent = AgentLoop::new(config);
@@ -4238,6 +4243,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config).with_task_storage(task_storage);
@@ -4363,6 +4369,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config).with_task_storage(task_storage);
@@ -4397,6 +4404,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         })
         .with_task_storage(task_storage_empty);
 
@@ -4429,6 +4437,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let hook_manager = Arc::new(HookManager::new("test-user"));
@@ -4466,6 +4475,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let hook_manager = Arc::new(HookManager::new("test-user"));
@@ -4552,6 +4562,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -4591,6 +4602,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -4629,6 +4641,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -4673,6 +4686,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -4739,6 +4753,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -4823,6 +4838,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -4886,6 +4902,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -4922,6 +4939,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -4957,6 +4975,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -5295,6 +5314,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let checkpoint_mgr = crate::core::checkpoints::TaskCheckpointManager::new(
@@ -5339,6 +5359,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config).with_system_prompt_context(
@@ -5405,6 +5426,7 @@ mod tests {
             max_tokens: None,
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
         };
 
         let agent = AgentLoop::new(config);

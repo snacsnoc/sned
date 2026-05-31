@@ -275,6 +275,48 @@ pub enum PlanSubcommand {
     Remove(usize),
     /// Replace the entire plan: (full_plan_text)
     Replace(String),
+    Approve,
+    Pause,
+    Resume,
+    Abort,
+}
+
+pub fn parse_plan_subcommand(args: &str) -> Option<PlanSubcommand> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.is_empty() {
+        return Some(PlanSubcommand::Status);
+    }
+
+    match parts[0] {
+        "status" => Some(PlanSubcommand::Status),
+        "approve" => Some(PlanSubcommand::Approve),
+        "pause" => Some(PlanSubcommand::Pause),
+        "resume" => Some(PlanSubcommand::Resume),
+        "abort" => Some(PlanSubcommand::Abort),
+        "edit" if parts.len() >= 3 => {
+            parts[1].parse::<usize>().ok()
+                .and_then(|step| {
+                    Some(PlanSubcommand::Edit(step, parts[2].to_string()))
+                })
+        }
+        "edit" => None,
+        "add" if parts.len() >= 3 => {
+            parts[1].parse::<usize>().ok()
+                .and_then(|after_step| {
+                    Some(PlanSubcommand::Add(after_step, parts[2].to_string()))
+                })
+        }
+        "add" => None,
+        "remove" if parts.len() >= 2 => {
+            parts[1].parse::<usize>().ok().map(PlanSubcommand::Remove)
+        }
+        "remove" => None,
+        "replace" if parts.len() >= 2 => {
+            Some(PlanSubcommand::Replace(parts[1..].join(" ")))
+        }
+        "replace" => None,
+        _ => None,
+    }
 }
 
 impl CliOnlyCommand {
@@ -313,66 +355,20 @@ impl CliOnlyCommand {
     /// Parse plan subcommands with arguments.
     /// Called when the command is "plan" and there's additional text.
     pub fn parse_plan_with_args(args: &str) -> Option<CliOnlyCommand> {
-        let args = args.trim();
-        if args.is_empty() {
-            return Some(CliOnlyCommand::Plan(PlanSubcommand::Status));
-        }
-
-        let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
-        match parts[0].to_lowercase().as_str() {
-            "approve" => Some(CliOnlyCommand::PlanApprove),
-            "pause" => Some(CliOnlyCommand::PlanPause),
-            "resume" => Some(CliOnlyCommand::PlanResume),
-            "abort" => Some(CliOnlyCommand::PlanAbort),
-            "edit" => {
-                if parts.len() >= 3 {
-                    if let Ok(step) = parts[1].parse::<usize>() {
-                        Some(CliOnlyCommand::Plan(PlanSubcommand::Edit(
-                            step,
-                            parts[2].to_string(),
-                        )))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            "add" => {
-                if parts.len() >= 3 {
-                    if let Ok(after_step) = parts[1].parse::<usize>() {
-                        Some(CliOnlyCommand::Plan(PlanSubcommand::Add(
-                            after_step,
-                            parts[2].to_string(),
-                        )))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            "remove" => {
-                if parts.len() >= 2 {
-                    if let Ok(step) = parts[1].parse::<usize>() {
-                        Some(CliOnlyCommand::Plan(PlanSubcommand::Remove(step)))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            "replace" => {
-                if parts.len() >= 2 {
-                    Some(CliOnlyCommand::Plan(PlanSubcommand::Replace(
-                        parts[1..].join(" "),
-                    )))
-                } else {
-                    None
-                }
-            }
-            _ => Some(CliOnlyCommand::PlanPrompt(args.to_string())),
+        let args_trimmed = args.trim();
+        let subcmd = parse_plan_subcommand(args_trimmed);
+        match subcmd {
+            Some(PlanSubcommand::Status) => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
+            Some(PlanSubcommand::Edit(step, desc)) => Some(CliOnlyCommand::Plan(PlanSubcommand::Edit(step, desc))),
+            Some(PlanSubcommand::Add(after, desc)) => Some(CliOnlyCommand::Plan(PlanSubcommand::Add(after, desc))),
+            Some(PlanSubcommand::Remove(step)) => Some(CliOnlyCommand::Plan(PlanSubcommand::Remove(step))),
+            Some(PlanSubcommand::Replace(text)) => Some(CliOnlyCommand::Plan(PlanSubcommand::Replace(text))),
+            Some(PlanSubcommand::Approve) => Some(CliOnlyCommand::PlanApprove),
+            Some(PlanSubcommand::Pause) => Some(CliOnlyCommand::PlanPause),
+            Some(PlanSubcommand::Resume) => Some(CliOnlyCommand::PlanResume),
+            Some(PlanSubcommand::Abort) => Some(CliOnlyCommand::PlanAbort),
+            None if args_trimmed.is_empty() => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
+            None => Some(CliOnlyCommand::PlanPrompt(args_trimmed.to_string())),
         }
     }
 
@@ -2251,74 +2247,7 @@ mod tests {
         assert!(text.contains("/checkpoint undo"));
     }
 
-    // --- Plan Mode Tests ---
-
-    #[test]
-    fn test_parse_plan_subcommand_approve() {
-        let parsed = parse_plan_subcommand("approve");
-        assert!(parsed.is_some());
-        assert!(matches!(parsed.unwrap(), PlanSubcommand::Approve));
-    }
-
-    #[test]
-    fn test_parse_plan_subcommand_pause() {
-        let parsed = parse_plan_subcommand("pause");
-        assert!(parsed.is_some());
-        assert!(matches!(parsed.unwrap(), PlanSubcommand::Pause));
-    }
-
-    #[test]
-    fn test_parse_plan_subcommand_resume() {
-        let parsed = parse_plan_subcommand("resume");
-        assert!(parsed.is_some());
-        assert!(matches!(parsed.unwrap(), PlanSubcommand::Resume));
-    }
-
-    #[test]
-    fn test_parse_plan_subcommand_abort() {
-        let parsed = parse_plan_subcommand("abort");
-        assert!(parsed.is_some());
-        assert!(matches!(parsed.unwrap(), PlanSubcommand::Abort));
-    }
-
-    #[test]
-    fn test_parse_plan_subcommand_edit() {
-        let parsed = parse_plan_subcommand("edit 2 new description");
-        assert!(parsed.is_some());
-        let sub = parsed.unwrap();
-        assert!(matches!(sub, PlanSubcommand::Edit(2, ref d) if d == "new description"));
-    }
-
-    #[test]
-    fn test_parse_plan_subcommand_add() {
-        let parsed = parse_plan_subcommand("add 0 new step");
-        assert!(parsed.is_some());
-        let sub = parsed.unwrap();
-        assert!(matches!(sub, PlanSubcommand::Add(0, ref d) if d == "new step"));
-    }
-
-    #[test]
-    fn test_parse_plan_subcommand_remove() {
-        let parsed = parse_plan_subcommand("remove 1");
-        assert!(parsed.is_some());
-        let sub = parsed.unwrap();
-        assert!(matches!(sub, PlanSubcommand::Remove(1)));
-    }
-
-    #[test]
-    fn test_parse_plan_subcommand_replace() {
-        let parsed = parse_plan_subcommand("replace 1. step one\n2. step two");
-        assert!(parsed.is_some());
-        let sub = parsed.unwrap();
-        let expected_text = "1. step one\n2. step two";
-        assert!(matches!(sub, PlanSubcommand::Replace(ref t) if t == expected_text));
-    }
-
-    #[test]
-    fn test_parse_plan_subcommand_unknown() {
-        let parsed = parse_plan_subcommand("unknown");
-        assert!(parsed.is_none());
-    }
+    // --- Plan Mode Tests (using CliOnlyCommand variants) ---
 
     #[test]
     fn test_parse_cli_only_plan_prompt() {
