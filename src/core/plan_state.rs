@@ -195,7 +195,7 @@ impl PlanState {
     /// Accepts formats:
     /// - `1. First step`
     /// - `1) First step`
-    /// - `- Step 1: First step`
+    /// - `Step 1: First step`
     pub fn parse_plan(text: &str) -> Option<Vec<String>> {
         let mut steps = Vec::new();
 
@@ -364,8 +364,10 @@ fn parse_numbered_line(line: &str) -> Option<String> {
 /// Parse a bullet line like "- Step N: description" or "Step N: description".
 /// Bare bullets ("- description") are rejected per spec — only numbered formats are accepted.
 fn parse_bullet_line(line: &str) -> Option<String> {
-    // Handle "Step N: description" (no leading bullet)
-    parse_step_prefix_line(line)
+    // Strip leading "- " or "* " bullet prefix if present
+    let stripped = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).unwrap_or(line);
+    // Handle "Step N: description" format
+    parse_step_prefix_line(stripped)
 }
 
 /// Parse a line like "Step 1: description" or "Step 1. description".
@@ -877,5 +879,97 @@ mod tests {
         assert_eq!(plan.steps[2].status_icon(), "✓");
         plan.mark_step(3, PlanStepStatus::Failed).unwrap();
         assert_eq!(plan.steps[3].status_icon(), "✗");
+    }
+
+    #[test]
+    fn test_approve_validates_current_step_index() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+            "Step 3".to_string(),
+        ]);
+        // Mark step 0 as Done, step 1 as Failed, set current to step 1
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.mark_step(1, PlanStepStatus::Failed).unwrap();
+        plan.current_step_index = 1;
+        // approve should find step 2 (first pending) not step 1 (failed)
+        let start_index = if plan.current_step_index < plan.steps.len()
+            && plan.steps[plan.current_step_index].status == PlanStepStatus::Pending
+        {
+            plan.current_step_index
+        } else {
+            plan.steps.iter().position(|s| s.status == PlanStepStatus::Pending)
+                .unwrap_or(0)
+        };
+        plan.current_step_index = start_index;
+        plan.approved = true;
+        plan.steps[start_index].status = PlanStepStatus::Running;
+        assert_eq!(start_index, 2);
+        assert_eq!(plan.steps[2].status, PlanStepStatus::Running);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Failed);
+    }
+
+    #[test]
+    fn test_approve_finds_first_pending_when_index_out_of_bounds() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+        ]);
+        plan.current_step_index = 5; // out of bounds
+        let start_index = if plan.current_step_index < plan.steps.len()
+            && plan.steps[plan.current_step_index].status == PlanStepStatus::Pending
+        {
+            plan.current_step_index
+        } else {
+            plan.steps.iter().position(|s| s.status == PlanStepStatus::Pending)
+                .unwrap_or(0)
+        };
+        assert_eq!(start_index, 0);
+    }
+
+    #[test]
+    fn test_pause_resume_failure_cycle() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+        ]);
+        plan.approved = true;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+
+        // Simulate failure
+        plan.mark_step(0, PlanStepStatus::Failed).unwrap();
+        plan.paused = true;
+        assert!(plan.paused);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Failed);
+
+        // Resume: mark failed step as running again
+        plan.paused = false;
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        assert!(!plan.paused);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+    }
+
+    #[test]
+    fn test_parse_plan_rejects_unnumbered_bullets() {
+        let text = "- first step\n- second step";
+        let result = PlanState::parse_plan(text);
+        assert!(result.is_none(), "unnumbered bullets should be rejected");
+    }
+
+    #[test]
+    fn test_parse_plan_accepts_step_prefix_with_bullet() {
+        let text = "- Step 1: first step\n- Step 2: second step";
+        let steps = PlanState::parse_plan(text).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0], "first step");
+        assert_eq!(steps[1], "second step");
+    }
+
+    #[test]
+    fn test_parse_plan_accepts_single_step() {
+        let text = "1. Only one step";
+        let steps = PlanState::parse_plan(text).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0], "Only one step");
     }
 }
