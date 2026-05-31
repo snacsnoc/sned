@@ -916,6 +916,18 @@ pub fn take_approval_sender() -> Option<std::sync::mpsc::Sender<ApprovalResult>>
     guard.take()
 }
 
+/// Begin an approval prompt lifecycle.
+///
+/// Sets the prompt visible state before the prompt text is emitted so the
+/// TUI can scroll to it immediately and route the next keypress correctly.
+fn begin_approval_prompt() -> std::sync::mpsc::Receiver<ApprovalResult> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    set_approval_sender(sender);
+    set_approval_prompt_scroll();
+    set_approval_prompt_active(true);
+    receiver
+}
+
 /// Prompt the user for approval of a tool execution.
 /// Blocks on a channel until the TUI loop sends a y/n/a response.
 pub fn prompt_for_approval(
@@ -942,15 +954,12 @@ pub fn prompt_for_approval(
     );
 
     use crate::cli::output::OutputEvent;
+    let receiver = begin_approval_prompt();
     output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
-    set_approval_prompt_scroll();
 
-    // Channel-based: store sender, set flag, block on receiver with timeout.
-    // The TUI loop reads the key event and sends the result through the channel.
-    // Timeout prevents hanging forever if user walks away or terminal crashes.
-    let (sender, receiver) = std::sync::mpsc::channel();
-    set_approval_sender(sender);
-    set_approval_prompt_active(true);
+    // Channel-based: the TUI loop reads the key event and sends the result
+    // through the channel. Timeout prevents hanging forever if user walks
+    // away or terminal crashes.
     let _guard = ApprovalPromptGuard;
 
     let result = receiver
@@ -1099,13 +1108,11 @@ pub async fn prompt_for_combined_approval(
     );
 
     use crate::cli::output::OutputEvent;
+    let receiver = begin_approval_prompt();
     output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
 
     // Wrap blocking channel recv in spawn_blocking to avoid blocking the tokio runtime
     tokio::task::spawn_blocking(move || {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        set_approval_sender(sender);
-        set_approval_prompt_active(true);
         let _guard = ApprovalPromptGuard;
 
         let result = receiver
@@ -1184,6 +1191,31 @@ mod tests {
     #[test]
     fn test_approval_prompt_active_flag_is_initially_false() {
         assert!(!is_approval_prompt_active());
+    }
+
+    #[test]
+    fn test_begin_approval_prompt_sets_visibility_flags() {
+        struct ApprovalPromptCleanup;
+
+        impl Drop for ApprovalPromptCleanup {
+            fn drop(&mut self) {
+                set_approval_prompt_active(false);
+                clear_approval_prompt_scroll();
+                let _ = take_approval_sender();
+            }
+        }
+
+        let _cleanup = ApprovalPromptCleanup;
+        clear_approval_prompt_scroll();
+        set_approval_prompt_active(false);
+        let receiver = begin_approval_prompt();
+
+        assert!(is_approval_prompt_active());
+        assert!(take_approval_prompt_scroll());
+
+        drop(receiver);
+        let _ = take_approval_sender();
+        set_approval_prompt_active(false);
     }
 
     #[test]

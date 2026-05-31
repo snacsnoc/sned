@@ -158,10 +158,7 @@ impl App {
 
     /// Push a turn separator line.
     pub fn push_turn_separator(&mut self) {
-        self.push_output(Line::from(Span::styled(
-            "─".repeat(40),
-            theme::dim_style(),
-        )));
+        self.push_output(Line::from(Span::styled("─".repeat(40), theme::dim_style())));
     }
 
     /// Push a user message with proper formatting (splits on newlines).
@@ -182,11 +179,9 @@ impl App {
 
         if has_plan {
             // Layout with plan panel on the right
-            let [main_area, plan_area] = Layout::horizontal([
-                Constraint::Min(40),
-                Constraint::Length(35),
-            ])
-            .areas(frame.area());
+            let [main_area, plan_area] =
+                Layout::horizontal([Constraint::Min(40), Constraint::Length(35)])
+                    .areas(frame.area());
 
             let [output_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(1),
@@ -269,12 +264,13 @@ impl App {
         let content_height = visible_height.saturating_sub(2);
         self.last_content_height = content_height;
         let total_lines = self.output_lines.len();
-        
+
         let scroll_y = if self.auto_scroll {
             total_lines.saturating_sub(content_height) as u16
         } else {
             // Re-enable auto-scroll if user is near bottom (within 2 lines)
-            let distance_from_bottom = total_lines.saturating_sub(self.scroll_offset as usize + content_height);
+            let distance_from_bottom =
+                total_lines.saturating_sub(self.scroll_offset as usize + content_height);
             if distance_from_bottom <= 2 {
                 self.auto_scroll = true;
                 total_lines.saturating_sub(content_height) as u16
@@ -293,21 +289,27 @@ impl App {
         // Output pane with visible lines only (virtual scrolling)
         {
             let visible_lines: Vec<Line> = if start < end {
-                self.output_lines.iter().skip(start).take(end - start).cloned().collect()
+                self.output_lines
+                    .iter()
+                    .skip(start)
+                    .take(end - start)
+                    .cloned()
+                    .collect()
             } else {
                 Vec::new()
             };
             let output = Paragraph::new(visible_lines)
                 .wrap(Wrap { trim: false })
-                .scroll((0, 0))  // No scroll - we already sliced to visible window
+                .scroll((0, 0)) // No scroll - we already sliced to visible window
                 .block(
                     theme::border_block(" sned ")
                         .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
                 );
             frame.render_widget(output, output_area);
 
-            // Render loading indicator at bottom of output area
-            if self.agent_busy {
+            // Render loading indicator at bottom of output area unless an
+            // approval prompt is active. Approval visibility takes priority.
+            if self.agent_busy && !crate::core::approval::is_approval_prompt_active() {
                 let loading_area = Rect::new(
                     output_area.x,
                     output_area.y + output_area.height.saturating_sub(1),
@@ -466,5 +468,55 @@ pub fn format_duration(duration: Duration) -> String {
 impl Default for App {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn test_render_output_hides_loading_overlay_during_approval_prompt() {
+        struct ApprovalPromptCleanup;
+
+        impl Drop for ApprovalPromptCleanup {
+            fn drop(&mut self) {
+                crate::core::approval::set_approval_prompt_active(false);
+            }
+        }
+
+        let _cleanup = ApprovalPromptCleanup;
+        crate::core::approval::set_approval_prompt_active(true);
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.auto_scroll = true;
+        app.output_lines
+            .push_back(ratatui::text::Line::from("line 1"));
+        app.output_lines
+            .push_back(ratatui::text::Line::from("line 2"));
+        app.output_lines.push_back(ratatui::text::Line::from(
+            "Approve these edits? (y/n/always):",
+        ));
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Approve these edits?"));
+        assert!(!rendered.contains("Agent processing..."));
     }
 }

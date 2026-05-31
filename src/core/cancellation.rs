@@ -199,6 +199,19 @@ fn signal_action(last_signal: &mut Option<Instant>, now: Instant) -> SignalActio
     }
 }
 
+/// Resolve the exit code for a force-exit signal.
+///
+/// In TUI mode, the interactive loop already owns the "double Ctrl+C" quit
+/// behavior, so the signal handler should not convert that path into a shell
+/// interrupt exit code. Non-TUI invocations keep the conventional signal code.
+fn force_exit_code(signal_name: &str, exit_code: i32) -> i32 {
+    if signal_name == "Ctrl+C" && TERMINAL_INITIALIZED.load(Ordering::Acquire) {
+        crate::exit_codes::EXIT_SUCCESS
+    } else {
+        exit_code
+    }
+}
+
 async fn handle_shutdown_signal(
     state: &Arc<Mutex<TaskState>>,
     last_signal: &Arc<Mutex<Option<Instant>>>,
@@ -236,7 +249,7 @@ async fn handle_shutdown_signal(
             if TERMINAL_INITIALIZED.load(Ordering::Acquire) {
                 ratatui::restore();
             }
-            std::process::exit(exit_code);
+            std::process::exit(force_exit_code(signal_name, exit_code));
         }
     }
 }
@@ -292,6 +305,29 @@ pub async fn setup_ctrl_c_handler(state: Arc<Mutex<TaskState>>) {
 mod tests {
     use super::*;
 
+    struct TerminalInitializedGuard(bool);
+
+    impl Drop for TerminalInitializedGuard {
+        fn drop(&mut self) {
+            TERMINAL_INITIALIZED.store(self.0, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn test_force_exit_code_uses_clean_exit_in_terminal_mode() {
+        let _guard = TerminalInitializedGuard(TERMINAL_INITIALIZED.load(Ordering::Acquire));
+
+        TERMINAL_INITIALIZED.store(false, Ordering::Release);
+        assert_eq!(force_exit_code("Ctrl+C", 130), 130);
+
+        TERMINAL_INITIALIZED.store(true, Ordering::Release);
+        assert_eq!(
+            force_exit_code("Ctrl+C", 130),
+            crate::exit_codes::EXIT_SUCCESS
+        );
+        assert_eq!(force_exit_code("SIGTERM", 143), 143);
+    }
+
     #[tokio::test]
     async fn test_cancellation_handler_sets_abort_flag() {
         let state = Arc::new(Mutex::new(TaskState::default()));
@@ -316,7 +352,11 @@ mod tests {
         let result = handler
             .abort_task(None, &state_manager, "test-task", None)
             .await;
-        assert!(result.is_ok(), "abort_task should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "abort_task should succeed: {:?}",
+            result.err()
+        );
 
         assert!(handler.is_cancelled().await);
 
@@ -362,7 +402,11 @@ mod tests {
         let result = handler
             .abort_task(None, &state_manager, "test-task", None)
             .await;
-        assert!(result.is_ok(), "abort_task should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "abort_task should succeed: {:?}",
+            result.err()
+        );
 
         assert!(
             handler.is_cancelled().await,
