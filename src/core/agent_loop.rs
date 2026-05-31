@@ -888,8 +888,28 @@ impl AgentLoop {
                         }
                     }
                     let expanded_message = self.expand_message_mentions(queued_message).await;
+                    // If a plan is active, prepend plan context so the model doesn't abandon it
+                    let final_message = {
+                        let state = self.state.lock().await;
+                        if let Some(ref plan) = state.plan_state
+                            && plan.approved && !plan.complete && !plan.paused
+                        {
+                            let note = format!(
+                                "[Note: A plan is in progress at step {}/{}. Continue executing the plan after addressing this message.]\n\n",
+                                plan.current_step_index + 1,
+                                plan.steps.len(),
+                            );
+                            let mut msg = expanded_message;
+                            if let MessageContent::Text(ref text) = msg.content {
+                                msg.content = MessageContent::Text(format!("{}{}", note, text));
+                            }
+                            msg
+                        } else {
+                            expanded_message
+                        }
+                    };
                     let mut history = self.conversation_history.lock().await;
-                    history.push(expanded_message);
+                    history.push(final_message);
                     drop(history);
                     let mut state = self.state.lock().await;
                     state.clear_denied_tool_actions();
@@ -930,8 +950,28 @@ impl AgentLoop {
                             }
                             let expanded_message =
                                 self.expand_message_mentions(queued_message).await;
+                            // If a plan is active, prepend plan context so the model doesn't abandon it
+                            let final_message = {
+                                let state = self.state.lock().await;
+                                if let Some(ref plan) = state.plan_state
+                                    && plan.approved && !plan.complete && !plan.paused
+                                {
+                                    let note = format!(
+                                        "[Note: A plan is in progress at step {}/{}. Continue executing the plan after addressing this message.]\n\n",
+                                        plan.current_step_index + 1,
+                                        plan.steps.len(),
+                                    );
+                                    let mut msg = expanded_message;
+                                    if let MessageContent::Text(ref text) = msg.content {
+                                        msg.content = MessageContent::Text(format!("{}{}", note, text));
+                                    }
+                                    msg
+                                } else {
+                                    expanded_message
+                                }
+                            };
                             let mut history = self.conversation_history.lock().await;
-                            history.push(expanded_message);
+                            history.push(final_message);
                             drop(history);
                             {
                                 let mut state = self.state.lock().await;
@@ -1213,18 +1253,24 @@ impl AgentLoop {
             })
         };
         if let Some((ps_text, hash)) = plan_state_entry {
-            let mut history = self.conversation_history.lock().await;
-            let last_hash = self.state.lock().await.last_injected_plan_state_hash;
+            let last_hash = {
+                let state = self.state.lock().await;
+                state.last_injected_plan_state_hash
+            };
             if last_hash != Some(hash) {
-                history.push(StorageMessage {
-                    id: None,
-                    role: MessageRole::User,
-                    content: MessageContent::Text(ps_text),
-                    model_info: None,
-                    metrics: None,
-                    ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-                });
-                self.state.lock().await.last_injected_plan_state_hash = Some(hash);
+                {
+                    let mut history = self.conversation_history.lock().await;
+                    history.push(StorageMessage {
+                        id: None,
+                        role: MessageRole::User,
+                        content: MessageContent::Text(ps_text),
+                        model_info: None,
+                        metrics: None,
+                        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                    });
+                }
+                let mut state = self.state.lock().await;
+                state.last_injected_plan_state_hash = Some(hash);
             }
         }
 
@@ -2797,24 +2843,23 @@ impl AgentLoop {
                     let mut step_fail_msg = None;
                     if let Some(ref mut plan) = state.plan_state
                         && plan.approved && !plan.complete
+                        && plan.current_step_index < plan.steps.len()
                     {
-                        if plan.current_step_index < plan.steps.len() {
-                            let current_status = &plan.steps[plan.current_step_index].status;
-                            if *current_status != PlanStepStatus::Failed {
-                                plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
-                                    .ok();
-                                plan.paused = true;
-                                tracing::info!(
-                                    step_index = plan.current_step_index,
-                                    "Plan step failed. Execution paused. User action required."
-                                );
-                                if !self.config.json_output {
-                                    step_fail_msg = Some(format!(
-                                        "Plan step {}/{} failed. Use /plan resume to retry or /plan abort to cancel.",
-                                        plan.current_step_index + 1,
-                                        plan.steps.len()
-                                    ));
-                                }
+                        let current_status = &plan.steps[plan.current_step_index].status;
+                        if *current_status != PlanStepStatus::Failed {
+                            plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
+                                .ok();
+                            plan.paused = true;
+                            tracing::info!(
+                                step_index = plan.current_step_index,
+                                "Plan step failed. Execution paused. User action required."
+                            );
+                            if !self.config.json_output {
+                                step_fail_msg = Some(format!(
+                                    "Plan step {}/{} failed. Use /plan resume to retry or /plan abort to cancel.",
+                                    plan.current_step_index + 1,
+                                    plan.steps.len()
+                                ));
                             }
                         }
                     }
@@ -2870,24 +2915,23 @@ impl AgentLoop {
                 let mut step_fail_msg = None;
                 if let Some(ref mut plan) = state.plan_state
                     && plan.approved && !plan.complete
+                    && plan.current_step_index < plan.steps.len()
                 {
-                    if plan.current_step_index < plan.steps.len() {
-                        let current_status = &plan.steps[plan.current_step_index].status;
-                        if *current_status != PlanStepStatus::Failed {
-                            plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
-                                .ok();
-                            plan.paused = true;
-                            tracing::info!(
-                                step_index = plan.current_step_index,
-                                "Plan step failed (no tool calls). Execution paused."
-                            );
-                            if !self.config.json_output {
-                                step_fail_msg = Some(format!(
-                                    "Plan step {}/{} failed (no tool calls). Use /plan resume to retry or /plan abort to cancel.",
-                                    plan.current_step_index + 1,
-                                    plan.steps.len()
-                                ));
-                            }
+                    let current_status = &plan.steps[plan.current_step_index].status;
+                    if *current_status != PlanStepStatus::Failed {
+                        plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
+                            .ok();
+                        plan.paused = true;
+                        tracing::info!(
+                            step_index = plan.current_step_index,
+                            "Plan step failed (no tool calls). Execution paused."
+                        );
+                        if !self.config.json_output {
+                            step_fail_msg = Some(format!(
+                                "Plan step {}/{} failed (no tool calls). Use /plan resume to retry or /plan abort to cancel.",
+                                plan.current_step_index + 1,
+                                plan.steps.len()
+                            ));
                         }
                     }
                 }

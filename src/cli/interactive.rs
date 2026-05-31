@@ -474,7 +474,7 @@ async fn cancel_agent(
 async fn handle_key_event(
     key: KeyEvent,
     app: &mut App,
-    _session: &Arc<Mutex<InteractiveSession>>,
+    session: &Arc<Mutex<InteractiveSession>>,
     task_id: &str,
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
@@ -510,7 +510,11 @@ async fn handle_key_event(
             if let Some(sender) = take_followup_sender(task_id) {
                 let text = app.get_input_with_expanded_pastes();
                 // Echo followup response to output pane
-                app.push_user_message(&text);
+                {
+                    let sess = session.lock().await;
+                    let writer = sess.agent_loop().output_writer();
+                    app.push_user_message(&text, writer);
+                }
                 let _ = sender.send(text);
                 app.input = App::new_textarea(Vec::new());
             }
@@ -532,7 +536,11 @@ async fn handle_key_event(
                 app.push_turn_separator();
             }
             // Echo prompt to output pane
-            app.push_user_message(&text);
+            {
+                let sess = session.lock().await;
+                let writer = sess.agent_loop().output_writer();
+                app.push_user_message(&text, writer);
+            }
             // Clear textarea and paste tracking
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
@@ -690,9 +698,10 @@ async fn handle_cli_only_command(
     app: &mut App,
     session: &Arc<Mutex<InteractiveSession>>,
     task_id: &str,
-    agent_busy: &AtomicBool,
-    _agent_start_time: &Arc<Mutex<Option<Instant>>>,
-    _agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    agent_busy: &Arc<AtomicBool>,
+    agent_done: &Arc<tokio::sync::Notify>,
+    agent_start_time: &Arc<Mutex<Option<Instant>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     task_opts: &TaskOptions,
     auto_approve: bool,
@@ -1245,6 +1254,7 @@ async fn handle_cli_only_command(
                 drop(state);
                 sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
                 app.mode = "ACT".to_string();
+                app.update_placeholder();
                 app.push_plain("Plan aborted. Already-applied changes are kept.");
             } else {
                 app.push_plain("No active plan to abort.");
@@ -1357,6 +1367,10 @@ async fn handle_cli_only_command(
                                 steps_len,
                                 step_desc
                             ));
+                            // Spawn agent to execute the approved plan
+                            let prompt = format!("Execute step {}/{}: {}", start_index + 1, steps_len, step_desc);
+                            spawn_agent_task(session, &prompt, &agent_busy, agent_done, agent_start_time, agent_task).await?;
+                            app.agent_busy = true;
                         }
                     }
                     CliOnlyCommand::PlanPause => {
@@ -1379,7 +1393,16 @@ async fn handle_cli_only_command(
                             if plan.steps.get(plan.current_step_index).is_some_and(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed) {
                                 plan.steps[plan.current_step_index].status = crate::core::plan_state::PlanStepStatus::Running;
                             }
-                            app.push_plain(format!("Plan resumed at step {}/{}: {}", plan.current_step_index + 1, plan.steps.len(), plan.steps[plan.current_step_index].description));
+                            let step_num = plan.current_step_index + 1;
+                            let step_total = plan.steps.len();
+                            let step_desc = plan.steps[plan.current_step_index].description.clone();
+                            drop(state);
+                            drop(sess);
+                            app.push_plain(format!("Plan resumed at step {}/{}: {}", step_num, step_total, step_desc));
+                            // Spawn agent to resume plan execution
+                            let prompt = format!("Execute step {}/{}: {}", step_num, step_total, step_desc);
+                            spawn_agent_task(session, &prompt, &agent_busy, agent_done, agent_start_time, agent_task).await?;
+                            app.agent_busy = true;
                         }
                     }
                     
@@ -1421,6 +1444,9 @@ async fn run_main_loop(
             if let Some(state_arc) = state_handle.lock().await.as_ref() {
                 let state = state_arc.lock().await;
                 app.plan_state_cache = state.plan_state.clone();
+                if let Some(ref plan) = state.plan_state {
+                    app.mode = if plan.approved { "ACT".to_string() } else { "PLAN".to_string() };
+                }
             }
         }
 
@@ -1571,9 +1597,14 @@ async fn run_main_loop(
             let mut sess = session.lock().await;
                                             sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Plan);
                                         }
-                                        app.push_user_message(&text);
+                                         {
+                                             let sess = session.lock().await;
+                                             let writer = sess.agent_loop().output_writer();
+                                             app.push_user_message(&text, writer);
+                                         }
                                         app.push_plain("Entering plan mode...");
                                         app.mode = "PLAN".to_string();
+                                        app.update_placeholder();
                                         // Spawn agent with the prompt
                                         if agent_busy.load(Ordering::Relaxed) {
                                             if let Some(qh) = queue_handle.lock().await.as_ref() {
@@ -1599,6 +1630,7 @@ async fn run_main_loop(
                                             &session,
                                             &task_id,
                                             &agent_busy,
+                                            &agent_done,
                                             &agent_start_time,
                                             &agent_task,
                                             &state_handle,
@@ -1620,7 +1652,11 @@ async fn run_main_loop(
                                         if let Some(qh) = queue_handle.lock().await.as_ref() {
                                             qh.enqueue_text_message(text.clone()).await;
                                             let count = qh.queued_message_count().await;
-                                            app.push_user_message(&text);
+                                            {
+                                             let sess = session.lock().await;
+                                             let writer = sess.agent_loop().output_writer();
+                                             app.push_user_message(&text, writer);
+                                         }
                                             app.push_styled(
                                                 format!(
                                                     "Command queued ({} in queue): {}",
@@ -1643,7 +1679,11 @@ async fn run_main_loop(
                                     && !processed.is_empty()
                                 {
                                     // Echo queued message to output pane
-                                    app.push_user_message(&processed);
+                                    {
+                                        let sess = session.lock().await;
+                                        let writer = sess.agent_loop().output_writer();
+                                        app.push_user_message(&processed, writer);
+                                    }
                                     qh.enqueue_text_message(processed).await;
                                     let count = qh.queued_message_count().await;
                                     app.push_styled(
@@ -1734,23 +1774,7 @@ async fn run_main_loop(
             }
         }
 
-        // 4b. Sync plan state from TaskState to App.plan_state_cache for TUI rendering
-        if let Some(state_arc) = state_handle.lock().await.as_ref() {
-            let state = state_arc.lock().await;
-            if let Some(ref plan) = state.plan_state {
-                app.plan_state_cache = Some(plan.clone());
-                // Sync mode from plan state: approved = ACT, unapproved = PLAN
-                if plan.approved {
-                    app.mode = "ACT".to_string();
-                } else {
-                    app.mode = "PLAN".to_string();
-                }
-            } else if app.plan_state_cache.is_some() {
-                // Clear cache when plan is cleared
-                app.plan_state_cache = None;
-                app.mode = "ACT".to_string();
-            }
-        }
+
 
         // 5. Update elapsed time for status bar
         if app.agent_busy
