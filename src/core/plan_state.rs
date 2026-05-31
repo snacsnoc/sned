@@ -361,19 +361,11 @@ fn parse_numbered_line(line: &str) -> Option<String> {
     Some(desc)
 }
 
-/// Parse a bullet line like "- description" or "- Step N: description".
+/// Parse a bullet line like "- Step N: description" or "Step N: description".
+/// Bare bullets ("- description") are rejected per spec — only numbered formats are accepted.
 fn parse_bullet_line(line: &str) -> Option<String> {
-    if line.starts_with("- ") || line.starts_with("* ") {
-        let desc = line[2..].trim().to_string();
-        if !desc.is_empty() {
-            return Some(desc);
-        }
-    }
-    // Also handle "Step N: description" (no leading bullet)
-    if let Some(step) = parse_step_prefix_line(line) {
-        return Some(step);
-    }
-    None
+    // Handle "Step N: description" (no leading bullet)
+    parse_step_prefix_line(line)
 }
 
 /// Parse a line like "Step 1: description" or "Step 1. description".
@@ -597,12 +589,12 @@ mod tests {
 
     #[test]
     fn test_parse_plan_mixed_formats() {
-        let text = "1. First numbered step\n- A bullet step\nStep 3: A prefix step";
+        let text = "1. First numbered step\nStep 2: A prefix step\n3) Third numbered step";
         let steps = PlanState::parse_plan(text).unwrap();
         assert_eq!(steps.len(), 3);
         assert_eq!(steps[0], "First numbered step");
-        assert_eq!(steps[1], "A bullet step");
-        assert_eq!(steps[2], "A prefix step");
+        assert_eq!(steps[1], "A prefix step");
+        assert_eq!(steps[2], "Third numbered step");
     }
 
     #[test]
