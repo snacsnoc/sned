@@ -1650,11 +1650,6 @@ async fn run_main_loop(
                                             let mut sess = session.lock().await;
                                             sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Plan);
                                         }
-                                         {
-                                             let sess = session.lock().await;
-                                             let writer = sess.agent_loop().output_writer();
-                                             app.push_user_message(&text, writer);
-                                         }
                                         app.push_plain("Entering plan mode...");
                                         app.mode = "PLAN".to_string();
                                         app.update_placeholder();
