@@ -932,6 +932,7 @@ pub fn prompt_for_approval(
 
     use crate::cli::output::OutputEvent;
     output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
+    set_approval_prompt_scroll();
 
     // Channel-based: store sender, set flag, block on receiver with timeout.
     // The TUI loop reads the key event and sends the result through the channel.
@@ -967,6 +968,20 @@ pub fn set_approval_prompt_active(active: bool) {
 /// Check if an approval prompt is currently active.
 pub fn is_approval_prompt_active() -> bool {
     APPROVAL_PROMPT_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Flag indicating if the approval prompt was just emitted and needs a forced scroll.
+/// Set when the prompt is emitted, cleared after one scroll in drain_output.
+static APPROVAL_PROMPT_SCROLL: AtomicBool = AtomicBool::new(false);
+
+/// Mark that the approval prompt was just emitted and needs a forced scroll.
+pub fn set_approval_prompt_scroll() {
+    APPROVAL_PROMPT_SCROLL.store(true, Ordering::SeqCst);
+}
+
+/// Check if the approval prompt needs a forced scroll, and clear the flag.
+pub fn take_approval_prompt_scroll() -> bool {
+    APPROVAL_PROMPT_SCROLL.swap(false, Ordering::SeqCst)
 }
 
 /// No-op retained for Ctrl+C handler compatibility; the approval channel was removed.

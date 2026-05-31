@@ -378,11 +378,8 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             }
         }
     }
-    if !app.output_lines.is_empty() {
-        app.auto_scroll = true;
-        app.scroll_offset = 0;
-    }
-    if crate::core::approval::is_approval_prompt_active() {
+    // Only force scroll for the one-shot approval prompt.
+    if crate::core::approval::take_approval_prompt_scroll() {
         app.auto_scroll = true;
         app.scroll_offset = 0;
     }
@@ -2025,6 +2022,40 @@ mod tests {
         assert!(header.contains("Resumed task"));
         assert!(header.contains("3 turns"));
         assert!(header.contains("═══"));
+    }
+
+    #[test]
+    fn test_drain_output_preserves_manual_scroll_without_approval_prompt() {
+        use crate::cli::output::OutputEvent;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(OutputEvent::plain("line 1")).unwrap();
+
+        let mut app = App::new();
+        app.auto_scroll = false;
+        app.scroll_offset = 7;
+
+        drain_output(&mut rx, &mut app);
+
+        assert!(!app.auto_scroll);
+        assert_eq!(app.scroll_offset, 7);
+        assert_eq!(app.output_lines.len(), 1);
+    }
+
+    #[test]
+    fn test_drain_output_forces_scroll_for_approval_prompt() {
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        crate::core::approval::set_approval_prompt_scroll();
+
+        let mut app = App::new();
+        app.auto_scroll = false;
+        app.scroll_offset = 7;
+
+        drain_output(&mut rx, &mut app);
+
+        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_offset, 0);
     }
 
     #[test]
