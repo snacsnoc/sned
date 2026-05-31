@@ -57,6 +57,7 @@ const DEFAULT_THINKING_HISTORY_LIMIT: usize = 2_000;
 /// Environment variable to configure thinking block history limit
 const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 
+use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
 use crate::core::tool_output::{
     extract_edit_stats_detailed, format_heat_map, format_tool_result, format_tool_summary,
@@ -808,6 +809,19 @@ impl AgentLoop {
             }
             turn_count += 1;
 
+// Check plan pause: halt iteration if plan is paused
+            {
+                let state = self.state.lock().await;
+                if let Some(ref plan) = state.plan_state
+                    && plan.paused && plan.approved
+                {
+                    drop(state);
+                    self.config.output_writer.emit(OutputEvent::dim_yellow("Plan is paused. Type /plan resume to continue."));
+                    continue;
+                }
+                drop(state);
+            }
+
             // Check if cancelled
             {
                 let state = self.state.lock().await;
@@ -1182,6 +1196,23 @@ impl AgentLoop {
                 crate::core::agent_types::AgentMode::Act => "act",
             };
             let _ = tracker.record_model_usage(provider_id, model_id, mode);
+        }
+
+        // 2.7 Inject plan state into conversation history (FIX: model state injection)
+        let plan_state_text = {
+            let state = self.state.lock().await;
+            state.plan_state.as_ref().map(|ps| ps.format_state())
+        };
+        if let Some(ps_text) = plan_state_text {
+            let mut history = self.conversation_history.lock().await;
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(ps_text),
+                model_info: None,
+                metrics: None,
+                ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+            });
         }
 
         // 3. Select tool profile and build tool definitions
@@ -2747,6 +2778,35 @@ impl AgentLoop {
                         "Tool execution failures detected"
                     );
 
+                    // Handle plan step failure: mark current step as Failed and stop execution
+                    if let Some(ref mut plan) = state.plan_state
+                        && plan.approved && !plan.complete
+                    {
+                        if plan.current_step_index < plan.steps.len() {
+                            let current_status = plan.steps[plan.current_step_index].status;
+                            if current_status != PlanStepStatus::Failed {
+                                plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
+                                    .ok();
+                                tracing::info!(
+                                    step_index = plan.current_step_index,
+                                    "Plan step failed. Execution stopped. User action required."
+                                );
+                                if !self.config.json_output {
+                                    drop(state);
+                                    self.config.output_writer.emit(OutputEvent::error(
+                                        format!(
+                                            "Plan step {}/{} failed. Use /plan resume to retry or /plan abort to cancel.",
+                                            plan.current_step_index + 1,
+                                            plan.steps.len()
+                                        )
+                                    ));
+                                    drop(state);
+                                }
+                                return TurnResult::Continue;
+                            }
+                        }
+                    }
+
                     if state.consecutive_mistakes >= self.config.max_consecutive_mistakes {
                         return TurnResult::Error(format!(
                             "Max consecutive mistakes ({}) reached. The model is repeatedly failing.",
@@ -2757,11 +2817,57 @@ impl AgentLoop {
                     // All tools succeeded - reset consecutive mistakes
                     let mut state = self.state.lock().await;
                     state.consecutive_mistakes = 0;
+                    // Advance plan step on success
+                    if let Some(ref mut plan) = state.plan_state
+                        && plan.approved && !plan.complete
+                    {
+                        plan.advance();
+                        // Check if plan is now complete
+                        if plan.complete {
+                            tracing::info!("All plan steps completed successfully.");
+                            if !self.config.json_output {
+                                drop(state);
+                                self.config.output_writer.emit(OutputEvent::styled(
+                                    "✓ Plan complete. All steps executed successfully.",
+                                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                                ));
+                            }
+                        }
+                    }
                 }
             } else {
                 // No tools were called (text-only response) - reset consecutive mistakes
                 let mut state = self.state.lock().await;
                 state.consecutive_mistakes = 0;
+
+                // Handle plan step failure: text-only response with tools available means step failed
+                if let Some(ref mut plan) = state.plan_state
+                    && plan.approved && !plan.complete
+                {
+                    if plan.current_step_index < plan.steps.len() {
+                        let current_status = plan.steps[plan.current_step_index].status;
+                        if current_status != PlanStepStatus::Failed {
+                            plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
+                                .ok();
+                            tracing::info!(
+                                step_index = plan.current_step_index,
+                                "Plan step failed (no tool calls). Execution stopped."
+                            );
+                            if !self.config.json_output {
+                                drop(state);
+                                self.config.output_writer.emit(OutputEvent::error(
+                                    format!(
+                                        "Plan step {}/{} failed (no tool calls). Use /plan resume to retry or /plan abort to cancel.",
+                                        plan.current_step_index + 1,
+                                        plan.steps.len()
+                                    )
+                                ));
+                                drop(state);
+                            }
+                            return TurnResult::Continue;
+                        }
+                    }
+                }
             }
 
             // Inject hint when approaching the mistake limit

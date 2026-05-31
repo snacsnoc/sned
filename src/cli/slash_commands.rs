@@ -256,6 +256,7 @@ pub enum CliOnlyCommand {
     HelpOption(String),
     Queue,
     Plan(PlanSubcommand),
+    PlanPrompt(String),
     PlanApprove,
     PlanPause,
     PlanResume,
@@ -371,7 +372,7 @@ impl CliOnlyCommand {
                     None
                 }
             }
-            _ => None,
+            _ => Some(CliOnlyCommand::PlanPrompt(args.to_string())),
         }
     }
 
@@ -413,6 +414,7 @@ impl CliOnlyCommand {
                 | CliOnlyCommand::Changes
                 | CliOnlyCommand::Queue
                 | CliOnlyCommand::Plan(_)
+                | CliOnlyCommand::PlanPrompt(_)
                 | CliOnlyCommand::PlanApprove
                 | CliOnlyCommand::PlanPause
                 | CliOnlyCommand::PlanResume
@@ -439,6 +441,7 @@ impl CliOnlyCommand {
         matches!(
             self,
             CliOnlyCommand::Plan(_)
+                | CliOnlyCommand::PlanPrompt(_)
                 | CliOnlyCommand::PlanApprove
                 | CliOnlyCommand::PlanPause
                 | CliOnlyCommand::PlanResume
