@@ -96,6 +96,8 @@ impl PlanState {
         after_index: usize,
         description: String,
     ) -> Result<(), String> {
+        let old_len = self.steps.len();
+        let old_current_step_index = self.current_step_index;
         let insert_pos = if after_index == usize::MAX {
             self.steps.len()
         } else {
@@ -117,17 +119,32 @@ impl PlanState {
             },
         );
         self.renumber();
+        if self.steps.is_empty() || old_len == 0 {
+            self.current_step_index = 0;
+        } else if old_current_step_index >= old_len {
+            self.current_step_index = self.steps.len() - 1;
+        } else if insert_pos <= old_current_step_index {
+            self.current_step_index = old_current_step_index + 1;
+        }
         Ok(())
     }
 
     /// Remove a step by index (0-based).
     pub fn remove_step(&mut self, index: usize) -> Result<(), String> {
+        let old_len = self.steps.len();
+        let old_current_step_index = self.current_step_index;
         if index >= self.steps.len() {
             return Err(format!("Step index {} out of range (0-{})", index, self.steps.len().saturating_sub(1)));
         }
         self.steps.remove(index);
         self.renumber();
-        if self.current_step_index >= self.steps.len() && !self.steps.is_empty() {
+        if self.steps.is_empty() {
+            self.current_step_index = 0;
+        } else if old_current_step_index >= old_len {
+            self.current_step_index = self.steps.len() - 1;
+        } else if index < old_current_step_index {
+            self.current_step_index = old_current_step_index - 1;
+        } else if self.current_step_index >= self.steps.len() {
             self.current_step_index = self.steps.len() - 1;
         }
         Ok(())
@@ -474,6 +491,19 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_step_before_current_advances_index() {
+        let mut plan = PlanState::create_plan(vec![
+            "First".to_string(),
+            "Second".to_string(),
+            "Third".to_string(),
+        ]);
+        plan.current_step_index = 1;
+        assert!(plan.insert_step_after(0, "Inserted".to_string()).is_ok());
+        assert_eq!(plan.current_step_index, 2);
+        assert_eq!(plan.steps[2].description, "Second");
+    }
+
+    #[test]
     fn test_insert_step_after_at_end() {
         let mut plan = PlanState::create_plan(vec![
             "First".to_string(),
@@ -622,6 +652,33 @@ mod tests {
         assert_eq!(plan.steps[0].index, 0);
         assert_eq!(plan.steps[1].index, 1);
         assert_eq!(plan.current_step_index, 1);
+    }
+
+    #[test]
+    fn test_remove_step_before_current_updates_index() {
+        let mut plan = PlanState::create_plan(vec![
+            "First".to_string(),
+            "Second".to_string(),
+            "Third".to_string(),
+        ]);
+        plan.current_step_index = 2;
+        plan.remove_step(0).unwrap();
+        assert_eq!(plan.current_step_index, 1);
+        assert_eq!(plan.steps[0].description, "Second");
+        assert_eq!(plan.steps[1].description, "Third");
+    }
+
+    #[test]
+    fn test_remove_current_last_step_clamps_index() {
+        let mut plan = PlanState::create_plan(vec![
+            "First".to_string(),
+            "Second".to_string(),
+        ]);
+        plan.current_step_index = 1;
+        plan.remove_step(1).unwrap();
+        assert_eq!(plan.current_step_index, 0);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].description, "First");
     }
 
     #[test]

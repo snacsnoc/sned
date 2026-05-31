@@ -380,6 +380,24 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     }
     if !app.output_lines.is_empty() {
         app.auto_scroll = true;
+        app.scroll_offset = 0;
+    }
+    if crate::core::approval::is_approval_prompt_active() {
+        app.auto_scroll = true;
+        app.scroll_offset = 0;
+    }
+}
+
+fn approval_result_for_key(key: &KeyEvent) -> Option<ApprovalResult> {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(ApprovalResult::Denied)
+        }
+        KeyCode::Char('y' | 'Y') => Some(ApprovalResult::Approved),
+        KeyCode::Char('n' | 'N') => Some(ApprovalResult::Denied),
+        KeyCode::Char('a' | 'A') => Some(ApprovalResult::Always),
+        KeyCode::Esc => Some(ApprovalResult::Denied),
+        _ => None,
     }
 }
 
@@ -1505,54 +1523,42 @@ async fn run_main_loop(
                 Event::Key(key) => {
                     // Approval prompt: route y/n/a to approval channel
                     if is_approval_prompt_active() {
-                        if let Some(sender) = take_approval_sender() {
-                            let prompt_lines = app.output_lines.len();
-
-                            // Ctrl+C during approval: deny, cancel agent
-                            if key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                let _ = sender.send(ApprovalResult::Denied);
+                        if let Some(result) = approval_result_for_key(&key) {
+                            if let Some(sender) = take_approval_sender() {
+                                let prompt_lines = app.output_lines.len();
+                                let _ = sender.send(result.clone());
                                 let drain_start = prompt_lines.min(app.output_lines.len());
                                 app.output_lines.drain(drain_start..);
-                                app.auto_scroll = true;
-                                app.scroll_offset = 0;
-                                cancel_agent(&state_handle, &agent_task, &agent_done).await?;
-                                app.push_plain("^C");
-                                app.agent_busy = false;
-                                continue;
-                            }
 
-                            let result = match key.code {
-                                KeyCode::Char('y' | 'Y') => ApprovalResult::Approved,
-                                KeyCode::Char('n' | 'N') => ApprovalResult::Denied,
-                                KeyCode::Char('a' | 'A') => ApprovalResult::Always,
-                                KeyCode::Esc => ApprovalResult::Denied,
-                                _ => {
-                                    // Put sender back so user can retry with y/n/a/Esc
-                                    crate::core::approval::set_approval_sender(sender);
+                                if key.code == KeyCode::Char('c')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                {
+                                    app.auto_scroll = true;
+                                    app.scroll_offset = 0;
+                                    cancel_agent(&state_handle, &agent_task, &agent_done)
+                                        .await?;
+                                    app.push_plain("^C");
+                                    app.agent_busy = false;
                                     continue;
                                 }
-                            };
-                            let _ = sender.send(result.clone());
-                            let drain_start = prompt_lines.min(app.output_lines.len());
-                            app.output_lines.drain(drain_start..);
-                            // Echo approval decision
-                            app.push_styled(
-                                format!(
-                                    "  ↳ {}",
-                                    match result {
-                                        ApprovalResult::Approved => "approved",
-                                        ApprovalResult::Denied => "denied",
-                                        ApprovalResult::Always => "always approve",
-                                    }
-                                ),
-                                Style::default().fg(theme::ACCENT),
-                            );
-                            app.auto_scroll = true;
-                            app.scroll_offset = 0;
+
+                                // Echo approval decision
+                                app.push_styled(
+                                    format!(
+                                        "  ↳ {}",
+                                        match result {
+                                            ApprovalResult::Approved => "approved",
+                                            ApprovalResult::Denied => "denied",
+                                            ApprovalResult::Always => "always approve",
+                                        }
+                                    ),
+                                    Style::default().fg(theme::ACCENT),
+                                );
+                                app.auto_scroll = true;
+                                app.scroll_offset = 0;
+                            }
+                            continue;
                         }
-                        continue;
                     }
 
                     // Global Ctrl+C handling
@@ -2014,5 +2020,39 @@ mod tests {
         assert!(header.contains("Resumed task"));
         assert!(header.contains("3 turns"));
         assert!(header.contains("═══"));
+    }
+
+    #[test]
+    fn test_approval_result_for_key_only_accepts_prompt_shortcuts() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert_eq!(
+            approval_result_for_key(&KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::empty()
+            )),
+            Some(ApprovalResult::Approved)
+        );
+        assert_eq!(
+            approval_result_for_key(&KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            )),
+            Some(ApprovalResult::Denied)
+        );
+        assert_eq!(
+            approval_result_for_key(&KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::empty()
+            )),
+            None
+        );
+        assert_eq!(
+            approval_result_for_key(&KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::empty()
+            )),
+            None
+        );
     }
 }

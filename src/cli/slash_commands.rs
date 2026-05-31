@@ -286,12 +286,16 @@ pub enum PlanSubcommand {
 }
 
 pub fn parse_plan_subcommand(args: &str) -> Option<PlanSubcommand> {
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    if parts.is_empty() {
+    let args = args.trim_start();
+    if args.is_empty() {
         return Some(PlanSubcommand::Status);
     }
 
-    match parts[0] {
+    let mut tokens = args.splitn(2, char::is_whitespace);
+    let command = tokens.next().unwrap_or("");
+    let remainder = tokens.next().unwrap_or("").trim_start();
+
+    match command {
         "status" => Some(PlanSubcommand::Status),
         "approve" => Some(PlanSubcommand::Approve),
         "pause" => Some(PlanSubcommand::Pause),
@@ -299,24 +303,29 @@ pub fn parse_plan_subcommand(args: &str) -> Option<PlanSubcommand> {
         "abort" => Some(PlanSubcommand::Abort),
         "complete" => Some(PlanSubcommand::Complete),
         "fail" => Some(PlanSubcommand::Fail),
-        "edit" if parts.len() >= 3 => {
-            parts[1].parse::<usize>().ok()
-                .map(|step| PlanSubcommand::Edit(step, parts[2].to_string()))
+        "edit" => {
+            let mut parts = remainder.splitn(2, char::is_whitespace);
+            let step = parts.next().unwrap_or("");
+            let description = parts.next().unwrap_or("").trim_start();
+            let step = step.parse::<usize>().unwrap_or(0);
+            Some(PlanSubcommand::Edit(step, description.to_string()))
         }
-        "edit" => None,
-        "add" if parts.len() >= 3 => {
-            parts[1].parse::<usize>().ok()
-                .map(|after_step| PlanSubcommand::Add(after_step, parts[2].to_string()))
+        "add" => {
+            let mut parts = remainder.splitn(2, char::is_whitespace);
+            let after_step = parts.next().unwrap_or("");
+            let description = parts.next().unwrap_or("").trim_start();
+            let after_step = after_step.parse::<usize>().unwrap_or(0);
+            Some(PlanSubcommand::Add(after_step, description.to_string()))
         }
-        "add" => None,
-        "remove" if parts.len() >= 2 => {
-            parts[1].parse::<usize>().ok().map(PlanSubcommand::Remove)
+        "remove" => {
+            let step = remainder
+                .split_whitespace()
+                .next()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .unwrap_or(0);
+            Some(PlanSubcommand::Remove(step))
         }
-        "remove" => None,
-        "replace" if parts.len() >= 2 => {
-            Some(PlanSubcommand::Replace(parts[1..].join(" ")))
-        }
-        "replace" => None,
+        "replace" => Some(PlanSubcommand::Replace(remainder.to_string())),
         _ => None,
     }
 }
@@ -2303,10 +2312,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cli_only_plan_edit_preserves_multi_word_description() {
+        let result = get_cli_only_command("/plan edit 2 update the README and tests");
+        match result {
+            Some(CliOnlyCommand::Plan(PlanSubcommand::Edit(step, desc))) => {
+                assert_eq!(step, 2);
+                assert_eq!(desc, "update the README and tests");
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parse_cli_only_plan_add() {
         let result = get_cli_only_command("/plan add 0 new step");
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), CliOnlyCommand::Plan(_)));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_add_preserves_multi_word_description() {
+        let result = get_cli_only_command("/plan add 1 add a follow-up step");
+        match result {
+            Some(CliOnlyCommand::Plan(PlanSubcommand::Add(after, desc))) => {
+                assert_eq!(after, 1);
+                assert_eq!(desc, "add a follow-up step");
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 
     #[test]
@@ -2321,5 +2354,16 @@ mod tests {
         let result = get_cli_only_command("/plan replace 1. step one\n2. step two");
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), CliOnlyCommand::Plan(_)));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_replace_preserves_full_text() {
+        let result = get_cli_only_command("/plan replace 1. step one\n2. step two");
+        match result {
+            Some(CliOnlyCommand::Plan(PlanSubcommand::Replace(text))) => {
+                assert_eq!(text, "1. step one\n2. step two");
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
     }
 }
