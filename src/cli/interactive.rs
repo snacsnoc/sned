@@ -1369,7 +1369,7 @@ async fn handle_cli_only_command(
                             ));
                             // Spawn agent to execute the approved plan
                             let prompt = format!("Execute step {}/{}: {}", start_index + 1, steps_len, step_desc);
-                            spawn_agent_task(session, &prompt, &agent_busy, agent_done, agent_start_time, agent_task).await?;
+                            spawn_agent_task(session, &prompt, agent_busy, agent_done, agent_start_time, agent_task).await?;
                             app.agent_busy = true;
                         }
                     }
@@ -1401,7 +1401,7 @@ async fn handle_cli_only_command(
                             app.push_plain(format!("Plan resumed at step {}/{}: {}", step_num, step_total, step_desc));
                             // Spawn agent to resume plan execution
                             let prompt = format!("Execute step {}/{}: {}", step_num, step_total, step_desc);
-                            spawn_agent_task(session, &prompt, &agent_busy, agent_done, agent_start_time, agent_task).await?;
+                            spawn_agent_task(session, &prompt, agent_busy, agent_done, agent_start_time, agent_task).await?;
                             app.agent_busy = true;
                         }
                     }

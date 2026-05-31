@@ -3786,7 +3786,10 @@ fn truncate_old_thinking_blocks(history: &mut [StorageMessage]) {
 mod tests {
     use super::*;
     use crate::core::tool_output::summarize_single_section;
-    use crate::providers::{ApiStream, ApiStreamTextChunk, ApiStreamToolCallsChunk, ProviderError};
+    use crate::providers::{
+        ApiStream, ApiStreamTextChunk, ApiStreamToolCall, ApiStreamToolCallFunction,
+        ApiStreamToolCallsChunk, ProviderError,
+    };
 
     struct RecordingChunkProvider {
         responses: Vec<Vec<ApiStreamChunk>>,
@@ -6290,5 +6293,200 @@ mod tests {
             crate::core::plan_state::PlanStepStatus::Running,
             "Text-only response should not fail the step"
         );
+    }
+
+    #[tokio::test]
+    async fn test_plan_act_transition_on_completion() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::list_files::ListFilesHandler;
+
+        // Two turns: each returns a list_files tool call (succeeds on workspace root)
+        let responses = vec![
+            vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_1".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("list_files".to_string()),
+                        arguments: Some(serde_json::json!({"path": "."}).to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            })],
+            vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_2".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("list_files".to_string()),
+                        arguments: Some(serde_json::json!({"path": "."}).to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            })],
+        ];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+
+        let config = AgentConfig {
+            provider,
+            mode: AgentMode::Act,
+            task_id: "test-plan-act-transition".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: false,
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ListFiles,
+            Arc::new(ListFilesHandler::new()),
+        );
+
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        // Set up plan: 2 steps, step 0 Running, approved
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Step one".to_string(),
+                "Step two".to_string(),
+            ]);
+            plan.approved = true;
+            plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
+            state.plan_state = Some(plan);
+        }
+
+        // Turn 1: tool call succeeds → advance to step 1
+        let result1 = agent.execute_turn().await;
+        assert!(
+            matches!(result1, TurnResult::Continue),
+            "Expected Continue after step 1 tool, got {:?}",
+            result1
+        );
+        {
+            let state = agent.state.lock().await;
+            let plan = state.plan_state.as_ref().unwrap();
+            assert_eq!(plan.steps[0].status, crate::core::plan_state::PlanStepStatus::Done);
+            assert_eq!(plan.steps[1].status, crate::core::plan_state::PlanStepStatus::Running);
+            assert!(!plan.complete);
+        }
+
+        // Turn 2: tool call succeeds → plan completes → transition to Act
+        let result2 = agent.execute_turn().await;
+        // Plan completion returns Continue (agent keeps running in Act mode).
+        // TurnResult::Complete is only for attempt_completion/plan_mode_respond.
+        assert!(
+            matches!(result2, TurnResult::Continue),
+            "Expected Continue (agent continues in Act mode), got {:?}",
+            result2
+        );
+        {
+            let state = agent.state.lock().await;
+            let plan = state.plan_state.as_ref().unwrap();
+            assert!(plan.complete, "Plan should be marked complete");
+            assert_eq!(plan.steps[1].status, crate::core::plan_state::PlanStepStatus::Done);
+            assert_eq!(agent.mode(), AgentMode::Act, "Mode should transition to Act");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_step_failure_pauses_execution() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::list_files::ListFilesHandler;
+
+        // One turn: list_files with non-existent path → tool failure
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_fail".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("list_files".to_string()),
+                    arguments: Some(serde_json::json!({"path": "nonexistent_dir_12345"}).to_string()),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+
+        let config = AgentConfig {
+            provider,
+            mode: AgentMode::Act,
+            task_id: "test-plan-failure-pauses".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: false,
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ListFiles,
+            Arc::new(ListFilesHandler::new()),
+        );
+
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        // Set up plan: 1 step, step 0 Running, approved
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Step one".to_string(),
+            ]);
+            plan.approved = true;
+            plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
+            state.plan_state = Some(plan);
+        }
+
+        // Turn 1: tool fails → step marked Failed, plan paused
+        let result = agent.execute_turn().await;
+        assert!(
+            matches!(result, TurnResult::Continue),
+            "Expected Continue after failed step, got {:?}",
+            result
+        );
+        {
+            let state = agent.state.lock().await;
+            let plan = state.plan_state.as_ref().unwrap();
+            assert_eq!(
+                plan.steps[0].status,
+                crate::core::plan_state::PlanStepStatus::Failed,
+                "Step should be marked Failed on tool failure"
+            );
+            assert!(plan.paused, "Plan should be paused after step failure");
+            assert!(!plan.complete, "Plan should not be complete after failure");
+        }
     }
 }
