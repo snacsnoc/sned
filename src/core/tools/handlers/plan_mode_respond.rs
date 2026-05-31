@@ -63,7 +63,11 @@ impl PlanModeRespondHandler {
             ));
         }
 
-        // Accept plans with 1 or more steps
+        if steps.len() < 2 {
+            return Err(ToolError::InvalidInput(
+                "Plan must have at least 2 steps".to_string(),
+            ));
+        }
 
         // Create PlanState with the parsed steps
         let plan = crate::core::plan_state::PlanState::create_plan(steps);
@@ -199,5 +203,29 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("need more exploration"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_respond_rejects_single_step() {
+        let handler = PlanModeRespondHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(
+            crate::core::agent_loop::TaskState::default(),
+        ));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = handler
+            .execute(&ctx, serde_json::json!({"response": "1. only one step"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least 2 steps"));
     }
 }
