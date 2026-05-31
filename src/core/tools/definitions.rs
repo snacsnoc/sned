@@ -341,14 +341,24 @@ pub fn plan_mode_respond_schema() -> ToolSchema {
     ToolSchema {
         name: "plan_mode_respond",
         description: "Respond to the user in plan mode. Use this when you need to present a plan or ask for confirmation before proceeding.",
-        parameters: vec![ToolParameter {
-            name: "response",
-            required: true,
-            param_type: "string",
-            description: "Your response to the user.",
-            items: None,
-            extra: None,
-        }],
+        parameters: vec![
+            ToolParameter {
+                name: "response",
+                required: true,
+                param_type: "string",
+                description: "Your response to the user.",
+                items: None,
+                extra: None,
+            },
+            ToolParameter {
+                name: "needs_more_exploration",
+                required: false,
+                param_type: "boolean",
+                description: "Set to true if you need more exploration before finalizing the plan.",
+                items: None,
+                extra: None,
+            },
+        ],
     }
 }
 
