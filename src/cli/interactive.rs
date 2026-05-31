@@ -793,21 +793,21 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::Stats => {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             let sh = sess.agent_loop().state_handle();
             let state = sh.lock().await;
             let stats = format_stats_text(&state);
             app.push_plain(stats);
         }
         CliOnlyCommand::Changes => {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             let sh = sess.agent_loop().state_handle();
             let state = sh.lock().await;
             let changes = format_changes_text(&state);
             app.push_plain(changes);
         }
         CliOnlyCommand::Queue => {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             if let Some(qh) = sess.message_queue_handle() {
                 let count = qh.queued_message_count().await;
                 if count == 0 {
@@ -833,7 +833,7 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::Undo | CliOnlyCommand::CheckpointUndo => {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             let checkpoint_mgr = sess
                 .agent_loop()
                 .checkpoint_manager()
@@ -1053,7 +1053,7 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::CheckpointList => {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             let checkpoint_mgr = sess
                 .agent_loop()
                 .checkpoint_manager()
@@ -1077,7 +1077,7 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::CheckpointRestore => {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             let checkpoint_mgr = sess
                 .agent_loop()
                 .checkpoint_manager()
@@ -1206,7 +1206,7 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Expand => {
             if let Some(index) = crate::cli::slash_commands::parse_expand_index(text) {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
                 let sh = sess.agent_loop().state_handle();
                 drop(sess);
                 let state = sh.lock().await;
@@ -1568,7 +1568,7 @@ async fn run_main_loop(
                                         }
                                         // Switch agent mode to Plan so write/edit tools are restricted
                                         {
-                                            let mut sess = session.lock().await;
+            let mut sess = session.lock().await;
                                             sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Plan);
                                         }
                                         app.push_user_message(&text);
@@ -1809,13 +1809,13 @@ pub async fn run_interactive_shell_inner(
     ));
 
     let task_id = {
-        let mut sess = session.lock().await;
+        let sess = session.lock().await;
         sess.agent_loop.task_id().to_string()
     };
 
     // Set status bar fields from session info
     {
-        let mut sess = session.lock().await;
+        let sess = session.lock().await;
         let provider = sess.agent_loop.get_provider();
         let model = provider.get_model();
         app.provider_name = provider.name().to_string();
@@ -1832,7 +1832,7 @@ pub async fn run_interactive_shell_inner(
 
     // 4. Startup banner → app.push_output()
     {
-        let mut sess = session.lock().await;
+        let sess = session.lock().await;
         if !sess.is_quiet() {
             let startup_info = sess.get_startup_info();
             for line in ansi_to_ratatui_lines(&startup_info) {
@@ -1864,7 +1864,7 @@ pub async fn run_interactive_shell_inner(
     app.history.reload();
 
     {
-        let mut sess = session.lock().await;
+        let sess = session.lock().await;
         let mut qh = queue_handle.lock().await;
         *qh = Some(sess.queue_handle());
         let mut sh = state_handle.lock().await;
