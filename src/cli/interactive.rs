@@ -378,6 +378,9 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             }
         }
     }
+    if !app.output_lines.is_empty() {
+        app.auto_scroll = true;
+    }
 }
 
 /// Spawn agent task with proper state management.
