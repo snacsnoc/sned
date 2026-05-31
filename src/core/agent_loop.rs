@@ -810,14 +810,17 @@ impl AgentLoop {
             }
             turn_count += 1;
 
-// Check plan pause: halt iteration if plan is paused
+            // Check plan pause: halt iteration if plan is paused
             {
                 let state = self.state.lock().await;
                 if let Some(ref plan) = state.plan_state
-                    && plan.paused && plan.approved
+                    && plan.paused
+                    && plan.approved
                 {
                     drop(state);
-                    self.config.output_writer.emit(OutputEvent::dim_yellow("Plan is paused. Type /plan resume to continue."));
+                    self.config.output_writer.emit(OutputEvent::dim_yellow(
+                        "Plan is paused. Type /plan resume to continue.",
+                    ));
                     // Prevent CPU spinning on pause
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
@@ -892,7 +895,9 @@ impl AgentLoop {
                     let final_message = {
                         let state = self.state.lock().await;
                         if let Some(ref plan) = state.plan_state
-                            && plan.approved && !plan.complete && !plan.paused
+                            && plan.approved
+                            && !plan.complete
+                            && !plan.paused
                         {
                             let note = format!(
                                 "[Note: A plan is in progress at step {}/{}. Continue executing the plan after addressing this message.]\n\n",
@@ -954,7 +959,9 @@ impl AgentLoop {
                             let final_message = {
                                 let state = self.state.lock().await;
                                 if let Some(ref plan) = state.plan_state
-                                    && plan.approved && !plan.complete && !plan.paused
+                                    && plan.approved
+                                    && !plan.complete
+                                    && !plan.paused
                                 {
                                     let note = format!(
                                         "[Note: A plan is in progress at step {}/{}. Continue executing the plan after addressing this message.]\n\n",
@@ -963,7 +970,8 @@ impl AgentLoop {
                                     );
                                     let mut msg = expanded_message;
                                     if let MessageContent::Text(ref text) = msg.content {
-                                        msg.content = MessageContent::Text(format!("{}{}", note, text));
+                                        msg.content =
+                                            MessageContent::Text(format!("{}{}", note, text));
                                     }
                                     msg
                                 } else {
@@ -1093,9 +1101,7 @@ impl AgentLoop {
                 }
                 TurnResult::Error(e) => {
                     // Emit error to output (visible in TUI and logged)
-                    self.config
-                        .output_writer
-                        .emit(OutputEvent::error(&e));
+                    self.config.output_writer.emit(OutputEvent::error(&e));
 
                     // Rollback the user message that was never processed by the model.
                     // Only rollback for context-window errors to prevent compounding failure.
@@ -1644,9 +1650,10 @@ impl AgentLoop {
                                     code_block_full_buffer.push(code_line.clone());
                                     if code_block_lines > code_block_display_limit {
                                         code_block_snipped = true;
-                    // Prevent CPU spinning on pause
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
+                                        // Prevent CPU spinning on pause
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
+                                        continue;
                                     }
 
                                     code_block_buffer.push(code_line);
@@ -2358,9 +2365,9 @@ impl AgentLoop {
                                     mgr.should_prompt(tool, cmd_fp)
                                 } else {
                                     // Has paths: check per-path approval
-                                    action_paths
-                                        .iter()
-                                        .any(|p| mgr.should_prompt_with_path(tool, Some(p.as_str())))
+                                    action_paths.iter().any(|p| {
+                                        mgr.should_prompt_with_path(tool, Some(p.as_str()))
+                                    })
                                 };
                                 if needs_prompt {
                                     drop(mgr); // Drop lock before async call
@@ -2842,7 +2849,8 @@ impl AgentLoop {
                     // Handle plan step failure: mark current step as Failed and stop execution
                     let mut step_fail_msg = None;
                     if let Some(ref mut plan) = state.plan_state
-                        && plan.approved && !plan.complete
+                        && plan.approved
+                        && !plan.complete
                         && plan.current_step_index < plan.steps.len()
                     {
                         let current_status = &plan.steps[plan.current_step_index].status;
@@ -2864,7 +2872,8 @@ impl AgentLoop {
                         }
                     }
 
-                    let max_reached = state.consecutive_mistakes >= self.config.max_consecutive_mistakes;
+                    let max_reached =
+                        state.consecutive_mistakes >= self.config.max_consecutive_mistakes;
                     drop(state);
 
                     if let Some(msg) = step_fail_msg {
@@ -2885,7 +2894,8 @@ impl AgentLoop {
                     // Advance plan step on success
                     let mut plan_completed = false;
                     if let Some(ref mut plan) = state.plan_state
-                        && plan.approved && !plan.complete
+                        && plan.approved
+                        && !plan.complete
                     {
                         plan.advance();
                         // Check if plan is now complete
@@ -2899,7 +2909,9 @@ impl AgentLoop {
                     if plan_completed && !self.config.json_output {
                         self.config.output_writer.emit(OutputEvent::styled(
                             "✓ Plan complete. All steps executed successfully.",
-                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
                         ));
                     }
                     if plan_completed {
@@ -3207,10 +3219,7 @@ impl AgentLoop {
 
     /// Check if a tool is restricted in plan mode.
     fn is_plan_mode_restricted(tool: SnedTool) -> bool {
-        matches!(
-            tool,
-            SnedTool::WriteToFile | SnedTool::EditFile | SnedTool::ExecuteCommand
-        )
+        matches!(tool, SnedTool::WriteToFile | SnedTool::EditFile)
     }
 
     /// Extract the first action path from tool params for per-path approval.
@@ -3426,7 +3435,6 @@ impl AgentLoop {
         let history = self.conversation_history.lock().await;
         history.clone()
     }
-
 
     /// Format duration as human-readable string.
 
@@ -4575,6 +4583,19 @@ mod tests {
         assert!(!AgentLoop::is_plan_mode_restricted(
             SnedTool::PlanModeRespond
         ));
+    }
+
+    #[test]
+    fn test_plan_mode_allows_execute_command_but_blocks_file_writes() {
+        // PLAN mode should allow execute_command for read-only operations
+        // (cat, wc, ls, grep, etc.) while still blocking file modifications.
+        // The CommandSafetyChecker handles safety for execute_command.
+        assert!(!AgentLoop::is_plan_mode_restricted(
+            SnedTool::ExecuteCommand
+        ));
+        // WriteToFile and EditFile remain blocked in PLAN mode
+        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::WriteToFile));
+        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::EditFile));
     }
 
     #[tokio::test]
@@ -6157,29 +6178,25 @@ mod tests {
         });
 
         let responses = vec![
-            vec![
-                ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                    tool_call: ApiStreamToolCall {
-                        call_id: Some("call_plan".to_string()),
-                        function: crate::providers::ApiStreamToolCallFunction {
-                            id: None,
-                            name: Some("plan_mode_respond".to_string()),
-                            arguments: Some(plan_json.to_string()),
-                        },
-                        signature: None,
+            vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_plan".to_string()),
+                    function: crate::providers::ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("plan_mode_respond".to_string()),
+                        arguments: Some(plan_json.to_string()),
                     },
-                    id: None,
                     signature: None,
-                }),
-            ],
+                },
+                id: None,
+                signature: None,
+            })],
             // Second turn: model responds with text after plan is created
-            vec![
-                ApiStreamChunk::Text(ApiStreamTextChunk {
-                    text: "Plan created. Waiting for approval.".to_string(),
-                    id: None,
-                    signature: None,
-                }),
-            ],
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Plan created. Waiting for approval.".to_string(),
+                id: None,
+                signature: None,
+            })],
         ];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6212,8 +6229,7 @@ mod tests {
             Arc::new(PlanModeRespondHandler::new()),
         );
 
-        let mut agent = AgentLoop::new(config)
-            .with_tools(Arc::new(registry));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
 
         let result = agent.execute_turn().await;
         assert!(
@@ -6236,13 +6252,11 @@ mod tests {
         use crate::core::tools::handlers::plan_mode_respond::PlanModeRespondHandler;
 
         // Create plan directly in state (skip PlanModeRespond call)
-        let responses = vec![vec![
-            ApiStreamChunk::Text(ApiStreamTextChunk {
-                text: "Executing step 1".to_string(),
-                id: None,
-                signature: None,
-            }),
-        ]];
+        let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+            text: "Executing step 1".to_string(),
+            id: None,
+            signature: None,
+        })]];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
@@ -6270,8 +6284,7 @@ mod tests {
 
         let registry = ToolRegistry::new();
 
-        let mut agent = AgentLoop::new(config)
-            .with_tools(Arc::new(registry));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
 
         // Set up plan state manually: approved, step 0 running
         {
@@ -6387,8 +6400,14 @@ mod tests {
         {
             let state = agent.state.lock().await;
             let plan = state.plan_state.as_ref().unwrap();
-            assert_eq!(plan.steps[0].status, crate::core::plan_state::PlanStepStatus::Done);
-            assert_eq!(plan.steps[1].status, crate::core::plan_state::PlanStepStatus::Running);
+            assert_eq!(
+                plan.steps[0].status,
+                crate::core::plan_state::PlanStepStatus::Done
+            );
+            assert_eq!(
+                plan.steps[1].status,
+                crate::core::plan_state::PlanStepStatus::Running
+            );
             assert!(!plan.complete);
         }
 
@@ -6405,8 +6424,15 @@ mod tests {
             let state = agent.state.lock().await;
             let plan = state.plan_state.as_ref().unwrap();
             assert!(plan.complete, "Plan should be marked complete");
-            assert_eq!(plan.steps[1].status, crate::core::plan_state::PlanStepStatus::Done);
-            assert_eq!(agent.mode(), AgentMode::Act, "Mode should transition to Act");
+            assert_eq!(
+                plan.steps[1].status,
+                crate::core::plan_state::PlanStepStatus::Done
+            );
+            assert_eq!(
+                agent.mode(),
+                AgentMode::Act,
+                "Mode should transition to Act"
+            );
         }
     }
 
@@ -6422,7 +6448,9 @@ mod tests {
                 function: ApiStreamToolCallFunction {
                     id: None,
                     name: Some("list_files".to_string()),
-                    arguments: Some(serde_json::json!({"path": "nonexistent_dir_12345"}).to_string()),
+                    arguments: Some(
+                        serde_json::json!({"path": "nonexistent_dir_12345"}).to_string(),
+                    ),
                 },
                 signature: None,
             },
@@ -6465,9 +6493,8 @@ mod tests {
         // Set up plan: 1 step, step 0 Running, approved
         {
             let mut state = agent.state.lock().await;
-            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
-                "Step one".to_string(),
-            ]);
+            let mut plan =
+                crate::core::plan_state::PlanState::create_plan(vec!["Step one".to_string()]);
             plan.approved = true;
             plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
             state.plan_state = Some(plan);

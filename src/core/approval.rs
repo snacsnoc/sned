@@ -135,7 +135,9 @@ impl CommandSafetyChecker {
         }
         // Block ${var} style variable expansion (more flexible than $var alone)
         if normalized.contains("${") {
-            return Err(CommandUnsafe::new("Variable expansion ${...} is not allowed"));
+            return Err(CommandUnsafe::new(
+                "Variable expansion ${...} is not allowed",
+            ));
         }
         Ok(())
     }
@@ -196,7 +198,10 @@ impl CommandSafetyChecker {
                 let replace_start = abs_start;
                 let replace_end = abs_start + 2 + end + 1;
                 let replace_len = replace_end.min(stripped.len()) - replace_start;
-                stripped.replace_range(replace_start..replace_start + replace_len, &" ".repeat(replace_len));
+                stripped.replace_range(
+                    replace_start..replace_start + replace_len,
+                    &" ".repeat(replace_len),
+                );
                 search_from = replace_end;
             } else {
                 break;
@@ -618,7 +623,7 @@ impl ApprovalManager {
     /// Check whether a path is local (within the workspace root).
     /// SECURITY (F-04): For non-existent paths, canonicalize the parent directory
     /// to detect symlink escapes even when the target file doesn't exist yet.
-    /// 
+    ///
     /// @-mentions produce workspace-relative paths like `/AGENTS.md` (single `/` prefix).
     /// These must be resolved relative to workspace_root, not filesystem root.
     fn is_path_local(&self, path: &str) -> bool {
@@ -630,7 +635,7 @@ impl ApprovalManager {
             } else {
                 path
             };
-            
+
             let p = Path::new(path);
             let r = Path::new(root);
 
@@ -672,12 +677,14 @@ impl ApprovalManager {
                             None
                         }
                     })
-                    .map(|canonical_parent| canonical_parent.join(normalized_path.file_name().unwrap_or_default()))
+                    .map(|canonical_parent| {
+                        canonical_parent.join(normalized_path.file_name().unwrap_or_default())
+                    })
                     .unwrap_or_else(|| normalized_path.clone())
             };
 
-            let canonical_root = std::fs::canonicalize(&normalized_root)
-                .unwrap_or_else(|_| normalized_root.clone());
+            let canonical_root =
+                std::fs::canonicalize(&normalized_root).unwrap_or_else(|_| normalized_root.clone());
 
             canonical_path.starts_with(&canonical_root)
         } else {
@@ -689,7 +696,9 @@ impl ApprovalManager {
     /// For execute_command, also store the command fingerprint for per-command approval.
     pub fn auto_approve(&mut self, tool: SnedTool, command_fingerprint: Option<&str>) {
         let tool_name = tool.name();
-        if tool_name == "execute_command" && let Some(fp) = command_fingerprint {
+        if tool_name == "execute_command"
+            && let Some(fp) = command_fingerprint
+        {
             // For execute_command, store the specific command fingerprint (F-02 fix)
             self.session_auto_approve_commands.insert(fp.to_string());
         } else {
@@ -701,7 +710,9 @@ impl ApprovalManager {
     /// Check if a tool is in the session auto-approve list.
     /// For execute_command, also check the command fingerprint.
     pub fn is_auto_approved(&self, tool_name: &str, command_fingerprint: Option<&str>) -> bool {
-        if tool_name == "execute_command" && let Some(fp) = command_fingerprint {
+        if tool_name == "execute_command"
+            && let Some(fp) = command_fingerprint
+        {
             // For execute_command, check if this specific command was approved (F-02 fix)
             self.session_auto_approve_commands.contains(fp)
         } else {
@@ -982,6 +993,12 @@ pub fn set_approval_prompt_scroll() {
 /// Check if the approval prompt needs a forced scroll, and clear the flag.
 pub fn take_approval_prompt_scroll() -> bool {
     APPROVAL_PROMPT_SCROLL.swap(false, Ordering::SeqCst)
+}
+
+/// Clear the approval prompt scroll flag without consuming it.
+/// Used for test teardown to ensure clean state between tests.
+pub fn clear_approval_prompt_scroll() {
+    APPROVAL_PROMPT_SCROLL.store(false, Ordering::SeqCst);
 }
 
 /// No-op retained for Ctrl+C handler compatibility; the approval channel was removed.
@@ -1268,18 +1285,18 @@ mod tests {
     fn test_execute_command_per_command_approval() {
         // SECURITY TEST (F-02): "always approve" should be per-command, not per-tool
         let mut manager = ApprovalManager::new();
-        
+
         // Auto-approve a specific command
         let cmd1_fp = "ls -la";
         manager.auto_approve(SnedTool::ExecuteCommand, Some(cmd1_fp));
-        
+
         // This specific command should not prompt
         assert!(!manager.should_prompt(SnedTool::ExecuteCommand, Some(cmd1_fp)));
-        
+
         // But a different command SHOULD still prompt
         let cmd2_fp = "rm -rf /tmp/test";
         assert!(manager.should_prompt(SnedTool::ExecuteCommand, Some(cmd2_fp)));
-        
+
         // Approve the second command
         manager.auto_approve(SnedTool::ExecuteCommand, Some(cmd2_fp));
         assert!(!manager.should_prompt(SnedTool::ExecuteCommand, Some(cmd2_fp)));
@@ -1305,7 +1322,11 @@ mod tests {
             &output_writer,
         )
         .expect("prompt should succeed");
-        assert_eq!(result, ApprovalResult::Denied, "Non-interactive stdin should deny by default (F-01)");
+        assert_eq!(
+            result,
+            ApprovalResult::Denied,
+            "Non-interactive stdin should deny by default (F-01)"
+        );
     }
 
     #[test]
@@ -1540,15 +1561,15 @@ mod tests {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().expect("create temp dir");
-        
+
         // Create workspace root
         let workspace = temp_dir.path().join("workspace");
         fs::create_dir(&workspace).expect("create workspace");
-        
+
         // Create a directory outside workspace
         let external_dir = temp_dir.path().join("external");
         fs::create_dir(&external_dir).expect("create external dir");
-        
+
         // Create a symlink INSIDE workspace that points OUTSIDE
         let symlink_in_workspace = workspace.join("escape_symlink");
         #[cfg(unix)]
@@ -1557,14 +1578,14 @@ mod tests {
         // Non-existent file via the escape symlink (should be detected as external)
         let non_existent_via_symlink = symlink_in_workspace.join("secret.txt");
 
-        let manager = ApprovalManager::new()
-            .with_workspace_root(workspace.to_string_lossy().to_string());
+        let manager =
+            ApprovalManager::new().with_workspace_root(workspace.to_string_lossy().to_string());
 
         // The non-existent file via escape symlink should NOT be considered local
         // because the symlink resolves outside the workspace root
         #[cfg(unix)]
         assert!(!manager.is_path_local(&non_existent_via_symlink.to_string_lossy()));
-        
+
         // A normal non-existent file inside workspace SHOULD be local
         let normal_non_existent = workspace.join("new_file.txt");
         #[cfg(unix)]

@@ -365,6 +365,10 @@ enum Action {
     Submit(String),
 }
 
+fn is_shutdown_submit(text: &str) -> bool {
+    crate::cli::slash_commands::get_cli_only_command(text).is_some_and(|cmd| cmd.is_shutdown())
+}
+
 /// Drain output channel into app buffer.
 fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     while let Ok(event) = rx.try_recv() {
@@ -547,13 +551,21 @@ async fn handle_key_event(
         // Normal submit - expand all paste markers before sending
         let text = app.get_input_with_expanded_pastes();
         if !text.is_empty() {
+            // Shutdown commands should bypass the session echo lock so /quit still works
+            // even if the agent is currently holding the session mutex.
+            if is_shutdown_submit(&text) {
+                app.input = App::new_textarea(Vec::new());
+                app.clear_pastes();
+                return Ok(Some(Action::Submit(text)));
+            }
+
             // Turn separator before user message (only if a previous turn completed)
             // Check if output already has a turn separator (from previous agent completion)
             if !app.output_lines.is_empty()
                 && app.output_lines.back().is_some_and(|line| {
-                    line.spans.first().is_some_and(|span| {
-                        span.content.as_ref().starts_with('─')
-                    })
+                    line.spans
+                        .first()
+                        .is_some_and(|span| span.content.as_ref().starts_with('─'))
                 })
             {
                 app.push_turn_separator();
@@ -595,7 +607,10 @@ async fn handle_key_event(
 
     // Handle pending clear confirmation
     if app.pending_clear.is_some() {
-        if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') || key.code == KeyCode::Enter {
+        if key.code == KeyCode::Char('y')
+            || key.code == KeyCode::Char('Y')
+            || key.code == KeyCode::Enter
+        {
             app.output_lines.clear();
             app.scroll_offset = 0;
             app.auto_scroll = true;
@@ -676,7 +691,10 @@ async fn handle_key_event(
     // Ctrl+L - clear output screen (with confirmation)
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.pending_clear = Some("ctrl_l".to_string());
-        app.push_styled("Clear output? (y to confirm, any other key to cancel): ", Style::default().fg(theme::WARNING_FG));
+        app.push_styled(
+            "Clear output? (y to confirm, any other key to cancel): ",
+            Style::default().fg(theme::WARNING_FG),
+        );
         return Ok(None);
     }
 
@@ -749,7 +767,10 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Clear => {
             app.pending_clear = Some("slash".to_string());
-            app.push_styled("Clear output? (y to confirm, any other key to cancel): ", Style::default().fg(theme::WARNING_FG));
+            app.push_styled(
+                "Clear output? (y to confirm, any other key to cancel): ",
+                Style::default().fg(theme::WARNING_FG),
+            );
         }
         CliOnlyCommand::History => {
             let last_n: Vec<String> = app
@@ -923,7 +944,10 @@ async fn handle_cli_only_command(
 
                 // Timeout or error: default to cancel (safe default)
                 if confirm.trim().is_empty() {
-                    app.push_styled("Confirmation timeout — cancelled.", Style::default().fg(theme::WARNING_FG));
+                    app.push_styled(
+                        "Confirmation timeout — cancelled.",
+                        Style::default().fg(theme::WARNING_FG),
+                    );
                     return Ok(false);
                 }
 
@@ -955,7 +979,10 @@ async fn handle_cli_only_command(
                     }
                 }
                 Err(e) => {
-                    app.push_styled(format!("Undo failed: {}", e), Style::default().fg(theme::ERROR_FG));
+                    app.push_styled(
+                        format!("Undo failed: {}", e),
+                        Style::default().fg(theme::ERROR_FG),
+                    );
                 }
             }
         }
@@ -975,7 +1002,10 @@ async fn handle_cli_only_command(
                             }
                         }
                         Err(e) => {
-                            app.push_styled(format!("Failed to get diff: {}", e), Style::default().fg(theme::ERROR_FG));
+                            app.push_styled(
+                                format!("Failed to get diff: {}", e),
+                                Style::default().fg(theme::ERROR_FG),
+                            );
                         }
                     }
                 }
@@ -997,7 +1027,10 @@ async fn handle_cli_only_command(
                             }
                         }
                         Err(e) => {
-                            app.push_styled(format!("Failed to get log: {}", e), Style::default().fg(theme::ERROR_FG));
+                            app.push_styled(
+                                format!("Failed to get log: {}", e),
+                                Style::default().fg(theme::ERROR_FG),
+                            );
                         }
                     }
                 }
@@ -1053,7 +1086,10 @@ async fn handle_cli_only_command(
 
                                     // Timeout or error: default to cancel (safe default)
                                     if confirm.trim().is_empty() {
-                                        app.push_styled("Confirmation timeout — cancelled.", Style::default().fg(theme::WARNING_FG));
+                                        app.push_styled(
+                                            "Confirmation timeout — cancelled.",
+                                            Style::default().fg(theme::WARNING_FG),
+                                        );
                                     } else if confirm.trim().to_lowercase() == "y" {
                                         match crate::core::shadow_git::commit_to_real_git(
                                             &workspace_root,
@@ -1066,16 +1102,25 @@ async fn handle_cli_only_command(
                                                 ));
                                             }
                                             Err(e) => {
-                                                app.push_styled(format!("Commit failed: {}", e), Style::default().fg(theme::ERROR_FG));
+                                                app.push_styled(
+                                                    format!("Commit failed: {}", e),
+                                                    Style::default().fg(theme::ERROR_FG),
+                                                );
                                             }
                                         }
                                     } else {
-                                        app.push_styled("Commit cancelled.", Style::default().fg(theme::WARNING_FG));
+                                        app.push_styled(
+                                            "Commit cancelled.",
+                                            Style::default().fg(theme::WARNING_FG),
+                                        );
                                     }
                                 }
                             }
                             Err(e) => {
-                                app.push_styled(format!("Failed to get diff: {}", e), Style::default().fg(theme::ERROR_FG));
+                                app.push_styled(
+                                    format!("Failed to get diff: {}", e),
+                                    Style::default().fg(theme::ERROR_FG),
+                                );
                             }
                         }
                     }
@@ -1205,12 +1250,18 @@ async fn handle_cli_only_command(
 
                             // Timeout or error: default to cancel (safe default)
                             if confirm.trim().is_empty() {
-                                app.push_styled("Confirmation timeout — cancelled.", Style::default().fg(theme::WARNING_FG));
+                                app.push_styled(
+                                    "Confirmation timeout — cancelled.",
+                                    Style::default().fg(theme::WARNING_FG),
+                                );
                                 return Ok(false);
                             }
 
                             if confirm.trim().to_lowercase() == "y" {
-                                app.push_styled("Restore cancelled.", Style::default().fg(theme::WARNING_FG));
+                                app.push_styled(
+                                    "Restore cancelled.",
+                                    Style::default().fg(theme::WARNING_FG),
+                                );
                                 return Ok(false);
                             }
                         }
@@ -1238,7 +1289,7 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Expand => {
             if let Some(index) = crate::cli::slash_commands::parse_expand_index(text) {
-            let sess = session.lock().await;
+                let sess = session.lock().await;
                 let sh = sess.agent_loop().state_handle();
                 drop(sess);
                 let state = sh.lock().await;
@@ -1276,7 +1327,8 @@ async fn handle_cli_only_command(
                 state.plan_state = None;
                 state.strict_plan_mode_enabled = true;
                 drop(state);
-                sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
+                sess.agent_loop_mut()
+                    .set_mode(crate::core::agent_types::AgentMode::Act);
                 app.mode = "ACT".to_string();
                 app.update_placeholder();
                 app.push_plain("Plan aborted. Already-applied changes are kept.");
@@ -1284,67 +1336,99 @@ async fn handle_cli_only_command(
                 app.push_plain("No active plan to abort.");
             }
         }
-        CliOnlyCommand::Plan(_) | CliOnlyCommand::PlanApprove | CliOnlyCommand::PlanPause | CliOnlyCommand::PlanResume | CliOnlyCommand::PlanComplete | CliOnlyCommand::PlanFail => {
+        CliOnlyCommand::Plan(_)
+        | CliOnlyCommand::PlanApprove
+        | CliOnlyCommand::PlanPause
+        | CliOnlyCommand::PlanResume
+        | CliOnlyCommand::PlanComplete
+        | CliOnlyCommand::PlanFail => {
             use crate::cli::slash_commands::PlanSubcommand;
             let mut sess = session.lock().await;
             let sh = sess.agent_loop().state_handle();
             let mut state = sh.lock().await;
             if let Some(plan) = &mut state.plan_state {
                 match cli_cmd {
-                    CliOnlyCommand::Plan(cmd) => match cmd {
-                        PlanSubcommand::Status => {
-                            app.push_plain(plan.status_summary());
-                            app.push_plain(plan.format_display());
-                        }
-                        PlanSubcommand::Edit(step_num, new_desc) => {
-                            if plan.approved && !plan.paused {
-                                app.push_plain("Cannot edit while plan is running. Use /plan pause first.");
-                            } else if step_num == 0 || step_num > plan.steps.len() {
-                                app.push_plain(format!("Invalid step number. Plan has {} steps (1-{}).", plan.steps.len(), plan.steps.len()));
-                            } else if new_desc.trim().is_empty() {
-                                app.push_plain("Step description cannot be empty.");
-                            } else {
-                                plan.steps[step_num - 1].description = new_desc.trim().to_string();
-                                app.push_plain(format!("Step {} updated.", step_num));
+                    CliOnlyCommand::Plan(cmd) => {
+                        match cmd {
+                            PlanSubcommand::Status => {
+                                app.push_plain(plan.status_summary());
+                                app.push_plain(plan.format_display());
                             }
-                        }
-                        PlanSubcommand::Add(after_step, step_text) => {
-                            if plan.approved && !plan.paused {
-                                app.push_plain("Cannot add steps while plan is running. Use /plan pause first.");
-                            } else if step_text.trim().is_empty() {
-                                app.push_plain("Usage: /plan add <after_step> <description>");
-                            } else {
-                                let after_idx = if after_step == 0 { usize::MAX } else { after_step - 1 };
-                                match plan.insert_step_after(after_idx, step_text.trim().to_string()) {
-                                    Ok(()) => {
-                                        if after_step == 0 {
-                                            app.push_plain(format!("Step added at the beginning. ({} steps total).", plan.steps.len()));
-                                        } else {
-                                            app.push_plain(format!("Step added after step {}. ({} steps total).", after_step, plan.steps.len()));
+                            PlanSubcommand::Edit(step_num, new_desc) => {
+                                if plan.approved && !plan.paused {
+                                    app.push_plain(
+                                        "Cannot edit while plan is running. Use /plan pause first.",
+                                    );
+                                } else if step_num == 0 || step_num > plan.steps.len() {
+                                    app.push_plain(format!(
+                                        "Invalid step number. Plan has {} steps (1-{}).",
+                                        plan.steps.len(),
+                                        plan.steps.len()
+                                    ));
+                                } else if new_desc.trim().is_empty() {
+                                    app.push_plain("Step description cannot be empty.");
+                                } else {
+                                    plan.steps[step_num - 1].description =
+                                        new_desc.trim().to_string();
+                                    app.push_plain(format!("Step {} updated.", step_num));
+                                }
+                            }
+                            PlanSubcommand::Add(after_step, step_text) => {
+                                if plan.approved && !plan.paused {
+                                    app.push_plain("Cannot add steps while plan is running. Use /plan pause first.");
+                                } else if step_text.trim().is_empty() {
+                                    app.push_plain("Usage: /plan add <after_step> <description>");
+                                } else {
+                                    let after_idx = if after_step == 0 {
+                                        usize::MAX
+                                    } else {
+                                        after_step - 1
+                                    };
+                                    match plan
+                                        .insert_step_after(after_idx, step_text.trim().to_string())
+                                    {
+                                        Ok(()) => {
+                                            if after_step == 0 {
+                                                app.push_plain(format!("Step added at the beginning. ({} steps total).", plan.steps.len()));
+                                            } else {
+                                                app.push_plain(format!(
+                                                    "Step added after step {}. ({} steps total).",
+                                                    after_step,
+                                                    plan.steps.len()
+                                                ));
+                                            }
                                         }
+                                        Err(e) => app.push_plain(format!("Error: {}", e)),
                                     }
-                                    Err(e) => app.push_plain(format!("Error: {}", e)),
                                 }
                             }
-                        }
-                        PlanSubcommand::Remove(step_num) => {
-                            if plan.approved && !plan.paused {
-                                app.push_plain("Cannot remove steps while plan is running. Use /plan pause first.");
-                            } else if step_num == 0 || step_num > plan.steps.len() {
-                                app.push_plain(format!("Invalid step number. Plan has {} steps (1-{}).", plan.steps.len(), plan.steps.len()));
-                            } else {
-                                match plan.remove_step(step_num - 1) {
-                                    Ok(()) => app.push_plain(format!("Step {} removed. ({} steps remaining).", step_num, plan.steps.len())),
-                                    Err(e) => app.push_plain(format!("Error: {}", e)),
+                            PlanSubcommand::Remove(step_num) => {
+                                if plan.approved && !plan.paused {
+                                    app.push_plain("Cannot remove steps while plan is running. Use /plan pause first.");
+                                } else if step_num == 0 || step_num > plan.steps.len() {
+                                    app.push_plain(format!(
+                                        "Invalid step number. Plan has {} steps (1-{}).",
+                                        plan.steps.len(),
+                                        plan.steps.len()
+                                    ));
+                                } else {
+                                    match plan.remove_step(step_num - 1) {
+                                        Ok(()) => app.push_plain(format!(
+                                            "Step {} removed. ({} steps remaining).",
+                                            step_num,
+                                            plan.steps.len()
+                                        )),
+                                        Err(e) => app.push_plain(format!("Error: {}", e)),
+                                    }
                                 }
                             }
-                        }
-                        PlanSubcommand::Replace(plan_text) => {
-                            if plan_text.trim().is_empty() {
-                                app.push_plain("Plan text cannot be empty.");
-                            } else {
-                                let parsed = crate::core::plan_state::PlanState::parse_plan(&plan_text);
-                                match parsed {
+                            PlanSubcommand::Replace(plan_text) => {
+                                if plan_text.trim().is_empty() {
+                                    app.push_plain("Plan text cannot be empty.");
+                                } else {
+                                    let parsed =
+                                        crate::core::plan_state::PlanState::parse_plan(&plan_text);
+                                    match parsed {
                                     Some(steps) if steps.len() >= 2 => {
                                         let new_plan = crate::core::plan_state::PlanState::create_plan(steps);
                                         *plan = new_plan;
@@ -1353,11 +1437,14 @@ async fn handle_cli_only_command(
                                     Some(_) => app.push_plain("Plan must have at least 2 steps."),
                                     None => app.push_plain("Could not parse plan text. Use numbered format: 1. Step description"),
                                 }
+                                }
                             }
+                            _ => unreachable!(
+                                "PlanSubcommand::Approve/Pause/Resume/Abort are routed to CliOnlyCommand::PlanApprove/Pause/Resume/Abort"
+                            ),
                         }
-                        _ => unreachable!("PlanSubcommand::Approve/Pause/Resume/Abort are routed to CliOnlyCommand::PlanApprove/Pause/Resume/Abort"),
-                    },
-                       CliOnlyCommand::PlanApprove => {
+                    }
+                    CliOnlyCommand::PlanApprove => {
                         if plan.approved {
                             app.push_plain("Plan is already approved and running.");
                         } else if plan.steps.is_empty() {
@@ -1365,28 +1452,35 @@ async fn handle_cli_only_command(
                         } else {
                             // Validate current_step_index points to a pending step; if not, find first pending
                             let start_index = if plan.current_step_index < plan.steps.len()
-                                && plan.steps[plan.current_step_index].status == crate::core::plan_state::PlanStepStatus::Pending
+                                && plan.steps[plan.current_step_index].status
+                                    == crate::core::plan_state::PlanStepStatus::Pending
                             {
                                 Some(plan.current_step_index)
                             } else {
-                                plan.steps.iter().position(|s| s.status == crate::core::plan_state::PlanStepStatus::Pending)
+                                plan.steps.iter().position(|s| {
+                                    s.status == crate::core::plan_state::PlanStepStatus::Pending
+                                })
                             };
                             let Some(start_index) = start_index else {
-                                app.push_plain("No pending step to approve. All steps are complete.");
+                                app.push_plain(
+                                    "No pending step to approve. All steps are complete.",
+                                );
                                 return Ok(false);
                             };
                             plan.current_step_index = start_index;
                             let steps_len = plan.steps.len();
                             let step_desc = plan.steps[start_index].description.clone();
                             plan.approved = true;
-                            plan.steps[start_index].status = crate::core::plan_state::PlanStepStatus::Running;
+                            plan.steps[start_index].status =
+                                crate::core::plan_state::PlanStepStatus::Running;
                             drop(state);
                             {
                                 let state_handle = sess.agent_loop_mut().state_handle();
                                 let mut state = state_handle.lock().await;
                                 state.strict_plan_mode_enabled = false;
                             }
-                            sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Act);
+                            sess.agent_loop_mut()
+                                .set_mode(crate::core::agent_types::AgentMode::Act);
                             drop(sess);
                             app.push_plain(format!(
                                 "Plan approved. Starting from step {}/{}: {}",
@@ -1395,8 +1489,21 @@ async fn handle_cli_only_command(
                                 step_desc
                             ));
                             // Spawn agent to execute the approved plan
-                            let prompt = format!("Execute step {}/{}: {}", start_index + 1, steps_len, step_desc);
-                            spawn_agent_task(session, &prompt, agent_busy, agent_done, agent_start_time, agent_task).await?;
+                            let prompt = format!(
+                                "Execute step {}/{}: {}",
+                                start_index + 1,
+                                steps_len,
+                                step_desc
+                            );
+                            spawn_agent_task(
+                                session,
+                                &prompt,
+                                agent_busy,
+                                agent_done,
+                                agent_start_time,
+                                agent_task,
+                            )
+                            .await?;
                             app.agent_busy = true;
                         }
                     }
@@ -1417,18 +1524,33 @@ async fn handle_cli_only_command(
                             app.push_plain("Plan is already complete.");
                         } else {
                             plan.paused = false;
-                            if plan.steps.get(plan.current_step_index).is_some_and(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed) {
-                                plan.steps[plan.current_step_index].status = crate::core::plan_state::PlanStepStatus::Running;
+                            if plan.steps.get(plan.current_step_index).is_some_and(|s| {
+                                s.status == crate::core::plan_state::PlanStepStatus::Failed
+                            }) {
+                                plan.steps[plan.current_step_index].status =
+                                    crate::core::plan_state::PlanStepStatus::Running;
                             }
                             let step_num = plan.current_step_index + 1;
                             let step_total = plan.steps.len();
                             let step_desc = plan.steps[plan.current_step_index].description.clone();
                             drop(state);
                             drop(sess);
-                            app.push_plain(format!("Plan resumed at step {}/{}: {}", step_num, step_total, step_desc));
+                            app.push_plain(format!(
+                                "Plan resumed at step {}/{}: {}",
+                                step_num, step_total, step_desc
+                            ));
                             // Spawn agent to resume plan execution
-                            let prompt = format!("Execute step {}/{}: {}", step_num, step_total, step_desc);
-                            spawn_agent_task(session, &prompt, agent_busy, agent_done, agent_start_time, agent_task).await?;
+                            let prompt =
+                                format!("Execute step {}/{}: {}", step_num, step_total, step_desc);
+                            spawn_agent_task(
+                                session,
+                                &prompt,
+                                agent_busy,
+                                agent_done,
+                                agent_start_time,
+                                agent_task,
+                            )
+                            .await?;
                             app.agent_busy = true;
                         }
                     }
@@ -1438,13 +1560,20 @@ async fn handle_cli_only_command(
                         } else if plan.current_step_index >= plan.steps.len() {
                             app.push_plain("No active step to mark complete.");
                         } else {
-                            plan.mark_step(plan.current_step_index, crate::core::plan_state::PlanStepStatus::Done).ok();
+                            plan.mark_step(
+                                plan.current_step_index,
+                                crate::core::plan_state::PlanStepStatus::Done,
+                            )
+                            .ok();
                             let next = plan.advance();
                             if next.is_none() && plan.is_complete() {
                                 plan.complete = true;
                                 app.push_plain("All steps marked complete. Plan finished.");
                             } else {
-                                app.push_plain(format!("Step {} marked complete.", plan.current_step_index + 1));
+                                app.push_plain(format!(
+                                    "Step {} marked complete.",
+                                    plan.current_step_index + 1
+                                ));
                             }
                         }
                     }
@@ -1454,7 +1583,11 @@ async fn handle_cli_only_command(
                         } else if plan.current_step_index >= plan.steps.len() {
                             app.push_plain("No active step to mark as failed.");
                         } else {
-                            plan.mark_step(plan.current_step_index, crate::core::plan_state::PlanStepStatus::Failed).ok();
+                            plan.mark_step(
+                                plan.current_step_index,
+                                crate::core::plan_state::PlanStepStatus::Failed,
+                            )
+                            .ok();
                             plan.paused = true;
                             app.push_plain(format!(
                                 "Step {}/{} marked as failed. Execution paused. Use /plan resume to retry.",
@@ -1463,7 +1596,7 @@ async fn handle_cli_only_command(
                             ));
                         }
                     }
-                    
+
                     _ => unreachable!(),
                 }
             } else {
@@ -1471,7 +1604,7 @@ async fn handle_cli_only_command(
             }
         }
     }
-Ok(false)
+    Ok(false)
 }
 
 /// Main ratatui event loop.
@@ -1503,7 +1636,10 @@ async fn run_main_loop(
                 let state = state_arc.lock().await;
                 app.plan_state_cache = state.plan_state.clone();
                 if let Some(ref plan) = state.plan_state {
-                    let has_failed = plan.steps.iter().any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
+                    let has_failed = plan
+                        .steps
+                        .iter()
+                        .any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
                     app.mode = if plan.complete {
                         "COMPLETE".to_string()
                     } else if has_failed {
@@ -1541,8 +1677,7 @@ async fn run_main_loop(
                                 {
                                     app.auto_scroll = true;
                                     app.scroll_offset = 0;
-                                    cancel_agent(&state_handle, &agent_task, &agent_done)
-                                        .await?;
+                                    cancel_agent(&state_handle, &agent_task, &agent_done).await?;
                                     app.push_plain("^C");
                                     app.agent_busy = false;
                                     continue;
@@ -1568,13 +1703,15 @@ async fn run_main_loop(
                     }
 
                     // Global Ctrl+C handling
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
                         let now = std::time::Instant::now();
                         let is_double_tap = {
                             let last = last_ctrlc.lock().unwrap();
                             last.is_some_and(|prev| now.duration_since(prev).as_secs() < 2)
                         };
-                        
+
                         if is_double_tap {
                             // Force exit on second Ctrl+C
                             if app.picker_active {
@@ -1583,20 +1720,20 @@ async fn run_main_loop(
                             }
                             return Ok(());
                         }
-                        
+
                         // First Ctrl+C - update timestamp
                         {
                             let mut last = last_ctrlc.lock().unwrap();
                             *last = Some(now);
                         }
-                        
+
                         // Dismiss picker if active
                         if app.picker_active {
                             app.picker_active = false;
                             app.picker_results.clear();
                             continue;
                         }
-                        
+
                         // If agent is busy, cancel it
                         if agent_busy.load(Ordering::Relaxed) {
                             cancel_agent(&state_handle, &agent_task, &agent_done).await?;
@@ -1608,7 +1745,7 @@ async fn run_main_loop(
                             );
                             continue;
                         }
-                        
+
                         // Not busy: clear input or hint about quitting
                         if !app.input.lines().join("\n").is_empty() {
                             app.push_plain("^C");
@@ -1621,14 +1758,7 @@ async fn run_main_loop(
                         continue;
                     }
 
-                    if let Some(action) = handle_key_event(
-                        key,
-                        app,
-                        &session,
-                        &task_id,
-                    )
-                    .await?
-                    {
+                    if let Some(action) = handle_key_event(key, app, &session, &task_id).await? {
                         match action {
                             Action::Submit(text) => {
                                 // Save to command history and reset navigation
@@ -1640,7 +1770,10 @@ async fn run_main_loop(
                                     crate::cli::slash_commands::get_cli_only_command(&text)
                                 {
                                     // Handle /plan <prompt> specially: clear old plan, enter Plan mode, spawn agent
-                                    if let crate::cli::slash_commands::CliOnlyCommand::PlanPrompt(ref prompt_text) = cli_cmd {
+                                    if let crate::cli::slash_commands::CliOnlyCommand::PlanPrompt(
+                                        ref prompt_text,
+                                    ) = cli_cmd
+                                    {
                                         // Clear old plan state and restore strict plan mode restrictions
                                         {
                                             let state_arc = state_handle.lock().await;
@@ -1653,7 +1786,9 @@ async fn run_main_loop(
                                         // Switch agent mode to Plan so write/edit tools are restricted
                                         {
                                             let mut sess = session.lock().await;
-                                            sess.agent_loop_mut().set_mode(crate::core::agent_types::AgentMode::Plan);
+                                            sess.agent_loop_mut().set_mode(
+                                                crate::core::agent_types::AgentMode::Plan,
+                                            );
                                         }
                                         app.push_plain("Entering plan mode...");
                                         app.mode = "PLAN".to_string();
@@ -1662,10 +1797,20 @@ async fn run_main_loop(
                                         if agent_busy.load(Ordering::Relaxed) {
                                             if let Some(qh) = queue_handle.lock().await.as_ref() {
                                                 qh.enqueue_text_message(prompt_text.clone()).await;
-                                                app.push_plain("Agent is busy. Plan prompt queued.");
+                                                app.push_plain(
+                                                    "Agent is busy. Plan prompt queued.",
+                                                );
                                             }
                                         } else {
-                                            spawn_agent_task(&session, prompt_text, &agent_busy, &agent_done, &agent_start_time, &agent_task).await?;
+                                            spawn_agent_task(
+                                                &session,
+                                                prompt_text,
+                                                &agent_busy,
+                                                &agent_done,
+                                                &agent_start_time,
+                                                &agent_task,
+                                            )
+                                            .await?;
                                             app.agent_busy = true;
                                         }
                                         app.auto_scroll = true;
@@ -1706,10 +1851,10 @@ async fn run_main_loop(
                                             qh.enqueue_text_message(text.clone()).await;
                                             let count = qh.queued_message_count().await;
                                             {
-                                             let sess = session.lock().await;
-                                             let writer = sess.agent_loop().output_writer();
-                                             app.push_user_message(&text, writer);
-                                         }
+                                                let sess = session.lock().await;
+                                                let writer = sess.agent_loop().output_writer();
+                                                app.push_user_message(&text, writer);
+                                            }
                                             app.push_styled(
                                                 format!(
                                                     "Command queued ({} in queue): {}",
@@ -1779,18 +1924,16 @@ async fn run_main_loop(
                 Event::Resize(_, _) => {
                     // Ratatui handles resize automatically on next draw
                 }
-                Event::Mouse(mouse_event) => {
-                    match mouse_event.kind {
-                        ratatui::crossterm::event::MouseEventKind::ScrollDown => {
-                            app.scroll_offset = app.scroll_offset.saturating_add(3);
-                        }
-                        ratatui::crossterm::event::MouseEventKind::ScrollUp => {
-                            app.auto_scroll = false;
-                            app.scroll_offset = app.scroll_offset.saturating_sub(3);
-                        }
-                        _ => {}
+                Event::Mouse(mouse_event) => match mouse_event.kind {
+                    ratatui::crossterm::event::MouseEventKind::ScrollDown => {
+                        app.scroll_offset = app.scroll_offset.saturating_add(3);
                     }
-                }
+                    ratatui::crossterm::event::MouseEventKind::ScrollUp => {
+                        app.auto_scroll = false;
+                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -1826,8 +1969,6 @@ async fn run_main_loop(
                 );
             }
         }
-
-
 
         // 5. Update elapsed time for status bar
         if app.agent_busy
@@ -2046,6 +2187,8 @@ mod tests {
     fn test_drain_output_forces_scroll_for_approval_prompt() {
         let (_tx, mut rx) = mpsc::channel(1);
 
+        // Ensure clean state before test
+        crate::core::approval::clear_approval_prompt_scroll();
         crate::core::approval::set_approval_prompt_scroll();
 
         let mut app = App::new();
@@ -2062,6 +2205,8 @@ mod tests {
     fn test_drain_output_forces_scroll_while_approval_prompt_is_active() {
         let (_tx, mut rx) = mpsc::channel(1);
 
+        // Ensure clean state before test
+        crate::core::approval::clear_approval_prompt_scroll();
         crate::core::approval::set_approval_prompt_active(true);
 
         let mut app = App::new();
@@ -2081,32 +2226,29 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         assert_eq!(
-            approval_result_for_key(&KeyEvent::new(
-                KeyCode::Char('y'),
-                KeyModifiers::empty()
-            )),
+            approval_result_for_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty())),
             Some(ApprovalResult::Approved)
         );
         assert_eq!(
-            approval_result_for_key(&KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL
-            )),
+            approval_result_for_key(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(ApprovalResult::Denied)
         );
         assert_eq!(
-            approval_result_for_key(&KeyEvent::new(
-                KeyCode::Char('/'),
-                KeyModifiers::empty()
-            )),
+            approval_result_for_key(&KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty())),
             None
         );
         assert_eq!(
-            approval_result_for_key(&KeyEvent::new(
-                KeyCode::Char('q'),
-                KeyModifiers::empty()
-            )),
+            approval_result_for_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())),
             None
         );
+    }
+
+    #[test]
+    fn test_shutdown_submit_detection_matches_exit_aliases() {
+        assert!(is_shutdown_submit("/exit"));
+        assert!(is_shutdown_submit("/quit"));
+        assert!(is_shutdown_submit("/q"));
+        assert!(!is_shutdown_submit("/clear"));
+        assert!(!is_shutdown_submit("hello world"));
     }
 }
