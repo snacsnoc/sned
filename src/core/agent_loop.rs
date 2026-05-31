@@ -1133,6 +1133,11 @@ impl AgentLoop {
 
     /// Executes a single turn of the agent loop.
     async fn execute_turn(&mut self) -> TurnResult {
+        // Keep the current plan state in the conversation history before we
+        // derive the request snapshot so the model actually sees the latest
+        // plan context on this turn.
+        self.inject_plan_state_into_history().await;
+
         // 1. Prepare conversation history (possibly truncated by context manager)
         let truncated_history = {
             // Read api_req_info + deleted_range BEFORE locking history,
@@ -1245,39 +1250,6 @@ impl AgentLoop {
                 crate::core::agent_types::AgentMode::Act => "act",
             };
             let _ = tracker.record_model_usage(provider_id, model_id, mode);
-        }
-
-        // 2.7 Inject plan state into conversation history only when changed
-        let plan_state_entry = {
-            let state = self.state.lock().await;
-            state.plan_state.as_ref().map(|ps| {
-                let text = ps.format_state();
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                std::hash::Hash::hash(&text, &mut hasher);
-                let hash = hasher.finish();
-                (text, hash)
-            })
-        };
-        if let Some((ps_text, hash)) = plan_state_entry {
-            let last_hash = {
-                let state = self.state.lock().await;
-                state.last_injected_plan_state_hash
-            };
-            if last_hash != Some(hash) {
-                {
-                    let mut history = self.conversation_history.lock().await;
-                    history.push(StorageMessage {
-                        id: None,
-                        role: MessageRole::User,
-                        content: MessageContent::Text(ps_text),
-                        model_info: None,
-                        metrics: None,
-                        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-                    });
-                }
-                let mut state = self.state.lock().await;
-                state.last_injected_plan_state_hash = Some(hash);
-            }
         }
 
         // 3. Select tool profile and build tool definitions
@@ -3192,6 +3164,48 @@ impl AgentLoop {
         } else {
             TurnResult::Continue
         }
+    }
+
+    async fn inject_plan_state_into_history(&self) {
+        let plan_state_entry = {
+            let mut state = self.state.lock().await;
+            match state.plan_state.as_ref() {
+                Some(plan_state) => {
+                    let text = plan_state.format_state();
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(&text, &mut hasher);
+                    let hash = hasher.finish();
+                    let should_inject = state.last_injected_plan_state_hash != Some(hash);
+                    Some((text, hash, should_inject))
+                }
+                None => {
+                    state.last_injected_plan_state_hash = None;
+                    None
+                }
+            }
+        };
+
+        let Some((ps_text, hash, should_inject)) = plan_state_entry else {
+            return;
+        };
+
+        if !should_inject {
+            return;
+        }
+
+        let mut history = self.conversation_history.lock().await;
+        history.push(StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(ps_text),
+            model_info: None,
+            metrics: None,
+            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+        });
+        drop(history);
+
+        let mut state = self.state.lock().await;
+        state.last_injected_plan_state_hash = Some(hash);
     }
 
     /// Cancels the current task.
@@ -6244,6 +6258,71 @@ mod tests {
         assert_eq!(plan.steps.len(), 3);
         assert!(!plan.approved);
         assert!(plan.format_state().contains("mode: APPROVAL"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_state_is_injected_into_provider_request() {
+        use crate::core::plan_state::PlanStepStatus;
+
+        let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+            text: "No-op response".to_string(),
+            id: None,
+            signature: None,
+        })]];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+
+        let config = AgentConfig {
+            provider,
+            mode: AgentMode::Act,
+            task_id: "test-plan-injection".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
+        };
+
+        let registry = ToolRegistry::new();
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "First step".to_string(),
+                "Second step".to_string(),
+            ]);
+            plan.approved = false;
+            plan.steps[0].status = PlanStepStatus::Pending;
+            state.plan_state = Some(plan);
+            state.last_injected_plan_state_hash = None;
+        }
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|request| request.messages.iter().any(|message| {
+                matches!(
+                    &message.content,
+                    crate::providers::MessageContent::Text(text)
+                        if text.contains("Plan state:\nmode: APPROVAL")
+                )
+            })),
+            "Plan state should be injected into at least one provider request"
+        );
     }
 
     #[tokio::test]

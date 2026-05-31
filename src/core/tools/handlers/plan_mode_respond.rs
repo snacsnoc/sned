@@ -70,6 +70,7 @@ impl PlanModeRespondHandler {
         {
             let mut state = ctx.state.lock().await;
             state.plan_state = Some(plan);
+            state.last_injected_plan_state_hash = None;
         }
 
         // Print plan response to user

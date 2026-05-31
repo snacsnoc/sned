@@ -1325,6 +1325,7 @@ async fn handle_cli_only_command(
             let mut state = sh.lock().await;
             if state.plan_state.is_some() {
                 state.plan_state = None;
+                state.last_injected_plan_state_hash = None;
                 state.strict_plan_mode_enabled = true;
                 drop(state);
                 sess.agent_loop_mut()
@@ -1435,10 +1436,14 @@ async fn handle_cli_only_command(
                                     match parsed {
                                         Some(steps) if !steps.is_empty() => {
                                             let new_plan = crate::core::plan_state::PlanState::create_plan(steps);
-                                            *plan = new_plan;
+                                            let plan_len = {
+                                                *plan = new_plan;
+                                                plan.steps.len()
+                                            };
+                                            state.last_injected_plan_state_hash = None;
                                             app.push_plain(format!(
                                                 "Plan replaced ({} steps).",
-                                                plan.steps.len()
+                                                plan_len
                                             ));
                                         }
                                         Some(_) => app.push_plain("Plan must have at least 1 step."),
@@ -1808,6 +1813,7 @@ async fn run_main_loop(
                                             if let Some(sh) = state_arc.as_ref() {
                                                 let mut state = sh.lock().await;
                                                 state.plan_state = None;
+                                                state.last_injected_plan_state_hash = None;
                                                 state.strict_plan_mode_enabled = true;
                                             }
                                         }

@@ -196,9 +196,7 @@ impl PlanState {
     pub fn advance(&mut self) -> Option<usize> {
         // Bounds check: if current_step_index is out of range, treat as complete
         if self.current_step_index >= self.steps.len() {
-            if self.is_complete() {
-                self.complete = true;
-            }
+            self.complete = self.is_complete();
             return None;
         }
 
