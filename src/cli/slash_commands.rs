@@ -261,6 +261,8 @@ pub enum CliOnlyCommand {
     PlanPause,
     PlanResume,
     PlanAbort,
+    PlanComplete,
+    PlanFail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +281,8 @@ pub enum PlanSubcommand {
     Pause,
     Resume,
     Abort,
+    Complete,
+    Fail,
 }
 
 pub fn parse_plan_subcommand(args: &str) -> Option<PlanSubcommand> {
@@ -293,6 +297,8 @@ pub fn parse_plan_subcommand(args: &str) -> Option<PlanSubcommand> {
         "pause" => Some(PlanSubcommand::Pause),
         "resume" => Some(PlanSubcommand::Resume),
         "abort" => Some(PlanSubcommand::Abort),
+        "complete" => Some(PlanSubcommand::Complete),
+        "fail" => Some(PlanSubcommand::Fail),
         "edit" if parts.len() >= 3 => {
             parts[1].parse::<usize>().ok()
                 .map(|step| PlanSubcommand::Edit(step, parts[2].to_string()))
@@ -344,6 +350,8 @@ impl CliOnlyCommand {
             "plan pause" => Some(CliOnlyCommand::PlanPause),
             "plan resume" => Some(CliOnlyCommand::PlanResume),
             "plan abort" => Some(CliOnlyCommand::PlanAbort),
+            "plan complete" => Some(CliOnlyCommand::PlanComplete),
+            "plan fail" => Some(CliOnlyCommand::PlanFail),
             _ => None,
         }
     }
@@ -363,6 +371,8 @@ impl CliOnlyCommand {
             Some(PlanSubcommand::Pause) => Some(CliOnlyCommand::PlanPause),
             Some(PlanSubcommand::Resume) => Some(CliOnlyCommand::PlanResume),
             Some(PlanSubcommand::Abort) => Some(CliOnlyCommand::PlanAbort),
+            Some(PlanSubcommand::Complete) => Some(CliOnlyCommand::PlanComplete),
+            Some(PlanSubcommand::Fail) => Some(CliOnlyCommand::PlanFail),
             None if args_trimmed.is_empty() => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
             None => Some(CliOnlyCommand::PlanPrompt(args_trimmed.to_string())),
         }
@@ -411,6 +421,8 @@ impl CliOnlyCommand {
                 | CliOnlyCommand::PlanPause
                 | CliOnlyCommand::PlanResume
                 | CliOnlyCommand::PlanAbort
+                | CliOnlyCommand::PlanComplete
+                | CliOnlyCommand::PlanFail
         )
     }
 
@@ -438,6 +450,8 @@ impl CliOnlyCommand {
                 | CliOnlyCommand::PlanPause
                 | CliOnlyCommand::PlanResume
                 | CliOnlyCommand::PlanAbort
+                | CliOnlyCommand::PlanComplete
+                | CliOnlyCommand::PlanFail
         )
     }
 }

@@ -1260,7 +1260,7 @@ async fn handle_cli_only_command(
                 app.push_plain("No active plan to abort.");
             }
         }
-        CliOnlyCommand::Plan(_) | CliOnlyCommand::PlanApprove | CliOnlyCommand::PlanPause | CliOnlyCommand::PlanResume => {
+        CliOnlyCommand::Plan(_) | CliOnlyCommand::PlanApprove | CliOnlyCommand::PlanPause | CliOnlyCommand::PlanResume | CliOnlyCommand::PlanComplete | CliOnlyCommand::PlanFail => {
             use crate::cli::slash_commands::PlanSubcommand;
             let mut sess = session.lock().await;
             let sh = sess.agent_loop().state_handle();
@@ -1403,6 +1403,37 @@ async fn handle_cli_only_command(
                             let prompt = format!("Execute step {}/{}: {}", step_num, step_total, step_desc);
                             spawn_agent_task(session, &prompt, &agent_busy, agent_done, agent_start_time, agent_task).await?;
                             app.agent_busy = true;
+                        }
+                    }
+                    CliOnlyCommand::PlanComplete => {
+                        if plan.complete {
+                            app.push_plain("Plan is already complete.");
+                        } else if plan.current_step_index >= plan.steps.len() {
+                            app.push_plain("No active step to mark complete.");
+                        } else {
+                            plan.mark_step(plan.current_step_index, crate::core::plan_state::PlanStepStatus::Done).ok();
+                            let next = plan.advance();
+                            if next.is_none() && plan.is_complete() {
+                                plan.complete = true;
+                                app.push_plain("All steps marked complete. Plan finished.");
+                            } else {
+                                app.push_plain(format!("Step {} marked complete.", plan.current_step_index + 1));
+                            }
+                        }
+                    }
+                    CliOnlyCommand::PlanFail => {
+                        if plan.complete {
+                            app.push_plain("Plan is already complete.");
+                        } else if plan.current_step_index >= plan.steps.len() {
+                            app.push_plain("No active step to mark as failed.");
+                        } else {
+                            plan.mark_step(plan.current_step_index, crate::core::plan_state::PlanStepStatus::Failed).ok();
+                            plan.paused = true;
+                            app.push_plain(format!(
+                                "Step {}/{} marked as failed. Execution paused. Use /plan resume to retry.",
+                                plan.current_step_index + 1,
+                                plan.steps.len()
+                            ));
                         }
                     }
                     
