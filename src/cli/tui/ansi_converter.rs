@@ -34,8 +34,10 @@ impl RatatuiPerformer {
 
     fn flush_current_text(&mut self) {
         if !self.current_text.is_empty() {
-            self.current_spans
-                .push(Span::styled(std::mem::take(&mut self.current_text), self.current_style));
+            self.current_spans.push(Span::styled(
+                std::mem::take(&mut self.current_text),
+                self.current_style,
+            ));
         }
     }
 
@@ -109,16 +111,18 @@ impl Perform for RatatuiPerformer {
                     [46] => self.current_style = self.current_style.bg(Color::Cyan),
                     [47] => self.current_style = self.current_style.bg(Color::White),
                     // Bright background colors: 100-107 (use Indexed colors 8-15 for bright palette)
-                    [100] => self.current_style = self.current_style.bg(Color::Indexed(8)),   // Bright black
-                    [101] => self.current_style = self.current_style.bg(Color::Indexed(9)),   // Bright red
-                    [102] => self.current_style = self.current_style.bg(Color::Indexed(10)),  // Bright green
-                    [103] => self.current_style = self.current_style.bg(Color::Indexed(11)),  // Bright yellow
-                    [104] => self.current_style = self.current_style.bg(Color::Indexed(12)),  // Bright blue
-                    [105] => self.current_style = self.current_style.bg(Color::Indexed(13)),  // Bright magenta
-                    [106] => self.current_style = self.current_style.bg(Color::Indexed(14)),  // Bright cyan
-                    [107] => self.current_style = self.current_style.bg(Color::Indexed(15)),  // Bright white
+                    [100] => self.current_style = self.current_style.bg(Color::Indexed(8)), // Bright black
+                    [101] => self.current_style = self.current_style.bg(Color::Indexed(9)), // Bright red
+                    [102] => self.current_style = self.current_style.bg(Color::Indexed(10)), // Bright green
+                    [103] => self.current_style = self.current_style.bg(Color::Indexed(11)), // Bright yellow
+                    [104] => self.current_style = self.current_style.bg(Color::Indexed(12)), // Bright blue
+                    [105] => self.current_style = self.current_style.bg(Color::Indexed(13)), // Bright magenta
+                    [106] => self.current_style = self.current_style.bg(Color::Indexed(14)), // Bright cyan
+                    [107] => self.current_style = self.current_style.bg(Color::Indexed(15)), // Bright white
                     // Blinking
-                    [5] => self.current_style = self.current_style.add_modifier(Modifier::SLOW_BLINK),
+                    [5] => {
+                        self.current_style = self.current_style.add_modifier(Modifier::SLOW_BLINK)
+                    }
                     // Reverse video
                     [7] => self.current_style = self.current_style.add_modifier(Modifier::REVERSED),
                     // Modifier resets
@@ -126,8 +130,13 @@ impl Perform for RatatuiPerformer {
                         self.current_style = self.current_style.remove_modifier(Modifier::BOLD);
                         self.current_style = self.current_style.remove_modifier(Modifier::DIM);
                     }
-                    [23] => self.current_style = self.current_style.remove_modifier(Modifier::ITALIC),
-                    [24] => self.current_style = self.current_style.remove_modifier(Modifier::UNDERLINED),
+                    [23] => {
+                        self.current_style = self.current_style.remove_modifier(Modifier::ITALIC)
+                    }
+                    [24] => {
+                        self.current_style =
+                            self.current_style.remove_modifier(Modifier::UNDERLINED)
+                    }
                     // 256-color: [38, 5, N] → Color::Indexed(N)
                     [38, 5, n] => {
                         self.current_style = self.current_style.fg(Color::Indexed(*n as u8))

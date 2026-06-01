@@ -372,10 +372,18 @@ impl CliOnlyCommand {
         let subcmd = parse_plan_subcommand(args_trimmed);
         match subcmd {
             Some(PlanSubcommand::Status) => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
-            Some(PlanSubcommand::Edit(step, desc)) => Some(CliOnlyCommand::Plan(PlanSubcommand::Edit(step, desc))),
-            Some(PlanSubcommand::Add(after, desc)) => Some(CliOnlyCommand::Plan(PlanSubcommand::Add(after, desc))),
-            Some(PlanSubcommand::Remove(step)) => Some(CliOnlyCommand::Plan(PlanSubcommand::Remove(step))),
-            Some(PlanSubcommand::Replace(text)) => Some(CliOnlyCommand::Plan(PlanSubcommand::Replace(text))),
+            Some(PlanSubcommand::Edit(step, desc)) => {
+                Some(CliOnlyCommand::Plan(PlanSubcommand::Edit(step, desc)))
+            }
+            Some(PlanSubcommand::Add(after, desc)) => {
+                Some(CliOnlyCommand::Plan(PlanSubcommand::Add(after, desc)))
+            }
+            Some(PlanSubcommand::Remove(step)) => {
+                Some(CliOnlyCommand::Plan(PlanSubcommand::Remove(step)))
+            }
+            Some(PlanSubcommand::Replace(text)) => {
+                Some(CliOnlyCommand::Plan(PlanSubcommand::Replace(text)))
+            }
             Some(PlanSubcommand::Approve) => Some(CliOnlyCommand::PlanApprove),
             Some(PlanSubcommand::Pause) => Some(CliOnlyCommand::PlanPause),
             Some(PlanSubcommand::Resume) => Some(CliOnlyCommand::PlanResume),

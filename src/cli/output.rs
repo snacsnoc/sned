@@ -34,7 +34,9 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(theme::WARNING_FG).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(theme::WARNING_FG)
+                .add_modifier(Modifier::DIM),
         )))
     }
 
@@ -63,7 +65,11 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(if is_error { theme::ERROR_FG } else { theme::PROMPT_FG }),
+            Style::default().fg(if is_error {
+                theme::ERROR_FG
+            } else {
+                theme::PROMPT_FG
+            }),
         )))
     }
 
@@ -100,7 +106,9 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         OutputEvent::Line(Line::from(Span::styled(
             format!("[sned] {}", text),
-            Style::default().fg(theme::INFO_FG).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(theme::INFO_FG)
+                .add_modifier(Modifier::DIM),
         )))
     }
 

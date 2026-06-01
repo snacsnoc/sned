@@ -846,6 +846,11 @@ async fn handle_cli_only_command(
         CliOnlyCommand::ResetCompact => {
             let mut sess = session.lock().await;
             if sess.clear_compacted_summary().await {
+                let sh = sess.agent_loop().state_handle();
+                {
+                    let mut state = sh.lock().await;
+                    state.last_injected_plan_state_hash = None;
+                }
                 app.push_plain("Compacted summary cleared. You can now use /compact again.");
             } else {
                 app.push_plain("No compacted summary to clear.");
