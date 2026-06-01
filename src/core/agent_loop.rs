@@ -167,9 +167,33 @@ fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriter
     use crate::cli::output::OutputEvent;
     let term_width = get_terminal_width();
     let indent = "  ";
-    let wrapped = crate::cli::text_utils::wrap_text(line, term_width, indent);
+    let sanitized = sanitize_model_text_for_display(line);
+    if sanitized.trim().is_empty() {
+        return;
+    }
+    let wrapped = crate::cli::text_utils::wrap_text(&sanitized, term_width, indent);
 
-    output_writer.emit(OutputEvent::model_output(wrapped));
+    // The TUI output buffer stores one ratatui Line per visual line. Emitting a
+    // single Line that still contains embedded '\n' lets one model event occupy
+    // multiple rows inside a single span, which can scramble viewport math and
+    // corrupt rendering when model output is long or malformed.
+    for wrapped_line in wrapped.lines() {
+        output_writer.emit(OutputEvent::model_output(wrapped_line.to_string()));
+    }
+}
+
+fn sanitize_model_text_for_display(line: &str) -> String {
+    line.chars()
+        .map(|ch| {
+            if matches!(ch, '\t') {
+                ' '
+            } else if ch.is_control() {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 fn print_code_block(
@@ -4017,6 +4041,47 @@ mod tests {
         assert!(!state.is_cancelled);
         assert!(!state.did_complete_reading_stream);
         assert!(state.snipped_code_blocks.is_empty());
+    }
+
+    #[test]
+    fn test_print_model_line_emits_one_output_event_per_wrapped_line() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        print_model_line(&"x".repeat(200), &writer);
+
+        let mut emitted = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                OutputEvent::Line(line) => emitted.push(line.to_string()),
+                other => panic!("unexpected output event: {:?}", other),
+            }
+        }
+
+        assert!(emitted.len() >= 2, "expected wrapped output to span multiple events");
+        assert!(emitted.iter().all(|line| !line.contains('\n')));
+    }
+
+    #[test]
+    fn test_print_model_line_sanitizes_control_characters() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        print_model_line("ok\r\x1b[31mthere\tfriend", &writer);
+
+        let rendered = match rx.try_recv() {
+            Ok(OutputEvent::Line(line)) => line.to_string(),
+            Ok(other) => panic!("unexpected output event: {:?}", other),
+            Err(err) => panic!("expected output event, got {}", err),
+        };
+
+        assert!(!rendered.contains('\r'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("ok"));
+        assert!(rendered.contains("there"));
+        assert!(rendered.contains("friend"));
     }
 
     #[tokio::test]
