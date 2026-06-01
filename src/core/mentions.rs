@@ -53,11 +53,21 @@ impl Mention {
         None
     }
 
+    fn display_path(path: &str) -> &str {
+        path.trim_start_matches('/')
+    }
+
     /// Get a description for the mention.
     pub fn description(&self) -> String {
         match self {
-            Mention::File(path) => format!("'{}' (see below for file content)", path),
-            Mention::Folder(path) => format!("'{}' (see below for folder content)", path),
+            Mention::File(path) => format!(
+                "'{}' (see below for file content)",
+                Self::display_path(path)
+            ),
+            Mention::Folder(path) => format!(
+                "'{}' (see below for folder content)",
+                Self::display_path(path)
+            ),
             Mention::GitChanges => "Working directory changes (see below for details)".to_string(),
             Mention::Commit(hash) => format!("Git commit '{}' (see below for commit info)", hash),
         }
@@ -126,7 +136,7 @@ async fn expand_file_mention(path: &str, workspace_root: &Path) -> Result<String
     match tokio::fs::read_to_string(&full_path).await {
         Ok(content) => Ok(format!(
             "<file_mention path=\"{}\">\n{}\n</file_mention>",
-            path, content
+            clean_path, content
         )),
         Err(e) => Err(format!("Failed to read file {}: {}", path, e)),
     }
@@ -151,7 +161,7 @@ async fn expand_folder_mention(path: &str, workspace_root: &Path) -> Result<Stri
 
             Ok(format!(
                 "<folder_mention path=\"{}\">\n{}\n</folder_mention>",
-                path,
+                clean_path,
                 lines.join("\n")
             ))
         }
@@ -247,7 +257,7 @@ mod tests {
     fn test_mention_description() {
         assert_eq!(
             Mention::File("/test.rs".to_string()).description(),
-            "'/test.rs' (see below for file content)"
+            "'test.rs' (see below for file content)"
         );
         assert_eq!(
             Mention::GitChanges.description(),
@@ -267,6 +277,8 @@ mod tests {
         let (parsed, expanded) = expand_mentions(text, &temp_dir).await;
 
         assert!(parsed.contains("see below for file content"));
+        assert!(parsed.contains("'test_mention.txt'"));
+        assert!(!parsed.contains("'/test_mention.txt'"));
         assert_eq!(expanded.len(), 1);
         assert!(expanded[0].contains("Hello from mention"));
 
