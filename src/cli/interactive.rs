@@ -742,6 +742,9 @@ async fn handle_key_event(
             app.picker_active = true;
             app.picker_results = results;
             app.picker_index = 0;
+            // Push deadline far forward so the main loop doesn't re-search immediately
+            app.mention_search_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(3600);
         } else if query != app.mention_search_query {
             // Query changed — reset debounce timer, keep stale results visible
             app.mention_search_query = query;
