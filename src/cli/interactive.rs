@@ -1669,6 +1669,8 @@ async fn run_main_loop(
     auto_approve: bool,
 ) -> anyhow::Result<()> {
     use std::sync::Mutex as StdMutex;
+    const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
 
     loop {
@@ -1705,8 +1707,14 @@ async fn run_main_loop(
         // 2. Render
         terminal.draw(|f| app.render(f))?;
 
-        // 3. Poll for events (blocking, 16ms timeout for ~60fps responsiveness)
-        let has_event = ratatui::crossterm::event::poll(Duration::from_millis(16))?;
+        // 3. Poll for events. Busy-state redraw does not need 60 FPS; a slower
+        // cadence keeps the TUI responsive without wasting most cycles on the spinner.
+        let poll_interval = if app.agent_busy {
+            BUSY_POLL_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
+        };
+        let has_event = ratatui::crossterm::event::poll(poll_interval)?;
         if has_event {
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {

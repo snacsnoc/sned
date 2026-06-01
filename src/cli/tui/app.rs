@@ -56,6 +56,8 @@ pub struct App {
     pub start_time: Option<Instant>,
     /// Spinner animation frame index
     pub spinner_index: usize,
+    /// Last time the spinner frame advanced.
+    pub last_spinner_tick: Option<Instant>,
     /// Current working directory (for file search)
     pub cwd: String,
     /// Whether @ mention file picker is active
@@ -105,9 +107,7 @@ impl App {
 
     /// Update the textarea placeholder based on current mode.
     pub fn update_placeholder(&mut self) {
-        if self.agent_busy {
-            self.input.set_placeholder_text("⟳ Agent working...");
-        } else if self.mode == "PLAN" {
+        if self.mode == "PLAN" {
             self.input.set_placeholder_text("❯ [PLAN] ");
         } else if self.mode == "ACT" {
             self.input.set_placeholder_text("❯ [ACT] ");
@@ -126,6 +126,7 @@ impl App {
             scroll_mode: ScrollMode::Auto,
             start_time: None,
             spinner_index: 0,
+            last_spinner_tick: None,
             cwd: String::new(),
             picker_active: false,
             picker_results: Vec::new(),
@@ -364,14 +365,7 @@ impl App {
 
     fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
         // Update input block with themed border and styled title
-        let input_title = if self.agent_busy {
-            Line::from(vec![
-                Span::styled(self.spinner_char().to_string(), theme::spinner_style()),
-                Span::raw(" Working "),
-            ])
-        } else {
-            Line::from(" Input ")
-        };
+        let input_title = Line::from(" Input ");
         self.input
             .set_block(theme::input_block(input_title, self.agent_busy));
 
@@ -427,8 +421,8 @@ impl App {
                 );
             frame.render_widget(output, output_area);
 
-            // Render loading indicator at bottom of output area unless an
-            // approval prompt is active. Approval visibility takes priority.
+            // Keep a single busy indicator in the output pane. Duplicating the
+            // spinner in the input pane just burns redraw budget and visual space.
             if self.agent_busy && !crate::core::approval::is_approval_prompt_active() {
                 let loading_area = Rect::new(
                     output_area.x,
@@ -443,6 +437,7 @@ impl App {
                 .style(theme::status_style());
                 frame.render_widget(loading, loading_area);
             }
+
         }
 
         // Scrollbar on output pane (render inside the border)
@@ -556,10 +551,25 @@ impl App {
         self.paste_chunks.clear();
     }
 
-    /// Increment spinner frame (call on each render tick when agent_busy).
+    /// Increment spinner frame at a human-scale cadence instead of every loop
+    /// iteration; a 60 FPS braille spinner just burns redraw budget.
     pub fn tick_spinner(&mut self) {
-        if self.agent_busy {
+        const SPINNER_INTERVAL: Duration = Duration::from_millis(125);
+
+        if !self.agent_busy {
+            self.last_spinner_tick = None;
+            return;
+        }
+
+        let now = Instant::now();
+        let should_advance = self
+            .last_spinner_tick
+            .map(|last| now.duration_since(last) >= SPINNER_INTERVAL)
+            .unwrap_or(true);
+
+        if should_advance {
             self.spinner_index = (self.spinner_index + 1) % 10;
+            self.last_spinner_tick = Some(now);
         }
     }
 
@@ -694,6 +704,61 @@ mod tests {
 
         assert!(rendered.contains("Approve these edits?"));
         assert!(!rendered.contains("Agent processing..."));
+    }
+
+    #[test]
+    fn test_busy_state_does_not_replace_input_placeholder() {
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.mode = "ACT".to_string();
+
+        app.update_placeholder();
+
+        assert_eq!(app.input.placeholder_text(), "❯ [ACT] ");
+    }
+
+    #[test]
+    fn test_render_output_keeps_single_busy_loading_message() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.mode = "ACT".to_string();
+        app.force_bottom();
+        app.output_lines.push_back(ratatui::text::Line::from("line 1"));
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Agent processing..."));
+        assert!(!rendered.contains("Working"));
+        assert!(!rendered.contains("Agent working..."));
+    }
+
+    #[test]
+    fn test_tick_spinner_throttles_frame_advancement() {
+        let mut app = App::new();
+        app.agent_busy = true;
+
+        app.tick_spinner();
+        let first = app.spinner_index;
+
+        app.tick_spinner();
+        assert_eq!(app.spinner_index, first);
+
+        app.last_spinner_tick = Some(Instant::now() - Duration::from_millis(200));
+        app.tick_spinner();
+        assert_ne!(app.spinner_index, first);
     }
 
     #[test]
