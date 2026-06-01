@@ -118,6 +118,8 @@ pub struct TaskState {
     pub cumulative_reasoning_tokens: u32,
     /// Cumulative cost across all turns.
     pub cumulative_cost: f64,
+    /// Consecutive API failures from provider errors (network/rate-limit/server errors).
+    pub consecutive_provider_failures: u32,
     /// Number of commands executed in this session.
     pub commands_executed: u32,
     /// Number of turns in this session.
@@ -186,6 +188,7 @@ impl Default for TaskState {
             cumulative_cache_reads: 0,
             cumulative_reasoning_tokens: 0,
             cumulative_cost: 0.0,
+            consecutive_provider_failures: 0,
             commands_executed: 0,
             turns_completed: 0,
             snipped_code_blocks: Vec::new(),

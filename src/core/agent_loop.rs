@@ -6988,4 +6988,455 @@ mod tests {
             assert!(!plan.complete, "Plan should not be complete after failure");
         }
     }
+
+    // =====================================================================
+    // keep_from_preserving_tool_pairs tests (real ToolUse/ToolResult blocks)
+    // =====================================================================
+
+    #[test]
+    fn test_keep_from_preserving_tool_pairs_basic() {
+        // ToolUse at index 3, ToolResult at index 5 (outside kept region).
+        // keep_from_base = 6 → should pull back to 3.
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields,
+            StorageMessage, ToolResultBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
+        };
+
+        let mut history = Vec::new();
+        for i in 0..6 {
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(format!("msg-{i}")),
+                model_info: None,
+                metrics: None,
+                ts: Some(i as u64),
+            });
+        }
+        // Index 3: ToolUse (assistant message)
+        history[3] = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                ToolUseBlock {
+                    id: "tu-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(3),
+        };
+        // Index 5: ToolResult (user message)
+        history[5] = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                ToolResultBlock {
+                    tool_use_id: "tu-1".to_string(),
+                    content: ToolResultContent::Text("ok".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(5),
+        };
+
+        // keep_from_base = 6 means we want to keep messages 6.., but index 5
+        // has a ToolResult referencing ToolUse at index 3, so keep_from → 3
+        let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 6);
+        assert_eq!(result, 3, "Should pull back to ToolUse at index 3");
+    }
+
+    #[test]
+    fn test_keep_from_preserving_tool_pairs_no_orphan() {
+        // ToolUse and ToolResult both inside kept region → keep_from unchanged.
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields,
+            StorageMessage, ToolResultBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
+        };
+
+        let mut history = Vec::new();
+        for i in 0..10 {
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(format!("msg-{i}")),
+                model_info: None,
+                metrics: None,
+                ts: Some(i as u64),
+            });
+        }
+        // ToolUse at index 7, ToolResult at index 8 — both in kept region (keep_from_base=5)
+        history[7] = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                ToolUseBlock {
+                    id: "tu-2".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "b.rs"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(7),
+        };
+        history[8] = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                ToolResultBlock {
+                    tool_use_id: "tu-2".to_string(),
+                    content: ToolResultContent::Text("ok".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(8),
+        };
+
+        // Both ToolUse (7) and ToolResult (8) are in kept region (5..) → no change
+        let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 5);
+        assert_eq!(result, 5, "No orphans — keep_from unchanged");
+    }
+
+    #[test]
+    fn test_keep_from_preserving_tool_pairs_cascade() {
+        // Cascade: ToolUse at 3, ToolResult at 5 (refers to 3).
+        // ToolUse at 7, ToolResult at 9 (refers to 7).
+        // keep_from_base = 10 → pulls to 7 (first pass), then 3 (second pass).
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields,
+            StorageMessage, ToolResultBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
+        };
+
+        let mut history = Vec::new();
+        for i in 0..10 {
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(format!("msg-{i}")),
+                model_info: None,
+                metrics: None,
+                ts: Some(i as u64),
+            });
+        }
+        // ToolUse at 3
+        history[3] = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                ToolUseBlock {
+                    id: "tu-a".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(3),
+        };
+        // ToolResult at 5 referencing tu-a
+        history[5] = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                ToolResultBlock {
+                    tool_use_id: "tu-a".to_string(),
+                    content: ToolResultContent::Text("ok-a".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(5),
+        };
+        // ToolUse at 7
+        history[7] = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                ToolUseBlock {
+                    id: "tu-b".to_string(),
+                    name: "edit_file".to_string(),
+                    input: serde_json::json!({"path": "b.rs"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(7),
+        };
+        // ToolResult at 9 referencing tu-b
+        history[9] = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                ToolResultBlock {
+                    tool_use_id: "tu-b".to_string(),
+                    content: ToolResultContent::Text("ok-b".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(9),
+        };
+
+        // keep_from_base=10: first pass finds ToolResult at 9 → pulls to 7.
+        // Second pass finds ToolResult at 5 (now outside 7..) → pulls to 3.
+        // Third pass: no more changes.
+        let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 10);
+        assert_eq!(result, 3, "Cascade should pull back through both pairs to index 3");
+    }
+
+    #[test]
+    fn test_keep_from_preserving_tool_pairs_text_only() {
+        // No tool blocks at all → keep_from_base unchanged.
+        use crate::providers::{MessageContent, MessageRole, StorageMessage};
+
+        let history: Vec<StorageMessage> = (0..10)
+            .map(|i| StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(format!("msg-{i}")),
+                model_info: None,
+                metrics: None,
+                ts: Some(i as u64),
+            })
+            .collect();
+
+        let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 5);
+        assert_eq!(result, 5, "Text-only history — keep_from unchanged");
+    }
+
+    #[test]
+    fn test_keep_from_preserving_tool_pairs_cascade_two_levels() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields,
+            StorageMessage, ToolResultBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
+        };
+
+        // Layout:
+        //   idx 0: text
+        //   idx 1: text
+        //   idx 2: ToolUse "tu-a"
+        //   idx 3: text
+        //   idx 4: text
+        //   idx 5: ToolResult for "tu-a"
+        //   idx 6: ToolUse "tu-b"
+        //   idx 7: ToolResult for "tu-b"
+        // keep_from_base=6: pass 1 finds TR at 7 (tu-b at 6 < 6? no, 6 == 6, skip).
+        //   Actually 6 < 6 is false. Let me adjust: keep_from_base=7.
+        // keep_from_base=7: pass 1 scans 7.. → TR at 7 for tu-b at 6, 6 < 7 → pull to 6.
+        // keep_from=6: pass 2 scans 6.. → TR at 7 for tu-b at 6, 6 >= 6 OK.
+        //   TR at 5 for tu-a at 2: 5 is NOT in 6.. (skip(6) starts at 6). 5 < 6, not scanned.
+        //   But 5 IS in the kept region? No: kept is history[6..], index 5 is excluded. No orphan.
+        //
+        // True cascade needs: after pulling, a previously-excluded TR lands in the kept region
+        // and its TU is still below the new keep_from.
+        //
+        // Layout for cascade:
+        //   idx 0: text
+        //   idx 1: text
+        //   idx 2: ToolUse "tu-a"
+        //   idx 3: text
+        //   idx 4: ToolResult for "tu-a"
+        //   idx 5: text
+        //   idx 6: ToolUse "tu-b"
+        //   idx 7: ToolResult for "tu-b"
+        // keep_from_base=6: scan 6.. → TR at 7 for tu-b at 6, 6 < 6? No. 6 is NOT < 6. No orphan.
+        // keep_from_base=5: scan 5.. → TR at 7 for tu-b at 6, 6 < 5? No. No orphan.
+        //
+        // Cascade trigger: keep_from must be BETWEEN the TU and its TR.
+        //
+        //   idx 0: text
+        //   idx 1: text
+        //   idx 2: ToolUse "tu-a"
+        //   idx 3: text
+        //   idx 4: ToolResult for "tu-a"
+        //   idx 5: ToolUse "tu-b"
+        //   idx 6: text
+        //   idx 7: ToolResult for "tu-b"
+        // keep_from_base=6: scan 6.. → TR at 7 for tu-b at 5, 5 < 6 → pull to 5.
+        // keep_from=5: scan 5.. → TR at 7 for tu-b at 5, 5 >= 5 OK.
+        //   TR at 4 for tu-a at 2: 4 < 5, not scanned. 4 NOT in kept region. No orphan.
+        //
+        // Hmm. For true cascade I need: after pulling keep_from from X to Y (Y < X),
+        // a TR at index Z where Y <= Z < X was previously not scanned (Z < X but Z >= Y)
+        // and that TR references a TU at index W where W < Y.
+        //
+        //   idx 0: text
+        //   idx 1: ToolUse "tu-a"
+        //   idx 2: text
+        //   idx 3: text
+        //   idx 4: ToolResult for "tu-a"
+        //   idx 5: ToolUse "tu-b"
+        //   idx 6: ToolResult for "tu-b"
+        //   idx 7: text
+        // keep_from_base=7: scan 7.. → nothing (only text at 7). keep_from=7. No trigger.
+        //
+        // keep_from_base=5: scan 5.. → TR at 6 for tu-b at 5, 5 < 5? No. TR at 4: not in 5..(4<5).
+        //
+        // I need the TR for tu-b to be AFTER keep_from_base, and tu-b's TU to be before it.
+        // Then pulling keep_from to tu-b's index exposes TR for tu-a which is between tu-b and keep_from.
+        //
+        //   idx 0: text
+        //   idx 1: ToolUse "tu-a"
+        //   idx 2: text
+        //   idx 3: ToolResult for "tu-a"
+        //   idx 4: text
+        //   idx 5: ToolUse "tu-b"
+        //   idx 6: text
+        //   idx 7: text
+        //   idx 8: ToolResult for "tu-b"
+        // keep_from_base=7: scan 7.. → TR at 8 for tu-b at 5, 5 < 7 → pull to 5.
+        // keep_from=5: scan 5.. → TR at 8 for tu-b at 5, 5 >= 5 OK.
+        //   TR at 3 for tu-a at 1: 3 < 5, not in scan range. 3 NOT in kept region (kept=5..). No orphan.
+        //
+        // For cascade: I need TR for tu-a to land IN the kept region after the first pull.
+        // That means TR for tu-a must be at index Y where Y >= new_keep_from.
+        // But new_keep_from = tu-b's TU index. So TR for tu-a must be >= tu-b's TU index.
+        // And TR for tu-a must have been below the original keep_from_base (otherwise it was
+        // already scanned and handled in pass 1).
+        //
+        //   idx 0: text
+        //   idx 1: ToolUse "tu-a"
+        //   idx 2: text
+        //   idx 3: text
+        //   idx 4: text
+        //   idx 5: ToolUse "tu-b"
+        //   idx 6: ToolResult for "tu-a"   <-- tu-a's TR is AFTER tu-b's TU
+        //   idx 7: text
+        //   idx 8: ToolResult for "tu-b"
+        //
+        // keep_from_base=7: scan 7.. → TR at 8 for tu-b at 5, 5 < 7 → pull to 5.
+        // keep_from=5: scan 5.. → TR at 8 for tu-b at 5, 5 >= 5 OK.
+        //   TR at 6 for tu-a at 1: 6 >= 5, IN scan range! tu-a at 1 < 5 → pull to 1!
+        // keep_from=1: scan 1.. → TR at 8 for tu-b at 5, 5 >= 1 OK.
+        //   TR at 6 for tu-a at 1, 1 >= 1 OK.
+        // Done. keep_from=1. CASCADE!
+
+        let mut history = Vec::new();
+        for i in 0..9 {
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(format!("msg-{i}")),
+                model_info: None,
+                metrics: None,
+                ts: Some(i as u64),
+            });
+        }
+        history[1] = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                ToolUseBlock {
+                    id: "tu-a".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(1),
+        };
+        history[5] = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                ToolUseBlock {
+                    id: "tu-b".to_string(),
+                    name: "edit_file".to_string(),
+                    input: serde_json::json!({"path": "b.rs"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(5),
+        };
+        history[6] = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                ToolResultBlock {
+                    tool_use_id: "tu-a".to_string(),
+                    content: ToolResultContent::Text("ok-a".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(6),
+        };
+        history[8] = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                ToolResultBlock {
+                    tool_use_id: "tu-b".to_string(),
+                    content: ToolResultContent::Text("ok-b".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(8),
+        };
+
+        let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 7);
+        assert_eq!(result, 1, "Cascade: pass 1 pulls to 5 (tu-b), pass 2 pulls to 1 (tu-a)");
+    }
 }

@@ -423,6 +423,8 @@ pub struct ApprovalManager {
     /// For execute_command: specific command fingerprints that are auto-approved.
     /// This provides per-command granularity instead of approving all commands.
     session_auto_approve_commands: HashSet<String>,
+    /// Tool names from SNED_AUTO_APPROVE env var — lowest priority auto-approval.
+    env_auto_approve: HashSet<String>,
     /// When true, skip all approval prompts (yolo mode).
     yolo_mode: bool,
     /// When true, skip prompts but keep interactive mode.
@@ -438,9 +440,21 @@ pub struct ApprovalManager {
 }
 
 impl ApprovalManager {
-    /// Create a new approval manager with no session auto-approvals.
+    /// Create a new approval manager, loading SNED_AUTO_APPROVE from the environment.
     pub fn new() -> Self {
-        Self::default()
+        let env_auto_approve = std::env::var("SNED_AUTO_APPROVE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            env_auto_approve,
+            ..Self::default()
+        }
     }
 
     /// Enable yolo mode (skip all approval prompts).
@@ -476,6 +490,12 @@ impl ApprovalManager {
     /// Set user-safe commands (overrides SNED_SAFE_COMMANDS env var).
     pub fn with_user_safe_commands(mut self, commands: Vec<String>) -> Self {
         self.user_safe_commands = commands;
+        self
+    }
+
+    /// Set env auto-approve tool names (from SNED_AUTO_APPROVE env var).
+    pub fn with_env_auto_approve(mut self, tools: HashSet<String>) -> Self {
+        self.env_auto_approve = tools;
         self
     }
 
@@ -544,7 +564,7 @@ impl ApprovalManager {
         }
 
         let tool_name = tool.name();
-        if self.session_auto_approve.contains(tool_name) {
+        if self.session_auto_approve.contains(tool_name) || self.env_auto_approve.contains(tool_name) {
             return false;
         }
 
@@ -716,8 +736,9 @@ impl ApprovalManager {
             // For execute_command, check if this specific command was approved (F-02 fix)
             self.session_auto_approve_commands.contains(fp)
         } else {
-            // For other tools, check if the tool name is approved
+            // For other tools, check session auto-approve, then env auto-approve
             self.session_auto_approve.contains(tool_name)
+                || self.env_auto_approve.contains(tool_name)
         }
     }
 
@@ -1875,5 +1896,31 @@ mod tests {
         assert!(formatted.contains("2 file(s)"));
         assert!(formatted.contains("main.rs (2)"));
         assert!(formatted.contains("lib.rs (1)"));
+    }
+
+    #[test]
+    fn test_sned_auto_approve_env_var_skips_prompt() {
+        let tools: HashSet<String> = ["edit_file", "write_to_file"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let manager = ApprovalManager::new().with_env_auto_approve(tools);
+        assert!(!manager.should_prompt(SnedTool::EditFile, None));
+        assert!(!manager.should_prompt(SnedTool::WriteToFile, None));
+        assert!(manager.should_prompt(SnedTool::ExecuteCommand, None));
+    }
+
+    #[test]
+    fn test_sned_auto_approve_complements_session_auto_approve() {
+        let env_tools: HashSet<String> = ["web_fetch"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut manager = ApprovalManager::new()
+            .with_env_auto_approve(env_tools);
+        manager.session_auto_approve.insert("edit_file".to_string());
+        assert!(!manager.should_prompt(SnedTool::EditFile, None));
+        assert!(!manager.should_prompt(SnedTool::WebFetch, None));
+        assert!(manager.should_prompt(SnedTool::ExecuteCommand, None));
     }
 }

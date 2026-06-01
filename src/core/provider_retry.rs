@@ -42,6 +42,9 @@ fn log_retry_status(
     }
 }
 
+/// Default max consecutive provider failures before pausing the agent loop.
+pub const DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES: u32 = 3;
+
 /// Retry policy for provider API requests.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
@@ -53,11 +56,19 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            base_delay_ms: 1_000,
-            max_delay_ms: 10_000,
+            max_retries: env_var_nonzero("SNED_MAX_RETRIES", 3) as usize,
+            base_delay_ms: env_var_nonzero("SNED_RETRY_BASE_DELAY_MS", 1_000),
+            max_delay_ms: env_var_nonzero("SNED_RETRY_MAX_DELAY_MS", 10_000),
         }
     }
+}
+
+fn env_var_nonzero(name: &str, fallback: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(fallback)
 }
 
 /// Create a provider stream with retry semantics.
@@ -83,13 +94,28 @@ pub async fn create_message_with_retry(
 
     loop {
         match provider.create_message(request.clone()).await {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                let mut state = task_state.lock().await;
+                state.consecutive_provider_failures = 0;
+                drop(state);
+                return Ok(stream);
+            }
             Err(error) => {
                 let Some(delay) = retry_delay_for_error(&error, retry_attempt, retry_config) else {
                     return Err(error);
                 };
 
                 if retry_attempt >= retry_config.max_retries {
+                    let mut state = task_state.lock().await;
+                    state.consecutive_provider_failures = state.consecutive_provider_failures.saturating_add(1);
+                    let max_retries = retry_config.max_retries;
+                    let msg = format!(
+                        "⚠ Provider failed after {max_retries} retries. Pausing. Use /continue or /model to switch."
+                    );
+                    drop(state);
+                    if let Some(writer) = output_writer {
+                        writer.emit(OutputEvent::plain(msg));
+                    }
                     return Err(error);
                 }
 
@@ -402,5 +428,104 @@ mod tests {
                 .await
                 .did_automatically_retry_failed_api_request
         );
+    }
+
+    #[tokio::test]
+    async fn consecutive_failures_reset_on_success() {
+        let provider = Arc::new(RetryTestProvider {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_until: 1,
+        });
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        let request = ProviderRequest {
+            system_prompt: "system".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        // First call succeeds, should set consecutive failures to 0
+        create_message_with_retry(
+            provider.clone(),
+            request.clone(),
+            state.clone(),
+            RetryConfig::default(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.consecutive_provider_failures, 0);
+
+        // Second call also succeeds
+        create_message_with_retry(
+            provider.clone(),
+            request.clone(),
+            state.clone(),
+            RetryConfig::default(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.consecutive_provider_failures, 0);
+    }
+
+    #[test]
+    fn env_var_sned_max_retries_overrides_default() {
+        let key = "SNED_MAX_RETRIES_1";
+        unsafe {
+            std::env::set_var(key, "10");
+            let config = RetryConfig {
+                max_retries: std::env::var(key)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(3) as usize,
+                ..RetryConfig::default()
+            };
+            assert_eq!(config.max_retries, 10);
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn env_var_sned_retry_base_delay_overrides_default() {
+        let key = "SNED_RETRY_BASE_DELAY_MS_1";
+        unsafe {
+            std::env::set_var(key, "5000");
+            let config = RetryConfig {
+                base_delay_ms: std::env::var(key)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(1_000),
+                ..RetryConfig::default()
+            };
+            assert_eq!(config.base_delay_ms, 5_000);
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn env_var_zero_uses_fallback() {
+        let key = "SNED_MAX_RETRIES_2";
+        unsafe {
+            std::env::set_var(key, "0");
+            let config = RetryConfig {
+                max_retries: std::env::var(key)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(3) as usize,
+                ..RetryConfig::default()
+            };
+            assert_eq!(config.max_retries, 3);
+            std::env::remove_var(key);
+        }
     }
 }
