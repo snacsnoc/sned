@@ -1360,95 +1360,95 @@ async fn handle_cli_only_command(
             let mut state = sh.lock().await;
             if let Some(plan) = &mut state.plan_state {
                 match cli_cmd {
-                    CliOnlyCommand::Plan(cmd) => {
-                        match cmd {
-                            PlanSubcommand::Status => {
-                                app.push_plain(plan.status_summary());
-                                app.push_plain(plan.format_display());
+                    CliOnlyCommand::Plan(cmd) => match cmd {
+                        PlanSubcommand::Status => {
+                            app.push_plain(plan.status_summary());
+                            app.push_plain(plan.format_display());
+                        }
+                        PlanSubcommand::Edit(step_num, new_desc) => {
+                            if plan.approved && !plan.paused {
+                                app.push_plain(
+                                    "Cannot edit while plan is running. Use /plan pause first.",
+                                );
+                            } else if step_num == 0 || step_num > plan.steps.len() {
+                                app.push_plain(format!(
+                                    "Invalid step number. Plan has {} steps (1-{}).",
+                                    plan.steps.len(),
+                                    plan.steps.len()
+                                ));
+                            } else if new_desc.trim().is_empty() {
+                                app.push_plain("Step description cannot be empty.");
+                            } else {
+                                plan.steps[step_num - 1].description = new_desc.trim().to_string();
+                                app.push_plain(format!("Step {} updated.", step_num));
                             }
-                            PlanSubcommand::Edit(step_num, new_desc) => {
-                                if plan.approved && !plan.paused {
-                                    app.push_plain(
-                                        "Cannot edit while plan is running. Use /plan pause first.",
-                                    );
-                                } else if step_num == 0 || step_num > plan.steps.len() {
-                                    app.push_plain(format!(
-                                        "Invalid step number. Plan has {} steps (1-{}).",
-                                        plan.steps.len(),
-                                        plan.steps.len()
-                                    ));
-                                } else if new_desc.trim().is_empty() {
-                                    app.push_plain("Step description cannot be empty.");
-                                } else {
-                                    plan.steps[step_num - 1].description =
-                                        new_desc.trim().to_string();
-                                    app.push_plain(format!("Step {} updated.", step_num));
-                                }
-                            }
-                            PlanSubcommand::Add(after_step, step_text) => {
-                                if plan.approved && !plan.paused {
-                                    app.push_plain("Cannot add steps while plan is running. Use /plan pause first.");
-                                } else if step_text.trim().is_empty() {
-                                    app.push_plain("Usage: /plan add <after_step> <description>");
-                                } else {
-                                    if after_step == 0 {
-                                        match plan.insert_step_at_beginning(step_text.trim().to_string()) {
-                                            Ok(()) => {
-                                                app.push_plain(format!(
-                                                    "Step added at the beginning. ({} steps total).",
-                                                    plan.steps.len()
-                                                ));
-                                            }
-                                            Err(e) => app.push_plain(format!("Error: {}", e)),
+                        }
+                        PlanSubcommand::Add(after_step, step_text) => {
+                            if plan.approved && !plan.paused {
+                                app.push_plain("Cannot add steps while plan is running. Use /plan pause first.");
+                            } else if step_text.trim().is_empty() {
+                                app.push_plain("Usage: /plan add <after_step> <description>");
+                            } else {
+                                if after_step == 0 {
+                                    match plan
+                                        .insert_step_at_beginning(step_text.trim().to_string())
+                                    {
+                                        Ok(()) => {
+                                            app.push_plain(format!(
+                                                "Step added at the beginning. ({} steps total).",
+                                                plan.steps.len()
+                                            ));
                                         }
-                                    } else {
-                                        let after_idx = after_step - 1;
-                                        match plan
-                                            .insert_step_after(after_idx, step_text.trim().to_string())
-                                        {
-                                            Ok(()) => {
-                                                app.push_plain(format!(
-                                                    "Step added after step {}. ({} steps total).",
-                                                    after_step,
-                                                    plan.steps.len()
-                                                ));
-                                            }
-                                            Err(e) => app.push_plain(format!("Error: {}", e)),
-                                        }
+                                        Err(e) => app.push_plain(format!("Error: {}", e)),
                                     }
-                                }
-                            }
-                            PlanSubcommand::Remove(step_num) => {
-                                if plan.approved && !plan.paused {
-                                    app.push_plain("Cannot remove steps while plan is running. Use /plan pause first.");
-                                } else if step_num == 0 || step_num > plan.steps.len() {
-                                    app.push_plain(format!(
-                                        "Invalid step number. Plan has {} steps (1-{}).",
-                                        plan.steps.len(),
-                                        plan.steps.len()
-                                    ));
                                 } else {
-                                    match plan.remove_step(step_num - 1) {
-                                        Ok(()) => app.push_plain(format!(
-                                            "Step {} removed. ({} steps remaining).",
-                                            step_num,
-                                            plan.steps.len()
-                                        )),
+                                    let after_idx = after_step - 1;
+                                    match plan
+                                        .insert_step_after(after_idx, step_text.trim().to_string())
+                                    {
+                                        Ok(()) => {
+                                            app.push_plain(format!(
+                                                "Step added after step {}. ({} steps total).",
+                                                after_step,
+                                                plan.steps.len()
+                                            ));
+                                        }
                                         Err(e) => app.push_plain(format!("Error: {}", e)),
                                     }
                                 }
                             }
-                            PlanSubcommand::Replace(plan_text) => {
-                                if plan.approved && !plan.paused && !plan.complete {
-                                    app.push_plain(
+                        }
+                        PlanSubcommand::Remove(step_num) => {
+                            if plan.approved && !plan.paused {
+                                app.push_plain("Cannot remove steps while plan is running. Use /plan pause first.");
+                            } else if step_num == 0 || step_num > plan.steps.len() {
+                                app.push_plain(format!(
+                                    "Invalid step number. Plan has {} steps (1-{}).",
+                                    plan.steps.len(),
+                                    plan.steps.len()
+                                ));
+                            } else {
+                                match plan.remove_step(step_num - 1) {
+                                    Ok(()) => app.push_plain(format!(
+                                        "Step {} removed. ({} steps remaining).",
+                                        step_num,
+                                        plan.steps.len()
+                                    )),
+                                    Err(e) => app.push_plain(format!("Error: {}", e)),
+                                }
+                            }
+                        }
+                        PlanSubcommand::Replace(plan_text) => {
+                            if plan.approved && !plan.paused && !plan.complete {
+                                app.push_plain(
                                         "Cannot replace plan while plan is running. Use /plan pause first.",
                                     );
-                                } else if plan_text.trim().is_empty() {
-                                    app.push_plain("Plan text cannot be empty.");
-                                } else {
-                                    let parsed =
-                                        crate::core::plan_state::PlanState::parse_plan(&plan_text);
-                                    match parsed {
+                            } else if plan_text.trim().is_empty() {
+                                app.push_plain("Plan text cannot be empty.");
+                            } else {
+                                let parsed =
+                                    crate::core::plan_state::PlanState::parse_plan(&plan_text);
+                                match parsed {
                                         Some(steps) if !steps.is_empty() => {
                                             let new_plan = crate::core::plan_state::PlanState::create_plan(steps);
                                             let plan_len = {
@@ -1464,13 +1464,12 @@ async fn handle_cli_only_command(
                                         Some(_) => app.push_plain("Plan must have at least 1 step."),
                                         None => app.push_plain("Could not parse plan text. Use numbered format: 1. Step description"),
                                     }
-                                }
                             }
-                            _ => unreachable!(
-                                "PlanSubcommand::Approve/Pause/Resume/Abort are routed to CliOnlyCommand::PlanApprove/Pause/Resume/Abort"
-                            ),
                         }
-                    }
+                        _ => unreachable!(
+                            "PlanSubcommand::Approve/Pause/Resume/Abort are routed to CliOnlyCommand::PlanApprove/Pause/Resume/Abort"
+                        ),
+                    },
                     CliOnlyCommand::PlanApprove => {
                         if plan.approved {
                             app.push_plain("Plan is already approved and running.");
@@ -1521,6 +1520,8 @@ async fn handle_cli_only_command(
                             }
                             sess.agent_loop_mut()
                                 .set_mode(crate::core::agent_types::AgentMode::Act);
+                            app.mode = "ACT".to_string();
+                            app.update_placeholder();
                             drop(sess);
                             app.push_plain(format!(
                                 "Plan approved. Starting from step {}/{}: {}",
@@ -2351,10 +2352,8 @@ mod tests {
         };
         {
             let mut state = state_handle.lock().await;
-            let mut plan = PlanState::create_plan(vec![
-                "Initial step".to_string(),
-                "Second step".to_string(),
-            ]);
+            let mut plan =
+                PlanState::create_plan(vec!["Initial step".to_string(), "Second step".to_string()]);
             plan.approved = true;
             plan.current_step_index = 0;
             plan.steps[0].status = PlanStepStatus::Running;
@@ -2462,10 +2461,8 @@ mod tests {
         {
             let mut state = state_handle.lock().await;
             state.strict_plan_mode_enabled = true;
-            let plan = PlanState::create_plan(vec![
-                "First step".to_string(),
-                "Second step".to_string(),
-            ]);
+            let plan =
+                PlanState::create_plan(vec!["First step".to_string(), "Second step".to_string()]);
             state.plan_state = Some(plan);
         }
 
@@ -2498,12 +2495,15 @@ mod tests {
         .await?;
 
         assert!(!should_exit);
-        assert_eq!(app.mode, "PLAN");
+        assert_eq!(app.mode, "ACT");
         assert!(app.agent_busy);
-        assert!(app
-            .output_lines
-            .iter()
-            .any(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>().contains("Plan approved. Starting from step 1/2: First step")));
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Plan approved. Starting from step 1/2: First step")
+        }));
 
         {
             let sess = session.lock().await;
