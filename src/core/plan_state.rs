@@ -56,6 +56,8 @@ pub struct PlanState {
     pub paused: bool,
     /// Whether the plan is complete.
     pub complete: bool,
+    /// Monotonic revision used by the TUI cache to detect mutations.
+    pub version: u64,
 }
 
 impl PlanState {
@@ -77,7 +79,12 @@ impl PlanState {
             approved: false,
             paused: false,
             complete: false,
+            version: 0,
         }
+    }
+
+    fn bump_version(&mut self) {
+        self.version = self.version.saturating_add(1);
     }
 
     /// Update a step's description.
@@ -87,6 +94,7 @@ impl PlanState {
             .get_mut(index)
             .ok_or_else(|| format!("Step {} does not exist", index + 1))?;
         step.description = description;
+        self.bump_version();
         Ok(())
     }
 
@@ -124,6 +132,7 @@ impl PlanState {
         } else if insert_pos <= old_current_step_index {
             self.current_step_index = old_current_step_index + 1;
         }
+        self.bump_version();
         Ok(())
     }
 
@@ -148,6 +157,7 @@ impl PlanState {
             self.current_step_index = old_current_step_index + 1;
         }
 
+        self.bump_version();
         Ok(())
     }
 
@@ -173,6 +183,7 @@ impl PlanState {
         } else if self.current_step_index >= self.steps.len() {
             self.current_step_index = self.steps.len() - 1;
         }
+        self.bump_version();
         Ok(())
     }
 
@@ -183,6 +194,7 @@ impl PlanState {
             .get_mut(index)
             .ok_or_else(|| format!("Step {} does not exist", index + 1))?;
         step.status = status;
+        self.bump_version();
         Ok(())
     }
 
@@ -196,6 +208,7 @@ impl PlanState {
     /// NOTE: Returns `usize` instead of `&PlanStep` to avoid reference-escaping-the-mutex issues
     /// when called through `Arc<Mutex<Session>>`. This is a deliberate Rust-native adaptation.
     pub fn advance(&mut self) -> Option<usize> {
+        let mut changed = false;
         let current_out_of_bounds = self.current_step_index >= self.steps.len();
 
         // If current_step_index is out of range, clamp to the first pending step.
@@ -206,9 +219,14 @@ impl PlanState {
                 .position(|s| s.status == PlanStepStatus::Pending)
             {
                 self.current_step_index = next_idx;
+                changed = true;
             } else {
-                if self.is_complete() {
+                if self.is_complete() && !self.complete {
                     self.complete = true;
+                    changed = true;
+                }
+                if changed {
+                    self.bump_version();
                 }
                 return None;
             }
@@ -218,12 +236,16 @@ impl PlanState {
             && step.status == PlanStepStatus::Running
         {
             step.status = PlanStepStatus::Done;
+            changed = true;
         }
 
         // Check if current step is Failed — do NOT skip it
         if let Some(step) = self.steps.get(self.current_step_index)
             && step.status == PlanStepStatus::Failed
         {
+            if changed {
+                self.bump_version();
+            }
             return None;
         }
 
@@ -233,13 +255,26 @@ impl PlanState {
             .iter()
             .position(|s| s.status == PlanStepStatus::Pending)
         {
-            self.current_step_index = next_idx;
-            self.steps[next_idx].status = PlanStepStatus::Running;
+            if self.current_step_index != next_idx {
+                self.current_step_index = next_idx;
+                changed = true;
+            }
+            if self.steps[next_idx].status != PlanStepStatus::Running {
+                self.steps[next_idx].status = PlanStepStatus::Running;
+                changed = true;
+            }
+            if changed {
+                self.bump_version();
+            }
             Some(self.current_step_index)
         } else {
             // Only mark complete if ALL steps are actually Done (not Failed)
-            if self.is_complete() {
+            if self.is_complete() && !self.complete {
                 self.complete = true;
+                changed = true;
+            }
+            if changed {
+                self.bump_version();
             }
             None
         }
@@ -499,6 +534,34 @@ mod tests {
         let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         plan.update_step(0, "Updated step one".to_string()).unwrap();
         assert_eq!(plan.steps[0].description, "Updated step one");
+    }
+
+    #[test]
+    fn test_revision_increments_on_mutations() {
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
+        assert_eq!(plan.version, 0);
+
+        plan.update_step(0, "Updated step one".to_string()).unwrap();
+        let after_update = plan.version;
+        assert!(after_update > 0);
+
+        plan.insert_step_after(0, "Inserted step".to_string())
+            .unwrap();
+        let after_insert = plan.version;
+        assert!(after_insert > after_update);
+
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        let after_mark = plan.version;
+        assert!(after_mark > after_insert);
+
+        plan.remove_step(1).unwrap();
+        let after_remove = plan.version;
+        assert!(after_remove > after_mark);
+
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.current_step_index = 0;
+        assert!(plan.advance().is_some());
+        assert!(plan.version > after_remove);
     }
 
     #[test]

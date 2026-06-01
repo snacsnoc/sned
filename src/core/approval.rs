@@ -26,6 +26,17 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(test)]
+static APPROVAL_TEST_MUTEX: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+
+#[cfg(test)]
+pub fn approval_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    APPROVAL_TEST_MUTEX
+        .lock()
+        .expect("approval test mutex should not be poisoned")
+}
+
 const SAFE_BASE_COMMANDS: &[&str] = &[
     "ls", "pwd", "date", "whoami", "uname", "cat", "grep", "find", "head", "tail", "cd", "clear",
     "echo", "hostname", "df", "du", "ps", "free", "uptime", "wc", "sort", "uniq", "file", "stat",

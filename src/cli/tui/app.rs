@@ -52,6 +52,8 @@ pub struct App {
     pub scroll_offset: u16,
     /// Current output scroll behavior
     pub scroll_mode: ScrollMode,
+    /// Whether the next draw should re-sync layout from the terminal size.
+    pub has_resized: bool,
     /// Session start time (for elapsed time display)
     pub start_time: Option<Instant>,
     /// Spinner animation frame index
@@ -88,12 +90,20 @@ pub struct App {
     pub last_content_height: usize,
     /// Last known output pane width from render/sync (used for wrapped scroll math)
     pub last_content_width: usize,
+    /// Cached wrapped visual row count for the current output width.
+    pub cached_visual_rows: usize,
+    /// Width the cached visual row count was computed against.
+    pub cached_wrap_width: Option<usize>,
     /// Pending clear confirmation (stores the trigger: "slash" or "ctrl_l")
     pub pending_clear: Option<String>,
     /// Saved draft input before history navigation
     pub history_draft: Option<String>,
     /// Cached plan state for TUI rendering (updated from interactive loop)
     pub plan_state_cache: Option<crate::core::plan_state::PlanState>,
+    /// Pointer identity for the cached plan state.
+    pub plan_state_cache_ptr: Option<usize>,
+    /// Revision of the cached plan state.
+    pub plan_state_cache_version: u64,
 }
 
 impl App {
@@ -124,6 +134,7 @@ impl App {
             agent_busy: false,
             scroll_offset: 0,
             scroll_mode: ScrollMode::Auto,
+            has_resized: true,
             start_time: None,
             spinner_index: 0,
             last_spinner_tick: None,
@@ -142,19 +153,44 @@ impl App {
             scrollbar_state: ScrollbarState::new(0),
             last_content_height: 0,
             last_content_width: 0,
+            cached_visual_rows: 0,
+            cached_wrap_width: None,
             pending_clear: None,
             history_draft: None,
             plan_state_cache: None,
+            plan_state_cache_ptr: None,
+            plan_state_cache_version: 0,
         }
     }
 
     /// Push an output line to the buffer.
     pub fn push_output(&mut self, line: Line<'static>) {
+        let wrap_width = self.last_wrap_width();
+        let line_rows = Self::line_visual_rows(&line, wrap_width);
+        let cache_valid = self.cached_wrap_width == Some(wrap_width);
         self.output_lines.push_back(line);
         if self.output_lines.len() > 10_000 {
+            let mut removed_rows = 0usize;
             while self.output_lines.len() > 10_000 {
-                self.output_lines.pop_front();
+                if cache_valid && let Some(removed) = self.output_lines.pop_front() {
+                    removed_rows += Self::line_visual_rows(&removed, wrap_width);
+                } else {
+                    self.output_lines.pop_front();
+                }
             }
+            if cache_valid {
+                self.cached_visual_rows = self
+                    .cached_visual_rows
+                    .saturating_add(line_rows)
+                    .saturating_sub(removed_rows);
+                return;
+            }
+        }
+
+        if cache_valid {
+            self.cached_visual_rows = self.cached_visual_rows.saturating_add(line_rows);
+        } else {
+            self.rebuild_visual_row_cache(wrap_width);
         }
     }
 
@@ -190,6 +226,35 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    /// Clear all output and reset the visual-row cache.
+    pub fn clear_output(&mut self) {
+        self.output_lines.clear();
+        self.cached_visual_rows = 0;
+        self.cached_wrap_width = Some(self.last_wrap_width());
+    }
+
+    /// Drain output from the given index onward and keep the visual-row cache in sync.
+    pub fn drain_output_from(&mut self, start: usize) {
+        let start = start.min(self.output_lines.len());
+        if start >= self.output_lines.len() {
+            return;
+        }
+
+        let wrap_width = self.last_wrap_width();
+        if self.cached_wrap_width == Some(wrap_width) {
+            let removed_rows = self
+                .output_lines
+                .drain(start..)
+                .map(|line| Self::line_visual_rows(&line, wrap_width))
+                .sum::<usize>();
+            self.cached_visual_rows = self.cached_visual_rows.saturating_sub(removed_rows);
+        } else {
+            self.output_lines.drain(start..);
+            self.cached_visual_rows = 0;
+            self.cached_wrap_width = None;
+        }
+    }
+
     pub fn pin_approval_bottom(&mut self) {
         self.scroll_mode = ScrollMode::ApprovalPinned;
         self.scroll_offset = 0;
@@ -216,6 +281,39 @@ impl App {
 
     pub fn set_content_width(&mut self, content_width: usize) {
         self.last_content_width = content_width;
+    }
+
+    /// Synchronize the cached plan panel state with the current task state.
+    pub fn sync_plan_state_cache(
+        &mut self,
+        plan: Option<&crate::core::plan_state::PlanState>,
+    ) -> bool {
+        match plan {
+            Some(plan) => {
+                let plan_ptr = plan as *const _ as usize;
+                if self.plan_state_cache_ptr == Some(plan_ptr)
+                    && self.plan_state_cache_version == plan.version
+                    && self.plan_state_cache.is_some()
+                {
+                    false
+                } else {
+                    self.plan_state_cache = Some(plan.clone());
+                    self.plan_state_cache_ptr = Some(plan_ptr);
+                    self.plan_state_cache_version = plan.version;
+                    true
+                }
+            }
+            None => {
+                if self.plan_state_cache.is_some() {
+                    self.plan_state_cache = None;
+                    self.plan_state_cache_ptr = None;
+                    self.plan_state_cache_version = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     pub fn clamp_to_content(&mut self) {
@@ -309,11 +407,20 @@ impl App {
         width.max(1).div_ceil(wrap_width)
     }
 
-    fn total_visual_rows(&self, wrap_width: usize) -> usize {
-        self.output_lines
+    fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
+        self.cached_visual_rows = self
+            .output_lines
             .iter()
             .map(|line| Self::line_visual_rows(line, wrap_width))
-            .sum()
+            .sum();
+        self.cached_wrap_width = Some(wrap_width);
+    }
+
+    fn total_visual_rows(&mut self, wrap_width: usize) -> usize {
+        if self.cached_wrap_width != Some(wrap_width) {
+            self.rebuild_visual_row_cache(wrap_width);
+        }
+        self.cached_visual_rows
     }
 
     /// Render the application state to the frame.
@@ -664,7 +771,54 @@ mod tests {
     }
 
     #[test]
+    fn test_cached_visual_rows_tracks_push_clear_and_drain() {
+        let mut app = App::new();
+        app.set_content_width(24);
+
+        app.push_plain("short line");
+        let wrap_width = app.last_wrap_width();
+        let first_total = app.total_visual_rows(wrap_width);
+        assert_eq!(app.cached_visual_rows, first_total);
+
+        app.push_plain("this line is intentionally long enough to wrap twice");
+        let second_total = app.total_visual_rows(wrap_width);
+        assert_eq!(app.cached_visual_rows, second_total);
+        assert!(second_total >= first_total);
+
+        app.drain_output_from(1);
+        let drained_total = app.total_visual_rows(wrap_width);
+        assert_eq!(app.cached_visual_rows, drained_total);
+
+        app.clear_output();
+        assert_eq!(app.total_visual_rows(wrap_width), 0);
+        assert_eq!(app.cached_visual_rows, 0);
+    }
+
+    #[test]
+    fn test_sync_plan_state_cache_skips_unchanged_plan() {
+        let mut app = App::new();
+        let mut plan =
+            crate::core::plan_state::PlanState::create_plan(vec!["First step".to_string()]);
+
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+        assert!(!app.sync_plan_state_cache(Some(&plan)));
+
+        plan.update_step(0, "Updated first step".to_string())
+            .unwrap();
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+        assert_eq!(
+            app.plan_state_cache
+                .as_ref()
+                .expect("plan should be cached")
+                .steps[0]
+                .description,
+            "Updated first step"
+        );
+    }
+
+    #[test]
     fn test_render_output_hides_loading_overlay_during_approval_prompt() {
+        let _approval_guard = crate::core::approval::approval_test_guard();
         struct ApprovalPromptCleanup;
 
         impl Drop for ApprovalPromptCleanup {
@@ -681,13 +835,9 @@ mod tests {
         let mut app = App::new();
         app.agent_busy = true;
         app.force_bottom();
-        app.output_lines
-            .push_back(ratatui::text::Line::from("line 1"));
-        app.output_lines
-            .push_back(ratatui::text::Line::from("line 2"));
-        app.output_lines.push_back(ratatui::text::Line::from(
-            "Approve these edits? (y/n/always):",
-        ));
+        app.push_plain("line 1");
+        app.push_plain("line 2");
+        app.push_plain("Approve these edits? (y/n/always):");
 
         terminal
             .draw(|frame| app.render(frame))
@@ -719,13 +869,14 @@ mod tests {
 
     #[test]
     fn test_render_output_keeps_single_busy_loading_message() {
+        let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
         app.agent_busy = true;
         app.mode = "ACT".to_string();
         app.force_bottom();
-        app.output_lines.push_back(ratatui::text::Line::from("line 1"));
+        app.push_plain("line 1");
 
         terminal
             .draw(|frame| app.render(frame))
@@ -767,17 +918,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
         app.pin_approval_bottom();
-        app.output_lines.push_back(ratatui::text::Line::from(
+        app.push_plain(
             "A long wrapped tool explanation line that takes multiple visual rows in the output pane.",
-        ));
-        app.output_lines.push_back(ratatui::text::Line::from(
+        );
+        app.push_plain(
             "Another wrapped line that would previously push the confirmation row below the viewport.",
-        ));
-        app.output_lines.push_back(ratatui::text::Line::from(
-            "[Sned Question] What kind of colour improvement would you like?",
-        ));
-        app.output_lines
-            .push_back(ratatui::text::Line::from("Your answer:"));
+        );
+        app.push_plain("[Sned Question] What kind of colour improvement would you like?");
+        app.push_plain("Your answer:");
 
         terminal
             .draw(|frame| app.render(frame))

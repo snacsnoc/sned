@@ -404,6 +404,7 @@ fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> a
     app.set_content_width(terminal_size.width as usize);
     app.set_content_height(content_height);
     app.clamp_to_content();
+    app.has_resized = false;
     Ok(())
 }
 
@@ -618,7 +619,7 @@ async fn handle_key_event(
             || key.code == KeyCode::Char('Y')
             || key.code == KeyCode::Enter
         {
-            app.output_lines.clear();
+            app.clear_output();
             app.force_bottom();
             let trigger = app.pending_clear.take().unwrap();
             if let Some(sh) = state_handle.lock().await.as_ref() {
@@ -1681,28 +1682,32 @@ async fn run_main_loop(
         {
             if let Some(state_arc) = state_handle.lock().await.as_ref() {
                 let state = state_arc.lock().await;
-                app.plan_state_cache = state.plan_state.clone();
-                if let Some(ref plan) = state.plan_state {
-                    let has_failed = plan
-                        .steps
-                        .iter()
-                        .any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
-                    app.mode = if plan.complete {
-                        "COMPLETE".to_string()
-                    } else if has_failed {
-                        "FAILED".to_string()
-                    } else if plan.paused {
-                        "PAUSED".to_string()
-                    } else if plan.approved {
-                        "ACT".to_string()
-                    } else {
-                        "PLAN".to_string()
-                    };
+                let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
+                if plan_changed {
+                    if let Some(ref plan) = state.plan_state {
+                        let has_failed = plan
+                            .steps
+                            .iter()
+                            .any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
+                        app.mode = if plan.complete {
+                            "COMPLETE".to_string()
+                        } else if has_failed {
+                            "FAILED".to_string()
+                        } else if plan.paused {
+                            "PAUSED".to_string()
+                        } else if plan.approved {
+                            "ACT".to_string()
+                        } else {
+                            "PLAN".to_string()
+                        };
+                    }
                 }
             }
         }
 
-        sync_scroll_viewport(terminal, app)?;
+        if app.has_resized {
+            sync_scroll_viewport(terminal, app)?;
+        }
 
         // 2. Render
         terminal.draw(|f| app.render(f))?;
@@ -1724,8 +1729,7 @@ async fn run_main_loop(
                             if let Some(sender) = take_approval_sender() {
                                 let prompt_lines = app.output_lines.len();
                                 let _ = sender.send(result.clone());
-                                let drain_start = prompt_lines.min(app.output_lines.len());
-                                app.output_lines.drain(drain_start..);
+                                app.drain_output_from(prompt_lines);
 
                                 if key.code == KeyCode::Char('c')
                                     && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1971,6 +1975,7 @@ async fn run_main_loop(
                     }
                 }
                 Event::Resize(_, _) => {
+                    app.has_resized = true;
                     // Ratatui handles resize automatically on next draw
                 }
                 Event::Mouse(mouse_event) => match mouse_event.kind {
@@ -2180,9 +2185,6 @@ pub fn render_interactive_prompt_prefix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex as StdMutex};
-
-    static PROMPT_STATE_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
     fn reset_prompt_state() {
         crate::core::approval::clear_approval_prompt_scroll();
@@ -2229,7 +2231,7 @@ mod tests {
         use crate::cli::output::OutputEvent;
         use crate::cli::tui::app::ScrollMode;
 
-        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(1);
@@ -2252,7 +2254,7 @@ mod tests {
     fn test_drain_output_forces_scroll_for_approval_prompt() {
         use crate::cli::tui::app::ScrollMode;
 
-        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
@@ -2277,7 +2279,7 @@ mod tests {
     fn test_drain_output_forces_scroll_while_approval_prompt_is_active() {
         use crate::cli::tui::app::ScrollMode;
 
-        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
@@ -2304,7 +2306,7 @@ mod tests {
     fn test_drain_output_forces_scroll_for_followup_prompt() {
         use crate::cli::tui::app::ScrollMode;
 
-        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
@@ -2328,7 +2330,7 @@ mod tests {
     fn test_drain_output_forces_scroll_while_followup_prompt_is_active() {
         use crate::cli::tui::app::ScrollMode;
 
-        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
@@ -2355,7 +2357,7 @@ mod tests {
     fn test_drain_output_clears_approval_pin_when_prompt_resolves() {
         use crate::cli::tui::app::ScrollMode;
 
-        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
@@ -2409,7 +2411,7 @@ mod tests {
     -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
         let (tx, _rx) = mpsc::channel(4);
@@ -2448,7 +2450,7 @@ mod tests {
     async fn test_handle_key_event_allows_shutdown_submit_during_approval() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
         let (tx, _rx) = mpsc::channel(4);
