@@ -7,6 +7,7 @@ use crate::cli::output::OutputEvent;
 use crate::core::agent_types::TaskState;
 use crate::core::context::context_window;
 use crate::providers::{ApiStream, Provider, ProviderError, ProviderRequest};
+use std::convert::TryFrom;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -56,7 +57,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: env_var_nonzero("SNED_MAX_RETRIES", 3) as usize,
+            max_retries: env_var_nonzero_usize("SNED_MAX_RETRIES", 3),
             base_delay_ms: env_var_nonzero("SNED_RETRY_BASE_DELAY_MS", 1_000),
             max_delay_ms: env_var_nonzero("SNED_RETRY_MAX_DELAY_MS", 10_000),
         }
@@ -68,6 +69,15 @@ fn env_var_nonzero(name: &str, fallback: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
+        .unwrap_or(fallback)
+}
+
+fn env_var_nonzero_usize(name: &str, fallback: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(fallback)
 }
 
@@ -107,12 +117,21 @@ pub async fn create_message_with_retry(
 
                 if retry_attempt >= retry_config.max_retries {
                     let mut state = task_state.lock().await;
-                    state.consecutive_provider_failures = state.consecutive_provider_failures.saturating_add(1);
+                    state.consecutive_provider_failures =
+                        state.consecutive_provider_failures.saturating_add(1);
+                    let consecutive_failures = state.consecutive_provider_failures;
                     let max_retries = retry_config.max_retries;
-                    let msg = format!(
-                        "⚠ Provider failed after {max_retries} retries. Pausing. Use /continue or /model to switch."
-                    );
                     drop(state);
+                    let msg = if consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES {
+                        format!(
+                            "⚠ Provider failed after {max_retries} retries. {consecutive_failures} consecutive provider requests have failed. Use /model to switch or retry after the provider recovers."
+                        )
+                    } else {
+                        format!(
+                            "⚠ Provider failed after {max_retries} retries. Request {consecutive_failures}/{} failed consecutively. Retry or use /model to switch.",
+                            DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES
+                        )
+                    };
                     if let Some(writer) = output_writer {
                         writer.emit(OutputEvent::plain(msg));
                     }
@@ -222,6 +241,36 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::sync::{LazyLock, Mutex as StdMutex};
+
+    static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(ref original) = self.original {
+                    std::env::set_var(self.key, original);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     struct RetryTestProvider {
         attempts: Arc<AtomicUsize>,
@@ -447,7 +496,7 @@ mod tests {
         };
 
         // First call succeeds, should set consecutive failures to 0
-        create_message_with_retry(
+        let stream = create_message_with_retry(
             provider.clone(),
             request.clone(),
             state.clone(),
@@ -458,10 +507,11 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(stream);
         assert_eq!(state.lock().await.consecutive_provider_failures, 0);
 
         // Second call also succeeds
-        create_message_with_retry(
+        let stream = create_message_with_retry(
             provider.clone(),
             request.clone(),
             state.clone(),
@@ -472,60 +522,89 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(stream);
         assert_eq!(state.lock().await.consecutive_provider_failures, 0);
     }
 
+    #[tokio::test]
+    async fn consecutive_failures_increment_on_retry_exhaustion() {
+        let provider = Arc::new(RetryTestProvider {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_until: usize::MAX,
+        });
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        let request = ProviderRequest {
+            system_prompt: "system".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+        };
+
+        let result = create_message_with_retry(
+            provider,
+            request,
+            state.clone(),
+            retry_config,
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("retry exhaustion should return the provider error"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, ProviderError::RateLimitError { .. }));
+        assert_eq!(state.lock().await.consecutive_provider_failures, 1);
+    }
+
     #[test]
-    fn env_var_sned_max_retries_overrides_default() {
-        let key = "SNED_MAX_RETRIES_1";
-        unsafe {
-            std::env::set_var(key, "10");
-            let config = RetryConfig {
-                max_retries: std::env::var(key)
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(3) as usize,
-                ..RetryConfig::default()
-            };
-            assert_eq!(config.max_retries, 10);
-            std::env::remove_var(key);
-        }
+    fn retry_config_reads_sned_max_retries_from_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("SNED_MAX_RETRIES", "10");
+
+        let config = RetryConfig::default();
+
+        assert_eq!(config.max_retries, 10);
     }
 
     #[test]
     fn env_var_sned_retry_base_delay_overrides_default() {
-        let key = "SNED_RETRY_BASE_DELAY_MS_1";
-        unsafe {
-            std::env::set_var(key, "5000");
-            let config = RetryConfig {
-                base_delay_ms: std::env::var(key)
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(1_000),
-                ..RetryConfig::default()
-            };
-            assert_eq!(config.base_delay_ms, 5_000);
-            std::env::remove_var(key);
-        }
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("SNED_RETRY_BASE_DELAY_MS", "5000");
+
+        let config = RetryConfig::default();
+
+        assert_eq!(config.base_delay_ms, 5_000);
     }
 
     #[test]
-    fn env_var_zero_uses_fallback() {
-        let key = "SNED_MAX_RETRIES_2";
-        unsafe {
-            std::env::set_var(key, "0");
-            let config = RetryConfig {
-                max_retries: std::env::var(key)
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(3) as usize,
-                ..RetryConfig::default()
-            };
-            assert_eq!(config.max_retries, 3);
-            std::env::remove_var(key);
-        }
+    fn retry_config_zero_max_retries_uses_fallback() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("SNED_MAX_RETRIES", "0");
+
+        let config = RetryConfig::default();
+
+        assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn retry_config_overflow_max_retries_uses_fallback() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let overflow = (usize::MAX as u128) + 1;
+        let _guard = EnvVarGuard::set("SNED_MAX_RETRIES", &overflow.to_string());
+
+        let config = RetryConfig::default();
+
+        assert_eq!(config.max_retries, 3);
     }
 }

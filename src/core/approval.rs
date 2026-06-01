@@ -564,7 +564,7 @@ impl ApprovalManager {
         }
 
         let tool_name = tool.name();
-        if self.session_auto_approve.contains(tool_name) || self.env_auto_approve.contains(tool_name) {
+        if self.is_tool_name_auto_approved(tool_name) {
             return false;
         }
 
@@ -736,10 +736,12 @@ impl ApprovalManager {
             // For execute_command, check if this specific command was approved (F-02 fix)
             self.session_auto_approve_commands.contains(fp)
         } else {
-            // For other tools, check session auto-approve, then env auto-approve
-            self.session_auto_approve.contains(tool_name)
-                || self.env_auto_approve.contains(tool_name)
+            self.is_tool_name_auto_approved(tool_name)
         }
+    }
+
+    fn is_tool_name_auto_approved(&self, tool_name: &str) -> bool {
+        self.session_auto_approve.contains(tool_name) || self.env_auto_approve.contains(tool_name)
     }
 
     /// Check if yolo mode is enabled.
@@ -1208,6 +1210,36 @@ fn build_combined_approval_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex as StdMutex};
+
+    static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(ref original) = self.original {
+                    std::env::set_var(self.key, original);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_approval_prompt_active_flag_is_initially_false() {
@@ -1900,11 +1932,9 @@ mod tests {
 
     #[test]
     fn test_sned_auto_approve_env_var_skips_prompt() {
-        let tools: HashSet<String> = ["edit_file", "write_to_file"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let manager = ApprovalManager::new().with_env_auto_approve(tools);
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("SNED_AUTO_APPROVE", "edit_file,write_to_file");
+        let manager = ApprovalManager::new();
         assert!(!manager.should_prompt(SnedTool::EditFile, None));
         assert!(!manager.should_prompt(SnedTool::WriteToFile, None));
         assert!(manager.should_prompt(SnedTool::ExecuteCommand, None));
@@ -1912,12 +1942,9 @@ mod tests {
 
     #[test]
     fn test_sned_auto_approve_complements_session_auto_approve() {
-        let env_tools: HashSet<String> = ["web_fetch"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let mut manager = ApprovalManager::new()
-            .with_env_auto_approve(env_tools);
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("SNED_AUTO_APPROVE", "web_fetch");
+        let mut manager = ApprovalManager::new();
         manager.session_auto_approve.insert("edit_file".to_string());
         assert!(!manager.should_prompt(SnedTool::EditFile, None));
         assert!(!manager.should_prompt(SnedTool::WebFetch, None));

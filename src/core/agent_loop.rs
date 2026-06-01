@@ -22,7 +22,9 @@ use crate::core::context::{
     ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager, context_window,
 };
 use crate::core::file_editor::AnchorStateManager;
-use crate::core::provider_retry::{RetryConfig, create_message_with_retry};
+use crate::core::provider_retry::{
+    DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES, RetryConfig, create_message_with_retry,
+};
 use crate::core::tools::SnedTool;
 use crate::core::tools::{
     ToolContext, ToolFailureClass, ToolFailureMetadata, ToolRegistry, ToolRequiredNextStep,
@@ -1366,7 +1368,20 @@ impl AgentLoop {
             Err(e) => {
                 error!(error = %e, "provider request failed");
                 let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
-                return TurnResult::Error(actionable.display());
+                let consecutive_failures = {
+                    let state = self.state.lock().await;
+                    state.consecutive_provider_failures
+                };
+                let message = if consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES {
+                    format!(
+                        "{}\nProvider has failed {} consecutive requests. Retry after the provider recovers, or use /model to switch providers.",
+                        actionable.display(),
+                        consecutive_failures
+                    )
+                } else {
+                    actionable.display()
+                };
+                return TurnResult::Error(message);
             }
         };
 
@@ -3436,10 +3451,7 @@ impl AgentLoop {
     /// Return the earliest history index that keeps tool_use/tool_result pairs intact.
     /// If a kept tool_result would be orphaned by pruning, extend the keep region
     /// backwards to include its corresponding tool_use.
-    fn keep_from_preserving_tool_pairs(
-        history: &[StorageMessage],
-        keep_from_base: usize,
-    ) -> usize {
+    fn keep_from_preserving_tool_pairs(history: &[StorageMessage], keep_from_base: usize) -> usize {
         // Build a map of tool_use_id -> message index for all tool_uses in history.
         let mut tool_use_index: std::collections::HashMap<String, usize> =
             std::collections::HashMap::with_capacity(16);
@@ -3944,6 +3956,37 @@ mod tests {
         }
     }
 
+    struct ErrorProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ErrorProvider {
+        async fn create_message(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<ApiStream, ProviderError> {
+            Err(ProviderError::RateLimitError {
+                message: "rate limited".to_string(),
+                retry_delay_ms: None,
+            })
+        }
+
+        fn get_model(&self) -> ProviderModel {
+            ProviderModel {
+                id: "error-provider".to_string(),
+                info: ModelInfo {
+                    name: Some("Error Provider".to_string()),
+                    max_tokens: Some(4096),
+                    context_window: Some(8192),
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn name(&self) -> &str {
+            "error-provider"
+        }
+    }
+
     fn test_agent_config(provider: Arc<dyn Provider>, task_id: &str) -> AgentConfig {
         AgentConfig {
             provider,
@@ -3974,6 +4017,35 @@ mod tests {
         assert!(!state.is_cancelled);
         assert!(!state.did_complete_reading_stream);
         assert!(state.snipped_code_blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_provider_failure_threshold_surfaces_recovery_message() {
+        let mut agent = AgentLoop::new(test_agent_config(
+            Arc::new(ErrorProvider),
+            "test-provider-failure-threshold",
+        ));
+        {
+            let mut state = agent.state.lock().await;
+            state.consecutive_provider_failures =
+                DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES.saturating_sub(1);
+        }
+
+        let result = agent.execute_turn().await;
+
+        match result {
+            TurnResult::Error(message) => {
+                assert!(message.contains("consecutive requests"));
+                assert!(message.contains("/model"));
+            }
+            other => panic!("expected provider failure error, got {:?}", other),
+        }
+
+        let state = agent.state.lock().await;
+        assert_eq!(
+            state.consecutive_provider_failures,
+            DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES
+        );
     }
 
     #[tokio::test]
@@ -4508,8 +4580,14 @@ mod tests {
                     ))
             )
         });
-        assert!(tool_use_present, "tool_use should be retained when result is kept");
-        assert!(tool_result_present, "tool_result should still be present after pruning");
+        assert!(
+            tool_use_present,
+            "tool_use should be retained when result is kept"
+        );
+        assert!(
+            tool_result_present,
+            "tool_result should still be present after pruning"
+        );
     }
 
     #[tokio::test]
@@ -6555,13 +6633,15 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert!(
-            requests.iter().any(|request| request.messages.iter().any(|message| {
-                matches!(
-                    &message.content,
-                    crate::providers::MessageContent::Text(text)
-                        if text.contains("Plan state:\nmode: APPROVAL")
-                )
-            })),
+            requests
+                .iter()
+                .any(|request| request.messages.iter().any(|message| {
+                    matches!(
+                        &message.content,
+                        crate::providers::MessageContent::Text(text)
+                            if text.contains("Plan state:\nmode: APPROVAL")
+                    )
+                })),
             "Plan state should be injected into at least one provider request"
         );
     }
@@ -6767,9 +6847,7 @@ mod tests {
                 function: ApiStreamToolCallFunction {
                     id: None,
                     name: Some("attempt_completion".to_string()),
-                    arguments: Some(
-                        serde_json::json!({"result": "Finished step 1"}).to_string(),
-                    ),
+                    arguments: Some(serde_json::json!({"result": "Finished step 1"}).to_string()),
                 },
                 signature: None,
             },
@@ -7222,7 +7300,10 @@ mod tests {
         // Second pass finds ToolResult at 5 (now outside 7..) → pulls to 3.
         // Third pass: no more changes.
         let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 10);
-        assert_eq!(result, 3, "Cascade should pull back through both pairs to index 3");
+        assert_eq!(
+            result, 3,
+            "Cascade should pull back through both pairs to index 3"
+        );
     }
 
     #[test]
@@ -7252,105 +7333,9 @@ mod tests {
             StorageMessage, ToolResultBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
         };
 
-        // Layout:
-        //   idx 0: text
-        //   idx 1: text
-        //   idx 2: ToolUse "tu-a"
-        //   idx 3: text
-        //   idx 4: text
-        //   idx 5: ToolResult for "tu-a"
-        //   idx 6: ToolUse "tu-b"
-        //   idx 7: ToolResult for "tu-b"
-        // keep_from_base=6: pass 1 finds TR at 7 (tu-b at 6 < 6? no, 6 == 6, skip).
-        //   Actually 6 < 6 is false. Let me adjust: keep_from_base=7.
-        // keep_from_base=7: pass 1 scans 7.. → TR at 7 for tu-b at 6, 6 < 7 → pull to 6.
-        // keep_from=6: pass 2 scans 6.. → TR at 7 for tu-b at 6, 6 >= 6 OK.
-        //   TR at 5 for tu-a at 2: 5 is NOT in 6.. (skip(6) starts at 6). 5 < 6, not scanned.
-        //   But 5 IS in the kept region? No: kept is history[6..], index 5 is excluded. No orphan.
-        //
-        // True cascade needs: after pulling, a previously-excluded TR lands in the kept region
-        // and its TU is still below the new keep_from.
-        //
-        // Layout for cascade:
-        //   idx 0: text
-        //   idx 1: text
-        //   idx 2: ToolUse "tu-a"
-        //   idx 3: text
-        //   idx 4: ToolResult for "tu-a"
-        //   idx 5: text
-        //   idx 6: ToolUse "tu-b"
-        //   idx 7: ToolResult for "tu-b"
-        // keep_from_base=6: scan 6.. → TR at 7 for tu-b at 6, 6 < 6? No. 6 is NOT < 6. No orphan.
-        // keep_from_base=5: scan 5.. → TR at 7 for tu-b at 6, 6 < 5? No. No orphan.
-        //
-        // Cascade trigger: keep_from must be BETWEEN the TU and its TR.
-        //
-        //   idx 0: text
-        //   idx 1: text
-        //   idx 2: ToolUse "tu-a"
-        //   idx 3: text
-        //   idx 4: ToolResult for "tu-a"
-        //   idx 5: ToolUse "tu-b"
-        //   idx 6: text
-        //   idx 7: ToolResult for "tu-b"
-        // keep_from_base=6: scan 6.. → TR at 7 for tu-b at 5, 5 < 6 → pull to 5.
-        // keep_from=5: scan 5.. → TR at 7 for tu-b at 5, 5 >= 5 OK.
-        //   TR at 4 for tu-a at 2: 4 < 5, not scanned. 4 NOT in kept region. No orphan.
-        //
-        // Hmm. For true cascade I need: after pulling keep_from from X to Y (Y < X),
-        // a TR at index Z where Y <= Z < X was previously not scanned (Z < X but Z >= Y)
-        // and that TR references a TU at index W where W < Y.
-        //
-        //   idx 0: text
-        //   idx 1: ToolUse "tu-a"
-        //   idx 2: text
-        //   idx 3: text
-        //   idx 4: ToolResult for "tu-a"
-        //   idx 5: ToolUse "tu-b"
-        //   idx 6: ToolResult for "tu-b"
-        //   idx 7: text
-        // keep_from_base=7: scan 7.. → nothing (only text at 7). keep_from=7. No trigger.
-        //
-        // keep_from_base=5: scan 5.. → TR at 6 for tu-b at 5, 5 < 5? No. TR at 4: not in 5..(4<5).
-        //
-        // I need the TR for tu-b to be AFTER keep_from_base, and tu-b's TU to be before it.
-        // Then pulling keep_from to tu-b's index exposes TR for tu-a which is between tu-b and keep_from.
-        //
-        //   idx 0: text
-        //   idx 1: ToolUse "tu-a"
-        //   idx 2: text
-        //   idx 3: ToolResult for "tu-a"
-        //   idx 4: text
-        //   idx 5: ToolUse "tu-b"
-        //   idx 6: text
-        //   idx 7: text
-        //   idx 8: ToolResult for "tu-b"
-        // keep_from_base=7: scan 7.. → TR at 8 for tu-b at 5, 5 < 7 → pull to 5.
-        // keep_from=5: scan 5.. → TR at 8 for tu-b at 5, 5 >= 5 OK.
-        //   TR at 3 for tu-a at 1: 3 < 5, not in scan range. 3 NOT in kept region (kept=5..). No orphan.
-        //
-        // For cascade: I need TR for tu-a to land IN the kept region after the first pull.
-        // That means TR for tu-a must be at index Y where Y >= new_keep_from.
-        // But new_keep_from = tu-b's TU index. So TR for tu-a must be >= tu-b's TU index.
-        // And TR for tu-a must have been below the original keep_from_base (otherwise it was
-        // already scanned and handled in pass 1).
-        //
-        //   idx 0: text
-        //   idx 1: ToolUse "tu-a"
-        //   idx 2: text
-        //   idx 3: text
-        //   idx 4: text
-        //   idx 5: ToolUse "tu-b"
-        //   idx 6: ToolResult for "tu-a"   <-- tu-a's TR is AFTER tu-b's TU
-        //   idx 7: text
-        //   idx 8: ToolResult for "tu-b"
-        //
-        // keep_from_base=7: scan 7.. → TR at 8 for tu-b at 5, 5 < 7 → pull to 5.
-        // keep_from=5: scan 5.. → TR at 8 for tu-b at 5, 5 >= 5 OK.
-        //   TR at 6 for tu-a at 1: 6 >= 5, IN scan range! tu-a at 1 < 5 → pull to 1!
-        // keep_from=1: scan 1.. → TR at 8 for tu-b at 5, 5 >= 1 OK.
-        //   TR at 6 for tu-a at 1, 1 >= 1 OK.
-        // Done. keep_from=1. CASCADE!
+        // This fixture forces a true two-level cascade: pulling the kept range
+        // back for tool-use "tu-b" exposes a second orphaned tool result for
+        // "tu-a", which then forces a second pullback in the same helper.
 
         let mut history = Vec::new();
         for i in 0..9 {
@@ -7437,6 +7422,9 @@ mod tests {
         };
 
         let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 7);
-        assert_eq!(result, 1, "Cascade: pass 1 pulls to 5 (tu-b), pass 2 pulls to 1 (tu-a)");
+        assert_eq!(
+            result, 1,
+            "Cascade: pass 1 pulls to 5 (tu-b), pass 2 pulls to 1 (tu-a)"
+        );
     }
 }
