@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 const MAX_FILE_READ_SIZE: u64 = 100 * 1024;
 
 static MENTION_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"@(/[^\s]*|[a-f0-9]{7,40}|git-changes)").unwrap());
+    LazyLock::new(|| Regex::new(r#"@("([^"]+)"|/[^\s]*|[a-f0-9]{7,40}|git-changes)"#).unwrap());
 
 static COMMIT_HASH_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-f0-9]{7,40}$").unwrap());
@@ -35,6 +35,11 @@ pub enum Mention {
 impl Mention {
     /// Parse a mention string into a typed Mention.
     pub fn parse(mention: &str) -> Option<Self> {
+        let mention = mention
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(mention);
+
         if mention == "git-changes" {
             return Some(Mention::GitChanges);
         }
@@ -225,6 +230,7 @@ mod tests {
         let regex = get_mention_regex();
 
         assert!(regex.is_match("Check @/src/main.rs for details"));
+        assert!(regex.is_match(r#"Check @"/src/my file.rs" for details"#));
         assert!(regex.is_match("Review @git-changes"));
         assert!(regex.is_match("Commit @abc1234"));
     }
@@ -238,10 +244,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_quoted_file_mention() {
+        assert_eq!(
+            Mention::parse(r#""/src/my file.rs""#),
+            Some(Mention::File("/src/my file.rs".to_string()))
+        );
+    }
+
+    #[test]
     fn test_parse_folder_mention() {
         assert_eq!(
             Mention::parse("/src/"),
             Some(Mention::Folder("/src/".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_quoted_folder_mention() {
+        assert_eq!(
+            Mention::parse(r#""/src/my folder/""#),
+            Some(Mention::Folder("/src/my folder/".to_string()))
         );
     }
 
@@ -283,6 +305,48 @@ mod tests {
         assert!(expanded[0].contains("Hello from mention"));
 
         tokio::fs::remove_file(&test_file).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_expand_mentions_quoted_file() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test quoted mention.txt");
+        tokio::fs::write(&test_file, "Hello from quoted mention")
+            .await
+            .unwrap();
+
+        let text = r#"Check @"/test quoted mention.txt" for info"#;
+        let (parsed, expanded) = expand_mentions(text, &temp_dir).await;
+
+        assert!(parsed.contains("see below for file content"));
+        assert!(parsed.contains("'test quoted mention.txt'"));
+        assert_eq!(expanded.len(), 1);
+        assert!(expanded[0].contains("Hello from quoted mention"));
+
+        tokio::fs::remove_file(&test_file).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_expand_mentions_quoted_folder() {
+        let temp_dir = std::env::temp_dir();
+        let test_dir = temp_dir.join("test quoted folder");
+        tokio::fs::create_dir_all(&test_dir).await.unwrap();
+        tokio::fs::write(test_dir.join("child.txt"), "child file")
+            .await
+            .unwrap();
+
+        let text = r#"Check @"/test quoted folder/" for info"#;
+        let (parsed, expanded) = expand_mentions(text, &temp_dir).await;
+
+        assert!(parsed.contains("see below for folder content"));
+        assert!(parsed.contains("'test quoted folder/'"));
+        assert_eq!(expanded.len(), 1);
+        assert!(expanded[0].contains("child.txt"));
+
+        tokio::fs::remove_file(test_dir.join("child.txt"))
+            .await
+            .unwrap();
+        tokio::fs::remove_dir(&test_dir).await.unwrap();
     }
 
     #[tokio::test]

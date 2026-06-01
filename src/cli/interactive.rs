@@ -522,7 +522,12 @@ async fn handle_key_event(
         if mq.in_mention_mode {
             let result = &app.picker_results[app.picker_index];
             let (new_text, cursor_pos) =
-                crate::core::file_search::insert_mention(&text, mq.at_index as usize, &result.path);
+                crate::core::file_search::insert_mention(
+                    &text,
+                    mq.at_index as usize,
+                    &result.path,
+                    result.file_type,
+                );
             app.input = App::new_textarea(vec![new_text]);
             app.input
                 .move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
