@@ -327,7 +327,7 @@ impl App {
             ScrollMode::Manual => {
                 self.scroll_offset = self.scroll_offset.min(max_offset);
                 let distance_from_bottom = max_offset.saturating_sub(self.scroll_offset);
-                if distance_from_bottom <= 2 {
+                if distance_from_bottom == 0 {
                     self.force_bottom();
                 }
             }
@@ -491,9 +491,11 @@ impl App {
         } else {
             String::new()
         };
+        let left_width = UnicodeWidthStr::width(status_left.as_str());
+        let right_width = UnicodeWidthStr::width(status_right.as_str());
         let spacer_len = status_area
             .width
-            .saturating_sub((status_left.len() + status_right.len()) as u16)
+            .saturating_sub((left_width + right_width) as u16)
             as usize;
         let status_line = Line::from(vec![
             Span::styled(status_left, theme::status_style()),
@@ -614,11 +616,12 @@ impl App {
     /// Handle a paste event, folding large pastes into markers.
     /// Returns true if the paste was folded, false if inserted directly.
     pub fn handle_paste(&mut self, content: &str) -> bool {
-        let folded = content.len() > self.paste_fold_threshold;
+        let char_count = content.chars().count();
+        let folded = char_count > self.paste_fold_threshold;
 
         if folded {
             // Create a marker for the folded paste
-            let marker = format!("[pasted {} chars]", content.len());
+            let marker = format!("[pasted {} chars]", char_count);
 
             // Insert the marker at cursor position
             self.input.insert_str(&marker);
@@ -736,10 +739,22 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_to_content_reenables_auto_near_bottom() {
+    fn test_clamp_to_content_stays_manual_near_bottom() {
         let mut app = make_scrolling_app(20, 5);
         app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 14;
+
+        app.clamp_to_content();
+
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 14);
+    }
+
+    #[test]
+    fn test_clamp_to_content_snaps_to_bottom_at_bottom() {
+        let mut app = make_scrolling_app(20, 5);
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 15;
 
         app.clamp_to_content();
 

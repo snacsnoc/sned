@@ -2024,10 +2024,10 @@ async fn run_main_loop(
         }
 
         // 5. Update elapsed time for status bar
-        if app.agent_busy
-            && let Some(start) = app.start_time
-        {
-            app.elapsed = Some(start.elapsed());
+        if app.agent_busy {
+            if let Some(start) = agent_start_time.lock().await.as_ref() {
+                app.elapsed = Some(start.elapsed());
+            }
         }
 
         // 6. Tick spinner
