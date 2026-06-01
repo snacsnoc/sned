@@ -226,8 +226,13 @@ pub async fn list_workspace_files(
     Ok(results.into_iter().take(limit).collect())
 }
 
+#[cfg(test)]
 fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
     let query_bytes = query.to_lowercase().into_bytes();
+    fuzzy_score_normalized(&query_bytes, target)
+}
+
+fn fuzzy_score_normalized(query_bytes: &[u8], target: &str) -> Option<usize> {
     let target_bytes = target.to_lowercase().into_bytes();
 
     if query_bytes.is_empty() {
@@ -297,11 +302,13 @@ pub async fn search_workspace_files(
         return items.into_iter().take(limit).collect();
     }
 
+    let query_lower = query.to_lowercase();
+    let query_bytes = query_lower.into_bytes();
     let mut scored: Vec<_> = items
         .iter()
         .filter_map(|item| {
             let search_target = format!("{} {}", item.label, item.path);
-            fuzzy_score(query, &search_target).map(|score| (score, item.clone()))
+            fuzzy_score_normalized(&query_bytes, &search_target).map(|score| (score, item.clone()))
         })
         .collect();
 
@@ -502,6 +509,18 @@ mod tests {
             score1,
             score2
         );
+    }
+
+    #[test]
+    fn test_fuzzy_score_normalized_mixed_case() {
+        // Regression: normalized query should match regardless of case
+        let query_lower = "main".to_lowercase().into_bytes();
+        let score1 = fuzzy_score_normalized(&query_lower, "Main.rs").unwrap();
+        let score2 = fuzzy_score_normalized(&query_lower, "MAIN.RS").unwrap();
+        let score3 = fuzzy_score_normalized(&query_lower, "main.rs").unwrap();
+        assert!(score1 > 0, "should match mixed-case Main.rs");
+        assert!(score2 > 0, "should match uppercase MAIN.RS");
+        assert_eq!(score1, score3, "mixed-case and lowercase should score equally");
     }
 
     #[test]

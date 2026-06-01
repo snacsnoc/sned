@@ -548,11 +548,15 @@ async fn handle_key_event(
                 .move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
             app.picker_active = false;
             app.picker_results.clear();
+            app.mention_search_active = false;
+            app.mention_search_query.clear();
             return Ok(None);
         }
         // Picker active but mention mode lost — dismiss picker and fall through
         app.picker_active = false;
         app.picker_results.clear();
+        app.mention_search_active = false;
+        app.mention_search_query.clear();
         // Fall through to normal Enter/Tab handling
     }
 
@@ -693,6 +697,8 @@ async fn handle_key_event(
     if key.code == KeyCode::Esc && app.picker_active {
         app.picker_active = false;
         app.picker_results.clear();
+        app.mention_search_active = false;
+        app.mention_search_query.clear();
         return Ok(None);
     }
 
@@ -722,19 +728,31 @@ async fn handle_key_event(
     use tui_textarea::Input;
     app.input.input(Input::from(key));
 
-    // Check for @ mention mode - show file picker overlay
+    // Check for @ mention mode - show file picker overlay (debounced)
     let input_text = app.input.lines().join("\n");
     let mq = crate::core::file_search::extract_mention_query(&input_text);
     if mq.in_mention_mode && !app.cwd.is_empty() {
-        let query = mq.query.clone();
-        let cwd = app.cwd.clone();
-        let results = crate::core::file_search::search_workspace_files(&query, &cwd, 10).await;
-        app.picker_active = true;
-        app.picker_results = results;
-        app.picker_index = 0;
+        let query = mq.query;
+        if !app.mention_search_active {
+            // First entry into mention mode — search immediately
+            app.mention_search_active = true;
+            app.mention_search_query = query.clone();
+            let results =
+                crate::core::file_search::search_workspace_files(&query, &app.cwd, 10).await;
+            app.picker_active = true;
+            app.picker_results = results;
+            app.picker_index = 0;
+        } else if query != app.mention_search_query {
+            // Query changed — reset debounce timer, keep stale results visible
+            app.mention_search_query = query;
+            app.mention_search_deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(150);
+        }
     } else {
         app.picker_active = false;
         app.picker_results.clear();
+        app.mention_search_active = false;
+        app.mention_search_query.clear();
     }
     Ok(None)
 }
@@ -1781,6 +1799,8 @@ async fn run_main_loop(
                             if app.picker_active {
                                 app.picker_active = false;
                                 app.picker_results.clear();
+                                app.mention_search_active = false;
+                                app.mention_search_query.clear();
                             }
                             return Ok(());
                         }
@@ -1795,6 +1815,8 @@ async fn run_main_loop(
                         if app.picker_active {
                             app.picker_active = false;
                             app.picker_results.clear();
+                            app.mention_search_active = false;
+                            app.mention_search_query.clear();
                             continue;
                         }
 
@@ -1995,6 +2017,23 @@ async fn run_main_loop(
                 },
                 _ => {}
             }
+        }
+
+        // 3b. Fire debounced mention search if timer expired
+        if app.mention_search_active
+            && !app.mention_search_query.is_empty()
+            && std::time::Instant::now() >= app.mention_search_deadline
+        {
+            let query = app.mention_search_query.clone();
+            let cwd = app.cwd.clone();
+            let results =
+                crate::core::file_search::search_workspace_files(&query, &cwd, 10).await;
+            app.picker_active = true;
+            app.picker_results = results;
+            app.picker_index = 0;
+            // Push deadline far forward so we don't re-search until query changes
+            app.mention_search_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(3600);
         }
 
         // 4. Check agent completion (non-blocking)

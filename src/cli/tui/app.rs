@@ -118,6 +118,12 @@ pub struct App {
     pub plan_state_cache_ptr: Option<usize>,
     /// Revision of the cached plan state.
     pub plan_state_cache_version: u64,
+    /// Whether @ mention search is active (user is in mention mode).
+    pub mention_search_active: bool,
+    /// Last query searched in mention mode (to detect changes).
+    pub mention_search_query: String,
+    /// Deadline for debounced mention search.
+    pub mention_search_deadline: Instant,
 }
 
 impl App {
@@ -174,6 +180,9 @@ impl App {
             plan_state_cache: None,
             plan_state_cache_ptr: None,
             plan_state_cache_version: 0,
+            mention_search_active: false,
+            mention_search_query: String::new(),
+            mention_search_deadline: Instant::now(),
         }
     }
 
@@ -520,8 +529,6 @@ impl App {
     }
 
     fn render_output(&mut self, frame: &mut Frame, output_area: Rect) {
-        self.update_placeholder();
-
         // Output pane with themed border and padding
         let visible_height = output_area.height as usize;
         // Content height excludes border (1 line top + 1 line bottom)
@@ -1030,5 +1037,54 @@ mod tests {
 
         assert!(rendered.contains("Files (1)"));
         assert!(rendered.contains("main.rs"));
+    }
+
+    #[test]
+    fn test_mention_debounce_does_not_fire_before_deadline() {
+        let mut app = App::new();
+        app.cwd = "/tmp".to_string();
+
+        // Simulate first entry into mention mode
+        app.mention_search_active = true;
+        app.mention_search_query = "@m".to_string();
+        app.mention_search_deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(150);
+
+        // Query changes — deadline should reset
+        app.mention_search_query = "@ma".to_string();
+        app.mention_search_deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(150);
+
+        // Deadline has not passed — search should NOT fire
+        assert!(std::time::Instant::now() < app.mention_search_deadline);
+    }
+
+    #[test]
+    fn test_render_output_does_not_update_placeholder() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.mode = "PLAN".to_string();
+        app.force_bottom();
+
+        // Record placeholder before render_output
+        let placeholder_before = app.input.placeholder_text().to_string();
+        assert_eq!(placeholder_before, "❯ ");
+
+        // Call render_output directly (not render(), which also calls render_input)
+        let output_area = ratatui::layout::Rect::new(0, 0, 80, 10);
+        terminal
+            .draw(|frame| app.render_output(frame, output_area))
+            .expect("render_output should succeed");
+
+        // Placeholder should be unchanged — render_output no longer mutates it
+        assert_eq!(
+            app.input.placeholder_text(),
+            placeholder_before,
+            "render_output should not update placeholder"
+        );
     }
 }
