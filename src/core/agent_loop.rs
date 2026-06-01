@@ -310,8 +310,14 @@ impl MessageQueueHandle {
         if dropped > 0 {
             warn!(
                 max_queue_len,
-                dropped, "message queue exceeded its limit; dropped oldest queued message(s)"
+                dropped, "message queue exceeded its limit; dropped {} queued message(s)", dropped
             );
+            if !self.json_output {
+                info!(
+                    "[sned] Warning: queue overflow — dropped {} message(s) (limit is {})",
+                    dropped, max_queue_len
+                );
+            }
         }
 
         if !self.json_output && count > 0 {
