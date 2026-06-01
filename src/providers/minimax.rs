@@ -564,6 +564,7 @@ fn convert_assistant_blocks_to_openai(
 ) -> Vec<serde_json::Value> {
     let mut text_content = String::new();
     let mut tool_calls = vec![];
+    let mut reasoning_details = vec![];
 
     for block in blocks {
         match block {
@@ -572,6 +573,13 @@ fn convert_assistant_blocks_to_openai(
                     text_content.push('\n');
                 }
                 text_content.push_str(&t.text);
+                if let Some(details) = &t.reasoning_details {
+                    reasoning_details.extend(
+                        details
+                            .iter()
+                            .map(|detail| json!({ "text": detail.text.clone() })),
+                    );
+                }
             }
             AssistantContentBlock::ToolUse(tu) => {
                 tool_calls.push(json!({
@@ -582,10 +590,22 @@ fn convert_assistant_blocks_to_openai(
                         "arguments": serde_json::to_string(&tu.input).unwrap_or_else(|_| "{}".to_string()),
                     }
                 }));
+                if let Some(details) = &tu.reasoning_details {
+                    reasoning_details.extend(
+                        details
+                            .iter()
+                            .map(|detail| json!({ "text": detail.text.clone() })),
+                    );
+                }
             }
-            AssistantContentBlock::Thinking(_) | AssistantContentBlock::RedactedThinking(_) => {
-                // Skip thinking blocks - MiniMax OpenAI-compatible API doesn't support them
-                // in conversation history (thinking is model-internal, not sent back)
+            AssistantContentBlock::Thinking(thinking) => {
+                // MiniMax requires reasoning_details to be preserved across turns when
+                // reasoning_split=true, so convert internal thinking blocks back into
+                // the OpenAI-compatible field rather than dropping them.
+                reasoning_details.push(json!({ "text": thinking.thinking.clone() }));
+            }
+            AssistantContentBlock::RedactedThinking(_) => {
+                // Redacted thinking cannot be reconstructed into reasoning_details.
             }
             _other => {
                 tracing::warn!("MiniMax dropped unhandled assistant content block variant");
@@ -608,6 +628,9 @@ fn convert_assistant_blocks_to_openai(
             text_content
         });
         msg["tool_calls"] = json!(tool_calls);
+    }
+    if !reasoning_details.is_empty() {
+        msg["reasoning_details"] = json!(reasoning_details);
     }
 
     vec![msg]
@@ -1583,6 +1606,63 @@ mod tests {
         let args = tool_calls[0]["function"]["arguments"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(args).unwrap();
         assert_eq!(parsed["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn test_build_request_body_preserves_reasoning_details_in_history() {
+        let config = MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "MiniMax-M2.7".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+        };
+        let provider = MinimaxProvider::new(config).unwrap();
+
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: vec![StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    AssistantContentBlock::Thinking(crate::providers::ThinkingBlock {
+                        thinking: "Need to inspect the tool output before replying.".to_string(),
+                        signature: "sig_1".to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        summary: None,
+                    }),
+                    AssistantContentBlock::ToolUse(crate::providers::ToolUseBlock {
+                        id: "call_abc".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "Cargo.toml"}),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        let message = &body["messages"][0];
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(
+            message["reasoning_details"][0]["text"],
+            "Need to inspect the tool output before replying."
+        );
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "read_file");
     }
 
     #[test]

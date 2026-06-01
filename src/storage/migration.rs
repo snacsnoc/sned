@@ -394,7 +394,7 @@ impl MigrationEngine {
                 }
                 OperationType::CreateDir => {
                     if op.file_path.exists()
-                        && let Err(e) = fs::remove_dir(&op.file_path)
+                        && let Err(e) = fs::remove_dir_all(&op.file_path)
                     {
                         errors.push(format!(
                             "failed to remove created directory {}: {}",
@@ -896,10 +896,14 @@ impl MigrationEngine {
             });
         }
 
-        for entry in WalkDir::new(&source_rules_dir)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in WalkDir::new(&source_rules_dir) {
+            let entry = entry.map_err(|source| MigrationError::Io {
+                path: source
+                    .path()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| source_rules_dir.clone()),
+                source: io::Error::other(source),
+            })?;
             if entry.file_type().is_file() {
                 let relative = entry
                     .path()
@@ -1239,7 +1243,14 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, MigrationError> {
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root) {
+        let entry = entry.map_err(|source| MigrationError::Io {
+            path: source
+                .path()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.to_path_buf()),
+            source: io::Error::other(source),
+        })?;
         if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
         }
@@ -1578,8 +1589,6 @@ mod tests {
 
     #[test]
     fn execute_rollback_on_partial_failure() {
-        use std::io::Write;
-
         let source = TempDir::new().unwrap();
         let destination = TempDir::new().unwrap();
 
@@ -1609,5 +1618,42 @@ mod tests {
         let endpoints: serde_json::Value = serde_json::from_str(&endpoints_content).unwrap();
         assert!(endpoints.get("key1").is_some());
         assert!(endpoints.get("existing").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_migration_fails_on_agents_walk_errors_and_rolls_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+
+        write_json(
+            &source.path().join("endpoints.json"),
+            &serde_json::json!({
+                "key1": "value1"
+            }),
+        );
+
+        let agents_dir = source.path().join(".agents");
+        let blocked_dir = agents_dir.join("blocked");
+        fs::create_dir_all(&blocked_dir).unwrap();
+        fs::write(agents_dir.join("ok.md"), "ok").unwrap();
+        fs::write(blocked_dir.join("secret.md"), "nope").unwrap();
+
+        // Trigger a WalkDir permission error while traversing .agents.
+        fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut engine = MigrationEngine::new(source.path(), destination.path());
+        let result = engine.execute();
+
+        // Restore permissions so TempDir cleanup can succeed.
+        fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(MigrationError::Io { .. })));
+        assert!(
+            !destination.path().join(".agents").exists(),
+            "created .agents directory should be removed during rollback"
+        );
     }
 }

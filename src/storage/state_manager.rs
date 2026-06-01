@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -1295,10 +1296,8 @@ impl StateManager {
                     {
                         let settings_path = task_dir.join("settings.json");
                         if settings_path.exists()
-                            && let Ok(contents) = fs::read_to_string(&settings_path)
-                            && let Ok(parsed) = serde_json::from_str::<
-                                serde_json::Map<String, serde_json::Value>,
-                            >(&contents)
+                            && let Some(parsed) =
+                                self.read_task_settings_with_backup(&settings_path)
                         {
                             // Convert Map to HashMap to match task_state type
                             let task_state_map: HashMap<String, serde_json::Value> =
@@ -1874,6 +1873,36 @@ impl StateManager {
         pending.insert(key);
     }
 
+    fn read_task_settings_with_backup(
+        &self,
+        file_path: &Path,
+    ) -> Option<serde_json::Map<String, Value>> {
+        match fs::read_to_string(file_path) {
+            Ok(contents) => match serde_json::from_str::<serde_json::Map<String, Value>>(&contents)
+            {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    if let Ok(backup_path) = crate::storage::disk::create_backup(file_path) {
+                        tracing::warn!(
+                            file_path = %file_path.display(),
+                            backup_path = %backup_path.display(),
+                            error = %e,
+                            "Created backup of corrupted task settings JSON"
+                        );
+                    } else {
+                        tracing::warn!(
+                            file_path = %file_path.display(),
+                            error = %e,
+                            "Failed to parse task settings JSON and backup failed"
+                        );
+                    }
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+
     /// Persist all pending changes to disk.
     /// This is called periodically or on explicit flush.
     pub fn persist(&self) -> io::Result<()> {
@@ -2024,11 +2053,9 @@ impl StateManager {
                 let file_path = task_dir.join("settings.json");
                 let mut existing_settings = serde_json::Map::new();
                 if file_path.exists()
-                    && let Ok(contents) = fs::read_to_string(&file_path)
-                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents)
-                    && let Some(obj) = parsed.as_object()
+                    && let Some(parsed) = self.read_task_settings_with_backup(&file_path)
                 {
-                    existing_settings = obj.clone();
+                    existing_settings = parsed;
                 }
 
                 // Merge pending keys into existing settings
@@ -2546,6 +2573,64 @@ mod tests {
                 backup_content, corrupted_content,
                 "Backup should contain original corrupted content"
             );
+        });
+    }
+
+    #[test]
+    fn test_initialize_creates_backup_on_corrupt_task_settings() {
+        use std::fs;
+
+        with_temp_data_dir(|| {
+            let tasks_dir = crate::storage::disk::get_tasks_dir();
+            let task_dir = tasks_dir.join("task-a");
+            fs::create_dir_all(&task_dir).unwrap();
+
+            let settings_path = task_dir.join("settings.json");
+            let corrupted_content = r#"{"mode":"act""#;
+            fs::write(&settings_path, corrupted_content).unwrap();
+
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+
+            let backup_path = settings_path.with_extension("json.bak");
+            assert!(
+                backup_path.exists(),
+                "Backup file should be created for corrupted task settings"
+            );
+            let backup_content = fs::read_to_string(&backup_path).unwrap();
+            assert_eq!(backup_content, corrupted_content);
+            assert!(manager.get_task_state("task-a", "mode").is_none());
+        });
+    }
+
+    #[test]
+    fn test_persist_task_states_creates_backup_on_corrupt_task_settings() {
+        use std::fs;
+
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+
+            let task_dir = crate::storage::disk::get_tasks_dir().join("task-a");
+            fs::create_dir_all(&task_dir).unwrap();
+            let settings_path = task_dir.join("settings.json");
+            let corrupted_content = r#"{"mode":"act""#;
+            fs::write(&settings_path, corrupted_content).unwrap();
+
+            manager.set_task_state("task-a", "mode", serde_json::Value::String("plan".into()));
+            manager.persist().unwrap();
+
+            let backup_path = settings_path.with_extension("json.bak");
+            assert!(
+                backup_path.exists(),
+                "Backup file should be created before overwriting corrupted task settings"
+            );
+            let backup_content = fs::read_to_string(&backup_path).unwrap();
+            assert_eq!(backup_content, corrupted_content);
+
+            let persisted: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+            assert_eq!(persisted["mode"], serde_json::Value::String("plan".into()));
         });
     }
 }
