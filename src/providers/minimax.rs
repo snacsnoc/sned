@@ -745,6 +745,48 @@ fn try_send_chunk(
 
 const MAX_XML_TOOL_CALL_BUFFER: usize = 64 * 1024;
 const XML_TOOL_CALL_CLOSING_TAG: &str = "</minimax:tool_call>";
+const MINIMAX_TEXT_FLUSH_THRESHOLD: usize = 64;
+
+fn minimax_text_buffer_should_flush(buffer: &str) -> bool {
+    if buffer.is_empty() {
+        return false;
+    }
+
+    if buffer.contains('\n') {
+        return true;
+    }
+
+    if buffer.len() >= MINIMAX_TEXT_FLUSH_THRESHOLD {
+        return true;
+    }
+
+    matches!(
+        buffer.chars().last(),
+        Some(ch) if ch.is_whitespace() || matches!(ch, '.' | '!' | '?' | ',' | ';' | ':')
+    )
+}
+
+fn flush_minimax_text_buffer(
+    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    pending_text: &mut String,
+    pending_text_signature: &mut Option<String>,
+    event_id: &str,
+) {
+    if pending_text.is_empty() {
+        return;
+    }
+
+    let text = std::mem::take(pending_text);
+    try_send_chunk(
+        tx,
+        ApiStreamChunk::Text(ApiStreamTextChunk {
+            text,
+            id: Some(event_id.to_string()),
+            signature: pending_text_signature.take(),
+        }),
+        "text",
+    );
+}
 
 /// Extract and emit all complete XML tool call blocks from the buffer.
 fn extract_and_emit_xml_tool_calls(
@@ -825,6 +867,8 @@ async fn process_minimax_sse_line(
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
     xml_buffer: &mut String,
+    pending_text: &mut String,
+    pending_text_signature: &mut Option<String>,
 ) {
     let line = line.trim();
     if line.is_empty() || line == "data: [DONE]" || line == "[DONE]" {
@@ -841,6 +885,7 @@ async fn process_minimax_sse_line(
         if let Some(choice) = event.choices.first() {
             // Handle reasoning_content (MiniMax M2.7+ interleaved thinking)
             if let Some(reasoning) = &choice.delta.reasoning_content {
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
                 try_send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
@@ -855,6 +900,7 @@ async fn process_minimax_sse_line(
             }
             // Handle reasoning_details array (MiniMax with reasoning_split=true)
             for detail in &choice.delta.reasoning_details {
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
                 try_send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
@@ -871,6 +917,7 @@ async fn process_minimax_sse_line(
             // Handle content: check for MiniMax-M2 XML tool calls
             if let Some(content) = &choice.delta.content {
                 if content.contains("<minimax:tool_call>") {
+                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
                     // Buffer XML content (bounded to prevent unbounded memory growth)
                     if xml_buffer.len() + content.len() <= MAX_XML_TOOL_CALL_BUFFER {
                         xml_buffer.push_str(content);
@@ -886,6 +933,7 @@ async fn process_minimax_sse_line(
                     extract_and_emit_xml_tool_calls(xml_buffer, tx, &event.id);
                     // Don't emit XML as text
                 } else if !xml_buffer.is_empty() {
+                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
                     // Continue buffering (bounded)
                     if xml_buffer.len() + content.len() <= MAX_XML_TOOL_CALL_BUFFER {
                         xml_buffer.push_str(content);
@@ -898,16 +946,18 @@ async fn process_minimax_sse_line(
                     }
                     extract_and_emit_xml_tool_calls(xml_buffer, tx, &event.id);
                 } else {
-                    // Normal text, emit
-                    try_send_chunk(
-                        tx,
-                        ApiStreamChunk::Text(ApiStreamTextChunk {
-                            text: content.clone(),
-                            id: Some(event.id.clone()),
-                            signature: None,
-                        }),
-                        "text",
-                    );
+                    pending_text.push_str(content);
+                    if minimax_text_buffer_should_flush(pending_text) {
+                        *pending_text_signature = Some(event.id.clone());
+                        flush_minimax_text_buffer(
+                            tx,
+                            pending_text,
+                            pending_text_signature,
+                            &event.id,
+                        );
+                    } else {
+                        *pending_text_signature = Some(event.id.clone());
+                    }
                 }
             }
 
@@ -917,6 +967,8 @@ async fn process_minimax_sse_line(
                 if completed_tool_call_indices.contains(&idx) {
                     continue;
                 }
+
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
 
                 if let Some(id) = &tool_call.id {
                     let entry = accumulated_tool_calls
@@ -985,6 +1037,7 @@ async fn process_minimax_sse_line(
             if let Some(finish_reason) = &choice.finish_reason
                 && finish_reason == "tool_calls"
             {
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
                 for (idx, (id, name, args)) in accumulated_tool_calls.iter() {
                     if !id.is_empty()
                         && !name.is_empty()
@@ -1110,6 +1163,8 @@ impl Provider for MinimaxProvider {
                 std::collections::HashSet::new();
             let mut last_stop_reason: Option<String> = None;
             let mut xml_buffer = String::new();
+            let mut pending_text = String::new();
+            let mut pending_text_signature: Option<String> = None;
             let mut stream_errored = false;
 
             while let Some(result) = stream.next().await {
@@ -1126,6 +1181,8 @@ impl Provider for MinimaxProvider {
                                 &mut completed_tool_call_indices,
                                 &mut last_stop_reason,
                                 &mut xml_buffer,
+                                &mut pending_text,
+                                &mut pending_text_signature,
                             )
                             .await;
                         }
@@ -1163,6 +1220,8 @@ impl Provider for MinimaxProvider {
                         &mut completed_tool_call_indices,
                         &mut last_stop_reason,
                         &mut xml_buffer,
+                        &mut pending_text,
+                        &mut pending_text_signature,
                     )
                     .await;
                 }
@@ -1172,6 +1231,12 @@ impl Provider for MinimaxProvider {
                 if !xml_buffer.is_empty() && xml_buffer.contains("<minimax:tool_call>") {
                     extract_and_emit_xml_tool_calls(&mut xml_buffer, &tx, "flush");
                 }
+                flush_minimax_text_buffer(
+                    &tx,
+                    &mut pending_text,
+                    &mut pending_text_signature,
+                    "flush",
+                );
 
                 // Flush any accumulated native tool calls that were never emitted
                 // (some providers send finish_reason:"stop" instead of "tool_calls")
@@ -1881,6 +1946,8 @@ mod tests {
 
         let mut last_stop_reason: Option<String> = None;
         let mut xml_buffer = String::new();
+        let mut pending_text = String::new();
+        let mut pending_text_signature: Option<String> = None;
 
         assert!(buffer.push_chunk(first).is_empty());
         for line in buffer.push_chunk(second) {
@@ -1891,6 +1958,8 @@ mod tests {
                 &mut completed_tool_call_indices,
                 &mut last_stop_reason,
                 &mut xml_buffer,
+                &mut pending_text,
+                &mut pending_text_signature,
             )
             .await;
         }
@@ -1908,6 +1977,55 @@ mod tests {
                 );
             }
             other => panic!("expected tool call chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_minimax_text_chunks_coalesce_until_sentence_boundary() {
+        let mut accumulated_tool_calls = std::collections::HashMap::with_capacity(4);
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut xml_buffer = String::new();
+        let mut pending_text = String::new();
+        let mut pending_text_signature: Option<String> = None;
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let first = r#"data: {"id":"evt_1","choices":[{"index":0,"delta":{"content":"I have a"}}]}"#;
+        process_minimax_sse_line(
+            first,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            &mut xml_buffer,
+            &mut pending_text,
+            &mut pending_text_signature,
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "partial text should stay buffered");
+
+        let second = r#"data: {"id":"evt_2","choices":[{"index":0,"delta":{"content":" complete."}}]}"#;
+        process_minimax_sse_line(
+            second,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            &mut xml_buffer,
+            &mut pending_text,
+            &mut pending_text_signature,
+        )
+        .await;
+
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for coalesced text chunk")
+            .expect("expected a text chunk");
+        match chunk {
+            crate::providers::ApiStreamChunk::Text(text_chunk) => {
+                assert_eq!(text_chunk.text, "I have a complete.");
+            }
+            other => panic!("expected text chunk, got {other:?}"),
         }
     }
 
