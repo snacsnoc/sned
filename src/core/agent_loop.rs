@@ -1317,79 +1317,7 @@ impl AgentLoop {
                 msg
             );
             tracing::info!("Applying emergency truncation to break deadlock");
-
-            // Keep only the last 20 messages (10 turns) + system prompt
-            // This should always fit within any reasonable context window
-            // CRITICAL: Preserve tool_use/tool_result pairs — never split a tool result
-            // from its corresponding tool use. If a tool_result would be kept but its
-            // tool_use was pruned, extend the keep region backwards to include the tool_use.
-            let emergency_keep = 20;
-            let mut history = self.conversation_history.lock().await;
-            if history.len() > emergency_keep {
-                // Build a map of tool_use_id → message index for all tool_uses in history
-                let mut tool_use_index: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::with_capacity(16);
-                for (idx, msg) in history.iter().enumerate() {
-                    if let MessageContent::AssistantBlocks(blocks) = &msg.content {
-                        for block in blocks {
-                            if let AssistantContentBlock::ToolUse(tu) = block {
-                                tool_use_index.insert(tu.id.clone(), idx);
-                            }
-                        }
-                    }
-                }
-
-                // Start with the most recent N messages
-                let keep_from_base = history.len().saturating_sub(emergency_keep);
-
-                // Scan the kept region for tool_results whose tool_use was pruned
-                // For each orphan, extend keep_from backwards to include the tool_use
-                let mut keep_from = keep_from_base;
-                for msg in history.iter().skip(keep_from_base) {
-                    if let MessageContent::UserBlocks(blocks) = &msg.content {
-                        for block in blocks {
-                            if let UserContentBlock::ToolResult(tr) = block
-                                && let Some(&tool_use_idx) = tool_use_index.get(&tr.tool_use_id)
-                                && tool_use_idx < keep_from
-                            {
-                                // This tool_use would be pruned but its result is kept — orphan!
-                                // Extend keep_from backwards to include the tool_use
-                                keep_from = keep_from.min(tool_use_idx);
-                            }
-                        }
-                    }
-                }
-
-                let dropped = keep_from;
-                history.drain(0..keep_from);
-                tracing::info!(
-                    "Emergency truncation: dropped {} oldest messages, keeping last {} (adjusted for tool_use/tool_result pairs)",
-                    dropped,
-                    history.len()
-                );
-
-                // Rebuild request with truncated history
-                request.messages = history.clone();
-            }
-            drop(history);
-
-            // IMPORTANT: Reset deleted_range to None. The emergency truncation physically
-            // removed messages from the vec, so the old deleted_range indices are now invalid.
-            // Since messages are already gone, there's nothing left to logically delete.
-            {
-                let mut state = self.state.lock().await;
-                if state.conversation_history_deleted_range.is_some() {
-                    tracing::debug!(
-                        "Reset conversation_history_deleted_range after emergency truncation"
-                    );
-                    state.conversation_history_deleted_range = None;
-                }
-            }
-
-            // Re-validate after emergency truncation
-            if let Err(msg) =
-                context_window::validate_context_window(&request, self.config.provider.as_ref())
-            {
+            if let Err(msg) = self.emergency_truncate_request(&mut request).await {
                 tracing::error!(
                     "Request still exceeds context limits after emergency truncation: {}",
                     msg
@@ -3505,6 +3433,54 @@ impl AgentLoop {
         }
     }
 
+    /// Return the earliest history index that keeps tool_use/tool_result pairs intact.
+    /// If a kept tool_result would be orphaned by pruning, extend the keep region
+    /// backwards to include its corresponding tool_use.
+    fn keep_from_preserving_tool_pairs(
+        history: &[StorageMessage],
+        keep_from_base: usize,
+    ) -> usize {
+        // Build a map of tool_use_id -> message index for all tool_uses in history.
+        let mut tool_use_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(16);
+        for (idx, msg) in history.iter().enumerate() {
+            if let MessageContent::AssistantBlocks(blocks) = &msg.content {
+                for block in blocks {
+                    if let AssistantContentBlock::ToolUse(tu) = block {
+                        tool_use_index.insert(tu.id.clone(), idx);
+                    }
+                }
+            }
+        }
+
+        let mut keep_from = keep_from_base.min(history.len());
+        loop {
+            let mut changed = false;
+            for msg in history.iter().skip(keep_from) {
+                if let MessageContent::UserBlocks(blocks) = &msg.content {
+                    for block in blocks {
+                        if let UserContentBlock::ToolResult(tr) = block
+                            && let Some(&tool_use_idx) = tool_use_index.get(&tr.tool_use_id)
+                            && tool_use_idx < keep_from
+                        {
+                            let new_keep_from = keep_from.min(tool_use_idx);
+                            if new_keep_from != keep_from {
+                                keep_from = new_keep_from;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        keep_from
+    }
+
     /// Prune oldest conversation history when it exceeds max_context_turns.
     /// Keeps system prompt (first message if present) + most recent N turns.
     /// A "turn" is counted as a user-assistant pair (2 messages).
@@ -3523,44 +3499,9 @@ impl AgentLoop {
             return history;
         }
 
-        // Build a map of tool_use_id → message index for all tool_uses in history
-        let mut tool_use_index: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::with_capacity(16);
-        for (idx, msg) in history.iter().enumerate() {
-            if let MessageContent::AssistantBlocks(blocks) = &msg.content {
-                for block in blocks {
-                    if let AssistantContentBlock::ToolUse(tu) = block {
-                        tool_use_index.insert(tu.id.clone(), idx);
-                    }
-                }
-            }
-        }
-
         // Start with the most recent N messages
         let keep_from_base = history.len().saturating_sub(max_messages);
-
-        // Scan the kept region for tool_results whose tool_use was pruned
-        // For each orphan, extend keep_from backwards to include the tool_use
-        // NOTE: Single-pass fix handles the common case (sequential tool_use→result pairs).
-        // Edge case: If pulling in a tool_use message brings in tool_results that reference
-        // even earlier tool_uses, those could also become orphans. A fully robust fix would
-        // iterate until keep_from stabilizes. In practice, tool_use→result pairs are sequential,
-        // so this cascade is unlikely.
-        let mut keep_from = keep_from_base;
-        for msg in history.iter().skip(keep_from_base) {
-            if let MessageContent::UserBlocks(blocks) = &msg.content {
-                for block in blocks {
-                    if let UserContentBlock::ToolResult(tr) = block
-                        && let Some(&tool_use_idx) = tool_use_index.get(&tr.tool_use_id)
-                        && tool_use_idx < keep_from
-                    {
-                        // This tool_use would be pruned but its result is kept — orphan!
-                        // Extend keep_from backwards to include the tool_use
-                        keep_from = keep_from.min(tool_use_idx);
-                    }
-                }
-            }
-        }
+        let keep_from = Self::keep_from_preserving_tool_pairs(&history, keep_from_base);
 
         // Preserve system prompt if it exists (first message with role=assistant)
         let has_system_prompt = history
@@ -3577,6 +3518,89 @@ impl AgentLoop {
         } else {
             history[keep_from..].to_vec()
         }
+    }
+
+    /// Apply emergency truncation repeatedly until the current request fits the provider
+    /// context window, while preserving tool_use/tool_result pairs in the retained tail.
+    async fn emergency_truncate_request(
+        &self,
+        request: &mut ProviderRequest,
+    ) -> Result<(), String> {
+        const INITIAL_KEEP_MESSAGES: usize = 20;
+        const MIN_KEEP_MESSAGES: usize = 2;
+
+        let mut keep_messages = INITIAL_KEEP_MESSAGES;
+        let mut truncated_any = false;
+        let mut history = self.conversation_history.lock().await;
+
+        let result = loop {
+            let dropped = Self::truncate_history_preserving_tool_pairs(&mut history, keep_messages);
+            if dropped > 0 {
+                truncated_any = true;
+                tracing::info!(
+                    dropped,
+                    retained = history.len(),
+                    keep_messages,
+                    "Emergency truncation dropped oldest messages while preserving tool pairs"
+                );
+            }
+
+            request.messages = history.clone();
+
+            match context_window::validate_context_window(request, self.config.provider.as_ref()) {
+                Ok(()) => break Ok(()),
+                Err(msg) => {
+                    tracing::warn!(
+                        keep_messages,
+                        retained = history.len(),
+                        "Request still exceeds context limits after emergency truncation: {}",
+                        msg
+                    );
+
+                    if keep_messages <= MIN_KEEP_MESSAGES || history.len() <= MIN_KEEP_MESSAGES {
+                        break Err(msg);
+                    }
+
+                    let next_keep = keep_messages.saturating_sub(2).max(MIN_KEEP_MESSAGES);
+                    if next_keep == keep_messages {
+                        break Err(msg);
+                    }
+
+                    tracing::info!(
+                        next_keep,
+                        "Emergency truncation still exceeds limits; retrying with smaller retained tail"
+                    );
+                    keep_messages = next_keep;
+                }
+            }
+        };
+
+        drop(history);
+
+        if truncated_any {
+            let mut state = self.state.lock().await;
+            if state.conversation_history_deleted_range.is_some() {
+                tracing::debug!(
+                    "Reset conversation_history_deleted_range after emergency truncation"
+                );
+                state.conversation_history_deleted_range = None;
+            }
+        }
+
+        result
+    }
+
+    fn truncate_history_preserving_tool_pairs(
+        history: &mut Vec<StorageMessage>,
+        keep_messages: usize,
+    ) -> usize {
+        let keep_from_base = history.len().saturating_sub(keep_messages);
+        let keep_from = Self::keep_from_preserving_tool_pairs(history, keep_from_base);
+        let dropped = keep_from.min(history.len());
+        if dropped > 0 {
+            history.drain(0..dropped);
+        }
+        dropped
     }
 
     /// Load conversation history from disk if task storage is configured.
@@ -3837,7 +3861,7 @@ mod tests {
     use crate::core::tool_output::summarize_single_section;
     use crate::providers::{
         ApiStream, ApiStreamTextChunk, ApiStreamToolCall, ApiStreamToolCallFunction,
-        ApiStreamToolCallsChunk, ProviderError,
+        ApiStreamToolCallsChunk, ModelInfo, ProviderError, ProviderModel,
     };
 
     struct RecordingChunkProvider {
@@ -3889,6 +3913,34 @@ mod tests {
 
         fn name(&self) -> &str {
             "recording"
+        }
+    }
+
+    struct TinyContextProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for TinyContextProvider {
+        async fn create_message(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<ApiStream, ProviderError> {
+            panic!("TinyContextProvider should not be called in truncation tests")
+        }
+
+        fn get_model(&self) -> ProviderModel {
+            ProviderModel {
+                id: "tiny-context".to_string(),
+                info: ModelInfo {
+                    name: Some("Tiny Context".to_string()),
+                    max_tokens: Some(1024),
+                    context_window: Some(1000),
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn name(&self) -> &str {
+            "tiny-context"
         }
     }
 
@@ -4293,6 +4345,171 @@ mod tests {
             result.conversation_history_deleted_range.is_some(),
             "Deleted range should be set"
         );
+    }
+
+    #[tokio::test]
+    async fn test_emergency_truncation_iteratively_shrinks_until_context_fits() {
+        use crate::core::context::context_window;
+        use crate::providers::{MessageContent, MessageRole, ProviderRequest, StorageMessage};
+
+        let provider: Arc<dyn Provider> = Arc::new(TinyContextProvider);
+        let agent = AgentLoop::new(test_agent_config(provider.clone(), "test-emergency-trunc"));
+
+        {
+            let mut history = agent.conversation_history.lock().await;
+            for i in 0..30 {
+                history.push(StorageMessage {
+                    id: None,
+                    role: if i % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Assistant
+                    },
+                    content: MessageContent::Text("x".repeat(192)),
+                    model_info: None,
+                    metrics: None,
+                    ts: Some(1_000 + i as u64),
+                });
+            }
+        }
+
+        let mut request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: agent.conversation_history.lock().await.clone(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        assert!(context_window::validate_context_window(&request, provider.as_ref()).is_err());
+
+        agent
+            .emergency_truncate_request(&mut request)
+            .await
+            .expect("emergency truncation should reduce the request until it fits");
+
+        assert!(
+            context_window::validate_context_window(&request, provider.as_ref()).is_ok(),
+            "emergency truncation should leave a request that fits the context window"
+        );
+        assert!(
+            request.messages.len() <= 16,
+            "emergency truncation should shrink past the first 20-message fallback when needed"
+        );
+    }
+
+    #[test]
+    fn test_truncate_history_preserves_tool_pairs() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields,
+            StorageMessage, TextContentBlock, ToolResultBlock, ToolResultContent, ToolUseBlock,
+            UserContentBlock,
+        };
+
+        let mut history = Vec::new();
+        for i in 0..5 {
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(format!("filler-{i}")),
+                model_info: None,
+                metrics: None,
+                ts: Some(1_000 + i as u64),
+            });
+        }
+        history.push(StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                ToolUseBlock {
+                    id: "tool-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(2_000),
+        });
+        for i in 6..15 {
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(format!("middle-{i}")),
+                model_info: None,
+                metrics: None,
+                ts: Some(2_000 + i as u64),
+            });
+        }
+        history.push(StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                ToolResultBlock {
+                    tool_use_id: "tool-1".to_string(),
+                    content: ToolResultContent::Text("ok".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(3_000),
+        });
+        for i in 16..30 {
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Text(
+                    TextContentBlock {
+                        text: format!("tail-{i}"),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: Some(4_000 + i as u64),
+            });
+        }
+
+        let dropped = AgentLoop::truncate_history_preserving_tool_pairs(&mut history, 20);
+        assert_eq!(dropped, 5);
+        assert_eq!(history.len(), 25);
+
+        let tool_use_present = history.iter().any(|msg| {
+            matches!(
+                &msg.content,
+                MessageContent::AssistantBlocks(blocks)
+                    if blocks.iter().any(|block| matches!(
+                        block,
+                        AssistantContentBlock::ToolUse(tool_use) if tool_use.id == "tool-1"
+                    ))
+            )
+        });
+        let tool_result_present = history.iter().any(|msg| {
+            matches!(
+                &msg.content,
+                MessageContent::UserBlocks(blocks)
+                    if blocks.iter().any(|block| matches!(
+                        block,
+                        UserContentBlock::ToolResult(result) if result.tool_use_id == "tool-1"
+                    ))
+            )
+        });
+        assert!(tool_use_present, "tool_use should be retained when result is kept");
+        assert!(tool_result_present, "tool_result should still be present after pruning");
     }
 
     #[tokio::test]

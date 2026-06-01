@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -101,13 +101,55 @@ impl UseSubagentsHandler {
             .unwrap_or(false)
     }
 
+    async fn collect_stream_output<R>(
+        reader: R,
+        prefix: String,
+        emit_progress: bool,
+        output_writer: Option<crate::cli::output::OutputWriterArc>,
+        is_stderr: bool,
+    ) -> String
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut lines = BufReader::new(reader).lines();
+        let mut collected = String::new();
+        let stream_prefix = if is_stderr {
+            format!("{} stderr", prefix)
+        } else {
+            prefix
+        };
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim_end_matches('\r').to_string();
+            if !collected.is_empty() {
+                collected.push('\n');
+            }
+            collected.push_str(&line);
+
+            if emit_progress
+                && let Some(ref writer) = output_writer
+            {
+                let formatted = format!("{} {}", stream_prefix, line);
+                if is_stderr {
+                    writer.emit(crate::cli::output::OutputEvent::dim_yellow(formatted));
+                } else {
+                    writer.emit(crate::cli::output::OutputEvent::dim(formatted));
+                }
+            }
+        }
+
+        collected
+    }
+
     async fn run_subagent(
+        subagent_index: usize,
         prompt: &str,
         timeout_secs: u64,
         max_turns: Option<u32>,
         _include_history: bool,
         cwd: &Path,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        progress_writer: Option<crate::cli::output::OutputWriterArc>,
     ) -> SubagentResult {
         let mut cmd = Command::new("sned");
         cmd.arg("task");
@@ -126,9 +168,26 @@ impl UseSubagentsHandler {
             cmd.arg(turns.to_string());
         }
 
+        let emit_progress = progress_writer.is_some();
+        if let Some(ref writer) = progress_writer {
+            use crate::cli::output::OutputEvent;
+            writer.emit(OutputEvent::info(format!(
+                "Subagent {} started",
+                subagent_index + 1
+            )));
+        }
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                if let Some(ref writer) = progress_writer {
+                    use crate::cli::output::OutputEvent;
+                    writer.emit(OutputEvent::error(format!(
+                        "Subagent {} failed to start: {}",
+                        subagent_index + 1,
+                        e
+                    )));
+                }
                 return SubagentResult {
                     status: "failed".to_string(),
                     error: Some(format!("spawn failed: {}", e)),
@@ -149,21 +208,50 @@ impl UseSubagentsHandler {
             tracing::debug!("Registered subagent PID {} for cancellation", child_pid);
         }
 
-        let mut stdout_buf = String::new();
-        let mut stderr_buf = String::new();
-
-        if let Some(ref mut fd) = child.stdout {
-            let _ = fd.read_to_string(&mut stdout_buf).await;
-        }
-        if let Some(ref mut fd) = child.stderr {
-            let _ = fd.read_to_string(&mut stderr_buf).await;
-        }
+        let stdout_handle = child.stdout.take().map(|stdout| {
+            let writer = progress_writer.clone();
+            let prefix = format!("[subagent {}]", subagent_index + 1);
+            tokio::spawn(Self::collect_stream_output(
+                stdout,
+                prefix,
+                emit_progress,
+                writer,
+                false,
+            ))
+        });
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            let writer = progress_writer.clone();
+            let prefix = format!("[subagent {}]", subagent_index + 1);
+            tokio::spawn(Self::collect_stream_output(
+                stderr,
+                prefix,
+                emit_progress,
+                writer,
+                true,
+            ))
+        });
 
         let wait_result = timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+
+        let stdout_buf = match stdout_handle {
+            Some(handle) => handle.await.unwrap_or_default(),
+            None => String::new(),
+        };
+        let stderr_buf = match stderr_handle {
+            Some(handle) => handle.await.unwrap_or_default(),
+            None => String::new(),
+        };
 
         let result = match wait_result {
             Ok(Ok(status)) => {
                 if status.success() {
+                    if let Some(ref writer) = progress_writer {
+                        use crate::cli::output::OutputEvent;
+                        writer.emit(OutputEvent::info(format!(
+                            "Subagent {} completed",
+                            subagent_index + 1
+                        )));
+                    }
                     SubagentResult {
                         status: "completed".to_string(),
                         result: Some(stdout_buf.trim().to_string()),
@@ -171,19 +259,40 @@ impl UseSubagentsHandler {
                         ..Default::default()
                     }
                 } else {
+                    if let Some(ref writer) = progress_writer {
+                        use crate::cli::output::OutputEvent;
+                        writer.emit(OutputEvent::warning(format!(
+                            "Subagent {} failed",
+                            subagent_index + 1
+                        )));
+                    }
                     SubagentResult {
                         status: "failed".to_string(),
                         result: None,
-                        error: Some(stderr_buf.trim().to_string()),
+                        error: Some(if stderr_buf.trim().is_empty() {
+                            stdout_buf.trim().to_string()
+                        } else {
+                            stderr_buf.trim().to_string()
+                        }),
                         ..Default::default()
                     }
                 }
             }
-            Ok(Err(e)) => SubagentResult {
-                status: "failed".to_string(),
-                error: Some(format!("wait failed: {}", e)),
-                ..Default::default()
-            },
+            Ok(Err(e)) => {
+                if let Some(ref writer) = progress_writer {
+                    use crate::cli::output::OutputEvent;
+                    writer.emit(OutputEvent::error(format!(
+                        "Subagent {} wait failed: {}",
+                        subagent_index + 1,
+                        e
+                    )));
+                }
+                SubagentResult {
+                    status: "failed".to_string(),
+                    error: Some(format!("wait failed: {}", e)),
+                    ..Default::default()
+                }
+            }
             Err(_) => {
                 #[cfg(unix)]
                 {
@@ -196,6 +305,14 @@ impl UseSubagentsHandler {
                     let _ = child.kill().await;
                 }
                 let _ = child.wait().await;
+                if let Some(ref writer) = progress_writer {
+                    use crate::cli::output::OutputEvent;
+                    writer.emit(OutputEvent::warning(format!(
+                        "Subagent {} timed out after {} seconds",
+                        subagent_index + 1,
+                        timeout_secs
+                    )));
+                }
                 SubagentResult {
                     status: "failed".to_string(),
                     error: Some(format!("Subagent timed out after {} seconds", timeout_secs)),
@@ -349,19 +466,27 @@ impl UseSubagentsHandler {
         }
 
         let mut handles = Vec::new();
+        let progress_writer = if json_output {
+            None
+        } else {
+            Some(output_writer.clone())
+        };
         for (i, prompt) in prompts.iter().enumerate() {
             let prompt_clone = prompt.clone();
             let cwd_clone = cwd.clone();
             let state_clone = Arc::clone(&state);
+            let progress_writer_clone = progress_writer.clone();
 
             handles.push(tokio::spawn(async move {
                 let result = Self::run_subagent(
+                    i,
                     &prompt_clone,
                     timeout_secs,
                     max_turns,
                     include_history,
                     cwd_clone.as_path(),
                     Some(state_clone),
+                    progress_writer_clone,
                 )
                 .await;
                 (i, result)
@@ -570,6 +695,25 @@ impl ToolHandler for UseSubagentsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::output::{OutputEvent, OutputWriter};
+    use tokio::io::AsyncWriteExt;
+
+    #[derive(Default)]
+    struct RecordingOutputWriter {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl OutputWriter for RecordingOutputWriter {
+        fn emit(&self, event: OutputEvent) {
+            let text = match event {
+                OutputEvent::Line(line) => line.to_string(),
+                OutputEvent::RawAnsi(text) => text,
+            };
+            self.events.lock().unwrap().push(text);
+        }
+
+        fn flush(&self) {}
+    }
 
     #[test]
     fn test_parse_prompts() {
@@ -683,5 +827,33 @@ mod tests {
         let result = handler.execute(&mut state, params).await;
         assert!(result.is_err());
         assert_eq!(state.consecutive_mistakes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_output_emits_progress_lines() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let recorder = Arc::new(RecordingOutputWriter::default());
+        let output_writer: crate::cli::output::OutputWriterArc = recorder.clone();
+
+        let handle = tokio::spawn(async move {
+            UseSubagentsHandler::collect_stream_output(
+                reader,
+                "[subagent 1]".to_string(),
+                true,
+                Some(output_writer),
+                false,
+            )
+            .await
+        });
+
+        writer.write_all(b"hello\nworld\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let collected = handle.await.unwrap();
+        assert_eq!(collected, "hello\nworld");
+
+        let events = recorder.events.lock().unwrap();
+        assert!(events.iter().any(|event| event.contains("[subagent 1] hello")));
+        assert!(events.iter().any(|event| event.contains("[subagent 1] world")));
     }
 }

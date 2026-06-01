@@ -328,21 +328,16 @@ impl EditFileHandler {
             // Acquire exclusive file lock to prevent concurrent edits
             let _file_guard = FileEditGuard::acquire(&batch.absolute_path).await;
 
-            // Mark file as edited by Sned to suppress false positives
-            state
-                .file_context_tracker
-                .mark_file_as_edited_by_sned(Path::new(&batch.absolute_path));
-
             let stale_warning = state
                 .file_context_tracker
                 .check_stale(Path::new(&batch.absolute_path))
                 .await;
-            if let Some(warning) = &stale_warning {
-                all_results.push(warning.clone());
-            }
-
             if stale_warning.is_some() {
-                state.file_content_cache.pop(&batch.absolute_path);
+                Self::mark_must_reread(state, &batch.absolute_path);
+                return Err(Self::external_modification_error(
+                    &batch.display_path,
+                    &batch.absolute_path,
+                ));
             }
 
             // Warn if editing a file not read this session
@@ -736,6 +731,9 @@ impl EditFileHandler {
                         item.absolute_path.clone(),
                         item.final_content.clone(),
                     );
+                    state
+                        .file_context_tracker
+                        .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
 
                     let write_result = crate::storage::disk::atomic_write_file_async(
                         &item.absolute_path,
@@ -801,6 +799,9 @@ impl EditFileHandler {
                         item.absolute_path.clone(),
                         item.final_content.clone(),
                     );
+                    state
+                        .file_context_tracker
+                        .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
 
                     let write_result = crate::storage::disk::atomic_write_file_async(
                         &item.absolute_path,
@@ -1443,7 +1444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_file_stale_warning_does_not_block_valid_anchors() {
+    async fn test_edit_file_external_modification_requires_reread() {
         let _guard = TEST_MUTEX.lock().await;
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
@@ -1491,15 +1492,15 @@ mod tests {
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
-        let result = ToolHandler::execute(&handler, &ctx, params).await.unwrap();
-        assert!(
-            result
-                .as_str()
-                .unwrap()
-                .contains("Applied 1 edit(s) successfully")
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        let err = result.expect_err("stale external edits should require a reread first");
+        assert!(err.to_string().contains("modified externally"));
+        assert_eq!(
+            err.metadata().map(|metadata| &metadata.class),
+            Some(&ToolFailureClass::AnchorInvalid)
         );
         assert!(
-            !state
+            state
                 .lock()
                 .await
                 .must_reread_before_edit
