@@ -72,6 +72,63 @@ impl Clone for TaskStorage {
 }
 
 impl TaskStorage {
+    fn read_task_metadata_from_path(path: &Path) -> TaskMetadata {
+        match fs::read_to_string(path) {
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(data) => data,
+                Err(e) => {
+                    // Create backup of corrupted file before discarding
+                    if let Ok(backup_path) = crate::storage::disk::create_backup(path) {
+                        tracing::warn!(
+                            file_path = %path.display(),
+                            backup_path = %backup_path.display(),
+                            error = %e,
+                            "Created backup of corrupted task metadata JSON"
+                        );
+                    } else {
+                        tracing::warn!(
+                            file_path = %path.display(),
+                            error = %e,
+                            "Failed to parse task metadata JSON and backup failed"
+                        );
+                    }
+                    TaskMetadata::default()
+                }
+            },
+            Err(_) => TaskMetadata::default(),
+        }
+    }
+
+    fn read_json_with_backup<T>(&self, file_path: &Path) -> Option<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        match fs::read_to_string(file_path) {
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    // Create backup of corrupted file before discarding
+                    if let Ok(backup_path) = crate::storage::disk::create_backup(file_path) {
+                        tracing::warn!(
+                            file_path = %file_path.display(),
+                            backup_path = %backup_path.display(),
+                            error = %e,
+                            "Created backup of corrupted settings JSON"
+                        );
+                    } else {
+                        tracing::warn!(
+                            file_path = %file_path.display(),
+                            error = %e,
+                            "Failed to parse settings JSON and backup failed"
+                        );
+                    }
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+
     pub fn new(task_id: &str) -> io::Result<Self> {
         let task_dir = get_tasks_dir().join(task_id);
         fs::create_dir_all(&task_dir)?;
@@ -256,20 +313,7 @@ impl TaskStorage {
     /// Read task metadata
     pub fn read_task_metadata(&self) -> TaskMetadata {
         let file_path = self.task_dir.join(GlobalFileNames::TASK_METADATA);
-        match fs::read_to_string(&file_path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        file_path = %file_path.display(),
-                        error = %e,
-                        "Failed to parse task metadata JSON"
-                    );
-                    TaskMetadata::default()
-                }
-            },
-            Err(_) => TaskMetadata::default(),
-        }
+        Self::read_task_metadata_from_path(&file_path)
     }
 
     /// Write task metadata
@@ -288,20 +332,7 @@ impl TaskStorage {
     /// Read task metadata without acquiring lock (caller must hold lock).
     fn read_task_metadata_unlocked(&self) -> TaskMetadata {
         let file_path = self.task_dir.join(GlobalFileNames::TASK_METADATA);
-        match fs::read_to_string(&file_path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        file_path = %file_path.display(),
-                        error = %e,
-                        "Failed to parse task metadata JSON"
-                    );
-                    TaskMetadata::default()
-                }
-            },
-            Err(_) => TaskMetadata::default(),
-        }
+        Self::read_task_metadata_from_path(&file_path)
     }
 
     /// Create initial task metadata for a new task
@@ -334,10 +365,7 @@ impl TaskStorage {
         T: for<'de> Deserialize<'de>,
     {
         let file_path = self.task_dir.join("settings.json");
-        match fs::read_to_string(&file_path) {
-            Ok(contents) => serde_json::from_str(&contents).ok(),
-            Err(_) => None,
-        }
+        self.read_json_with_backup(&file_path)
     }
 
     /// Write per-task settings (merging with existing)
@@ -350,11 +378,18 @@ impl TaskStorage {
             let mut existing = serde_json::Map::new();
 
             // Read existing settings if they exist
-            if let Ok(contents) = fs::read_to_string(&file_path)
-                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents)
-                && let serde_json::Value::Object(map) = val
-            {
-                existing = map;
+            if let Ok(contents) = fs::read_to_string(&file_path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let serde_json::Value::Object(map) = val {
+                        existing = map;
+                    }
+                } else if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
+                    tracing::warn!(
+                        file_path = %file_path.display(),
+                        backup_path = %backup_path.display(),
+                        "Created backup of corrupted settings JSON before overwrite"
+                    );
+                }
             }
 
             // Merge new settings
@@ -679,6 +714,94 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].path, "/tmp/b.rs");
         assert_eq!(loaded[0].record_source, FileRecordSource::SnedEdited);
+    }
+
+    #[test]
+    fn test_save_file_context_metadata_creates_backup_on_corrupt_task_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let metadata_path = task_dir.join(GlobalFileNames::TASK_METADATA);
+        fs::write(&metadata_path, "{not valid json").unwrap();
+
+        use crate::core::context::trackers::{
+            FileMetadataEntry, FileRecordSource, FileRecordState,
+        };
+
+        let entries = vec![FileMetadataEntry {
+            path: "/tmp/task.rs".to_string(),
+            record_state: FileRecordState::Active,
+            record_source: FileRecordSource::ReadTool,
+            sned_read_date: Some(42),
+            sned_edit_date: None,
+            user_edit_date: None,
+        }];
+
+        storage.save_file_context_metadata(&entries).unwrap();
+
+        let backup = fs::read_dir(&task_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with("task_metadata.json.") && name.ends_with(".bak"))
+            });
+
+        assert!(backup.is_some(), "corrupt task metadata should be backed up");
+
+        let loaded = storage.load_file_context_metadata();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].path, "/tmp/task.rs");
+    }
+
+    #[test]
+    fn test_write_settings_creates_backup_on_corrupt_settings_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let settings_path = task_dir.join("settings.json");
+        fs::write(&settings_path, "{not valid json").unwrap();
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct TestSettings {
+            theme: String,
+        }
+
+        storage
+            .write_settings(&TestSettings {
+                theme: "dark".to_string(),
+            })
+            .unwrap();
+
+        let backup = fs::read_dir(&task_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with("settings.json.") && name.ends_with(".bak"))
+            });
+
+        assert!(backup.is_some(), "corrupt settings should be backed up");
+
+        let loaded: Option<TestSettings> = storage.read_settings();
+        assert_eq!(
+            loaded,
+            Some(TestSettings {
+                theme: "dark".to_string()
+            })
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ use tracing::warn;
 /// Log a retry status message (visible in logs and TUI output pane)
 fn log_retry_status(
     retry_attempt: usize,
+    max_retries: usize,
     delay: Duration,
     error: &ProviderError,
     output_writer: Option<&crate::cli::output::OutputWriterArc>,
@@ -34,7 +35,7 @@ fn log_retry_status(
         "⚠️ {} — retrying (attempt {}/{}, delay: {:.1}s)",
         error_summary,
         retry_attempt + 1,
-        retry_attempt + 1,
+        max_retries,
         delay_secs
     );
     tracing::info!("{}", msg);
@@ -150,7 +151,13 @@ pub async fn create_message_with_retry(
                     "provider request failed; retrying"
                 );
                 if !json_output {
-                    log_retry_status(retry_attempt, delay, &error, output_writer.as_ref());
+                    log_retry_status(
+                        retry_attempt,
+                        retry_config.max_retries,
+                        delay,
+                        &error,
+                        output_writer.as_ref(),
+                    );
                 }
 
                 // Sleep with cancellation check — poll in small intervals to remain responsive to Ctrl+C
@@ -234,6 +241,7 @@ fn exponential_backoff_delay(retry_attempt: usize, retry_config: RetryConfig) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::output::{OutputEvent, OutputWriter};
     use crate::providers::{ApiStreamChunk, ProviderModel};
     use async_trait::async_trait;
     use futures::StreamExt;
@@ -244,6 +252,26 @@ mod tests {
     use std::sync::{LazyLock, Mutex as StdMutex};
 
     static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    struct CaptureWriter {
+        events: StdMutex<Vec<OutputEvent>>,
+    }
+
+    impl CaptureWriter {
+        fn new() -> Self {
+            Self {
+                events: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl OutputWriter for CaptureWriter {
+        fn emit(&self, event: OutputEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+
+        fn flush(&self) {}
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -358,6 +386,26 @@ mod tests {
         let error = ProviderError::NetworkError("connection reset".to_string());
         let delay = retry_delay_for_error(&error, 0, RetryConfig::default());
         assert!(delay.is_some());
+    }
+
+    #[test]
+    fn retry_status_uses_configured_max_retries() {
+        let writer = Arc::new(CaptureWriter::new());
+        let writer_dyn: Arc<dyn OutputWriter> = writer.clone();
+        let error = ProviderError::RateLimitError {
+            message: "rate limited".to_string(),
+            retry_delay_ms: None,
+        };
+
+        log_retry_status(0, 3, Duration::from_secs(2), &error, Some(&writer_dyn));
+
+        let events = writer.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let rendered = match &events[0] {
+            OutputEvent::Line(line) => format!("{}", line),
+            other => panic!("expected line event, got {other:?}"),
+        };
+        assert!(rendered.contains("attempt 1/3"));
     }
 
     #[test]
