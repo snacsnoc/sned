@@ -635,34 +635,38 @@ async fn finish_gemini_sse_to_chunks(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &mut HashMap<String, (String, String, String, Option<String>)>,
     completed_tool_call_ids: &mut HashSet<String>,
-    _last_stop_reason: &mut Option<String>,
+    last_stop_reason: &mut Option<String>,
     last_grounding_metadata: &mut Option<serde_json::Value>,
 ) {
-    // Flush accumulated tool calls on stream end
-    for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
-        if !completed_tool_call_ids.contains(call_id) {
-            completed_tool_call_ids.insert(call_id.clone());
-            try_send_chunk(
-                tx,
-                ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                    tool_call: ApiStreamToolCall {
-                        call_id: Some(id.clone()),
-                        function: ApiStreamToolCallFunction {
-                            id: Some(id.clone()),
-                            name: Some(name.clone()),
-                            arguments: Some(crate::providers::validate_tool_call_args(
-                                args,
-                                "Gemini",
-                                "at stream end",
-                            )),
+    // Do not flush tool calls if the model was blocked or only emitted
+    // recitation content. Those states are explicit terminal responses.
+    if !matches!(last_stop_reason.as_deref(), Some("RECITATION") | Some("BLOCKED")) {
+        // Flush accumulated tool calls on stream end.
+        for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
+            if !completed_tool_call_ids.contains(call_id) {
+                completed_tool_call_ids.insert(call_id.clone());
+                try_send_chunk(
+                    tx,
+                    ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                        tool_call: ApiStreamToolCall {
+                            call_id: Some(id.clone()),
+                            function: ApiStreamToolCallFunction {
+                                id: Some(id.clone()),
+                                name: Some(name.clone()),
+                                arguments: Some(crate::providers::validate_tool_call_args(
+                                    args,
+                                    "Gemini",
+                                    "at stream end",
+                                )),
+                            },
+                            signature: signature.clone(),
                         },
+                        id: None,
                         signature: signature.clone(),
-                    },
-                    id: None,
-                    signature: signature.clone(),
-                }),
-                "tool_calls",
-            );
+                    }),
+                    "tool_calls",
+                );
+            }
         }
     }
 
@@ -1596,6 +1600,37 @@ mod tests {
             // Just verify the logic runs without panic
             let _ = should_emit;
         }
+    }
+
+    #[tokio::test]
+    async fn test_finish_gemini_sse_to_chunks_skips_blocked_tool_calls() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(8);
+        let mut accumulated_tool_calls = HashMap::from([(
+            "call-1".to_string(),
+            (
+                "call-1".to_string(),
+                "read_file".to_string(),
+                r#"{"path":"src/main.rs"}"#.to_string(),
+                None,
+            ),
+        )]);
+        let mut completed_tool_call_ids = HashSet::new();
+        let mut last_stop_reason = Some("BLOCKED".to_string());
+        let mut last_grounding_metadata = None;
+
+        finish_gemini_sse_to_chunks(
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_ids,
+            &mut last_stop_reason,
+            &mut last_grounding_metadata,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "BLOCKED finish should not emit tool calls");
+        assert!(completed_tool_call_ids.is_empty());
     }
 
     #[test]

@@ -350,34 +350,44 @@ pub fn resolve_sanitized_path(
         return Ok(canonical);
     }
 
-    if let Some(parent) = normalized.parent()
-    {
-        // Canonicalize directly without exists() check to prevent TOCTOU race.
-        // If parent doesn't exist, canonicalize will fail with NotFound error.
-        let canonical_parent = match std::fs::canonicalize(parent) {
-            Ok(p) => p,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Parent doesn't exist - that's OK, file will be created
-                return Ok(normalized);
+    let mut current = workspace_root.to_path_buf();
+    let suffix = normalized
+        .strip_prefix(workspace_root)
+        .unwrap_or_else(|_| normalized.as_path());
+
+    for component in suffix.components() {
+        current.push(component.as_os_str());
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if !meta.file_type().is_symlink() {
+                    continue;
+                }
+                let canonical = std::fs::canonicalize(&current).map_err(|e| {
+                    ToolError::InvalidInput(format!(
+                        "Failed to resolve symlink path: {} ({})",
+                        current.display(),
+                        e
+                    ))
+                })?;
+
+                if !canonical.starts_with(&canonical_root) {
+                    return Err(ToolError::InvalidInput(format!(
+                        "Resolved parent path escapes workspace via symlink: {} -> {}",
+                        path.display(),
+                        canonical.display()
+                    )));
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 return Err(ToolError::InvalidInput(format!(
-                    "Failed to resolve parent path: {} ({})",
-                    parent.display(),
+                    "Failed to inspect path component {} ({})",
+                    current.display(),
                     e
                 )));
             }
-        };
-
-        if !canonical_parent.starts_with(&canonical_root) {
-            return Err(ToolError::InvalidInput(format!(
-                "Resolved parent path escapes workspace via symlink: {} -> {}",
-                path.display(),
-                canonical_parent.display()
-            )));
         }
-
-        return Ok(canonical_parent.join(normalized.file_name().unwrap_or_default()));
     }
 
     Ok(normalized)
@@ -590,5 +600,21 @@ mod tests {
         let params = serde_json::json!({});
         let result = coerce_string_array(&params, "paths", "path");
         assert!(result.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_sanitized_path_rejects_nested_missing_path_through_symlink() {
+        use std::os::unix::fs::symlink;
+        let workspace_root = tempfile::tempdir().unwrap();
+        let outside_root = tempfile::tempdir().unwrap();
+        let symlink_path = workspace_root.path().join("linked");
+
+        symlink(outside_root.path(), &symlink_path).unwrap();
+
+        let result = resolve_sanitized_path(workspace_root.path(), "linked/nested/file.rs");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("symlink") || err.contains("escapes workspace"));
     }
 }
