@@ -1670,7 +1670,7 @@ async fn run_main_loop(
     auto_approve: bool,
 ) -> anyhow::Result<()> {
     use std::sync::Mutex as StdMutex;
-    const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(33);
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
 

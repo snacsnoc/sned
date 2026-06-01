@@ -38,6 +38,7 @@ use crate::providers::{
 use crate::storage::global_state::HistoryItem;
 use crate::storage::state_manager::StateManager;
 use crate::storage::task_storage::TaskStorage;
+use std::borrow::Cow;
 use futures::future::FutureExt;
 use ratatui::style::{Color, Modifier, Style};
 use std::collections::{HashMap, VecDeque};
@@ -182,18 +183,24 @@ fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriter
     }
 }
 
-fn sanitize_model_text_for_display(line: &str) -> String {
-    line.chars()
-        .map(|ch| {
-            if matches!(ch, '\t') {
-                ' '
-            } else if ch.is_control() {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect()
+fn sanitize_model_text_for_display(line: &str) -> Cow<'_, str> {
+    if line.chars().all(|ch| !ch.is_control() && ch != '\t') {
+        Cow::Borrowed(line)
+    } else {
+        Cow::Owned(
+            line.chars()
+                .map(|ch| {
+                    if matches!(ch, '\t') {
+                        ' '
+                    } else if ch.is_control() {
+                        ' '
+                    } else {
+                        ch
+                    }
+                })
+                .collect(),
+        )
+    }
 }
 
 fn print_code_block(
@@ -4082,6 +4089,14 @@ mod tests {
         assert!(rendered.contains("ok"));
         assert!(rendered.contains("there"));
         assert!(rendered.contains("friend"));
+    }
+
+    #[test]
+    fn test_sanitize_model_text_fast_path_borrows_clean_input() {
+        match sanitize_model_text_for_display("already clean") {
+            Cow::Borrowed(text) => assert_eq!(text, "already clean"),
+            Cow::Owned(_) => panic!("clean input should not allocate"),
+        }
     }
 
     #[tokio::test]
