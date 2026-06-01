@@ -290,6 +290,9 @@ impl App {
             self.render_output(frame, output_area);
             self.render_status_bar(frame, status_area);
             self.render_input(frame, input_area);
+            if self.picker_active {
+                self.render_picker_overlay(frame, output_area);
+            }
             self.render_plan_panel(frame, plan_area);
         } else {
             let [output_area, status_area, input_area] = Layout::vertical([
@@ -302,6 +305,9 @@ impl App {
             self.render_output(frame, output_area);
             self.render_status_bar(frame, status_area);
             self.render_input(frame, input_area);
+            if self.picker_active {
+                self.render_picker_overlay(frame, output_area);
+            }
         }
     }
 
@@ -657,5 +663,34 @@ mod tests {
 
         assert!(rendered.contains("Approve these edits?"));
         assert!(!rendered.contains("Agent processing..."));
+    }
+
+    #[test]
+    fn test_render_shows_picker_overlay_when_active() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.picker_active = true;
+        app.picker_results = vec![crate::core::file_search::FileSearchResult {
+            path: "src/main.rs".to_string(),
+            file_type: crate::core::file_search::FileType::File,
+            label: "main.rs".to_string(),
+        }];
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Files (1)"));
+        assert!(rendered.contains("main.rs"));
     }
 }
