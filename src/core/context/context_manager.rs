@@ -302,20 +302,45 @@ fn apply_context_history_updates(
 
     let mut messages_to_update = Vec::with_capacity(first_chunk.len() + second_chunk.len() + 1);
     messages_to_update.extend_from_slice(first_chunk);
-
-    // Insert compacted summary after first 2 messages if present
-    if let Some(summary) = compacted_summary {
-        messages_to_update.push(StorageMessage {
-            id: None,
-            role: MessageRole::Assistant,
-            content: MessageContent::Text(summary.summary_text.clone()),
-            model_info: None,
-            metrics: None,
-            ts: None,
-        });
-    }
-
     messages_to_update.extend_from_slice(second_chunk);
+
+    // Keep the summary from splitting an immediate tool-use/tool-result pair at the
+    // truncation boundary. When the first kept assistant message issues a tool and the
+    // next kept user message contains the matching result, the summary must come after
+    // that pair so the provider still sees adjacent tool blocks.
+    let summary_insert_index = if compacted_summary.is_some()
+        && messages_to_update.len() > 2
+        && messages_to_update[1].role == MessageRole::Assistant
+        && matches!(
+            messages_to_update[1].content,
+            MessageContent::AssistantBlocks(ref blocks)
+                if blocks.iter().any(|block| matches!(block, AssistantContentBlock::ToolUse(_)))
+        )
+        && messages_to_update[2].role == MessageRole::User
+        && matches!(
+            messages_to_update[2].content,
+            MessageContent::UserBlocks(ref blocks)
+                if blocks.iter().any(|block| matches!(block, UserContentBlock::ToolResult(_)))
+        )
+    {
+        3
+    } else {
+        2.min(messages_to_update.len())
+    };
+
+    if let Some(summary) = compacted_summary {
+        messages_to_update.insert(
+            summary_insert_index,
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text(summary.summary_text.clone()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        );
+    }
 
     if start_from_index > 2
         && messages_to_update.len() > 2
@@ -709,6 +734,81 @@ mod tests {
         } else {
             panic!("Expected UserBlocks");
         }
+    }
+
+    #[test]
+    fn test_get_truncated_messages_keeps_summary_out_of_tool_pair() {
+        let messages = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("Initial task".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    AssistantContentBlock::Text(crate::providers::TextContentBlock {
+                        text: "Using a tool".to_string(),
+                        shared: crate::providers::SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    }),
+                    AssistantContentBlock::ToolUse(crate::providers::ToolUseBlock {
+                        id: "tool_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "/tmp/test"}),
+                        shared: crate::providers::SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![
+                    UserContentBlock::ToolResult(crate::providers::ToolResultBlock {
+                        tool_use_id: "tool_1".to_string(),
+                        content: crate::providers::ToolResultContent::Text(
+                            "file content here".to_string(),
+                        ),
+                        shared: crate::providers::SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("Response 2".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+        let summary = CompactedSummary::new("Test summary".to_string(), 2);
+
+        let truncated = get_truncated_messages(&messages, None, Some(&summary));
+        assert_eq!(truncated.len(), 5);
+        assert!(matches!(truncated[1].content, MessageContent::AssistantBlocks(_)));
+        assert!(matches!(truncated[2].content, MessageContent::UserBlocks(_)));
+        assert!(matches!(truncated[3].content, MessageContent::Text(ref text) if text == "Test summary"));
     }
 
     #[test]
