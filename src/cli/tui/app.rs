@@ -19,6 +19,13 @@ use tui_textarea::TextArea;
 use crate::cli::colors::spinner_frame;
 use crate::cli::output::{OutputEvent, OutputWriterArc};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollMode {
+    Auto,
+    Manual,
+    ApprovalPinned,
+}
+
 /// Tracks a pasted chunk of text that was folded into a marker.
 #[derive(Debug, Clone)]
 pub struct PasteChunk {
@@ -40,10 +47,10 @@ pub struct App {
     pub input: TextArea<'static>,
     /// Whether the agent is currently busy
     pub agent_busy: bool,
-    /// Manual scroll offset (when auto_scroll is false)
+    /// Manual scroll offset (top-of-viewport line index)
     pub scroll_offset: u16,
-    /// Whether to auto-scroll to bottom on new output
-    pub auto_scroll: bool,
+    /// Current output scroll behavior
+    pub scroll_mode: ScrollMode,
     /// Session start time (for elapsed time display)
     pub start_time: Option<Instant>,
     /// Spinner animation frame index
@@ -113,7 +120,7 @@ impl App {
             input: Self::new_textarea(Vec::new()),
             agent_busy: false,
             scroll_offset: 0,
-            auto_scroll: true,
+            scroll_mode: ScrollMode::Auto,
             start_time: None,
             spinner_index: 0,
             cwd: String::new(),
@@ -171,6 +178,96 @@ impl App {
             let content = format!("{}{}", prefix, line);
             writer.emit(OutputEvent::styled(content, style));
         }
+    }
+
+    pub fn force_bottom(&mut self) {
+        self.scroll_mode = ScrollMode::Auto;
+        self.scroll_offset = 0;
+    }
+
+    pub fn pin_approval_bottom(&mut self) {
+        self.scroll_mode = ScrollMode::ApprovalPinned;
+        self.scroll_offset = 0;
+    }
+
+    pub fn clear_approval_pin(&mut self) {
+        self.force_bottom();
+    }
+
+    pub fn is_approval_pinned(&self) -> bool {
+        matches!(self.scroll_mode, ScrollMode::ApprovalPinned)
+    }
+
+    pub fn is_auto_following_output(&self) -> bool {
+        matches!(
+            self.scroll_mode,
+            ScrollMode::Auto | ScrollMode::ApprovalPinned
+        )
+    }
+
+    pub fn set_content_height(&mut self, content_height: usize) {
+        self.last_content_height = content_height;
+    }
+
+    pub fn clamp_to_content(&mut self) {
+        let total_lines = self.output_lines.len();
+        let max_offset = Self::max_scroll_offset_for(total_lines, self.last_content_height);
+
+        match self.scroll_mode {
+            ScrollMode::Auto | ScrollMode::ApprovalPinned => {
+                self.scroll_offset = 0;
+            }
+            ScrollMode::Manual => {
+                self.scroll_offset = self.scroll_offset.min(max_offset);
+                let distance_from_bottom = max_offset.saturating_sub(self.scroll_offset);
+                if distance_from_bottom <= 2 {
+                    self.force_bottom();
+                }
+            }
+        }
+    }
+
+    pub fn scroll_lines(&mut self, delta: isize) {
+        let total_lines = self.output_lines.len();
+        if !self.enter_manual_mode(total_lines) {
+            return;
+        }
+
+        let max_offset =
+            Self::max_scroll_offset_for(total_lines, self.last_content_height) as isize;
+        let next = (self.scroll_offset as isize + delta).clamp(0, max_offset);
+        self.scroll_offset = next as u16;
+        self.clamp_to_content();
+    }
+
+    pub fn scroll_pages(&mut self, delta_pages: isize) {
+        let page_height = self.last_content_height.saturating_sub(1).max(1);
+        self.scroll_lines(delta_pages * page_height as isize);
+    }
+
+    pub fn resolved_scroll_y_for(&self, total_lines: usize, content_height: usize) -> u16 {
+        let max_offset = Self::max_scroll_offset_for(total_lines, content_height);
+        match self.scroll_mode {
+            ScrollMode::Auto | ScrollMode::ApprovalPinned => max_offset,
+            ScrollMode::Manual => self.scroll_offset.min(max_offset),
+        }
+    }
+
+    fn enter_manual_mode(&mut self, total_lines: usize) -> bool {
+        match self.scroll_mode {
+            ScrollMode::ApprovalPinned => false,
+            ScrollMode::Manual => true,
+            ScrollMode::Auto => {
+                self.scroll_mode = ScrollMode::Manual;
+                self.scroll_offset =
+                    Self::max_scroll_offset_for(total_lines, self.last_content_height);
+                true
+            }
+        }
+    }
+
+    fn max_scroll_offset_for(total_lines: usize, content_height: usize) -> u16 {
+        total_lines.saturating_sub(content_height) as u16
     }
 
     /// Render the application state to the frame.
@@ -264,20 +361,7 @@ impl App {
         let content_height = visible_height.saturating_sub(2);
         self.last_content_height = content_height;
         let total_lines = self.output_lines.len();
-
-        let scroll_y = if self.auto_scroll {
-            total_lines.saturating_sub(content_height) as u16
-        } else {
-            // Re-enable auto-scroll if user is near bottom (within 2 lines)
-            let distance_from_bottom =
-                total_lines.saturating_sub(self.scroll_offset as usize + content_height);
-            if distance_from_bottom <= 2 {
-                self.auto_scroll = true;
-                total_lines.saturating_sub(content_height) as u16
-            } else {
-                self.scroll_offset
-            }
-        };
+        let scroll_y = self.resolved_scroll_y_for(total_lines, content_height);
 
         // Virtual scrolling: only render visible lines + small buffer (2x visible height)
         // This avoids cloning 10,000 lines every frame and reduces Paragraph processing
@@ -477,6 +561,61 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    fn make_scrolling_app(total_lines: usize, content_height: usize) -> App {
+        let mut app = App::new();
+        app.set_content_height(content_height);
+        for index in 0..total_lines {
+            app.push_plain(format!("line {}", index));
+        }
+        app
+    }
+
+    #[test]
+    fn test_scroll_lines_switches_to_manual_mode() {
+        let mut app = make_scrolling_app(20, 5);
+
+        app.scroll_lines(-3);
+
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 12);
+        assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 12);
+    }
+
+    #[test]
+    fn test_clamp_to_content_reenables_auto_near_bottom() {
+        let mut app = make_scrolling_app(20, 5);
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 14;
+
+        app.clamp_to_content();
+
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 15);
+    }
+
+    #[test]
+    fn test_approval_pin_ignores_manual_scroll_attempts() {
+        let mut app = make_scrolling_app(20, 5);
+        app.pin_approval_bottom();
+
+        app.scroll_lines(-4);
+
+        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
+        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 15);
+    }
+
+    #[test]
+    fn test_clear_approval_pin_returns_to_auto_follow() {
+        let mut app = make_scrolling_app(20, 5);
+        app.pin_approval_bottom();
+
+        app.clear_approval_pin();
+
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert!(app.is_auto_following_output());
+    }
+
     #[test]
     fn test_render_output_hides_loading_overlay_during_approval_prompt() {
         struct ApprovalPromptCleanup;
@@ -494,7 +633,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
         app.agent_busy = true;
-        app.auto_scroll = true;
+        app.force_bottom();
         app.output_lines
             .push_back(ratatui::text::Line::from("line 1"));
         app.output_lines
