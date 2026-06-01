@@ -119,9 +119,7 @@ impl PlanState {
             },
         );
         self.renumber();
-        if self.steps.is_empty() || old_len == 0 {
-            self.current_step_index = 0;
-        } else if old_current_step_index >= old_len {
+        if old_current_step_index >= old_len {
             self.current_step_index = self.steps.len() - 1;
         } else if insert_pos <= old_current_step_index {
             self.current_step_index = old_current_step_index + 1;
@@ -144,7 +142,7 @@ impl PlanState {
         );
         self.renumber();
 
-        if old_len == 0 || old_current_step_index >= old_len {
+        if old_current_step_index >= old_len {
             self.current_step_index = 0;
         } else {
             self.current_step_index = old_current_step_index + 1;
@@ -158,7 +156,11 @@ impl PlanState {
         let old_len = self.steps.len();
         let old_current_step_index = self.current_step_index;
         if index >= self.steps.len() {
-            return Err(format!("Step index {} out of range (0-{})", index, self.steps.len().saturating_sub(1)));
+            return Err(format!(
+                "Step index {} out of range (0-{})",
+                index,
+                self.steps.len().saturating_sub(1)
+            ));
         }
         self.steps.remove(index);
         self.renumber();
@@ -194,10 +196,22 @@ impl PlanState {
     /// NOTE: Returns `usize` instead of `&PlanStep` to avoid reference-escaping-the-mutex issues
     /// when called through `Arc<Mutex<Session>>`. This is a deliberate Rust-native adaptation.
     pub fn advance(&mut self) -> Option<usize> {
-        // Bounds check: if current_step_index is out of range, treat as complete
-        if self.current_step_index >= self.steps.len() {
-            self.complete = self.is_complete();
-            return None;
+        let current_out_of_bounds = self.current_step_index >= self.steps.len();
+
+        // If current_step_index is out of range, clamp to the first pending step.
+        if current_out_of_bounds {
+            if let Some(next_idx) = self
+                .steps
+                .iter()
+                .position(|s| s.status == PlanStepStatus::Pending)
+            {
+                self.current_step_index = next_idx;
+            } else {
+                if self.is_complete() {
+                    self.complete = true;
+                }
+                return None;
+            }
         }
 
         if let Some(step) = self.steps.get_mut(self.current_step_index)
@@ -214,7 +228,10 @@ impl PlanState {
         }
 
         // Find next pending step
-        if let Some(next_idx) = self.steps.iter().position(|s| s.status == PlanStepStatus::Pending)
+        if let Some(next_idx) = self
+            .steps
+            .iter()
+            .position(|s| s.status == PlanStepStatus::Pending)
         {
             self.current_step_index = next_idx;
             self.steps[next_idx].status = PlanStepStatus::Running;
@@ -267,18 +284,17 @@ impl PlanState {
             }
         }
 
-        if steps.is_empty() {
-            None
-        } else {
-            Some(steps)
-        }
+        if steps.is_empty() { None } else { Some(steps) }
     }
 
     /// Format the plan state for model context injection.
     pub fn format_state(&self) -> String {
         let mut out = String::new();
 
-        let has_failed = self.steps.iter().any(|s| s.status == PlanStepStatus::Failed);
+        let has_failed = self
+            .steps
+            .iter()
+            .any(|s| s.status == PlanStepStatus::Failed);
         let mode_label = if self.complete {
             "COMPLETE"
         } else if has_failed {
@@ -354,7 +370,10 @@ impl PlanState {
     pub fn status_summary(&self) -> String {
         let total = self.steps.len();
         let current = self.current_step_index + 1;
-        let has_failed = self.steps.iter().any(|s| s.status == PlanStepStatus::Failed);
+        let has_failed = self
+            .steps
+            .iter()
+            .any(|s| s.status == PlanStepStatus::Failed);
         let complete = self.complete;
         let paused = self.paused;
         let approved = self.approved;
@@ -415,7 +434,10 @@ fn parse_numbered_line(line: &str) -> Option<String> {
 /// Bare bullets ("- description") are rejected per spec — only numbered formats are accepted.
 fn parse_bullet_line(line: &str) -> Option<String> {
     // Strip leading "- " or "* " bullet prefix if present
-    let stripped = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).unwrap_or(line);
+    let stripped = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .unwrap_or(line);
     // Handle "Step N: description" format
     parse_step_prefix_line(stripped)
 }
@@ -474,20 +496,15 @@ mod tests {
 
     #[test]
     fn test_update_step() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         plan.update_step(0, "Updated step one".to_string()).unwrap();
         assert_eq!(plan.steps[0].description, "Updated step one");
     }
 
     #[test]
     fn test_insert_step_after() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step three".to_string(),
-        ]);
+        let mut plan =
+            PlanState::create_plan(vec!["Step one".to_string(), "Step three".to_string()]);
         plan.insert_step_after(0, "Step two".to_string()).unwrap();
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].description, "Step one");
@@ -529,11 +546,11 @@ mod tests {
 
     #[test]
     fn test_insert_step_after_at_end() {
-        let mut plan = PlanState::create_plan(vec![
-            "First".to_string(),
-            "Second".to_string(),
-        ]);
-        assert!(plan.insert_step_after(usize::MAX, "Last".to_string()).is_ok());
+        let mut plan = PlanState::create_plan(vec!["First".to_string(), "Second".to_string()]);
+        assert!(
+            plan.insert_step_after(usize::MAX, "Last".to_string())
+                .is_ok()
+        );
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[2].description, "Last");
         assert_eq!(plan.steps[2].index, 2);
@@ -541,10 +558,7 @@ mod tests {
 
     #[test]
     fn test_mark_step() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
         assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
     }
@@ -568,10 +582,7 @@ mod tests {
 
     #[test]
     fn test_completion_detection() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         assert!(!plan.is_complete());
 
         plan.mark_step(0, PlanStepStatus::Done).unwrap();
@@ -606,10 +617,7 @@ mod tests {
 
     #[test]
     fn test_format_state() {
-        let plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         let state = plan.format_state();
         assert!(state.contains("approved: false"));
         assert!(state.contains("1. [pending] Step one"));
@@ -618,10 +626,7 @@ mod tests {
 
     #[test]
     fn test_status_summary() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         assert_eq!(plan.status_summary(), "Plan: awaiting approval");
 
         plan.approved = true;
@@ -694,10 +699,7 @@ mod tests {
 
     #[test]
     fn test_remove_current_last_step_clamps_index() {
-        let mut plan = PlanState::create_plan(vec![
-            "First".to_string(),
-            "Second".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["First".to_string(), "Second".to_string()]);
         plan.current_step_index = 1;
         plan.remove_step(1).unwrap();
         assert_eq!(plan.current_step_index, 0);
@@ -707,10 +709,7 @@ mod tests {
 
     #[test]
     fn test_remove_step_invalid_index() {
-        let mut plan = PlanState::create_plan(vec![
-            "First".to_string(),
-            "Second".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["First".to_string(), "Second".to_string()]);
         let err = plan.remove_step(5).unwrap_err();
         assert!(err.contains("out of range"));
     }
@@ -756,10 +755,7 @@ mod tests {
 
     #[test]
     fn test_format_state_with_running_step() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step 1".to_string(),
-            "Step 2".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
         plan.approved = true;
         plan.paused = false;
@@ -773,10 +769,7 @@ mod tests {
 
     #[test]
     fn test_format_display() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step 1".to_string(),
-            "Step 2".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
         plan.mark_step(0, PlanStepStatus::Done).unwrap();
         plan.mark_step(1, PlanStepStatus::Running).unwrap();
         let display = plan.format_display();
@@ -833,10 +826,7 @@ mod tests {
 
     #[test]
     fn test_renumber_after_insert() {
-        let mut plan = PlanState::create_plan(vec![
-            "A".to_string(),
-            "C".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["A".to_string(), "C".to_string()]);
         plan.insert_step_after(0, "B".to_string()).unwrap();
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].index, 0);
@@ -846,10 +836,7 @@ mod tests {
 
     #[test]
     fn test_plan_state_pause_resume_cycle() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step 1".to_string(),
-            "Step 2".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
         plan.approved = true;
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
 
@@ -863,10 +850,7 @@ mod tests {
 
     #[test]
     fn test_abort_clears_plan() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step 1".to_string(),
-            "Step 2".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
         plan.approved = true;
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
         plan.current_step_index = plan.steps.len();
@@ -877,10 +861,7 @@ mod tests {
 
     #[test]
     fn test_format_state_approval_mode() {
-        let plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         let state = plan.format_state();
         assert!(state.contains("mode: APPROVAL"));
         assert!(state.contains("approved: false"));
@@ -888,10 +869,7 @@ mod tests {
 
     #[test]
     fn test_format_state_failed_mode() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         plan.approved = true;
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
         plan.mark_step(0, PlanStepStatus::Failed).unwrap();
@@ -901,10 +879,7 @@ mod tests {
 
     #[test]
     fn test_format_state_paused_mode() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         plan.approved = true;
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
         plan.paused = true;
@@ -914,10 +889,7 @@ mod tests {
 
     #[test]
     fn test_format_state_act_mode() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         plan.approved = true;
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
         let state = plan.format_state();
@@ -926,10 +898,7 @@ mod tests {
 
     #[test]
     fn test_format_state_complete_mode() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step one".to_string(),
-            "Step two".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         plan.complete = true;
         let state = plan.format_state();
         assert!(state.contains("mode: COMPLETE"));
@@ -943,10 +912,7 @@ mod tests {
 
     #[test]
     fn test_current_step_returns_running_step() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step 1".to_string(),
-            "Step 2".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
         let step = plan.current_step().unwrap();
         assert_eq!(step.index, 0);
@@ -987,7 +953,9 @@ mod tests {
         {
             plan.current_step_index
         } else {
-            plan.steps.iter().position(|s| s.status == PlanStepStatus::Pending)
+            plan.steps
+                .iter()
+                .position(|s| s.status == PlanStepStatus::Pending)
                 .unwrap_or(0)
         };
         plan.current_step_index = start_index;
@@ -1000,17 +968,16 @@ mod tests {
 
     #[test]
     fn test_approve_finds_first_pending_when_index_out_of_bounds() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step 1".to_string(),
-            "Step 2".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
         plan.current_step_index = 5; // out of bounds
         let start_index = if plan.current_step_index < plan.steps.len()
             && plan.steps[plan.current_step_index].status == PlanStepStatus::Pending
         {
             plan.current_step_index
         } else {
-            plan.steps.iter().position(|s| s.status == PlanStepStatus::Pending)
+            plan.steps
+                .iter()
+                .position(|s| s.status == PlanStepStatus::Pending)
                 .unwrap_or(0)
         };
         assert_eq!(start_index, 0);
@@ -1018,10 +985,7 @@ mod tests {
 
     #[test]
     fn test_pause_resume_failure_cycle() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step 1".to_string(),
-            "Step 2".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
         plan.approved = true;
         plan.mark_step(0, PlanStepStatus::Running).unwrap();
 
@@ -1065,19 +1029,36 @@ mod tests {
     #[test]
     fn test_advance_handles_out_of_bounds_index() {
         let mut plan = PlanState::create_plan(vec!["Step 1".to_string()]);
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
         plan.current_step_index = 99; // Out of bounds
         assert!(plan.advance().is_none());
+        assert!(plan.complete);
+    }
+
+    #[test]
+    fn test_advance_clamps_out_of_bounds_to_first_pending_step() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+            "Step 3".to_string(),
+        ]);
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.current_step_index = 99; // Out of bounds with pending steps remaining
+
+        let next_idx = plan.advance();
+
+        assert_eq!(next_idx, Some(1));
+        assert_eq!(plan.current_step_index, 1);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
         assert!(!plan.complete);
     }
 
     #[test]
     fn test_insert_step_at_beginning() {
-        let mut plan = PlanState::create_plan(vec![
-            "Step 1".to_string(),
-            "Step 2".to_string(),
-        ]);
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
         plan.current_step_index = 1;
-        plan.insert_step_at_beginning("Inserted first".to_string()).unwrap();
+        plan.insert_step_at_beginning("Inserted first".to_string())
+            .unwrap();
 
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].description, "Inserted first");
