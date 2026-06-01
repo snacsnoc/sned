@@ -1033,6 +1033,25 @@ pub fn clear_approval_prompt_scroll() {
     APPROVAL_PROMPT_SCROLL.store(false, Ordering::SeqCst);
 }
 
+/// Flag indicating if a followup prompt was just emitted and needs a forced scroll.
+/// This covers tool-driven prompts like ask_followup_question and slash-command confirmations.
+static FOLLOWUP_PROMPT_SCROLL: AtomicBool = AtomicBool::new(false);
+
+/// Mark that the followup prompt was just emitted and needs a forced scroll.
+pub fn set_followup_prompt_scroll() {
+    FOLLOWUP_PROMPT_SCROLL.store(true, Ordering::SeqCst);
+}
+
+/// Check if the followup prompt needs a forced scroll, and clear the flag.
+pub fn take_followup_prompt_scroll() -> bool {
+    FOLLOWUP_PROMPT_SCROLL.swap(false, Ordering::SeqCst)
+}
+
+/// Clear the followup prompt scroll flag without consuming it.
+pub fn clear_followup_prompt_scroll() {
+    FOLLOWUP_PROMPT_SCROLL.store(false, Ordering::SeqCst);
+}
+
 /// No-op retained for Ctrl+C handler compatibility; the approval channel was removed.
 pub fn clear_approval_sender() {}
 
@@ -1050,6 +1069,7 @@ pub fn set_followup_question_active(task_id: &str, active: bool) {
     let mut guard = FOLLOWUP_ACTIVE.lock();
     if active {
         guard.insert(task_id.to_string());
+        set_followup_prompt_scroll();
     } else {
         guard.remove(task_id);
     }
@@ -1059,6 +1079,12 @@ pub fn set_followup_question_active(task_id: &str, active: bool) {
 pub fn is_followup_question_active(task_id: &str) -> bool {
     let guard = FOLLOWUP_ACTIVE.lock();
     guard.contains(task_id)
+}
+
+/// Check if any followup question is currently active.
+pub fn is_any_followup_question_active() -> bool {
+    let guard = FOLLOWUP_ACTIVE.lock();
+    !guard.is_empty()
 }
 
 /// Channel for followup question responses (full line, not single char).

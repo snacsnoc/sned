@@ -15,6 +15,7 @@ use ratatui::{
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthStr;
 
 use crate::cli::colors::spinner_frame;
 use crate::cli::output::{OutputEvent, OutputWriterArc};
@@ -83,6 +84,8 @@ pub struct App {
     pub scrollbar_state: ScrollbarState,
     /// Last known content height from render (used by key handlers)
     pub last_content_height: usize,
+    /// Last known output pane width from render/sync (used for wrapped scroll math)
+    pub last_content_width: usize,
     /// Pending clear confirmation (stores the trigger: "slash" or "ctrl_l")
     pub pending_clear: Option<String>,
     /// Saved draft input before history navigation
@@ -137,6 +140,7 @@ impl App {
             elapsed: None,
             scrollbar_state: ScrollbarState::new(0),
             last_content_height: 0,
+            last_content_width: 0,
             pending_clear: None,
             history_draft: None,
             plan_state_cache: None,
@@ -209,9 +213,13 @@ impl App {
         self.last_content_height = content_height;
     }
 
+    pub fn set_content_width(&mut self, content_width: usize) {
+        self.last_content_width = content_width;
+    }
+
     pub fn clamp_to_content(&mut self) {
-        let total_lines = self.output_lines.len();
-        let max_offset = Self::max_scroll_offset_for(total_lines, self.last_content_height);
+        let total_rows = self.total_visual_rows(self.last_wrap_width());
+        let max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height);
 
         match self.scroll_mode {
             ScrollMode::Auto | ScrollMode::ApprovalPinned => {
@@ -228,13 +236,13 @@ impl App {
     }
 
     pub fn scroll_lines(&mut self, delta: isize) {
-        let total_lines = self.output_lines.len();
-        if !self.enter_manual_mode(total_lines) {
+        let total_rows = self.total_visual_rows(self.last_wrap_width());
+        if !self.enter_manual_mode(total_rows) {
             return;
         }
 
         let max_offset =
-            Self::max_scroll_offset_for(total_lines, self.last_content_height) as isize;
+            Self::max_scroll_offset_for(total_rows, self.last_content_height) as isize;
         let next = (self.scroll_offset as isize + delta).clamp(0, max_offset);
         self.scroll_offset = next as u16;
         self.clamp_to_content();
@@ -253,14 +261,14 @@ impl App {
         }
     }
 
-    fn enter_manual_mode(&mut self, total_lines: usize) -> bool {
+    fn enter_manual_mode(&mut self, total_rows: usize) -> bool {
         match self.scroll_mode {
             ScrollMode::ApprovalPinned => false,
             ScrollMode::Manual => true,
             ScrollMode::Auto => {
                 self.scroll_mode = ScrollMode::Manual;
                 self.scroll_offset =
-                    Self::max_scroll_offset_for(total_lines, self.last_content_height);
+                    Self::max_scroll_offset_for(total_rows, self.last_content_height);
                 true
             }
         }
@@ -268,6 +276,43 @@ impl App {
 
     fn max_scroll_offset_for(total_lines: usize, content_height: usize) -> u16 {
         total_lines.saturating_sub(content_height) as u16
+    }
+
+    fn last_wrap_width(&self) -> usize {
+        if self.last_content_width == 0 {
+            80
+        } else {
+            Self::content_wrap_width(self.last_content_width)
+        }
+    }
+
+    fn content_wrap_width(content_width: usize) -> usize {
+        content_width.saturating_sub(3).max(1)
+    }
+
+    fn line_visual_rows(line: &Line<'_>, wrap_width: usize) -> usize {
+        if wrap_width == 0 {
+            return 1;
+        }
+
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        // Bottom pinning must be computed in rendered rows, not logical lines.
+        // A single long prompt line can wrap into multiple terminal rows; if we
+        // count only logical lines, the actionable tail of the prompt can land
+        // below the visible viewport even while the TUI thinks it is at bottom.
+        let width = UnicodeWidthStr::width(text.as_str());
+        width.max(1).div_ceil(wrap_width)
+    }
+
+    fn total_visual_rows(&self, wrap_width: usize) -> usize {
+        self.output_lines
+            .iter()
+            .map(|line| Self::line_visual_rows(line, wrap_width))
+            .sum()
     }
 
     /// Render the application state to the frame.
@@ -365,32 +410,17 @@ impl App {
         let visible_height = output_area.height as usize;
         // Content height excludes border (1 line top + 1 line bottom)
         let content_height = visible_height.saturating_sub(2);
+        self.last_content_width = output_area.width as usize;
         self.last_content_height = content_height;
-        let total_lines = self.output_lines.len();
-        let scroll_y = self.resolved_scroll_y_for(total_lines, content_height);
-
-        // Virtual scrolling: only render visible lines + small buffer (2x visible height)
-        // This avoids cloning 10,000 lines every frame and reduces Paragraph processing
-        let buffer_multiplier = 2;
-        let buffer_size = content_height * buffer_multiplier;
-        let start = scroll_y as usize;
-        let end = (start + buffer_size).min(total_lines);
+        let wrap_width = Self::content_wrap_width(output_area.width as usize);
+        let total_rows = self.total_visual_rows(wrap_width);
+        let scroll_y = self.resolved_scroll_y_for(total_rows, content_height);
 
         // Output pane with visible lines only (virtual scrolling)
         {
-            let visible_lines: Vec<Line> = if start < end {
-                self.output_lines
-                    .iter()
-                    .skip(start)
-                    .take(end - start)
-                    .cloned()
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let output = Paragraph::new(visible_lines)
+            let output = Paragraph::new(self.output_lines.iter().cloned().collect::<Vec<_>>())
                 .wrap(Wrap { trim: false })
-                .scroll((0, 0)) // No scroll - we already sliced to visible window
+                .scroll((scroll_y, 0))
                 .block(
                     theme::border_block(" sned ")
                         .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
@@ -418,7 +448,7 @@ impl App {
         // Scrollbar on output pane (render inside the border)
         self.scrollbar_state = self
             .scrollbar_state
-            .content_length(total_lines)
+            .content_length(total_rows)
             .viewport_content_length(content_height.max(1))
             .position(scroll_y as usize);
         frame.render_stateful_widget(
@@ -570,6 +600,7 @@ mod tests {
     fn make_scrolling_app(total_lines: usize, content_height: usize) -> App {
         let mut app = App::new();
         app.set_content_height(content_height);
+        app.set_content_width(80);
         for index in 0..total_lines {
             app.push_plain(format!("line {}", index));
         }
@@ -663,6 +694,41 @@ mod tests {
 
         assert!(rendered.contains("Approve these edits?"));
         assert!(!rendered.contains("Agent processing..."));
+    }
+
+    #[test]
+    fn test_render_output_keeps_wrapped_prompt_tail_visible_when_pinned() {
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.pin_approval_bottom();
+        app.output_lines.push_back(ratatui::text::Line::from(
+            "A long wrapped tool explanation line that takes multiple visual rows in the output pane.",
+        ));
+        app.output_lines.push_back(ratatui::text::Line::from(
+            "Another wrapped line that would previously push the confirmation row below the viewport.",
+        ));
+        app.output_lines.push_back(ratatui::text::Line::from(
+            "[Sned Question] What kind of colour improvement would you like?",
+        ));
+        app.output_lines
+            .push_back(ratatui::text::Line::from("Your answer:"));
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Your answer:"));
+        assert!(rendered.contains("What kind of colour improvement"));
     }
 
     #[test]

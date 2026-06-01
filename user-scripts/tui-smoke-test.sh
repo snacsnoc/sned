@@ -158,6 +158,7 @@ test_tui_startup_exit() {
     SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -253,6 +254,7 @@ test_tui_user_echo() {
     SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -357,6 +359,7 @@ test_tui_turn_indicators() {
     SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -466,6 +469,7 @@ test_tui_approval_scroll() {
     SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -500,12 +504,19 @@ if pid == 0:
 
 buf = b""
 sent_user_prompt = False
-sent_prompt = False
 sent_scroll = False
 sent_approve = False
 sent_exit = False
+prompt_visible = False
 exit_code = None
 deadline = time.time() + 18
+
+ansi_re = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+def visible_tail(text: str, rows: int = 24) -> str:
+    clean = ansi_re.sub("", text).replace("\r", "\n")
+    lines = [line for line in clean.split("\n") if line.strip()]
+    return "\n".join(lines[-rows:])
 
 try:
     while time.time() < deadline:
@@ -527,6 +538,9 @@ try:
             if "approval scroll line 15" in text and not sent_scroll:
                 os.write(fd, b"\x1b[5~\x1b[5~\x1b[5~")
                 sent_scroll = True
+            tail = visible_tail(text)
+            if "Execute this tool?" in tail:
+                prompt_visible = True
             if "Execute this tool?" in text and not sent_approve:
                 os.write(fd, b"y\r")
                 sent_approve = True
@@ -534,8 +548,6 @@ try:
                 time.sleep(0.25)
                 os.write(fd, b"/exit\r")
                 sent_exit = True
-            if "approval scroll line 01" in text:
-                sent_prompt = True
 
         ended, status = os.waitpid(pid, os.WNOHANG)
         if ended:
@@ -562,6 +574,8 @@ try:
         print("TUI_TEST_FAIL PageUp was not sent")
     elif "Execute this tool?" not in text:
         print("TUI_TEST_FAIL approval prompt did not appear after scrolling")
+    elif not prompt_visible:
+        print("TUI_TEST_FAIL approval prompt appeared in transcript but not in the visible viewport")
     elif not sent_approve:
         print("TUI_TEST_FAIL approval prompt was not acknowledged")
     elif "Task Completed" not in text:

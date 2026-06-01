@@ -382,9 +382,15 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             }
         }
     }
-    if crate::core::approval::take_approval_prompt_scroll() {
+    if crate::core::approval::take_approval_prompt_scroll()
+        || crate::core::approval::take_followup_prompt_scroll()
+    {
         app.pin_approval_bottom();
     } else if crate::core::approval::is_approval_prompt_active() {
+        app.pin_approval_bottom();
+    } else if crate::core::approval::is_any_followup_question_active() {
+        // Any interactive prompt that blocks progress must keep its input line
+        // visible until the user responds, regardless of prior manual scroll.
         app.pin_approval_bottom();
     } else if app.is_approval_pinned() {
         app.clear_approval_pin();
@@ -392,8 +398,10 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
 }
 
 fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
-    let terminal_height = terminal.size()?.height;
+    let terminal_size = terminal.size()?;
+    let terminal_height = terminal_size.height;
     let content_height = terminal_height.saturating_sub(6) as usize;
+    app.set_content_width(terminal_size.width as usize);
     app.set_content_height(content_height);
     app.clamp_to_content();
     Ok(())
@@ -2164,6 +2172,16 @@ pub fn render_interactive_prompt_prefix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex as StdMutex};
+
+    static PROMPT_STATE_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    fn reset_prompt_state() {
+        crate::core::approval::clear_approval_prompt_scroll();
+        crate::core::approval::set_approval_prompt_active(false);
+        crate::core::approval::clear_followup_prompt_scroll();
+        crate::core::approval::set_followup_question_active("test-task", false);
+    }
 
     #[test]
     fn test_format_duration_seconds() {
@@ -2203,6 +2221,9 @@ mod tests {
         use crate::cli::output::OutputEvent;
         use crate::cli::tui::app::ScrollMode;
 
+        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        reset_prompt_state();
+
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(OutputEvent::plain("line 1")).unwrap();
 
@@ -2215,11 +2236,16 @@ mod tests {
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
         assert_eq!(app.scroll_offset, 7);
         assert_eq!(app.output_lines.len(), 1);
+
+        reset_prompt_state();
     }
 
     #[test]
     fn test_drain_output_forces_scroll_for_approval_prompt() {
         use crate::cli::tui::app::ScrollMode;
+
+        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
 
@@ -2235,11 +2261,16 @@ mod tests {
 
         assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
         assert_eq!(app.scroll_offset, 0);
+
+        reset_prompt_state();
     }
 
     #[test]
     fn test_drain_output_forces_scroll_while_approval_prompt_is_active() {
         use crate::cli::tui::app::ScrollMode;
+
+        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
 
@@ -2257,11 +2288,67 @@ mod tests {
 
         assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
         assert_eq!(app.scroll_offset, 0);
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_forces_scroll_for_followup_prompt() {
+        use crate::cli::tui::app::ScrollMode;
+
+        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        reset_prompt_state();
+
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        crate::core::approval::clear_followup_prompt_scroll();
+        crate::core::approval::set_followup_prompt_scroll();
+
+        let mut app = App::new();
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 7;
+
+        drain_output(&mut rx, &mut app);
+
+        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
+        assert_eq!(app.scroll_offset, 0);
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_forces_scroll_while_followup_prompt_is_active() {
+        use crate::cli::tui::app::ScrollMode;
+
+        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        reset_prompt_state();
+
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        crate::core::approval::clear_followup_prompt_scroll();
+        crate::core::approval::set_followup_question_active("test-task", true);
+
+        let mut app = App::new();
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 7;
+
+        drain_output(&mut rx, &mut app);
+
+        crate::core::approval::set_followup_question_active("test-task", false);
+        crate::core::approval::clear_followup_prompt_scroll();
+
+        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
+        assert_eq!(app.scroll_offset, 0);
+
+        reset_prompt_state();
     }
 
     #[test]
     fn test_drain_output_clears_approval_pin_when_prompt_resolves() {
         use crate::cli::tui::app::ScrollMode;
+
+        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
         crate::core::approval::clear_approval_prompt_scroll();
@@ -2274,6 +2361,8 @@ mod tests {
 
         assert_eq!(app.scroll_mode, ScrollMode::Auto);
         assert_eq!(app.scroll_offset, 0);
+
+        reset_prompt_state();
     }
 
     #[test]
@@ -2312,6 +2401,9 @@ mod tests {
     -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        reset_prompt_state();
+
         let (tx, _rx) = mpsc::channel(4);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
         let state_handle = Arc::new(Mutex::new(None));
@@ -2339,12 +2431,17 @@ mod tests {
                 .contains("Approval pending. Type y, n, or a first.")
         }));
 
+        reset_prompt_state();
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_handle_key_event_allows_shutdown_submit_during_approval() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = PROMPT_STATE_LOCK.lock().unwrap();
+        reset_prompt_state();
 
         let (tx, _rx) = mpsc::channel(4);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
@@ -2365,6 +2462,8 @@ mod tests {
 
         assert!(matches!(action, Some(Action::Submit(text)) if text == "/quit"));
         assert!(app.input.lines().join("\n").is_empty());
+
+        reset_prompt_state();
 
         Ok(())
     }
