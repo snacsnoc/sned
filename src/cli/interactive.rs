@@ -371,7 +371,9 @@ fn is_shutdown_submit(text: &str) -> bool {
 
 /// Drain output channel into app buffer.
 fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
+    let mut saw_output = false;
     while let Ok(event) = rx.try_recv() {
+        saw_output = true;
         match event {
             OutputEvent::Line(line) => app.push_output(line),
             OutputEvent::RawAnsi(s) => {
@@ -394,6 +396,10 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
         app.pin_approval_bottom();
     } else if app.is_approval_pinned() {
         app.clear_approval_pin();
+    }
+
+    if saw_output {
+        app.clamp_to_content();
     }
 }
 
@@ -2246,6 +2252,34 @@ mod tests {
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
         assert_eq!(app.scroll_offset, 7);
         assert_eq!(app.output_lines.len(), 1);
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_reenables_auto_follow_near_bottom() {
+        use crate::cli::output::OutputEvent;
+        use crate::cli::tui::app::ScrollMode;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(OutputEvent::plain("new streamed line")).unwrap();
+
+        let mut app = App::new();
+        app.set_content_height(5);
+        app.set_content_width(80);
+        for index in 0..20 {
+            app.push_plain(format!("line {}", index));
+        }
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 14;
+
+        drain_output(&mut rx, &mut app);
+
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 16);
 
         reset_prompt_state();
     }
