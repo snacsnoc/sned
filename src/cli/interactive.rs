@@ -1939,7 +1939,7 @@ async fn run_main_loop(
                                         if let Some(qh) = queue_handle.lock().await.as_ref() {
                                             qh.enqueue_text_message(text.clone()).await;
                                             let count = qh.queued_message_count().await;
-                                            app.push_user_message(&text, &output_writer);
+                                            // Message already echoed by handle_key_event
                                             app.push_styled(
                                                 format!(
                                                     "Command queued ({} in queue): {}",
@@ -1961,8 +1961,7 @@ async fn run_main_loop(
                                     && let Some(qh) = queue_handle.lock().await.as_ref()
                                     && !processed.is_empty()
                                 {
-                                    // Echo queued message to output pane
-                                    app.push_user_message(&processed, &output_writer);
+                                    // Message already echoed by handle_key_event; just enqueue
                                     qh.enqueue_text_message(processed).await;
                                     let count = qh.queued_message_count().await;
                                     app.push_styled(
