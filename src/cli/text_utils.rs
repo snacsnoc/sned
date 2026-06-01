@@ -3,6 +3,7 @@
 //! Provides word-wrapping and text formatting that respects terminal width.
 
 use std::io::{self, IsTerminal};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Get the current terminal width, or a sensible default.
 pub fn get_terminal_width() -> usize {
@@ -145,57 +146,77 @@ fn wrap_line(line: &str, width: usize, indent: &str, output: &mut String) {
         return;
     }
 
-    // If the line fits, output it as-is
-    if trimmed.chars().count() <= available_width {
+    // If the line fits, output it as-is.
+    if UnicodeWidthStr::width(trimmed) <= available_width {
         output.push_str(indent);
         output.push_str(trimmed);
         output.push('\n');
         return;
     }
 
-    // Need to wrap: break at word boundaries
-    let mut remaining = trimmed;
+    // Need to wrap: scan once and emit each visual segment as soon as it
+    // overflows. This avoids rescanning the remainder of long lines on every
+    // wrap iteration.
+    let mut segment_start = 0;
+    let mut segment_width = 0usize;
+    let mut last_space: Option<(usize, usize)> = None;
 
-    while !remaining.is_empty() {
-        if remaining.chars().count() <= available_width {
-            // Rest fits on one line
-            output.push_str(indent);
-            output.push_str(remaining);
+    fn push_segment(output: &mut String, indent: &str, segment: &str) {
+        let segment = segment.trim_end();
+        if segment.is_empty() {
             output.push('\n');
-            break;
-        }
-
-        // Find the best break point (at a word boundary)
-        let break_point = find_word_break(remaining, available_width);
-
-        output.push_str(indent);
-        output.push_str(&remaining[..break_point]);
-        output.push('\n');
-
-        remaining = remaining[break_point..].trim_start();
-    }
-}
-
-/// Find the best position to break a line at a word boundary.
-/// Returns the byte index where the line should be broken.
-fn find_word_break(text: &str, max_width: usize) -> usize {
-    let mut last_space = None;
-
-    for (char_count, (i, c)) in text.char_indices().enumerate() {
-        if char_count >= max_width {
-            break;
-        }
-        if c == ' ' {
-            last_space = Some(i);
+        } else {
+            output.push_str(indent);
+            output.push_str(segment);
+            output.push('\n');
         }
     }
 
-    if let Some(space_pos) = last_space {
-        return space_pos + 1;
+    for (byte_idx, ch) in trimmed.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let next_byte = byte_idx + ch.len_utf8();
+        segment_width += ch_width;
+
+        if ch == ' ' {
+            last_space = Some((next_byte, segment_width));
+        }
+
+        if segment_width <= available_width {
+            continue;
+        }
+
+        if let Some((space_byte, space_width)) = last_space.take()
+            && space_byte > segment_start
+        {
+            push_segment(output, indent, &trimmed[segment_start..space_byte]);
+            segment_start = space_byte;
+            segment_width = segment_width.saturating_sub(space_width);
+            continue;
+        }
+
+        if byte_idx > segment_start {
+            push_segment(output, indent, &trimmed[segment_start..byte_idx]);
+            segment_start = byte_idx;
+            segment_width = ch_width;
+            last_space = if ch == ' ' {
+                Some((next_byte, ch_width))
+            } else {
+                None
+            };
+            continue;
+        }
+
+        // The first glyph itself is too wide for the available area. Emit it
+        // alone so we still make forward progress.
+        push_segment(output, indent, &trimmed[segment_start..next_byte]);
+        segment_start = next_byte;
+        segment_width = 0;
+        last_space = None;
     }
 
-    // No space found — hard break at char boundary
-    text.floor_char_boundary(max_width)
+    if segment_start < trimmed.len() {
+        push_segment(output, indent, &trimmed[segment_start..]);
+    }
 }
 
 #[cfg(test)]
@@ -255,16 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn test_find_word_break_cjk_boundary() {
-        let text = "日本語test";
-        let bp = find_word_break(text, 4);
-        assert!(
-            text.is_char_boundary(bp),
-            "break point {} is not a char boundary in {:?}",
-            bp,
-            text
-        );
-        let _prefix = &text[..bp];
-        let _suffix = &text[bp..];
+    fn test_wrap_cjk_line_stays_well_formed() {
+        let result = wrap_text("日本語test", 4, "");
+        let lines: Vec<&str> = result.lines().collect();
+        assert!(lines.len() >= 2);
+        assert!(lines.iter().all(|line| !line.is_empty()));
     }
 }
