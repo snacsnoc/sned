@@ -20,6 +20,20 @@ use unicode_width::UnicodeWidthStr;
 use crate::cli::colors::spinner_frame;
 use crate::cli::output::{OutputEvent, OutputWriterArc};
 
+/// Scroll behaviour state machine.
+///
+/// Valid transitions:
+///
+///   Auto ──scroll_lines()──→ Manual (offset = max)
+///   Manual ──clamp_to_content(distance=0)──→ Auto
+///   Auto ──pin_approval_bottom()──→ ApprovalPinned
+///   ApprovalPinned ──clear_approval_pin()──→ Auto
+///   ApprovalPinned ──scroll_lines()──→ no-op (returns false)
+///
+/// Invariants:
+///   - Manual at offset > 0 from bottom stays Manual
+///   - Manual at offset = 0 (bottom) snaps to Auto
+///   - ApprovalPinned overrides Manual; user scroll is rejected
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollMode {
     Auto,
@@ -327,7 +341,7 @@ impl App {
             ScrollMode::Manual => {
                 self.scroll_offset = self.scroll_offset.min(max_offset);
                 let distance_from_bottom = max_offset.saturating_sub(self.scroll_offset);
-                if distance_from_bottom <= 2 {
+                if distance_from_bottom == 0 {
                     self.force_bottom();
                 }
             }
@@ -739,15 +753,15 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_to_content_reenables_auto_near_bottom() {
+    fn test_clamp_to_content_stays_manual_near_bottom() {
         let mut app = make_scrolling_app(20, 5);
         app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 14;
 
         app.clamp_to_content();
 
-        assert_eq!(app.scroll_mode, ScrollMode::Auto);
-        assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 15);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 14);
     }
 
     #[test]
@@ -760,6 +774,36 @@ mod tests {
 
         assert_eq!(app.scroll_mode, ScrollMode::Auto);
         assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 15);
+    }
+
+    #[test]
+    fn scroll_mode_transition_table() {
+        let max_offset = 15u16; // make_scrolling_app(20, 5) → max_offset = 15
+        let cases: &[(ScrollMode, u16, ScrollMode, &str)] = &[
+            // Manual at exact bottom → Auto
+            (ScrollMode::Manual, max_offset, ScrollMode::Auto, "at bottom"),
+            // Manual 1 from bottom → stays Manual (regression guard for <= 2 → == 0 fix)
+            (ScrollMode::Manual, max_offset - 1, ScrollMode::Manual, "1 from bottom"),
+            // Manual at arbitrary mid-position → stays Manual
+            (ScrollMode::Manual, 5, ScrollMode::Manual, "mid-position"),
+            // Manual at top → stays Manual
+            (ScrollMode::Manual, 0, ScrollMode::Manual, "at top"),
+            // Auto always stays Auto
+            (ScrollMode::Auto, 0, ScrollMode::Auto, "auto"),
+            // ApprovalPinned always stays ApprovalPinned
+            (ScrollMode::ApprovalPinned, 0, ScrollMode::ApprovalPinned, "approval pinned"),
+        ];
+
+        for &(start_mode, offset, expected, label) in cases {
+            let mut app = make_scrolling_app(20, 5);
+            app.scroll_mode = start_mode;
+            app.scroll_offset = offset;
+            app.clamp_to_content();
+            assert_eq!(
+                app.scroll_mode, expected,
+                "clamp({start_mode:?}, offset={offset}) [{label}] should yield {expected:?}",
+            );
+        }
     }
 
     #[test]
