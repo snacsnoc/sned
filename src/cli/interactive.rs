@@ -382,16 +382,21 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             }
         }
     }
-    // Keep approval prompts visible even if the user had manually scrolled away.
-    if crate::core::approval::is_approval_prompt_active() {
-        app.auto_scroll = true;
-        app.scroll_offset = 0;
-    }
-    // Also force the initial prompt render once even if it arrives between frames.
     if crate::core::approval::take_approval_prompt_scroll() {
-        app.auto_scroll = true;
-        app.scroll_offset = 0;
+        app.pin_approval_bottom();
+    } else if crate::core::approval::is_approval_prompt_active() {
+        app.pin_approval_bottom();
+    } else if app.is_approval_pinned() {
+        app.clear_approval_pin();
     }
+}
+
+fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    let terminal_height = terminal.size()?.height;
+    let content_height = terminal_height.saturating_sub(6) as usize;
+    app.set_content_height(content_height);
+    app.clamp_to_content();
+    Ok(())
 }
 
 fn approval_result_for_key(key: &KeyEvent) -> Option<ApprovalResult> {
@@ -501,7 +506,8 @@ async fn cancel_agent(
 async fn handle_key_event(
     key: KeyEvent,
     app: &mut App,
-    session: &Arc<Mutex<InteractiveSession>>,
+    output_writer: &OutputWriterArc,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     task_id: &str,
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
@@ -536,12 +542,7 @@ async fn handle_key_event(
         if is_followup_question_active(task_id) {
             if let Some(sender) = take_followup_sender(task_id) {
                 let text = app.get_input_with_expanded_pastes();
-                // Echo followup response to output pane
-                {
-                    let sess = session.lock().await;
-                    let writer = sess.agent_loop().output_writer();
-                    app.push_user_message(&text, writer);
-                }
+                app.push_user_message(&text, output_writer);
                 let _ = sender.send(text);
                 app.input = App::new_textarea(Vec::new());
             }
@@ -559,6 +560,14 @@ async fn handle_key_event(
                 return Ok(Some(Action::Submit(text)));
             }
 
+            if is_approval_prompt_active() {
+                app.push_styled(
+                    "Approval pending. Type y, n, or a first.",
+                    Style::default().fg(theme::WARNING_FG),
+                );
+                return Ok(None);
+            }
+
             // Turn separator before user message (only if a previous turn completed)
             // Check if output already has a turn separator (from previous agent completion)
             if !app.output_lines.is_empty()
@@ -570,12 +579,7 @@ async fn handle_key_event(
             {
                 app.push_turn_separator();
             }
-            // Echo prompt to output pane
-            {
-                let sess = session.lock().await;
-                let writer = sess.agent_loop().output_writer();
-                app.push_user_message(&text, writer);
-            }
+            app.push_user_message(&text, output_writer);
             // Clear textarea and paste tracking
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
@@ -587,21 +591,11 @@ async fn handle_key_event(
 
     // PageUp/PageDown for scrolling
     if key.code == KeyCode::PageUp {
-        if app.auto_scroll {
-            let total = app.output_lines.len();
-            app.scroll_offset = total.saturating_sub(app.last_content_height) as u16;
-        }
-        app.auto_scroll = false;
-        app.scroll_offset = app.scroll_offset.saturating_sub(10);
+        app.scroll_pages(-1);
         return Ok(None);
     }
     if key.code == KeyCode::PageDown {
-        if app.auto_scroll {
-            let total = app.output_lines.len();
-            app.scroll_offset = total.saturating_sub(app.last_content_height) as u16;
-        }
-        app.auto_scroll = false;
-        app.scroll_offset = app.scroll_offset.saturating_add(10);
+        app.scroll_pages(1);
         return Ok(None);
     }
 
@@ -612,12 +606,9 @@ async fn handle_key_event(
             || key.code == KeyCode::Enter
         {
             app.output_lines.clear();
-            app.scroll_offset = 0;
-            app.auto_scroll = true;
+            app.force_bottom();
             let trigger = app.pending_clear.take().unwrap();
-            {
-                let sess = session.lock().await;
-                let sh = sess.agent_loop().state_handle();
+            if let Some(sh) = state_handle.lock().await.as_ref() {
                 let mut state = sh.lock().await;
                 state.last_injected_plan_state_hash = None;
             }
@@ -632,20 +623,11 @@ async fn handle_key_event(
     // Shift+Up/Down for manual scroll
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         if key.code == KeyCode::Up {
-            if app.auto_scroll {
-                let total = app.output_lines.len();
-                app.scroll_offset = total.saturating_sub(app.last_content_height) as u16;
-            }
-            app.auto_scroll = false;
-            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+            app.scroll_lines(-1);
             return Ok(None);
         }
         if key.code == KeyCode::Down {
-            if app.auto_scroll {
-                let total = app.output_lines.len();
-                app.scroll_offset = total.saturating_sub(app.last_content_height) as u16;
-            }
-            app.scroll_offset = app.scroll_offset.saturating_add(1);
+            app.scroll_lines(1);
             return Ok(None);
         }
     }
@@ -1661,6 +1643,7 @@ async fn run_main_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     output_rx: &mut mpsc::Receiver<OutputEvent>,
+    output_writer: OutputWriterArc,
     session: Arc<Mutex<InteractiveSession>>,
     task_id: String,
     agent_busy: Arc<AtomicBool>,
@@ -1704,6 +1687,8 @@ async fn run_main_loop(
             }
         }
 
+        sync_scroll_viewport(terminal, app)?;
+
         // 2. Render
         terminal.draw(|f| app.render(f))?;
 
@@ -1724,8 +1709,7 @@ async fn run_main_loop(
                                 if key.code == KeyCode::Char('c')
                                     && key.modifiers.contains(KeyModifiers::CONTROL)
                                 {
-                                    app.auto_scroll = true;
-                                    app.scroll_offset = 0;
+                                    app.force_bottom();
                                     cancel_agent(&state_handle, &agent_task, &agent_done).await?;
                                     app.push_plain("^C");
                                     app.agent_busy = false;
@@ -1744,8 +1728,8 @@ async fn run_main_loop(
                                     ),
                                     Style::default().fg(theme::ACCENT),
                                 );
-                                app.auto_scroll = true;
-                                app.scroll_offset = 0;
+                                app.clear_approval_pin();
+                                app.force_bottom();
                             }
                             continue;
                         }
@@ -1807,7 +1791,9 @@ async fn run_main_loop(
                         continue;
                     }
 
-                    if let Some(action) = handle_key_event(key, app, &session, &task_id).await? {
+                    if let Some(action) =
+                        handle_key_event(key, app, &output_writer, &state_handle, &task_id).await?
+                    {
                         match action {
                             Action::Submit(text) => {
                                 // Save to command history and reset navigation
@@ -1863,8 +1849,8 @@ async fn run_main_loop(
                                             .await?;
                                             app.agent_busy = true;
                                         }
-                                        app.auto_scroll = true;
-                                        app.scroll_offset = 0;
+                                        app.force_bottom();
+                                        sync_scroll_viewport(terminal, app)?;
                                         terminal.draw(|f| app.render(f))?;
                                         continue;
                                     }
@@ -1900,11 +1886,7 @@ async fn run_main_loop(
                                         if let Some(qh) = queue_handle.lock().await.as_ref() {
                                             qh.enqueue_text_message(text.clone()).await;
                                             let count = qh.queued_message_count().await;
-                                            {
-                                                let sess = session.lock().await;
-                                                let writer = sess.agent_loop().output_writer();
-                                                app.push_user_message(&text, writer);
-                                            }
+                                            app.push_user_message(&text, &output_writer);
                                             app.push_styled(
                                                 format!(
                                                     "Command queued ({} in queue): {}",
@@ -1927,11 +1909,7 @@ async fn run_main_loop(
                                     && !processed.is_empty()
                                 {
                                     // Echo queued message to output pane
-                                    {
-                                        let sess = session.lock().await;
-                                        let writer = sess.agent_loop().output_writer();
-                                        app.push_user_message(&processed, writer);
-                                    }
+                                    app.push_user_message(&processed, &output_writer);
                                     qh.enqueue_text_message(processed).await;
                                     let count = qh.queued_message_count().await;
                                     app.push_styled(
@@ -1951,8 +1929,8 @@ async fn run_main_loop(
                                     app.agent_busy = true;
                                 }
                                 // Render immediately to show user message before agent starts streaming
-                                app.auto_scroll = true;
-                                app.scroll_offset = 0;
+                                app.force_bottom();
+                                sync_scroll_viewport(terminal, app)?;
                                 terminal.draw(|f| app.render(f))?;
                             }
                         }
@@ -1976,11 +1954,10 @@ async fn run_main_loop(
                 }
                 Event::Mouse(mouse_event) => match mouse_event.kind {
                     ratatui::crossterm::event::MouseEventKind::ScrollDown => {
-                        app.scroll_offset = app.scroll_offset.saturating_add(3);
+                        app.scroll_lines(3);
                     }
                     ratatui::crossterm::event::MouseEventKind::ScrollUp => {
-                        app.auto_scroll = false;
-                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                        app.scroll_lines(-3);
                     }
                     _ => {}
                 },
@@ -2145,6 +2122,7 @@ pub async fn run_interactive_shell_inner(
         &mut terminal,
         &mut app,
         &mut output_rx,
+        output_writer,
         session,
         task_id,
         agent_busy,
@@ -2218,23 +2196,26 @@ mod tests {
     #[test]
     fn test_drain_output_preserves_manual_scroll_without_approval_prompt() {
         use crate::cli::output::OutputEvent;
+        use crate::cli::tui::app::ScrollMode;
 
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(OutputEvent::plain("line 1")).unwrap();
 
         let mut app = App::new();
-        app.auto_scroll = false;
+        app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 7;
 
         drain_output(&mut rx, &mut app);
 
-        assert!(!app.auto_scroll);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
         assert_eq!(app.scroll_offset, 7);
         assert_eq!(app.output_lines.len(), 1);
     }
 
     #[test]
     fn test_drain_output_forces_scroll_for_approval_prompt() {
+        use crate::cli::tui::app::ScrollMode;
+
         let (_tx, mut rx) = mpsc::channel(1);
 
         // Ensure clean state before test
@@ -2242,17 +2223,19 @@ mod tests {
         crate::core::approval::set_approval_prompt_scroll();
 
         let mut app = App::new();
-        app.auto_scroll = false;
+        app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 7;
 
         drain_output(&mut rx, &mut app);
 
-        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
         assert_eq!(app.scroll_offset, 0);
     }
 
     #[test]
     fn test_drain_output_forces_scroll_while_approval_prompt_is_active() {
+        use crate::cli::tui::app::ScrollMode;
+
         let (_tx, mut rx) = mpsc::channel(1);
 
         // Ensure clean state before test
@@ -2260,14 +2243,31 @@ mod tests {
         crate::core::approval::set_approval_prompt_active(true);
 
         let mut app = App::new();
-        app.auto_scroll = false;
+        app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 7;
 
         drain_output(&mut rx, &mut app);
 
         crate::core::approval::set_approval_prompt_active(false);
 
-        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_drain_output_clears_approval_pin_when_prompt_resolves() {
+        use crate::cli::tui::app::ScrollMode;
+
+        let (_tx, mut rx) = mpsc::channel(1);
+        crate::core::approval::clear_approval_prompt_scroll();
+        crate::core::approval::set_approval_prompt_active(false);
+
+        let mut app = App::new();
+        app.pin_approval_bottom();
+
+        drain_output(&mut rx, &mut app);
+
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
         assert_eq!(app.scroll_offset, 0);
     }
 
@@ -2300,6 +2300,68 @@ mod tests {
         assert!(is_shutdown_submit("/q"));
         assert!(!is_shutdown_submit("/clear"));
         assert!(!is_shutdown_submit("hello world"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_blocks_normal_submit_while_approval_is_active()
+    -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.input = App::new_textarea(vec!["hello".to_string()]);
+
+        crate::core::approval::set_approval_prompt_active(true);
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        crate::core::approval::set_approval_prompt_active(false);
+
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "hello");
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Approval pending. Type y, n, or a first.")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_allows_shutdown_submit_during_approval() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.input = App::new_textarea(vec!["/quit".to_string()]);
+
+        crate::core::approval::set_approval_prompt_active(true);
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        crate::core::approval::set_approval_prompt_active(false);
+
+        assert!(matches!(action, Some(Action::Submit(text)) if text == "/quit"));
+        assert!(app.input.lines().join("\n").is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
