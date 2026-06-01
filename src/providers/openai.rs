@@ -803,32 +803,34 @@ pub async fn finish_openai_sse_to_chunks(
 
     // Flush any remaining accumulated tool calls on stream end
     // (some providers don't send finish_reason == "tool_calls" explicitly)
-    let mut sorted_indices: Vec<_> = accumulated_tool_calls.keys().collect();
-    sorted_indices.sort();
+    if !matches!(last_stop_reason.as_deref(), Some("content_filter")) {
+        let mut sorted_indices: Vec<_> = accumulated_tool_calls.keys().collect();
+        sorted_indices.sort();
 
-    for idx in sorted_indices {
-        let (id, name, args) = &accumulated_tool_calls[idx];
-        if !completed_tool_call_indices.contains(idx) && !id.is_empty() && !name.is_empty() {
-            completed_tool_call_indices.insert(*idx);
-            let validated_args =
-                crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end");
-            try_send_chunk(
-                tx,
-                ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                    tool_call: ApiStreamToolCall {
-                        call_id: Some(id.clone()),
-                        function: ApiStreamToolCallFunction {
-                            id: Some(id.clone()),
-                            name: Some(name.clone()),
-                            arguments: Some(validated_args),
+        for idx in sorted_indices {
+            let (id, name, args) = &accumulated_tool_calls[idx];
+            if !completed_tool_call_indices.contains(idx) && !id.is_empty() && !name.is_empty() {
+                completed_tool_call_indices.insert(*idx);
+                let validated_args =
+                    crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end");
+                try_send_chunk(
+                    tx,
+                    ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                        tool_call: ApiStreamToolCall {
+                            call_id: Some(id.clone()),
+                            function: ApiStreamToolCallFunction {
+                                id: Some(id.clone()),
+                                name: Some(name.clone()),
+                                arguments: Some(validated_args),
+                            },
+                            signature: None,
                         },
+                        id: None,
                         signature: None,
-                    },
-                    id: None,
-                    signature: None,
-                }),
-                "tool_calls",
-            );
+                    }),
+                    "tool_calls",
+                );
+            }
         }
     }
 
@@ -1172,7 +1174,7 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{FunctionDefinition, MessageRole, StorageMessage, ToolDefinition};
+    use crate::providers::{FunctionDefinition, MessageRole, SseLineBuffer, StorageMessage, ToolDefinition};
 
     #[test]
     fn test_openai_config() {
@@ -1382,6 +1384,45 @@ mod tests {
         .await;
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_finish_openai_sse_to_chunks_skips_content_filter_tool_calls() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut buffer = SseLineBuffer::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::from([(
+            0usize,
+            (
+                "call_1".to_string(),
+                "read_file".to_string(),
+                "{\"path\":\"a.rs\"}".to_string(),
+            ),
+        )]);
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = Some("content_filter".to_string());
+        let model_info: Option<crate::providers::OpenAiCompatibleModelInfo> = None;
+        let mut usage_sent = false;
+
+        finish_openai_sse_to_chunks(
+            &mut buffer,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            &model_info,
+            &mut usage_sent,
+        )
+        .await;
+        drop(tx);
+
+        let mut saw_tool_calls = false;
+        while let Some(chunk) = rx.recv().await {
+            if matches!(chunk, ApiStreamChunk::ToolCalls(_)) {
+                saw_tool_calls = true;
+            }
+        }
+
+        assert!(!saw_tool_calls);
     }
 
     // ============== Bug 1 Tests: max_completion_tokens for reasoning models ==============

@@ -430,9 +430,21 @@ impl HookManager {
             .take()
             .ok_or_else(|| "Failed to open stdin for hook process".to_string())?;
         use std::io::Write;
-        stdin
-            .write_all(input_json.as_bytes())
-            .map_err(|e| format!("Failed to write hook input to stdin: {}", e))?;
+        if let Err(e) = stdin.write_all(input_json.as_bytes()) {
+            #[cfg(unix)]
+            {
+                let pid = child.id();
+                if pid > 0 {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(-(pid as i32)),
+                        nix::sys::signal::Signal::SIGTERM,
+                    );
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Failed to write hook input to stdin: {}", e));
+        }
         drop(stdin);
 
         // Track active execution AFTER stdin is written
@@ -1354,6 +1366,75 @@ mod tests {
 
         // Hook should have run (exit code 0 = success, -1 = not run)
         assert_ne!(result.exit_code, -1);
+    }
+
+    #[test]
+    fn test_hook_write_failure_cleans_up_child_process() {
+        let temp_dir = std::env::temp_dir().join("sned_test_hooks_write_failure");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let hook_path = temp_dir.join("TaskStart");
+        let pid_file = temp_dir.join("pid.txt");
+        fs::write(
+            &hook_path,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec 0<&-\nwhile :; do :; done\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&hook_path, perms).unwrap();
+        }
+
+        let mut manager = HookManager::new("test-user");
+        manager.set_runtime_hooks_dir(temp_dir.clone());
+
+        let input = HookInput {
+            task_id: "test-task".to_string(),
+            model: None,
+            data: HookData::TaskStart {
+                task_start: TaskStartData {
+                    task: "x".repeat(8 * 1024 * 1024),
+                },
+            },
+        };
+
+        let result = manager.execute_hook(HookName::TaskStart, &input, None);
+        assert!(
+            result.error.is_some(),
+            "hook should fail when stdin write breaks"
+        );
+
+        let pid_text = fs::read_to_string(&pid_file).unwrap();
+        let pid = pid_text.trim().parse::<i32>().unwrap();
+
+        let mut alive = false;
+        for _ in 0..20 {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("kill -0 {}", pid))
+                .status()
+                .unwrap();
+            if !status.success() {
+                alive = false;
+                break;
+            }
+            alive = true;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(
+            !alive,
+            "hook child should be terminated after stdin write failure"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

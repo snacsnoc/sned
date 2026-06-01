@@ -354,6 +354,23 @@ impl ExecuteCommandHandler {
                                 let _ = child.kill().await;
                             }
                             let _ = child.wait().await;
+                            #[cfg(unix)]
+                            if child_pid != 0
+                                && let Some(ref state) = task_state
+                            {
+                                let mut state = state.lock().await;
+                                if let Some(pos) = state
+                                    .running_command_pids
+                                    .iter()
+                                    .position(|&p| p == child_pid)
+                                {
+                                    state.running_command_pids.remove(pos);
+                                    tracing::debug!(
+                                        "Unregistered command PID {} after cancellation",
+                                        child_pid
+                                    );
+                                }
+                            }
                             return Err(anyhow::anyhow!("Command cancelled by user"));
                         }
                     }
@@ -425,6 +442,23 @@ impl ExecuteCommandHandler {
                                     let _ = child.kill().await;
                                 }
                                 let _ = child.wait().await;
+                                #[cfg(unix)]
+                                if child_pid != 0
+                                    && let Some(ref state) = task_state
+                                {
+                                    let mut state = state.lock().await;
+                                    if let Some(pos) = state
+                                        .running_command_pids
+                                        .iter()
+                                        .position(|&p| p == child_pid)
+                                    {
+                                        state.running_command_pids.remove(pos);
+                                        tracing::debug!(
+                                            "Unregistered command PID {} after timeout",
+                                            child_pid
+                                        );
+                                    }
+                                }
                                 let err = crate::cli::actionable_errors::command_timeout(&cmd_str, timeout_duration.as_secs());
                                 return Err(anyhow::anyhow!("{}\nStdout: {}\nStderr: {}", err.display(), stdout_collected, stderr_collected));
                             }
@@ -985,6 +1019,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let pid_file = temp_dir.path().join("pid.txt");
         let command = format!("echo $$ > {}; while :; do :; done", pid_file.display());
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
 
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
@@ -994,7 +1029,7 @@ mod tests {
                 None,
                 Some(Duration::from_millis(100)),
                 false,
-                None,
+                Some(state.clone()),
                 false,
                 &output_writer,
             )
@@ -1024,6 +1059,12 @@ mod tests {
         }
 
         assert!(!alive, "timed-out command should be terminated");
+
+        let state = state.lock().await;
+        assert!(
+            state.running_command_pids.is_empty(),
+            "timed-out command PID should be removed from cancellation tracking"
+        );
     }
 
     #[tokio::test]
