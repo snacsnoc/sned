@@ -2524,4 +2524,335 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_plan_pause_marks_running_plan_paused() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        use crate::core::plan_state::{PlanState, PlanStepStatus};
+
+        let task_opts = TaskOptions {
+            act: false,
+            plan: true,
+            yolo: false,
+            auto_approve_all: false,
+            timeout: None,
+            model: None,
+            provider: Some("mock".to_string()),
+            base_url: None,
+            api_key: None,
+            verbose: false,
+            cwd: None,
+            config: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_consecutive_mistakes: None,
+            json: false,
+            double_check_completion: false,
+            auto_condense: true,
+            no_token_display: false,
+            subagents: false,
+            is_subagent: false,
+            user_agent: None,
+            hooks_dir: None,
+            export: None,
+            image: vec![],
+            track_changes: false,
+            max_context_turns: None,
+            max_tokens: None,
+            debug: false,
+        };
+        let root_opts = RootOnlyOptions {
+            task_id: None,
+            continue_task: false,
+        };
+
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(task_opts.clone(), root_opts, None).await?,
+        ));
+        let state_handle = {
+            let sess = session.lock().await;
+            sess.agent_loop().state_handle()
+        };
+        {
+            let mut state = state_handle.lock().await;
+            let mut plan =
+                PlanState::create_plan(vec!["Initial step".to_string(), "Second step".to_string()]);
+            plan.approved = true;
+            plan.current_step_index = 0;
+            plan.steps[0].status = PlanStepStatus::Running;
+            state.strict_plan_mode_enabled = false;
+            state.plan_state = Some(plan);
+        }
+
+        let mut app = App::new();
+        app.mode = "ACT".to_string();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(None));
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::PlanPause,
+            "/plan pause",
+            &mut app,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Plan paused. Use /plan resume to continue.")
+        }));
+        assert_eq!(app.mode, "ACT");
+
+        let state = state_handle.lock().await;
+        let plan = state.plan_state.as_ref().expect("plan should remain");
+        assert!(plan.approved);
+        assert!(plan.paused);
+        assert_eq!(plan.current_step_index, 0);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_resume_unpauses_failed_step_and_starts_execution() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        use crate::core::plan_state::{PlanState, PlanStepStatus};
+
+        let task_opts = TaskOptions {
+            act: false,
+            plan: true,
+            yolo: false,
+            auto_approve_all: false,
+            timeout: None,
+            model: None,
+            provider: Some("mock".to_string()),
+            base_url: None,
+            api_key: None,
+            verbose: false,
+            cwd: None,
+            config: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_consecutive_mistakes: None,
+            json: false,
+            double_check_completion: false,
+            auto_condense: true,
+            no_token_display: false,
+            subagents: false,
+            is_subagent: false,
+            user_agent: None,
+            hooks_dir: None,
+            export: None,
+            image: vec![],
+            track_changes: false,
+            max_context_turns: None,
+            max_tokens: None,
+            debug: false,
+        };
+        let root_opts = RootOnlyOptions {
+            task_id: None,
+            continue_task: false,
+        };
+
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(task_opts.clone(), root_opts, None).await?,
+        ));
+        let state_handle = {
+            let sess = session.lock().await;
+            sess.agent_loop().state_handle()
+        };
+        {
+            let mut state = state_handle.lock().await;
+            let mut plan =
+                PlanState::create_plan(vec!["Initial step".to_string(), "Second step".to_string()]);
+            plan.approved = true;
+            plan.paused = true;
+            plan.current_step_index = 0;
+            plan.steps[0].status = PlanStepStatus::Failed;
+            state.strict_plan_mode_enabled = false;
+            state.plan_state = Some(plan);
+        }
+
+        let mut app = App::new();
+        app.mode = "ACT".to_string();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(None));
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::PlanResume,
+            "/plan resume",
+            &mut app,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        assert!(app.agent_busy);
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Plan resumed at step 1/2: Initial step")
+        }));
+        assert_eq!(app.mode, "ACT");
+
+        {
+            let state = state_handle.lock().await;
+            let plan = state.plan_state.as_ref().expect("plan should remain");
+            assert!(plan.approved);
+            assert!(!plan.paused);
+            assert_eq!(plan.current_step_index, 0);
+            assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+            assert_eq!(plan.steps[1].status, PlanStepStatus::Pending);
+        }
+
+        if let Some(task) = agent_task.lock().await.take() {
+            task.abort();
+        }
+        agent_busy.store(false, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_abort_clears_paused_plan() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        use crate::core::plan_state::{PlanState, PlanStepStatus};
+
+        let task_opts = TaskOptions {
+            act: false,
+            plan: true,
+            yolo: false,
+            auto_approve_all: false,
+            timeout: None,
+            model: None,
+            provider: Some("mock".to_string()),
+            base_url: None,
+            api_key: None,
+            verbose: false,
+            cwd: None,
+            config: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_consecutive_mistakes: None,
+            json: false,
+            double_check_completion: false,
+            auto_condense: true,
+            no_token_display: false,
+            subagents: false,
+            is_subagent: false,
+            user_agent: None,
+            hooks_dir: None,
+            export: None,
+            image: vec![],
+            track_changes: false,
+            max_context_turns: None,
+            max_tokens: None,
+            debug: false,
+        };
+        let root_opts = RootOnlyOptions {
+            task_id: None,
+            continue_task: false,
+        };
+
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(task_opts.clone(), root_opts, None).await?,
+        ));
+        let state_handle = {
+            let sess = session.lock().await;
+            sess.agent_loop().state_handle()
+        };
+        {
+            let mut state = state_handle.lock().await;
+            let mut plan =
+                PlanState::create_plan(vec!["Initial step".to_string(), "Second step".to_string()]);
+            plan.approved = true;
+            plan.paused = true;
+            plan.current_step_index = 0;
+            plan.steps[0].status = PlanStepStatus::Failed;
+            state.strict_plan_mode_enabled = false;
+            state.plan_state = Some(plan);
+            state.last_injected_plan_state_hash = Some(12345);
+        }
+
+        let mut app = App::new();
+        app.mode = "PLAN".to_string();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(None));
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::PlanAbort,
+            "/plan abort",
+            &mut app,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        assert_eq!(app.mode, "ACT");
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Plan aborted. Already-applied changes are kept.")
+        }));
+
+        let state = state_handle.lock().await;
+        assert!(state.plan_state.is_none());
+        assert!(state.strict_plan_mode_enabled);
+        assert_eq!(state.last_injected_plan_state_hash, None);
+
+        Ok(())
+    }
 }
