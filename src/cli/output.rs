@@ -205,45 +205,6 @@ pub fn timing_enabled() -> bool {
     )
 }
 
-/// Output writer that records the timestamp of the first emit call.
-///
-/// Wraps another `OutputWriter` and records `Instant::now()` on the first
-/// `emit()` call. The recorded timestamp is exposed via `first_emit()` for
-/// downstream timing (e.g., first-token latency).
-pub struct TimingOutputWriter {
-    inner: OutputWriterArc,
-    first_emit: std::sync::Mutex<Option<std::time::Instant>>,
-}
-
-impl TimingOutputWriter {
-    pub fn new(inner: OutputWriterArc) -> Self {
-        Self {
-            inner,
-            first_emit: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Returns the timestamp of the first emit call, if any has occurred.
-    pub fn first_emit(&self) -> Option<std::time::Instant> {
-        *self.first_emit.lock().unwrap()
-    }
-}
-
-impl OutputWriter for TimingOutputWriter {
-    fn emit(&self, event: OutputEvent) {
-        let mut guard = self.first_emit.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(std::time::Instant::now());
-        }
-        drop(guard);
-        self.inner.emit(event);
-    }
-
-    fn flush(&self) {
-        self.inner.flush();
-    }
-}
-
 /// Format phase timing diagnostics into printable lines.
 pub fn format_timing_phases(
     session_start: Instant,
