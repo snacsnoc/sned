@@ -547,6 +547,17 @@ impl AgentLoop {
         }
     }
 
+    async fn record_first_reasoning_chunk_time(&self) {
+        if !crate::cli::output::timing_enabled() {
+            return;
+        }
+
+        let mut state = self.state.lock().await;
+        if state.first_reasoning_chunk_time.is_none() {
+            state.first_reasoning_chunk_time = Some(std::time::Instant::now());
+        }
+    }
+
     async fn record_first_displayable_text_time(&self) {
         if !crate::cli::output::timing_enabled() {
             return;
@@ -1677,6 +1688,7 @@ impl AgentLoop {
                     accumulated_text.push_str(&text_chunk.text);
                 }
                 ApiStreamChunk::Reasoning(reasoning_chunk) => {
+                    self.record_first_reasoning_chunk_time().await;
                     if self.config.json_output {
                         tracing::info!(
                             target: "json_output",
@@ -3209,6 +3221,7 @@ impl AgentLoop {
                         start,
                         state.request_sent_time,
                         state.first_provider_chunk_time,
+                        state.first_reasoning_chunk_time,
                         state.first_displayable_text_time,
                         state.first_output_emit_time,
                         None,

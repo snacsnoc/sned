@@ -210,6 +210,7 @@ pub fn format_timing_phases(
     session_start: Instant,
     request_sent: Option<Instant>,
     first_provider_chunk: Option<Instant>,
+    first_reasoning_chunk: Option<Instant>,
     first_displayable_text: Option<Instant>,
     first_output_emit: Option<Instant>,
     first_render: Option<Instant>,
@@ -234,6 +235,15 @@ pub fn format_timing_phases(
                 "[timing] request_to_first_chunk_us={}",
                 first_provider_chunk.duration_since(request_sent).as_micros()
             ));
+
+            if let Some(first_reasoning_chunk) = first_reasoning_chunk {
+                lines.push(format!(
+                    "[timing] first_chunk_to_first_reasoning_chunk_us={}",
+                    first_reasoning_chunk
+                        .duration_since(first_provider_chunk)
+                        .as_micros()
+                ));
+            }
 
             if let Some(first_displayable_text) = first_displayable_text {
                 lines.push(format!(
@@ -282,6 +292,7 @@ mod tests {
         let start = Instant::now();
         let request = start + Duration::from_millis(100);
         let chunk = request + Duration::from_millis(250);
+        let reasoning = chunk + Duration::from_millis(12);
         let displayable = chunk + Duration::from_millis(25);
         let output = displayable + Duration::from_millis(25);
         let render = output + Duration::from_millis(16);
@@ -290,6 +301,7 @@ mod tests {
             start,
             Some(request),
             Some(chunk),
+            Some(reasoning),
             Some(displayable),
             Some(output),
             Some(render),
@@ -298,15 +310,16 @@ mod tests {
         assert_eq!(lines[0], "[timing] first_token_us=400000");
         assert_eq!(lines[1], "[timing] session_to_request_us=100000");
         assert_eq!(lines[2], "[timing] request_to_first_chunk_us=250000");
+        assert_eq!(lines[3], "[timing] first_chunk_to_first_reasoning_chunk_us=12000");
         assert_eq!(
-            lines[3],
+            lines[4],
             "[timing] first_chunk_to_first_displayable_text_us=25000"
         );
         assert_eq!(
-            lines[4],
+            lines[5],
             "[timing] first_displayable_text_to_first_output_us=25000"
         );
-        assert_eq!(lines[5], "[timing] first_chunk_to_first_output_us=50000");
-        assert_eq!(lines[6], "[timing] first_output_to_first_render_us=16000");
+        assert_eq!(lines[6], "[timing] first_chunk_to_first_output_us=50000");
+        assert_eq!(lines[7], "[timing] first_output_to_first_render_us=16000");
     }
 }
