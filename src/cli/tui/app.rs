@@ -1147,4 +1147,19 @@ mod tests {
         );
         assert!(app.cached_status_left.contains("task-2"));
     }
+
+    #[test]
+    fn test_clear_pastes_empties_paste_chunks() {
+        let mut app = App::new();
+        app.paste_chunks.push(PasteChunk {
+            marker: "[pasted 10 chars]".to_string(),
+            content: "0123456789".to_string(),
+            start_line: 0,
+            expanded: false,
+        });
+        assert_eq!(app.paste_chunks.len(), 1);
+
+        app.clear_pastes();
+        assert!(app.paste_chunks.is_empty());
+    }
 }

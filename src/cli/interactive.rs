@@ -1839,6 +1839,7 @@ async fn run_main_loop(
                         if !app.input.lines().join("\n").is_empty() {
                             app.push_plain("^C");
                             app.input = App::new_textarea(Vec::new());
+                            app.clear_pastes();
                         }
                         app.push_styled(
                             "Press Ctrl+C again to quit.",
