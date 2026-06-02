@@ -182,7 +182,6 @@ impl InteractiveSession {
         let state_handle = agent.state_handle();
         let state = state_handle.lock().await;
         let turns_completed = state.turns_completed;
-        let total_tokens = state.cumulative_tokens_in + state.cumulative_tokens_out;
         let files_tracked = state.file_context_tracker.tracked_files().len();
         drop(state);
 
@@ -245,14 +244,6 @@ impl InteractiveSession {
                 )
             )));
         }
-
-        writer.emit(OutputEvent::RawAnsi(format!(
-            "{}\n",
-            crate::cli::colors::colorize(
-                &format!("  📊 Tokens: {}", total_tokens),
-                crate::cli::colors::style::DIM
-            )
-        )));
 
         crate::cli::colors::print_horizontal_rule_writer(writer);
     }
