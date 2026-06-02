@@ -1035,7 +1035,7 @@ async fn process_minimax_sse_line(
             }
 
             if let Some(finish_reason) = &choice.finish_reason
-                && finish_reason == "tool_calls"
+                && (finish_reason == "tool_calls" || finish_reason == "tool_call")
             {
                 flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
                 for (idx, (id, name, args)) in accumulated_tool_calls.iter() {
@@ -2086,5 +2086,75 @@ mod tests {
             }
             Err(e) => panic!("SSE line with tool_call.type should parse: {}", e),
         }
+    }
+
+    #[tokio::test]
+    async fn test_finish_reason_singular_tool_call_emits_tool_call() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel(8);
+
+        // Use the actual process_minimax_sse_line function so we exercise the
+        // exact condition path that was broken. The model streams a complete
+        // tool call, then signals completion with the singular finish_reason
+        // "tool_call" (undocumented but observed in production logs).
+        let mut accumulated = std::collections::HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        let mut last_stop_reason = None;
+        let mut xml_buffer = String::new();
+        let mut pending_text = String::new();
+        let mut pending_text_signature = None;
+
+        // Chunk 1: tool call id + name + first args fragment
+        process_minimax_sse_line(
+            r#"data: {"id":"evt1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"pa"}}]}}],"model":"MiniMax-M2.7"}"#,
+            &tx,
+            &mut accumulated,
+            &mut completed,
+            &mut last_stop_reason,
+            &mut xml_buffer,
+            &mut pending_text,
+            &mut pending_text_signature,
+        )
+        .await;
+
+        // Chunk 2: remaining args + finish_reason: "tool_call" (singular)
+        process_minimax_sse_line(
+            r#"data: {"id":"evt2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ths\": [\"src/main.rs\"]}"}}]},"finish_reason":"tool_call"}],"model":"MiniMax-M2.7"}"#,
+            &tx,
+            &mut accumulated,
+            &mut completed,
+            &mut last_stop_reason,
+            &mut xml_buffer,
+            &mut pending_text,
+            &mut pending_text_signature,
+        )
+        .await;
+
+        drop(tx);
+
+        // Collect all emitted chunks
+        let mut tool_call_chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            if let ApiStreamChunk::ToolCalls(tc) = chunk {
+                tool_call_chunks.push(tc);
+            }
+        }
+
+        assert_eq!(
+            tool_call_chunks.len(),
+            1,
+            "singular finish_reason \"tool_call\" must trigger tool call emission at finish_reason"
+        );
+        let tc = &tool_call_chunks[0].tool_call;
+        assert_eq!(tc.call_id.as_deref(), Some("call_1"));
+        assert_eq!(tc.function.name.as_deref(), Some("read_file"));
+        let args = tc.function.arguments.as_deref().unwrap_or("{}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(args).expect("arguments must be valid JSON");
+        assert_eq!(
+            parsed["paths"][0],
+            "src/main.rs",
+            "complete args must arrive (not truncated by late stream-end flush)"
+        );
     }
 }
