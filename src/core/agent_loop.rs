@@ -7210,10 +7210,14 @@ mod tests {
             ts: Some(5),
         };
 
-        // keep_from_base = 6 means we want to keep messages 6.., but index 5
-        // has a ToolResult referencing ToolUse at index 3, so keep_from → 3
+        // keep_from_base = 6 keeps [6..]. The ToolResult at 5 and its ToolUse
+        // at 3 are both in the dropped region [0..6], so no orphan exists in
+        // the kept region — keep_from stays at 6.
         let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 6);
-        assert_eq!(result, 3, "Should pull back to ToolUse at index 3");
+        assert_eq!(
+            result, 6,
+            "Both pair members are in the dropped region — no pullback needed"
+        );
     }
 
     #[test]
@@ -7376,13 +7380,14 @@ mod tests {
             ts: Some(9),
         };
 
-        // keep_from_base=10: first pass finds ToolResult at 9 → pulls to 7.
-        // Second pass finds ToolResult at 5 (now outside 7..) → pulls to 3.
-        // Third pass: no more changes.
+        // keep_from_base=10 keeps [10..] (empty since history.len()==10).
+        // Both tool pairs (3↔5 and 7↔9) are entirely in the dropped region
+        // [0..10], so no orphan exists in the kept region — keep_from stays
+        // at 10.
         let result = AgentLoop::keep_from_preserving_tool_pairs(&history, 10);
         assert_eq!(
-            result, 3,
-            "Cascade should pull back through both pairs to index 3"
+            result, 10,
+            "Both pairs are in the dropped region — no cascade pullback"
         );
     }
 
