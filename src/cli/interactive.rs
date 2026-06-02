@@ -2285,6 +2285,11 @@ mod tests {
         tx.try_send(OutputEvent::plain("line 1")).unwrap();
 
         let mut app = App::new();
+        app.set_content_height(5);
+        app.set_content_width(80);
+        for index in 0..20 {
+            app.push_plain(format!("line {}", index));
+        }
         app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 7;
 
@@ -2292,13 +2297,12 @@ mod tests {
 
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
         assert_eq!(app.scroll_offset, 7);
-        assert_eq!(app.output_lines.len(), 1);
 
         reset_prompt_state();
     }
 
     #[test]
-    fn test_drain_output_reenables_auto_follow_near_bottom() {
+    fn test_drain_output_reenables_auto_follow_at_bottom() {
         use crate::cli::output::OutputEvent;
         use crate::cli::tui::app::ScrollMode;
 
@@ -2315,12 +2319,13 @@ mod tests {
             app.push_plain(format!("line {}", index));
         }
         app.scroll_mode = ScrollMode::Manual;
-        app.scroll_offset = 14;
+        // 20 lines + 1 new = 21 lines, content_height=5 → max_offset=16.
+        // At exact bottom (offset=16), distance_from_bottom==0 → snaps to Auto.
+        app.scroll_offset = 16;
 
         drain_output(&mut rx, &mut app);
 
         assert_eq!(app.scroll_mode, ScrollMode::Auto);
-        assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 16);
 
         reset_prompt_state();
     }

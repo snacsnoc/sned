@@ -32,9 +32,10 @@ static APPROVAL_TEST_MUTEX: LazyLock<std::sync::Mutex<()>> =
 
 #[cfg(test)]
 pub fn approval_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    APPROVAL_TEST_MUTEX
-        .lock()
-        .expect("approval test mutex should not be poisoned")
+    // Recover from poisoning: a sibling test may have panicked while holding
+    // the lock. The poisoned state carries no data we care about — global
+    // approval state is reset per-test — so we proceed to the next test.
+    APPROVAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 const SAFE_BASE_COMMANDS: &[&str] = &[
