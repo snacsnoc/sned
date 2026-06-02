@@ -1771,14 +1771,51 @@ async fn run_main_loop(
     auto_approve: bool,
 ) -> anyhow::Result<()> {
     use std::sync::Mutex as StdMutex;
+
+    struct TimingSummary {
+        draw_total_us: u64,
+        draw_count: u64,
+        drain_total_us: u64,
+        drain_count: u64,
+        output_lines_peak: usize,
+    }
+
+    impl Drop for TimingSummary {
+        fn drop(&mut self) {
+            eprintln!(
+                "[timing] draw: total={}us count={} avg={}us",
+                self.draw_total_us,
+                self.draw_count,
+                if self.draw_count > 0 {
+                    self.draw_total_us / self.draw_count
+                } else {
+                    0
+                }
+            );
+            eprintln!(
+                "[timing] drain: total={}us count={} avg={}us",
+                self.drain_total_us,
+                self.drain_count,
+                if self.drain_count > 0 {
+                    self.drain_total_us / self.drain_count
+                } else {
+                    0
+                }
+            );
+            eprintln!("[timing] output_lines_peak={}", self.output_lines_peak);
+        }
+    }
+
     const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(10);
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(15);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
-    let mut draw_total_us: u64 = 0;
-    let mut draw_count: u64 = 0;
-    let mut drain_total_us: u64 = 0;
-    let mut drain_count: u64 = 0;
-    let mut output_lines_peak: usize = 0;
+    let mut timing = TimingSummary {
+        draw_total_us: 0,
+        draw_count: 0,
+        drain_total_us: 0,
+        drain_count: 0,
+        output_lines_peak: 0,
+    };
     let first_token_start = std::time::Instant::now();
     let mut first_token_reported = false;
 
@@ -1788,8 +1825,8 @@ async fn run_main_loop(
             let t = std::time::Instant::now();
             drain_output(output_rx, app);
             let us = t.elapsed().as_micros() as u64;
-            drain_total_us += us;
-            drain_count += 1;
+            timing.drain_total_us += us;
+            timing.drain_count += 1;
         }
 
         // Track first-token latency
@@ -1801,8 +1838,8 @@ async fn run_main_loop(
 
         // Track output lines peak
         let len = app.output_lines.len();
-        if len > output_lines_peak {
-            output_lines_peak = len;
+        if len > timing.output_lines_peak {
+            timing.output_lines_peak = len;
         }
 
         // 1b. Sync plan state from TaskState to App TUI cache
@@ -1844,8 +1881,8 @@ async fn run_main_loop(
             {
                 let t = std::time::Instant::now();
                 terminal.draw(|f| app.render(f))?;
-                draw_total_us += t.elapsed().as_micros() as u64;
-                draw_count += 1;
+                timing.draw_total_us += t.elapsed().as_micros() as u64;
+                timing.draw_count += 1;
             }
             app.needs_redraw = false;
         }
@@ -2207,11 +2244,6 @@ async fn run_main_loop(
         if app.tick_spinner() {
             app.needs_redraw = true;
         }
-
-        // Print timing summary when loop exits
-        eprintln!("[timing] draw: total={}us count={} avg={}us", draw_total_us, draw_count, if draw_count > 0 { draw_total_us / draw_count } else { 0 });
-        eprintln!("[timing] drain: total={}us count={} avg={}us", drain_total_us, drain_count, if drain_count > 0 { drain_total_us / drain_count } else { 0 });
-        eprintln!("[timing] output_lines_peak={}", output_lines_peak);
     }
 }
 
