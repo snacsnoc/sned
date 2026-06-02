@@ -2108,6 +2108,7 @@ async fn run_main_loop(
         if agent_done.notified().now_or_never().is_some() {
             agent_busy.store(false, Ordering::Relaxed);
             app.agent_busy = false;
+            app.needs_redraw = true;
             // Check if task was cancelled — if so, allow user to exit
             let task_was_cancelled = if let Some(state_arc) = state_handle.lock().await.as_ref() {
                 let state = state_arc.lock().await;
