@@ -78,6 +78,7 @@ impl CondenseHandler {
         if !ctx.json_output {
             use crate::cli::output::OutputEvent;
             use ratatui::style::{Color, Modifier, Style};
+            let timeout_secs = crate::core::approval::followup_timeout().as_secs();
             ctx.output_writer.emit(OutputEvent::styled(
                 "\n[Sned wants to condense the conversation]",
                 Style::default().fg(Color::Yellow),
@@ -90,6 +91,10 @@ impl CondenseHandler {
                 "Press Enter to accept, or provide feedback: ",
                 Style::default().fg(Color::Cyan),
             ));
+            ctx.output_writer.emit(OutputEvent::dim(format!(
+                "(waiting up to {}s for your response)",
+                timeout_secs
+            )));
             ctx.output_writer.flush();
 
             // Use channel-based input to avoid blocking tokio worker and fighting TUI stdin
@@ -101,7 +106,7 @@ impl CondenseHandler {
             // Use recv_timeout to avoid blocking the TUI event loop indefinitely.
             // Same pattern as ask_followup_question and other followup prompts.
             let response_result = tokio::task::spawn_blocking(move || {
-                receiver.recv_timeout(std::time::Duration::from_secs(30))
+                receiver.recv_timeout(crate::core::approval::followup_timeout())
             })
             .await;
 

@@ -30,6 +30,7 @@ impl AskFollowupQuestionHandler {
         if !ctx.json_output {
             use crate::cli::output::OutputEvent;
             use ratatui::style::{Color, Modifier, Style};
+            let timeout_secs = crate::core::approval::followup_timeout().as_secs();
             ctx.output_writer.emit(OutputEvent::styled(
                 format!("\n{} {}\n", "[Sned Question]", question),
                 Style::default()
@@ -40,6 +41,10 @@ impl AskFollowupQuestionHandler {
                 "Your answer: ",
                 Style::default().fg(Color::Cyan),
             ));
+            ctx.output_writer.emit(OutputEvent::dim(format!(
+                "(waiting up to {}s for your response)",
+                timeout_secs
+            )));
             ctx.output_writer.flush();
 
             // Capture task_id for use after spawn_blocking
@@ -53,7 +58,7 @@ impl AskFollowupQuestionHandler {
             // Use recv_timeout to avoid blocking the TUI event loop indefinitely.
             // Same pattern as /undo, /commit, /checkpoint-restore followup prompts.
             let response_result = tokio::task::spawn_blocking(move || {
-                receiver.recv_timeout(std::time::Duration::from_secs(30))
+                receiver.recv_timeout(crate::core::approval::followup_timeout())
             })
             .await;
 

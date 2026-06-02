@@ -1049,6 +1049,9 @@ pub fn clear_approval_prompt_scroll() {
 /// This covers tool-driven prompts like ask_followup_question and slash-command confirmations.
 static FOLLOWUP_PROMPT_SCROLL: AtomicBool = AtomicBool::new(false);
 
+/// Default followup prompt timeout in seconds.
+const DEFAULT_FOLLOWUP_TIMEOUT_SECS: u64 = 300;
+
 /// Mark that the followup prompt was just emitted and needs a forced scroll.
 pub fn set_followup_prompt_scroll() {
     FOLLOWUP_PROMPT_SCROLL.store(true, Ordering::SeqCst);
@@ -1062,6 +1065,22 @@ pub fn take_followup_prompt_scroll() -> bool {
 /// Clear the followup prompt scroll flag without consuming it.
 pub fn clear_followup_prompt_scroll() {
     FOLLOWUP_PROMPT_SCROLL.store(false, Ordering::SeqCst);
+}
+
+/// Return the timeout used by followup prompts such as ask_followup_question
+/// and condense. The timeout can be overridden with
+/// `SNED_FOLLOWUP_TIMEOUT_SECS`.
+pub(crate) fn followup_timeout_secs() -> u64 {
+    std::env::var("SNED_FOLLOWUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_FOLLOWUP_TIMEOUT_SECS)
+}
+
+/// Duration wrapper for `followup_timeout_secs()`.
+pub(crate) fn followup_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(followup_timeout_secs())
 }
 
 /// No-op retained for Ctrl+C handler compatibility; the approval channel was removed.
@@ -1265,6 +1284,14 @@ mod tests {
             }
             Self { key, original }
         }
+
+        fn clear(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, original }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -1318,6 +1345,24 @@ mod tests {
         assert!(is_approval_prompt_active());
         set_approval_prompt_active(false);
         assert!(!is_approval_prompt_active());
+    }
+
+    #[test]
+    fn test_followup_timeout_defaults_to_five_minutes() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::clear("SNED_FOLLOWUP_TIMEOUT_SECS");
+
+        assert_eq!(followup_timeout_secs(), 300);
+        assert_eq!(followup_timeout().as_secs(), 300);
+    }
+
+    #[test]
+    fn test_followup_timeout_uses_env_override() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("SNED_FOLLOWUP_TIMEOUT_SECS", "120");
+
+        assert_eq!(followup_timeout_secs(), 120);
+        assert_eq!(followup_timeout().as_secs(), 120);
     }
 
     #[test]

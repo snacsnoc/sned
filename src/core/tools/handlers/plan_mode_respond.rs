@@ -53,13 +53,13 @@ impl PlanModeRespondHandler {
         let steps = crate::core::plan_state::PlanState::parse_plan(response);
         let steps = steps.ok_or_else(|| {
             ToolError::InvalidInput(
-                "Could not parse plan into numbered steps. Use format: 1. Step description".to_string(),
+                "Could not parse plan into numbered steps. Use format: 1. Step description. If you need more exploration, set needs_more_exploration=true.".to_string(),
             )
         })?;
 
         if steps.len() < 2 {
             return Err(ToolError::InvalidInput(
-                "Plan must have at least 2 steps".to_string(),
+                "Plan must have at least 2 steps. If you need more exploration, set needs_more_exploration=true instead of sending a partial plan.".to_string(),
             ));
         }
 
@@ -221,6 +221,8 @@ mod tests {
             .execute(&ctx, serde_json::json!({"response": "1. only one step"}))
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("at least 2 steps"));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("at least 2 steps"));
+        assert!(err.contains("needs_more_exploration=true"));
     }
 }

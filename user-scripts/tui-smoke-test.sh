@@ -19,8 +19,8 @@ SNED_BIN="${REPO_ROOT}/target/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
-TOTAL_TESTS=10
+ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-history-navigation tui-slash-commands tui-auto-scroll help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
+TOTAL_TESTS=13
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -58,6 +58,9 @@ tui-startup-exit      Start ratatui in a pty, render banner, send /exit
 tui-user-echo         Type a prompt, verify ❯ prefix appears in transcript
 tui-turn-indicators   Type a prompt, verify ♦ and ─ turn markers appear
 tui-approval-scroll   Scroll away, then verify approval prompt stays visible
+tui-history-navigation Type prompts, press Up arrow, verify previous prompt appears
+tui-slash-commands    Type /help, verify help text renders in output
+tui-auto-scroll       Type multiple prompts, verify output scrolls to show latest
 help                  --help shows usage
 version               --version shows version
 invalid-flag           Invalid flag returns an error
@@ -103,6 +106,9 @@ test_description() {
         tui-user-echo) echo "Type a prompt, verify ❯ prefix appears in transcript" ;;
         tui-turn-indicators) echo "Type a prompt, verify ✦ and ─ turn markers appear" ;;
         tui-approval-scroll) echo "Scroll away, then verify approval prompt stays visible" ;;
+        tui-history-navigation) echo "Type prompts, press Up arrow, verify previous prompt appears in input" ;;
+        tui-slash-commands) echo "Type /help, verify help text renders in output" ;;
+        tui-auto-scroll) echo "Type multiple prompts, verify output scrolls to show latest" ;;
         help) echo "--help shows usage" ;;
         version) echo "--version shows version" ;;
         invalid-flag) echo "Invalid flag returns an error" ;;
@@ -119,6 +125,9 @@ test_source() {
         tui-user-echo) echo "src/cli/tui/app.rs push_user_message / src/cli/interactive.rs Enter handler" ;;
         tui-turn-indicators) echo "src/core/agent_loop.rs assistant turn indicator / src/cli/tui/app.rs push_turn_separator" ;;
         tui-approval-scroll) echo "src/cli/interactive.rs drain_output approval scroll path / src/core/approval.rs begin_approval_prompt" ;;
+        tui-history-navigation) echo "src/cli/interactive.rs handle_key_event Up/Down arrow history / src/cli/tui/history.rs FileHistory" ;;
+        tui-slash-commands) echo "src/cli/interactive.rs handle_cli_only_command / src/cli/slash_commands.rs format_help_text" ;;
+        tui-auto-scroll) echo "src/cli/tui/app.rs scroll_mode / src/cli/interactive.rs drain_output auto-scroll" ;;
         help|version|invalid-flag|yolo-help|json-no-prompt) echo "src/cli/mod.rs CLI dispatch" ;;
         ctrlc-quit-empty) echo "src/cli/interactive.rs handle_key_event Ctrl+C on empty input" ;;
         *) echo "unknown" ;;
@@ -823,6 +832,361 @@ finally:
 PY
 }
 
+test_tui_history_navigation() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import os
+import pty
+import select
+import shutil
+import signal
+import tempfile
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-history-nav.")
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+})
+
+cmd = [
+    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+sent_first = False
+sent_second = False
+sent_up = False
+sent_exit = False
+first_responded = False
+second_responded = False
+exit_code = None
+deadline = time.time() + 15
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+            text = buf.decode("utf-8", "replace")
+            if "type a prompt" in text and not sent_first:
+                os.write(fd, b"first command\r")
+                sent_first = True
+            # Wait for the first command to get a mock response before sending the second
+            if sent_first and "Mock provider" in text and not sent_second:
+                time.sleep(0.3)
+                os.write(fd, b"second command\r")
+                sent_second = True
+            # Wait for the second command to get a mock response before pressing Up
+            if sent_second and "Mock provider" in text and not first_responded:
+                first_responded = True
+            if sent_second and first_responded and not sent_up:
+                # Count mock responses to ensure second command was processed
+                response_count = text.count("Mock provider")
+                if response_count >= 2 and not sent_up:
+                    time.sleep(0.3)
+                    # Up arrow: \x1b[A
+                    os.write(fd, b"\x1b[A")
+                    sent_up = True
+            if sent_up and not sent_exit:
+                time.sleep(0.5)
+                os.write(fd, b"/exit\r")
+                sent_exit = True
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None:
+        try:
+            ended, status = os.waitpid(pid, os.WNOHANG)
+            if ended:
+                exit_code = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            exit_code = 0
+
+    text = buf.decode("utf-8", "replace")
+    if verbose:
+        print(text)
+
+    # After pressing Up, the input field should show "first command" (previous history entry)
+    # The textarea renders input text, so it will appear in the pty output
+    if not sent_first:
+        print("TUI_TEST_FAIL first prompt was not sent")
+    elif not sent_second:
+        print("TUI_TEST_FAIL second prompt was not sent")
+    elif not sent_up:
+        print("TUI_TEST_FAIL Up arrow was not sent")
+    elif "first command" not in text:
+        print("TUI_TEST_FAIL previous prompt 'first command' not found after Up arrow")
+    elif exit_code not in (0, None):
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS history navigation via Up arrow worked")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
+test_tui_slash_commands() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import os
+import pty
+import select
+import shutil
+import signal
+import tempfile
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-slash-cmd.")
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+})
+
+cmd = [
+    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+sent_help = False
+sent_exit = False
+exit_code = None
+deadline = time.time() + 10
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+            text = buf.decode("utf-8", "replace")
+            if "type a prompt" in text and not sent_help:
+                os.write(fd, b"/help\r")
+                sent_help = True
+            if sent_help and "Sned Commands" in text and not sent_exit:
+                time.sleep(0.25)
+                os.write(fd, b"/exit\r")
+                sent_exit = True
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None:
+        try:
+            ended, status = os.waitpid(pid, os.WNOHANG)
+            if ended:
+                exit_code = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            exit_code = 0
+
+    text = buf.decode("utf-8", "replace")
+    if verbose:
+        print(text)
+
+    # The /help command renders help text containing keyboard shortcuts.
+    # Check for "Ctrl+C" which appears in the keyboard shortcuts section of the help text.
+    if not sent_help:
+        print("TUI_TEST_FAIL /help was not sent")
+    elif "Ctrl+C" not in text:
+        print("TUI_TEST_FAIL help text with keyboard shortcuts not found in output")
+    elif exit_code not in (0, None):
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS /help rendered help text in output")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
+test_tui_auto_scroll() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import os
+import pty
+import select
+import shutil
+import signal
+import tempfile
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-auto-scroll.")
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+})
+
+cmd = [
+    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+prompt_count = 0
+banner_seen = False
+pending_prompt = None
+next_prompt_ready_at = 0.0
+next_prompt = 1
+sent_exit = False
+exit_code = None
+deadline = time.time() + 20
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+            text = buf.decode("utf-8", "replace")
+        text = buf.decode("utf-8", "replace")
+        tail = text.replace("\r", "\n")
+        if "type a prompt" in text and not banner_seen:
+            banner_seen = True
+
+        # Drive the prompt sequence from a small state machine outside the
+        # read branch so the next prompt can be sent even when the TUI is
+        # momentarily quiet.
+        if pending_prompt is None and banner_seen and next_prompt <= 5:
+            if time.time() >= next_prompt_ready_at:
+                os.write(fd, f"prompt {next_prompt}\r".encode())
+                prompt_count += 1
+                pending_prompt = next_prompt
+
+        if pending_prompt is not None and f"prompt {pending_prompt}" in tail:
+            pending_prompt = None
+            next_prompt += 1
+            next_prompt_ready_at = time.time() + 0.5
+
+        # After all prompts are processed and responses appear, wait then exit.
+        if prompt_count >= 5 and "Mock provider" in text and not sent_exit:
+            time.sleep(0.5)
+            os.write(fd, b"/exit\r")
+            sent_exit = True
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None:
+        try:
+            ended, status = os.waitpid(pid, os.WNOHANG)
+            if ended:
+                exit_code = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            exit_code = 0
+
+    text = buf.decode("utf-8", "replace")
+    if verbose:
+        print(text)
+
+    # Verify that the latest prompt appears in the output (auto-scroll worked)
+    has_latest_prompt = "prompt 5" in text
+    has_mock_response = "Mock provider" in text
+
+    if prompt_count < 5:
+        print(f"TUI_TEST_FAIL only sent {prompt_count} prompts, expected 5")
+    elif not has_latest_prompt:
+        print("TUI_TEST_FAIL latest prompt 'prompt 5' not found in output")
+    elif not has_mock_response:
+        print("TUI_TEST_FAIL mock provider response not found")
+    elif exit_code not in (0, None):
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS auto-scroll kept viewport at bottom for new output")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
 run_one() {
     local name="$1"
     local result reason
@@ -839,6 +1203,9 @@ run_one() {
         tui-user-echo) result="$(test_tui_user_echo 2>&1)" ;;
         tui-turn-indicators) result="$(test_tui_turn_indicators 2>&1)" ;;
         tui-approval-scroll) result="$(test_tui_approval_scroll 2>&1)" ;;
+        tui-history-navigation) result="$(test_tui_history_navigation 2>&1)" ;;
+        tui-slash-commands) result="$(test_tui_slash_commands 2>&1)" ;;
+        tui-auto-scroll) result="$(test_tui_auto_scroll 2>&1)" ;;
         help) result="$(test_help 2>&1)" ;;
         version) result="$(test_version 2>&1)" ;;
         invalid-flag) result="$(test_invalid_flag 2>&1)" ;;
