@@ -360,13 +360,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_files_respects_max_count_per_file() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Explicitly set the env var to the default to avoid interference from parallel tests
-        // SAFETY: restoring env after test
-        unsafe {
-            std::env::set_var(SEARCH_MAX_LINES_ENV, "100");
-        }
         let temp_dir = TempDir::new().unwrap();
         let content = (0..150)
             .map(|i| format!("match {}", i))
@@ -374,13 +367,20 @@ mod tests {
             .join("\n");
         fs::write(temp_dir.path().join("large_file.txt"), content).unwrap();
 
-        let handler = SearchFilesHandler::new();
-        // Use 10 so this test's env var won't break test_search_files_custom_max_count_via_env
-        // (which asserts line_count <= 10) if values leak between parallel tests.
-        unsafe {
-            std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
+        {
+            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            // Explicitly set the env var to the default to avoid interference from parallel tests
+            // SAFETY: restoring env after test
+            unsafe {
+                std::env::set_var(SEARCH_MAX_LINES_ENV, "100");
+            }
+            // Use 10 so this test's env var won't break test_search_files_custom_max_count_via_env
+            // (which asserts line_count <= 10) if values leak between parallel tests.
+            unsafe {
+                std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
+            }
         }
-        let result = handler
+        let result = SearchFilesHandler::new()
             .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
             .await
             .unwrap();
@@ -406,13 +406,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_files_custom_max_count_via_env() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Test with custom limit via environment variable
-        // SAFETY: restoring env after test
-        unsafe {
-            std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
-        }
         let temp_dir = TempDir::new().unwrap();
         // Create a single file with more matches than the limit
         let content = (0..50)
@@ -421,13 +414,21 @@ mod tests {
             .join("\n");
         fs::write(temp_dir.path().join("large_file.txt"), content).unwrap();
 
-        let handler = SearchFilesHandler::new();
-        // Use 3 so this test's env var won't break test_search_files_respects_max_count_per_file
-        // (which asserts line_count <= 100) if values leak between parallel tests.
-        unsafe {
-            std::env::set_var(SEARCH_MAX_LINES_ENV, "3");
+        {
+            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Test with custom limit via environment variable
+            // SAFETY: restoring env after test
+            unsafe {
+                std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
+            }
+            // Use 3 so this test's env var won't break test_search_files_respects_max_count_per_file
+            // (which asserts line_count <= 100) if values leak between parallel tests.
+            unsafe {
+                std::env::set_var(SEARCH_MAX_LINES_ENV, "3");
+            }
         }
-        let result = handler
+        let result = SearchFilesHandler::new()
             .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
             .await
             .unwrap();

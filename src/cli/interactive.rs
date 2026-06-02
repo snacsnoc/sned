@@ -594,10 +594,10 @@ async fn handle_key_event(
             .get(app.slash_command_selected)
             .map(|entry| entry.name.as_str());
 
-        if let (Some(query), Some(selected)) = (current_query.as_deref(), selected) {
-            if query != selected && accept_slash_completion(app) {
-                return Ok(None);
-            }
+        if let (Some(query), Some(selected)) = (current_query.as_deref(), selected)
+            && query != selected && accept_slash_completion(app)
+        {
+            return Ok(None);
         }
         // Fall through so Enter can submit a non-autocomplete slash command.
     }
@@ -1781,30 +1781,29 @@ async fn run_main_loop(
 
         // 1b. Sync plan state from TaskState to App TUI cache
         {
-            if let Ok(state_arc) = state_handle.try_lock() {
-                if let Some(ref inner_arc) = state_arc.as_ref() {
-                    if let Ok(state) = inner_arc.try_lock() {
-                        let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
-                        if plan_changed {
-                            app.needs_redraw = true;
-                            if let Some(ref plan) = state.plan_state {
-                                let has_failed = plan
-                                    .steps
-                                    .iter()
-                                    .any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
-                                app.mode = if plan.complete {
-                                    "COMPLETE".to_string()
-                                } else if has_failed {
-                                    "FAILED".to_string()
-                                } else if plan.paused {
-                                    "PAUSED".to_string()
-                                } else if plan.approved {
-                                    "ACT".to_string()
-                                } else {
-                                    "PLAN".to_string()
-                                };
-                            }
-                        }
+            if let Ok(state_arc) = state_handle.try_lock()
+                && let Some(inner_arc) = state_arc.as_ref()
+                && let Ok(state) = inner_arc.try_lock()
+            {
+                let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
+                if plan_changed {
+                    app.needs_redraw = true;
+                    if let Some(ref plan) = state.plan_state {
+                        let has_failed = plan
+                            .steps
+                            .iter()
+                            .any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
+                        app.mode = if plan.complete {
+                            "COMPLETE".to_string()
+                        } else if has_failed {
+                            "FAILED".to_string()
+                        } else if plan.paused {
+                            "PAUSED".to_string()
+                        } else if plan.approved {
+                            "ACT".to_string()
+                        } else {
+                            "PLAN".to_string()
+                        };
                     }
                 }
             }
@@ -1833,40 +1832,40 @@ async fn run_main_loop(
                 Event::Key(key) => {
                     app.needs_redraw = true;
                     // Approval prompt: route y/n/a to approval channel
-                    if is_approval_prompt_active() {
-                        if let Some(result) = approval_result_for_key(&key) {
-                            if let Some(sender) = take_approval_sender() {
-                                let prompt_lines = app.output_lines.len();
-                                let _ = sender.send(result.clone());
-                                app.drain_output_from(prompt_lines);
+                    if is_approval_prompt_active()
+                        && let Some(result) = approval_result_for_key(&key)
+                    {
+                        if let Some(sender) = take_approval_sender() {
+                            let prompt_lines = app.output_lines.len();
+                            let _ = sender.send(result.clone());
+                            app.drain_output_from(prompt_lines);
 
-                                if key.code == KeyCode::Char('c')
-                                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                                {
-                                    app.force_bottom();
-                                    cancel_agent(&state_handle, &agent_task, &agent_done).await?;
-                                    app.push_plain("^C");
-                                    app.agent_busy = false;
-                                    continue;
-                                }
-
-                                // Echo approval decision
-                                app.push_styled(
-                                    format!(
-                                        "  ↳ {}",
-                                        match result {
-                                            ApprovalResult::Approved => "approved",
-                                            ApprovalResult::Denied => "denied",
-                                            ApprovalResult::Always => "always approve",
-                                        }
-                                    ),
-                                    Style::default().fg(theme::ACCENT),
-                                );
-                                app.clear_approval_pin();
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
                                 app.force_bottom();
+                                cancel_agent(&state_handle, &agent_task, &agent_done).await?;
+                                app.push_plain("^C");
+                                app.agent_busy = false;
+                                continue;
                             }
-                            continue;
+
+                            // Echo approval decision
+                            app.push_styled(
+                                format!(
+                                    "  ↳ {}",
+                                    match result {
+                                        ApprovalResult::Approved => "approved",
+                                        ApprovalResult::Denied => "denied",
+                                        ApprovalResult::Always => "always approve",
+                                    }
+                                ),
+                                Style::default().fg(theme::ACCENT),
+                            );
+                            app.clear_approval_pin();
+                            app.force_bottom();
                         }
+                        continue;
                     }
 
                     // Global Ctrl+C handling
@@ -2161,15 +2160,15 @@ async fn run_main_loop(
         }
 
         // 5. Update elapsed time for status bar
-        if app.agent_busy {
-            if let Some(start) = agent_start_time.lock().await.as_ref() {
-                let new_elapsed = start.elapsed();
-                let new_secs = new_elapsed.as_secs();
-                let old_secs = app.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
-                app.elapsed = Some(new_elapsed);
-                if new_secs != old_secs {
-                    app.needs_redraw = true;
-                }
+        if app.agent_busy
+            && let Some(start) = agent_start_time.lock().await.as_ref()
+        {
+            let new_elapsed = start.elapsed();
+            let new_secs = new_elapsed.as_secs();
+            let old_secs = app.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
+            app.elapsed = Some(new_elapsed);
+            if new_secs != old_secs {
+                app.needs_redraw = true;
             }
         }
 
@@ -2677,8 +2676,10 @@ mod tests {
     -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
+        {
+            let _lock = crate::core::approval::approval_test_guard();
+            reset_prompt_state();
+        }
 
         let (tx, _rx) = mpsc::channel(4);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
@@ -2703,8 +2704,8 @@ mod tests {
             line.spans
                 .iter()
                 .map(|span| span.content.as_ref())
-                .collect::<String>()
-                .contains("Approval pending. Type y, n, or a first.")
+            .collect::<String>()
+            .contains("Approval pending. Type y, n, or a first.")
         }));
 
         reset_prompt_state();
@@ -2716,8 +2717,10 @@ mod tests {
     async fn test_handle_key_event_allows_shutdown_submit_during_approval() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
+        {
+            let _lock = crate::core::approval::approval_test_guard();
+            reset_prompt_state();
+        }
 
         let (tx, _rx) = mpsc::channel(4);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
@@ -2953,7 +2956,7 @@ mod tests {
         }
 
         let state = state_handle.lock().await;
-        assert!(state.strict_plan_mode_enabled == false);
+        assert!(!state.strict_plan_mode_enabled);
         let plan = state.plan_state.as_ref().expect("plan should exist");
         assert!(plan.approved);
         assert_eq!(plan.current_step_index, 0);

@@ -496,10 +496,10 @@ impl App {
             self.scroll_mode,
         );
 
-        if let Some(cached) = self.cached_visible_window {
-            if self.cached_window_fingerprint == fingerprint {
-                return cached;
-            }
+        if let Some(cached) = self.cached_visible_window
+            && self.cached_window_fingerprint == fingerprint
+        {
+            return cached;
         }
 
         let target_start = scroll_y.min(self.cached_visual_rows);

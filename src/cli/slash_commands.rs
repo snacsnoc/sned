@@ -740,123 +740,122 @@ pub fn build_slash_command_entries(
     global_workflow_toggles: &HashMap<String, bool>,
     remote_workflow_toggles: &HashMap<String, bool>,
 ) -> Vec<SlashCommandEntry> {
-    let mut entries = Vec::new();
-
-    // Agent-injected slash commands
-    entries.push(SlashCommandEntry {
-        name: "newtask".to_string(),
-        description: "Create a new task with the current context".to_string(),
-        aliases: vec!["nt".to_string()],
-        category: SlashCommandCategory::Agent,
-        requires_args: true,
-    });
-    entries.push(SlashCommandEntry {
-        name: "compact".to_string(),
-        description: "Condense the current context to reduce token usage".to_string(),
-        aliases: vec!["c".to_string()],
-        category: SlashCommandCategory::Agent,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "newrule".to_string(),
-        description: "Add a new rule to the agent's behavior".to_string(),
-        aliases: vec!["nr".to_string()],
-        category: SlashCommandCategory::Agent,
-        requires_args: true,
-    });
-    entries.push(SlashCommandEntry {
-        name: "reportbug".to_string(),
-        description: "Report a bug in sned".to_string(),
-        aliases: vec!["bug".to_string()],
-        category: SlashCommandCategory::Agent,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "explain-changes".to_string(),
-        description: "Explain recent code changes".to_string(),
-        aliases: vec!["explain".to_string()],
-        category: SlashCommandCategory::Agent,
-        requires_args: false,
-    });
-
-    // Local CLI commands
-    entries.push(SlashCommandEntry {
-        name: "exit".to_string(),
-        description: "Exit the interactive shell".to_string(),
-        aliases: vec!["quit".to_string(), "q".to_string()],
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "clear".to_string(),
-        description: "Clear the output screen".to_string(),
-        aliases: vec!["cls".to_string()],
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "help".to_string(),
-        description: "Show available commands".to_string(),
-        aliases: vec!["?".to_string()],
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "settings".to_string(),
-        description: "View and edit configuration".to_string(),
-        aliases: vec![],
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "history".to_string(),
-        description: "Show command history".to_string(),
-        aliases: vec!["h".to_string()],
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "skills".to_string(),
-        description: "List available skills".to_string(),
-        aliases: vec![],
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "plan".to_string(),
-        description: "View or manage the current plan".to_string(),
-        aliases: vec![],
-        category: SlashCommandCategory::Plan,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "expand".to_string(),
-        description: "Expand a snipped block by index".to_string(),
-        aliases: vec!["e".to_string()],
-        category: SlashCommandCategory::Local,
-        requires_args: true,
-    });
-    entries.push(SlashCommandEntry {
-        name: "undo".to_string(),
-        description: "Undo the last edit operation".to_string(),
-        aliases: vec![],
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-    });
-    entries.push(SlashCommandEntry {
-        name: "commit".to_string(),
-        description: "Create a git commit with pending changes".to_string(),
-        aliases: vec![],
-        category: SlashCommandCategory::Local,
-        requires_args: true,
-    });
-    entries.push(SlashCommandEntry {
-        name: "checkpoint".to_string(),
-        description: "Create or restore a checkpoint".to_string(),
-        aliases: vec!["cp".to_string()],
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-    });
+    let mut entries = vec![
+        // Agent-injected slash commands
+        SlashCommandEntry {
+            name: "newtask".to_string(),
+            description: "Create a new task with the current context".to_string(),
+            aliases: vec!["nt".to_string()],
+            category: SlashCommandCategory::Agent,
+            requires_args: true,
+        },
+        SlashCommandEntry {
+            name: "compact".to_string(),
+            description: "Condense the current context to reduce token usage".to_string(),
+            aliases: vec!["c".to_string()],
+            category: SlashCommandCategory::Agent,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "newrule".to_string(),
+            description: "Add a new rule to the agent's behavior".to_string(),
+            aliases: vec!["nr".to_string()],
+            category: SlashCommandCategory::Agent,
+            requires_args: true,
+        },
+        SlashCommandEntry {
+            name: "reportbug".to_string(),
+            description: "Report a bug in sned".to_string(),
+            aliases: vec!["bug".to_string()],
+            category: SlashCommandCategory::Agent,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "explain-changes".to_string(),
+            description: "Explain recent code changes".to_string(),
+            aliases: vec!["explain".to_string()],
+            category: SlashCommandCategory::Agent,
+            requires_args: false,
+        },
+        // Local CLI commands
+        SlashCommandEntry {
+            name: "exit".to_string(),
+            description: "Exit the interactive shell".to_string(),
+            aliases: vec!["quit".to_string(), "q".to_string()],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "clear".to_string(),
+            description: "Clear the output screen".to_string(),
+            aliases: vec!["cls".to_string()],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "help".to_string(),
+            description: "Show available commands".to_string(),
+            aliases: vec!["?".to_string()],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "settings".to_string(),
+            description: "View and edit configuration".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "history".to_string(),
+            description: "Show command history".to_string(),
+            aliases: vec!["h".to_string()],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "skills".to_string(),
+            description: "List available skills".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "plan".to_string(),
+            description: "View or manage the current plan".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Plan,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "expand".to_string(),
+            description: "Expand a snipped block by index".to_string(),
+            aliases: vec!["e".to_string()],
+            category: SlashCommandCategory::Local,
+            requires_args: true,
+        },
+        SlashCommandEntry {
+            name: "undo".to_string(),
+            description: "Undo the last edit operation".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "commit".to_string(),
+            description: "Create a git commit with pending changes".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Local,
+            requires_args: true,
+        },
+        SlashCommandEntry {
+            name: "checkpoint".to_string(),
+            description: "Create or restore a checkpoint".to_string(),
+            aliases: vec!["cp".to_string()],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+    ];
 
     // Skills
     for skill in available_skills {

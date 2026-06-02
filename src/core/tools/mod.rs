@@ -353,7 +353,7 @@ pub fn resolve_sanitized_path(
     let mut current = workspace_root.to_path_buf();
     let suffix = normalized
         .strip_prefix(workspace_root)
-        .unwrap_or_else(|_| normalized.as_path());
+        .unwrap_or(&normalized);
 
     for component in suffix.components() {
         current.push(component.as_os_str());

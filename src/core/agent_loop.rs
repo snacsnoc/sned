@@ -3042,13 +3042,12 @@ impl AgentLoop {
             )
         });
         let plan_active = self.plan_execution_active().await;
-        let is_completion = (text_only_completes_task && !plan_active)
-            || (prepared_tool_calls.iter().any(|prepared| {
-                matches!(
-                    SnedTool::from_name(&prepared.tool_name),
-                    Some(SnedTool::AttemptCompletion)
-                )
-            }) && !plan_active)
+        let is_completion = (prepared_tool_calls.iter().any(|prepared| {
+            matches!(
+                SnedTool::from_name(&prepared.tool_name),
+                Some(SnedTool::AttemptCompletion)
+            )
+        }) || text_only_completes_task) && !plan_active
             || (tool_failure_count == 0
                 && prepared_tool_calls.iter().any(|prepared| {
                     matches!(
@@ -6729,7 +6728,6 @@ mod tests {
     #[tokio::test]
     async fn test_plan_advance_on_tool_success() {
         use crate::core::tools::ToolRegistry;
-        use crate::core::tools::handlers::plan_mode_respond::PlanModeRespondHandler;
 
         // Create plan directly in state (skip PlanModeRespond call)
         let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {

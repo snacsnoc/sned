@@ -455,8 +455,7 @@ mod tests {
         let state = TaskState::default();
         assert!(state.strict_plan_mode_enabled);
 
-        let mut state = TaskState::default();
-        state.strict_plan_mode_enabled = false;
+        let mut state = TaskState { strict_plan_mode_enabled: false, ..Default::default() };
         assert!(!state.strict_plan_mode_enabled);
 
         state.strict_plan_mode_enabled = true;
