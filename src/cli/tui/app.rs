@@ -68,6 +68,8 @@ pub struct App {
     pub scroll_mode: ScrollMode,
     /// Whether the next draw should re-sync layout from the terminal size.
     pub has_resized: bool,
+    /// Whether the next draw should render (dirty flag for render optimization).
+    pub needs_redraw: bool,
     /// Session start time (for elapsed time display)
     pub start_time: Option<Instant>,
     /// Spinner animation frame index
@@ -172,6 +174,7 @@ impl App {
             scroll_offset: 0,
             scroll_mode: ScrollMode::Auto,
             has_resized: true,
+            needs_redraw: true,
             start_time: None,
             spinner_index: 0,
             last_spinner_tick: None,
@@ -213,6 +216,7 @@ impl App {
 
     /// Push an output line to the buffer.
     pub fn push_output(&mut self, line: Line<'static>) {
+        self.needs_redraw = true;
         let wrap_width = self.last_wrap_width();
         let line_rows = Self::line_visual_rows(&line, wrap_width);
         let cache_valid = self.cached_wrap_width == Some(wrap_width);
@@ -270,12 +274,14 @@ impl App {
     }
 
     pub fn force_bottom(&mut self) {
+        self.needs_redraw = true;
         self.scroll_mode = ScrollMode::Auto;
         self.scroll_offset = 0;
     }
 
     /// Clear all output and reset the visual-row cache.
     pub fn clear_output(&mut self) {
+        self.needs_redraw = true;
         self.output_lines.clear();
         self.cached_visual_rows = 0;
         self.cached_wrap_width = Some(self.last_wrap_width());
@@ -283,6 +289,7 @@ impl App {
 
     /// Drain output from the given index onward and keep the visual-row cache in sync.
     pub fn drain_output_from(&mut self, start: usize) {
+        self.needs_redraw = true;
         let start = start.min(self.output_lines.len());
         if start >= self.output_lines.len() {
             return;
@@ -304,11 +311,13 @@ impl App {
     }
 
     pub fn pin_approval_bottom(&mut self) {
+        self.needs_redraw = true;
         self.scroll_mode = ScrollMode::ApprovalPinned;
         self.scroll_offset = 0;
     }
 
     pub fn clear_approval_pin(&mut self) {
+        self.needs_redraw = true;
         self.force_bottom();
     }
 
@@ -383,6 +392,7 @@ impl App {
     }
 
     pub fn scroll_lines(&mut self, delta: isize) {
+        self.needs_redraw = true;
         let total_rows = self.total_visual_rows(self.last_wrap_width());
         if !self.enter_manual_mode(total_rows) {
             return;
@@ -396,6 +406,7 @@ impl App {
     }
 
     pub fn scroll_pages(&mut self, delta_pages: isize) {
+        self.needs_redraw = true;
         let page_height = self.last_content_height.saturating_sub(1).max(1);
         self.scroll_lines(delta_pages * page_height as isize);
     }
@@ -772,12 +783,13 @@ impl App {
 
     /// Increment spinner frame at a human-scale cadence instead of every loop
     /// iteration; a 60 FPS braille spinner just burns redraw budget.
-    pub fn tick_spinner(&mut self) {
+    /// Returns true when the spinner frame advanced.
+    pub fn tick_spinner(&mut self) -> bool {
         const SPINNER_INTERVAL: Duration = Duration::from_millis(125);
 
         if !self.agent_busy {
             self.last_spinner_tick = None;
-            return;
+            return false;
         }
 
         let now = Instant::now();
@@ -789,7 +801,9 @@ impl App {
         if should_advance {
             self.spinner_index = (self.spinner_index + 1) % 10;
             self.last_spinner_tick = Some(now);
+            return true;
         }
+        false
     }
 
     /// Get current spinner character.

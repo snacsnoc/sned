@@ -1763,6 +1763,7 @@ async fn run_main_loop(
                 let state = state_arc.lock().await;
                 let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
                 if plan_changed {
+                    app.needs_redraw = true;
                     if let Some(ref plan) = state.plan_state {
                         let has_failed = plan
                             .steps
@@ -1788,8 +1789,11 @@ async fn run_main_loop(
             sync_scroll_viewport(terminal, app)?;
         }
 
-        // 2. Render
-        terminal.draw(|f| app.render(f))?;
+        // 2. Render (skip if nothing changed)
+        if app.needs_redraw || app.has_resized {
+            terminal.draw(|f| app.render(f))?;
+            app.needs_redraw = false;
+        }
 
         // 3. Poll for events. Busy-state redraw does not need 60 FPS; a slower
         // cadence keeps the TUI responsive without wasting most cycles on the spinner.
@@ -1802,6 +1806,7 @@ async fn run_main_loop(
         if has_event {
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {
+                    app.needs_redraw = true;
                     // Approval prompt: route y/n/a to approval channel
                     if is_approval_prompt_active() {
                         if let Some(result) = approval_result_for_key(&key) {
@@ -2059,17 +2064,21 @@ async fn run_main_loop(
                 }
                 Event::Resize(_, _) => {
                     app.has_resized = true;
+                    app.needs_redraw = true;
                     // Ratatui handles resize automatically on next draw
                 }
-                Event::Mouse(mouse_event) => match mouse_event.kind {
-                    ratatui::crossterm::event::MouseEventKind::ScrollDown => {
-                        app.scroll_lines(3);
+                Event::Mouse(mouse_event) => {
+                    app.needs_redraw = true;
+                    match mouse_event.kind {
+                        ratatui::crossterm::event::MouseEventKind::ScrollDown => {
+                            app.scroll_lines(3);
+                        }
+                        ratatui::crossterm::event::MouseEventKind::ScrollUp => {
+                            app.scroll_lines(-3);
+                        }
+                        _ => {}
                     }
-                    ratatui::crossterm::event::MouseEventKind::ScrollUp => {
-                        app.scroll_lines(-3);
-                    }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
@@ -2086,6 +2095,7 @@ async fn run_main_loop(
             app.picker_active = true;
             app.picker_results = results;
             app.picker_index = 0;
+            app.needs_redraw = true;
             // Push deadline far forward so we don't re-search until query changes
             app.mention_search_deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(3600);
@@ -2126,12 +2136,20 @@ async fn run_main_loop(
         // 5. Update elapsed time for status bar
         if app.agent_busy {
             if let Some(start) = agent_start_time.lock().await.as_ref() {
-                app.elapsed = Some(start.elapsed());
+                let new_elapsed = start.elapsed();
+                let new_secs = new_elapsed.as_secs();
+                let old_secs = app.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
+                app.elapsed = Some(new_elapsed);
+                if new_secs != old_secs {
+                    app.needs_redraw = true;
+                }
             }
         }
 
         // 6. Tick spinner
-        app.tick_spinner();
+        if app.tick_spinner() {
+            app.needs_redraw = true;
+        }
     }
 }
 
