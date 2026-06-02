@@ -112,6 +112,8 @@ pub struct TaskState {
     pub request_sent_time: Option<std::time::Instant>,
     /// Timestamp when the first provider chunk was received.
     pub first_provider_chunk_time: Option<std::time::Instant>,
+    /// Timestamp when the first displayable text reached the line buffer.
+    pub first_displayable_text_time: Option<std::time::Instant>,
     /// Timestamp when the first model output was emitted to the output writer.
     pub first_output_emit_time: Option<std::time::Instant>,
     /// Cumulative input tokens across all turns.
@@ -193,6 +195,7 @@ impl Default for TaskState {
             first_token_time: None,
             request_sent_time: None,
             first_provider_chunk_time: None,
+            first_displayable_text_time: None,
             first_output_emit_time: None,
             cumulative_tokens_in: 0,
             cumulative_tokens_out: 0,

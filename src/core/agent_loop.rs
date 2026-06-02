@@ -547,6 +547,17 @@ impl AgentLoop {
         }
     }
 
+    async fn record_first_displayable_text_time(&self) {
+        if !crate::cli::output::timing_enabled() {
+            return;
+        }
+
+        let mut state = self.state.lock().await;
+        if state.first_displayable_text_time.is_none() {
+            state.first_displayable_text_time = Some(std::time::Instant::now());
+        }
+    }
+
     pub fn new(config: AgentConfig) -> Self {
         let is_subagent = config.is_subagent_execution;
         let state = TaskState {
@@ -1582,6 +1593,7 @@ impl AgentLoop {
 
                         // Only display non-thinking content
                         if !processed.is_empty() {
+                            self.record_first_displayable_text_time().await;
                             display_buffer.push_str(&processed);
                             while let Some(nl_pos) = display_buffer.find('\n') {
                                 // Extract line and trim in one pass (reduces allocations)
@@ -3197,6 +3209,7 @@ impl AgentLoop {
                         start,
                         state.request_sent_time,
                         state.first_provider_chunk_time,
+                        state.first_displayable_text_time,
                         state.first_output_emit_time,
                         None,
                     ) {

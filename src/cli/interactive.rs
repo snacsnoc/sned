@@ -1779,6 +1779,7 @@ async fn run_main_loop(
         session_start_time: Option<std::time::Instant>,
         request_sent_time: Option<std::time::Instant>,
         first_provider_chunk_time: Option<std::time::Instant>,
+        first_displayable_text_time: Option<std::time::Instant>,
         first_output_emit_time: Option<std::time::Instant>,
         first_render_time: Option<std::time::Instant>,
         draw_total_us: u64,
@@ -1821,6 +1822,7 @@ async fn run_main_loop(
                     session_start,
                     self.request_sent_time,
                     self.first_provider_chunk_time,
+                    self.first_displayable_text_time,
                     self.first_output_emit_time,
                     self.first_render_time,
                 ) {
@@ -1838,6 +1840,7 @@ async fn run_main_loop(
         session_start_time: app.start_time,
         request_sent_time: None,
         first_provider_chunk_time: None,
+        first_displayable_text_time: None,
         first_output_emit_time: None,
         first_render_time: None,
         draw_total_us: 0,
@@ -1878,6 +1881,9 @@ async fn run_main_loop(
                     }
                     if timing.first_provider_chunk_time.is_none() {
                         timing.first_provider_chunk_time = state.first_provider_chunk_time;
+                    }
+                    if timing.first_displayable_text_time.is_none() {
+                        timing.first_displayable_text_time = state.first_displayable_text_time;
                     }
                     if timing.first_output_emit_time.is_none() {
                         timing.first_output_emit_time = state.first_output_emit_time;
