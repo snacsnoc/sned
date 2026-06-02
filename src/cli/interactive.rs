@@ -2050,6 +2050,7 @@ async fn run_main_loop(
                     }
                 }
                 Event::Paste(content) => {
+                    app.needs_redraw = true;
                     // Handle paste event with folding for large pastes
                     let folded = app.handle_paste(&content);
                     if folded {
