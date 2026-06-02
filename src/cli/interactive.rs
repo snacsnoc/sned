@@ -702,6 +702,20 @@ async fn handle_key_event(
         return Ok(None);
     }
 
+    // Escape key - dismiss slash command picker
+    if key.code == KeyCode::Esc && app.slash_command_active {
+        app.slash_command_active = false;
+        app.slash_command_results.clear();
+        app.slash_command_selected = 0;
+        let text = app.input.lines().join("\n");
+        if let Some(query) = crate::cli::slash_commands::extract_slash_query(&text) {
+            let start = text.find('/').unwrap_or(0);
+            let new_text = format!("{}{}", &text[..start], &text[start + query.len() + 1..]);
+            app.input = App::new_textarea(vec![new_text]);
+        }
+        return Ok(None);
+    }
+
     // Ctrl+L - clear output screen (with confirmation)
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.pending_clear = Some("ctrl_l".to_string());
@@ -721,6 +735,26 @@ async fn handle_key_event(
     // Ctrl+E - move cursor to end of line
     if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.input.move_cursor(tui_textarea::CursorMove::End);
+        return Ok(None);
+    }
+
+    // Slash command mode - Enter selects the current entry
+    if app.slash_command_active && key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        if !app.slash_command_results.is_empty() {
+            let selected = app.slash_command_results[app.slash_command_selected].name.clone();
+            app.input = App::new_textarea(vec![selected]);
+            app.slash_command_active = false;
+            app.slash_command_results.clear();
+            app.slash_command_selected = 0;
+        }
+        return Ok(None);
+    }
+
+    // Slash command mode - Tab cycles through results
+    if app.slash_command_active && key.code == KeyCode::Tab {
+        if !app.slash_command_results.is_empty() {
+            app.slash_command_selected = (app.slash_command_selected + 1) % app.slash_command_results.len();
+        }
         return Ok(None);
     }
 
@@ -757,6 +791,24 @@ async fn handle_key_event(
         app.mention_search_active = false;
         app.mention_search_query.clear();
     }
+
+    // Check for slash command mode activation / update
+    if let Some(query) = crate::cli::slash_commands::extract_slash_query(&input_text) {
+        if !app.slash_command_active {
+            app.slash_command_active = true;
+            app.slash_command_selected = 0;
+            app.slash_command_results =
+                crate::cli::slash_commands::filter_slash_commands(&app.slash_command_all_entries, &query);
+        } else {
+            app.slash_command_results =
+                crate::cli::slash_commands::filter_slash_commands(&app.slash_command_all_entries, &query);
+        }
+    } else if app.slash_command_active {
+        app.slash_command_active = false;
+        app.slash_command_results.clear();
+        app.slash_command_selected = 0;
+    }
+
     Ok(None)
 }
 
@@ -2188,6 +2240,24 @@ pub async fn run_interactive_shell_inner(
         *qh = Some(sess.queue_handle());
         let mut sh = state_handle.lock().await;
         *sh = Some(sess.state_handle());
+
+        let _cwd = app.cwd.clone();
+        let agent_loop = sess.agent_loop.state_handle();
+        let skills = {
+            let state = agent_loop.lock().await;
+            state.available_skills.clone()
+        };
+        let local_toggles: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let global_toggles: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let remote_toggles: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+
+        let entries = crate::cli::slash_commands::build_slash_command_entries(
+            &skills,
+            &local_toggles,
+            &global_toggles,
+            &remote_toggles,
+        );
+        app.slash_command_all_entries = entries;
     }
 
     // 6. Main loop

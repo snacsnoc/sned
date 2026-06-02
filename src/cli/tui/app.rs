@@ -133,6 +133,14 @@ pub struct App {
     pub cached_status_right: String,
     /// Seconds value the cached right segment was built for.
     pub cached_status_right_secs: u64,
+    /// Whether the slash command picker is active.
+    pub slash_command_active: bool,
+    /// Filtered slash command results for the current query.
+    pub slash_command_results: Vec<crate::cli::slash_commands::SlashCommandEntry>,
+    /// Currently selected index in the result list.
+    pub slash_command_selected: usize,
+    /// All available slash command entries (unfiltered).
+    pub slash_command_all_entries: Vec<crate::cli::slash_commands::SlashCommandEntry>,
 }
 
 impl App {
@@ -196,6 +204,10 @@ impl App {
             status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
             cached_status_right: String::new(),
             cached_status_right_secs: u64::MAX,
+            slash_command_active: false,
+            slash_command_results: Vec::new(),
+            slash_command_selected: 0,
+            slash_command_all_entries: Vec::new(),
         }
     }
 
@@ -481,6 +493,9 @@ impl App {
             if self.picker_active {
                 self.render_picker_overlay(frame, output_area);
             }
+            if self.slash_command_active {
+                self.render_slash_command_overlay(frame, output_area);
+            }
             self.render_plan_panel(frame, plan_area);
         } else {
             let [output_area, status_area, input_area] = Layout::vertical([
@@ -495,6 +510,9 @@ impl App {
             self.render_input(frame, input_area);
             if self.picker_active {
                 self.render_picker_overlay(frame, output_area);
+            }
+            if self.slash_command_active {
+                self.render_slash_command_overlay(frame, output_area);
             }
         }
     }
@@ -654,6 +672,50 @@ impl App {
         let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
             " Files ({}) ",
             self.picker_results.len()
+        )));
+
+        frame.render_widget(Clear, overlay_area);
+        frame.render_widget(picker, overlay_area);
+    }
+
+    /// Render slash command picker overlay as a floating Table widget.
+    fn render_slash_command_overlay(&self, frame: &mut Frame, output_area: Rect) {
+        let max_height = 10.min(self.slash_command_results.len() as u16);
+        let width = 50.min(output_area.width);
+
+        let overlay_area = Rect {
+            x: output_area.x + 2,
+            y: output_area
+                .y
+                .saturating_add(output_area.height.saturating_sub(max_height + 4)),
+            width,
+            height: max_height + 2,
+        };
+
+        let rows: Vec<Line> = self
+            .slash_command_results
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let category_marker = match entry.category {
+                    crate::cli::slash_commands::SlashCommandCategory::Agent => "▶ ",
+                    crate::cli::slash_commands::SlashCommandCategory::Local => "● ",
+                    crate::cli::slash_commands::SlashCommandCategory::Plan => "◆ ",
+                    crate::cli::slash_commands::SlashCommandCategory::Skill => "★ ",
+                    crate::cli::slash_commands::SlashCommandCategory::Workflow => "▸ ",
+                };
+                let label = format!("{} {} - {}", category_marker, entry.name, entry.description);
+                if i == self.slash_command_selected {
+                    Line::from(Span::styled(label, theme::picker_selected_style()))
+                } else {
+                    Line::from(label)
+                }
+            })
+            .collect();
+
+        let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
+            " Slash Commands ({}) ",
+            self.slash_command_results.len()
         )));
 
         frame.render_widget(Clear, overlay_area);
@@ -1209,5 +1271,32 @@ mod tests {
             "cache should rebuild when seconds change"
         );
         assert!(app.cached_status_right.contains("43"));
+    }
+
+    #[test]
+    fn test_slash_command_fields_initialized() {
+        let app = App::new();
+        assert!(!app.slash_command_active);
+        assert!(app.slash_command_results.is_empty());
+        assert_eq!(app.slash_command_selected, 0);
+        assert!(app.slash_command_all_entries.is_empty());
+    }
+
+    #[test]
+    fn test_slash_command_overlay_not_rendered_when_inactive() {
+        let mut app = App::new();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        app.slash_command_active = false;
+        app.slash_command_results = vec![crate::cli::slash_commands::SlashCommandEntry {
+            name: "exit".to_string(),
+            description: "Exit".to_string(),
+            aliases: vec![],
+            category: crate::cli::slash_commands::SlashCommandCategory::Local,
+            requires_args: false,
+        }];
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
     }
 }

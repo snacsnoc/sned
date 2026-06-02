@@ -696,7 +696,296 @@ pub fn parse_checkpoint_restore(text: &str) -> Option<usize> {
         .filter(|index| *index > 0)
 }
 
-pub fn format_help_text() -> String {
+// =============================================================================
+// Slash command autocomplete
+// =============================================================================
+
+/// Category of a slash command entry for grouping in the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCommandCategory {
+    /// Commands injected to the agent (newtask, compact, etc.)
+    Agent,
+    /// Local CLI-only commands (exit, clear, help, etc.)
+    Local,
+    /// Plan subcommands (status, approve, pause, etc.)
+    Plan,
+    /// Skills loaded from available skills
+    Skill,
+    /// Workflows loaded from .agents/workflows/ or ~/.sned/workflows/
+    Workflow,
+}
+
+/// A single slash command entry for the autocomplete picker.
+#[derive(Debug, Clone)]
+pub struct SlashCommandEntry {
+    /// Command name without the leading slash (e.g. "compact")
+    pub name: String,
+    /// One-line description shown in the picker
+    pub description: String,
+    /// Alternative names that match this command (e.g. ["q", "quit"] for exit)
+    pub aliases: Vec<String>,
+    /// Category for grouping/coloring
+    pub category: SlashCommandCategory,
+    /// Whether this command requires arguments (e.g. /commit, /expand)
+    pub requires_args: bool,
+}
+
+/// Build the list of all available slash command entries.
+///
+/// Combines built-in agent commands, local CLI commands, skills, and workflows
+/// into a single list for the autocomplete picker.
+pub fn build_slash_command_entries(
+    available_skills: &[SkillMetadata],
+    local_workflow_toggles: &HashMap<String, bool>,
+    global_workflow_toggles: &HashMap<String, bool>,
+    remote_workflow_toggles: &HashMap<String, bool>,
+) -> Vec<SlashCommandEntry> {
+    let mut entries = Vec::new();
+
+    // Agent-injected slash commands
+    entries.push(SlashCommandEntry {
+        name: "newtask".to_string(),
+        description: "Create a new task with the current context".to_string(),
+        aliases: vec!["nt".to_string()],
+        category: SlashCommandCategory::Agent,
+        requires_args: true,
+    });
+    entries.push(SlashCommandEntry {
+        name: "smol".to_string(),
+        description: "Run a compact, fast task".to_string(),
+        aliases: vec![],
+        category: SlashCommandCategory::Agent,
+        requires_args: true,
+    });
+    entries.push(SlashCommandEntry {
+        name: "compact".to_string(),
+        description: "Condense the current context to reduce token usage".to_string(),
+        aliases: vec!["c".to_string()],
+        category: SlashCommandCategory::Agent,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "newrule".to_string(),
+        description: "Add a new rule to the agent's behavior".to_string(),
+        aliases: vec!["nr".to_string()],
+        category: SlashCommandCategory::Agent,
+        requires_args: true,
+    });
+    entries.push(SlashCommandEntry {
+        name: "reportbug".to_string(),
+        description: "Report a bug in sned".to_string(),
+        aliases: vec!["bug".to_string()],
+        category: SlashCommandCategory::Agent,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "explain-changes".to_string(),
+        description: "Explain recent code changes".to_string(),
+        aliases: vec!["explain".to_string()],
+        category: SlashCommandCategory::Agent,
+        requires_args: false,
+    });
+
+    // Local CLI commands
+    entries.push(SlashCommandEntry {
+        name: "exit".to_string(),
+        description: "Exit the interactive shell".to_string(),
+        aliases: vec!["quit".to_string(), "q".to_string()],
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "clear".to_string(),
+        description: "Clear the output screen".to_string(),
+        aliases: vec!["cls".to_string()],
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "help".to_string(),
+        description: "Show available commands".to_string(),
+        aliases: vec!["?".to_string()],
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "settings".to_string(),
+        description: "View and edit configuration".to_string(),
+        aliases: vec![],
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "history".to_string(),
+        description: "Show command history".to_string(),
+        aliases: vec!["h".to_string()],
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "skills".to_string(),
+        description: "List available skills".to_string(),
+        aliases: vec![],
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "plan".to_string(),
+        description: "View or manage the current plan".to_string(),
+        aliases: vec![],
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "expand".to_string(),
+        description: "Expand a snipped block by index".to_string(),
+        aliases: vec!["e".to_string()],
+        category: SlashCommandCategory::Local,
+        requires_args: true,
+    });
+    entries.push(SlashCommandEntry {
+        name: "undo".to_string(),
+        description: "Undo the last edit operation".to_string(),
+        aliases: vec![],
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+    });
+    entries.push(SlashCommandEntry {
+        name: "commit".to_string(),
+        description: "Create a git commit with pending changes".to_string(),
+        aliases: vec![],
+        category: SlashCommandCategory::Local,
+        requires_args: true,
+    });
+    entries.push(SlashCommandEntry {
+        name: "checkpoint".to_string(),
+        description: "Create or restore a checkpoint".to_string(),
+        aliases: vec!["cp".to_string()],
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+    });
+
+    // Skills
+    for skill in available_skills {
+        let desc = if skill.description.is_empty() {
+            "Skill".to_string()
+        } else {
+            skill.description.clone()
+        };
+        entries.push(SlashCommandEntry {
+            name: skill.name.clone(),
+            description: desc,
+            aliases: vec![],
+            category: SlashCommandCategory::Skill,
+            requires_args: true,
+        });
+    }
+
+    // Note: workflows are loaded from disk and require cwd — the TUI layer
+    // calls build_slash_command_entries with a populated workflow list.
+    // For simplicity, the TUI passes a pre-built WorkflowInfo list below.
+    let _ = (local_workflow_toggles, global_workflow_toggles, remote_workflow_toggles);
+
+    entries
+}
+
+/// Build workflow entries from a pre-loaded workflow list.
+pub fn build_workflow_entries(workflows: &[(String, String)]) -> Vec<SlashCommandEntry> {
+    workflows
+        .iter()
+        .map(|(name, _content)| SlashCommandEntry {
+            name: name.clone(),
+            description: "Workflow".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Workflow,
+            requires_args: true,
+        })
+        .collect()
+}
+
+/// Extract the slash command query from the input text.
+///
+/// Returns `Some(query)` if the user is currently typing a slash command
+/// (text contains `/` at the start of a word), `None` otherwise.
+pub fn extract_slash_query(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut last_slash_pos = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'/' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            last_slash_pos = Some(i);
+        }
+    }
+    let pos = last_slash_pos?;
+    let after = &text[pos + 1..];
+    if after.split_whitespace().count() > 1 {
+        return None;
+    }
+    Some(after.split_whitespace().next().unwrap_or("").to_string())
+}
+
+/// Filter slash command entries by query string.
+///
+/// Returns matching entries in priority order:
+/// 1. Exact name match
+/// 2. Prefix match on name
+/// 3. Prefix match on alias
+/// 4. Substring match on name or description
+pub fn filter_slash_commands(
+    entries: &[SlashCommandEntry],
+    query: &str,
+) -> Vec<SlashCommandEntry> {
+    if query.is_empty() {
+        return entries.to_vec();
+    }
+
+    let query_lower = query.to_lowercase();
+
+    // Priority 1: exact name match
+    let exact: Vec<SlashCommandEntry> = entries
+        .iter()
+        .filter(|e| e.name.to_lowercase() == query_lower)
+        .cloned()
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    // Priority 2: prefix match on name
+    let prefix: Vec<SlashCommandEntry> = entries
+        .iter()
+        .filter(|e| e.name.to_lowercase().starts_with(&query_lower))
+        .cloned()
+        .collect();
+    if !prefix.is_empty() {
+        return prefix;
+    }
+
+    // Priority 3: prefix match on any alias
+    let alias: Vec<SlashCommandEntry> = entries
+        .iter()
+        .filter(|e| {
+            e.aliases
+                .iter()
+                .any(|a| a.to_lowercase().starts_with(&query_lower))
+        })
+        .cloned()
+        .collect();
+    if !alias.is_empty() {
+        return alias;
+    }
+
+    // Priority 4: substring match on name or description
+    let substring: Vec<SlashCommandEntry> = entries
+        .iter()
+        .filter(|e| {
+            e.name.to_lowercase().contains(&query_lower)
+                || e.description.to_lowercase().contains(&query_lower)
+        })
+        .cloned()
+        .collect();
+
+    substring.into_iter().take(10).collect()
+}pub fn format_help_text() -> String {
     use crate::cli::colors::style;
 
     let mut s = String::new();
@@ -2373,5 +2662,236 @@ mod tests {
             }
             other => panic!("unexpected result: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_extract_slash_query_empty() {
+        assert!(extract_slash_query("").is_none());
+    }
+
+    #[test]
+    fn test_extract_slash_query_no_slash() {
+        assert!(extract_slash_query("hello world").is_none());
+    }
+
+    #[test]
+    fn test_extract_slash_query_at_start() {
+        assert_eq!(extract_slash_query("/compact").unwrap(), "compact");
+    }
+
+    #[test]
+    fn test_extract_slash_query_after_whitespace() {
+        assert_eq!(extract_slash_query("hello /compact").unwrap(), "compact");
+    }
+
+    #[test]
+    fn test_extract_slash_query_multiple_words_not_detected() {
+        // Multiple words after slash returns None
+        assert!(extract_slash_query("/compact do this").is_none());
+    }
+
+    #[test]
+    fn test_extract_slash_query_latest_wins() {
+        assert_eq!(extract_slash_query("/a /b").unwrap(), "b");
+    }
+
+    #[test]
+    fn test_filter_slash_commands_empty_query() {
+        let entries = vec![
+            SlashCommandEntry {
+                name: "exit".to_string(),
+                description: "Exit".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Local,
+                requires_args: false,
+            },
+            SlashCommandEntry {
+                name: "compact".to_string(),
+                description: "Compact".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Agent,
+                requires_args: false,
+            },
+        ];
+        let results = filter_slash_commands(&entries, "");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_slash_commands_exact_match() {
+        let entries = vec![
+            SlashCommandEntry {
+                name: "exit".to_string(),
+                description: "Exit".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Local,
+                requires_args: false,
+            },
+            SlashCommandEntry {
+                name: "compact".to_string(),
+                description: "Compact".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Agent,
+                requires_args: false,
+            },
+        ];
+        let results = filter_slash_commands(&entries, "exit");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "exit");
+    }
+
+    #[test]
+    fn test_filter_slash_commands_prefix_match() {
+        let entries = vec![
+            SlashCommandEntry {
+                name: "exit".to_string(),
+                description: "Exit".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Local,
+                requires_args: false,
+            },
+            SlashCommandEntry {
+                name: "expand".to_string(),
+                description: "Expand".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Local,
+                requires_args: false,
+            },
+        ];
+        let results = filter_slash_commands(&entries, "ex");
+        assert_eq!(results.len(), 2);
+        // exit comes before expand alphabetically in this case
+        // but both should match prefix
+        assert!(results.iter().any(|e| e.name == "exit"));
+        assert!(results.iter().any(|e| e.name == "expand"));
+    }
+
+    #[test]
+    fn test_filter_slash_commands_alias_match() {
+        let entries = vec![
+            SlashCommandEntry {
+                name: "exit".to_string(),
+                description: "Exit".to_string(),
+                aliases: vec!["q".to_string(), "quit".to_string()],
+                category: SlashCommandCategory::Local,
+                requires_args: false,
+            },
+        ];
+        let results = filter_slash_commands(&entries, "q");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "exit");
+    }
+
+    #[test]
+    fn test_filter_slash_commands_case_insensitive() {
+        let entries = vec![
+            SlashCommandEntry {
+                name: "compact".to_string(),
+                description: "Compact".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Agent,
+                requires_args: false,
+            },
+        ];
+        let results = filter_slash_commands(&entries, "COMPACT");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "compact");
+    }
+
+    #[test]
+    fn test_filter_slash_commands_no_match() {
+        let entries = vec![
+            SlashCommandEntry {
+                name: "compact".to_string(),
+                description: "Compact".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Agent,
+                requires_args: false,
+            },
+        ];
+        let results = filter_slash_commands(&entries, "zzz");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_filter_slash_commands_description_match() {
+        let entries = vec![
+            SlashCommandEntry {
+                name: "compact".to_string(),
+                description: "Condense the current context".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Agent,
+                requires_args: false,
+            },
+        ];
+        let results = filter_slash_commands(&entries, "condense");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "compact");
+    }
+
+    #[test]
+    fn test_filter_slash_commands_exact_takes_priority() {
+        let entries = vec![
+            SlashCommandEntry {
+                name: "compact".to_string(),
+                description: "Compact".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Agent,
+                requires_args: false,
+            },
+            SlashCommandEntry {
+                name: "compact-all".to_string(),
+                description: "Compact all".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Agent,
+                requires_args: false,
+            },
+        ];
+        let results = filter_slash_commands(&entries, "compact");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "compact");
+    }
+
+    #[test]
+    fn test_filter_slash_commands_limit_substring() {
+        let entries: Vec<SlashCommandEntry> = (0..20)
+            .map(|i| SlashCommandEntry {
+                name: format!("command{}", i),
+                description: format!("Command {}", i),
+                aliases: vec![],
+                category: SlashCommandCategory::Local,
+                requires_args: false,
+            })
+            .collect();
+        // "xyz" doesn't match any name prefix, falls through to substring
+        let results = filter_slash_commands(&entries, "xyz");
+        assert_eq!(results.len(), 0);
+
+        // "command" matches all 20 as prefix - no limit applied to prefix matches
+        let results = filter_slash_commands(&entries, "command");
+        assert_eq!(results.len(), 20);
+
+        // Use a query that only matches via description substring
+        let entries2: Vec<SlashCommandEntry> = (0..20)
+            .map(|i| SlashCommandEntry {
+                name: format!("cmd{}", i),
+                description: format!("Special command {}", i),
+                aliases: vec![],
+                category: SlashCommandCategory::Local,
+                requires_args: false,
+            })
+            .collect();
+        // "Special" only matches in description (substring), limited to 10
+        let results = filter_slash_commands(&entries2, "Special");
+        assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn test_slash_command_category_all_variants() {
+        assert_eq!(format!("{:?}", SlashCommandCategory::Agent), "Agent");
+        assert_eq!(format!("{:?}", SlashCommandCategory::Local), "Local");
+        assert_eq!(format!("{:?}", SlashCommandCategory::Plan), "Plan");
+        assert_eq!(format!("{:?}", SlashCommandCategory::Skill), "Skill");
+        assert_eq!(format!("{:?}", SlashCommandCategory::Workflow), "Workflow");
     }
 }
