@@ -751,13 +751,6 @@ pub fn build_slash_command_entries(
         requires_args: true,
     });
     entries.push(SlashCommandEntry {
-        name: "smol".to_string(),
-        description: "Run a compact, fast task".to_string(),
-        aliases: vec![],
-        category: SlashCommandCategory::Agent,
-        requires_args: true,
-    });
-    entries.push(SlashCommandEntry {
         name: "compact".to_string(),
         description: "Condense the current context to reduce token usage".to_string(),
         aliases: vec!["c".to_string()],
