@@ -106,6 +106,14 @@ pub struct TaskState {
     pub compacted_summary: Option<crate::core::context::context_manager::CompactedSummary>,
     /// Session start time for calculating duration in session summary.
     pub session_start_time: Option<std::time::Instant>,
+    /// First token emission timestamp (set when first model output reaches user).
+    pub first_token_time: Option<std::time::Instant>,
+    /// Timestamp when the provider request was handed off.
+    pub request_sent_time: Option<std::time::Instant>,
+    /// Timestamp when the first provider chunk was received.
+    pub first_provider_chunk_time: Option<std::time::Instant>,
+    /// Timestamp when the first model output was emitted to the output writer.
+    pub first_output_emit_time: Option<std::time::Instant>,
     /// Cumulative input tokens across all turns.
     pub cumulative_tokens_in: u32,
     /// Cumulative output tokens across all turns.
@@ -182,6 +190,10 @@ impl Default for TaskState {
             first_tool_result_printed: false,
             compacted_summary: None,
             session_start_time: None,
+            first_token_time: None,
+            request_sent_time: None,
+            first_provider_chunk_time: None,
+            first_output_emit_time: None,
             cumulative_tokens_in: 0,
             cumulative_tokens_out: 0,
             cumulative_cache_writes: 0,

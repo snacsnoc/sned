@@ -1772,7 +1772,15 @@ async fn run_main_loop(
 ) -> anyhow::Result<()> {
     use std::sync::Mutex as StdMutex;
 
+    let timing_enabled = crate::cli::output::timing_enabled();
+
     struct TimingSummary {
+        enabled: bool,
+        session_start_time: Option<std::time::Instant>,
+        request_sent_time: Option<std::time::Instant>,
+        first_provider_chunk_time: Option<std::time::Instant>,
+        first_output_emit_time: Option<std::time::Instant>,
+        first_render_time: Option<std::time::Instant>,
         draw_total_us: u64,
         draw_count: u64,
         drain_total_us: u64,
@@ -1782,6 +1790,10 @@ async fn run_main_loop(
 
     impl Drop for TimingSummary {
         fn drop(&mut self) {
+            if !self.enabled {
+                return;
+            }
+
             eprintln!(
                 "[timing] draw: total={}us count={} avg={}us",
                 self.draw_total_us,
@@ -1803,6 +1815,18 @@ async fn run_main_loop(
                 }
             );
             eprintln!("[timing] output_lines_peak={}", self.output_lines_peak);
+
+            if let Some(session_start) = self.session_start_time {
+                for line in crate::cli::output::format_timing_phases(
+                    session_start,
+                    self.request_sent_time,
+                    self.first_provider_chunk_time,
+                    self.first_output_emit_time,
+                    self.first_render_time,
+                ) {
+                    eprintln!("{}", line);
+                }
+            }
         }
     }
 
@@ -1810,14 +1834,18 @@ async fn run_main_loop(
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(15);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
     let mut timing = TimingSummary {
+        enabled: timing_enabled,
+        session_start_time: app.start_time,
+        request_sent_time: None,
+        first_provider_chunk_time: None,
+        first_output_emit_time: None,
+        first_render_time: None,
         draw_total_us: 0,
         draw_count: 0,
         drain_total_us: 0,
         drain_count: 0,
         output_lines_peak: 0,
     };
-    let first_token_start = std::time::Instant::now();
-    let mut first_token_reported = false;
 
     loop {
         // 1. Drain channel into app
@@ -1827,13 +1855,6 @@ async fn run_main_loop(
             let us = t.elapsed().as_micros() as u64;
             timing.drain_total_us += us;
             timing.drain_count += 1;
-        }
-
-        // Track first-token latency
-        if !first_token_reported && !app.output_lines.is_empty() {
-            first_token_reported = true;
-            let latency = first_token_start.elapsed().as_micros() as u64;
-            eprintln!("[timing] first_token_us={}", latency);
         }
 
         // Track output lines peak
@@ -1848,6 +1869,21 @@ async fn run_main_loop(
                 && let Some(inner_arc) = state_arc.as_ref()
                 && let Ok(state) = inner_arc.try_lock()
             {
+                if timing_enabled {
+                    if timing.session_start_time.is_none() {
+                        timing.session_start_time = state.session_start_time;
+                    }
+                    if timing.request_sent_time.is_none() {
+                        timing.request_sent_time = state.request_sent_time;
+                    }
+                    if timing.first_provider_chunk_time.is_none() {
+                        timing.first_provider_chunk_time = state.first_provider_chunk_time;
+                    }
+                    if timing.first_output_emit_time.is_none() {
+                        timing.first_output_emit_time = state.first_output_emit_time;
+                    }
+                }
+
                 let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
                 if plan_changed {
                     app.needs_redraw = true;
@@ -1883,6 +1919,12 @@ async fn run_main_loop(
                 terminal.draw(|f| app.render(f))?;
                 timing.draw_total_us += t.elapsed().as_micros() as u64;
                 timing.draw_count += 1;
+                if timing_enabled
+                    && timing.first_render_time.is_none()
+                    && timing.first_output_emit_time.is_some()
+                {
+                    timing.first_render_time = Some(std::time::Instant::now());
+                }
             }
             app.needs_redraw = false;
         }

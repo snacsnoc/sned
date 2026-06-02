@@ -532,6 +532,21 @@ impl AgentLoop {
             .is_some_and(|plan| plan.approved && !plan.complete && !plan.paused)
     }
 
+    async fn record_first_output_emit_time(&self) {
+        if !crate::cli::output::timing_enabled() {
+            return;
+        }
+
+        let mut state = self.state.lock().await;
+        if state.first_output_emit_time.is_none() {
+            let now = std::time::Instant::now();
+            state.first_output_emit_time = Some(now);
+            if state.first_token_time.is_none() {
+                state.first_token_time = Some(now);
+            }
+        }
+    }
+
     pub fn new(config: AgentConfig) -> Self {
         let is_subagent = config.is_subagent_execution;
         let state = TaskState {
@@ -1384,6 +1399,13 @@ impl AgentLoop {
             RetryConfig::default()
         };
 
+        if crate::cli::output::timing_enabled() {
+            let mut state = self.state.lock().await;
+            if state.request_sent_time.is_none() {
+                state.request_sent_time = Some(std::time::Instant::now());
+            }
+        }
+
         let stream = match create_message_with_retry(
             provider.clone(),
             request,
@@ -1491,6 +1513,12 @@ impl AgentLoop {
             }
 
             if !first_chunk_received {
+                if crate::cli::output::timing_enabled() {
+                    let mut state = self.state.lock().await;
+                    if state.first_provider_chunk_time.is_none() {
+                        state.first_provider_chunk_time = Some(std::time::Instant::now());
+                    }
+                }
                 first_chunk_received = true;
             }
 
@@ -1621,6 +1649,7 @@ impl AgentLoop {
                                 }
 
                                 // Regular content - already trimmed
+                                self.record_first_output_emit_time().await;
                                 print_model_line(trimmed_line, &self.config.output_writer);
                             }
                             // Buffer flush to ~50ms frames to reduce syscalls on high-latency connections (P9)
@@ -1964,6 +1993,7 @@ impl AgentLoop {
         } else if !display_buffer.is_empty() && !self.config.json_output {
             let remaining = display_buffer.trim_end().to_string();
             if !remaining.is_empty() {
+                self.record_first_output_emit_time().await;
                 print_model_line(&remaining, &self.config.output_writer);
             }
         } else if !self.config.json_output {
@@ -3155,6 +3185,24 @@ impl AgentLoop {
                         "Failed to save API conversation history on completion: {}",
                         e
                     );
+                }
+            }
+            if !self.config.interactive_mode
+                && !self.config.json_output
+                && crate::cli::output::timing_enabled()
+            {
+                let state = self.state.lock().await;
+                if let Some(start) = state.session_start_time {
+                    for line in crate::cli::output::format_timing_phases(
+                        start,
+                        state.request_sent_time,
+                        state.first_provider_chunk_time,
+                        state.first_output_emit_time,
+                        None,
+                    ) {
+                        self.config.output_writer.emit(OutputEvent::dim(line));
+                    }
+                    self.config.output_writer.flush();
                 }
             }
             TurnResult::Complete

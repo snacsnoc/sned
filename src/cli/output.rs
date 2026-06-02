@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use std::fmt;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// An output event that can be rendered by the TUI or forwarded to stderr.
@@ -193,3 +194,123 @@ impl OutputWriter for ChannelOutputWriter {
 
 /// Type alias for convenience.
 pub type OutputWriterArc = Arc<dyn OutputWriter>;
+
+/// Returns whether diagnostic timing output is enabled.
+///
+/// Set `SNED_TIMING=1` to enable phase timing logs.
+pub fn timing_enabled() -> bool {
+    matches!(
+        std::env::var("SNED_TIMING").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// Output writer that records the timestamp of the first emit call.
+///
+/// Wraps another `OutputWriter` and records `Instant::now()` on the first
+/// `emit()` call. The recorded timestamp is exposed via `first_emit()` for
+/// downstream timing (e.g., first-token latency).
+pub struct TimingOutputWriter {
+    inner: OutputWriterArc,
+    first_emit: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl TimingOutputWriter {
+    pub fn new(inner: OutputWriterArc) -> Self {
+        Self {
+            inner,
+            first_emit: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Returns the timestamp of the first emit call, if any has occurred.
+    pub fn first_emit(&self) -> Option<std::time::Instant> {
+        *self.first_emit.lock().unwrap()
+    }
+}
+
+impl OutputWriter for TimingOutputWriter {
+    fn emit(&self, event: OutputEvent) {
+        let mut guard = self.first_emit.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(std::time::Instant::now());
+        }
+        drop(guard);
+        self.inner.emit(event);
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
+/// Format phase timing diagnostics into printable lines.
+pub fn format_timing_phases(
+    session_start: Instant,
+    request_sent: Option<Instant>,
+    first_provider_chunk: Option<Instant>,
+    first_output_emit: Option<Instant>,
+    first_render: Option<Instant>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if let Some(first_output_emit) = first_output_emit {
+        lines.push(format!(
+            "[timing] first_token_us={}",
+            first_output_emit.duration_since(session_start).as_micros()
+        ));
+    }
+
+    if let Some(request_sent) = request_sent {
+        lines.push(format!(
+            "[timing] session_to_request_us={}",
+            request_sent.duration_since(session_start).as_micros()
+        ));
+
+        if let Some(first_provider_chunk) = first_provider_chunk {
+            lines.push(format!(
+                "[timing] request_to_first_chunk_us={}",
+                first_provider_chunk.duration_since(request_sent).as_micros()
+            ));
+
+            if let Some(first_output_emit) = first_output_emit {
+                lines.push(format!(
+                    "[timing] first_chunk_to_first_output_us={}",
+                    first_output_emit.duration_since(first_provider_chunk).as_micros()
+                ));
+
+                if let Some(first_render) = first_render {
+                    lines.push(format!(
+                        "[timing] first_output_to_first_render_us={}",
+                        first_render.duration_since(first_output_emit).as_micros()
+                    ));
+                }
+            }
+        }
+    }
+
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_timing_phases;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_format_timing_phases_includes_all_known_phases() {
+        let start = Instant::now();
+        let request = start + Duration::from_millis(100);
+        let chunk = request + Duration::from_millis(250);
+        let output = chunk + Duration::from_millis(50);
+        let render = output + Duration::from_millis(16);
+
+        let lines = format_timing_phases(start, Some(request), Some(chunk), Some(output), Some(render));
+
+        assert_eq!(lines[0], "[timing] first_token_us=400000");
+        assert_eq!(lines[1], "[timing] session_to_request_us=100000");
+        assert_eq!(lines[2], "[timing] request_to_first_chunk_us=250000");
+        assert_eq!(lines[3], "[timing] first_chunk_to_first_output_us=50000");
+        assert_eq!(lines[4], "[timing] first_output_to_first_render_us=16000");
+    }
+}
