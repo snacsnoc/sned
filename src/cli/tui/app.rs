@@ -124,6 +124,11 @@ pub struct App {
     pub mention_search_query: String,
     /// Deadline for debounced mention search.
     pub mention_search_deadline: Instant,
+    /// Cached status bar left segment (provider / model | task | mode).
+    /// Rebuilt only when the underlying fields change.
+    pub cached_status_left: String,
+    /// Fingerprint of the fields used to build cached_status_left.
+    pub status_left_fingerprint: (String, String, String, String),
 }
 
 impl App {
@@ -183,6 +188,8 @@ impl App {
             mention_search_active: false,
             mention_search_query: String::new(),
             mention_search_deadline: Instant::now(),
+            cached_status_left: String::new(),
+            status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
         }
     }
 
@@ -503,11 +510,21 @@ impl App {
         frame.render_widget(&self.input, input_area);
     }
 
-    fn render_status_bar(&self, frame: &mut Frame, status_area: Rect) {
-        let status_left = format!(
-            " {} / {} | {} | {} ",
-            self.provider_name, self.model_name, self.task_id, self.mode
+    fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect) {
+        let current_fingerprint = (
+            self.provider_name.clone(),
+            self.model_name.clone(),
+            self.task_id.clone(),
+            self.mode.clone(),
         );
+        if self.status_left_fingerprint != current_fingerprint {
+            self.cached_status_left = format!(
+                " {} / {} | {} | {} ",
+                self.provider_name, self.model_name, self.task_id, self.mode
+            );
+            self.status_left_fingerprint = current_fingerprint;
+        }
+        let status_left = self.cached_status_left.clone();
         let status_right = if let Some(elapsed) = self.elapsed {
             format!("⏱ {} ", format_duration(elapsed))
         } else {
@@ -1086,5 +1103,48 @@ mod tests {
             placeholder_before,
             "render_output should not update placeholder"
         );
+    }
+
+    #[test]
+    fn test_render_status_bar_caches_static_fields() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.provider_name = "openai".to_string();
+        app.model_name = "gpt-4".to_string();
+        app.task_id = "task-1".to_string();
+        app.mode = "ACT".to_string();
+
+        let status_area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("first render should succeed");
+
+        let cached_after_first = app.cached_status_left.clone();
+        assert!(cached_after_first.contains("openai"));
+        assert!(cached_after_first.contains("gpt-4"));
+
+        // Second render with no field changes — cache should be reused
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("second render should succeed");
+        assert_eq!(
+            app.cached_status_left, cached_after_first,
+            "cache should be reused when fields are unchanged"
+        );
+
+        // Mutate a field — cache should rebuild
+        app.task_id = "task-2".to_string();
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("third render should succeed");
+        assert_ne!(
+            app.cached_status_left, cached_after_first,
+            "cache should rebuild when a field changes"
+        );
+        assert!(app.cached_status_left.contains("task-2"));
     }
 }
