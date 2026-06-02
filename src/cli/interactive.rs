@@ -1774,10 +1774,36 @@ async fn run_main_loop(
     const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(10);
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(15);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
+    let mut draw_total_us: u64 = 0;
+    let mut draw_count: u64 = 0;
+    let mut drain_total_us: u64 = 0;
+    let mut drain_count: u64 = 0;
+    let mut output_lines_peak: usize = 0;
+    let first_token_start = std::time::Instant::now();
+    let mut first_token_reported = false;
 
     loop {
         // 1. Drain channel into app
-        drain_output(output_rx, app);
+        {
+            let t = std::time::Instant::now();
+            drain_output(output_rx, app);
+            let us = t.elapsed().as_micros() as u64;
+            drain_total_us += us;
+            drain_count += 1;
+        }
+
+        // Track first-token latency
+        if !first_token_reported && !app.output_lines.is_empty() {
+            first_token_reported = true;
+            let latency = first_token_start.elapsed().as_micros() as u64;
+            eprintln!("[timing] first_token_us={}", latency);
+        }
+
+        // Track output lines peak
+        let len = app.output_lines.len();
+        if len > output_lines_peak {
+            output_lines_peak = len;
+        }
 
         // 1b. Sync plan state from TaskState to App TUI cache
         {
@@ -1815,7 +1841,12 @@ async fn run_main_loop(
 
         // 2. Render (skip if nothing changed)
         if app.needs_redraw || app.has_resized {
-            terminal.draw(|f| app.render(f))?;
+            {
+                let t = std::time::Instant::now();
+                terminal.draw(|f| app.render(f))?;
+                draw_total_us += t.elapsed().as_micros() as u64;
+                draw_count += 1;
+            }
             app.needs_redraw = false;
         }
 
@@ -2176,6 +2207,11 @@ async fn run_main_loop(
         if app.tick_spinner() {
             app.needs_redraw = true;
         }
+
+        // Print timing summary when loop exits
+        eprintln!("[timing] draw: total={}us count={} avg={}us", draw_total_us, draw_count, if draw_count > 0 { draw_total_us / draw_count } else { 0 });
+        eprintln!("[timing] drain: total={}us count={} avg={}us", drain_total_us, drain_count, if drain_count > 0 { drain_total_us / drain_count } else { 0 });
+        eprintln!("[timing] output_lines_peak={}", output_lines_peak);
     }
 }
 
@@ -2676,10 +2712,8 @@ mod tests {
     -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        {
-            let _lock = crate::core::approval::approval_test_guard();
-            reset_prompt_state();
-        }
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
 
         let (tx, _rx) = mpsc::channel(4);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
@@ -2717,10 +2751,8 @@ mod tests {
     async fn test_handle_key_event_allows_shutdown_submit_during_approval() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        {
-            let _lock = crate::core::approval::approval_test_guard();
-            reset_prompt_state();
-        }
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
 
         let (tx, _rx) = mpsc::channel(4);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
