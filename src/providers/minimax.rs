@@ -756,7 +756,7 @@ fn minimax_text_buffer_should_flush(buffer: &str) -> bool {
         return true;
     }
 
-    if buffer.len() >= MINIMAX_TEXT_FLUSH_THRESHOLD {
+    if buffer.chars().count() >= MINIMAX_TEXT_FLUSH_THRESHOLD {
         return true;
     }
 

@@ -1759,27 +1759,30 @@ async fn run_main_loop(
 
         // 1b. Sync plan state from TaskState to App TUI cache
         {
-            if let Some(state_arc) = state_handle.lock().await.as_ref() {
-                let state = state_arc.lock().await;
-                let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
-                if plan_changed {
-                    app.needs_redraw = true;
-                    if let Some(ref plan) = state.plan_state {
-                        let has_failed = plan
-                            .steps
-                            .iter()
-                            .any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
-                        app.mode = if plan.complete {
-                            "COMPLETE".to_string()
-                        } else if has_failed {
-                            "FAILED".to_string()
-                        } else if plan.paused {
-                            "PAUSED".to_string()
-                        } else if plan.approved {
-                            "ACT".to_string()
-                        } else {
-                            "PLAN".to_string()
-                        };
+            if let Ok(state_arc) = state_handle.try_lock() {
+                if let Some(ref inner_arc) = state_arc.as_ref() {
+                    if let Ok(state) = inner_arc.try_lock() {
+                        let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
+                        if plan_changed {
+                            app.needs_redraw = true;
+                            if let Some(ref plan) = state.plan_state {
+                                let has_failed = plan
+                                    .steps
+                                    .iter()
+                                    .any(|s| s.status == crate::core::plan_state::PlanStepStatus::Failed);
+                                app.mode = if plan.complete {
+                                    "COMPLETE".to_string()
+                                } else if has_failed {
+                                    "FAILED".to_string()
+                                } else if plan.paused {
+                                    "PAUSED".to_string()
+                                } else if plan.approved {
+                                    "ACT".to_string()
+                                } else {
+                                    "PLAN".to_string()
+                                };
+                            }
+                        }
                     }
                 }
             }
