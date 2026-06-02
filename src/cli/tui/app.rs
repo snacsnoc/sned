@@ -129,6 +129,10 @@ pub struct App {
     pub cached_status_left: String,
     /// Fingerprint of the fields used to build cached_status_left.
     pub status_left_fingerprint: (String, String, String, String),
+    /// Cached status bar right segment (elapsed timer). Rebuilt when seconds change.
+    pub cached_status_right: String,
+    /// Seconds value the cached right segment was built for.
+    pub cached_status_right_secs: u64,
 }
 
 impl App {
@@ -190,6 +194,8 @@ impl App {
             mention_search_deadline: Instant::now(),
             cached_status_left: String::new(),
             status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
+            cached_status_right: String::new(),
+            cached_status_right_secs: u64::MAX,
         }
     }
 
@@ -524,22 +530,25 @@ impl App {
             );
             self.status_left_fingerprint = current_fingerprint;
         }
-        let status_left = self.cached_status_left.clone();
-        let status_right = if let Some(elapsed) = self.elapsed {
-            format!("⏱ {} ", format_duration(elapsed))
-        } else {
-            String::new()
-        };
-        let left_width = UnicodeWidthStr::width(status_left.as_str());
-        let right_width = UnicodeWidthStr::width(status_right.as_str());
+        let elapsed_secs = self.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
+        if elapsed_secs != self.cached_status_right_secs {
+            self.cached_status_right = if let Some(elapsed) = self.elapsed {
+                format!("⏱ {} ", format_duration(elapsed))
+            } else {
+                String::new()
+            };
+            self.cached_status_right_secs = elapsed_secs;
+        }
+        let left_width = UnicodeWidthStr::width(self.cached_status_left.as_str());
+        let right_width = UnicodeWidthStr::width(self.cached_status_right.as_str());
         let spacer_len = status_area
             .width
             .saturating_sub((left_width + right_width) as u16)
             as usize;
         let status_line = Line::from(vec![
-            Span::styled(status_left, theme::status_style()),
+            Span::styled(self.cached_status_left.clone(), theme::status_style()),
             Span::raw(" ".repeat(spacer_len)),
-            Span::styled(status_right, theme::status_style()),
+            Span::styled(self.cached_status_right.clone(), theme::status_style()),
         ]);
         let status = Paragraph::new(status_line);
         frame.render_widget(status, status_area);
@@ -1161,5 +1170,44 @@ mod tests {
 
         app.clear_pastes();
         assert!(app.paste_chunks.is_empty());
+    }
+
+    #[test]
+    fn test_render_status_bar_caches_right_segment() {
+        use std::time::Duration;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.elapsed = Some(Duration::from_secs(42));
+
+        let status_area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("first render should succeed");
+        let cached_after_first = app.cached_status_right.clone();
+        assert!(cached_after_first.contains("42"));
+
+        // Same second — cache should be reused
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("second render should succeed");
+        assert_eq!(
+            app.cached_status_right, cached_after_first,
+            "cache should be reused within the same second"
+        );
+
+        // Different second — cache should rebuild
+        app.elapsed = Some(Duration::from_secs(43));
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("third render should succeed");
+        assert_ne!(
+            app.cached_status_right, cached_after_first,
+            "cache should rebuild when seconds change"
+        );
+        assert!(app.cached_status_right.contains("43"));
     }
 }
