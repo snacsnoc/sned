@@ -135,6 +135,10 @@ pub struct App {
     pub cached_status_right: String,
     /// Seconds value the cached right segment was built for.
     pub cached_status_right_secs: u64,
+    /// Cached visible output window result (start_idx, take_count, start_row_offset).
+    pub cached_visible_window: Option<(usize, usize, usize)>,
+    /// Fingerprint for the visible window cache (output_len, scroll_y, wrap_width, content_height, cached_visual_rows, scroll_mode).
+    pub cached_window_fingerprint: (usize, usize, usize, usize, usize, ScrollMode),
     /// Whether the slash command picker is active.
     pub slash_command_active: bool,
     /// Filtered slash command results for the current query.
@@ -211,6 +215,8 @@ impl App {
             slash_command_results: Vec::new(),
             slash_command_selected: 0,
             slash_command_all_entries: Vec::new(),
+            cached_visible_window: None,
+            cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
         }
     }
 
@@ -466,13 +472,28 @@ impl App {
     }
 
     fn visible_output_window(
-        &self,
+        &mut self,
         wrap_width: usize,
         scroll_y: usize,
         content_height: usize,
     ) -> (usize, usize, usize) {
         if self.output_lines.is_empty() {
             return (0, 0, 0);
+        }
+
+        let fingerprint = (
+            self.output_lines.len(),
+            scroll_y,
+            wrap_width,
+            content_height,
+            self.cached_visual_rows,
+            self.scroll_mode,
+        );
+
+        if let Some(cached) = self.cached_visible_window {
+            if self.cached_window_fingerprint == fingerprint {
+                return cached;
+            }
         }
 
         let target_start = scroll_y.min(self.cached_visual_rows);
@@ -508,7 +529,12 @@ impl App {
         }
 
         let take_count = end_idx.saturating_sub(start_idx).saturating_add(1);
-        (start_idx, take_count, start_row_offset)
+        let result = (start_idx, take_count, start_row_offset);
+
+        self.cached_visible_window = Some(result);
+        self.cached_window_fingerprint = fingerprint;
+
+        result
     }
 
     fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
