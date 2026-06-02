@@ -518,6 +518,31 @@ async fn handle_key_event(
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
 
+    fn accept_slash_completion(app: &mut App) -> bool {
+        if app.slash_command_results.is_empty() {
+            return false;
+        }
+
+        let text = app.input.lines().join("\n");
+        let selected = app.slash_command_results[app.slash_command_selected]
+            .name
+            .clone();
+
+        if let Some((new_text, cursor_pos)) =
+            crate::cli::slash_commands::apply_slash_completion(&text, &selected)
+        {
+            app.input = App::new_textarea(vec![new_text]);
+            app.input
+                .move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
+            app.slash_command_active = false;
+            app.slash_command_results.clear();
+            app.slash_command_selected = 0;
+            return true;
+        }
+
+        false
+    }
+
     // Tab or Enter with active file picker -> insert selection (must come before Enter handler)
     if app.picker_active
         && !app.picker_results.is_empty()
@@ -549,6 +574,32 @@ async fn handle_key_event(
         app.mention_search_active = false;
         app.mention_search_query.clear();
         // Fall through to normal Enter/Tab handling
+    }
+
+    // Slash command mode - Tab/Enter accept the current entry into the input box.
+    if app.slash_command_active && key.code == KeyCode::Tab {
+        if accept_slash_completion(app) {
+            return Ok(None);
+        }
+        return Ok(None);
+    }
+    if app.slash_command_active
+        && key.code == KeyCode::Enter
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        let text = app.input.lines().join("\n");
+        let current_query = crate::cli::slash_commands::extract_slash_query(&text);
+        let selected = app
+            .slash_command_results
+            .get(app.slash_command_selected)
+            .map(|entry| entry.name.as_str());
+
+        if let (Some(query), Some(selected)) = (current_query.as_deref(), selected) {
+            if query != selected && accept_slash_completion(app) {
+                return Ok(None);
+            }
+        }
+        // Fall through so Enter can submit a non-autocomplete slash command.
     }
 
     // Enter key - intercept before passing to textarea
@@ -726,26 +777,6 @@ async fn handle_key_event(
     // Ctrl+E - move cursor to end of line
     if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.input.move_cursor(tui_textarea::CursorMove::End);
-        return Ok(None);
-    }
-
-    // Slash command mode - Enter selects the current entry
-    if app.slash_command_active && key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
-        if !app.slash_command_results.is_empty() {
-            let selected = app.slash_command_results[app.slash_command_selected].name.clone();
-            app.input = App::new_textarea(vec![selected]);
-            app.slash_command_active = false;
-            app.slash_command_results.clear();
-            app.slash_command_selected = 0;
-        }
-        return Ok(None);
-    }
-
-    // Slash command mode - Tab cycles through results
-    if app.slash_command_active && key.code == KeyCode::Tab {
-        if !app.slash_command_results.is_empty() {
-            app.slash_command_selected = (app.slash_command_selected + 1) % app.slash_command_results.len();
-        }
         return Ok(None);
     }
 
@@ -2569,6 +2600,76 @@ mod tests {
         assert!(is_shutdown_submit("/q"));
         assert!(!is_shutdown_submit("/clear"));
         assert!(!is_shutdown_submit("hello world"));
+    }
+
+    fn slash_completion_test_app() -> App {
+        let mut app = App::new();
+        app.input = App::new_textarea(vec!["/pl".to_string()]);
+        app.slash_command_active = true;
+        app.slash_command_results = vec![crate::cli::slash_commands::SlashCommandEntry {
+            name: "plan".to_string(),
+            description: "View or manage the current plan".to_string(),
+            aliases: vec![],
+            category: crate::cli::slash_commands::SlashCommandCategory::Plan,
+            requires_args: false,
+        }];
+        app.slash_command_selected = 0;
+        app
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_accepts_slash_completion_with_enter()
+    -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = slash_completion_test_app();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "/plan");
+        assert!(!app.slash_command_active);
+        assert!(app.slash_command_results.is_empty());
+        assert_eq!(app.slash_command_selected, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_accepts_slash_completion_with_tab() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = slash_completion_test_app();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "/plan");
+        assert!(!app.slash_command_active);
+        assert!(app.slash_command_results.is_empty());
+        assert_eq!(app.slash_command_selected, 0);
+
+        Ok(())
     }
 
     #[tokio::test]

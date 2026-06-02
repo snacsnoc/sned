@@ -916,6 +916,35 @@ pub fn extract_slash_query(text: &str) -> Option<String> {
     Some(after.split_whitespace().next().unwrap_or("").to_string())
 }
 
+/// Replace the active slash query with the selected command name.
+///
+/// The returned text keeps any prefix before the slash and any suffix after
+/// the typed query, but the current `/query` token is replaced with the
+/// completed command name including its leading slash.
+pub fn apply_slash_completion(text: &str, command_name: &str) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut last_slash_pos = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'/' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            last_slash_pos = Some(i);
+        }
+    }
+
+    let pos = last_slash_pos?;
+    let query = extract_slash_query(text)?;
+    let end = pos + 1 + query.len();
+
+    let mut new_text =
+        String::with_capacity(text.len() + command_name.len() + 1 - (end - pos));
+    new_text.push_str(&text[..pos]);
+    new_text.push('/');
+    new_text.push_str(command_name);
+    new_text.push_str(&text[end..]);
+
+    let cursor_pos = text[..pos].len() + command_name.len() + 1;
+    Some((new_text, cursor_pos))
+}
+
 /// Filter slash command entries by query string.
 ///
 /// Returns matching entries in priority order:
@@ -2686,6 +2715,20 @@ mod tests {
     #[test]
     fn test_extract_slash_query_latest_wins() {
         assert_eq!(extract_slash_query("/a /b").unwrap(), "b");
+    }
+
+    #[test]
+    fn test_apply_slash_completion_replaces_current_query() {
+        let (text, cursor) = apply_slash_completion("please /pl", "plan").unwrap();
+        assert_eq!(text, "please /plan");
+        assert_eq!(cursor, "please /plan".len());
+    }
+
+    #[test]
+    fn test_apply_slash_completion_preserves_suffix() {
+        let (text, cursor) = apply_slash_completion("/pl  ", "plan").unwrap();
+        assert_eq!(text, "/plan  ");
+        assert_eq!(cursor, "/plan".len());
     }
 
     #[test]
