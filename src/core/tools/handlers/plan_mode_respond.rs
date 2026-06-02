@@ -87,7 +87,7 @@ impl PlanModeRespondHandler {
             use crate::cli::output::OutputEvent;
             use ratatui::style::{Color, Modifier, Style};
             ctx.output_writer.emit(OutputEvent::styled(
-                format!("\n{} {}\n{}\n", "Plan", "Generated Plan", response),
+                format!("\n📋 Plan Generated\n{}\n", response),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
