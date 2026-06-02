@@ -465,6 +465,52 @@ impl App {
         width.max(1).div_ceil(wrap_width)
     }
 
+    fn visible_output_window(
+        &self,
+        wrap_width: usize,
+        scroll_y: usize,
+        content_height: usize,
+    ) -> (usize, usize, usize) {
+        if self.output_lines.is_empty() {
+            return (0, 0, 0);
+        }
+
+        let target_start = scroll_y.min(self.cached_visual_rows);
+        let target_end = target_start.saturating_add(content_height.max(1));
+
+        let mut rows_before = 0usize;
+        let mut start_idx = self.output_lines.len();
+        let mut start_row_offset = 0usize;
+        let mut end_idx = self.output_lines.len().saturating_sub(1);
+
+        for (idx, line) in self.output_lines.iter().enumerate() {
+            let rows = Self::line_visual_rows(line, wrap_width);
+            let rows_after = rows_before.saturating_add(rows);
+
+            if start_idx == self.output_lines.len() && rows_after > target_start {
+                start_idx = idx;
+                start_row_offset = target_start.saturating_sub(rows_before);
+            }
+
+            if rows_after >= target_end {
+                end_idx = idx;
+                break;
+            }
+
+            rows_before = rows_after;
+            end_idx = idx;
+        }
+
+        if start_idx == self.output_lines.len() {
+            start_idx = self.output_lines.len().saturating_sub(1);
+            start_row_offset = 0;
+            end_idx = start_idx;
+        }
+
+        let take_count = end_idx.saturating_sub(start_idx).saturating_add(1);
+        (start_idx, take_count, start_row_offset)
+    }
+
     fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
         self.cached_visual_rows = self
             .output_lines
@@ -593,13 +639,22 @@ impl App {
         let wrap_width = Self::content_wrap_width(output_area.width as usize);
         let total_rows = self.total_visual_rows(wrap_width);
         let scroll_y = self.resolved_scroll_y_for(total_rows, content_height);
+        let (start_idx, visible_count, visible_scroll_y) =
+            self.visible_output_window(wrap_width, scroll_y as usize, content_height);
 
         // Render the full transcript. Cached row counts keep scroll math cheap,
         // but slicing the render buffer can clip wrapped prompt text.
         {
-            let output = Paragraph::new(self.output_lines.iter().cloned().collect::<Vec<_>>())
+            let output = Paragraph::new(
+                self.output_lines
+                    .iter()
+                    .skip(start_idx)
+                    .take(visible_count)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
                 .wrap(Wrap { trim: false })
-                .scroll((scroll_y, 0))
+                .scroll((visible_scroll_y as u16, 0))
                 .block(
                     theme::border_block(" sned ")
                         .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
@@ -960,6 +1015,26 @@ mod tests {
         app.clear_output();
         assert_eq!(app.total_visual_rows(wrap_width), 0);
         assert_eq!(app.cached_visual_rows, 0);
+    }
+
+    #[test]
+    fn test_visible_output_window_limits_render_to_viewport_slice() {
+        let mut app = App::new();
+        app.set_content_width(20);
+
+        app.push_plain("this first line wraps over the viewport width");
+        for index in 0..40 {
+            app.push_plain(format!("line {}", index));
+        }
+
+        let wrap_width = app.last_wrap_width();
+        let total_rows = app.total_visual_rows(wrap_width);
+        let (start_idx, take_count, scroll_y) =
+            app.visible_output_window(wrap_width, total_rows.saturating_sub(3), 3);
+
+        assert!(start_idx > 0, "expected a later slice near the bottom");
+        assert!(take_count < app.output_lines.len(), "window should not clone all lines");
+        assert!(scroll_y <= 3, "local scroll offset should stay within the viewport");
     }
 
     #[test]
