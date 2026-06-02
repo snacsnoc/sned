@@ -135,6 +135,10 @@ pub struct App {
     pub cached_status_right: String,
     /// Seconds value the cached right segment was built for.
     pub cached_status_right_secs: u64,
+    /// Cached spacer string for the status bar.
+    pub cached_spacer: String,
+    /// Length the cached spacer was built for.
+    pub cached_spacer_len: usize,
     /// Cached visible output window result (start_idx, take_count, start_row_offset).
     pub cached_visible_window: Option<(usize, usize, usize)>,
     /// Fingerprint for the visible window cache (output_len, scroll_y, wrap_width, content_height, cached_visual_rows, scroll_mode).
@@ -211,6 +215,8 @@ impl App {
             status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
             cached_status_right: String::new(),
             cached_status_right_secs: u64::MAX,
+            cached_spacer: String::new(),
+            cached_spacer_len: 0,
             slash_command_active: false,
             slash_command_results: Vec::new(),
             slash_command_selected: 0,
@@ -646,9 +652,13 @@ impl App {
             .width
             .saturating_sub((left_width + right_width) as u16)
             as usize;
+        if spacer_len != self.cached_spacer_len {
+            self.cached_spacer = " ".repeat(spacer_len);
+            self.cached_spacer_len = spacer_len;
+        }
         let status_line = Line::from(vec![
             Span::styled(self.cached_status_left.clone(), theme::status_style()),
-            Span::raw(" ".repeat(spacer_len)),
+            Span::raw(self.cached_spacer.clone()),
             Span::styled(self.cached_status_right.clone(), theme::status_style()),
         ]);
         let status = Paragraph::new(status_line);
