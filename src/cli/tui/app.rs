@@ -1313,4 +1313,66 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("render should succeed");
     }
+
+    #[test]
+    fn test_wrapped_line_not_clipped_at_viewport_boundary() {
+        // This is the exact scenario that caused the clipping bug with the old
+        // virtual scrolling approach. A long wrapped line sits at the top of the
+        // visible viewport. The old approach sliced the buffer and used a local
+        // scroll offset, which was wrong when line_visual_rows() didn't match
+        // ratatui's actual wrapping. The current approach passes the full buffer
+        // and lets ratatui handle wrapping + scrolling natively.
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.set_content_width(60);
+        app.set_content_height(8); // 10 - 2 border
+
+        // Short lines first
+        for i in 0..5 {
+            app.push_plain(format!("short line {}", i));
+        }
+        // A long wrapped line that takes ~3 visual rows at width 60
+        let long_line = "This is a very long prompt line that wraps across multiple visual rows in the terminal output pane and must not be clipped when scrolled into view";
+        app.push_plain(long_line);
+        // More short lines
+        for i in 0..10 {
+            app.push_plain(format!("trailing line {}", i));
+        }
+
+        // Scroll to a position where the long wrapped line is at the top of the viewport.
+        // The long line starts at visual row 5 (after 5 short lines).
+        // Scroll so the viewport starts at row 5 (the long line is the first visible line).
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 5;
+        app.last_content_width = 60;
+        app.last_content_height = 8;
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+
+        // The long line must be visible and not clipped.
+        // Its first words should appear in the rendered output.
+        let full_rendered = rendered.join("\n");
+        assert!(
+            full_rendered.contains("This is a very long"),
+            "wrapped line must not be clipped at viewport boundary.\nRendered:\n{}",
+            full_rendered
+        );
+        // The long line should also show its tail (not clipped mid-word).
+        assert!(
+            full_rendered.contains("scrolled into view"),
+            "wrapped line tail must be visible, not clipped.\nRendered:\n{}",
+            full_rendered
+        );
+    }
 }
