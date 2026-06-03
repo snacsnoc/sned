@@ -292,46 +292,46 @@ pub fn format_heat_map(edit_files: &[(String, i32, i32)]) -> String {
     )
 }
 
-pub fn format_tool_result(result: &str, max_lines: usize) -> String {
-    // Strip hash anchors (Word§line content) from display — they're agent-internal
-    // for edit_file, not user-facing. The § delimiter separates the anchor word from
-    // the actual file content.
-    let stripped: String = result
-        .lines()
-        .map(|line| {
-            if let Some(idx) = line.find('§') {
-                // Verify the prefix is a single-word anchor (no spaces before §)
-                let prefix = &line[..idx];
-                if !prefix.contains(char::is_whitespace) && !prefix.is_empty() {
-                    return &line[idx + '§'.len_utf8()..];
-                }
-            }
-            line
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Count lines and find truncation point without full collection
-    let mut line_count = 0;
-    let mut truncate_after = None;
-
-    for (i, _) in stripped.lines().enumerate() {
-        line_count = i + 1;
-        if i == max_lines {
-            truncate_after = Some(i);
-            break;
+/// Strip the hash anchor prefix (Word§) from a single line.
+/// Returns the line unchanged if it doesn't look like an anchored line.
+fn strip_anchor(line: &str) -> &str {
+    if let Some(idx) = line.find('§') {
+        // Verify the prefix is a single-word anchor (no whitespace before §)
+        let prefix = &line[..idx];
+        if !prefix.is_empty() && !prefix.contains(char::is_whitespace) {
+            return &line[idx + '§'.len_utf8()..];
         }
     }
+    line
+}
 
-    // No truncation needed - return stripped
-    if truncate_after.is_none() {
-        return stripped;
+pub fn format_tool_result(result: &str, max_lines: usize) -> String {
+    // Strip hash anchors (Word§line content) from display — they're agent-internal
+    // for edit_file, not user-facing. The § delimiter separates the anchor word
+    // from the actual file content.
+    //
+    // Single pass: strip anchors and count lines, stopping early once we know
+    // truncation is needed. Only allocate the final output string.
+    let mut output = String::new();
+    let mut line_count = 0;
+
+    for line in result.lines() {
+        let stripped = strip_anchor(line);
+
+        if line_count == max_lines {
+            // We have enough lines; count remaining without building output.
+            let remaining = result.lines().count() - max_lines;
+            return format!("{output}\n... {remaining} more lines");
+        }
+
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(stripped);
+        line_count += 1;
     }
 
-    // Collect only the lines we need to display
-    let displayed: Vec<&str> = stripped.lines().take(max_lines).collect();
-    let remaining = line_count - max_lines;
-    format!("{}\n... {} more lines", displayed.join("\n"), remaining)
+    output
 }
 
 #[cfg(test)]
@@ -417,5 +417,53 @@ mod tests {
         let params = serde_json::json!({});
         let summary = format_tool_summary("unknown_tool", &params);
         assert_eq!(summary, "unknown_tool");
+    }
+
+    #[test]
+    fn test_strip_anchor_with_valid_prefix() {
+        assert_eq!(strip_anchor("TranslucentMismatch§/*"), "/*");
+        assert_eq!(strip_anchor("Apple§void main() {"), "void main() {");
+    }
+
+    #[test]
+    fn test_strip_anchor_without_anchor() {
+        assert_eq!(strip_anchor("just a line"), "just a line");
+        assert_eq!(strip_anchor(""), "");
+    }
+
+    #[test]
+    fn test_strip_anchor_preserves_mid_line_delimiter() {
+        assert_eq!(strip_anchor("foo § bar"), "foo § bar");
+    }
+
+    #[test]
+    fn test_strip_anchor_preserves_whitespace_prefix() {
+        assert_eq!(strip_anchor("  Word§content"), "  Word§content");
+    }
+
+    #[test]
+    fn test_format_tool_result_strips_anchors() {
+        let result = "TranslucentMismatch§/*\nWarehouseSetter§ * Tetris clone";
+        let formatted = format_tool_result(result, 10);
+        assert_eq!(formatted, "/*\n * Tetris clone");
+    }
+
+    #[test]
+    fn test_format_tool_result_no_truncation() {
+        let result = "line one\nline two\nline three";
+        let formatted = format_tool_result(result, 10);
+        assert_eq!(formatted, "line one\nline two\nline three");
+    }
+
+    #[test]
+    fn test_format_tool_result_with_truncation() {
+        let result = "a\nb\nc\nd\ne\nf\ng\nh";
+        let formatted = format_tool_result(result, 3);
+        assert_eq!(formatted, "a\nb\nc\n... 5 more lines");
+    }
+
+    #[test]
+    fn test_format_tool_result_empty() {
+        assert_eq!(format_tool_result("", 10), "");
     }
 }
