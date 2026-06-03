@@ -137,7 +137,9 @@ pub struct App {
     /// Cached status bar right segment (elapsed timer). Rebuilt when seconds change.
     pub cached_status_right: String,
     /// Seconds value the cached right segment was built for.
-    pub cached_status_right_secs: u64,
+    /// Last known context usage percentage from the API.
+    pub context_pct: Option<f64>,
+    pub cached_status_right_secs: (u64, Option<f64>),
     /// Cached spacer string for the status bar.
     pub cached_spacer: String,
     /// Length the cached spacer was built for.
@@ -218,7 +220,8 @@ impl App {
             cached_status_left: String::new(),
             status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
             cached_status_right: String::new(),
-            cached_status_right_secs: u64::MAX,
+            cached_status_right_secs: (u64::MAX, None),
+            context_pct: None,
             cached_spacer: String::new(),
             cached_spacer_len: 0,
             slash_command_active: false,
@@ -617,8 +620,17 @@ impl App {
     }
 
     fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
-        // Update input block with themed border and styled title
-        let input_title = Line::from(" Input ");
+        let input_title = if self.agent_busy
+            && !crate::core::approval::is_approval_prompt_active()
+        {
+            if self.reasoning_active {
+                format!(" {} Reasoning... ", self.spinner_char())
+            } else {
+                format!(" {} Agent processing... ", self.spinner_char())
+            }
+        } else {
+            " Input ".to_string()
+        };
         self.input
             .set_block(theme::input_block(input_title, self.agent_busy));
 
@@ -642,13 +654,18 @@ impl App {
             self.status_left_fingerprint = current_fingerprint;
         }
         let elapsed_secs = self.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
-        if elapsed_secs != self.cached_status_right_secs {
-            self.cached_status_right = if let Some(elapsed) = self.elapsed {
-                format!("⏱ {} ", format_duration(elapsed))
-            } else {
-                String::new()
+        let context_key = (elapsed_secs, self.context_pct);
+        if context_key != self.cached_status_right_secs {
+            let context_str = self
+                .context_pct
+                .map(|pct| format!("Context: {:.0}% left · ", 100.0 - pct));
+            self.cached_status_right = match (context_str, self.elapsed) {
+                (Some(ctx), Some(elapsed)) => format!("{}⏱ {} ", ctx, format_duration(elapsed)),
+                (Some(ctx), None) => format!("{} ", ctx),
+                (None, Some(elapsed)) => format!("⏱ {} ", format_duration(elapsed)),
+                (None, None) => String::new(),
             };
-            self.cached_status_right_secs = elapsed_secs;
+            self.cached_status_right_secs = context_key;
         }
         let left_width = UnicodeWidthStr::width(self.cached_status_left.as_str());
         let right_width = UnicodeWidthStr::width(self.cached_status_right.as_str());
@@ -700,29 +717,6 @@ impl App {
                         .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
                 );
             frame.render_widget(output, output_area);
-
-            // Keep a single busy indicator in the output pane. Duplicating the
-            // spinner in the input pane just burns redraw budget and visual space.
-            // When reasoning is active (model streaming reasoning before any
-            // displayable text), show a "Reasoning..." indicator instead so the
-            // user can see the agent is alive during the 20s+ reasoning phase.
-            if self.agent_busy && !crate::core::approval::is_approval_prompt_active() {
-                let loading_area = Rect::new(
-                    output_area.x,
-                    output_area.y + output_area.height.saturating_sub(1),
-                    output_area.width,
-                    1,
-                );
-                let label = if self.reasoning_active {
-                    format!("{} Reasoning...", self.spinner_char())
-                } else {
-                    format!("{} Agent processing...", self.spinner_char())
-                };
-                let loading = Paragraph::new(Line::from(Span::styled(label, theme::spinner_style())))
-                    .style(theme::status_style());
-                frame.render_widget(loading, loading_area);
-            }
-
         }
 
         // Scrollbar on output pane (render inside the border)
