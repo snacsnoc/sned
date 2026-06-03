@@ -293,11 +293,29 @@ pub fn format_heat_map(edit_files: &[(String, i32, i32)]) -> String {
 }
 
 pub fn format_tool_result(result: &str, max_lines: usize) -> String {
+    // Strip hash anchors (Word§line content) from display — they're agent-internal
+    // for edit_file, not user-facing. The § delimiter separates the anchor word from
+    // the actual file content.
+    let stripped: String = result
+        .lines()
+        .map(|line| {
+            if let Some(idx) = line.find('§') {
+                // Verify the prefix is a single-word anchor (no spaces before §)
+                let prefix = &line[..idx];
+                if !prefix.contains(char::is_whitespace) && !prefix.is_empty() {
+                    return &line[idx + '§'.len_utf8()..];
+                }
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     // Count lines and find truncation point without full collection
     let mut line_count = 0;
     let mut truncate_after = None;
 
-    for (i, _) in result.lines().enumerate() {
+    for (i, _) in stripped.lines().enumerate() {
         line_count = i + 1;
         if i == max_lines {
             truncate_after = Some(i);
@@ -305,13 +323,13 @@ pub fn format_tool_result(result: &str, max_lines: usize) -> String {
         }
     }
 
-    // No truncation needed - return original
+    // No truncation needed - return stripped
     if truncate_after.is_none() {
-        return result.to_string();
+        return stripped;
     }
 
     // Collect only the lines we need to display
-    let displayed: Vec<&str> = result.lines().take(max_lines).collect();
+    let displayed: Vec<&str> = stripped.lines().take(max_lines).collect();
     let remaining = line_count - max_lines;
     format!("{}\n... {} more lines", displayed.join("\n"), remaining)
 }
