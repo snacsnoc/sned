@@ -3128,40 +3128,7 @@ impl AgentLoop {
         if !self.config.json_output && self.config.show_token_usage {
             let state = self.state.lock().await;
             if let Some(ref api_req_info) = state.last_api_req_info {
-                let tokens_in = api_req_info.tokens_in.unwrap_or(0);
-                let tokens_out = api_req_info.tokens_out.unwrap_or(0);
-                let cache_writes = api_req_info.cache_writes.unwrap_or(0);
-                let cache_reads = api_req_info.cache_reads.unwrap_or(0);
-                let reasoning = api_req_info.reasoning_tokens.unwrap_or(0);
-                let cost = api_req_info.cost.unwrap_or(0.0);
                 let context_pct = api_req_info.context_usage_percentage.unwrap_or(0.0);
-
-                let cost_str = if cost > 0.0 {
-                    format!(" | ${:.4}", cost)
-                } else {
-                    String::new()
-                };
-
-                self.config.output_writer.emit(OutputEvent::dim(format!(
-                    "  📊 Tokens: {} in / {} out{}{}{} | Context: {:.1}%",
-                    tokens_in,
-                    tokens_out,
-                    if cache_writes > 0 || cache_reads > 0 {
-                        format!(
-                            " ({} cache write / {} cache read)",
-                            cache_writes, cache_reads
-                        )
-                    } else {
-                        String::new()
-                    },
-                    if reasoning > 0 {
-                        format!(" | {} reasoning", reasoning)
-                    } else {
-                        String::new()
-                    },
-                    cost_str,
-                    context_pct
-                )));
 
                 if context_pct >= 95.0 {
                     self.config.output_writer.emit(OutputEvent::yellow(
@@ -3175,17 +3142,6 @@ impl AgentLoop {
                     self.config.output_writer.emit(OutputEvent::dim(
                         "ℹ 50% context window used — use /compact to free space before starting new topics".to_string(),
                     ));
-                }
-
-                let cost_warn_threshold = std::env::var("SNED_COST_WARN")
-                    .ok()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(5.0);
-                if cost >= cost_warn_threshold {
-                    self.config.output_writer.emit(OutputEvent::yellow(format!(
-                        "⚠ Session cost ${:.2} (threshold: ${:.2})",
-                        cost, cost_warn_threshold
-                    )));
                 }
             }
         }

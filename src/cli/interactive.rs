@@ -1912,6 +1912,10 @@ async fn run_main_loop(
                 }
 
                 app.reasoning_active = state.reasoning_active;
+                app.context_pct = state
+                    .last_api_req_info
+                    .as_ref()
+                    .and_then(|info| info.context_usage_percentage);
                 let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
                 if plan_changed {
                     app.needs_redraw = true;
