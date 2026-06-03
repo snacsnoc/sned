@@ -62,6 +62,9 @@ pub struct App {
     pub input: TextArea<'static>,
     /// Whether the agent is currently busy
     pub agent_busy: bool,
+    /// Whether the model is currently in a reasoning/thinking phase (no displayable output yet).
+    /// Drives the "Reasoning..." indicator rendered above the status bar.
+    pub reasoning_active: bool,
     /// Manual scroll offset (top-of-viewport line index)
     pub scroll_offset: u16,
     /// Current output scroll behavior
@@ -179,6 +182,7 @@ impl App {
             output_lines: VecDeque::new(),
             input: Self::new_textarea(Vec::new()),
             agent_busy: false,
+            reasoning_active: false,
             scroll_offset: 0,
             scroll_mode: ScrollMode::Auto,
             has_resized: true,
@@ -699,6 +703,9 @@ impl App {
 
             // Keep a single busy indicator in the output pane. Duplicating the
             // spinner in the input pane just burns redraw budget and visual space.
+            // When reasoning is active (model streaming reasoning before any
+            // displayable text), show a "Reasoning..." indicator instead so the
+            // user can see the agent is alive during the 20s+ reasoning phase.
             if self.agent_busy && !crate::core::approval::is_approval_prompt_active() {
                 let loading_area = Rect::new(
                     output_area.x,
@@ -706,11 +713,13 @@ impl App {
                     output_area.width,
                     1,
                 );
-                let loading = Paragraph::new(Line::from(Span::styled(
-                    format!("{} Agent processing...", self.spinner_char()),
-                    theme::spinner_style(),
-                )))
-                .style(theme::status_style());
+                let label = if self.reasoning_active {
+                    format!("{} Reasoning...", self.spinner_char())
+                } else {
+                    format!("{} Agent processing...", self.spinner_char())
+                };
+                let loading = Paragraph::new(Line::from(Span::styled(label, theme::spinner_style())))
+                    .style(theme::status_style());
                 frame.render_widget(loading, loading_area);
             }
 
@@ -1484,6 +1493,76 @@ mod tests {
             full_rendered.contains("scrolled into view"),
             "wrapped line tail must be visible, not clipped.\nRendered:\n{}",
             full_rendered
+        );
+    }
+
+    #[test]
+    fn test_render_output_shows_reasoning_indicator_when_reasoning_active() {
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.reasoning_active = true;
+        app.mode = "ACT".to_string();
+        app.force_bottom();
+        app.push_plain("line 1");
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Reasoning..."),
+            "expected 'Reasoning...' indicator when reasoning_active is true, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Agent processing..."),
+            "should not show 'Agent processing...' when reasoning is active, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_render_output_shows_agent_processing_when_not_reasoning() {
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.reasoning_active = false;
+        app.mode = "ACT".to_string();
+        app.force_bottom();
+        app.push_plain("line 1");
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Agent processing..."),
+            "expected 'Agent processing...' when reasoning is not active, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Reasoning..."),
+            "should not show 'Reasoning...' when reasoning is not active, got:\n{rendered}"
         );
     }
 }

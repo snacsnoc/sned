@@ -533,28 +533,26 @@ impl AgentLoop {
     }
 
     async fn record_first_output_emit_time(&self) {
-        if !crate::cli::output::timing_enabled() {
-            return;
-        }
-
         let mut state = self.state.lock().await;
         if state.first_output_emit_time.is_none() {
-            let now = std::time::Instant::now();
-            state.first_output_emit_time = Some(now);
-            if state.first_token_time.is_none() {
-                state.first_token_time = Some(now);
+            if crate::cli::output::timing_enabled() {
+                let now = std::time::Instant::now();
+                state.first_output_emit_time = Some(now);
+                if state.first_token_time.is_none() {
+                    state.first_token_time = Some(now);
+                }
             }
+            state.reasoning_active = false;
         }
     }
 
     async fn record_first_reasoning_chunk_time(&self) {
-        if !crate::cli::output::timing_enabled() {
-            return;
-        }
-
         let mut state = self.state.lock().await;
         if state.first_reasoning_chunk_time.is_none() {
-            state.first_reasoning_chunk_time = Some(std::time::Instant::now());
+            if crate::cli::output::timing_enabled() {
+                state.first_reasoning_chunk_time = Some(std::time::Instant::now());
+            }
+            state.reasoning_active = true;
         }
     }
 

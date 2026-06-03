@@ -1896,6 +1896,7 @@ async fn run_main_loop(
                     }
                 }
 
+                app.reasoning_active = state.reasoning_active;
                 let plan_changed = app.sync_plan_state_cache(state.plan_state.as_ref());
                 if plan_changed {
                     app.needs_redraw = true;

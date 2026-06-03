@@ -72,6 +72,8 @@ pub struct TaskState {
     pub is_waiting_for_first_chunk: bool,
     /// Whether we've completed reading the stream.
     pub did_complete_reading_stream: bool,
+    /// Whether the model is in a reasoning/thinking phase (no displayable output yet).
+    pub reasoning_active: bool,
     /// Whether we automatically retried a failed API request.
     pub did_automatically_retry_failed_api_request: bool,
     /// Whether to use native tool calls.
@@ -174,6 +176,7 @@ impl Default for TaskState {
             running_command_pids: Vec::new(),
             is_waiting_for_first_chunk: false,
             did_complete_reading_stream: false,
+            reasoning_active: false,
             did_automatically_retry_failed_api_request: false,
             use_native_tool_calls: false,
             conversation_history_deleted_range: None,
