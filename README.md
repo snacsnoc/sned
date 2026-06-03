@@ -63,6 +63,13 @@ sned --task-id <id>
 
 Other flags: `--yolo`, `--plan`, `--subagents`, `--json`, `--export <path>`, `--double-check-completion`, `--track-changes`, `--verbose`, `--no-token-display`, `--thinking <budget>`.
 
+## interactive ux
+
+- Slash commands autocomplete in the input box. Use `Tab` or `Enter` to accept a partial match like `/pl` -> `/plan` before submitting.
+- While the model is reasoning, sned shows a compact `Reasoning...` indicator so the TUI does not look stalled.
+- Context usage is shown in the status bar, not as a per-tool token line.
+- `--export <path>` still writes the transcript even if the agent turn errors.
+
 ## hash-anchored edits
 
 Every line is hashed on read. Before writing, sned re-hashes. If the file changed between read and write, the hash won't match and the edit fails. You get a conflict report, the agent re-reads and retries. No silent wrong-line patching.
