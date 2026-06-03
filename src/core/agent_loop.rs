@@ -183,6 +183,23 @@ fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriter
     }
 }
 
+/// Like `print_model_line`, but if `pending` is true, prepends the turn indicator
+/// "♦ " to the first emitted line and clears the flag. This keeps the indicator
+/// on the same line as the start of the response instead of on its own line.
+fn print_model_line_with_prefix_if_pending(
+    line: &str,
+    output_writer: &crate::cli::output::OutputWriterArc,
+    pending: &mut bool,
+) {
+    if *pending && !line.trim().is_empty() {
+        *pending = false;
+        let prefixed = format!("♦ {}", line);
+        print_model_line(&prefixed, output_writer);
+    } else {
+        print_model_line(line, output_writer);
+    }
+}
+
 fn sanitize_model_text_for_display(line: &str) -> Cow<'_, str> {
     if line.chars().all(|ch| !ch.is_control() && ch != '\t') {
         Cow::Borrowed(line)
@@ -1504,13 +1521,9 @@ impl AgentLoop {
         let mut last_flush_time = Instant::now();
         let flush_interval = std::time::Duration::from_millis(50);
 
-        // Emit assistant turn indicator
-        self.config.output_writer.emit(OutputEvent::styled(
-            "♦ ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        // Turn indicator is prepended to the first output line, not emitted separately,
+        // so it appears on the same line as the start of the response.
+        let mut turn_indicator_pending = true;
 
         while let Some(chunk) = rx.recv().await {
             // Check for cancellation during stream processing so Ctrl+C
@@ -1648,7 +1661,11 @@ impl AgentLoop {
                                         code_block_snipped = false;
                                     }
 
-                                    print_model_line(trimmed_line, &self.config.output_writer);
+                                    print_model_line_with_prefix_if_pending(
+                                        trimmed_line,
+                                        &self.config.output_writer,
+                                        &mut turn_indicator_pending,
+                                    );
                                     continue;
                                 }
 
@@ -1671,7 +1688,11 @@ impl AgentLoop {
 
                                 // Regular content - already trimmed
                                 self.record_first_output_emit_time().await;
-                                print_model_line(trimmed_line, &self.config.output_writer);
+                                print_model_line_with_prefix_if_pending(
+                                    trimmed_line,
+                                    &self.config.output_writer,
+                                    &mut turn_indicator_pending,
+                                );
                             }
                             // Buffer flush to ~50ms frames to reduce syscalls on high-latency connections (P9)
                             if last_flush_time.elapsed() >= flush_interval {
