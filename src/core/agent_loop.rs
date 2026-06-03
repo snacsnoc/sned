@@ -70,6 +70,9 @@ use crate::core::tool_output::{
 
 const MAX_TOOL_RESULT_DISPLAY_LINES: usize = 5;
 const MAX_COMMAND_RESULT_DISPLAY_LINES: usize = 8;
+/// Default concurrency limit for parallel non-grouped tool execution.
+/// Prevents I/O contention when many tools run simultaneously.
+const DEFAULT_TOOL_CONCURRENCY: usize = 12;
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
 
@@ -2569,8 +2572,8 @@ impl AgentLoop {
                                 let tool_name = tool_name.clone();
                                 let tool_params = tool_params.clone();
                                 let task_storage = self.deps.task_storage.clone().map(Arc::new);
-                                let edit_file_paths = if tool_name == "edit_file" {
-                                    Self::extract_edit_file_path(&tool_params)
+                                let edit_file_paths = if tool_name == "edit_file" || tool_name == "write_to_file" {
+                                    Self::extract_file_action_path(&tool_name, &tool_params)
                                 } else {
                                     vec![]
                                 };
@@ -2644,8 +2647,8 @@ impl AgentLoop {
             // Execute with serialization only for same-file edit_file calls
             let mut non_edit_executed = std::collections::HashSet::new();
 
-            // Collect edit_file futures grouped by file paths (take ownership)
-            // Each edit_file call is stored with ALL its paths to detect overlaps
+            // Collect edit_file and write_to_file futures grouped by file paths (take ownership)
+            // Both tools modify files, so they need path-based serialization
             type EditGroup = (
                 std::collections::HashSet<String>,
                 Vec<(
@@ -2655,7 +2658,7 @@ impl AgentLoop {
             );
             let mut edit_groups: Vec<EditGroup> = Vec::new();
             for (i, (_, tool_name, _, task, edit_file_paths)) in tool_tasks.iter_mut().enumerate() {
-                if tool_name == "edit_file"
+                if (tool_name == "edit_file" || tool_name == "write_to_file")
                     && let Some(future) = task.take()
                 {
                     let paths: std::collections::HashSet<String> =
@@ -2676,12 +2679,12 @@ impl AgentLoop {
                 }
             }
 
-            // Extract non-edit futures, execute in parallel
+            // Extract non-edit futures (exclude both edit_file and write_to_file which are grouped)
             let non_edit_futures: Vec<_> = tool_tasks
                 .iter_mut()
                 .enumerate()
                 .filter_map(|(i, (_, tool_name, _, task, _))| {
-                    if task.is_some() && tool_name != "edit_file" {
+                    if task.is_some() && tool_name != "edit_file" && tool_name != "write_to_file" {
                         non_edit_executed.insert(i);
                         task.take()
                     } else {
@@ -2690,7 +2693,14 @@ impl AgentLoop {
                 })
                 .collect();
 
-            let non_edit_results = futures::future::join_all(non_edit_futures).await;
+            // Cap concurrency to prevent I/O contention when many tools run simultaneously
+            let non_edit_results: Vec<_> = {
+                use futures::StreamExt;
+                futures::stream::iter(non_edit_futures)
+                    .buffered(DEFAULT_TOOL_CONCURRENCY)
+                    .collect()
+                    .await
+            };
 
             // Execute edit_file groups in parallel, but calls within each group sequentially
             let edit_group_futures: Vec<_> = edit_groups
@@ -3388,21 +3398,30 @@ impl AgentLoop {
         ))
     }
 
-    /// Extract all file paths from edit_file tool params for per-file grouping.
-    /// Returns empty vec if params don't contain a valid files array with paths.
-    fn extract_edit_file_path(params: &serde_json::Value) -> Vec<String> {
-        params
-            .get("files")
-            .and_then(|f| f.as_array())
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(|file| file.get("path"))
-                    .filter_map(|p| p.as_str())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Extract all file paths from file-modifying tool params for per-file grouping.
+    /// Supports edit_file (files array) and write_to_file (single path).
+    /// Returns empty vec if params don't contain valid paths.
+    fn extract_file_action_path(tool_name: &str, params: &serde_json::Value) -> Vec<String> {
+        match tool_name {
+            "edit_file" => params
+                .get("files")
+                .and_then(|f| f.as_array())
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(|file| file.get("path"))
+                        .filter_map(|p| p.as_str())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            "write_to_file" => params
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(|s| vec![String::from(s)])
+                .unwrap_or_default(),
+            _ => vec![],
+        }
     }
 
     /// Static version of execute_tool_with_hooks for parallel execution.
@@ -5740,6 +5759,27 @@ mod tests {
     fn test_extract_action_path_empty_params() {
         let params = serde_json::json!({});
         let paths = AgentLoop::extract_action_path(SnedTool::ReadFile, &params);
+        assert_eq!(paths, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_extract_file_action_path_edit_file() {
+        let params = serde_json::json!({"files": [{"path": "a.rs"}, {"path": "b.rs"}]});
+        let paths = AgentLoop::extract_file_action_path("edit_file", &params);
+        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_file_action_path_write_to_file() {
+        let params = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"});
+        let paths = AgentLoop::extract_file_action_path("write_to_file", &params);
+        assert_eq!(paths, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_file_action_path_unknown_tool() {
+        let params = serde_json::json!({"path": "foo.rs"});
+        let paths = AgentLoop::extract_file_action_path("read_file", &params);
         assert_eq!(paths, Vec::<String>::new());
     }
 
