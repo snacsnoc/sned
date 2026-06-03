@@ -2037,7 +2037,11 @@ impl AgentLoop {
             let remaining = display_buffer.trim_end().to_string();
             if !remaining.is_empty() {
                 self.record_first_output_emit_time().await;
-                print_model_line(&remaining, &self.config.output_writer);
+                print_model_line_with_prefix_if_pending(
+                    &remaining,
+                    &self.config.output_writer,
+                    &mut turn_indicator_pending,
+                );
             }
         } else if !self.config.json_output {
             self.config.output_writer.flush();
