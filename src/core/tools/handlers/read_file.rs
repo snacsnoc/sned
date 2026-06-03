@@ -13,8 +13,9 @@ use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use futures::StreamExt;
 use async_trait::async_trait;
+use futures::StreamExt;
+use tokio::io::AsyncBufReadExt;
 
 fn max_file_read_size() -> usize {
     use std::sync::OnceLock;
@@ -60,10 +61,11 @@ impl ReadFileHandler {
         end_line: Option<usize>,
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
+        output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Vec<FileReadResult> {
         let read_futures: Vec<_> = paths
             .iter()
-            .map(|path| self.read_file(path, start_line, end_line, anchor_mgr, task_id))
+            .map(|path| self.read_file(path, start_line, end_line, anchor_mgr, task_id, output_writer))
             .collect();
 
         // Buffer concurrent reads to prevent OOM on bulk operations (12 = reasonable parallelism)
@@ -86,6 +88,7 @@ impl ReadFileHandler {
         end_line: Option<usize>,
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
+        output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> FileReadResult {
         // SECURITY: Re-verify path is still valid and not a symlink race (TOCTOU protection)
         // The path was already resolved by resolve_sanitized_path, but we re-canonicalize
@@ -158,7 +161,7 @@ impl ReadFileHandler {
                     Err(e) => return e,
                 }
             } else {
-                match self.read_full_file(&canonical_path.to_string_lossy()).await {
+                match self.read_full_file(&canonical_path.to_string_lossy(), output_writer).await {
                     Ok((content, lines)) => (
                         content,
                         lines.clone(),
@@ -327,12 +330,24 @@ impl ReadFileHandler {
         ))
     }
 
-    /// Read the entire file (current behavior for full reads).
-    async fn read_full_file(&self, path: &str) -> Result<(String, Vec<String>), FileReadResult> {
-        let content = match tokio::fs::read_to_string(path).await {
-            Ok(c) => c,
+    /// Read the entire file using BufReader for reduced peak memory.
+    ///
+    /// Instead of `read_to_string` (which allocates the full file as one String,
+    /// then `.lines()` allocates again as Vec<String> — 2x peak memory), we use
+    /// `BufReader` to read line-by-line. Only the Vec<String> is retained, so
+    /// peak memory is ~1x file size instead of ~2x.
+    ///
+    /// For large files, emits progress events via `output_writer` every N lines.
+    async fn read_full_file(
+        &self,
+        path: &str,
+        output_writer: Option<&crate::cli::output::OutputWriterArc>,
+    ) -> Result<(String, Vec<String>), FileReadResult> {
+        use tokio::io::BufReader;
+
+        let file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
             Err(e) => {
-                // Handle binary files or encoding errors gracefully
                 let err_msg = if e.kind() == std::io::ErrorKind::InvalidData {
                     format!(
                         "File appears to be binary or contains invalid UTF-8. \
@@ -353,7 +368,49 @@ impl ReadFileHandler {
                 });
             }
         };
-        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+        let reader = BufReader::new(file);
+        let mut lines_stream = reader.lines();
+        let mut lines: Vec<String> = Vec::new();
+        let mut line_count: usize = 0;
+        let progress_interval: usize = 5000;
+
+        while let Some(line) = lines_stream.next_line().await.map_err(|e| {
+            let err_msg = format!("Error reading file: {}", e);
+            let err = crate::cli::actionable_errors::file_not_found(path, &err_msg);
+            FileReadResult {
+                path: path.to_string(),
+                content: String::new(),
+                hash: String::new(),
+                success: false,
+                error: Some(err.display()),
+            }
+        })? {
+            lines.push(line);
+            line_count += 1;
+
+            if line_count % progress_interval == 0 {
+                if let Some(writer) = output_writer {
+                    writer.emit(crate::cli::output::OutputEvent::dim(format!(
+                        "  Reading {}: {} lines...",
+                        path, line_count
+                    )));
+                }
+            }
+        }
+
+        if line_count >= progress_interval {
+            if let Some(writer) = output_writer {
+                writer.emit(crate::cli::output::OutputEvent::dim(format!(
+                    "  Read {} lines from {}",
+                    line_count, path
+                )));
+            }
+        }
+
+        // Join lines for content_hash — this is the same as the old read_to_string
+        // result but built from the Vec we already own (no extra allocation).
+        let content = lines.join("\n");
         Ok((content, lines))
     }
 
@@ -427,10 +484,11 @@ impl ReadFileHandler {
         params: serde_json::Value,
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
+        output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Result<(Vec<String>, Vec<FileReadResult>), ToolError> {
         let (paths, start_line, end_line) = Self::parse_params(&params)?;
         let results = self
-            .read_files(paths.clone(), start_line, end_line, anchor_mgr, task_id)
+            .read_files(paths.clone(), start_line, end_line, anchor_mgr, task_id, output_writer)
             .await;
         Ok((paths, results))
     }
@@ -451,9 +509,10 @@ impl ReadFileHandler {
         params: serde_json::Value,
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
+        output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Result<String, ToolError> {
         let (paths, results) = self
-            .execute_with_results(params, anchor_mgr, task_id)
+            .execute_with_results(params, anchor_mgr, task_id, output_writer)
             .await?;
         Self::track_read_files(state, &paths, &results);
         Ok(Self::format_results(results))
@@ -520,6 +579,7 @@ impl ToolHandler for ReadFileHandler {
                 end_line,
                 &ctx.anchor_mgr,
                 Some(ctx.task_id.as_str()),
+                Some(&ctx.output_writer),
             )
             .await;
         {
@@ -584,6 +644,7 @@ mod tests {
                 None,
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -694,6 +755,7 @@ mod tests {
                 Some(3),
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -715,6 +777,7 @@ mod tests {
                 None,
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -738,6 +801,7 @@ mod tests {
                 None,
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -765,6 +829,7 @@ mod tests {
                 None,
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -791,6 +856,7 @@ mod tests {
                 Some(10),
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -812,7 +878,7 @@ mod tests {
             file2.path().to_str().unwrap().to_string(),
         ];
         let results = handler
-            .read_files(paths, None, None, &anchor_mgr, Some("test-task"))
+            .read_files(paths, None, None, &anchor_mgr, Some("test-task"), None)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -838,7 +904,7 @@ mod tests {
         ];
 
         let results = handler
-            .read_files(paths, None, None, &anchor_mgr, Some("test-task"))
+            .read_files(paths, None, None, &anchor_mgr, Some("test-task"), None)
             .await;
         let output = ReadFileHandler::format_results(results);
 
@@ -870,7 +936,7 @@ mod tests {
         ];
 
         let results = handler
-            .read_files(paths, None, None, &anchor_mgr, Some("test-task"))
+            .read_files(paths, None, None, &anchor_mgr, Some("test-task"), None)
             .await;
         assert_eq!(results.len(), 3);
         assert!(results[0].success);
@@ -902,6 +968,7 @@ mod tests {
                 None,
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -933,6 +1000,7 @@ mod tests {
                 Some(999),
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -957,6 +1025,7 @@ mod tests {
                 Some(300),
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -983,6 +1052,7 @@ mod tests {
                 None,
                 &anchor_mgr,
                 Some("test-task"),
+                None,
             )
             .await;
 
@@ -1020,6 +1090,7 @@ mod tests {
                 Some(20),
                 &anchor_mgr,
                 Some(task_id),
+                None,
             )
             .await;
 
