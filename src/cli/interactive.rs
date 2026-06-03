@@ -328,25 +328,40 @@ impl InteractiveSession {
             });
         }
 
-        agent
+        let run_result = agent
             .run(initial_messages, state_manager)
             .await
-            .map_err(|e| anyhow::anyhow!("Agent error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Agent error: {}", e));
 
+        // Always export on exit, even if the agent errored out.
+        // This ensures the conversation is saved for debugging failed runs.
         if let Some(export_path) = self.task_opts.export.clone() {
             let history = agent.get_conversation_history().await;
-            let mut export_data = serde_json::to_string_pretty(&history)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize conversation: {}", e))?;
-            // Redact secrets from export
-            export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
-            crate::storage::disk::atomic_write_file(&export_path, &export_data)
-                .map_err(|e| anyhow::anyhow!("Failed to write export file: {}", e))?;
-            println!(
-                "Conversation exported to: {} (secrets redacted)",
-                export_path
-            );
+            match serde_json::to_string_pretty(&history) {
+                Ok(mut export_data) => {
+                    export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
+                    if let Err(e) =
+                        crate::storage::disk::atomic_write_file(&export_path, &export_data)
+                    {
+                        if !self.task_opts.json {
+                            eprintln!("Warning: Failed to write export file: {}", e);
+                        }
+                    } else if !self.task_opts.json {
+                        println!(
+                            "Conversation exported to: {} (secrets redacted)",
+                            export_path
+                        );
+                    }
+                }
+                Err(e) => {
+                    if !self.task_opts.json {
+                        eprintln!("Warning: Failed to serialize conversation: {}", e);
+                    }
+                }
+            }
         }
 
+        run_result?;
         Ok(())
     }
 }
