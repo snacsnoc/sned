@@ -186,11 +186,31 @@ pub fn summarize_single_section(section: &str) -> String {
         .unwrap_or("unknown");
     let line_count = section.lines().count().saturating_sub(1);
     let size_kb = section.len() / 1024;
-    format!(
-        "[Context pruned: {} lines, ~{}KB. Hash: {}. Re-read with read_file if you need current anchors.]",
+
+    let anchored_lines: Vec<&str> = section
+        .lines()
+        .skip(1)
+        .filter(|l| l.contains('§'))
+        .take(MAX_PRESERVED_ANCHORS)
+        .collect();
+
+    let mut out = format!(
+        "[Context pruned: {} lines, ~{}KB. Hash: {}]",
         line_count, size_kb, file_hash
-    )
+    );
+
+    if !anchored_lines.is_empty() {
+        out.push_str("\nPreserved anchors (copy EXACTLY for edit_file):\n");
+        out.push_str(&anchored_lines.join("\n"));
+        out.push_str("\nRe-read with read_file for full content or to see lines beyond the preserved set.");
+    } else {
+        out.push_str(" Re-read with read_file if you need current anchors.");
+    }
+
+    out
 }
+
+const MAX_PRESERVED_ANCHORS: usize = 80;
 
 pub fn extract_edit_stats_detailed(result: &str) -> (String, String, i32, i32) {
     let mut files_changed = 0;

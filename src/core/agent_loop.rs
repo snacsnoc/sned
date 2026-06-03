@@ -6057,7 +6057,32 @@ mod tests {
         let summary = summarize_single_section(section);
         assert!(summary.contains("Hash: abc123"));
         assert!(summary.contains("2 lines"));
-        assert!(!summary.contains("hello"));
+        assert!(summary.contains("Preserved anchors"));
+        assert!(summary.contains("1§hello"));
+        assert!(summary.contains("2§world"));
+    }
+
+    #[test]
+    fn test_summarize_single_section_no_anchors() {
+        let section = "[File: src/main.rs, Hash: abc123]\nno anchors here\njust plain text";
+        let summary = summarize_single_section(section);
+        assert!(summary.contains("Hash: abc123"));
+        assert!(!summary.contains("Preserved anchors"));
+        assert!(summary.contains("Re-read with read_file if you need current anchors"));
+    }
+
+    #[test]
+    fn test_summarize_single_section_caps_preserved_anchors() {
+        let mut section = String::from("[File: src/main.rs, Hash: abc123]");
+        for i in 0..200 {
+            section.push_str(&format!("\n{}§line {}", i, i));
+        }
+        let summary = summarize_single_section(&section);
+        assert!(summary.contains("Preserved anchors"));
+        assert!(summary.contains("0§line 0"));
+        assert!(summary.contains("79§line 79"));
+        assert!(!summary.contains("80§line 80"));
+        assert!(!summary.contains("199§line 199"));
     }
 
     #[test]
@@ -6067,7 +6092,7 @@ mod tests {
         let edited = vec!["src/foo.rs".to_string()];
         let result = summarize_matching_sections(text, &edited);
         assert!(result.contains("Hash: aaa"));
-        assert!(!result.contains("1§foo"));
+        assert!(result.contains("1§foo"), "pruned section preserves anchored lines");
         assert!(result.contains("1§bar"));
     }
 
@@ -6077,8 +6102,8 @@ mod tests {
             "[File: src/foo.rs, Hash: aaa]\n1§foo\n---\n[File: src/bar.rs, Hash: bbb]\n1§bar";
         let edited = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
         let result = summarize_matching_sections(text, &edited);
-        assert!(!result.contains("1§foo"));
-        assert!(!result.contains("1§bar"));
+        assert!(result.contains("1§foo"), "pruned section preserves anchored lines");
+        assert!(result.contains("1§bar"), "pruned section preserves anchored lines");
         assert!(result.contains("Hash: aaa"));
         assert!(result.contains("Hash: bbb"));
     }
@@ -6111,8 +6136,8 @@ mod tests {
         let text = "[File: /Users/test/project/main.c, Hash: abc123]\n1§hello\n2§world";
         let edited = vec!["main.c".to_string()];
         let result = summarize_matching_sections(text, &edited);
-        // Should summarize (not keep full content) because paths match after normalization
-        assert!(!result.contains("hello"));
+        // Pruned section preserves hash-anchored lines for use with edit_file
+        assert!(result.contains("1§hello"), "pruned section preserves anchored lines");
         assert!(result.contains("Hash: abc123"));
     }
 

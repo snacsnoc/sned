@@ -737,7 +737,7 @@ impl EditExecutor {
         normalized_line_hashes: &[String],
         lines: &[String],
     ) -> (usize, Option<String>) {
-        let anchor_raw = raw_anchor.trim();
+        let anchor_raw = raw_anchor.lines().next().unwrap_or("").trim();
         if anchor_raw.is_empty() {
             return (usize::MAX, Some(format!("{} is missing.", anchor_type)));
         }

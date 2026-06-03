@@ -181,8 +181,11 @@ impl ReadFileHandler {
         // For output, use only the sliced lines and their corresponding anchors
         let output_lines = &sliced_lines;
         let output_anchors = if start_line.is_some() || end_line.is_some() {
-            // Use the clamped range indices returned from read_lines_range
-            &anchors[range_start..range_end.min(anchors.len())]
+            // Guard against invalid ranges (range_start > range_end) that can occur
+            // when the model sends start_line > end_line or out-of-order values.
+            let safe_start = range_start.min(anchors.len());
+            let safe_end = range_end.min(anchors.len()).max(safe_start);
+            &anchors[safe_start..safe_end]
         } else {
             &anchors
         };
@@ -936,6 +939,32 @@ mod tests {
         assert!(result.success);
         assert!(result.content.contains("line 10"));
         assert!(!result.content.contains("[Note:"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_start_line_exceeds_end_line_no_panic() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 1..=10 {
+            writeln!(temp_file, "line {}", i).unwrap();
+        }
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let result = handler
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                Some(450),
+                Some(300),
+                &anchor_mgr,
+                Some("test-task"),
+            )
+            .await;
+
+        assert!(
+            result.success,
+            "invalid range (start > end) must not panic, got error: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]

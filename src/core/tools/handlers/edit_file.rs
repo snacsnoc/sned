@@ -89,7 +89,7 @@ impl EditFileHandler {
 
             let mut edits = Vec::new();
             for edit_raw in edits_raw {
-                let anchor = edit_raw
+                let anchor_raw = edit_raw
                     .get("anchor")
                     .and_then(|a| a.as_str())
                     .ok_or_else(|| {
@@ -99,6 +99,7 @@ impl EditFileHandler {
                             error_guidance::missing_parameter("anchor", 0)
                         ))
                     })?;
+                let anchor = anchor_raw.lines().next().unwrap_or("").trim();
 
                 let edit_type = edit_raw
                     .get("edit_type")
@@ -107,7 +108,10 @@ impl EditFileHandler {
 
                 Self::validate_edit_type(edit_type)?;
 
-                let end_anchor = edit_raw.get("end_anchor").and_then(|e| e.as_str());
+                let end_anchor = edit_raw
+                    .get("end_anchor")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.lines().next().unwrap_or("").trim().to_string());
 
                 let text = edit_raw.get("text").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -173,7 +177,8 @@ impl EditFileHandler {
                 .unwrap_or(&[]);
 
             for edit in edits {
-                let anchor = edit.get("anchor").and_then(|a| a.as_str()).unwrap_or("");
+                let anchor_raw = edit.get("anchor").and_then(|a| a.as_str()).unwrap_or("");
+                let anchor = anchor_raw.lines().next().unwrap_or("").trim();
 
                 if !anchor.contains(ANCHOR_DELIMITER) {
                     invalid_anchors.push(format!(
@@ -188,19 +193,21 @@ impl EditFileHandler {
                     ));
                 }
 
-                if let Some(end_anchor) = edit.get("end_anchor").and_then(|a| a.as_str())
-                    && !end_anchor.contains(ANCHOR_DELIMITER)
+                if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a| a.as_str())
                 {
-                    invalid_anchors.push(format!(
-                        "  - File '{}': end_anchor '{}' is missing the '{}' delimiter",
-                        path,
-                        if end_anchor.chars().count() > 50 {
-                            format!("{}...", end_anchor.chars().take(50).collect::<String>())
-                        } else {
-                            end_anchor.to_string()
-                        },
-                        ANCHOR_DELIMITER
-                    ));
+                    let end_anchor = end_anchor_raw.lines().next().unwrap_or("").trim();
+                    if !end_anchor.contains(ANCHOR_DELIMITER) {
+                        invalid_anchors.push(format!(
+                            "  - File '{}': end_anchor '{}' is missing the '{}' delimiter",
+                            path,
+                            if end_anchor.chars().count() > 50 {
+                                format!("{}...", end_anchor.chars().take(50).collect::<String>())
+                            } else {
+                                end_anchor.to_string()
+                            },
+                            ANCHOR_DELIMITER
+                        ));
+                    }
                 }
             }
         }
@@ -277,7 +284,13 @@ impl EditFileHandler {
     ) -> Result<String, ToolError> {
         let files = params
             .get("files")
-            .and_then(|f| f.as_array())
+            .and_then(|f| f.as_array().cloned())
+            .or_else(|| {
+                params
+                    .get("files")
+                    .and_then(|f| f.as_str())
+                    .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+            })
             .ok_or_else(|| {
                 ToolError::InvalidInput("Missing required parameter: files".to_string())
             })?;
@@ -286,9 +299,9 @@ impl EditFileHandler {
             return Err(ToolError::InvalidInput("No files provided".to_string()));
         }
 
-        self.validate_anchors(files, workspace_root)?;
+        self.validate_anchors(&files, workspace_root)?;
 
-        let parsed = self.parse_edits(files)?;
+        let parsed = self.parse_edits(&files)?;
         let processor = BatchProcessor::new(DiffMode::Full);
 
         let silent = params
@@ -1110,6 +1123,73 @@ mod tests {
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No files"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_stringified_files_array() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§line 1", crate::core::hash_utils::content_hash("line 1"));
+        let stringified_files = serde_json::json!({
+            "files": format!(
+                r#"[{{"path": "test.txt", "edits": [{{"anchor": "{}", "edit_type": "replace", "text": "{}§replaced"}}]}}]"#,
+                anchor,
+                crate::core::hash_utils::content_hash("line 1"),
+            )
+        });
+        let result = ToolHandler::execute(&handler, &ctx, stringified_files).await;
+        assert!(result.is_ok(), "stringified files array should parse: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_normalizes_multiline_anchors() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§line 1", crate::core::hash_utils::content_hash("line 1"));
+        let multiline_anchor = format!("{}\nline 2", anchor);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": multiline_anchor,
+                    "edit_type": "replace",
+                    "end_anchor": multiline_anchor,
+                    "text": format!("{}§replaced", crate::core::hash_utils::content_hash("line 1"))
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok(), "multi-line anchor should be normalized: {:?}", result.err());
     }
 
     #[tokio::test]
