@@ -355,6 +355,7 @@ impl CliOnlyCommand {
             "expand" => Some(CliOnlyCommand::Expand),
             "changes" => Some(CliOnlyCommand::Changes),
             "queue" => Some(CliOnlyCommand::Queue),
+            "model" => Some(CliOnlyCommand::ModelSwitch(String::new())),
             "plan" => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
             "plan approve" => Some(CliOnlyCommand::PlanApprove),
             "plan pause" => Some(CliOnlyCommand::PlanPause),
@@ -399,7 +400,7 @@ impl CliOnlyCommand {
     pub fn parse_with_arg(cmd: &str, arg: &str) -> Option<CliOnlyCommand> {
         match cmd.to_lowercase().as_str() {
             "help" if !arg.is_empty() => Some(CliOnlyCommand::HelpOption(arg.to_lowercase())),
-            "model" if !arg.is_empty() => Some(CliOnlyCommand::ModelSwitch(arg.to_string())),
+            "model" => Some(CliOnlyCommand::ModelSwitch(arg.to_string())),
             _ => Self::parse(cmd),
         }
     }
@@ -2949,6 +2950,16 @@ mod tests {
     #[test]
     fn test_parse_model_switch_empty_arg() {
         let result = CliOnlyCommand::parse_with_arg("model", "");
-        assert!(result.is_none());
+        assert!(result.is_some());
+        if let Some(CliOnlyCommand::ModelSwitch(s)) = result {
+            assert!(s.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_parse_model_switch_no_arg() {
+        let result = CliOnlyCommand::parse("model");
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::ModelSwitch(_)));
     }
 }
