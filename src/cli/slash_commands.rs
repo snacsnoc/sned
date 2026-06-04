@@ -263,6 +263,7 @@ pub enum CliOnlyCommand {
     PlanAbort,
     PlanComplete,
     PlanFail,
+    ModelSwitch(String), // /model provider/model_id
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +399,7 @@ impl CliOnlyCommand {
     pub fn parse_with_arg(cmd: &str, arg: &str) -> Option<CliOnlyCommand> {
         match cmd.to_lowercase().as_str() {
             "help" if !arg.is_empty() => Some(CliOnlyCommand::HelpOption(arg.to_lowercase())),
+            "model" if !arg.is_empty() => Some(CliOnlyCommand::ModelSwitch(arg.to_string())),
             _ => Self::parse(cmd),
         }
     }
@@ -440,6 +442,7 @@ impl CliOnlyCommand {
                 | CliOnlyCommand::PlanAbort
                 | CliOnlyCommand::PlanComplete
                 | CliOnlyCommand::PlanFail
+                | CliOnlyCommand::ModelSwitch(_)
         )
     }
 
@@ -2928,5 +2931,25 @@ mod tests {
         assert_eq!(format!("{:?}", SlashCommandCategory::Plan), "Plan");
         assert_eq!(format!("{:?}", SlashCommandCategory::Skill), "Skill");
         assert_eq!(format!("{:?}", SlashCommandCategory::Workflow), "Workflow");
+    }
+
+    #[test]
+    fn test_parse_model_switch_command() {
+        let result = CliOnlyCommand::parse_with_arg("model", "anthropic/claude-sonnet-4");
+        let _expected = CliOnlyCommand::ModelSwitch("anthropic/claude-sonnet-4".to_string());
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), CliOnlyCommand::ModelSwitch(_)));
+    }
+
+    #[test]
+    fn test_model_switch_is_local_command() {
+        let cmd = CliOnlyCommand::ModelSwitch("openai/gpt-4".to_string());
+        assert!(cmd.is_local_command());
+    }
+
+    #[test]
+    fn test_parse_model_switch_empty_arg() {
+        let result = CliOnlyCommand::parse_with_arg("model", "");
+        assert!(result.is_none());
     }
 }

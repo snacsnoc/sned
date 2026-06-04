@@ -151,7 +151,7 @@ impl InteractiveSession {
         let model_name = self.task_opts.model.as_deref().unwrap_or(&model.id);
         let task_id = self.agent_loop.task_id();
         let mode = if self.task_opts.plan { "PLAN" } else { "ACT" };
-        let context_info = get_context_window_info(provider);
+        let context_info = get_context_window_info(provider.as_ref());
         let context_window = format_context_window(context_info.context_window);
 
         // Use stderr-aware color functions since this is printed via eprint_info()
@@ -948,6 +948,33 @@ async fn handle_cli_only_command(
             for line in ansi_to_ratatui_lines(&settings_text) {
                 app.push_output(line);
             }
+        }
+        CliOnlyCommand::ModelSwitch(model_spec) => {
+            let parts: Vec<&str> = model_spec.splitn(2, '/').collect();
+            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                app.push_plain("Usage: /model provider/model_id\nExample: /model anthropic/claude-sonnet-4");
+                return Ok(false);
+            }
+
+            let provider_name = parts[0];
+            let model_id = parts[1];
+
+            let mut temp_opts = task_opts.clone();
+            temp_opts.provider = Some(provider_name.to_string());
+            temp_opts.model = Some(model_id.to_string());
+
+            match crate::cli::create_provider(&temp_opts) {
+                Ok(new_provider) => {
+                    let mut sess = session.lock().await;
+                    sess.agent_loop_mut().set_provider(new_provider);
+                    drop(sess);
+                    app.push_plain(format!("Model switched to {}/{}", provider_name, model_id));
+                }
+                Err(e) => {
+                    app.push_plain(format!("Failed to create provider: {}", e));
+                }
+            }
+            return Ok(false);
         }
         CliOnlyCommand::Models => {
             let models_text = crate::cli::slash_commands::format_models_text();

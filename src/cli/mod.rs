@@ -634,7 +634,7 @@ fn build_symbol_index_service(
     }
 }
 
-fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
+pub(crate) fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
     use crate::providers::env_auth::get_provider_from_env;
 
     // Determine provider: --provider flag > auto-detection from env > custom base_url (with api_key from flag/env) > error
@@ -1118,7 +1118,7 @@ async fn build_task_components(
     }
 
     let config = AgentConfig {
-        provider: provider.clone(),
+        provider: Arc::new(std::sync::Mutex::new(provider.clone())),
         mode,
         task_id: task_id.clone(),
         enable_checkpoints: state_manager

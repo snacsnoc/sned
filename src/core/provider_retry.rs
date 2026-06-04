@@ -125,11 +125,11 @@ pub async fn create_message_with_retry(
                     drop(state);
                     let msg = if consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES {
                         format!(
-                            "⚠ Provider failed after {max_retries} retries. {consecutive_failures} consecutive provider requests have failed. Use /model to switch or retry after the provider recovers."
+                            "⚠ Provider failed after {max_retries} retries. {consecutive_failures} consecutive provider requests have failed. Use /model <provider/model> to switch or retry after the provider recovers."
                         )
                     } else {
                         format!(
-                            "⚠ Provider failed after {max_retries} retries. Request {consecutive_failures}/{} failed consecutively. Retry or use /model to switch.",
+                            "⚠ Provider failed after {max_retries} retries. Request {consecutive_failures}/{} failed consecutively. Retry or use /model <provider/model> to switch.",
                             DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES
                         )
                     };

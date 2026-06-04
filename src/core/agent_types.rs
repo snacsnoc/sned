@@ -7,7 +7,7 @@ use crate::providers::Provider;
 use lru::LruCache;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Maximum consecutive mistakes before asking user.
 pub const MAX_CONSECUTIVE_MISTAKES: u32 = 3;
@@ -226,19 +226,19 @@ impl Default for TaskState {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            provider: Arc::new(
+            provider: Arc::new(Mutex::new(Arc::new(
                 crate::providers::openai::OpenAiProvider::new(
                     crate::providers::openai::OpenAiConfig {
                         api_key: String::new(),
                         base_url: None,
-                        model_id: String::new(),
+                        model_id: "gpt-4o".to_string(),
                         model_info: None,
                         reasoning_effort: None,
                         custom_headers: None,
-                        provider_name: None, // Use default "OpenAI"
+                        provider_name: None,
                     }
                 ).expect("OpenAiProvider::new() should never fail with empty config; reqwest::Client build failure indicates system resource exhaustion")
-            ),
+            ))),
             mode: AgentMode::Act,
             task_id: String::new(),
             enable_checkpoints: false,
@@ -264,7 +264,7 @@ impl Default for AgentConfig {
 #[derive(Clone)]
 pub struct AgentConfig {
     /// The provider to use for API calls.
-    pub provider: Arc<dyn Provider>,
+    pub provider: Arc<Mutex<Arc<dyn Provider>>>,
     /// The mode (plan or act).
     pub mode: AgentMode,
     /// Task ID (also used as ULID for telemetry).
