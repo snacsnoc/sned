@@ -235,7 +235,7 @@ impl Default for AgentConfig {
                         model_info: None,
                         reasoning_effort: None,
                         custom_headers: None,
-                        provider_name: None,
+                        provider_name: None, // Use default "OpenAI"
                     }
                 ).expect("OpenAiProvider::new() should never fail with empty config; reqwest::Client build failure indicates system resource exhaustion")
             ))),
