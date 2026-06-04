@@ -231,7 +231,7 @@ impl Default for AgentConfig {
                     crate::providers::openai::OpenAiConfig {
                         api_key: String::new(),
                         base_url: None,
-                        model_id: "gpt-4o".to_string(),
+                        model_id: String::new(),
                         model_info: None,
                         reasoning_effort: None,
                         custom_headers: None,

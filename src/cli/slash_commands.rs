@@ -2936,7 +2936,6 @@ mod tests {
     #[test]
     fn test_parse_model_switch_command() {
         let result = CliOnlyCommand::parse_with_arg("model", "anthropic/claude-sonnet-4");
-        let _expected = CliOnlyCommand::ModelSwitch("anthropic/claude-sonnet-4".to_string());
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), CliOnlyCommand::ModelSwitch(_)));
     }

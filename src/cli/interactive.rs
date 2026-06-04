@@ -967,7 +967,6 @@ async fn handle_cli_only_command(
                 Ok(new_provider) => {
                     let mut sess = session.lock().await;
                     sess.agent_loop_mut().set_provider(new_provider);
-                    drop(sess);
                     app.push_plain(format!("Model switched to {}/{}", provider_name, model_id));
                 }
                 Err(e) => {
