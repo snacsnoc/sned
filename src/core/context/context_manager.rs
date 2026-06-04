@@ -98,7 +98,7 @@ fn cache_token_strategy(provider_name: &str) -> CacheTokenStrategy {
     match provider_name {
         // OpenAI-compatible providers subtract cached_tokens from prompt_tokens,
         // so input_tokens = prompt_tokens - cached_tokens. Add cache_reads back.
-        "openai" | "minimax" | "groq" | "xai" | "deepseek" | "openrouter" => {
+        "openai" | "minimax" | "deepseek" | "openrouter" => {
             CacheTokenStrategy::InputExcludesCacheReads
         }
         // Anthropic and Gemini: input_tokens excludes all cache tokens.
@@ -125,7 +125,7 @@ fn effective_cache_tokens(info: &ApiReqInfo, provider_name: &str) -> u64 {
 /// don't contribute to the current request size.
 ///
 /// Cache token handling varies by provider:
-/// - OpenAI-compatible (openai, minimax, groq, xai, deepseek, openrouter):
+/// - OpenAI-compatible (openai, minimax, deepseek, openrouter):
 ///   input_tokens excludes cache_reads — add cache_reads back for true prompt size.
 /// - Anthropic/Gemini: input_tokens excludes all cache tokens — add both
 ///   cache_writes and cache_reads.
@@ -983,7 +983,7 @@ mod tests {
         };
 
         // All OpenAI-compatible providers should use the same cache strategy
-        for name in &["groq", "xai", "deepseek", "openrouter", "minimax"] {
+        for name in &["deepseek", "openrouter", "minimax"] {
             assert!(
                 should_compact_context_window(&info, 200_000, 160_000, None, name),
                 "{}: 100k input + 70k cache = 170k should trigger", name
@@ -1036,7 +1036,7 @@ mod tests {
         };
 
         // OpenAI-compatible: only cache_reads
-        for name in &["openai", "minimax", "groq", "xai", "deepseek", "openrouter"] {
+        for name in &["openai", "minimax", "deepseek", "openrouter"] {
             assert_eq!(effective_cache_tokens(&info, name), 20_000, "{}", name);
         }
 

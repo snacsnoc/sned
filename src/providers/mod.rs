@@ -8,12 +8,10 @@ pub mod deepseek;
 pub mod env_auth;
 pub mod gemini;
 pub mod gemini_format;
-pub mod groq;
 pub mod minimax;
 pub mod mock;
 pub mod openai;
 pub mod openrouter;
-pub mod xai;
 
 use reqwest::StatusCode;
 

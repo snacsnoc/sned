@@ -372,7 +372,6 @@ impl GlobalFileNames {
     pub const SNED_MODELS: &'static str = "sned_models.json";
     pub const OPENROUTER_MODELS: &'static str = "openrouter_models.json";
     pub const VERCEL_AI_GATEWAY_MODELS: &'static str = "vercel_ai_gateway_models.json";
-    pub const GROQ_MODELS: &'static str = "groq_models.json";
     pub const BASETEN_MODELS: &'static str = "baseten_models.json";
     pub const AGENTS_SKILLS_DIR: &'static str = ".agents/skills";
     pub const AI_SKILLS_DIR: &'static str = ".ai/skills";

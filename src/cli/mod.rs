@@ -655,9 +655,7 @@ pub(crate) fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn
              \x1b[36m  ANTHROPIC_API_KEY\x1b[0m       - Anthropic Claude\n\
              \x1b[36m  OPENAI_API_KEY\x1b[0m          - OpenAI GPT\n\
              \x1b[36m  GEMINI_API_KEY\x1b[0m          - Google Gemini\n\
-             \x1b[36m  GROQ_API_KEY\x1b[0m            - Groq\n\
              \x1b[36m  OPENROUTER_API_KEY\x1b[0m      - OpenRouter\n\
-             \x1b[36m  XAI_API_KEY\x1b[0m             - xAI Grok\n\
              \x1b[36m  DEEPSEEK_API_KEY\x1b[0m       - DeepSeek\n\
              \x1b[36m  QWEN_API_KEY\x1b[0m            - Qwen\n\
              \n\
@@ -827,23 +825,6 @@ pub(crate) fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn
                 },
             )?)
         }
-        "groq" => {
-            let api_key = task_opts
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("GROQ_API_KEY").ok())
-                .unwrap_or_default();
-            let model_id_str = model_id
-                .clone()
-                .unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
-            Arc::new(crate::providers::groq::GroqProvider::new(
-                crate::providers::groq::GroqConfig {
-                    api_key,
-                    model_id: model_id_str.clone(),
-                    model_info: Some(crate::providers::groq::get_groq_model_info(&model_id_str)),
-                },
-            )?)
-        }
         "openrouter" => {
             let api_key = task_opts
                 .api_key
@@ -862,21 +843,6 @@ pub(crate) fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn
                     )),
                     provider_sort: None,
                     provider_name: None, // Use default "openrouter"
-                },
-            )?)
-        }
-        "xai" => {
-            let api_key = task_opts
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("XAI_API_KEY").ok())
-                .unwrap_or_default();
-            let model_id_str = model_id.clone().unwrap_or_else(|| "grok-3".to_string());
-            Arc::new(crate::providers::xai::XaiProvider::new(
-                crate::providers::xai::XaiConfig {
-                    api_key,
-                    model_id: model_id_str.clone(),
-                    model_info: Some(crate::providers::xai::get_xai_model_info(&model_id_str)),
                 },
             )?)
         }
@@ -2001,8 +1967,6 @@ mod tests {
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
                 "GEMINI_API_KEY",
-                "GROQ_API_KEY",
-                "XAI_API_KEY",
                 "OPENROUTER_API_KEY",
                 "DEEPSEEK_API_KEY",
                 "MINIMAX_API_KEY",
@@ -2052,16 +2016,6 @@ mod tests {
 
         clear_env();
         // SAFETY: single-threaded test; sequential env mutation
-        unsafe { env::set_var("GROQ_API_KEY", "groq-key") };
-        assert_eq!(get_provider_from_env(), Some("groq"));
-
-        clear_env();
-        // SAFETY: single-threaded test; sequential env mutation
-        unsafe { env::set_var("XAI_API_KEY", "xai-key") };
-        assert_eq!(get_provider_from_env(), Some("xai"));
-
-        clear_env();
-        // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("OPENROUTER_API_KEY", "or-key") };
         assert_eq!(get_provider_from_env(), Some("openrouter"));
 
@@ -2082,8 +2036,6 @@ mod tests {
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
-            "GROQ_API_KEY",
-            "XAI_API_KEY",
             "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",
             "QWEN_API_KEY",
@@ -2171,8 +2123,6 @@ mod tests {
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
-            "GROQ_API_KEY",
-            "XAI_API_KEY",
             "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",
             "QWEN_API_KEY",
@@ -2207,7 +2157,7 @@ mod tests {
             unsafe { env::remove_var(var) };
         }
 
-        // Set ANTHROPIC_API_KEY but explicitly request groq
+        // Set ANTHROPIC_API_KEY but explicitly request deepseek
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("ANTHROPIC_API_KEY", "ant-key") };
 
@@ -2218,9 +2168,9 @@ mod tests {
             auto_approve_all: false,
             timeout: None,
             model: None,
-            provider: Some("groq".to_string()),
+            provider: Some("deepseek".to_string()),
             base_url: None,
-            api_key: Some("groq-key".to_string()),
+            api_key: Some("deepseek-key".to_string()),
             verbose: false,
             cwd: None,
             config: None,
@@ -2243,7 +2193,7 @@ mod tests {
             debug: false,
         };
 
-        // Should use groq (explicit flag) not anthropic (env var)
+        // Should use deepseek (explicit flag) not anthropic (env var)
         let result = create_provider(&task_opts);
         assert!(result.is_ok(), "Expected Ok with explicit provider");
 

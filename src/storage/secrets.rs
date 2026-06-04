@@ -25,14 +25,12 @@ pub const SECRET_KEYS: &[&str] = &[
     "mistralApiKey",
     "liteLlmApiKey",
     "authNonce",
-    "xaiApiKey",
     "moonshotApiKey",
     "zaiApiKey",
     "huggingFaceApiKey",
     "nebiusApiKey",
     "sambanovaApiKey",
     "cerebrasApiKey",
-    "groqApiKey",
     "huaweiCloudMaasApiKey",
     "basetenApiKey",
     "vercelAiGatewayApiKey",
@@ -53,9 +51,7 @@ pub fn env_var_to_secret_key() -> HashMap<&'static str, &'static str> {
     map.insert("OPENAI_API_KEY", "openAiApiKey");
     map.insert("AZURE_OPENAI_API_KEY", "openAiApiKey");
     map.insert("GEMINI_API_KEY", "geminiApiKey");
-    map.insert("GROQ_API_KEY", "groqApiKey");
     map.insert("CEREBRAS_API_KEY", "cerebrasApiKey");
-    map.insert("XAI_API_KEY", "xaiApiKey");
     map.insert("OPENROUTER_API_KEY", "openRouterApiKey");
     map.insert("AI_GATEWAY_API_KEY", "vercelAiGatewayApiKey");
     map.insert("ZAI_API_KEY", "zaiApiKey");

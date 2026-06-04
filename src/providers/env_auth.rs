@@ -20,12 +20,6 @@ pub fn get_provider_from_env() -> Option<&'static str> {
     if std::env::var("GEMINI_API_KEY").is_ok() {
         return Some("gemini");
     }
-    if std::env::var("GROQ_API_KEY").is_ok() {
-        return Some("groq");
-    }
-    if std::env::var("XAI_API_KEY").is_ok() {
-        return Some("xai");
-    }
     if std::env::var("MINIMAX_API_KEY").is_ok() || std::env::var("MINIMAX_CN_API_KEY").is_ok() {
         return Some("minimax");
     }
@@ -48,8 +42,6 @@ mod tests {
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
-            "GROQ_API_KEY",
-            "XAI_API_KEY",
             "MINIMAX_API_KEY",
             "MINIMAX_CN_API_KEY",
             "DEEPSEEK_API_KEY",
@@ -95,8 +87,6 @@ mod tests {
             ("OPENROUTER_API_KEY", "openrouter"),
             ("OPENAI_API_KEY", "openai-native"),
             ("GEMINI_API_KEY", "gemini"),
-            ("GROQ_API_KEY", "groq"),
-            ("XAI_API_KEY", "xai"),
             ("MINIMAX_API_KEY", "minimax"),
             ("DEEPSEEK_API_KEY", "deepseek"),
         ];

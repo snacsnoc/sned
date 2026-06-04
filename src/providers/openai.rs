@@ -27,7 +27,7 @@ pub struct OpenAiConfig {
     pub reasoning_effort: Option<String>,
     pub custom_headers: Option<std::collections::HashMap<String, String>>,
     /// Provider name for error messages (defaults to "OpenAI" if not set).
-    /// Used by OpenAI-compatible providers (OpenRouter, DeepSeek, Groq, xAI) to identify themselves in errors.
+    /// Used by OpenAI-compatible providers (OpenRouter, DeepSeek) to identify themselves in errors.
     pub provider_name: Option<String>,
 }
 
