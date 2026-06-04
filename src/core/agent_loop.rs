@@ -345,12 +345,13 @@ struct PreparedToolCall {
 pub struct MessageQueueHandle {
     queue: Arc<Mutex<VecDeque<StorageMessage>>>,
     json_output: bool,
+    message_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MessageQueueHandle {
     pub async fn enqueue_text_message(&self, text: String) {
         let msg = StorageMessage {
-            id: None,
+            id: Some(AgentLoop::next_message_id(&self.message_counter)),
             role: MessageRole::User,
             content: MessageContent::Text(text),
             model_info: None,
@@ -423,6 +424,9 @@ pub struct AgentLoop {
     model_tracker: Option<crate::core::context_tracking::ModelContextTracker>,
     /// Tracks environment snapshots for task metadata
     env_tracker: Option<crate::core::context_tracking::EnvironmentContextTracker>,
+    /// Monotonically increasing counter for generating unique message IDs.
+    /// Shared via Arc so static methods (execute_tool_with_hooks_internal) can also generate IDs.
+    message_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl AgentLoop {
@@ -610,7 +614,15 @@ impl AgentLoop {
             env_tracker: Some(
                 crate::core::context_tracking::EnvironmentContextTracker::new(&task_id),
             ),
+            message_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Generate the next unique message ID for this task.
+    /// Format: `msg_{counter}` (monotonically increasing per AgentLoop instance).
+    fn next_message_id(counter: &std::sync::atomic::AtomicUsize) -> String {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("msg_{}", n)
     }
 
     /// Get a reference to the underlying provider.
@@ -655,6 +667,7 @@ impl AgentLoop {
         MessageQueueHandle {
             queue: self.message_queue.clone(),
             json_output: self.config.json_output,
+            message_counter: self.message_counter.clone(),
         }
     }
 
@@ -800,7 +813,7 @@ impl AgentLoop {
 
                 // Append environment details as a separate message
                 history.push(crate::providers::StorageMessage {
-                    id: None,
+                    id: Some(Self::next_message_id(&self.message_counter)),
                     role: crate::providers::MessageRole::User,
                     content: crate::providers::MessageContent::Text(env_details),
                     model_info: None,
@@ -869,7 +882,7 @@ impl AgentLoop {
                     // Inject context modification into conversation history
                     let mut history = self.conversation_history.lock().await;
                     history.push(StorageMessage {
-                        id: None,
+                        id: Some(Self::next_message_id(&self.message_counter)),
                         role: MessageRole::User,
                         content: MessageContent::Text(format!(
                             "[Hook context from TaskStart]: {}",
@@ -1103,7 +1116,7 @@ impl AgentLoop {
                             // Inject context modification into conversation history
                             let mut history = self.conversation_history.lock().await;
                             history.push(StorageMessage {
-                                id: None,
+                                id: Some(Self::next_message_id(&self.message_counter)),
                                 role: MessageRole::User,
                                 content: MessageContent::Text(format!(
                                     "[Hook context from TaskComplete]: {}",
@@ -2198,7 +2211,7 @@ impl AgentLoop {
             truncate_old_thinking_blocks(&mut history);
 
             history.push(StorageMessage {
-                id: None,
+                id: Some(Self::next_message_id(&self.message_counter)),
                 role: MessageRole::Assistant,
                 content: MessageContent::AssistantBlocks(blocks),
                 model_info: None,
@@ -2236,7 +2249,7 @@ impl AgentLoop {
                             );
                             self.deps.tool_profile = Some(next);
                             history.push(StorageMessage {
-                                id: None,
+                                id: Some(Self::next_message_id(&self.message_counter)),
                                 role: MessageRole::User,
                                 content: MessageContent::Text(
                                     String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
@@ -2247,7 +2260,7 @@ impl AgentLoop {
                             });
                         } else {
                             history.push(StorageMessage {
-                                id: None,
+                                id: Some(Self::next_message_id(&self.message_counter)),
                                 role: MessageRole::User,
                                 content: MessageContent::Text(
                                     String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
@@ -2259,7 +2272,7 @@ impl AgentLoop {
                         }
                     } else {
                         history.push(StorageMessage {
-                            id: None,
+                            id: Some(Self::next_message_id(&self.message_counter)),
                             role: MessageRole::User,
                             content: MessageContent::Text(
                                 String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
@@ -2580,6 +2593,7 @@ impl AgentLoop {
 
                                 // Clone conversation history for hook context injection
                                 let conversation_history = self.conversation_history.clone();
+                                let message_counter = self.message_counter.clone();
 
                                 tool_tasks.push((
                                     tool_id,
@@ -2601,6 +2615,7 @@ impl AgentLoop {
                                                 handler,
                                                 task_storage,
                                                 conversation_history,
+                                                message_counter,
                                             )
                                             .await;
                                             tracing::debug!(
@@ -2856,10 +2871,10 @@ impl AgentLoop {
 
                 tool_result_blocks.push(UserContentBlock::ToolResult(
                     crate::providers::ToolResultBlock {
-                        tool_use_id: tool_id,
+                        tool_use_id: tool_id.clone(),
                         content: ToolResultContent::Text(truncated_text),
                         shared: SharedContentFields {
-                            call_id: None,
+                            call_id: Some(tool_id),
                             signature: None,
                         },
                     },
@@ -2872,7 +2887,7 @@ impl AgentLoop {
 
                 let mut history = self.conversation_history.lock().await;
                 history.push(StorageMessage {
-                    id: None,
+                    id: Some(Self::next_message_id(&self.message_counter)),
                     role: MessageRole::User,
                     content: MessageContent::UserBlocks(tool_result_blocks),
                     model_info: None,
@@ -2988,7 +3003,7 @@ impl AgentLoop {
                 if let Some(hint) = hint {
                     let mut history = self.conversation_history.lock().await;
                     history.push(StorageMessage {
-                        id: None,
+                        id: Some(Self::next_message_id(&self.message_counter)),
                         role: crate::providers::MessageRole::User,
                         content: crate::providers::MessageContent::Text(hint),
                         model_info: None,
@@ -3255,7 +3270,7 @@ impl AgentLoop {
 
         let mut history = self.conversation_history.lock().await;
         history.push(StorageMessage {
-            id: None,
+            id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
             content: MessageContent::Text(ps_text),
             model_info: None,
@@ -3435,6 +3450,7 @@ impl AgentLoop {
         handler: Arc<dyn crate::core::tools::ToolHandler>,
         task_storage: Option<Arc<crate::storage::task_storage::TaskStorage>>,
         conversation_history: Arc<Mutex<Vec<StorageMessage>>>,
+        message_counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> ToolExecutionOutput {
         let params_for_execution = tool_params.clone();
         let _ = if let Some(ref hook_mgr) = hook_manager {
@@ -3451,7 +3467,7 @@ impl AgentLoop {
                     // Inject context modification into conversation history
                     let mut history = conversation_history.lock().await;
                     history.push(StorageMessage {
-                        id: None,
+                        id: Some(Self::next_message_id(&message_counter)),
                         role: MessageRole::User,
                         content: MessageContent::Text(format!(
                             "[Hook context from PreToolUse]: {}",
@@ -3494,7 +3510,7 @@ impl AgentLoop {
                         // Inject context modification into conversation history
                         let mut history = conversation_history.lock().await;
                         history.push(StorageMessage {
-                            id: None,
+                            id: Some(Self::next_message_id(&message_counter)),
                             role: MessageRole::User,
                             content: MessageContent::Text(format!(
                                 "[Hook context from PostToolUse]: {}",
@@ -3850,7 +3866,7 @@ impl AgentLoop {
 
     pub async fn enqueue_text_message(&self, text: String) {
         self.enqueue_message(StorageMessage {
-            id: None,
+            id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
             content: MessageContent::Text(text),
             model_info: None,
