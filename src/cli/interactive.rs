@@ -48,7 +48,7 @@ fn format_context_window(tokens: u64) -> String {
 }
 
 pub struct InteractiveSession {
-    agent_loop: crate::core::agent_loop::AgentLoop,
+    agent_loop: Arc<tokio::sync::Mutex<crate::core::agent_loop::AgentLoop>>,
     hook_manager: Arc<crate::core::hooks::HookManager>,
     state_manager: Arc<crate::storage::state_manager::StateManager>,
     task_opts: TaskOptions,
@@ -57,13 +57,13 @@ pub struct InteractiveSession {
 
 impl InteractiveSession {
     /// Get a reference to the underlying AgentLoop.
-    pub fn agent_loop(&self) -> &crate::core::agent_loop::AgentLoop {
-        &self.agent_loop
+    pub async fn agent_loop(&self) -> tokio::sync::MutexGuard<'_, crate::core::agent_loop::AgentLoop> {
+        self.agent_loop.lock().await
     }
 
     /// Get a mutable reference to the underlying AgentLoop.
-    pub fn agent_loop_mut(&mut self) -> &mut crate::core::agent_loop::AgentLoop {
-        &mut self.agent_loop
+    pub async fn agent_loop_mut(&self) -> tokio::sync::MutexGuard<'_, crate::core::agent_loop::AgentLoop> {
+        self.agent_loop.lock().await
     }
 
     pub async fn build(task_opts: TaskOptions, root_opts: RootOnlyOptions) -> anyhow::Result<Self> {
@@ -113,7 +113,8 @@ impl InteractiveSession {
             .with_hooks(components.hook_manager.clone())
             .with_checkpoint_manager(components.checkpoint_mgr);
 
-        crate::core::cancellation::setup_ctrl_c_handler(agent_loop.state_handle()).await;
+        let agent_loop = Arc::new(tokio::sync::Mutex::new(agent_loop));
+        crate::core::cancellation::setup_ctrl_c_handler(agent_loop.lock().await.state_handle()).await;
 
         Ok(Self {
             agent_loop,
@@ -124,32 +125,33 @@ impl InteractiveSession {
         })
     }
 
-    fn queue_handle(&self) -> crate::core::agent_loop::MessageQueueHandle {
-        self.agent_loop.message_queue_handle()
+    async fn queue_handle(&self) -> crate::core::agent_loop::MessageQueueHandle {
+        self.agent_loop.lock().await.message_queue_handle()
     }
 
     /// Get the message queue handle for checking queued messages.
-    pub fn message_queue_handle(&self) -> Option<crate::core::agent_loop::MessageQueueHandle> {
-        Some(self.agent_loop.message_queue_handle())
+    pub async fn message_queue_handle(&self) -> Option<crate::core::agent_loop::MessageQueueHandle> {
+        Some(self.agent_loop.lock().await.message_queue_handle())
     }
 
-    fn state_handle(&self) -> Arc<tokio::sync::Mutex<crate::core::agent_types::TaskState>> {
-        self.agent_loop.state_handle()
+    async fn state_handle(&self) -> Arc<tokio::sync::Mutex<crate::core::agent_types::TaskState>> {
+        self.agent_loop.lock().await.state_handle()
     }
 
     async fn clear_compacted_summary(&mut self) -> bool {
-        self.agent_loop.clear_compacted_summary().await
+        self.agent_loop.lock().await.clear_compacted_summary().await
     }
 
     /// Get startup info line showing provider, model, task ID, mode, and context window.
     pub fn get_startup_info(&self) -> String {
         use crate::core::context::context_window::get_context_window_info;
 
-        let provider = self.agent_loop.get_provider();
+        let provider = self.agent_loop.blocking_lock().get_provider();
         let provider_name = provider.name();
         let model = provider.get_model();
         let model_name = self.task_opts.model.as_deref().unwrap_or(&model.id);
-        let task_id = self.agent_loop.task_id();
+        let guard = self.agent_loop.blocking_lock();
+        let task_id = guard.task_id();
         let mode = if self.task_opts.plan { "PLAN" } else { "ACT" };
         let context_info = get_context_window_info(provider.as_ref());
         let context_window = format_context_window(context_info.context_window);
@@ -248,23 +250,24 @@ impl InteractiveSession {
         crate::cli::colors::print_horizontal_rule_writer(writer);
     }
 
-    pub async fn run(&mut self, prompt: Option<String>) -> anyhow::Result<()> {
+    pub async fn run(&self, prompt: Option<String>) -> anyhow::Result<()> {
         tracing::debug!(target: "sned::session", "InteractiveSession::run() called, prompt={}", prompt.as_ref().map(|s| format!("{} chars", s.len())).unwrap_or("None".to_string()));
-        let agent = &mut self.agent_loop;
+        let agent = self.agent_loop.clone();
         let state_manager = self.state_manager.clone();
 
         let mut initial_messages = Vec::new();
 
         let is_resuming = self.root_opts.continue_task || self.root_opts.task_id.is_some();
         if is_resuming {
-            let loaded = agent.load_conversation_history().await;
-            agent.load_file_context_tracker().await;
+            let loaded = agent.lock().await.load_conversation_history().await;
+            agent.lock().await.load_file_context_tracker().await;
 
             // Fire TaskResume hook after loading state
-            let _ = self.hook_manager.task_resume(agent.task_id());
+            let _ = self.hook_manager.task_resume(agent.lock().await.task_id());
 
             if loaded && !self.task_opts.json {
-                Self::print_resume_summary(agent, agent.output_writer()).await;
+                let agent_lock = agent.lock().await;
+                Self::print_resume_summary(&agent_lock, agent_lock.output_writer()).await;
             }
         }
 
@@ -279,11 +282,11 @@ impl InteractiveSession {
                 }
             }
 
-            let model_info = agent.get_provider().get_model().info;
+            let model_info = agent.lock().await.get_provider().get_model().info;
             let supports_images = model_info.supports_images.unwrap_or(false);
             let image_blocks = if !all_image_paths.is_empty() && !supports_images {
                 if !self.task_opts.json {
-                    agent
+                    agent.lock().await
                         .output_writer()
                         .emit(crate::cli::output::OutputEvent::warning(format!(
                             "Model '{}' does not support images. Ignoring {} image(s).",
@@ -328,7 +331,7 @@ impl InteractiveSession {
             });
         }
 
-        let run_result = agent
+        let run_result = agent.lock().await
             .run(initial_messages, state_manager)
             .await
             .map_err(|e| anyhow::anyhow!("Agent error: {}", e));
@@ -336,7 +339,7 @@ impl InteractiveSession {
         // Always export on exit, even if the agent errored out.
         // This ensures the conversation is saved for debugging failed runs.
         if let Some(export_path) = self.task_opts.export.clone() {
-            let history = agent.get_conversation_history().await;
+            let history = agent.lock().await.get_conversation_history().await;
             match serde_json::to_string_pretty(&history) {
                 Ok(mut export_data) => {
                     export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
@@ -451,9 +454,29 @@ async fn spawn_agent_task(
     let agent_done_clone = Arc::clone(agent_done);
 
     let handle = tokio::spawn(async move {
-        let mut sess = session_clone.lock().await;
-        let result = sess.run(Some(prompt)).await;
+        let sess = session_clone.lock().await;
+        let agent_loop = sess.agent_loop.clone();
+        let state_manager = sess.state_manager.clone();
+        let task_opts = sess.task_opts.clone();
+        let root_opts = sess.root_opts.clone();
         drop(sess);
+
+        // Build initial message from prompt
+        let processed_prompt = crate::cli::slash_commands::process_slash_command(&prompt);
+        let (clean_prompt, _parsed_image_paths) =
+            crate::cli::image_input::parse_images_from_input(&processed_prompt);
+
+        let mut initial_messages = vec![crate::providers::StorageMessage {
+            id: None,
+            role: crate::providers::MessageRole::User,
+            content: crate::providers::MessageContent::Text(clean_prompt),
+            model_info: None,
+            metrics: None,
+            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+        }];
+
+        let result = agent_loop.lock().await.run(initial_messages, state_manager).await;
+        drop(agent_loop);
 
         agent_busy_clone.store(false, Ordering::Relaxed);
         agent_done_clone.notify_one();
@@ -1009,7 +1032,7 @@ async fn handle_cli_only_command(
             match crate::cli::create_provider(&temp_opts) {
                 Ok(new_provider) => {
                     let mut sess = session.lock().await;
-                    sess.agent_loop_mut().set_provider(new_provider);
+                    sess.agent_loop_mut().await.set_provider(new_provider);
                     app.push_plain(format!("Model switched to {}/{}", provider_name, model_id));
                 }
                 Err(e) => {
@@ -1027,7 +1050,7 @@ async fn handle_cli_only_command(
         CliOnlyCommand::ResetCompact => {
             let mut sess = session.lock().await;
             if sess.clear_compacted_summary().await {
-                let sh = sess.agent_loop().state_handle();
+                let sh = sess.agent_loop().await.state_handle();
                 {
                     let mut state = sh.lock().await;
                     state.last_injected_plan_state_hash = None;
@@ -1039,21 +1062,21 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Stats => {
             let sess = session.lock().await;
-            let sh = sess.agent_loop().state_handle();
+            let sh = sess.agent_loop().await.state_handle();
             let state = sh.lock().await;
             let stats = format_stats_text(&state);
             app.push_plain(stats);
         }
         CliOnlyCommand::Changes => {
             let sess = session.lock().await;
-            let sh = sess.agent_loop().state_handle();
+            let sh = sess.agent_loop().await.state_handle();
             let state = sh.lock().await;
             let changes = format_changes_text(&state);
             app.push_plain(changes);
         }
         CliOnlyCommand::Queue => {
             let sess = session.lock().await;
-            if let Some(qh) = sess.message_queue_handle() {
+            if let Some(qh) = sess.message_queue_handle().await {
                 let count = qh.queued_message_count().await;
                 if count == 0 {
                     app.push_plain("No messages queued.");
@@ -1079,8 +1102,8 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Undo | CliOnlyCommand::CheckpointUndo => {
             let sess = session.lock().await;
-            let checkpoint_mgr = sess
-                .agent_loop()
+            let agent_guard = sess.agent_loop().await;
+            let checkpoint_mgr = agent_guard
                 .checkpoint_manager()
                 .expect("checkpoint manager should be initialized");
             let checkpoints = match checkpoint_mgr.list_checkpoints().await {
@@ -1162,7 +1185,7 @@ async fn handle_cli_only_command(
                             app.push_plain(format!("  - {}", f));
                         }
                     }
-                    let removed = sess.agent_loop().remove_last_turn().await;
+                    let removed = sess.agent_loop().await.remove_last_turn().await;
                     if removed > 0 {
                         app.push_plain(format!(
                             "Removed {} message(s) from conversation history.",
@@ -1323,8 +1346,8 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::CheckpointList => {
             let sess = session.lock().await;
-            let checkpoint_mgr = sess
-                .agent_loop()
+            let agent_guard = sess.agent_loop().await;
+            let checkpoint_mgr = agent_guard
                 .checkpoint_manager()
                 .expect("checkpoint manager should be initialized");
             match checkpoint_mgr.list_checkpoints().await {
@@ -1347,8 +1370,8 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::CheckpointRestore => {
             let sess = session.lock().await;
-            let checkpoint_mgr = sess
-                .agent_loop()
+            let agent_guard = sess.agent_loop().await;
+            let checkpoint_mgr = agent_guard
                 .checkpoint_manager()
                 .expect("checkpoint manager should be initialized");
             let checkpoints = match checkpoint_mgr.list_checkpoints().await {
@@ -1482,7 +1505,7 @@ async fn handle_cli_only_command(
         CliOnlyCommand::Expand => {
             if let Some(index) = crate::cli::slash_commands::parse_expand_index(text) {
                 let sess = session.lock().await;
-                let sh = sess.agent_loop().state_handle();
+                let sh = sess.agent_loop().await.state_handle();
                 drop(sess);
                 let state = sh.lock().await;
                 if let Some(block) = state
@@ -1513,14 +1536,14 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::PlanAbort => {
             let mut sess = session.lock().await;
-            let sh = sess.agent_loop().state_handle();
+            let sh = sess.agent_loop().await.state_handle();
             let mut state = sh.lock().await;
             if state.plan_state.is_some() {
                 state.plan_state = None;
                 state.last_injected_plan_state_hash = None;
                 state.strict_plan_mode_enabled = true;
                 drop(state);
-                sess.agent_loop_mut()
+                sess.agent_loop_mut().await
                     .set_mode(crate::core::agent_types::AgentMode::Act);
                 app.mode = "ACT".to_string();
                 app.update_placeholder();
@@ -1537,7 +1560,7 @@ async fn handle_cli_only_command(
         | CliOnlyCommand::PlanFail => {
             use crate::cli::slash_commands::PlanSubcommand;
             let mut sess = session.lock().await;
-            let sh = sess.agent_loop().state_handle();
+            let sh = sess.agent_loop().await.state_handle();
             let mut state = sh.lock().await;
             if let Some(plan) = &mut state.plan_state {
                 match cli_cmd {
@@ -1695,11 +1718,11 @@ async fn handle_cli_only_command(
                                 crate::core::plan_state::PlanStepStatus::Running;
                             drop(state);
                             {
-                                let state_handle = sess.agent_loop_mut().state_handle();
+                                let state_handle = sess.agent_loop_mut().await.state_handle();
                                 let mut state = state_handle.lock().await;
                                 state.strict_plan_mode_enabled = false;
                             }
-                            sess.agent_loop_mut()
+                            sess.agent_loop_mut().await
                                 .set_mode(crate::core::agent_types::AgentMode::Act);
                             app.mode = "ACT".to_string();
                             app.update_placeholder();
@@ -2163,7 +2186,7 @@ async fn run_main_loop(
                                         // Switch agent mode to Plan so write/edit tools are restricted
                                         {
                                             let mut sess = session.lock().await;
-                                            sess.agent_loop_mut().set_mode(
+                                            sess.agent_loop_mut().await.set_mode(
                                                 crate::core::agent_types::AgentMode::Plan,
                                             );
                                         }
@@ -2219,26 +2242,35 @@ async fn run_main_loop(
                                         continue;
                                     }
 
-                                    // Agent-required commands: check if agent is busy
-                                    if agent_busy.load(Ordering::Relaxed)
-                                        && cli_cmd.requires_agent_idle()
-                                    {
-                                        // Queue the command
-                                        if let Some(qh) = queue_handle.lock().await.as_ref() {
-                                            qh.enqueue_text_message(text.clone()).await;
-                                            let count = qh.queued_message_count().await;
-                                            // Message already echoed by handle_key_event
-                                            app.push_styled(
-                                                format!(
-                                                    "Command queued ({} in queue): {}",
-                                                    count, text
-                                                ),
-                                                theme::dim_style(),
-                                            );
-                                        }
-                                        continue;
-                                    }
+                                // Block slash commands while approval prompt is active
+                                if is_approval_prompt_active() {
+                                    app.push_styled(
+                                        "Blocked: cannot process commands while approval is pending.",
+                                        theme::status_style(),
+                                    );
+                                    continue;
                                 }
+
+                                // Agent-required commands: check if agent is busy
+                                if agent_busy.load(Ordering::Relaxed)
+                                    && cli_cmd.requires_agent_idle()
+                                {
+                                    // Queue the command
+                                    if let Some(qh) = queue_handle.lock().await.as_ref() {
+                                        qh.enqueue_text_message(text.clone()).await;
+                                        let count = qh.queued_message_count().await;
+                                        // Message already echoed by handle_key_event
+                                        app.push_styled(
+                                            format!(
+                                                "Command queued ({} in queue): {}",
+                                                count, text
+                                            ),
+                                            theme::dim_style(),
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
 
                                 // Process model-side slash commands (e.g., /compact, /plan)
                                 let processed =
@@ -2426,15 +2458,16 @@ pub async fn run_interactive_shell_inner(
         .await?,
     ));
 
-    let task_id = {
-        let sess = session.lock().await;
-        sess.agent_loop.task_id().to_string()
-    };
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
 
     // Set status bar fields from session info
     {
         let sess = session.lock().await;
-        let provider = sess.agent_loop.get_provider();
+        let agent_guard = sess.agent_loop().await;
+        let provider = agent_guard.get_provider();
         let model = provider.get_model();
         app.provider_name = provider.name().to_string();
         app.model_name = sess
@@ -2484,12 +2517,12 @@ pub async fn run_interactive_shell_inner(
     {
         let sess = session.lock().await;
         let mut qh = queue_handle.lock().await;
-        *qh = Some(sess.queue_handle());
+        *qh = Some(sess.queue_handle().await);
         let mut sh = state_handle.lock().await;
-        *sh = Some(sess.state_handle());
+        *sh = Some(sess.state_handle().await);
 
         let _cwd = app.cwd.clone();
-        let agent_loop = sess.agent_loop.state_handle();
+        let agent_loop = sess.agent_loop().await.state_handle();
         let skills = {
             let state = agent_loop.lock().await;
             state.available_skills.clone()
@@ -2992,7 +3025,7 @@ mod tests {
         ));
         let state_handle = {
             let sess = session.lock().await;
-            sess.agent_loop().state_handle()
+            sess.agent_loop().await.state_handle()
         };
         {
             let mut state = state_handle.lock().await;
@@ -3012,7 +3045,7 @@ mod tests {
         let state_handle_slot = Arc::new(Mutex::new(None));
         let task_id = {
             let sess = session.lock().await;
-            sess.agent_loop().task_id().to_string()
+            sess.agent_loop().await.task_id().to_string()
         };
 
         let should_exit = handle_cli_only_command(
@@ -3100,7 +3133,7 @@ mod tests {
         ));
         let state_handle = {
             let sess = session.lock().await;
-            sess.agent_loop().state_handle()
+            sess.agent_loop().await.state_handle()
         };
         {
             let mut state = state_handle.lock().await;
@@ -3119,7 +3152,7 @@ mod tests {
         let state_handle_slot = Arc::new(Mutex::new(None));
         let task_id = {
             let sess = session.lock().await;
-            sess.agent_loop().task_id().to_string()
+            sess.agent_loop().await.task_id().to_string()
         };
 
         let should_exit = handle_cli_only_command(
@@ -3151,7 +3184,7 @@ mod tests {
 
         {
             let sess = session.lock().await;
-            assert_eq!(sess.agent_loop().mode(), AgentMode::Act);
+            assert_eq!(sess.agent_loop().await.mode(), AgentMode::Act);
         }
 
         let state = state_handle.lock().await;
@@ -3215,7 +3248,7 @@ mod tests {
         ));
         let state_handle = {
             let sess = session.lock().await;
-            sess.agent_loop().state_handle()
+            sess.agent_loop().await.state_handle()
         };
         {
             let mut state = state_handle.lock().await;
@@ -3237,7 +3270,7 @@ mod tests {
         let state_handle_slot = Arc::new(Mutex::new(None));
         let task_id = {
             let sess = session.lock().await;
-            sess.agent_loop().task_id().to_string()
+            sess.agent_loop().await.task_id().to_string()
         };
 
         let should_exit = handle_cli_only_command(
@@ -3322,7 +3355,7 @@ mod tests {
         ));
         let state_handle = {
             let sess = session.lock().await;
-            sess.agent_loop().state_handle()
+            sess.agent_loop().await.state_handle()
         };
         {
             let mut state = state_handle.lock().await;
@@ -3345,7 +3378,7 @@ mod tests {
         let state_handle_slot = Arc::new(Mutex::new(None));
         let task_id = {
             let sess = session.lock().await;
-            sess.agent_loop().task_id().to_string()
+            sess.agent_loop().await.task_id().to_string()
         };
 
         let should_exit = handle_cli_only_command(
@@ -3439,7 +3472,7 @@ mod tests {
         ));
         let state_handle = {
             let sess = session.lock().await;
-            sess.agent_loop().state_handle()
+            sess.agent_loop().await.state_handle()
         };
         {
             let mut state = state_handle.lock().await;
@@ -3463,7 +3496,7 @@ mod tests {
         let state_handle_slot = Arc::new(Mutex::new(None));
         let task_id = {
             let sess = session.lock().await;
-            sess.agent_loop().task_id().to_string()
+            sess.agent_loop().await.task_id().to_string()
         };
 
         let should_exit = handle_cli_only_command(
