@@ -272,6 +272,11 @@ impl App {
         } else {
             self.rebuild_visual_row_cache(wrap_width);
         }
+
+        // Auto-scroll to bottom when new output arrives (unless approval-pinned)
+        if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
+            self.force_bottom();
+        }
     }
 
     /// Push a plain text line.

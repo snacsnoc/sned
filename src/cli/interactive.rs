@@ -2623,7 +2623,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_output_preserves_manual_scroll_without_approval_prompt() {
+    fn test_drain_output_resets_to_auto_on_new_output() {
         use crate::cli::output::OutputEvent;
         use crate::cli::tui::app::ScrollMode;
 
@@ -2631,7 +2631,7 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutputEvent::plain("line 1")).unwrap();
+        tx.try_send(OutputEvent::plain("new line")).unwrap();
 
         let mut app = App::new();
         app.set_content_height(5);
@@ -2644,8 +2644,8 @@ mod tests {
 
         drain_output(&mut rx, &mut app);
 
-        assert_eq!(app.scroll_mode, ScrollMode::Manual);
-        assert_eq!(app.scroll_offset, 7);
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert_eq!(app.scroll_offset, 0);
 
         reset_prompt_state();
     }
