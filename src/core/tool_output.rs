@@ -313,13 +313,11 @@ pub fn format_tool_result(result: &str, max_lines: usize) -> String {
     // Single pass: strip anchors and count lines, stopping early once we know
     // truncation is needed. Only allocate the final output string.
     let mut output = String::new();
-    let mut line_count = 0;
 
-    for line in result.lines() {
+    for (line_count, line) in result.lines().enumerate() {
         let stripped = strip_anchor(line);
 
         if line_count == max_lines {
-            // We have enough lines; count remaining without building output.
             let remaining = result.lines().count() - max_lines;
             return format!("{output}\n... {remaining} more lines");
         }
@@ -328,7 +326,6 @@ pub fn format_tool_result(result: &str, max_lines: usize) -> String {
             output.push('\n');
         }
         output.push_str(stripped);
-        line_count += 1;
     }
 
     output

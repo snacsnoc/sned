@@ -389,22 +389,19 @@ impl ReadFileHandler {
             lines.push(line);
             line_count += 1;
 
-            if line_count % progress_interval == 0 {
-                if let Some(writer) = output_writer {
+            if let Some(writer) = output_writer {
+                if line_count.is_multiple_of(progress_interval) {
                     writer.emit(crate::cli::output::OutputEvent::dim(format!(
                         "  Reading {}: {} lines...",
                         path, line_count
                     )));
                 }
-            }
-        }
-
-        if line_count >= progress_interval {
-            if let Some(writer) = output_writer {
-                writer.emit(crate::cli::output::OutputEvent::dim(format!(
-                    "  Read {} lines from {}",
-                    line_count, path
-                )));
+                if line_count >= progress_interval {
+                    writer.emit(crate::cli::output::OutputEvent::dim(format!(
+                        "  Read {} lines from {}",
+                        line_count, path
+                    )));
+                }
             }
         }
 

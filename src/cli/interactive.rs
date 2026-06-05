@@ -1884,21 +1884,13 @@ async fn run_main_loop(
                 "[timing] draw: total={}us count={} avg={}us",
                 self.draw_total_us,
                 self.draw_count,
-                if self.draw_count > 0 {
-                    self.draw_total_us / self.draw_count
-                } else {
-                    0
-                }
+                self.draw_total_us.saturating_div(self.draw_count),
             );
             eprintln!(
                 "[timing] drain: total={}us count={} avg={}us",
                 self.drain_total_us,
                 self.drain_count,
-                if self.drain_count > 0 {
-                    self.drain_total_us / self.drain_count
-                } else {
-                    0
-                }
+                self.drain_total_us.saturating_div(self.drain_count),
             );
             eprintln!("[timing] output_lines_peak={}", self.output_lines_peak);
 
