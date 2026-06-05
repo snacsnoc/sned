@@ -1223,7 +1223,7 @@ async fn run_task_inner(
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
 ) -> anyhow::Result<()> {
-    let mut session = InteractiveSession::build(task_opts, root_opts).await?;
+    let session = InteractiveSession::build(task_opts, root_opts).await?;
     session.run(prompt).await
 }
 

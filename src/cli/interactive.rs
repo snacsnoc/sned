@@ -457,8 +457,6 @@ async fn spawn_agent_task(
         let sess = session_clone.lock().await;
         let agent_loop = sess.agent_loop.clone();
         let state_manager = sess.state_manager.clone();
-        let task_opts = sess.task_opts.clone();
-        let root_opts = sess.root_opts.clone();
         drop(sess);
 
         // Build initial message from prompt
@@ -466,7 +464,7 @@ async fn spawn_agent_task(
         let (clean_prompt, _parsed_image_paths) =
             crate::cli::image_input::parse_images_from_input(&processed_prompt);
 
-        let mut initial_messages = vec![crate::providers::StorageMessage {
+        let initial_messages = vec![crate::providers::StorageMessage {
             id: None,
             role: crate::providers::MessageRole::User,
             content: crate::providers::MessageContent::Text(clean_prompt),
@@ -1031,7 +1029,7 @@ async fn handle_cli_only_command(
 
             match crate::cli::create_provider(&temp_opts) {
                 Ok(new_provider) => {
-                    let mut sess = session.lock().await;
+                    let sess = session.lock().await;
                     sess.agent_loop_mut().await.set_provider(new_provider);
                     app.push_plain(format!("Model switched to {}/{}", provider_name, model_id));
                 }
@@ -1535,7 +1533,7 @@ async fn handle_cli_only_command(
             app.push_plain("Plan prompt should be handled by the main loop.");
         }
         CliOnlyCommand::PlanAbort => {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             let sh = sess.agent_loop().await.state_handle();
             let mut state = sh.lock().await;
             if state.plan_state.is_some() {
@@ -1559,7 +1557,7 @@ async fn handle_cli_only_command(
         | CliOnlyCommand::PlanComplete
         | CliOnlyCommand::PlanFail => {
             use crate::cli::slash_commands::PlanSubcommand;
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             let sh = sess.agent_loop().await.state_handle();
             let mut state = sh.lock().await;
             if let Some(plan) = &mut state.plan_state {
@@ -2185,7 +2183,7 @@ async fn run_main_loop(
                                         }
                                         // Switch agent mode to Plan so write/edit tools are restricted
                                         {
-                                            let mut sess = session.lock().await;
+                                            let sess = session.lock().await;
                                             sess.agent_loop_mut().await.set_mode(
                                                 crate::core::agent_types::AgentMode::Plan,
                                             );
