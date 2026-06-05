@@ -11,6 +11,8 @@
 //! - /commit to finalize changes to user's real git
 
 use anyhow::{Context, Result};
+use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
@@ -60,7 +62,7 @@ pub fn commit_turn(workspace_root: &Path, message: &str) -> Result<()> {
 fn commit_turn_internal(workspace_root: &Path, message: &str) -> Result<()> {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 
-    // Default ignores for common noise
+    // Create a temporary exclude file with default ignores
     let default_ignores = [
         "target/",
         "node_modules/",
@@ -80,6 +82,14 @@ fn commit_turn_internal(workspace_root: &Path, message: &str) -> Result<()> {
         "*.sqlite3",
     ];
 
+    let exclude_file = workspace_root.join(".sned/.git-agent/excludes");
+    fs::create_dir_all(exclude_file.parent().unwrap()).ok();
+    let mut f = fs::File::create(&exclude_file).context("Failed to create exclude file")?;
+    for ignore in &default_ignores {
+        writeln!(f, "{}", ignore).ok();
+    }
+    drop(f);
+
     // Stage all changes with ignores
     let mut git_cmd = Command::new("git");
     git_cmd
@@ -87,17 +97,14 @@ fn commit_turn_internal(workspace_root: &Path, message: &str) -> Result<()> {
         .arg("-A")
         .current_dir(workspace_root)
         .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root);
+        .env("GIT_WORK_TREE", workspace_root)
+        .arg("--exclude-from")
+        .arg(&exclude_file);
 
-    // Add user's .gitignore via --exclude-from if it exists
+    // Also add user's .gitignore via second --exclude-from
     let user_gitignore = workspace_root.join(".gitignore");
     if user_gitignore.exists() {
         git_cmd.arg("--exclude-from").arg(&user_gitignore);
-    }
-
-    // Add default ignores via --exclude
-    for ignore in &default_ignores {
-        git_cmd.arg("--exclude").arg(ignore);
     }
 
     let output = git_cmd
@@ -525,5 +532,162 @@ pub fn turn_count(workspace_root: &Path) -> usize {
             .parse()
             .unwrap_or(0),
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn git_config_for_tests(workspace_root: &Path) {
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Sned Test"])
+            .current_dir(workspace_root)
+            .output();
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@sned.run"])
+            .current_dir(workspace_root)
+            .output();
+    }
+
+    #[test]
+    fn test_init_shadow_repo_creates_head() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+        assert!(is_initialized(temp.path()));
+        assert!(temp.path().join(SHADOW_GIT_DIR).join("HEAD").exists());
+    }
+
+    #[test]
+    fn test_init_shadow_repo_idempotent() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+        init_shadow_repo(temp.path()).unwrap();
+        assert_eq!(turn_count(temp.path()), 1);
+    }
+
+    #[test]
+    fn test_commit_turn_tracks_changes() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+
+        fs::write(temp.path().join("test.txt"), "hello").unwrap();
+        commit_turn(temp.path(), "test commit").unwrap();
+        assert_eq!(turn_count(temp.path()), 2);
+    }
+
+    #[test]
+    fn test_commit_turn_no_changes_skips() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+        let count_before = turn_count(temp.path());
+        commit_turn(temp.path(), "no-op commit").unwrap();
+        assert_eq!(turn_count(temp.path()), count_before);
+    }
+
+    #[test]
+    fn test_undo_last_turn_reverts_changes() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+
+        fs::write(temp.path().join("test.txt"), "hello").unwrap();
+        commit_turn(temp.path(), "add test file").unwrap();
+
+        let (added, _modified) = undo_last_turn(temp.path()).unwrap();
+        assert!(added.contains(&"test.txt".to_string()));
+        assert!(!temp.path().join("test.txt").exists());
+        assert_eq!(turn_count(temp.path()), 1);
+    }
+
+    #[test]
+    fn test_undo_last_turn_requires_two_commits() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+        let err = undo_last_turn(temp.path()).unwrap_err();
+        assert!(err.to_string().contains("No turns to undo"));
+    }
+
+    #[test]
+    fn test_diff_turns_shows_changes() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+
+        fs::write(temp.path().join("file.txt"), "content").unwrap();
+        commit_turn(temp.path(), "add file").unwrap();
+
+        let diff = diff_turns(temp.path(), 1, 0).unwrap();
+        assert!(!diff.is_empty());
+        assert!(diff.contains("file.txt"));
+    }
+
+    #[test]
+    fn test_log_shows_commits() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+
+        fs::write(temp.path().join("a.txt"), "a").unwrap();
+        commit_turn(temp.path(), "add a").unwrap();
+
+        let log = log(temp.path(), Some(5)).unwrap();
+        assert!(!log.is_empty());
+        assert!(log.contains("add a"));
+    }
+
+    #[test]
+    fn test_is_initialized_false_before_init() {
+        let temp = TempDir::new().unwrap();
+        assert!(!is_initialized(temp.path()));
+    }
+
+    #[test]
+    fn test_turn_count_zero_before_init() {
+        let temp = TempDir::new().unwrap();
+        assert_eq!(turn_count(temp.path()), 0);
+    }
+
+    #[test]
+    fn test_get_user_edits_detects_user_changes() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+
+        fs::write(temp.path().join("agent_file.txt"), "agent").unwrap();
+        commit_turn(temp.path(), "agent change").unwrap();
+
+        fs::write(temp.path().join("user_file.txt"), "user").unwrap();
+        let edits = get_user_edits_since_last_turn(temp.path()).unwrap();
+        assert!(edits.contains(&"user_file.txt".to_string()));
+        assert!(!edits.contains(&"agent_file.txt".to_string()));
+    }
+
+    #[test]
+    fn test_commit_to_real_git_stages_changed_files() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+
+        // Initialize real git repo
+        let _ = Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(temp.path())
+            .output();
+        git_config_for_tests(temp.path());
+
+        init_shadow_repo(temp.path()).unwrap();
+
+        fs::write(temp.path().join("shadow_file.txt"), "shadow").unwrap();
+        commit_turn(temp.path(), "shadow commit").unwrap();
+
+        let files = commit_to_real_git(temp.path(), "promote to real git").unwrap();
+        assert!(files.contains(&"shadow_file.txt".to_string()));
     }
 }
