@@ -48,18 +48,18 @@ pub fn init_shadow_repo(workspace_root: &Path) -> Result<()> {
         );
     }
 
-    // Create initial commit
-    commit_turn_internal(workspace_root, "[sned] session start")?;
+    // Create initial commit (force=true to allow empty commit)
+    commit_turn_internal(workspace_root, "[sned] session start", true)?;
 
     Ok(())
 }
 
 /// Commit the current state to the shadow repo.
 pub fn commit_turn(workspace_root: &Path, message: &str) -> Result<()> {
-    commit_turn_internal(workspace_root, message)
+    commit_turn_internal(workspace_root, message, false)
 }
 
-fn commit_turn_internal(workspace_root: &Path, message: &str) -> Result<()> {
+fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Result<()> {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 
     // Create a temporary exclude file with default ignores
@@ -83,31 +83,37 @@ fn commit_turn_internal(workspace_root: &Path, message: &str) -> Result<()> {
     ];
 
     let exclude_file = workspace_root.join(".sned/.git-agent/excludes");
-    fs::create_dir_all(exclude_file.parent().unwrap()).ok();
-    let mut f = fs::File::create(&exclude_file).context("Failed to create exclude file")?;
+    let exclude_file_abs = exclude_file.canonicalize().unwrap_or(exclude_file);
+    fs::create_dir_all(exclude_file_abs.parent().unwrap()).ok();
+    let mut f = fs::File::create(&exclude_file_abs).context("Failed to create exclude file")?;
     for ignore in &default_ignores {
         writeln!(f, "{}", ignore).ok();
     }
     drop(f);
 
+    // Set core.excludesFile in shadow repo config
+    let config_output = Command::new("git")
+        .args(["config", "core.excludesFile", exclude_file_abs.to_string_lossy().as_ref()])
+        .current_dir(workspace_root)
+        .env("GIT_DIR", &shadow_git_path)
+        .env("GIT_WORK_TREE", workspace_root)
+        .output()
+        .context("Failed to set git config")?;
+
+    if !config_output.status.success() {
+        anyhow::bail!(
+            "git config failed: {}",
+            String::from_utf8_lossy(&config_output.stderr)
+        );
+    }
+
     // Stage all changes with ignores
-    let mut git_cmd = Command::new("git");
-    git_cmd
+    let output = Command::new("git")
         .arg("add")
         .arg("-A")
         .current_dir(workspace_root)
         .env("GIT_DIR", &shadow_git_path)
         .env("GIT_WORK_TREE", workspace_root)
-        .arg("--exclude-from")
-        .arg(&exclude_file);
-
-    // Also add user's .gitignore via second --exclude-from
-    let user_gitignore = workspace_root.join(".gitignore");
-    if user_gitignore.exists() {
-        git_cmd.arg("--exclude-from").arg(&user_gitignore);
-    }
-
-    let output = git_cmd
         .output()
         .context("Failed to stage files for shadow commit")?;
 
@@ -130,20 +136,26 @@ fn commit_turn_internal(workspace_root: &Path, message: &str) -> Result<()> {
         .output()
         .context("Failed to check for changes")?;
 
-    if diff_output.status.success() {
+    if diff_output.status.success() && !force {
         // No changes to commit
         return Ok(());
     }
 
     // Commit
-    let output = Command::new("git")
+    let mut commit_cmd = Command::new("git");
+    commit_cmd
         .arg("commit")
         .arg("-m")
         .arg(message)
         .current_dir(workspace_root)
         .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
+        .env("GIT_WORK_TREE", workspace_root);
+
+    if force {
+        commit_cmd.arg("--allow-empty");
+    }
+
+    let output = commit_cmd.output()
         .context("Failed to commit to shadow repo")?;
 
     if !output.status.success() {
@@ -489,21 +501,25 @@ pub fn get_user_edits_since_last_turn(workspace_root: &Path) -> Result<Vec<Strin
         .collect();
 
     // Check for user edits (files modified in working tree but not in last turn)
-    let working_tree_diff = Command::new("git")
-        .arg("diff")
-        .arg("--name-only")
-        .arg("HEAD")
+    // Use git status --porcelain to catch both tracked changes and untracked files
+    let status_output = Command::new("git")
+        .arg("status")
+        .arg("--porcelain")
         .current_dir(workspace_root)
         .env("GIT_DIR", &shadow_git_path)
         .env("GIT_WORK_TREE", workspace_root)
         .output()
-        .context("Failed to check working tree")?;
+        .context("Failed to check working tree status")?;
 
-    let user_edited: Vec<String> = String::from_utf8_lossy(&working_tree_diff.stdout)
+    let user_edited: Vec<String> = String::from_utf8_lossy(&status_output.stdout)
         .lines()
         .filter(|s| !s.is_empty())
-        .filter(|s| !modified_files.iter().any(|f| f == s) && !added_files.iter().any(|f| f == s))
-        .map(|s| s.to_string())
+        .map(|s| {
+            // porcelain format: "XY filename" or "XY old_filename -> new_filename"
+            s.split_whitespace().nth(1).unwrap_or("").to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .filter(|s| !modified_files.contains(s) && !added_files.contains(s))
         .collect();
 
     Ok(user_edited)
