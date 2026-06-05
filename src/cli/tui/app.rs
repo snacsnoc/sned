@@ -156,6 +156,12 @@ pub struct App {
     pub slash_command_selected: usize,
     /// All available slash command entries (unfiltered).
     pub slash_command_all_entries: Vec<crate::cli::slash_commands::SlashCommandEntry>,
+    /// Whether the model picker is active.
+    pub model_picker_active: bool,
+    /// Model picker entries.
+    pub model_picker_results: Vec<crate::cli::slash_commands::ModelPickerEntry>,
+    /// Currently selected index in model picker.
+    pub model_picker_selected: usize,
 }
 
 impl App {
@@ -228,6 +234,9 @@ impl App {
             slash_command_results: Vec::new(),
             slash_command_selected: 0,
             slash_command_all_entries: Vec::new(),
+            model_picker_active: false,
+            model_picker_results: Vec::new(),
+            model_picker_selected: 0,
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
         }
@@ -592,6 +601,9 @@ impl App {
             if self.slash_command_active {
                 self.render_slash_command_overlay(frame, output_area);
             }
+            if self.model_picker_active {
+                self.render_model_picker_overlay(frame, output_area);
+            }
             self.render_plan_panel(frame, plan_area);
         } else {
             let [output_area, status_area, input_area] = Layout::vertical([
@@ -609,6 +621,9 @@ impl App {
             }
             if self.slash_command_active {
                 self.render_slash_command_overlay(frame, output_area);
+            }
+            if self.model_picker_active {
+                self.render_model_picker_overlay(frame, output_area);
             }
         }
     }
@@ -821,6 +836,43 @@ impl App {
         let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
             " Slash Commands ({}) ",
             self.slash_command_results.len()
+        )));
+
+        frame.render_widget(Clear, overlay_area);
+        frame.render_widget(picker, overlay_area);
+    }
+
+    /// Render model picker overlay as a floating widget.
+    fn render_model_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
+        let max_height = 10.min(self.model_picker_results.len() as u16);
+        let width = 50.min(output_area.width);
+
+        let overlay_area = Rect {
+            x: output_area.x + 2,
+            y: output_area
+                .y
+                .saturating_add(output_area.height.saturating_sub(max_height + 4)),
+            width,
+            height: max_height + 2,
+        };
+
+        let rows: Vec<Line> = self
+            .model_picker_results
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let label = format!("[{}] {} - {}", entry.provider, entry.label, entry.description);
+                if i == self.model_picker_selected {
+                    Line::from(Span::styled(label, theme::picker_selected_style()))
+                } else {
+                    Line::from(label)
+                }
+            })
+            .collect();
+
+        let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
+            " Models ({}) ",
+            self.model_picker_results.len()
         )));
 
         frame.render_widget(Clear, overlay_area);

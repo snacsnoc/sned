@@ -558,6 +558,21 @@ async fn handle_key_event(
         false
     }
 
+    // Tab or Enter with active model picker -> insert model spec into textarea
+    if app.model_picker_active
+        && !app.model_picker_results.is_empty()
+        && (key.code == KeyCode::Tab || (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT)))
+    {
+        let entry = &app.model_picker_results[app.model_picker_selected];
+        let model_spec = format!("{}/{}", entry.provider, entry.model_id);
+        app.input = App::new_textarea(vec![model_spec]);
+        app.input.move_cursor(tui_textarea::CursorMove::End);
+        app.model_picker_active = false;
+        app.model_picker_results.clear();
+        app.model_picker_selected = 0;
+        return Ok(None);
+    }
+
     // Tab or Enter with active file picker -> insert selection (must come before Enter handler)
     if app.picker_active
         && !app.picker_results.is_empty()
@@ -748,6 +763,26 @@ async fn handle_key_event(
             app.picker_index = (app.picker_index + 1).min(app.picker_results.len() - 1);
             return Ok(None);
         }
+    }
+
+    // Up/Down for model picker navigation (when model picker is active)
+    if app.model_picker_active && !app.model_picker_results.is_empty() {
+        if key.code == KeyCode::Up {
+            app.model_picker_selected = app.model_picker_selected.saturating_sub(1);
+            return Ok(None);
+        }
+        if key.code == KeyCode::Down {
+            app.model_picker_selected = (app.model_picker_selected + 1).min(app.model_picker_results.len() - 1);
+            return Ok(None);
+        }
+    }
+
+    // Escape key - dismiss model picker
+    if key.code == KeyCode::Esc && app.model_picker_active {
+        app.model_picker_active = false;
+        app.model_picker_results.clear();
+        app.model_picker_selected = 0;
+        return Ok(None);
     }
 
     // Escape key - dismiss picker or clear input mode
@@ -950,6 +985,14 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::ModelSwitch(model_spec) => {
+            if model_spec.is_empty() {
+                // No argument: show model picker
+                app.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
+                app.model_picker_selected = 0;
+                app.model_picker_active = true;
+                return Ok(false);
+            }
+
             let parts: Vec<&str> = model_spec.splitn(2, '/').collect();
             if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
                 app.push_plain("Usage: /model provider/model_id\nExample: /model anthropic/claude-sonnet-4");

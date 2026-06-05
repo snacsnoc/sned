@@ -1794,25 +1794,128 @@ Auto-approve: {}
     )
 }
 
+/// Model picker entry for the /model command.
+#[derive(Debug, Clone)]
+pub struct ModelPickerEntry {
+    pub provider: &'static str,
+    pub model_id: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+/// Build the list of available model picker entries.
+pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
+    vec![
+        ModelPickerEntry {
+            provider: "anthropic",
+            model_id: "claude-sonnet-4-20250514",
+            label: "claude-sonnet-4-20250514",
+            description: "Claude Sonnet 4",
+        },
+        ModelPickerEntry {
+            provider: "anthropic",
+            model_id: "claude-opus-4-20250514",
+            label: "claude-opus-4-20250514",
+            description: "Claude Opus 4",
+        },
+        ModelPickerEntry {
+            provider: "anthropic",
+            model_id: "claude-3-5-sonnet-20241022",
+            label: "claude-3-5-sonnet-20241022",
+            description: "Claude 3.5 Sonnet",
+        },
+        ModelPickerEntry {
+            provider: "anthropic",
+            model_id: "claude-3-5-haiku-20241022",
+            label: "claude-3-5-haiku-20241022",
+            description: "Claude 3.5 Haiku",
+        },
+        ModelPickerEntry {
+            provider: "openai",
+            model_id: "gpt-4o",
+            label: "gpt-4o",
+            description: "GPT-4o",
+        },
+        ModelPickerEntry {
+            provider: "openai",
+            model_id: "gpt-4o-mini",
+            label: "gpt-4o-mini",
+            description: "GPT-4o Mini",
+        },
+        ModelPickerEntry {
+            provider: "openai",
+            model_id: "o1-preview",
+            label: "o1-preview",
+            description: "O1 Preview",
+        },
+        ModelPickerEntry {
+            provider: "openai",
+            model_id: "o1-mini",
+            label: "o1-mini",
+            description: "O1 Mini",
+        },
+        ModelPickerEntry {
+            provider: "minimax",
+            model_id: "minimax-m2.7",
+            label: "minimax-m2.7",
+            description: "MiniMax M2.7",
+        },
+        ModelPickerEntry {
+            provider: "gemini",
+            model_id: "gemini-3.1-pro-preview",
+            label: "gemini-3.1-pro-preview",
+            description: "Gemini 3.1 Pro",
+        },
+        ModelPickerEntry {
+            provider: "deepseek",
+            model_id: "deepseek-chat",
+            label: "deepseek-chat",
+            description: "DeepSeek Chat",
+        },
+        ModelPickerEntry {
+            provider: "openrouter",
+            model_id: "anthropic/claude-sonnet-4.5",
+            label: "anthropic/claude-sonnet-4.5",
+            description: "OpenRouter - Claude Sonnet 4.5",
+        },
+    ]
+}
+
+/// Format available models text for /models command.
 pub fn format_models_text() -> String {
-    r#"Available Models:
+    let entries = build_model_picker_entries();
+    let mut s = String::new();
+    s.push_str("Available Models:\n");
+    let mut current_provider: Option<&str> = None;
+    for entry in &entries {
+        if Some(entry.provider) != current_provider {
+            current_provider = Some(entry.provider);
+            s.push_str(&format!("\n{}:\n", to_title_case(entry.provider)));
+        }
+        s.push_str(&format!("  {}\n", entry.label));
+    }
+    s
+}
 
-Anthropic:
-  claude-sonnet-4-20250514
-  claude-opus-4-20250514
-  claude-3-5-sonnet-20241022
-  claude-3-5-haiku-20241022
-
-OpenAI:
-  gpt-4o
-  gpt-4o-mini
-  o1-preview
-  o1-mini
-
-MiniMax:
-  minimax-m2.7
-"#
-    .to_string()
+fn to_title_case(s: &str) -> String {
+    // Special cases for provider names
+    match s {
+        "openai" => "OpenAI".to_string(),
+        "minimax" => "MiniMax".to_string(),
+        "deepseek" => "DeepSeek".to_string(),
+        "openrouter" => "OpenRouter".to_string(),
+        _ => {
+            let mut c = s.chars();
+            match c.next() {
+                None => String::new(),
+                Some(first) => {
+                    let mut result = first.to_uppercase().collect::<String>();
+                    result.extend(c.flat_map(|ch| ch.to_lowercase()));
+                    result
+                }
+            }
+        }
+    }
 }
 
 pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String {
