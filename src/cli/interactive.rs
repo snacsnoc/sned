@@ -143,14 +143,14 @@ impl InteractiveSession {
     }
 
     /// Get startup info line showing provider, model, task ID, mode, and context window.
-    pub fn get_startup_info(&self) -> String {
+    pub async fn get_startup_info(&self) -> String {
         use crate::core::context::context_window::get_context_window_info;
 
-        let provider = self.agent_loop.blocking_lock().get_provider();
+        let guard = self.agent_loop.lock().await;
+        let provider = guard.get_provider();
         let provider_name = provider.name();
         let model = provider.get_model();
         let model_name = self.task_opts.model.as_deref().unwrap_or(&model.id);
-        let guard = self.agent_loop.blocking_lock();
         let task_id = guard.task_id();
         let mode = if self.task_opts.plan { "PLAN" } else { "ACT" };
         let context_info = get_context_window_info(provider.as_ref());
@@ -2483,7 +2483,7 @@ pub async fn run_interactive_shell_inner(
     {
         let sess = session.lock().await;
         if !sess.is_quiet() {
-            let startup_info = sess.get_startup_info();
+            let startup_info = sess.get_startup_info().await;
             for line in ansi_to_ratatui_lines(&startup_info) {
                 app.push_output(line);
             }
