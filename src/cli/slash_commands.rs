@@ -3065,4 +3065,50 @@ mod tests {
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), CliOnlyCommand::ModelSwitch(_)));
     }
+
+    #[test]
+    fn test_model_picker_entries_contains_providers() {
+        let entries = build_model_picker_entries();
+        assert!(entries.len() >= 12);
+
+        let providers: Vec<&str> = entries.iter().map(|e| e.provider).collect();
+        assert!(providers.contains(&"anthropic"));
+        assert!(providers.contains(&"openai"));
+        assert!(providers.contains(&"minimax"));
+        assert!(providers.contains(&"gemini"));
+        assert!(providers.contains(&"deepseek"));
+        assert!(providers.contains(&"openrouter"));
+    }
+
+    #[test]
+    fn test_model_picker_entry_has_model_id() {
+        let entries = build_model_picker_entries();
+        for entry in &entries {
+            assert!(!entry.provider.is_empty(), "provider must not be empty");
+            assert!(!entry.model_id.is_empty(), "model_id must not be empty");
+            assert!(!entry.label.is_empty(), "label must not be empty");
+            assert!(!entry.description.is_empty(), "description must not be empty");
+        }
+    }
+
+    #[test]
+    fn test_format_models_text_has_all_providers() {
+        let text = format_models_text();
+        assert!(text.contains("Anthropic"));
+        assert!(text.contains("OpenAI"));
+        assert!(text.contains("MiniMax"));
+        assert!(text.contains("Gemini"));
+        assert!(text.contains("DeepSeek"));
+        assert!(text.contains("OpenRouter"));
+    }
+
+    #[test]
+    fn test_format_models_text_has_models() {
+        let text = format_models_text();
+        assert!(text.contains("claude-"));
+        assert!(text.contains("gpt-"));
+        assert!(text.contains("minimax-"));
+        assert!(text.contains("gemini-"));
+        assert!(text.contains("deepseek-"));
+    }
 }
