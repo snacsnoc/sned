@@ -1072,6 +1072,7 @@ test_tui_auto_scroll() {
     SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -1110,8 +1111,17 @@ pending_prompt = None
 next_prompt_ready_at = 0.0
 next_prompt = 1
 sent_exit = False
+sent_scroll = False
 exit_code = None
 deadline = time.time() + 20
+
+ansi_re = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+def visible_tail(text, rows=24):
+    """Get the last N non-empty lines (the visible viewport)."""
+    clean = ansi_re.sub("", text).replace("\r", "\n")
+    lines = [line for line in clean.split("\n") if line.strip()]
+    return "\n".join(lines[-rows:])
 
 try:
     while time.time() < deadline:
@@ -1127,7 +1137,6 @@ try:
             if b"\x1b[6n" in data:
                 os.write(fd, b"\x1b[1;1R")
             text = buf.decode("utf-8", "replace")
-        text = buf.decode("utf-8", "replace")
         tail = text.replace("\r", "\n")
         if "type a prompt" in text and not banner_seen:
             banner_seen = True
@@ -1146,9 +1155,17 @@ try:
             next_prompt += 1
             next_prompt_ready_at = time.time() + 0.5
 
-        # After all prompts are processed and responses appear, wait then exit.
-        if prompt_count >= 5 and "Mock provider" in text and not sent_exit:
-            time.sleep(0.5)
+        # After all prompts are processed, scroll up to enter Manual mode,
+        # then send a 6th prompt to verify auto-scroll resets the viewport.
+        if prompt_count >= 5 and "Mock provider" in text and not sent_scroll:
+            os.write(fd, b"\x1b[5~\x1b[5~\x1b[5~")
+            sent_scroll = True
+
+        if sent_scroll and not sent_exit:
+            # Send a final prompt after scrolling — this triggers new output
+            # which should force the viewport back to bottom.
+            os.write(fd, b"final prompt\r")
+            time.sleep(1.0)
             os.write(fd, b"/exit\r")
             sent_exit = True
 
@@ -1171,16 +1188,20 @@ try:
     if verbose:
         print(text)
 
-    # Verify that the latest prompt appears in the output (auto-scroll worked)
-    has_latest_prompt = "prompt 5" in text
-    has_mock_response = "Mock provider" in text
+    # Check the VISIBLE VIEWPORT (last 24 lines), not the full buffer.
+    # If auto-scroll works, the latest output must be in the visible tail.
+    viewport = visible_tail(text)
+    has_latest_in_viewport = "final prompt" in viewport
+    has_mock_in_viewport = "Mock provider" in viewport
 
     if prompt_count < 5:
         print(f"TUI_TEST_FAIL only sent {prompt_count} prompts, expected 5")
-    elif not has_latest_prompt:
-        print("TUI_TEST_FAIL latest prompt 'prompt 5' not found in output")
-    elif not has_mock_response:
-        print("TUI_TEST_FAIL mock provider response not found")
+    elif not sent_scroll:
+        print("TUI_TEST_FAIL PageUp scroll not sent")
+    elif not has_latest_in_viewport:
+        print("TUI_TEST_FAIL latest prompt not in visible viewport — auto-scroll failed")
+    elif not has_mock_in_viewport:
+        print("TUI_TEST_FAIL mock response not in visible viewport — auto-scroll failed")
     elif exit_code not in (0, None):
         print(f"TUI_TEST_FAIL sned exited with {exit_code}")
     else:
