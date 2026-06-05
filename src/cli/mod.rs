@@ -1361,6 +1361,8 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::sync::Mutex;
+    static PROVIDER_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_task_subcommand() {
@@ -2030,9 +2032,9 @@ mod tests {
     #[test]
     fn test_create_provider_auto_detects_anthropic() {
         use std::env;
-
-        // Clear ALL provider env vars comprehensively
-        let all_provider_vars = vec![
+        {
+            let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let all_provider_vars = vec![
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
@@ -2065,140 +2067,127 @@ mod tests {
             "KIMI_API_KEY",
             "OPENAI_COMPATIBLE_CUSTOM_KEY",
         ];
-        for var in &all_provider_vars {
-            // SAFETY: single-threaded test; clearing env before each assertion
-            unsafe { env::remove_var(var) };
+            for var in &all_provider_vars {
+                // SAFETY: clearing under mutex lock
+                unsafe { env::remove_var(var) };
+            }
+            // SAFETY: setting under mutex lock
+            unsafe { env::set_var("ANTHROPIC_API_KEY", "test-key") };
+            let task_opts = TaskOptions {
+                act: false,
+                plan: false,
+                yolo: false,
+                auto_approve_all: false,
+                timeout: None,
+                model: None,
+                provider: None,
+                base_url: None,
+                api_key: None,
+                verbose: false,
+                cwd: None,
+                config: None,
+                thinking: None,
+                reasoning_effort: None,
+                max_consecutive_mistakes: None,
+                json: false,
+                double_check_completion: false,
+                auto_condense: true,
+                no_token_display: false,
+                subagents: false,
+                is_subagent: false,
+                user_agent: None,
+                hooks_dir: None,
+                export: None,
+                image: vec![],
+                track_changes: false,
+                max_context_turns: None,
+                max_tokens: None,
+                debug: false,
+            };
+            let result = create_provider(&task_opts);
+            assert!(result.is_ok(), "Expected Ok when ANTHROPIC_API_KEY is set");
+            // SAFETY: cleanup under mutex lock
+            unsafe { env::remove_var("ANTHROPIC_API_KEY") };
         }
-
-        // Set only ANTHROPIC_API_KEY
-        // SAFETY: single-threaded test; sequential env mutation
-        unsafe { env::set_var("ANTHROPIC_API_KEY", "test-key") };
-
-        let task_opts = TaskOptions {
-            act: false,
-            plan: false,
-            yolo: false,
-            auto_approve_all: false,
-            timeout: None,
-            model: None,
-            provider: None,
-            base_url: None,
-            api_key: None,
-            verbose: false,
-            cwd: None,
-            config: None,
-            thinking: None,
-            reasoning_effort: None,
-            max_consecutive_mistakes: None,
-            json: false,
-            double_check_completion: false,
-            auto_condense: true,
-            no_token_display: false,
-            subagents: false,
-            is_subagent: false,
-            user_agent: None,
-            hooks_dir: None,
-            export: None,
-            image: vec![],
-            track_changes: false,
-            max_context_turns: None,
-            max_tokens: None,
-            debug: false,
-        };
-
-        // Should auto-detect anthropic and succeed
-        let result = create_provider(&task_opts);
-        assert!(result.is_ok(), "Expected Ok when ANTHROPIC_API_KEY is set");
-
-        // SAFETY: single-threaded test; cleaning up env after assertion
-        unsafe { env::remove_var("ANTHROPIC_API_KEY") };
     }
 
     #[test]
     fn test_create_provider_explicit_flag_takes_precedence() {
         use std::env;
-
-        // Clear ALL provider env vars comprehensively
-        let all_provider_vars = vec![
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "GEMINI_API_KEY",
-            "OPENROUTER_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "QWEN_API_KEY",
-            "MINIMAX_API_KEY",
-            "MINIMAX_CN_API_KEY",
-            "MISTRAL_API_KEY",
-            "MOONSHOT_API_KEY",
-            "HF_TOKEN",
-            "ZAI_API_KEY",
-            "CEREBRAS_API_KEY",
-            "AI_GATEWAY_API_KEY",
-            "TOGETHER_API_KEY",
-            "FIREWORKS_API_KEY",
-            "NEBIUS_API_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_SESSION_TOKEN",
-            "AWS_BEDROCK_MODEL",
-            "AWS_BEDROCK_MODEL_ACT",
-            "AWS_BEDROCK_MODEL_PLAN",
-            "GOOGLE_CLOUD_PROJECT",
-            "GCP_PROJECT",
-            "GOOGLE_CLOUD_LOCATION",
-            "GOOGLE_CLOUD_REGION",
-            "OPENAI_API_BASE",
-            "OPENCODE_API_KEY",
-            "KIMI_API_KEY",
-            "OPENAI_COMPATIBLE_CUSTOM_KEY",
-        ];
-        for var in &all_provider_vars {
-            // SAFETY: single-threaded test; clearing env before each assertion
-            unsafe { env::remove_var(var) };
+        {
+            let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let all_provider_vars = vec![
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "OPENROUTER_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "QWEN_API_KEY",
+                "MINIMAX_API_KEY",
+                "MINIMAX_CN_API_KEY",
+                "MISTRAL_API_KEY",
+                "MOONSHOT_API_KEY",
+                "HF_TOKEN",
+                "ZAI_API_KEY",
+                "CEREBRAS_API_KEY",
+                "AI_GATEWAY_API_KEY",
+                "TOGETHER_API_KEY",
+                "FIREWORKS_API_KEY",
+                "NEBIUS_API_KEY",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_BEDROCK_MODEL",
+                "AWS_BEDROCK_MODEL_ACT",
+                "AWS_BEDROCK_MODEL_PLAN",
+                "GOOGLE_CLOUD_PROJECT",
+                "GCP_PROJECT",
+                "GOOGLE_CLOUD_LOCATION",
+                "GOOGLE_CLOUD_REGION",
+                "OPENAI_API_BASE",
+                "OPENCODE_API_KEY",
+                "KIMI_API_KEY",
+                "OPENAI_COMPATIBLE_CUSTOM_KEY",
+            ];
+            for var in &all_provider_vars {
+                unsafe { env::remove_var(var) };
+            }
+            unsafe { env::set_var("ANTHROPIC_API_KEY", "ant-key") };
+            let task_opts = TaskOptions {
+                act: false,
+                plan: false,
+                yolo: false,
+                auto_approve_all: false,
+                timeout: None,
+                model: None,
+                provider: Some("deepseek".to_string()),
+                base_url: None,
+                api_key: Some("deepseek-key".to_string()),
+                verbose: false,
+                cwd: None,
+                config: None,
+                thinking: None,
+                reasoning_effort: None,
+                max_consecutive_mistakes: None,
+                json: false,
+                double_check_completion: false,
+                auto_condense: true,
+                no_token_display: false,
+                subagents: false,
+                is_subagent: false,
+                user_agent: None,
+                hooks_dir: None,
+                export: None,
+                image: vec![],
+                track_changes: false,
+                max_context_turns: None,
+                max_tokens: None,
+                debug: false,
+            };
+            let result = create_provider(&task_opts);
+            assert!(result.is_ok(), "Expected Ok with explicit provider");
+            unsafe { env::remove_var("ANTHROPIC_API_KEY") };
         }
-
-        // Set ANTHROPIC_API_KEY but explicitly request deepseek
-        // SAFETY: single-threaded test; sequential env mutation
-        unsafe { env::set_var("ANTHROPIC_API_KEY", "ant-key") };
-
-        let task_opts = TaskOptions {
-            act: false,
-            plan: false,
-            yolo: false,
-            auto_approve_all: false,
-            timeout: None,
-            model: None,
-            provider: Some("deepseek".to_string()),
-            base_url: None,
-            api_key: Some("deepseek-key".to_string()),
-            verbose: false,
-            cwd: None,
-            config: None,
-            thinking: None,
-            reasoning_effort: None,
-            max_consecutive_mistakes: None,
-            json: false,
-            double_check_completion: false,
-            auto_condense: true,
-            no_token_display: false,
-            subagents: false,
-            is_subagent: false,
-            user_agent: None,
-            hooks_dir: None,
-            export: None,
-            image: vec![],
-            track_changes: false,
-            max_context_turns: None,
-            max_tokens: None,
-            debug: false,
-        };
-
-        // Should use deepseek (explicit flag) not anthropic (env var)
-        let result = create_provider(&task_opts);
-        assert!(result.is_ok(), "Expected Ok with explicit provider");
-
-        // SAFETY: single-threaded test; cleaning up env after assertion
-        unsafe { env::remove_var("ANTHROPIC_API_KEY") };
     }
 
     #[test]
