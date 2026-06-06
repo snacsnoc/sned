@@ -2,6 +2,7 @@ pub mod actionable_errors;
 pub mod colors;
 pub mod image_input;
 pub mod interactive;
+pub mod markdown;
 pub mod output;
 pub mod redact;
 pub mod slash_commands;

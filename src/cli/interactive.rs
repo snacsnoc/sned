@@ -393,10 +393,12 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 }
             }
             OutputEvent::Completion(result) => {
-                app.push_completion_line(Line::from(Span::styled(
-                    format!("🚀 Task Completed: {}", result),
-                    Style::default().fg(theme::PROMPT_FG),
-                )));
+                for line in crate::cli::markdown::render_completion_markdown(
+                    "🚀 Task Completed: ",
+                    &result,
+                ) {
+                    app.push_completion_line(line);
+                }
             }
         }
     }
