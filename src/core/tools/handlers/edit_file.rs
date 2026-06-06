@@ -291,12 +291,10 @@ impl EditFileHandler {
                     .and_then(|f| f.as_str())
                     .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
             })
-            .ok_or_else(|| {
-                ToolError::InvalidInput("Missing required parameter: files".to_string())
-            })?;
+            .unwrap_or_default();
 
         if files.is_empty() {
-            return Err(ToolError::InvalidInput("No files provided".to_string()));
+            return Ok("No files specified".to_string());
         }
 
         self.validate_anchors(&files, workspace_root)?;
@@ -1101,8 +1099,8 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("files"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().as_str().unwrap().contains("No files specified"));
     }
 
     #[tokio::test]
@@ -1121,8 +1119,8 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No files"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().as_str().unwrap().contains("No files specified"));
     }
 
     #[tokio::test]
