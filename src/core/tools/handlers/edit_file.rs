@@ -436,7 +436,7 @@ impl EditFileHandler {
                 .track_file_read(Path::new(&batch.absolute_path));
 
             // Compute line hashes via AnchorStateManager
-            let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            let lines = crate::core::file_editor::split_content_lines(&content);
             let anchors = anchor_mgr.reconcile(&batch.absolute_path, &lines, task_id);
 
             // Prepare edits
@@ -1603,6 +1603,58 @@ mod tests {
                 .must_reread_before_edit
                 .contains(&file_path.to_string_lossy().to_string())
         );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_preserves_trailing_newline_anchor_alignment() {
+        let _guard = TEST_MUTEX.lock().await;
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let temp_dir = std::env::temp_dir().canonicalize().unwrap();
+        let rand_suffix: String = std::iter::repeat_with(fastrand::alphanumeric)
+            .take(8)
+            .collect();
+        let file_path = temp_dir.join(format!("test_edit_trailing_newline_{}.txt", rand_suffix));
+        let raw_content = "alpha\nbeta\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(raw_content);
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path.strip_prefix(&temp_dir).unwrap().to_string_lossy().to_string(),
+                "edits": [{
+                    "anchor": format!("{}§beta", anchors[1]),
+                    "end_anchor": format!("{}§beta", anchors[1]),
+                    "text": "gamma"
+                }]
+            }]
+        });
+
+        let ctx = ToolContext::new(
+            state,
+            None,
+            temp_dir.clone(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "edit should succeed on trailing-newline files"
+        );
+
+        let final_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(final_content, "alpha\ngamma\n");
 
         let _ = tokio::fs::remove_file(&file_path).await;
     }

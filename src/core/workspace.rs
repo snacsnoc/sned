@@ -516,6 +516,10 @@ mod tests {
             "/home/user/project",
             "/home/other/file.rs"
         ));
+        assert!(!is_within_workspace(
+            "/home/user/project",
+            "/home/user/project2/src/main.rs"
+        ));
     }
 
     #[test]

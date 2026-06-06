@@ -530,6 +530,13 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_sanitized_path_rejects_sibling_prefix_path() {
+        let workspace = std::path::Path::new("/tmp/workspace");
+        let result = resolve_sanitized_path(workspace, "/tmp/workspace2/file.rs");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_resolve_sanitized_path_allows_absolute_within_workspace() {
         let workspace = std::path::Path::new("/tmp/workspace");
         let result = resolve_sanitized_path(workspace, "/tmp/workspace/subdir/file.rs");

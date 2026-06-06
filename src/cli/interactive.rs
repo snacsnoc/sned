@@ -10,8 +10,7 @@ use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::{ApprovalResult, is_approval_prompt_active, take_approval_sender};
 use futures::FutureExt;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyModifiers,
+    EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
 };
 use ratatui::crossterm::execute;
 use ratatui::style::Style;
@@ -26,13 +25,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Disable bracketed paste and mouse capture before restoring terminal
-        let _ = execute!(
-            std::io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture
-        );
-        ratatui::restore();
+        crate::core::cancellation::restore_terminal_state();
     }
 }
 
@@ -339,12 +332,14 @@ impl InteractiveSession {
             });
         }
 
-        let run_result = agent
-            .lock()
-            .await
-            .run(initial_messages, state_manager)
-            .await
-            .map_err(|e| anyhow::anyhow!("Agent error: {}", e));
+        let run_result = {
+            let mut loop_guard = agent.lock().await;
+            loop_guard.reset_cancellation().await;
+            loop_guard
+                .run(initial_messages, state_manager)
+                .await
+                .map_err(|e| anyhow::anyhow!("Agent error: {}", e))
+        };
 
         // Always export on exit, even if the agent errored out.
         // This ensures the conversation is saved for debugging failed runs.
@@ -490,11 +485,11 @@ async fn spawn_agent_task(
             ts: Some(chrono::Utc::now().timestamp_millis() as u64),
         }];
 
-        let result = agent_loop
-            .lock()
-            .await
-            .run(initial_messages, state_manager)
-            .await;
+        let result = {
+            let mut agent = agent_loop.lock().await;
+            agent.reset_cancellation().await;
+            agent.run(initial_messages, state_manager).await
+        };
         drop(agent_loop);
 
         agent_busy_clone.store(false, Ordering::Relaxed);

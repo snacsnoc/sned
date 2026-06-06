@@ -20,6 +20,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::core::anchor_dictionary::ANCHOR_DICTIONARY;
 use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor, strip_hashes};
 
+/// Split file content into logical lines while preserving a trailing empty line
+/// when the file ends with `\n`. Anchor reconciliation and edit resolution must
+/// use identical line semantics.
+pub fn split_content_lines(content: &str) -> Vec<String> {
+    content.split('\n').map(|s| s.to_string()).collect()
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -1049,7 +1056,7 @@ impl FileEditor {
         absolute_path: &str,
         task_id: Option<&str>,
     ) -> Result<(String, Vec<AppliedEdit>, Vec<FailedEdit>), FileEditorError> {
-        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let line_hashes = self.anchor_mgr.reconcile(absolute_path, &lines, task_id);
 
         let (resolved_edits, failed_edits) =
@@ -1536,7 +1543,7 @@ mod tests {
         let content = "def hello():\n    print('world')\n    return 42";
 
         // First reconcile to get anchors
-        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let anchors = editor.reconcile_anchors("/tmp/e2e.py", &lines, Some(task_id));
 
         // Update edit with real anchor

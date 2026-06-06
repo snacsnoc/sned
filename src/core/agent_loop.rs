@@ -772,9 +772,6 @@ impl AgentLoop {
         {
             let mut state = self.state.lock().await;
             state.double_check_completion_enabled = self.config.double_check_completion;
-            state.is_cancelled = false;
-            self.cancelled
-                .store(false, std::sync::atomic::Ordering::Release);
             state.first_tool_result_printed = false;
             // Initialize session start time for session summary
             state.session_start_time = Some(std::time::Instant::now());
@@ -3314,6 +3311,14 @@ impl AgentLoop {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Clears cancellation state when the caller explicitly starts a new turn.
+    pub async fn reset_cancellation(&self) {
+        let mut state = self.state.lock().await;
+        state.is_cancelled = false;
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
     /// Returns a handle to the internal task state for external cancellation.
     pub fn state_handle(&self) -> Arc<Mutex<TaskState>> {
         self.state.clone()
@@ -4275,6 +4280,44 @@ mod tests {
             state.consecutive_provider_failures,
             DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_preserves_pending_cancellation_until_observed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(data_dir.join("state")).unwrap();
+        std::fs::create_dir_all(data_dir.join("settings")).unwrap();
+        let old_data_dir = std::env::var_os("SNED_DATA_DIR");
+        // SAFETY: this test is intended to run with isolated validation commands.
+        unsafe {
+            std::env::set_var("SNED_DATA_DIR", &data_dir);
+        }
+
+        let provider = Arc::new(crate::providers::mock::MockProvider::single_text_response(
+            "should not run",
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-run-pending-cancel"));
+        {
+            let mut state = agent.state.lock().await;
+            state.is_cancelled = true;
+            state
+                .is_cancelled_atomic
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        let state_manager = Arc::new(StateManager::new().unwrap());
+        let result = agent.run(vec![], state_manager).await;
+        assert!(result.is_ok(), "pending cancellation should exit cleanly");
+        assert!(agent.state.lock().await.is_cancelled);
+
+        // SAFETY: restore the process environment for later tests.
+        unsafe {
+            match old_data_dir {
+                Some(ref value) => std::env::set_var("SNED_DATA_DIR", value),
+                None => std::env::remove_var("SNED_DATA_DIR"),
+            }
+        }
     }
 
     #[tokio::test]

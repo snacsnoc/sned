@@ -3,7 +3,7 @@
 //! and `dirac/src/core/task/tools/handlers/edit-file/EditFormatter.ts`.
 
 use crate::core::file_editor::{
-    AppliedEdit, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit,
+    AppliedEdit, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit, split_content_lines,
 };
 use crate::core::hash_utils::format_line_with_hash;
 
@@ -154,7 +154,7 @@ impl BatchProcessor {
         edits: &[Edit],
         line_hashes: &[String],
     ) -> Result<PreparedEdits, FileEditorError> {
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
 
         // Validate all edits first
         for edit in edits {
@@ -680,7 +680,7 @@ mod tests {
         let processor = BatchProcessor::new(DiffMode::Full);
 
         let content = "fn hello() {\n    println!(\"world\");\n    return 42;\n}";
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let hashes = anchor_mgr.reconcile("/tmp/batch.rs", &lines, Some(task_id));
 
         let edits = vec![Edit {
@@ -714,7 +714,7 @@ mod tests {
         let processor = BatchProcessor::new(DiffMode::Full);
 
         let content = "line1\nline2\nline3";
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let hashes = anchor_mgr.reconcile("/tmp/format.rs", &lines, Some(task_id));
 
         let edits = vec![Edit {
@@ -755,7 +755,7 @@ mod tests {
         let processor = BatchProcessor::new(DiffMode::AdditionsOnly);
 
         let content = "line1\nline2\nline3";
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let hashes = anchor_mgr.reconcile("/tmp/additions.rs", &lines, Some(task_id));
 
         let edits = vec![Edit {
@@ -802,7 +802,7 @@ mod tests {
         let processor = BatchProcessor::new(DiffMode::Full);
 
         let content = "line1\nline2\nline3";
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let hashes = anchor_mgr.reconcile("/tmp/diag.rs", &lines, Some(task_id));
 
         let edits = vec![Edit {
@@ -851,7 +851,7 @@ mod tests {
         let processor = BatchProcessor::new(DiffMode::Full);
 
         let content = "line1\nline2\nline3";
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let hashes = anchor_mgr.reconcile("/tmp/user.rs", &lines, Some(task_id));
 
         let edits = vec![Edit {
@@ -894,7 +894,7 @@ mod tests {
         let processor = BatchProcessor::new(DiffMode::Full);
 
         let content = "line1\nline2\nline3";
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let hashes = anchor_mgr.reconcile("/tmp/fmt.rs", &lines, Some(task_id));
 
         let edits = vec![Edit {
@@ -941,7 +941,7 @@ mod tests {
         let processor = BatchProcessor::new(DiffMode::Full);
 
         let content = "line1\nline2\nline3";
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let hashes = anchor_mgr.reconcile("/tmp/color_test.rs", &lines, Some(task_id));
 
         let edits = vec![Edit {
@@ -1009,7 +1009,7 @@ mod tests {
         let processor = BatchProcessor::new(DiffMode::Full);
 
         let content = "line1\nline2\nline3";
-        let lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_content_lines(content);
         let hashes = anchor_mgr.reconcile("/tmp/no_color_test.rs", &lines, Some(task_id));
 
         let edits = vec![Edit {

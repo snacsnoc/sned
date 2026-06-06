@@ -8,6 +8,8 @@ use crate::storage::disk;
 use crate::storage::state_manager::StateManager;
 #[cfg(unix)]
 use libc;
+use ratatui::crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
+use ratatui::crossterm::execute;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -18,6 +20,17 @@ use tokio::time::Instant;
 /// Guards ratatui::restore() calls in the force-exit signal handler
 /// so we don't write ANSI escape sequences to stdout in one-shot mode.
 pub(crate) static TERMINAL_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Restore the interactive terminal state on shutdown or forced exit.
+pub(crate) fn restore_terminal_state() {
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
+    ratatui::restore();
+    TERMINAL_INITIALIZED.store(false, Ordering::Release);
+}
 
 /// Handles task cancellation and cleanup.
 pub struct CancellationHandler {
@@ -245,11 +258,12 @@ async fn handle_shutdown_signal(
                     disk::active_atomic_write_count()
                 );
             }
+            let exit = force_exit_code(signal_name, exit_code);
             // Restore terminal state before forced exit to avoid breaking user's shell
             if TERMINAL_INITIALIZED.load(Ordering::Acquire) {
-                ratatui::restore();
+                restore_terminal_state();
             }
-            std::process::exit(force_exit_code(signal_name, exit_code));
+            std::process::exit(exit);
         }
     }
 }
