@@ -10,7 +10,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Wrap,
+    },
 };
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -575,11 +578,17 @@ impl App {
     }
 
     fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
-        self.cached_visual_rows = self
+        let output_rows: usize = self
             .output_lines
             .iter()
             .map(|line| Self::line_visual_rows(line, wrap_width))
             .sum();
+        let completion_rows: usize = self
+            .completion_lines
+            .iter()
+            .map(|line| Self::line_visual_rows(line, wrap_width))
+            .sum();
+        self.cached_visual_rows = output_rows.saturating_add(completion_rows);
         self.cached_wrap_width = Some(wrap_width);
     }
 
@@ -747,6 +756,31 @@ impl App {
                         .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
                 );
             frame.render_widget(output, output_area);
+        }
+
+        // Render completion box as a distinct block at the bottom of the output area.
+        if !self.completion_lines.is_empty() {
+            let completion_rows = self
+                .completion_lines
+                .iter()
+                .map(|line| Self::line_visual_rows(line, wrap_width))
+                .sum::<usize>();
+            let completion_height = (completion_rows.max(1) as u16).min(content_height as u16);
+            let completion_area = Rect {
+                x: output_area.x,
+                y: output_area.y + output_area.height.saturating_sub(completion_height + 1),
+                width: output_area.width,
+                height: completion_height,
+            };
+            let completion_lines: Vec<Line<'static>> = self.completion_lines.iter().cloned().collect();
+            let completion = Paragraph::new(completion_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme::PROMPT_FG))
+                        .border_type(ratatui::widgets::BorderType::Rounded),
+                );
+            frame.render_widget(completion, completion_area);
         }
 
         // Scrollbar on output pane (render inside the border)

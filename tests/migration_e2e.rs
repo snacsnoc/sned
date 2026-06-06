@@ -221,56 +221,39 @@ fn test_vscode_fixture_migration() {
 
 #[test]
 fn test_rollback_on_failure() {
-    // This test verifies that rollback restores state on failure
-    // We'll create a scenario where migration partially succeeds then fails
+    // This test verifies that rollback restores state on failure.
+    // We create a valid endpoints.json (succeeds), then inject invalid JSON
+    // in .secrets.json so the migration fails mid-execution, triggering rollback.
 
     let source = create_temp_dir("rollback_source");
     let dest = create_temp_dir("rollback_dest");
 
-    // Create valid source files
+    // Create valid source endpoints — this migration step will succeed first
     fs::write(
         source.join("endpoints.json"),
         r#"{"anthropic": {"apiKey": "test"}}"#,
     )
     .unwrap();
 
-    // Create a valid destination that will cause a conflict
-    fs::create_dir_all(dest.join("data/settings")).unwrap();
+    // Inject invalid JSON in .secrets.json — this step will fail, triggering rollback
     fs::write(
-        dest.join("data/settings/global_settings.json"),
-        r#"{"is_new_user": false}"#,
+        source.join(".secrets.json"),
+        "{ not valid json",
     )
     .unwrap();
-
-    // Make destination read-only to simulate failure
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(&dest).unwrap();
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o555); // read-only
-        fs::set_permissions(&dest, perms).unwrap();
-    }
 
     let mut engine = MigrationEngine::new(&source, &dest);
     let result = engine.execute();
 
-    // Restore permissions for cleanup
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(&dest).unwrap();
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&dest, perms).unwrap();
-    }
-
-    // Migration should fail
+    // Migration should fail due to invalid JSON in .secrets.json
     assert!(result.is_err());
 
     // Rollback should succeed
     let rollback_result = engine.rollback();
     assert!(rollback_result.is_ok());
+
+    // Verify rollback: endpoints.json should be removed from dest
+    assert!(!dest.join("endpoints.json").exists());
 
     // Cleanup
     let _ = fs::remove_dir_all(&source);

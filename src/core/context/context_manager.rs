@@ -169,7 +169,9 @@ pub fn get_new_context_messages_and_metadata(
         // Output tokens (tokens_out) are from previous responses and don't
         // contribute to the current request size that validate_context_window checks.
         let cache_tokens = effective_cache_tokens(info, provider_name);
-        let total_tokens = (info.tokens_in.unwrap_or(0) as u64) + cache_tokens;
+        let total_tokens = (info.tokens_in.unwrap_or(0) as u64)
+            + (info.tokens_out.unwrap_or(0) as u64)
+            + cache_tokens;
 
         let threshold_pct = if use_auto_condense { 0.7 } else { 0.8 };
         let max_allowed_size = info
