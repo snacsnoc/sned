@@ -667,7 +667,9 @@ impl App {
     }
 
     fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
-        let input_title = if self.agent_busy {
+        let input_title = if self.agent_busy
+            && !crate::core::approval::is_approval_prompt_active()
+        {
             if self.reasoning_active {
                 format!(" {} Reasoning... ", self.spinner_char())
             } else {
