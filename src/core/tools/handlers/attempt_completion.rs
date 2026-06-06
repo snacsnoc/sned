@@ -27,9 +27,7 @@ impl AttemptCompletionHandler {
         let result = params
             .get("result")
             .and_then(|r| r.as_str())
-            .ok_or_else(|| {
-                ToolError::InvalidInput("Missing required parameter: result".to_string())
-            })?;
+            .unwrap_or("");
 
         // Reset consecutive mistakes on completion
         state.consecutive_mistakes = 0;
@@ -105,10 +103,13 @@ mod tests {
     #[tokio::test]
     async fn test_attempt_completion_missing_result() {
         let handler = AttemptCompletionHandler::new();
-        let mut state = TaskState::default();
+        let mut state = TaskState {
+            double_check_completion_pending: true,
+            ..Default::default()
+        };
         let result = handler.execute(&mut state, serde_json::json!({})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("result"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "");
     }
 
     #[tokio::test]
