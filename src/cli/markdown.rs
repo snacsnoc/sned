@@ -34,10 +34,6 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
     let mut in_code_block = false;
     // Are we currently inside a table?
     let mut in_table = false;
-    // Are we inside a list item?
-    let mut in_list_item = false;
-    // Are we inside a heading?
-    let mut in_heading = false;
     // Pending list-item prefix to emit at the start of the next text run.
     let mut pending_list_prefix: Option<String> = None;
 
@@ -98,7 +94,6 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
                     pending_list_prefix = Some(prefix_marker.to_string());
                     style_stack
                         .push(style_stack.last().unwrap().add_modifier(Modifier::BOLD));
-                    in_heading = true;
                 }
                 Tag::Strong => {
                     style_stack
@@ -120,9 +115,7 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
                     in_code_block = true;
                 }
                 Tag::List(_) => {}
-                Tag::Item => {
-                    in_list_item = true;
-                }
+                Tag::Item => {}
                 Tag::Table(_) => {
                     in_table = true;
                 }
@@ -159,7 +152,6 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
                     );
                     *is_first_line = false;
                     style_stack.pop();
-                    in_heading = false;
                     pending_list_prefix = None;
                 }
                 TagEnd::Strong | TagEnd::Emphasis => {
@@ -169,7 +161,6 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
                     in_code_block = false;
                 }
                 TagEnd::Item => {
-                    in_list_item = false;
                     pending_list_prefix = None;
                 }
                 TagEnd::List(_) => {}
