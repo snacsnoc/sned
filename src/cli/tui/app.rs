@@ -315,6 +315,8 @@ impl App {
 
     /// Push a user message with proper formatting (splits on newlines).
     pub fn push_user_message(&mut self, text: &str, writer: &OutputWriterArc) {
+        self.completion_lines.clear();
+        self.cached_completion_rows = 0;
         let style = Style::default()
             .fg(theme::PROMPT_FG)
             .add_modifier(Modifier::BOLD);
