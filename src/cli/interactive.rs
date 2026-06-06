@@ -57,12 +57,16 @@ pub struct InteractiveSession {
 
 impl InteractiveSession {
     /// Get a reference to the underlying AgentLoop.
-    pub async fn agent_loop(&self) -> tokio::sync::MutexGuard<'_, crate::core::agent_loop::AgentLoop> {
+    pub async fn agent_loop(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, crate::core::agent_loop::AgentLoop> {
         self.agent_loop.lock().await
     }
 
     /// Get a mutable reference to the underlying AgentLoop.
-    pub async fn agent_loop_mut(&self) -> tokio::sync::MutexGuard<'_, crate::core::agent_loop::AgentLoop> {
+    pub async fn agent_loop_mut(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, crate::core::agent_loop::AgentLoop> {
         self.agent_loop.lock().await
     }
 
@@ -111,10 +115,12 @@ impl InteractiveSession {
             .with_context_loader(components.context_loader)
             .with_approval_manager(components.approval_manager)
             .with_hooks(components.hook_manager.clone())
-            .with_checkpoint_manager(components.checkpoint_mgr);
+            .with_checkpoint_manager(components.checkpoint_mgr)
+            .with_yolo(task_opts.yolo);
 
         let agent_loop = Arc::new(tokio::sync::Mutex::new(agent_loop));
-        crate::core::cancellation::setup_ctrl_c_handler(agent_loop.lock().await.state_handle()).await;
+        crate::core::cancellation::setup_ctrl_c_handler(agent_loop.lock().await.state_handle())
+            .await;
 
         Ok(Self {
             agent_loop,
@@ -130,7 +136,9 @@ impl InteractiveSession {
     }
 
     /// Get the message queue handle for checking queued messages.
-    pub async fn message_queue_handle(&self) -> Option<crate::core::agent_loop::MessageQueueHandle> {
+    pub async fn message_queue_handle(
+        &self,
+    ) -> Option<crate::core::agent_loop::MessageQueueHandle> {
         Some(self.agent_loop.lock().await.message_queue_handle())
     }
 
@@ -286,13 +294,13 @@ impl InteractiveSession {
             let supports_images = model_info.supports_images.unwrap_or(false);
             let image_blocks = if !all_image_paths.is_empty() && !supports_images {
                 if !self.task_opts.json {
-                    agent.lock().await
-                        .output_writer()
-                        .emit(crate::cli::output::OutputEvent::warning(format!(
+                    agent.lock().await.output_writer().emit(
+                        crate::cli::output::OutputEvent::warning(format!(
                             "Model '{}' does not support images. Ignoring {} image(s).",
                             model_info.name.as_deref().unwrap_or("unknown"),
                             all_image_paths.len()
-                        )));
+                        )),
+                    );
                 }
                 Vec::new()
             } else {
@@ -331,7 +339,9 @@ impl InteractiveSession {
             });
         }
 
-        let run_result = agent.lock().await
+        let run_result = agent
+            .lock()
+            .await
             .run(initial_messages, state_manager)
             .await
             .map_err(|e| anyhow::anyhow!("Agent error: {}", e));
@@ -392,10 +402,9 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 }
             }
             OutputEvent::Completion(result) => {
-                for line in crate::cli::markdown::render_completion_markdown(
-                    "🚀 Task Completed: ",
-                    &result,
-                ) {
+                for line in
+                    crate::cli::markdown::render_completion_markdown("🚀 Task Completed: ", &result)
+                {
                     app.push_completion_line(line);
                 }
             }
@@ -481,7 +490,11 @@ async fn spawn_agent_task(
             ts: Some(chrono::Utc::now().timestamp_millis() as u64),
         }];
 
-        let result = agent_loop.lock().await.run(initial_messages, state_manager).await;
+        let result = agent_loop
+            .lock()
+            .await
+            .run(initial_messages, state_manager)
+            .await;
         drop(agent_loop);
 
         agent_busy_clone.store(false, Ordering::Relaxed);
@@ -590,7 +603,8 @@ async fn handle_key_event(
     // Tab or Enter with active model picker -> insert model spec into textarea
     if app.model_picker_active
         && !app.model_picker_results.is_empty()
-        && (key.code == KeyCode::Tab || (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT)))
+        && (key.code == KeyCode::Tab
+            || (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT)))
     {
         let entry = &app.model_picker_results[app.model_picker_selected];
         let model_spec = format!("{}/{}", entry.provider, entry.model_id);
@@ -611,13 +625,12 @@ async fn handle_key_event(
         let mq = crate::core::file_search::extract_mention_query(&text);
         if mq.in_mention_mode {
             let result = &app.picker_results[app.picker_index];
-            let (new_text, cursor_pos) =
-                crate::core::file_search::insert_mention(
-                    &text,
-                    mq.at_index as usize,
-                    &result.path,
-                    result.file_type,
-                );
+            let (new_text, cursor_pos) = crate::core::file_search::insert_mention(
+                &text,
+                mq.at_index as usize,
+                &result.path,
+                result.file_type,
+            );
             app.input = App::new_textarea(vec![new_text]);
             app.input
                 .move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
@@ -654,7 +667,8 @@ async fn handle_key_event(
             .map(|entry| entry.name.as_str());
 
         if let (Some(query), Some(selected)) = (current_query.as_deref(), selected)
-            && query != selected && accept_slash_completion(app)
+            && query != selected
+            && accept_slash_completion(app)
         {
             return Ok(None);
         }
@@ -801,7 +815,8 @@ async fn handle_key_event(
             return Ok(None);
         }
         if key.code == KeyCode::Down {
-            app.model_picker_selected = (app.model_picker_selected + 1).min(app.model_picker_results.len() - 1);
+            app.model_picker_selected =
+                (app.model_picker_selected + 1).min(app.model_picker_results.len() - 1);
             return Ok(None);
         }
     }
@@ -898,11 +913,15 @@ async fn handle_key_event(
         if !app.slash_command_active {
             app.slash_command_active = true;
             app.slash_command_selected = 0;
-            app.slash_command_results =
-                crate::cli::slash_commands::filter_slash_commands(&app.slash_command_all_entries, &query);
+            app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
+                &app.slash_command_all_entries,
+                &query,
+            );
         } else {
-            app.slash_command_results =
-                crate::cli::slash_commands::filter_slash_commands(&app.slash_command_all_entries, &query);
+            app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
+                &app.slash_command_all_entries,
+                &query,
+            );
         }
     } else if app.slash_command_active {
         app.slash_command_active = false;
@@ -1024,7 +1043,9 @@ async fn handle_cli_only_command(
 
             let parts: Vec<&str> = model_spec.splitn(2, '/').collect();
             if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-                app.push_plain("Usage: /model provider/model_id\nExample: /model anthropic/claude-sonnet-4");
+                app.push_plain(
+                    "Usage: /model provider/model_id\nExample: /model anthropic/claude-sonnet-4",
+                );
                 return Ok(false);
             }
 
@@ -1549,7 +1570,8 @@ async fn handle_cli_only_command(
                 state.last_injected_plan_state_hash = None;
                 state.strict_plan_mode_enabled = true;
                 drop(state);
-                sess.agent_loop_mut().await
+                sess.agent_loop_mut()
+                    .await
                     .set_mode(crate::core::agent_types::AgentMode::Act);
                 app.mode = "ACT".to_string();
                 app.update_placeholder();
@@ -1728,7 +1750,8 @@ async fn handle_cli_only_command(
                                 let mut state = state_handle.lock().await;
                                 state.strict_plan_mode_enabled = false;
                             }
-                            sess.agent_loop_mut().await
+                            sess.agent_loop_mut()
+                                .await
                                 .set_mode(crate::core::agent_types::AgentMode::Act);
                             app.mode = "ACT".to_string();
                             app.update_placeholder();
@@ -2248,35 +2271,35 @@ async fn run_main_loop(
                                         continue;
                                     }
 
-                                // Block slash commands while approval prompt is active
-                                if is_approval_prompt_active() {
-                                    app.push_styled(
+                                    // Block slash commands while approval prompt is active
+                                    if is_approval_prompt_active() {
+                                        app.push_styled(
                                         "Blocked: cannot process commands while approval is pending.",
                                         theme::status_style(),
                                     );
-                                    continue;
-                                }
-
-                                // Agent-required commands: check if agent is busy
-                                if agent_busy.load(Ordering::Relaxed)
-                                    && cli_cmd.requires_agent_idle()
-                                {
-                                    // Queue the command
-                                    if let Some(qh) = queue_handle.lock().await.as_ref() {
-                                        qh.enqueue_text_message(text.clone()).await;
-                                        let count = qh.queued_message_count().await;
-                                        // Message already echoed by handle_key_event
-                                        app.push_styled(
-                                            format!(
-                                                "Command queued ({} in queue): {}",
-                                                count, text
-                                            ),
-                                            theme::dim_style(),
-                                        );
+                                        continue;
                                     }
-                                    continue;
+
+                                    // Agent-required commands: check if agent is busy
+                                    if agent_busy.load(Ordering::Relaxed)
+                                        && cli_cmd.requires_agent_idle()
+                                    {
+                                        // Queue the command
+                                        if let Some(qh) = queue_handle.lock().await.as_ref() {
+                                            qh.enqueue_text_message(text.clone()).await;
+                                            let count = qh.queued_message_count().await;
+                                            // Message already echoed by handle_key_event
+                                            app.push_styled(
+                                                format!(
+                                                    "Command queued ({} in queue): {}",
+                                                    count, text
+                                                ),
+                                                theme::dim_style(),
+                                            );
+                                        }
+                                        continue;
+                                    }
                                 }
-                            }
 
                                 // Process model-side slash commands (e.g., /compact, /plan)
                                 let processed =
@@ -2356,8 +2379,7 @@ async fn run_main_loop(
         {
             let query = app.mention_search_query.clone();
             let cwd = app.cwd.clone();
-            let results =
-                crate::core::file_search::search_workspace_files(&query, &cwd, 10).await;
+            let results = crate::core::file_search::search_workspace_files(&query, &cwd, 10).await;
             app.picker_active = true;
             app.picker_results = results;
             app.picker_index = 0;
@@ -2370,7 +2392,8 @@ async fn run_main_loop(
         // 4. Check agent completion (non-blocking)
         // Always check notification to avoid race condition where agent_busy is already false
         // but app.agent_busy hasn't been updated yet
-        if agent_done.notified().now_or_never().is_some() {
+        let agent_completed = agent_done.notified().now_or_never().is_some();
+        if agent_completed {
             agent_busy.store(false, Ordering::Relaxed);
             app.agent_busy = false;
             app.needs_redraw = true;
@@ -2397,6 +2420,27 @@ async fn run_main_loop(
                     "Task cancelled. Type /exit to quit.",
                     Style::default().fg(theme::WARNING_FG),
                 );
+            }
+        }
+
+        // Export conversation after each completed turn when --export is set.
+        if agent_completed {
+            if let Some(export_path) = task_opts.export.clone() {
+                let history = session
+                    .lock()
+                    .await
+                    .agent_loop()
+                    .await
+                    .get_conversation_history()
+                    .await;
+                if let Ok(mut export_data) = serde_json::to_string_pretty(&history) {
+                    export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
+                    if let Err(e) =
+                        crate::storage::disk::atomic_write_file(&export_path, &export_data)
+                    {
+                        eprintln!("Warning: Failed to write export file: {}", e);
+                    }
+                }
             }
         }
 
@@ -2464,10 +2508,10 @@ pub async fn run_interactive_shell_inner(
         .await?,
     ));
 
-        let task_id = {
-            let sess = session.lock().await;
-            sess.agent_loop().await.task_id().to_string()
-        };
+    let task_id = {
+        let sess = session.lock().await;
+        sess.agent_loop().await.task_id().to_string()
+    };
 
     // Set status bar fields from session info
     {
@@ -2533,9 +2577,12 @@ pub async fn run_interactive_shell_inner(
             let state = agent_loop.lock().await;
             state.available_skills.clone()
         };
-        let local_toggles: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-        let global_toggles: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-        let remote_toggles: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let local_toggles: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let global_toggles: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let remote_toggles: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
 
         let entries = crate::cli::slash_commands::build_slash_command_entries(
             &skills,
@@ -2667,7 +2714,8 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutputEvent::plain("new streamed line")).unwrap();
+        tx.try_send(OutputEvent::plain("new streamed line"))
+            .unwrap();
 
         let mut app = App::new();
         app.set_content_height(5);
@@ -2859,8 +2907,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_key_event_accepts_slash_completion_with_enter()
-    -> anyhow::Result<()> {
+    async fn test_handle_key_event_accepts_slash_completion_with_enter() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (tx, _rx) = mpsc::channel(4);
@@ -2944,8 +2991,8 @@ mod tests {
             line.spans
                 .iter()
                 .map(|span| span.content.as_ref())
-            .collect::<String>()
-            .contains("Approval pending. Type y, n, or a first.")
+                .collect::<String>()
+                .contains("Approval pending. Type y, n, or a first.")
         }));
 
         reset_prompt_state();

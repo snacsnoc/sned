@@ -38,9 +38,9 @@ use crate::providers::{
 use crate::storage::global_state::HistoryItem;
 use crate::storage::state_manager::StateManager;
 use crate::storage::task_storage::TaskStorage;
-use std::borrow::Cow;
 use futures::future::FutureExt;
 use ratatui::style::{Color, Modifier, Style};
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -309,6 +309,10 @@ struct AgentLoopDeps {
     approval_manager: Option<Arc<tokio::sync::Mutex<crate::core::approval::ApprovalManager>>>,
     checkpoint_manager: Option<crate::core::checkpoints::TaskCheckpointManager>,
     tool_profile: Option<crate::core::tools::definitions::ToolProfile>,
+    /// When true, the tool profile is forced to at least `Validate` so
+    /// `execute_command` is available. This is the explicit opt-in for
+    /// shell execution (paired with `--yolo` / `--auto-approve-all`).
+    yolo: bool,
 }
 
 impl AgentLoopDeps {
@@ -323,6 +327,7 @@ impl AgentLoopDeps {
             approval_manager: None,
             checkpoint_manager: None,
             tool_profile: None,
+            yolo: false,
         }
     }
 
@@ -616,6 +621,13 @@ impl AgentLoop {
             ),
             message_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Enable yolo mode — forces tool profile to `Validate` so
+    /// `execute_command` is available (explicit shell opt-in).
+    pub fn with_yolo(mut self, yolo: bool) -> Self {
+        self.deps.yolo = yolo;
+        self
     }
 
     /// Generate the next unique message ID for this task.
@@ -1375,26 +1387,24 @@ impl AgentLoop {
         }
 
         // 3. Select tool profile and build tool definitions
-        let profile = match self.deps.tool_profile {
-            Some(profile) => profile,
-            None => {
-                let mode_str = match self.config.mode {
-                    crate::core::agent_types::AgentMode::Plan => "plan",
-                    crate::core::agent_types::AgentMode::Act => "act",
-                };
-                let prompt = pruned_history
-                    .iter()
-                    .find(|m| m.role == crate::providers::MessageRole::User)
-                    .and_then(|m| match &m.content {
-                        crate::providers::MessageContent::Text(t) => Some(t.as_str()),
-                        _ => None,
-                    })
-                    .unwrap_or("");
-                let p = crate::core::tools::definitions::select_tool_profile(prompt, mode_str);
-                tracing::info!(profile = ?p, prompt_len = prompt.len(), "selected tool profile");
-                self.deps.tool_profile = Some(p);
-                p
-            }
+        let profile = {
+            let mode_str = match self.config.mode {
+                crate::core::agent_types::AgentMode::Plan => "plan",
+                crate::core::agent_types::AgentMode::Act => "act",
+            };
+            let prompt = pruned_history
+                .iter()
+                .find(|m| m.role == crate::providers::MessageRole::User)
+                .and_then(|m| match &m.content {
+                    crate::providers::MessageContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            let profile =
+                resolve_tool_profile(self.deps.tool_profile, self.deps.yolo, prompt, mode_str);
+            tracing::info!(profile = ?profile, prompt_len = prompt.len(), "selected tool profile");
+            self.deps.tool_profile = Some(profile);
+            profile
         };
         let tool_definitions =
             crate::core::tools::definitions::get_tool_definitions_for_profile(profile);
@@ -2596,11 +2606,12 @@ impl AgentLoop {
                                 let tool_name = tool_name.clone();
                                 let tool_params = tool_params.clone();
                                 let task_storage = self.deps.task_storage.clone().map(Arc::new);
-                                let edit_file_paths = if tool_name == "edit_file" || tool_name == "write_to_file" {
-                                    Self::extract_file_action_path(&tool_name, &tool_params)
-                                } else {
-                                    vec![]
-                                };
+                                let edit_file_paths =
+                                    if tool_name == "edit_file" || tool_name == "write_to_file" {
+                                        Self::extract_file_action_path(&tool_name, &tool_params)
+                                    } else {
+                                        vec![]
+                                    };
 
                                 // Clone conversation history for hook context injection
                                 let conversation_history = self.conversation_history.clone();
@@ -3160,7 +3171,8 @@ impl AgentLoop {
                 SnedTool::from_name(&prepared.tool_name),
                 Some(SnedTool::AttemptCompletion)
             )
-        }) || text_only_completes_task) && !plan_active
+        }) || text_only_completes_task)
+            && !plan_active
             || (tool_failure_count == 0
                 && prepared_tool_calls.iter().any(|prepared| {
                     matches!(
@@ -3688,7 +3700,10 @@ impl AgentLoop {
 
             request.messages = history.clone();
 
-            match context_window::validate_context_window(request, self.config.provider.lock().unwrap().as_ref()) {
+            match context_window::validate_context_window(
+                request,
+                self.config.provider.lock().unwrap().as_ref(),
+            ) {
                 Ok(()) => break Ok(()),
                 Err(msg) => {
                     tracing::warn!(
@@ -3946,6 +3961,24 @@ impl AgentLoop {
     }
 }
 
+fn resolve_tool_profile(
+    cached: Option<crate::core::tools::definitions::ToolProfile>,
+    yolo: bool,
+    prompt: &str,
+    mode_str: &str,
+) -> crate::core::tools::definitions::ToolProfile {
+    let selected = match cached {
+        Some(profile) => profile,
+        None => crate::core::tools::definitions::select_tool_profile(prompt, mode_str),
+    };
+
+    if yolo {
+        crate::core::tools::definitions::ToolProfile::Validate
+    } else {
+        selected
+    }
+}
+
 /// Truncates thinking blocks in all assistant messages except the most recent one.
 ///
 /// This prevents token bloat from extended-thinking models (Claude, DeepSeek)
@@ -4140,6 +4173,21 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_tool_profile_applies_yolo_over_cached_profile() {
+        let profile = resolve_tool_profile(
+            Some(crate::core::tools::definitions::ToolProfile::WriteOnly),
+            true,
+            "write a file",
+            "act",
+        );
+
+        assert_eq!(
+            profile,
+            crate::core::tools::definitions::ToolProfile::Validate
+        );
+    }
+
+    #[test]
     fn test_task_state_default() {
         let state = TaskState::default();
         assert_eq!(state.consecutive_mistakes, 0);
@@ -4164,7 +4212,10 @@ mod tests {
             }
         }
 
-        assert!(emitted.len() >= 2, "expected wrapped output to span multiple events");
+        assert!(
+            emitted.len() >= 2,
+            "expected wrapped output to span multiple events"
+        );
         assert!(emitted.iter().all(|line| !line.contains('\n')));
     }
 
@@ -4235,9 +4286,9 @@ mod tests {
         code.push_str("```\n");
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::single_text_response(
-                &code,
-            )))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::single_text_response(&code),
+            ))),
             mode: AgentMode::Act,
             task_id: "test-snipped-code".to_string(),
             enable_checkpoints: false,
@@ -4278,9 +4329,9 @@ mod tests {
         code.push_str("```\n");
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::single_text_response(
-                &code,
-            )))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::single_text_response(&code),
+            ))),
             mode: AgentMode::Act,
             task_id: "test-one-shot-code".to_string(),
             enable_checkpoints: false,
@@ -4311,9 +4362,9 @@ mod tests {
     #[tokio::test]
     async fn test_one_shot_text_only_response_completes_without_tool_nudge() {
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::single_text_response(
-                "4",
-            )))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::single_text_response("4"),
+            ))),
             mode: AgentMode::Act,
             task_id: "test-one-shot-text-only".to_string(),
             enable_checkpoints: false,
@@ -4780,7 +4831,9 @@ mod tests {
         let task_storage = TaskStorage::new_with_dir(task_id, &sned_dir).unwrap();
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: task_id.to_string(),
             enable_checkpoints: false,
@@ -4906,7 +4959,9 @@ mod tests {
             .unwrap();
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: task_id.to_string(),
             enable_checkpoints: false,
@@ -4941,7 +4996,9 @@ mod tests {
         // Verify no history is loaded when file is empty/missing
         let task_storage_empty = TaskStorage::new("empty-task").unwrap();
         let agent_empty = AgentLoop::new(AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "empty-task".to_string(),
             enable_checkpoints: false,
@@ -4974,7 +5031,9 @@ mod tests {
         use crate::core::hooks::HookManager;
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5008,11 +5067,13 @@ mod tests {
         use crate::core::tools::handlers::read_file::ReadFileHandler;
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::single_tool_call(
-                "call_1",
-                "read_file",
-                serde_json::json!({"path": "/tmp/test_hook_file.txt"}),
-            )))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::single_tool_call(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": "/tmp/test_hook_file.txt"}),
+                ),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5112,7 +5173,9 @@ mod tests {
     #[tokio::test]
     async fn test_plan_mode_blocks_restricted_tools() {
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Plan,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5152,7 +5215,9 @@ mod tests {
     #[tokio::test]
     async fn test_act_mode_allows_all_tools() {
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5191,7 +5256,9 @@ mod tests {
     #[tokio::test]
     async fn test_plan_mode_disabled_allows_all_tools() {
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Plan,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5232,11 +5299,13 @@ mod tests {
         use crate::core::tools::handlers::read_file::ReadFileHandler;
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::single_tool_call(
-                "call_1",
-                "read_file",
-                serde_json::json!({"path": "/tmp/test_approval_file.txt"}),
-            )))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::single_tool_call(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": "/tmp/test_approval_file.txt"}),
+                ),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5305,11 +5374,13 @@ mod tests {
         unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::single_tool_call(
-                "call_1",
-                "execute_command",
-                serde_json::json!({"command": "echo hello"}),
-            )))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::single_tool_call(
+                    "call_1",
+                    "execute_command",
+                    serde_json::json!({"command": "echo hello"}),
+                ),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5393,11 +5464,13 @@ mod tests {
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::single_tool_call(
-                "call_1",
-                "execute_command",
-                serde_json::json!({"commands": ["echo hello world"]}),
-            )))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::single_tool_call(
+                    "call_1",
+                    "execute_command",
+                    serde_json::json!({"commands": ["echo hello world"]}),
+                ),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5461,7 +5534,9 @@ mod tests {
     #[tokio::test]
     async fn test_message_queue_enqueue_and_count() {
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5498,7 +5573,9 @@ mod tests {
     #[tokio::test]
     async fn test_message_queue_clear() {
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5534,7 +5611,9 @@ mod tests {
         use crate::providers::{MessageContent, MessageRole, StorageMessage};
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5894,7 +5973,9 @@ mod tests {
     #[test]
     fn test_checkpoint_manager_wired() {
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "test-checkpoint-task".to_string(),
             enable_checkpoints: false,
@@ -5939,7 +6020,9 @@ mod tests {
         std::fs::write(&test_file, "fn main() {}").unwrap();
 
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "test-mention-task".to_string(),
             enable_checkpoints: false,
@@ -6006,7 +6089,9 @@ mod tests {
     #[tokio::test]
     async fn test_ctrl_c_cancellation_wired() {
         let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::new(vec![])))),
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(
+                crate::providers::mock::MockProvider::new(vec![]),
+            ))),
             mode: AgentMode::Act,
             task_id: "test-cancel-task".to_string(),
             enable_checkpoints: false,
@@ -6149,7 +6234,10 @@ mod tests {
         let edited = vec!["src/foo.rs".to_string()];
         let result = summarize_matching_sections(text, &edited);
         assert!(result.contains("Hash: aaa"));
-        assert!(result.contains("1§foo"), "pruned section preserves anchored lines");
+        assert!(
+            result.contains("1§foo"),
+            "pruned section preserves anchored lines"
+        );
         assert!(result.contains("1§bar"));
     }
 
@@ -6159,8 +6247,14 @@ mod tests {
             "[File: src/foo.rs, Hash: aaa]\n1§foo\n---\n[File: src/bar.rs, Hash: bbb]\n1§bar";
         let edited = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
         let result = summarize_matching_sections(text, &edited);
-        assert!(result.contains("1§foo"), "pruned section preserves anchored lines");
-        assert!(result.contains("1§bar"), "pruned section preserves anchored lines");
+        assert!(
+            result.contains("1§foo"),
+            "pruned section preserves anchored lines"
+        );
+        assert!(
+            result.contains("1§bar"),
+            "pruned section preserves anchored lines"
+        );
         assert!(result.contains("Hash: aaa"));
         assert!(result.contains("Hash: bbb"));
     }
@@ -6194,7 +6288,10 @@ mod tests {
         let edited = vec!["main.c".to_string()];
         let result = summarize_matching_sections(text, &edited);
         // Pruned section preserves hash-anchored lines for use with edit_file
-        assert!(result.contains("1§hello"), "pruned section preserves anchored lines");
+        assert!(
+            result.contains("1§hello"),
+            "pruned section preserves anchored lines"
+        );
         assert!(result.contains("Hash: abc123"));
     }
 
