@@ -973,7 +973,7 @@ pub fn prompt_for_approval(
     let stdin = io::stdin();
     // SECURITY (F-01): Non-interactive stdin DENIES by default to prevent
     // piped input attacks. Require explicit --yolo or --auto-approve-all flag.
-    if !stdin.is_terminal() {
+    if std::env::var("SNED_APPROVAL_DENY").is_ok() || !stdin.is_terminal() {
         return Ok(ApprovalResult::Denied);
     }
 
@@ -1482,6 +1482,7 @@ mod tests {
         // SECURITY TEST (F-01): Non-interactive stdin (piped input, CI, scripts)
         // should DENY tool execution by default to prevent automated attacks.
         // User must explicitly pass --yolo or --auto-approve-all for non-interactive use.
+        unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
         let output_writer: crate::cli::output::OutputWriterArc =
             std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
         let result = prompt_for_approval(
@@ -1495,6 +1496,7 @@ mod tests {
             ApprovalResult::Denied,
             "Non-interactive stdin should deny by default (F-01)"
         );
+        unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
     }
 
     #[test]

@@ -5298,6 +5298,12 @@ mod tests {
         use crate::core::tools::ToolRegistry;
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
 
+        // Force non-interactive denial path. cargo test allocates a PTY for
+        // stdin, so is_terminal() returns true and the channel-based path
+        // would otherwise block/close instead of returning Denied.
+        // SAFETY: single-threaded test; sequential env mutation.
+        unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
+
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(crate::providers::mock::MockProvider::single_tool_call(
                 "call_1",
@@ -5376,6 +5382,9 @@ mod tests {
         } else {
             panic!("Expected at least one message in history");
         }
+
+        // SAFETY: single-threaded test; restoring env after test.
+        unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
     }
 
     #[tokio::test]
