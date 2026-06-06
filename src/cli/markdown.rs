@@ -23,7 +23,10 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
         ))];
     }
 
-    let parser = Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES);
+    let parser = Parser::new_ext(
+        text,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES,
+    );
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut current_text = String::new();
@@ -62,7 +65,10 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
         if is_first {
             current_spans.insert(
                 0,
-                Span::styled(prefix.to_string(), Style::default().fg(crate::cli::tui::theme::PROMPT_FG)),
+                Span::styled(
+                    prefix.to_string(),
+                    Style::default().fg(crate::cli::tui::theme::PROMPT_FG),
+                ),
             );
         }
         let spans = std::mem::take(current_spans);
@@ -92,16 +98,13 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
                         HeadingLevel::H6 => "###### ",
                     };
                     pending_list_prefix = Some(prefix_marker.to_string());
-                    style_stack
-                        .push(style_stack.last().unwrap().add_modifier(Modifier::BOLD));
+                    style_stack.push(style_stack.last().unwrap().add_modifier(Modifier::BOLD));
                 }
                 Tag::Strong => {
-                    style_stack
-                        .push(style_stack.last().unwrap().add_modifier(Modifier::BOLD));
+                    style_stack.push(style_stack.last().unwrap().add_modifier(Modifier::BOLD));
                 }
                 Tag::Emphasis => {
-                    style_stack
-                        .push(style_stack.last().unwrap().add_modifier(Modifier::ITALIC));
+                    style_stack.push(style_stack.last().unwrap().add_modifier(Modifier::ITALIC));
                 }
                 Tag::CodeBlock(_) => {
                     flush_line(
@@ -202,7 +205,9 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
                     // Strip pipe characters and alignment row markers.
                     let cleaned = piece.replace('|', "  ").trim().to_string();
                     // Skip separator rows like "--- | --- | ---"
-                    if cleaned.chars().all(|c| c == '-' || c.is_whitespace()) && cleaned.contains('-') {
+                    if cleaned.chars().all(|c| c == '-' || c.is_whitespace())
+                        && cleaned.contains('-')
+                    {
                         continue;
                     }
                     if !cleaned.is_empty() {
@@ -254,7 +259,10 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
                     Style::default().add_modifier(Modifier::DIM),
                 )));
             }
-            Event::Html(_) | Event::InlineHtml(_) | Event::FootnoteReference(_) | Event::TaskListMarker(_) => {}
+            Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::FootnoteReference(_)
+            | Event::TaskListMarker(_) => {}
         }
     }
 
@@ -286,7 +294,12 @@ mod tests {
     fn collect_text(lines: &[Line<'static>]) -> String {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -322,11 +335,14 @@ mod tests {
         let lines = render_completion_markdown("🚀 ", "Use `ls` to list files");
         let found = lines.iter().any(|l| {
             l.spans.iter().any(|s| {
-                s.content.contains("`ls`")
-                    && s.style.fg == Some(crate::cli::tui::theme::PROMPT_FG)
+                s.content.contains("`ls`") && s.style.fg == Some(crate::cli::tui::theme::PROMPT_FG)
             })
         });
-        assert!(found, "expected inline code with PROMPT_FG, got: {:?}", lines);
+        assert!(
+            found,
+            "expected inline code with PROMPT_FG, got: {:?}",
+            lines
+        );
     }
 
     #[test]
@@ -349,9 +365,17 @@ mod tests {
         assert!(text.contains("1"), "got: {}", text);
         assert!(text.contains("3"), "got: {}", text);
         // Pipes should be stripped (replaced with two spaces, then trimmed).
-        assert!(!text.contains('|'), "expected no pipe characters, got: {}", text);
+        assert!(
+            !text.contains('|'),
+            "expected no pipe characters, got: {}",
+            text
+        );
         // Separator row should be dropped.
-        assert!(!text.contains("---"), "expected separator row to be dropped, got: {}", text);
+        assert!(
+            !text.contains("---"),
+            "expected separator row to be dropped, got: {}",
+            text
+        );
     }
 
     #[test]
@@ -366,6 +390,10 @@ mod tests {
                     .any(|s| s.content.contains("🚀") && s.content.starts_with("🚀"))
             })
             .count();
-        assert_eq!(prefix_count, 1, "prefix should appear once, got: {:?}", lines);
+        assert_eq!(
+            prefix_count, 1,
+            "prefix should appear once, got: {:?}",
+            lines
+        );
     }
 }

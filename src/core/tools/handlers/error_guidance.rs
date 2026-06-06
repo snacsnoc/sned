@@ -14,10 +14,7 @@ pub fn missing_parameter(param: &str, consecutive_failures: u32) -> String {
     );
 
     match consecutive_failures {
-        0 | 1 => format!(
-            "{} Check the tool schema and provide a valid value.",
-            base
-        ),
+        0 | 1 => format!("{} Check the tool schema and provide a valid value.", base),
         2 => format!(
             "{} This is the second failed attempt. Re-read the tool schema carefully and provide all required parameters.",
             base
@@ -31,10 +28,7 @@ pub fn missing_parameter(param: &str, consecutive_failures: u32) -> String {
 
 /// Guidance for file not found errors.
 pub fn file_not_found(path: &str, consecutive_failures: u32) -> String {
-    let base = format!(
-        "File '{}' does not exist.",
-        path
-    );
+    let base = format!("File '{}' does not exist.", path);
 
     match consecutive_failures {
         0 | 1 => format!(
@@ -54,10 +48,7 @@ pub fn file_not_found(path: &str, consecutive_failures: u32) -> String {
 
 /// Guidance for permission denied errors.
 pub fn permission_denied(path: &str, action: &str, consecutive_failures: u32) -> String {
-    let base = format!(
-        "Permission denied when trying to {} '{}'.",
-        action, path
-    );
+    let base = format!("Permission denied when trying to {} '{}'.", action, path);
 
     match consecutive_failures {
         0 | 1 => format!(
@@ -77,10 +68,7 @@ pub fn permission_denied(path: &str, action: &str, consecutive_failures: u32) ->
 
 /// Guidance for symbol not found errors.
 pub fn symbol_not_found(symbol: &str, path: &str, consecutive_failures: u32) -> String {
-    let base = format!(
-        "Symbol '{}' not found in {}.",
-        symbol, path
-    );
+    let base = format!("Symbol '{}' not found in {}.", symbol, path);
 
     match consecutive_failures {
         0 | 1 => format!(
@@ -170,10 +158,7 @@ pub fn network_error(url: &str, consecutive_failures: u32) -> String {
 
 /// Guidance for command execution failures.
 pub fn command_failed(cmd: &str, consecutive_failures: u32) -> String {
-    let base = format!(
-        "Command failed: {}",
-        cmd
-    );
+    let base = format!("Command failed: {}", cmd);
 
     match consecutive_failures {
         0 | 1 => format!(
@@ -193,16 +178,10 @@ pub fn command_failed(cmd: &str, consecutive_failures: u32) -> String {
 
 /// Guidance for tool-specific schema errors.
 pub fn invalid_tool_input(tool: &str, reason: &str, consecutive_failures: u32) -> String {
-    let base = format!(
-        "Invalid input for '{}': {}",
-        tool, reason
-    );
+    let base = format!("Invalid input for '{}': {}", tool, reason);
 
     match consecutive_failures {
-        0 | 1 => format!(
-            "{} Review the tool schema and correct the input.",
-            base
-        ),
+        0 | 1 => format!("{} Review the tool schema and correct the input.", base),
         2 => format!(
             "{} This is the second failed attempt. Re-read the tool schema carefully and provide valid input.",
             base

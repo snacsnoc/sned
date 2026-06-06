@@ -225,10 +225,10 @@ impl SecretsStore {
                     key
                 );
                 return Err(io::Error::other(
-                    "OS keychain unavailable and SNED_REQUIRE_KEYCHAIN is set"
+                    "OS keychain unavailable and SNED_REQUIRE_KEYCHAIN is set",
                 ));
             }
-            
+
             // Fall back to file storage with strong warning
             // WARN the user that secrets are stored in plaintext
             tracing::warn!(

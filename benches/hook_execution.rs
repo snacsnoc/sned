@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use sned::core::hooks::{HookData, HookInput, HookManager, HookName, PreToolUseData};
+use std::hint::black_box;
 
 fn bench_hook_serialization(c: &mut Criterion) {
     let input = HookInput {

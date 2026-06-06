@@ -170,8 +170,7 @@ pub fn calculate_context_usage_percentage(
     context_window: u64,
     _provider_name: &str,
 ) -> f64 {
-    let cache_tokens =
-        cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64;
+    let cache_tokens = cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64;
 
     let total_tokens = tokens_in as u64 + tokens_out as u64 + cache_tokens;
 

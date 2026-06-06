@@ -93,7 +93,11 @@ fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Re
 
     // Set core.excludesFile in shadow repo config
     let config_output = Command::new("git")
-        .args(["config", "core.excludesFile", exclude_file_abs.to_string_lossy().as_ref()])
+        .args([
+            "config",
+            "core.excludesFile",
+            exclude_file_abs.to_string_lossy().as_ref(),
+        ])
         .current_dir(workspace_root)
         .env("GIT_DIR", &shadow_git_path)
         .env("GIT_WORK_TREE", workspace_root)
@@ -155,7 +159,8 @@ fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Re
         commit_cmd.arg("--allow-empty");
     }
 
-    let output = commit_cmd.output()
+    let output = commit_cmd
+        .output()
         .context("Failed to commit to shadow repo")?;
 
     if !output.status.success() {

@@ -750,10 +750,15 @@ mod tests {
             .find(|path| {
                 path.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|name| name.starts_with("task_metadata.json.") && name.ends_with(".bak"))
+                    .is_some_and(|name| {
+                        name.starts_with("task_metadata.json.") && name.ends_with(".bak")
+                    })
             });
 
-        assert!(backup.is_some(), "corrupt task metadata should be backed up");
+        assert!(
+            backup.is_some(),
+            "corrupt task metadata should be backed up"
+        );
 
         let loaded = storage.load_file_context_metadata();
         assert_eq!(loaded.len(), 1);
@@ -790,7 +795,9 @@ mod tests {
             .find(|path| {
                 path.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|name| name.starts_with("settings.json.") && name.ends_with(".bak"))
+                    .is_some_and(|name| {
+                        name.starts_with("settings.json.") && name.ends_with(".bak")
+                    })
             });
 
         assert!(backup.is_some(), "corrupt settings should be backed up");

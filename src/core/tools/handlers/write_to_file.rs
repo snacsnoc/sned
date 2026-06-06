@@ -54,7 +54,8 @@ impl WriteToFileHandler {
         let _guard = FileEditGuard::acquire(path).await;
 
         // Canonicalize workspace root once for consistent comparison
-        let canonical_workspace = fs::canonicalize(workspace_root).await
+        let canonical_workspace = fs::canonicalize(workspace_root)
+            .await
             .unwrap_or_else(|_| workspace_root.to_path_buf());
 
         let path_obj = Path::new(path);
@@ -62,10 +63,10 @@ impl WriteToFileHandler {
         // Create parent directories if they don't exist
         if let Some(parent) = path_obj.parent() {
             fs::create_dir_all(parent).await?;
-            
+
             // Re-verify parent directory after creation to catch symlink race
             let canonical_parent = fs::canonicalize(parent).await?;
-            
+
             if !canonical_parent.starts_with(&canonical_workspace) {
                 anyhow::bail!(
                     "Parent directory {} resolved to {} which is outside workspace {}",
@@ -79,14 +80,18 @@ impl WriteToFileHandler {
         // Final canonicalization check immediately before write
         // Use parent + filename if file doesn't exist yet
         let final_canonical = if path_obj.exists() {
-            fs::canonicalize(path).await.unwrap_or_else(|_| PathBuf::from(path))
+            fs::canonicalize(path)
+                .await
+                .unwrap_or_else(|_| PathBuf::from(path))
         } else {
             // File doesn't exist yet - canonicalize parent and append filename
             let parent = path_obj.parent().unwrap_or(Path::new("."));
-            let canonical_parent = fs::canonicalize(parent).await.unwrap_or_else(|_| PathBuf::from(parent));
+            let canonical_parent = fs::canonicalize(parent)
+                .await
+                .unwrap_or_else(|_| PathBuf::from(parent));
             canonical_parent.join(path_obj.file_name().unwrap_or_default())
         };
-        
+
         if !final_canonical.starts_with(&canonical_workspace) {
             anyhow::bail!(
                 "Path {} resolved to {} which is outside workspace {} (symlink detected)",
@@ -110,35 +115,39 @@ impl WriteToFileHandler {
         let path = params["path"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("path", 0)))?;
-        let content = params["content"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("content", 0)))?;
+        let content = params["content"].as_str().ok_or_else(|| {
+            ToolError::InvalidInput(error_guidance::missing_parameter("content", 0))
+        })?;
         if content.is_empty() {
-            return Err(ToolError::InvalidInput(
-                error_guidance::empty_content(path, 0),
-            ));
+            return Err(ToolError::InvalidInput(error_guidance::empty_content(
+                path, 0,
+            )));
         }
 
-        self.write_file(path, content, workspace_root).await.map_err(|e| {
-            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                match io_err.kind() {
-                    std::io::ErrorKind::PermissionDenied => ToolError::ExecutionFailedWithMetadata(
-                        actionable_errors::permission_denied(path, "write to").to_string(),
-                        ToolFailureMetadata {
-                            class: ToolFailureClass::PermissionDenied,
-                            affected_paths: vec![path.to_string()],
-                            required_next_step: None,
-                        },
-                    ),
-                    _ => ToolError::ExecutionFailed(format!(
-                        "Failed to write '{}': {}",
-                        path, io_err
-                    )),
+        self.write_file(path, content, workspace_root)
+            .await
+            .map_err(|e| {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    match io_err.kind() {
+                        std::io::ErrorKind::PermissionDenied => {
+                            ToolError::ExecutionFailedWithMetadata(
+                                actionable_errors::permission_denied(path, "write to").to_string(),
+                                ToolFailureMetadata {
+                                    class: ToolFailureClass::PermissionDenied,
+                                    affected_paths: vec![path.to_string()],
+                                    required_next_step: None,
+                                },
+                            )
+                        }
+                        _ => ToolError::ExecutionFailed(format!(
+                            "Failed to write '{}': {}",
+                            path, io_err
+                        )),
+                    }
+                } else {
+                    ToolError::ExecutionFailed(e.to_string())
                 }
-            } else {
-                ToolError::ExecutionFailed(e.to_string())
-            }
-        })
+            })
     }
     pub fn new() -> Self {
         Self
@@ -153,9 +162,12 @@ impl ToolHandler for WriteToFileHandler {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
         let consecutive_mistakes = ctx.state.lock().await.consecutive_mistakes;
-        let path = params["path"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("path", consecutive_mistakes)))?;
+        let path = params["path"].as_str().ok_or_else(|| {
+            ToolError::InvalidInput(error_guidance::missing_parameter(
+                "path",
+                consecutive_mistakes,
+            ))
+        })?;
         let path = path.to_string();
         let resolved_path = Self::resolve_path(ctx.workspace_root.as_path(), &path)?;
         let mut resolved_params = params;
@@ -168,7 +180,12 @@ impl ToolHandler for WriteToFileHandler {
 
         let content = resolved_params["content"]
             .as_str()
-            .ok_or_else(|| ToolError::InvalidInput(error_guidance::missing_parameter("content", consecutive_mistakes)))?
+            .ok_or_else(|| {
+                ToolError::InvalidInput(error_guidance::missing_parameter(
+                    "content",
+                    consecutive_mistakes,
+                ))
+            })?
             .to_string();
         let lines_added = content.lines().count() as u32;
 
@@ -318,7 +335,10 @@ mod tests {
             let content = format!("content-{}", i);
             let workspace = temp_dir.path().to_path_buf();
             handles.push(tokio::spawn(async move {
-                handler.write_file(&path, &content, &workspace).await.unwrap();
+                handler
+                    .write_file(&path, &content, &workspace)
+                    .await
+                    .unwrap();
             }));
         }
 

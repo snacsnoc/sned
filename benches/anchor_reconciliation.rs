@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use sned::core::file_editor::AnchorStateManager;
+use std::hint::black_box;
 
 /// Generate test file content with specified line count
 fn generate_content(line_count: usize) -> Vec<String> {

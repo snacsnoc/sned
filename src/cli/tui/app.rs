@@ -11,8 +11,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Wrap,
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
 use std::collections::VecDeque;
@@ -453,8 +452,7 @@ impl App {
             return;
         }
 
-        let max_offset =
-            Self::max_scroll_offset_for(total_rows, self.last_content_height) as isize;
+        let max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height) as isize;
         let next = (self.scroll_offset as isize + delta).clamp(0, max_offset);
         self.scroll_offset = next as u16;
         self.clamp_to_content();
@@ -669,8 +667,7 @@ impl App {
     }
 
     fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
-        let input_title = if self.agent_busy
-            && !crate::core::approval::is_approval_prompt_active()
+        let input_title = if self.agent_busy && !crate::core::approval::is_approval_prompt_active()
         {
             if self.reasoning_active {
                 format!(" {} Reasoning... ", self.spinner_char())
@@ -720,8 +717,7 @@ impl App {
         let right_width = UnicodeWidthStr::width(self.cached_status_right.as_str());
         let spacer_len = status_area
             .width
-            .saturating_sub((left_width + right_width) as u16)
-            as usize;
+            .saturating_sub((left_width + right_width) as u16) as usize;
         if spacer_len != self.cached_spacer_len {
             self.cached_spacer = " ".repeat(spacer_len);
             self.cached_spacer_len = spacer_len;
@@ -800,18 +796,18 @@ impl App {
                     .cloned()
                     .collect::<Vec<_>>(),
             )
-                .wrap(Wrap { trim: false })
-                .scroll((visible_scroll_y as u16, 0))
-                .block(
-                    theme::border_block(" sned ")
-                        .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
-                );
+            .wrap(Wrap { trim: false })
+            .scroll((visible_scroll_y as u16, 0))
+            .block(
+                theme::border_block(" sned ").padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
+            );
             frame.render_widget(output, main_output_area);
         }
 
         // Render completion box as a distinct block below the main output area.
         if has_completion {
-            let completion_lines: Vec<Line<'static>> = self.completion_lines.iter().cloned().collect();
+            let completion_lines: Vec<Line<'static>> =
+                self.completion_lines.iter().cloned().collect();
             let completion = Paragraph::new(completion_lines)
                 .wrap(Wrap { trim: false })
                 .block(
@@ -950,7 +946,10 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, entry)| {
-                let label = format!("[{}] {} - {}", entry.provider, entry.label, entry.description);
+                let label = format!(
+                    "[{}] {} - {}",
+                    entry.provider, entry.label, entry.description
+                );
                 if i == self.model_picker_selected {
                     Line::from(Span::styled(label, theme::picker_selected_style()))
                 } else {
@@ -1125,9 +1124,19 @@ mod tests {
         let max_offset = 15u16; // make_scrolling_app(20, 5) → max_offset = 15
         let cases: &[(ScrollMode, u16, ScrollMode, &str)] = &[
             // Manual at exact bottom → Auto
-            (ScrollMode::Manual, max_offset, ScrollMode::Auto, "at bottom"),
+            (
+                ScrollMode::Manual,
+                max_offset,
+                ScrollMode::Auto,
+                "at bottom",
+            ),
             // Manual 1 from bottom → stays Manual (regression guard for <= 2 → == 0 fix)
-            (ScrollMode::Manual, max_offset - 1, ScrollMode::Manual, "1 from bottom"),
+            (
+                ScrollMode::Manual,
+                max_offset - 1,
+                ScrollMode::Manual,
+                "1 from bottom",
+            ),
             // Manual at arbitrary mid-position → stays Manual
             (ScrollMode::Manual, 5, ScrollMode::Manual, "mid-position"),
             // Manual at top → stays Manual
@@ -1135,7 +1144,12 @@ mod tests {
             // Auto always stays Auto
             (ScrollMode::Auto, 0, ScrollMode::Auto, "auto"),
             // ApprovalPinned always stays ApprovalPinned
-            (ScrollMode::ApprovalPinned, 0, ScrollMode::ApprovalPinned, "approval pinned"),
+            (
+                ScrollMode::ApprovalPinned,
+                0,
+                ScrollMode::ApprovalPinned,
+                "approval pinned",
+            ),
         ];
 
         for &(start_mode, offset, expected, label) in cases {
@@ -1213,8 +1227,14 @@ mod tests {
             app.visible_output_window(wrap_width, total_rows.saturating_sub(3), 3);
 
         assert!(start_idx > 0, "expected a later slice near the bottom");
-        assert!(take_count < app.output_lines.len(), "window should not clone all lines");
-        assert!(scroll_y <= 3, "local scroll offset should stay within the viewport");
+        assert!(
+            take_count < app.output_lines.len(),
+            "window should not clone all lines"
+        );
+        assert!(
+            scroll_y <= 3,
+            "local scroll offset should stay within the viewport"
+        );
     }
 
     #[test]
@@ -1418,8 +1438,8 @@ mod tests {
 
     #[test]
     fn test_render_output_does_not_update_placeholder() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -1447,8 +1467,8 @@ mod tests {
 
     #[test]
     fn test_render_status_bar_caches_static_fields() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -1505,9 +1525,9 @@ mod tests {
 
     #[test]
     fn test_render_status_bar_caches_right_segment() {
-        use std::time::Duration;
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::time::Duration;
 
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");

@@ -29,14 +29,14 @@ fn create_backup_path(original: &Path) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_secs();
-    
+
     let mut backup_name = original
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "backup".to_string());
-    
+
     backup_name.push_str(&format!(".{}.bak", timestamp));
-    
+
     original.with_file_name(backup_name)
 }
 
@@ -44,12 +44,12 @@ fn create_backup_path(original: &Path) -> PathBuf {
 /// Returns None if the path contains ".." components or is absolute
 fn sanitize_relative_path(path: &str) -> Option<PathBuf> {
     let pb = PathBuf::from(path);
-    
+
     // Reject absolute paths
     if pb.is_absolute() {
         return None;
     }
-    
+
     // Reject paths with ".." components
     for component in pb.components() {
         match component {
@@ -58,7 +58,7 @@ fn sanitize_relative_path(path: &str) -> Option<PathBuf> {
             _ => {}
         }
     }
-    
+
     Some(pb)
 }
 
@@ -305,16 +305,16 @@ impl MigrationEngine {
         self.executed_operations.clear();
 
         let result = (|| -> Result<MigrationExecutionReport, MigrationError> {
-            let endpoints =
-                self.execute_json_object_migration("endpoints.json", PathBuf::from("endpoints.json"))?;
+            let endpoints = self
+                .execute_json_object_migration("endpoints.json", PathBuf::from("endpoints.json"))?;
 
             let global_settings = self.execute_json_object_migration(
                 "data/settings/global_settings.json",
                 PathBuf::from("data/settings/global_settings.json"),
             )?;
 
-            let secrets =
-                self.execute_json_object_migration(".secrets.json", PathBuf::from(".secrets.json"))?;
+            let secrets = self
+                .execute_json_object_migration(".secrets.json", PathBuf::from(".secrets.json"))?;
 
             let task_history = self.execute_task_history_migration(
                 "data/state/taskHistory.json",
@@ -422,12 +422,13 @@ impl MigrationEngine {
         _report_path: PathBuf,
     ) -> Result<Option<JsonObjectMigration>, MigrationError> {
         // Sanitize relative path to prevent path traversal attacks
-        let sanitized_path = sanitize_relative_path(relative_path)
-            .ok_or_else(|| MigrationError::UnsupportedJson {
+        let sanitized_path = sanitize_relative_path(relative_path).ok_or_else(|| {
+            MigrationError::UnsupportedJson {
                 path: PathBuf::from(relative_path),
                 message: "invalid path: contains path traversal (..) or is absolute".to_string(),
-            })?;
-        
+            }
+        })?;
+
         let source_path = self.source_root.join(&sanitized_path);
         let destination_path = self.destination_root.join(&sanitized_path);
 
@@ -515,10 +516,12 @@ impl MigrationEngine {
                 }
             })?;
 
-        crate::storage::disk::atomic_write_file(&destination_path, &json_str).map_err(|source| MigrationError::Io {
-            path: destination_path.clone(),
-            source,
-        })?;
+        crate::storage::disk::atomic_write_file(&destination_path, &json_str).map_err(
+            |source| MigrationError::Io {
+                path: destination_path.clone(),
+                source,
+            },
+        )?;
 
         #[cfg(unix)]
         {
@@ -652,10 +655,12 @@ impl MigrationEngine {
                 }
             })?;
 
-        crate::storage::disk::atomic_write_file(&destination_path, &json_str).map_err(|source| MigrationError::Io {
-            path: destination_path.clone(),
-            source,
-        })?;
+        crate::storage::disk::atomic_write_file(&destination_path, &json_str).map_err(
+            |source| MigrationError::Io {
+                path: destination_path.clone(),
+                source,
+            },
+        )?;
 
         let operation_type = if backup_path.is_some() {
             OperationType::UpdateFile
@@ -843,10 +848,12 @@ impl MigrationEngine {
                 path: source_file.clone(),
                 source,
             })?;
-            crate::storage::disk::atomic_write_file_bytes(&destination_file, &content).map_err(|source| MigrationError::Io {
-                path: destination_file.clone(),
-                source,
-            })?;
+            crate::storage::disk::atomic_write_file_bytes(&destination_file, &content).map_err(
+                |source| MigrationError::Io {
+                    path: destination_file.clone(),
+                    source,
+                },
+            )?;
 
             let op_type = if backup_path.is_some() {
                 OperationType::UpdateFile
@@ -936,18 +943,15 @@ impl MigrationEngine {
                         None
                     };
 
-                    let content = fs::read(source_file).map_err(|source| {
-                        MigrationError::Io {
-                            path: source_file.to_path_buf(),
-                            source,
-                        }
+                    let content = fs::read(source_file).map_err(|source| MigrationError::Io {
+                        path: source_file.to_path_buf(),
+                        source,
                     })?;
-                    crate::storage::disk::atomic_write_file_bytes(&destination_file, &content).map_err(|source| {
-                        MigrationError::Io {
+                    crate::storage::disk::atomic_write_file_bytes(&destination_file, &content)
+                        .map_err(|source| MigrationError::Io {
                             path: destination_file.clone(),
                             source,
-                        }
-                    })?;
+                        })?;
 
                     let op_type = if backup_path.is_some() {
                         OperationType::UpdateFile

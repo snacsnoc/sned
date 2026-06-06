@@ -27,7 +27,10 @@ pub struct AnthropicConfig {
 impl std::fmt::Debug for AnthropicConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnthropicConfig")
-            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field(
+                "api_key",
+                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+            )
             .field("base_url", &self.base_url)
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)

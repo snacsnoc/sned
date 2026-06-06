@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use sned::core::context::trackers::{FileContextTracker, FileRecordSource};
+use std::hint::black_box;
 use std::io::Write;
 
 fn bench_track_file(c: &mut Criterion) {

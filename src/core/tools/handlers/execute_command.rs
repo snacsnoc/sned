@@ -546,7 +546,11 @@ impl ExecuteCommandHandler {
         if !all_filtered_names.is_empty() {
             all_filtered_names.sort();
             all_filtered_names.dedup();
-            let sample: Vec<&str> = all_filtered_names.iter().take(5).map(|s| s.as_str()).collect();
+            let sample: Vec<&str> = all_filtered_names
+                .iter()
+                .take(5)
+                .map(|s| s.as_str())
+                .collect();
             let note = if all_filtered_names.len() > 5 {
                 format!(
                     "\n[Sandbox: {} env vars filtered (e.g. {}). Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
@@ -785,7 +789,9 @@ impl ExecuteCommandHandler {
 
         Ok(combined)
     }
-    fn build_sandbox_env(cwd: Option<&Path>) -> (std::collections::HashMap<String, String>, Vec<String>) {
+    fn build_sandbox_env(
+        cwd: Option<&Path>,
+    ) -> (std::collections::HashMap<String, String>, Vec<String>) {
         use std::collections::HashMap;
 
         static BASE_ALLOWLIST: &[&str] = &[
@@ -1476,18 +1482,22 @@ mod tests {
         let (env, filtered) = ExecuteCommandHandler::build_sandbox_env(None);
         assert!(env.contains_key("PATH"), "PATH should be allowed");
         assert!(env.contains_key("HOME"), "HOME should be allowed");
-        assert!(!filtered.iter().any(|k| k == "PATH"), "PATH should not be in filtered list");
+        assert!(
+            !filtered.iter().any(|k| k == "PATH"),
+            "PATH should not be in filtered list"
+        );
     }
 
     #[test]
     fn test_sandbox_filters_sensitive_vars() {
         let (env, _filtered) = ExecuteCommandHandler::build_sandbox_env(None);
-        for key in &["API_KEY", "SECRET_TOKEN", "MY_PASSWORD", "AWS_SECRET_ACCESS_KEY"] {
-            assert!(
-                !env.contains_key(*key),
-                "{} should be filtered out",
-                key
-            );
+        for key in &[
+            "API_KEY",
+            "SECRET_TOKEN",
+            "MY_PASSWORD",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(!env.contains_key(*key), "{} should be filtered out", key);
         }
     }
 
@@ -1509,28 +1519,51 @@ mod tests {
         let handler = ExecuteCommandHandler::new();
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
-        let result = rt.block_on(handler.execute_commands_with_timeout(
-            vec!["echo $HOME".to_string()],
-            None,
-            None,
-            false,
-            None,
-            false,
-            &output_writer,
-        )).unwrap();
-
-        if std::env::vars().any(|(k, _)| !k.starts_with("SNED_")
-            && !matches!(
-                k.as_str(),
-                "PATH" | "HOME" | "USER" | "LANG" | "LC_ALL" | "TERM"
-                | "TERM_PROGRAM" | "TZ" | "SHELL" | "PWD" | "TMPDIR"
-                | "XDG_CACHE_HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME"
-                | "XDG_STATE_HOME" | "EDITOR" | "VISUAL" | "PAGER" | "LESS"
-                | "MORE" | "LOGNAME" | "HOSTNAME" | "DOCKER_HOST"
-                | "CARGO_HOME" | "RUSTUP_HOME" | "GOPATH"
-                | "NPM_CONFIG_PREFIX"
+        let result = rt
+            .block_on(handler.execute_commands_with_timeout(
+                vec!["echo $HOME".to_string()],
+                None,
+                None,
+                false,
+                None,
+                false,
+                &output_writer,
             ))
-        {
+            .unwrap();
+
+        if std::env::vars().any(|(k, _)| {
+            !k.starts_with("SNED_")
+                && !matches!(
+                    k.as_str(),
+                    "PATH"
+                        | "HOME"
+                        | "USER"
+                        | "LANG"
+                        | "LC_ALL"
+                        | "TERM"
+                        | "TERM_PROGRAM"
+                        | "TZ"
+                        | "SHELL"
+                        | "PWD"
+                        | "TMPDIR"
+                        | "XDG_CACHE_HOME"
+                        | "XDG_CONFIG_HOME"
+                        | "XDG_DATA_HOME"
+                        | "XDG_STATE_HOME"
+                        | "EDITOR"
+                        | "VISUAL"
+                        | "PAGER"
+                        | "LESS"
+                        | "MORE"
+                        | "LOGNAME"
+                        | "HOSTNAME"
+                        | "DOCKER_HOST"
+                        | "CARGO_HOME"
+                        | "RUSTUP_HOME"
+                        | "GOPATH"
+                        | "NPM_CONFIG_PREFIX"
+                )
+        }) {
             assert!(
                 result.contains("[Sandbox:"),
                 "output should contain sandbox notification when env vars are filtered, got: {}",

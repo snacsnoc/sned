@@ -174,7 +174,9 @@ impl WebFetchHandler {
             .host_str()
             .ok_or_else(|| ToolError::InvalidInput("URL must have a valid hostname".to_string()))?;
 
-        let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+        let port = url
+            .port()
+            .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
 
         // For bare IP addresses, validate directly without DNS resolution
         let ip_str = host.trim_start_matches('[').trim_end_matches(']');
@@ -187,7 +189,9 @@ impl WebFetchHandler {
         // could race via rebinding. We validate every resolved IP.
         let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to resolve hostname '{}': {}", host, e)))?
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to resolve hostname '{}': {}", host, e))
+            })?
             .collect();
 
         if addrs.is_empty() {
@@ -232,9 +236,9 @@ impl WebFetchHandler {
         // instead of performing its own DNS lookup, preventing rebinding
         builder = builder.resolve(&host, pinned_addr);
 
-        let client = builder
-            .build()
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create HTTP client: {}", e)))?;
+        let client = builder.build().map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to create HTTP client: {}", e))
+        })?;
 
         // Manual redirect loop with DNS validation at each hop
         let mut current_url = validated_url;
@@ -251,9 +255,7 @@ impl WebFetchHandler {
             let status = response.status();
             if status.is_redirection() {
                 if redirect_count >= MAX_REDIRECTS {
-                    return Err(ToolError::ExecutionFailed(
-                        "Too many redirects".to_string(),
-                    ));
+                    return Err(ToolError::ExecutionFailed("Too many redirects".to_string()));
                 }
 
                 let location = response
@@ -270,7 +272,10 @@ impl WebFetchHandler {
                 let redirect_url = Url::parse(location)
                     .or_else(|_| current_url.join(location))
                     .map_err(|e| {
-                        ToolError::ExecutionFailed(format!("Invalid redirect URL '{}': {}", location, e))
+                        ToolError::ExecutionFailed(format!(
+                            "Invalid redirect URL '{}': {}",
+                            location, e
+                        ))
                     })?;
 
                 // Validate the redirect URL and resolve its DNS — prevents

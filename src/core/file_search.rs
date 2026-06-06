@@ -444,24 +444,21 @@ mod tests {
 
     #[test]
     fn test_insert_mention_simple() {
-        let (result, cursor_pos) =
-            insert_mention("hello @", 6, "src/main.rs", FileType::File);
+        let (result, cursor_pos) = insert_mention("hello @", 6, "src/main.rs", FileType::File);
         assert_eq!(result, "hello @/src/main.rs ");
         assert_eq!(cursor_pos, 20); // after "@/src/main.rs "
     }
 
     #[test]
     fn test_insert_mention_spaces() {
-        let (result, cursor_pos) =
-            insert_mention("hello @", 6, "/src/my file.rs", FileType::File);
+        let (result, cursor_pos) = insert_mention("hello @", 6, "/src/my file.rs", FileType::File);
         assert_eq!(result, "hello @\"/src/my file.rs\" ");
         assert_eq!(cursor_pos, 25); // after "@/src/my file.rs "
     }
 
     #[test]
     fn test_insert_mention_folder_spaces() {
-        let (result, cursor_pos) =
-            insert_mention("hello @", 6, "/src/my folder", FileType::Folder);
+        let (result, cursor_pos) = insert_mention("hello @", 6, "/src/my folder", FileType::Folder);
         assert_eq!(result, "hello @\"/src/my folder/\" ");
         assert_eq!(cursor_pos, 25); // after @"/src/my folder/ "
     }
@@ -520,7 +517,10 @@ mod tests {
         let score3 = fuzzy_score_normalized(&query_lower, "main.rs").unwrap();
         assert!(score1 > 0, "should match mixed-case Main.rs");
         assert!(score2 > 0, "should match uppercase MAIN.RS");
-        assert_eq!(score1, score3, "mixed-case and lowercase should score equally");
+        assert_eq!(
+            score1, score3,
+            "mixed-case and lowercase should score equally"
+        );
     }
 
     #[test]

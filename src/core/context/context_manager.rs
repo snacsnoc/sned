@@ -109,9 +109,7 @@ fn cache_token_strategy(provider_name: &str) -> CacheTokenStrategy {
 
 fn effective_cache_tokens(info: &ApiReqInfo, provider_name: &str) -> u64 {
     match cache_token_strategy(provider_name) {
-        CacheTokenStrategy::InputExcludesCacheReads => {
-            info.cache_reads.unwrap_or(0) as u64
-        }
+        CacheTokenStrategy::InputExcludesCacheReads => info.cache_reads.unwrap_or(0) as u64,
         CacheTokenStrategy::InputExcludesAllCache => {
             info.cache_writes.unwrap_or(0) as u64 + info.cache_reads.unwrap_or(0) as u64
         }
@@ -323,8 +321,7 @@ fn apply_context_history_updates(
             messages_to_update[2].content,
             MessageContent::UserBlocks(ref blocks)
                 if blocks.iter().any(|block| matches!(block, UserContentBlock::ToolResult(_)))
-        )
-    {
+        ) {
         3
     } else {
         2.min(messages_to_update.len())
@@ -779,8 +776,8 @@ mod tests {
             StorageMessage {
                 id: None,
                 role: MessageRole::User,
-                content: MessageContent::UserBlocks(vec![
-                    UserContentBlock::ToolResult(crate::providers::ToolResultBlock {
+                content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                    crate::providers::ToolResultBlock {
                         tool_use_id: "tool_1".to_string(),
                         content: crate::providers::ToolResultContent::Text(
                             "file content here".to_string(),
@@ -789,8 +786,8 @@ mod tests {
                             call_id: None,
                             signature: None,
                         },
-                    }),
-                ]),
+                    },
+                )]),
                 model_info: None,
                 metrics: None,
                 ts: None,
@@ -808,9 +805,17 @@ mod tests {
 
         let truncated = get_truncated_messages(&messages, None, Some(&summary));
         assert_eq!(truncated.len(), 5);
-        assert!(matches!(truncated[1].content, MessageContent::AssistantBlocks(_)));
-        assert!(matches!(truncated[2].content, MessageContent::UserBlocks(_)));
-        assert!(matches!(truncated[3].content, MessageContent::Text(ref text) if text == "Test summary"));
+        assert!(matches!(
+            truncated[1].content,
+            MessageContent::AssistantBlocks(_)
+        ));
+        assert!(matches!(
+            truncated[2].content,
+            MessageContent::UserBlocks(_)
+        ));
+        assert!(
+            matches!(truncated[3].content, MessageContent::Text(ref text) if text == "Test summary")
+        );
     }
 
     #[test]
@@ -988,7 +993,8 @@ mod tests {
         for name in &["deepseek", "openrouter", "minimax"] {
             assert!(
                 should_compact_context_window(&info, 200_000, 160_000, None, name),
-                "{}: 100k input + 70k cache = 170k should trigger", name
+                "{}: 100k input + 70k cache = 170k should trigger",
+                name
             );
         }
     }

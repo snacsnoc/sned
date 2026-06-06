@@ -167,7 +167,10 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = handler
-            .execute(&ctx, serde_json::json!({"response": "1. do this\n2. do that"}))
+            .execute(
+                &ctx,
+                serde_json::json!({"response": "1. do this\n2. do that"}),
+            )
             .await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("do this"));

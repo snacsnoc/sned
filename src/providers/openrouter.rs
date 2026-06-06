@@ -25,7 +25,10 @@ pub struct OpenRouterConfig {
 impl std::fmt::Debug for OpenRouterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenRouterConfig")
-            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field(
+                "api_key",
+                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+            )
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
             .field("provider_sort", &self.provider_sort)

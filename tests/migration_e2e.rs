@@ -236,11 +236,7 @@ fn test_rollback_on_failure() {
     .unwrap();
 
     // Inject invalid JSON in .secrets.json — this step will fail, triggering rollback
-    fs::write(
-        source.join(".secrets.json"),
-        "{ not valid json",
-    )
-    .unwrap();
+    fs::write(source.join(".secrets.json"), "{ not valid json").unwrap();
 
     let mut engine = MigrationEngine::new(&source, &dest);
     let result = engine.execute();

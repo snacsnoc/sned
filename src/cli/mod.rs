@@ -635,7 +635,9 @@ fn build_symbol_index_service(
     }
 }
 
-pub(crate) fn create_provider(task_opts: &TaskOptions) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
+pub(crate) fn create_provider(
+    task_opts: &TaskOptions,
+) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
     use crate::providers::env_auth::get_provider_from_env;
 
     // Determine provider: --provider flag > auto-detection from env > custom base_url (with api_key from flag/env) > error
@@ -2036,38 +2038,38 @@ mod tests {
         {
             let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             let all_provider_vars = vec![
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "GEMINI_API_KEY",
-            "OPENROUTER_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "QWEN_API_KEY",
-            "MINIMAX_API_KEY",
-            "MINIMAX_CN_API_KEY",
-            "MISTRAL_API_KEY",
-            "MOONSHOT_API_KEY",
-            "HF_TOKEN",
-            "ZAI_API_KEY",
-            "CEREBRAS_API_KEY",
-            "AI_GATEWAY_API_KEY",
-            "TOGETHER_API_KEY",
-            "FIREWORKS_API_KEY",
-            "NEBIUS_API_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_SESSION_TOKEN",
-            "AWS_BEDROCK_MODEL",
-            "AWS_BEDROCK_MODEL_ACT",
-            "AWS_BEDROCK_MODEL_PLAN",
-            "GOOGLE_CLOUD_PROJECT",
-            "GCP_PROJECT",
-            "GOOGLE_CLOUD_LOCATION",
-            "GOOGLE_CLOUD_REGION",
-            "OPENAI_API_BASE",
-            "OPENCODE_API_KEY",
-            "KIMI_API_KEY",
-            "OPENAI_COMPATIBLE_CUSTOM_KEY",
-        ];
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "OPENROUTER_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "QWEN_API_KEY",
+                "MINIMAX_API_KEY",
+                "MINIMAX_CN_API_KEY",
+                "MISTRAL_API_KEY",
+                "MOONSHOT_API_KEY",
+                "HF_TOKEN",
+                "ZAI_API_KEY",
+                "CEREBRAS_API_KEY",
+                "AI_GATEWAY_API_KEY",
+                "TOGETHER_API_KEY",
+                "FIREWORKS_API_KEY",
+                "NEBIUS_API_KEY",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_BEDROCK_MODEL",
+                "AWS_BEDROCK_MODEL_ACT",
+                "AWS_BEDROCK_MODEL_PLAN",
+                "GOOGLE_CLOUD_PROJECT",
+                "GCP_PROJECT",
+                "GOOGLE_CLOUD_LOCATION",
+                "GOOGLE_CLOUD_REGION",
+                "OPENAI_API_BASE",
+                "OPENCODE_API_KEY",
+                "KIMI_API_KEY",
+                "OPENAI_COMPATIBLE_CUSTOM_KEY",
+            ];
             for var in &all_provider_vars {
                 // SAFETY: clearing under mutex lock
                 unsafe { env::remove_var(var) };

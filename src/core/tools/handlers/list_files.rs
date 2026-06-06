@@ -66,7 +66,10 @@ impl ListFilesHandler {
                 files: Vec::new(),
                 hit_limit: false,
                 success: false,
-                error: Some(format!("Error listing files in {}: path does not exist", path)),
+                error: Some(format!(
+                    "Error listing files in {}: path does not exist",
+                    path
+                )),
                 warning: None,
             };
         }

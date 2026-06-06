@@ -202,7 +202,9 @@ pub fn summarize_single_section(section: &str) -> String {
     if !anchored_lines.is_empty() {
         out.push_str("\nPreserved anchors (copy EXACTLY for edit_file):\n");
         out.push_str(&anchored_lines.join("\n"));
-        out.push_str("\nRe-read with read_file for full content or to see lines beyond the preserved set.");
+        out.push_str(
+            "\nRe-read with read_file for full content or to see lines beyond the preserved set.",
+        );
     } else {
         out.push_str(" Re-read with read_file if you need current anchors.");
     }

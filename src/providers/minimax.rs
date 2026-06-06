@@ -47,7 +47,10 @@ pub struct MinimaxConfig {
 impl std::fmt::Debug for MinimaxConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MinimaxConfig")
-            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field(
+                "api_key",
+                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+            )
             .field("api_line", &self.api_line)
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
@@ -1990,7 +1993,8 @@ mod tests {
         let mut pending_text_signature: Option<String> = None;
         let (tx, mut rx) = mpsc::channel(4);
 
-        let first = r#"data: {"id":"evt_1","choices":[{"index":0,"delta":{"content":"I have a"}}]}"#;
+        let first =
+            r#"data: {"id":"evt_1","choices":[{"index":0,"delta":{"content":"I have a"}}]}"#;
         process_minimax_sse_line(
             first,
             &tx,
@@ -2004,7 +2008,8 @@ mod tests {
         .await;
         assert!(rx.try_recv().is_err(), "partial text should stay buffered");
 
-        let second = r#"data: {"id":"evt_2","choices":[{"index":0,"delta":{"content":" complete."}}]}"#;
+        let second =
+            r#"data: {"id":"evt_2","choices":[{"index":0,"delta":{"content":" complete."}}]}"#;
         process_minimax_sse_line(
             second,
             &tx,
@@ -2152,8 +2157,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(args).expect("arguments must be valid JSON");
         assert_eq!(
-            parsed["paths"][0],
-            "src/main.rs",
+            parsed["paths"][0], "src/main.rs",
             "complete args must arrive (not truncated by late stream-end flush)"
         );
     }

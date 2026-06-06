@@ -880,7 +880,11 @@ pub fn build_slash_command_entries(
     // Note: workflows are loaded from disk and require cwd — the TUI layer
     // calls build_slash_command_entries with a populated workflow list.
     // For simplicity, the TUI passes a pre-built WorkflowInfo list below.
-    let _ = (local_workflow_toggles, global_workflow_toggles, remote_workflow_toggles);
+    let _ = (
+        local_workflow_toggles,
+        global_workflow_toggles,
+        remote_workflow_toggles,
+    );
 
     entries
 }
@@ -937,8 +941,7 @@ pub fn apply_slash_completion(text: &str, command_name: &str) -> Option<(String,
     let query = extract_slash_query(text)?;
     let end = pos + 1 + query.len();
 
-    let mut new_text =
-        String::with_capacity(text.len() + command_name.len() + 1 - (end - pos));
+    let mut new_text = String::with_capacity(text.len() + command_name.len() + 1 - (end - pos));
     new_text.push_str(&text[..pos]);
     new_text.push('/');
     new_text.push_str(command_name);
@@ -955,10 +958,7 @@ pub fn apply_slash_completion(text: &str, command_name: &str) -> Option<(String,
 /// 2. Prefix match on name
 /// 3. Prefix match on alias
 /// 4. Substring match on name or description
-pub fn filter_slash_commands(
-    entries: &[SlashCommandEntry],
-    query: &str,
-) -> Vec<SlashCommandEntry> {
+pub fn filter_slash_commands(entries: &[SlashCommandEntry], query: &str) -> Vec<SlashCommandEntry> {
     if query.is_empty() {
         return entries.to_vec();
     }
@@ -1010,7 +1010,8 @@ pub fn filter_slash_commands(
         .collect();
 
     substring.into_iter().take(10).collect()
-}pub fn format_help_text() -> String {
+}
+pub fn format_help_text() -> String {
     use crate::cli::colors::style;
 
     let mut s = String::new();
@@ -2910,15 +2911,13 @@ mod tests {
 
     #[test]
     fn test_filter_slash_commands_alias_match() {
-        let entries = vec![
-            SlashCommandEntry {
-                name: "exit".to_string(),
-                description: "Exit".to_string(),
-                aliases: vec!["q".to_string(), "quit".to_string()],
-                category: SlashCommandCategory::Local,
-                requires_args: false,
-            },
-        ];
+        let entries = vec![SlashCommandEntry {
+            name: "exit".to_string(),
+            description: "Exit".to_string(),
+            aliases: vec!["q".to_string(), "quit".to_string()],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        }];
         let results = filter_slash_commands(&entries, "q");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "exit");
@@ -2926,15 +2925,13 @@ mod tests {
 
     #[test]
     fn test_filter_slash_commands_case_insensitive() {
-        let entries = vec![
-            SlashCommandEntry {
-                name: "compact".to_string(),
-                description: "Compact".to_string(),
-                aliases: vec![],
-                category: SlashCommandCategory::Agent,
-                requires_args: false,
-            },
-        ];
+        let entries = vec![SlashCommandEntry {
+            name: "compact".to_string(),
+            description: "Compact".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Agent,
+            requires_args: false,
+        }];
         let results = filter_slash_commands(&entries, "COMPACT");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "compact");
@@ -2942,30 +2939,26 @@ mod tests {
 
     #[test]
     fn test_filter_slash_commands_no_match() {
-        let entries = vec![
-            SlashCommandEntry {
-                name: "compact".to_string(),
-                description: "Compact".to_string(),
-                aliases: vec![],
-                category: SlashCommandCategory::Agent,
-                requires_args: false,
-            },
-        ];
+        let entries = vec![SlashCommandEntry {
+            name: "compact".to_string(),
+            description: "Compact".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Agent,
+            requires_args: false,
+        }];
         let results = filter_slash_commands(&entries, "zzz");
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_filter_slash_commands_description_match() {
-        let entries = vec![
-            SlashCommandEntry {
-                name: "compact".to_string(),
-                description: "Condense the current context".to_string(),
-                aliases: vec![],
-                category: SlashCommandCategory::Agent,
-                requires_args: false,
-            },
-        ];
+        let entries = vec![SlashCommandEntry {
+            name: "compact".to_string(),
+            description: "Condense the current context".to_string(),
+            aliases: vec![],
+            category: SlashCommandCategory::Agent,
+            requires_args: false,
+        }];
         let results = filter_slash_commands(&entries, "condense");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "compact");
@@ -3087,7 +3080,10 @@ mod tests {
             assert!(!entry.provider.is_empty(), "provider must not be empty");
             assert!(!entry.model_id.is_empty(), "model_id must not be empty");
             assert!(!entry.label.is_empty(), "label must not be empty");
-            assert!(!entry.description.is_empty(), "description must not be empty");
+            assert!(
+                !entry.description.is_empty(),
+                "description must not be empty"
+            );
         }
     }
 

@@ -391,11 +391,11 @@ impl HookManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        
+
         // Create new process group so we can kill all children on timeout/cancel
         #[cfg(unix)]
         cmd.process_group(0);
-        
+
         cmd.env("SNED_VERSION", &self.sned_version)
             .env("SNED_USER_ID", &self.user_id)
             // Remove sensitive environment variables for sandboxing
@@ -727,7 +727,7 @@ impl HookManager {
                     modification.len()
                 ));
             }
-            
+
             // Detect imperative instructions that could override user intent.
             // Keep the list broad enough to catch direct prompt-injection patterns.
             let injection_patterns = [
@@ -752,7 +752,7 @@ impl HookManager {
                 "wget | bash",
                 "download and execute",
             ];
-            
+
             let lower = modification.to_lowercase();
             for pattern in &injection_patterns {
                 if lower.contains(pattern) {
@@ -917,8 +917,9 @@ impl HookManager {
             {
                 use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
-                kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM)
-                    .map_err(|e| HookError::Other(format!("Failed to kill process group: {}", e)))?;
+                kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM).map_err(|e| {
+                    HookError::Other(format!("Failed to kill process group: {}", e))
+                })?;
                 let kill_start = std::time::Instant::now();
                 while kill_start.elapsed() < std::time::Duration::from_millis(500) {
                     match nix::sys::wait::waitpid(
@@ -1476,7 +1477,9 @@ mod tests {
                 injection
             );
             assert!(
-                result.unwrap_err().contains("prohibited instruction pattern"),
+                result
+                    .unwrap_err()
+                    .contains("prohibited instruction pattern"),
                 "Error should mention prohibited pattern"
             );
         }

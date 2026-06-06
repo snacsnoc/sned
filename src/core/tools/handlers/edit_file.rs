@@ -89,16 +89,17 @@ impl EditFileHandler {
 
             let mut edits = Vec::new();
             for edit_raw in edits_raw {
-                let anchor_raw = edit_raw
-                    .get("anchor")
-                    .and_then(|a| a.as_str())
-                    .ok_or_else(|| {
-                        ToolError::InvalidInput(format!(
-                            "Missing 'anchor' in edit for file '{}'. {}",
-                            path,
-                            error_guidance::missing_parameter("anchor", 0)
-                        ))
-                    })?;
+                let anchor_raw =
+                    edit_raw
+                        .get("anchor")
+                        .and_then(|a| a.as_str())
+                        .ok_or_else(|| {
+                            ToolError::InvalidInput(format!(
+                                "Missing 'anchor' in edit for file '{}'. {}",
+                                path,
+                                error_guidance::missing_parameter("anchor", 0)
+                            ))
+                        })?;
                 let anchor = anchor_raw.lines().next().unwrap_or("").trim();
 
                 let edit_type = edit_raw
@@ -193,8 +194,7 @@ impl EditFileHandler {
                     ));
                 }
 
-                if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a| a.as_str())
-                {
+                if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a| a.as_str()) {
                     let end_anchor = end_anchor_raw.lines().next().unwrap_or("").trim();
                     if !end_anchor.contains(ANCHOR_DELIMITER) {
                         invalid_anchors.push(format!(
@@ -374,7 +374,10 @@ impl EditFileHandler {
                     // SECURITY: Re-verify file is still valid (not swapped with symlink) even when using cache
                     match tokio::fs::symlink_metadata(&batch.absolute_path).await {
                         Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => {
-                            tracing::debug!("Using cached content for {} (symlink check passed)", batch.display_path);
+                            tracing::debug!(
+                                "Using cached content for {} (symlink check passed)",
+                                batch.display_path
+                            );
                             (cached_content.clone(), None)
                         }
                         Ok(_) => {
@@ -386,7 +389,10 @@ impl EditFileHandler {
                             continue;
                         }
                         Err(e) => {
-                            all_results.push(format!("Error verifying file {}: {}", batch.display_path, e));
+                            all_results.push(format!(
+                                "Error verifying file {}: {}",
+                                batch.display_path, e
+                            ));
                             total_failed += 1;
                             continue;
                         }
@@ -685,13 +691,10 @@ impl EditFileHandler {
                         // Note: previously written files were already unlocked after their atomic writes
                         for path in written_paths.iter().rev() {
                             if let Some(orig) = original_contents.get(path)
-                                && let Err(re) =
-                                    crate::storage::disk::atomic_write_file(path, orig)
+                                && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
                             {
-                                rollback_errors.push(format!(
-                                    "Failed to rollback {}: {}",
-                                    path, re
-                                ));
+                                rollback_errors
+                                    .push(format!("Failed to rollback {}: {}", path, re));
                             }
                         }
                         if !rollback_errors.is_empty() {
@@ -762,10 +765,8 @@ impl EditFileHandler {
                                     && let Err(re) =
                                         crate::storage::disk::atomic_write_file(path, orig)
                                 {
-                                    rollback_errors.push(format!(
-                                        "Failed to rollback {}: {}",
-                                        path, re
-                                    ));
+                                    rollback_errors
+                                        .push(format!("Failed to rollback {}: {}", path, re));
                                 }
                             }
                             if !rollback_errors.is_empty() {
@@ -832,10 +833,8 @@ impl EditFileHandler {
                                     && let Err(re) =
                                         crate::storage::disk::atomic_write_file(path, orig)
                                 {
-                                    rollback_errors.push(format!(
-                                        "Failed to rollback {}: {}",
-                                        path, re
-                                    ));
+                                    rollback_errors
+                                        .push(format!("Failed to rollback {}: {}", path, re));
                                 }
                             }
                             if !rollback_errors.is_empty() {
@@ -1100,7 +1099,13 @@ mod tests {
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().as_str().unwrap().contains("No files specified"));
+        assert!(
+            result
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("No files specified")
+        );
     }
 
     #[tokio::test]
@@ -1120,7 +1125,13 @@ mod tests {
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().as_str().unwrap().contains("No files specified"));
+        assert!(
+            result
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("No files specified")
+        );
     }
 
     #[tokio::test]
@@ -1151,7 +1162,11 @@ mod tests {
             )
         });
         let result = ToolHandler::execute(&handler, &ctx, stringified_files).await;
-        assert!(result.is_ok(), "stringified files array should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "stringified files array should parse: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -1187,7 +1202,11 @@ mod tests {
             }]
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok(), "multi-line anchor should be normalized: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "multi-line anchor should be normalized: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -1812,10 +1831,7 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(
-            result.is_ok(),
-            "Edit should succeed in yolo mode"
-        );
+        assert!(result.is_ok(), "Edit should succeed in yolo mode");
         let result_text = result.unwrap();
         let result_str = result_text.as_str().unwrap();
         assert!(

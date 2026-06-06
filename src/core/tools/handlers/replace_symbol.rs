@@ -61,9 +61,10 @@ impl ReplaceSymbolHandler {
                 consecutive_mistakes = state.consecutive_mistakes,
                 "replace_symbol: no replacements provided"
             );
-            return Err(ToolError::InvalidInput(
-                error_guidance::missing_parameter("replacements", state.consecutive_mistakes),
-            ));
+            return Err(ToolError::InvalidInput(error_guidance::missing_parameter(
+                "replacements",
+                state.consecutive_mistakes,
+            )));
         }
 
         let batches = group_replacements_by_file(replacements, workspace_root)?;
@@ -115,8 +116,16 @@ impl ReplaceSymbolHandler {
             let summaries: Vec<String> = file_results
                 .into_iter()
                 .map(|fr| {
-                    let symbol_list = fr.symbols.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ");
-                    format!("Successfully replaced symbols {} in {}.", symbol_list, fr.display_path)
+                    let symbol_list = fr
+                        .symbols
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "Successfully replaced symbols {} in {}.",
+                        symbol_list, fr.display_path
+                    )
                 })
                 .collect();
 
@@ -375,7 +384,11 @@ async fn process_batch(
             None => {
                 state.consecutive_mistakes += 1;
                 return Err(ToolError::ExecutionFailed(
-                    error_guidance::symbol_not_found(&r.symbol, &r.path, state.consecutive_mistakes),
+                    error_guidance::symbol_not_found(
+                        &r.symbol,
+                        &r.path,
+                        state.consecutive_mistakes,
+                    ),
                 ));
             }
         }
@@ -391,7 +404,11 @@ async fn process_batch(
                 resolved_replacements[i + 1].0.symbol.as_str(),
             ];
             return Err(ToolError::ExecutionFailed(
-                error_guidance::overlapping_replacements(&symbols, &batch.display_path, state.consecutive_mistakes),
+                error_guidance::overlapping_replacements(
+                    &symbols,
+                    &batch.display_path,
+                    state.consecutive_mistakes,
+                ),
             ));
         }
     }

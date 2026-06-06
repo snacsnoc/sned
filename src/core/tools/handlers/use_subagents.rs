@@ -79,18 +79,21 @@ impl UseSubagentsHandler {
         params
             .get("timeout")
             .and_then(|v| v.as_i64())
-            .map(|t| if t > 0 { t as u64 } else { DEFAULT_TIMEOUT_SECS })
+            .map(|t| {
+                if t > 0 {
+                    t as u64
+                } else {
+                    DEFAULT_TIMEOUT_SECS
+                }
+            })
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
     }
 
     fn parse_max_turns(params: &serde_json::Value) -> Option<u32> {
-        params.get("max_turns").and_then(|v| v.as_i64()).map(|t| {
-            if t > 0 {
-                t as u32
-            } else {
-                1
-            }
-        })
+        params
+            .get("max_turns")
+            .and_then(|v| v.as_i64())
+            .map(|t| if t > 0 { t as u32 } else { 1 })
     }
 
     fn parse_include_history(params: &serde_json::Value) -> bool {
@@ -126,9 +129,7 @@ impl UseSubagentsHandler {
             }
             collected.push_str(&line);
 
-            if emit_progress
-                && let Some(ref writer) = output_writer
-            {
+            if emit_progress && let Some(ref writer) = output_writer {
                 let formatted = format!("{} {}", stream_prefix, line);
                 if is_stderr {
                     writer.emit(crate::cli::output::OutputEvent::dim_yellow(formatted));
@@ -326,7 +327,11 @@ impl UseSubagentsHandler {
             && let Some(ref state) = task_state
         {
             let mut state = state.lock().await;
-            if let Some(pos) = state.running_command_pids.iter().position(|&p| p == child_pid) {
+            if let Some(pos) = state
+                .running_command_pids
+                .iter()
+                .position(|&p| p == child_pid)
+            {
                 state.running_command_pids.remove(pos);
                 tracing::debug!("Unregistered subagent PID {} after completion", child_pid);
             }
@@ -548,7 +553,8 @@ impl UseSubagentsHandler {
                         summary_lines.push(format!("{} SUCCEEDED (no output)", label));
                     }
                     total_tool_calls = total_tool_calls.saturating_add(result.tool_calls);
-                    total_cache_writes = total_cache_writes.saturating_add(result.cache_write_tokens);
+                    total_cache_writes =
+                        total_cache_writes.saturating_add(result.cache_write_tokens);
                     total_cache_reads = total_cache_reads.saturating_add(result.cache_read_tokens);
                     if result.context_tokens > max_context_tokens {
                         max_context_tokens = result.context_tokens;
@@ -596,9 +602,7 @@ impl UseSubagentsHandler {
             if max_context_tokens > 0 && max_context_window > 0 {
                 summary_lines.push(format!(
                     "Max context: {} / {} ({:.1}%)",
-                    max_context_tokens,
-                    max_context_window,
-                    max_context_pct
+                    max_context_tokens, max_context_window, max_context_pct
                 ));
             }
         }
@@ -631,14 +635,15 @@ impl UseSubagentsHandler {
             ..Default::default()
         };
         let state_arc: Arc<Mutex<TaskState>> = Arc::new(Mutex::new(initial_state));
-        let result = self.execute_with_workspace_root(
-            state_arc.clone(),
-            params,
-            workspace_root.as_path(),
-            false,
-            &output_writer,
-        )
-        .await;
+        let result = self
+            .execute_with_workspace_root(
+                state_arc.clone(),
+                params,
+                workspace_root.as_path(),
+                false,
+                &output_writer,
+            )
+            .await;
         // Sync back consecutive_mistakes for tests
         let guard = state_arc.lock().await;
         state.consecutive_mistakes = guard.consecutive_mistakes;
@@ -854,7 +859,15 @@ mod tests {
         assert_eq!(collected, "hello\nworld");
 
         let events = recorder.events.lock().unwrap();
-        assert!(events.iter().any(|event| event.contains("[subagent 1] hello")));
-        assert!(events.iter().any(|event| event.contains("[subagent 1] world")));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("[subagent 1] hello"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("[subagent 1] world"))
+        );
     }
 }

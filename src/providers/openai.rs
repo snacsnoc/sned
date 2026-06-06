@@ -34,7 +34,10 @@ pub struct OpenAiConfig {
 impl std::fmt::Debug for OpenAiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiConfig")
-            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field(
+                "api_key",
+                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+            )
             .field("base_url", &self.base_url)
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
@@ -116,12 +119,9 @@ impl OpenAiProvider {
 
     fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
         let model_id = &self.config.model_id;
-        let is_reasoning_family = ["o1", "o3", "o4", "gpt-5"]
-            .iter()
-            .any(|prefix| {
-                model_id.starts_with(prefix) || model_id.contains(&format!("/{}", prefix))
-            })
-            && !model_id.contains("chat");
+        let is_reasoning_family = ["o1", "o3", "o4", "gpt-5"].iter().any(|prefix| {
+            model_id.starts_with(prefix) || model_id.contains(&format!("/{}", prefix))
+        }) && !model_id.contains("chat");
 
         let mut messages = vec![];
 
@@ -712,8 +712,7 @@ async fn process_openai_sse_line(
                 // Cost for uncached input tokens
                 let input_cost = input_price * (uncached_input_tokens as f64 / 1_000_000.0);
                 // Cost for output tokens — completion_tokens already includes reasoning tokens
-                let output_cost =
-                    output_price * (usage.completion_tokens as f64 / 1_000_000.0);
+                let output_cost = output_price * (usage.completion_tokens as f64 / 1_000_000.0);
                 // Cost for cache reads (discounted)
                 let cache_read_cost = if cached_tokens > 0 {
                     cache_reads_price * (cached_tokens as f64 / 1_000_000.0)
@@ -1174,7 +1173,9 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{FunctionDefinition, MessageRole, SseLineBuffer, StorageMessage, ToolDefinition};
+    use crate::providers::{
+        FunctionDefinition, MessageRole, SseLineBuffer, StorageMessage, ToolDefinition,
+    };
 
     #[test]
     fn test_openai_config() {

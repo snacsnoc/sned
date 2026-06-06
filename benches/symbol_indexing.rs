@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use sned::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
+use std::hint::black_box;
 
 const RUST_SAMPLE: &str = r#"
 use std::collections::HashMap;
@@ -169,7 +169,8 @@ fn bench_symbol_lookup(c: &mut Criterion) {
 
     c.bench_function("symbol_lookup_by_name", |b| {
         b.iter(|| {
-            let result = service.get_symbols(black_box("Config"), Some(SymbolType::Definition), None);
+            let result =
+                service.get_symbols(black_box("Config"), Some(SymbolType::Definition), None);
             black_box(result);
         })
     });

@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use sha2::{Sha256, Digest};
 
 /// Global state and settings combined (mirrors TypeScript GlobalStateAndSettings)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -356,41 +356,42 @@ pub fn load_global_state_with_integrity() -> GlobalState {
         .join("data")
         .join("settings")
         .join("global_settings.json");
-    
+
     match fs::read_to_string(&path) {
         Ok(contents) => {
             // Parse checksum and data
             let mut lines = contents.lines();
             let checksum_line = lines.next().unwrap_or("");
-            
+
             // Check if file has checksum prefix (format: "sha256:<hash>")
-            let (expected_checksum, json_data) = if let Some(checksum) = checksum_line.strip_prefix("sha256:") {
-                let json_data = lines.collect::<Vec<_>>().join("\n");
-                (Some(checksum), json_data)
-            } else {
-                // Legacy format without checksum
-                (None, contents)
-            };
-            
+            let (expected_checksum, json_data) =
+                if let Some(checksum) = checksum_line.strip_prefix("sha256:") {
+                    let json_data = lines.collect::<Vec<_>>().join("\n");
+                    (Some(checksum), json_data)
+                } else {
+                    // Legacy format without checksum
+                    (None, contents)
+                };
+
             // Validate checksum if present
             if let Some(expected) = expected_checksum
                 && !validate_checksum(&json_data, expected)
             {
-                    tracing::warn!(
-                        file_path = %path.display(),
-                        "Global state checksum mismatch - file may be corrupted or tampered"
-                    );
-                    if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
-                        eprintln!(
-                            "WARNING: Global state integrity check failed at '{}'. \
+                tracing::warn!(
+                    file_path = %path.display(),
+                    "Global state checksum mismatch - file may be corrupted or tampered"
+                );
+                if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
+                    eprintln!(
+                        "WARNING: Global state integrity check failed at '{}'. \
                              Backed up to '{}' for investigation. Starting with default settings.",
-                            path.display(),
-                            backup_path.display()
-                        );
-                    }
-                    return GlobalState::default();
+                        path.display(),
+                        backup_path.display()
+                    );
                 }
-            
+                return GlobalState::default();
+            }
+
             // Parse JSON
             match serde_json::from_str(&json_data) {
                 Ok(state) => state,
@@ -414,7 +415,7 @@ pub fn load_global_state_with_integrity() -> GlobalState {
                     GlobalState::default()
                 }
             }
-        },
+        }
         Err(_) => GlobalState::default(),
     }
 }
@@ -425,16 +426,15 @@ pub fn save_global_state_with_integrity(state: &GlobalState) -> std::io::Result<
         .join("data")
         .join("settings")
         .join("global_settings.json");
-    
-    let json_data = serde_json::to_string_pretty(state)
-        .map_err(std::io::Error::other)?;
-    
+
+    let json_data = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
+
     let checksum = compute_checksum(&json_data);
     let contents = format!("sha256:{}\n{}", checksum, json_data);
-    
+
     // Use atomic write for safety
     crate::storage::disk::atomic_write_file(&path, &contents)?;
-    
+
     Ok(())
 }
 

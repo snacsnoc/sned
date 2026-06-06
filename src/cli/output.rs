@@ -238,7 +238,9 @@ pub fn format_timing_phases(
         if let Some(first_provider_chunk) = first_provider_chunk {
             lines.push(format!(
                 "[timing] request_to_first_chunk_us={}",
-                first_provider_chunk.duration_since(request_sent).as_micros()
+                first_provider_chunk
+                    .duration_since(request_sent)
+                    .as_micros()
             ));
 
             if let Some(first_reasoning_chunk) = first_reasoning_chunk {
@@ -271,7 +273,9 @@ pub fn format_timing_phases(
             if let Some(first_output_emit) = first_output_emit {
                 lines.push(format!(
                     "[timing] first_chunk_to_first_output_us={}",
-                    first_output_emit.duration_since(first_provider_chunk).as_micros()
+                    first_output_emit
+                        .duration_since(first_provider_chunk)
+                        .as_micros()
                 ));
 
                 if let Some(first_render) = first_render {
@@ -315,7 +319,10 @@ mod tests {
         assert_eq!(lines[0], "[timing] first_token_us=400000");
         assert_eq!(lines[1], "[timing] session_to_request_us=100000");
         assert_eq!(lines[2], "[timing] request_to_first_chunk_us=250000");
-        assert_eq!(lines[3], "[timing] first_chunk_to_first_reasoning_chunk_us=12000");
+        assert_eq!(
+            lines[3],
+            "[timing] first_chunk_to_first_reasoning_chunk_us=12000"
+        );
         assert_eq!(
             lines[4],
             "[timing] first_chunk_to_first_displayable_text_us=25000"

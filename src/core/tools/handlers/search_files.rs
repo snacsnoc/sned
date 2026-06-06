@@ -379,7 +379,7 @@ mod tests {
                 .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
                 .await
                 .unwrap();
-        
+
             // Count only lines with filename:linenum: pattern (actual rg output)
             line_count = result
                 .lines()

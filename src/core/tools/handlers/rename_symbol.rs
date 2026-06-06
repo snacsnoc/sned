@@ -78,9 +78,10 @@ impl RenameSymbolHandler {
                 consecutive_mistakes = state.consecutive_mistakes,
                 "rename_symbol: missing required parameter 'paths'"
             );
-            return Err(ToolError::InvalidInput(
-                error_guidance::missing_parameter("paths", state.consecutive_mistakes),
-            ));
+            return Err(ToolError::InvalidInput(error_guidance::missing_parameter(
+                "paths",
+                state.consecutive_mistakes,
+            )));
         }
         if existing_symbol.is_empty() {
             state.consecutive_mistakes += 1;
@@ -88,9 +89,10 @@ impl RenameSymbolHandler {
                 consecutive_mistakes = state.consecutive_mistakes,
                 "rename_symbol: missing required parameter 'existing_symbol'"
             );
-            return Err(ToolError::InvalidInput(
-                error_guidance::missing_parameter("existing_symbol", state.consecutive_mistakes),
-            ));
+            return Err(ToolError::InvalidInput(error_guidance::missing_parameter(
+                "existing_symbol",
+                state.consecutive_mistakes,
+            )));
         }
         if new_symbol.is_empty() {
             state.consecutive_mistakes += 1;
@@ -98,9 +100,10 @@ impl RenameSymbolHandler {
                 consecutive_mistakes = state.consecutive_mistakes,
                 "rename_symbol: missing required parameter 'new_symbol'"
             );
-            return Err(ToolError::InvalidInput(
-                error_guidance::missing_parameter("new_symbol", state.consecutive_mistakes),
-            ));
+            return Err(ToolError::InvalidInput(error_guidance::missing_parameter(
+                "new_symbol",
+                state.consecutive_mistakes,
+            )));
         }
 
         let expanded_paths = expand_paths(&paths, workspace_root).await?;

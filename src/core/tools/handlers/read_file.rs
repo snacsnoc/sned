@@ -65,7 +65,16 @@ impl ReadFileHandler {
     ) -> Vec<FileReadResult> {
         let read_futures: Vec<_> = paths
             .iter()
-            .map(|path| self.read_file(path, start_line, end_line, anchor_mgr, task_id, output_writer))
+            .map(|path| {
+                self.read_file(
+                    path,
+                    start_line,
+                    end_line,
+                    anchor_mgr,
+                    task_id,
+                    output_writer,
+                )
+            })
             .collect();
 
         // Buffer concurrent reads to prevent OOM on bulk operations (12 = reasonable parallelism)
@@ -137,12 +146,18 @@ impl ReadFileHandler {
 
         let (content_for_hash, sliced_lines, clamping_note, full_lines, range_start, range_end) =
             if start_line.is_some() || end_line.is_some() {
-                match self.read_lines_range(&canonical_path.to_string_lossy(), start_line, end_line).await {
+                match self
+                    .read_lines_range(&canonical_path.to_string_lossy(), start_line, end_line)
+                    .await
+                {
                     Ok(v) => v,
                     Err(e) => return e,
                 }
             } else if metadata.len() > max_file_read_size() as u64 {
-                match self.read_truncated(&canonical_path.to_string_lossy(), max_file_read_size()).await {
+                match self
+                    .read_truncated(&canonical_path.to_string_lossy(), max_file_read_size())
+                    .await
+                {
                     Ok((content, lines)) => {
                         let size_kb = metadata.len() / 1024;
                         let max_kb = max_file_read_size() as u64 / 1024;
@@ -161,7 +176,10 @@ impl ReadFileHandler {
                     Err(e) => return e,
                 }
             } else {
-                match self.read_full_file(&canonical_path.to_string_lossy(), output_writer).await {
+                match self
+                    .read_full_file(&canonical_path.to_string_lossy(), output_writer)
+                    .await
+                {
                     Ok((content, lines)) => (
                         content,
                         lines.clone(),
@@ -418,7 +436,7 @@ impl ReadFileHandler {
         max_bytes: usize,
     ) -> Result<(String, Vec<String>), FileReadResult> {
         use tokio::io::AsyncReadExt;
-        
+
         // SECURITY: Re-canonicalize path to catch symlink race (TOCTOU)
         let canonical_path = match tokio::fs::canonicalize(path).await {
             Ok(p) => p,
@@ -485,7 +503,14 @@ impl ReadFileHandler {
     ) -> Result<(Vec<String>, Vec<FileReadResult>), ToolError> {
         let (paths, start_line, end_line) = Self::parse_params(&params)?;
         let results = self
-            .read_files(paths.clone(), start_line, end_line, anchor_mgr, task_id, output_writer)
+            .read_files(
+                paths.clone(),
+                start_line,
+                end_line,
+                anchor_mgr,
+                task_id,
+                output_writer,
+            )
             .await;
         Ok((paths, results))
     }

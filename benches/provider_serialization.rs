@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use sned::providers::*;
+use std::hint::black_box;
 
 fn bench_message_serialization(c: &mut Criterion) {
     let message = StorageMessage {

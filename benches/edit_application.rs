@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use sned::core::file_editor::{Edit, EditExecutor, ResolvedEdit};
+use std::hint::black_box;
 
 fn create_resolved_edit(line_idx: usize, edit_type: &str, text: &str) -> ResolvedEdit {
     ResolvedEdit {

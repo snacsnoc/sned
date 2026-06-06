@@ -20,7 +20,10 @@ pub struct DeepSeekConfig {
 impl std::fmt::Debug for DeepSeekConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeepSeekConfig")
-            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field(
+                "api_key",
+                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+            )
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
             .finish()

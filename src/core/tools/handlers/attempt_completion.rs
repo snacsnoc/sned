@@ -24,10 +24,7 @@ impl AttemptCompletionHandler {
         state: &mut TaskState,
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
-        let result = params
-            .get("result")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
+        let result = params.get("result").and_then(|r| r.as_str()).unwrap_or("");
 
         // Reset consecutive mistakes on completion
         state.consecutive_mistakes = 0;
@@ -79,7 +76,8 @@ impl ToolHandler for AttemptCompletionHandler {
         } else {
             use crate::cli::output::OutputEvent;
             let completion_text = result.clone();
-            ctx.output_writer.emit(OutputEvent::Completion(completion_text));
+            ctx.output_writer
+                .emit(OutputEvent::Completion(completion_text));
         }
 
         Ok(serde_json::Value::String(result))

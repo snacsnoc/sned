@@ -1,9 +1,9 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use sned::core::context::context_manager::{
     TruncationKeep, get_next_truncation_range, get_truncated_messages,
 };
 use sned::providers::{MessageContent, MessageRole, StorageMessage};
+use std::hint::black_box;
 
 /// Create test messages with specified count
 fn create_messages(count: usize) -> Vec<StorageMessage> {

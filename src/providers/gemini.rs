@@ -38,7 +38,10 @@ pub struct GeminiConfig {
 impl std::fmt::Debug for GeminiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GeminiConfig")
-            .field("api_key", &format!("***REDACTED ({} chars)***", self.api_key.len()))
+            .field(
+                "api_key",
+                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+            )
             .field("base_url", &self.base_url)
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
@@ -481,7 +484,10 @@ async fn process_gemini_sse_line(
                         // complete args in one chunk rather than streaming deltas,
                         // but the size limit still applies.
                         let args_str = match fc.args.as_ref() {
-                            Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => fc.args.as_ref().unwrap().to_string(),
+                            Some(serde_json::Value::Object(_))
+                            | Some(serde_json::Value::Array(_)) => {
+                                fc.args.as_ref().unwrap().to_string()
+                            }
                             Some(_) => "{}".to_string(),
                             None => "{}".to_string(),
                         };
@@ -640,7 +646,10 @@ async fn finish_gemini_sse_to_chunks(
 ) {
     // Do not flush tool calls if the model was blocked or only emitted
     // recitation content. Those states are explicit terminal responses.
-    if !matches!(last_stop_reason.as_deref(), Some("RECITATION") | Some("BLOCKED")) {
+    if !matches!(
+        last_stop_reason.as_deref(),
+        Some("RECITATION") | Some("BLOCKED")
+    ) {
         // Flush accumulated tool calls on stream end.
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
             if !completed_tool_call_ids.contains(call_id) {
@@ -1629,7 +1638,10 @@ mod tests {
         )
         .await;
 
-        assert!(rx.try_recv().is_err(), "BLOCKED finish should not emit tool calls");
+        assert!(
+            rx.try_recv().is_err(),
+            "BLOCKED finish should not emit tool calls"
+        );
         assert!(completed_tool_call_ids.is_empty());
     }
 
