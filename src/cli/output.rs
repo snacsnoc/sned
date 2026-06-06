@@ -20,6 +20,8 @@ pub enum OutputEvent {
     Line(Line<'static>),
     /// Raw ANSI escape sequences (for PTY output, etc.).
     RawAnsi(String),
+    /// Task completion message rendered as a dedicated Block widget.
+    Completion(String),
 }
 
 impl OutputEvent {
@@ -157,6 +159,9 @@ impl OutputWriter for StderrOutputWriter {
             }
             OutputEvent::RawAnsi(s) => {
                 eprint!("{}", s);
+            }
+            OutputEvent::Completion(result) => {
+                eprintln!("\n[sned] Task Completed: {}", result);
             }
         }
     }

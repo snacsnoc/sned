@@ -15,6 +15,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -390,6 +391,12 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 for line in lines {
                     app.push_output(line);
                 }
+            }
+            OutputEvent::Completion(result) => {
+                app.push_completion_line(Line::from(Span::styled(
+                    format!("🚀 Task Completed: {}", result),
+                    Style::default().fg(theme::PROMPT_FG),
+                )));
             }
         }
     }

@@ -162,6 +162,8 @@ pub struct App {
     pub model_picker_results: Vec<crate::cli::slash_commands::ModelPickerEntry>,
     /// Currently selected index in model picker.
     pub model_picker_selected: usize,
+    /// Completion box lines rendered as a dedicated Block widget.
+    pub completion_lines: VecDeque<Line<'static>>,
 }
 
 impl App {
@@ -237,6 +239,7 @@ impl App {
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
+            completion_lines: VecDeque::new(),
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
         }
@@ -279,6 +282,12 @@ impl App {
         }
     }
 
+    /// Push a completion line to the completion buffer.
+    pub fn push_completion_line(&mut self, line: Line<'static>) {
+        self.needs_redraw = true;
+        self.completion_lines.push_back(line);
+    }
+
     /// Push a plain text line.
     pub fn push_plain(&mut self, text: impl Into<String>) {
         self.push_output(Line::from(text.into()));
@@ -316,6 +325,7 @@ impl App {
     pub fn clear_output(&mut self) {
         self.needs_redraw = true;
         self.output_lines.clear();
+        self.completion_lines.clear();
         self.cached_visual_rows = 0;
         self.cached_wrap_width = Some(self.last_wrap_width());
     }

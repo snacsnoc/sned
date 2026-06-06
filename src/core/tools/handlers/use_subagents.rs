@@ -708,6 +708,7 @@ mod tests {
             let text = match event {
                 OutputEvent::Line(line) => line.to_string(),
                 OutputEvent::RawAnsi(text) => text,
+                OutputEvent::Completion(_) => String::new(),
             };
             self.events.lock().unwrap().push(text);
         }

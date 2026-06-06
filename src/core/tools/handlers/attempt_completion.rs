@@ -80,17 +80,8 @@ impl ToolHandler for AttemptCompletionHandler {
             );
         } else {
             use crate::cli::output::OutputEvent;
-            use ratatui::style::{Color, Style};
-            let term_width = crossterm::terminal::size()
-                .map(|(cols, _)| cols as usize)
-                .unwrap_or(80);
-
-            let boxed =
-                crate::cli::text_utils::draw_completion_box("Task Completed", &result, term_width);
-            ctx.output_writer.emit(OutputEvent::styled(
-                format!("\n{}", boxed),
-                Style::default().fg(Color::Green),
-            ));
+            let completion_text = result.clone();
+            ctx.output_writer.emit(OutputEvent::Completion(completion_text));
         }
 
         Ok(serde_json::Value::String(result))
