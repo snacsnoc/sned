@@ -4,20 +4,20 @@
 //! and disables ANSI codes when the target stream is not a TTY.
 
 use std::io::IsTerminal;
-use std::sync::OnceLock;
 
 fn env_colors_disabled() -> bool {
     std::env::var("NO_COLOR").is_ok() || std::env::var("TERM").is_ok_and(|t| t == "dumb")
 }
 
+// Re-evaluate on every call so tests that mutate NO_COLOR mid-process take
+// effect immediately. The cost is one std::env::var + one is_terminal() per
+// call, which is negligible for human-scale output.
 fn stdout_colors_disabled() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| env_colors_disabled() || !std::io::stdout().is_terminal())
+    env_colors_disabled() || !std::io::stdout().is_terminal()
 }
 
 fn stderr_colors_disabled() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| env_colors_disabled() || !std::io::stderr().is_terminal())
+    env_colors_disabled() || !std::io::stderr().is_terminal()
 }
 
 /// ANSI color/style codes.
