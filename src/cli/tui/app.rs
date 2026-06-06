@@ -167,6 +167,8 @@ pub struct App {
     pub model_picker_selected: usize,
     /// Completion box lines rendered as a dedicated Block widget.
     pub completion_lines: VecDeque<Line<'static>>,
+    /// Cached completion row count, valid when cached_wrap_width matches.
+    pub cached_completion_rows: usize,
 }
 
 impl App {
@@ -243,6 +245,7 @@ impl App {
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
             completion_lines: VecDeque::new(),
+            cached_completion_rows: 0,
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
         }
@@ -289,6 +292,10 @@ impl App {
     pub fn push_completion_line(&mut self, line: Line<'static>) {
         self.needs_redraw = true;
         self.completion_lines.push_back(line);
+        // Invalidate the visual-row cache so cached_completion_rows is
+        // recomputed on the next render. Without this, the completion box
+        // keeps its stale height (just borders) and the text is clipped.
+        self.cached_wrap_width = None;
     }
 
     /// Push a plain text line.
@@ -589,6 +596,7 @@ impl App {
             .map(|line| Self::line_visual_rows(line, wrap_width))
             .sum();
         self.cached_visual_rows = output_rows.saturating_add(completion_rows);
+        self.cached_completion_rows = completion_rows;
         self.cached_wrap_width = Some(wrap_width);
     }
 
@@ -659,9 +667,7 @@ impl App {
     }
 
     fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
-        let input_title = if self.agent_busy
-            && !crate::core::approval::is_approval_prompt_active()
-        {
+        let input_title = if self.agent_busy {
             if self.reasoning_active {
                 format!(" {} Reasoning... ", self.spinner_char())
             } else {
@@ -726,15 +732,56 @@ impl App {
     }
 
     fn render_output(&mut self, frame: &mut Frame, output_area: Rect) {
+        // When completion box is present, split the output_area vertically so the
+        // completion block occupies its own region below the main output instead
+        // of overlapping the last rows of the transcript.
+        let has_completion = !self.completion_lines.is_empty();
+        // Rebuild the visual-row cache up front so completion_height reflects
+        // the current completion_lines. Without this, a push_completion_line
+        // that invalidates cached_wrap_width still leaves the height math
+        // using the stale cached_completion_rows from the prior render.
+        let wrap_width = Self::content_wrap_width(output_area.width as usize);
+        let _ = self.total_visual_rows(wrap_width);
+        // +2 accounts for top and bottom borders of the completion Block widget.
+        let completion_height: u16 = if has_completion {
+            ((self.cached_completion_rows + 2) as u16).min(output_area.height as u16)
+        } else {
+            0
+        };
+        let main_output_area = if has_completion {
+            Rect {
+                x: output_area.x,
+                y: output_area.y,
+                width: output_area.width,
+                height: output_area.height.saturating_sub(completion_height),
+            }
+        } else {
+            output_area
+        };
+        let completion_area = if has_completion {
+            Rect {
+                x: output_area.x,
+                y: output_area.y + main_output_area.height,
+                width: output_area.width,
+                height: completion_height,
+            }
+        } else {
+            output_area
+        };
+
         // Output pane with themed border and padding
-        let visible_height = output_area.height as usize;
+        let visible_height = main_output_area.height as usize;
         // Content height excludes border (1 line top + 1 line bottom)
         let content_height = visible_height.saturating_sub(2);
-        self.last_content_width = output_area.width as usize;
+        self.last_content_width = main_output_area.width as usize;
         self.last_content_height = content_height;
-        let wrap_width = Self::content_wrap_width(output_area.width as usize);
         let total_rows = self.total_visual_rows(wrap_width);
-        let scroll_y = self.resolved_scroll_y_for(total_rows, content_height);
+        // The output Paragraph only renders output_lines; completion_lines are
+        // drawn as a separate Block below the main output. Scroll math must
+        // therefore be based on output_rows alone, or the bottom of the
+        // output gets hidden behind the completion overlay.
+        let output_rows = total_rows.saturating_sub(self.cached_completion_rows);
+        let scroll_y = self.resolved_scroll_y_for(output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y as usize, content_height);
 
@@ -755,25 +802,14 @@ impl App {
                     theme::border_block(" sned ")
                         .padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
                 );
-            frame.render_widget(output, output_area);
+            frame.render_widget(output, main_output_area);
         }
 
-        // Render completion box as a distinct block at the bottom of the output area.
-        if !self.completion_lines.is_empty() {
-            let completion_rows = self
-                .completion_lines
-                .iter()
-                .map(|line| Self::line_visual_rows(line, wrap_width))
-                .sum::<usize>();
-            let completion_height = (completion_rows.max(1) as u16).min(content_height as u16);
-            let completion_area = Rect {
-                x: output_area.x,
-                y: output_area.y + output_area.height.saturating_sub(completion_height + 1),
-                width: output_area.width,
-                height: completion_height,
-            };
+        // Render completion box as a distinct block below the main output area.
+        if has_completion {
             let completion_lines: Vec<Line<'static>> = self.completion_lines.iter().cloned().collect();
             let completion = Paragraph::new(completion_lines)
+                .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -1658,6 +1694,49 @@ mod tests {
         assert!(
             !rendered.contains("Reasoning..."),
             "should not show 'Reasoning...' when reasoning is not active, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_completion_line_renders_in_buffer() {
+        // Regression guard: push_completion_line must invalidate the visual
+        // row cache so the completion box height reflects the new line.
+        // A prior bug left cached_wrap_width stale, so completion_height
+        // collapsed to 2 (just borders) and the text was clipped.
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.force_bottom();
+        // Push some output first so cached_wrap_width is populated.
+        app.push_plain("line 1");
+        app.push_plain("line 2");
+        // Trigger a render to populate cached_wrap_width.
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial render should succeed");
+
+        // Now push a completion line and render again.
+        app.push_completion_line(Line::from(Span::styled(
+            "MARKER_COMPLETION_TEXT",
+            Style::default().fg(theme::PROMPT_FG),
+        )));
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("post-completion render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("MARKER_COMPLETION_TEXT"),
+            "completion line should appear in rendered buffer; got:\n{rendered}"
         );
     }
 }

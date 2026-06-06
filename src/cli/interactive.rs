@@ -667,6 +667,8 @@ async fn handle_key_event(
             if let Some(sender) = take_followup_sender(task_id) {
                 let text = app.get_input_with_expanded_pastes();
                 app.push_user_message(&text, output_writer);
+                app.completion_lines.clear();
+                app.cached_completion_rows = 0;
                 let _ = sender.send(text);
                 app.input = App::new_textarea(Vec::new());
             }
@@ -704,6 +706,10 @@ async fn handle_key_event(
                 app.push_turn_separator();
             }
             app.push_user_message(&text, output_writer);
+            // Stale completion box from a prior attempt_completion would otherwise
+            // persist above the input and skew the scroll math. Clear it on new turn.
+            app.completion_lines.clear();
+            app.cached_completion_rows = 0;
             // Clear textarea and paste tracking
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
