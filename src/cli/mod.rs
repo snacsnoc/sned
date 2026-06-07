@@ -44,20 +44,20 @@ where
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if event.metadata().target() == "json_output" {
-            struct MessageVisitor(String);
-            impl tracing::field::Visit for MessageVisitor {
-                fn record_debug(
-                    &mut self,
-                    _field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0 = format!("{:?}", value);
+            if event.metadata().target() == "json_output" {
+                struct MessageVisitor(String);
+                impl tracing::field::Visit for MessageVisitor {
+                    fn record_debug(
+                        &mut self,
+                        _field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0 = serde_json::Value::String(format!("{:?}", value)).to_string();
+                    }
+                    fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+                        self.0 = value.to_string();
+                    }
                 }
-                fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
-                    self.0 = value.to_string();
-                }
-            }
             let mut visitor = MessageVisitor(String::new());
             event.record(&mut visitor);
             let mut stdout = std::io::stdout().lock();
@@ -696,8 +696,15 @@ pub(crate) fn create_provider(
 
     let provider: Arc<dyn crate::providers::Provider> = match provider_name {
         "anthropic" => {
-            let api_key =
-                std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "dummy".to_string());
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ANTHROPIC_API_KEY is not set. \n\
+                         Set the environment variable or pass --api-key."
+                    )
+                })?;
             // Use stored model ID default and base URL if not specified
             let state = crate::storage::global_state::load_global_state();
             let default_model = model_id
@@ -1302,7 +1309,13 @@ pub fn run() -> anyhow::Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
         }
-        Some(Command::Doctor) => run_doctor(),
+        Some(Command::Doctor) => match run_doctor() {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("doctor failed: {}", e);
+                std::process::exit(crate::exit_codes::EXIT_ERROR)
+            }
+        },
         None => {
             let stdin_input = read_piped_stdin()?;
             let stdin_was_piped = stdin_input.is_some();
@@ -2111,6 +2124,84 @@ mod tests {
             assert!(result.is_ok(), "Expected Ok when ANTHROPIC_API_KEY is set");
             // SAFETY: cleanup under mutex lock
             unsafe { env::remove_var("ANTHROPIC_API_KEY") };
+        }
+    }
+
+    #[test]
+    fn test_create_provider_anthropic_bails_when_key_unset() {
+        use std::env;
+        {
+            let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let all_provider_vars = vec![
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "OPENROUTER_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "QWEN_API_KEY",
+                "MINIMAX_API_KEY",
+                "MINIMAX_CN_API_KEY",
+                "MISTRAL_API_KEY",
+                "MOONSHOT_API_KEY",
+                "HF_TOKEN",
+                "ZAI_API_KEY",
+                "CEREBRAS_API_KEY",
+                "AI_GATEWAY_API_KEY",
+                "TOGETHER_API_KEY",
+                "FIREWORKS_API_KEY",
+                "NEBIUS_API_KEY",
+                "OPENAI_API_BASE",
+                "OPENCODE_API_KEY",
+                "KIMI_API_KEY",
+                "OPENAI_COMPATIBLE_CUSTOM_KEY",
+            ];
+            for var in &all_provider_vars {
+                // SAFETY: clearing under mutex lock
+                unsafe { env::remove_var(var) };
+            }
+            let task_opts = TaskOptions {
+                act: false,
+                plan: false,
+                yolo: false,
+                auto_approve_all: false,
+                timeout: None,
+                model: None,
+                provider: Some("anthropic".to_string()),
+                base_url: None,
+                api_key: None,
+                verbose: false,
+                cwd: None,
+                config: None,
+                thinking: None,
+                reasoning_effort: None,
+                max_consecutive_mistakes: None,
+                json: false,
+                double_check_completion: false,
+                auto_condense: true,
+                no_token_display: false,
+                subagents: false,
+                is_subagent: false,
+                user_agent: None,
+                hooks_dir: None,
+                export: None,
+                image: vec![],
+                track_changes: false,
+                max_context_turns: None,
+                max_tokens: None,
+                debug: false,
+            };
+            let result = create_provider(&task_opts);
+            assert!(
+                result.is_err(),
+                "Expected Err when ANTHROPIC_API_KEY is unset (not a dummy-key Ok)"
+            );
+            let err = result.err().unwrap();
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("ANTHROPIC_API_KEY"),
+                "Error should mention ANTHROPIC_API_KEY, got: {}",
+                msg
+            );
         }
     }
 

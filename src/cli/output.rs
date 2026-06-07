@@ -176,19 +176,40 @@ impl OutputWriter for StderrOutputWriter {
 /// The channel is unbounded; the render loop drains it on each frame tick.
 pub struct ChannelOutputWriter {
     tx: mpsc::Sender<OutputEvent>,
+    dropped_count: std::sync::atomic::AtomicU64,
 }
 
 impl ChannelOutputWriter {
     /// Create a new ChannelOutputWriter with a bounded channel.
     pub fn new(tx: mpsc::Sender<OutputEvent>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            dropped_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Returns the number of events dropped due to a full channel.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
-        // Use try_send to avoid blocking; drop the result since we don't need it
-        let _ = self.tx.try_send(event);
+        if self.tx.try_send(event).is_err() {
+            let count = self
+                .dropped_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 100 == 0 {
+                tracing::warn!(
+                    dropped = count + 1,
+                    "Output channel full; TUI render loop is falling behind. \
+                     {} events dropped so far.",
+                    count + 1
+                );
+            }
+        }
     }
 
     fn flush(&self) {

@@ -262,17 +262,11 @@ pub fn run_migration(source_dir: &str, dry_run: bool) -> anyhow::Result<()> {
     let destination_dir = std::env::var("SNED_DIR")
         .ok()
         .or_else(|| dirs::config_dir().map(|p| p.join("sned").to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "~/.config/sned".to_string());
-
-    let destination_dir = if destination_dir.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            destination_dir.replacen('~', &home.to_string_lossy(), 1)
-        } else {
-            destination_dir
-        }
-    } else {
-        destination_dir
-    };
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".config/sned").to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".config/sned".to_string())
+        });
 
     let destination_path = PathBuf::from(&destination_dir);
 
@@ -803,11 +797,10 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
 }
 
 /// Run diagnostic checks and report status
-pub fn run_doctor() -> anyhow::Result<()> {
+pub fn run_doctor() -> anyhow::Result<i32> {
     use std::env;
-    use std::fs;
 
-    let mut has_fail = false;
+    let has_fail = false;
     let mut has_warn = false;
 
     println!("sned Diagnostic Report");
@@ -855,45 +848,34 @@ pub fn run_doctor() -> anyhow::Result<()> {
 
     // Check 2: Config file
     println!("\n[Configuration]");
-    let config_path = dirs::config_dir()
-        .map(|mut p| {
-            p.push("sned");
-            p.push("config.json");
-            p
+    let config_path = env::var("SNED_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            dirs::config_dir().map(|mut p| {
+                p.push("sned");
+                p
+            })
         })
         .or_else(|| {
             env::var("HOME").ok().map(|p| {
                 let mut path = PathBuf::from(p);
-                path.push(".config/sned/config.json");
+                path.push(".sned");
                 path
             })
         });
 
     if let Some(config_path) = config_path {
         if config_path.exists() {
-            match fs::read_to_string(&config_path) {
-                Ok(content) => {
-                    if serde_json::from_str::<serde_json::Value>(&content).is_ok() {
-                        println!("  [OK] Config file found and parseable");
-                        println!("       {}", config_path.display());
-                    } else {
-                        println!("  [FAIL] Config file is not valid JSON");
-                        println!("         {}", config_path.display());
-                        has_fail = true;
-                    }
-                }
-                Err(e) => {
-                    println!("  [FAIL] Cannot read config file: {}", e);
-                    has_fail = true;
-                }
-            }
+            println!("  [OK] Sned storage directory found");
+            println!("       {}", config_path.display());
         } else {
-            println!("  [WARN] Config file not found");
+            println!("  [WARN] Sned storage directory not found (will be created on first use)");
             println!("         {}", config_path.display());
             has_warn = true;
         }
     } else {
-        println!("  [WARN] Cannot determine config directory");
+        println!("  [WARN] Cannot determine Sned storage directory");
         has_warn = true;
     }
 
@@ -961,13 +943,13 @@ pub fn run_doctor() -> anyhow::Result<()> {
     println!("\n{}", "=".repeat(50));
     if has_fail {
         println!("Status: FAIL (some checks failed)");
-        std::process::exit(crate::exit_codes::EXIT_ERROR);
+        Ok(crate::exit_codes::EXIT_ERROR)
     } else if has_warn {
         println!("Status: WARN (some warnings, but functional)");
-        std::process::exit(crate::exit_codes::EXIT_CONFIG);
+        Ok(crate::exit_codes::EXIT_CONFIG)
     } else {
         println!("Status: OK (all checks passed)");
-        Ok(())
+        Ok(0)
     }
 }
 

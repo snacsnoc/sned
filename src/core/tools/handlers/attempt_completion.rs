@@ -72,6 +72,7 @@ impl ToolHandler for AttemptCompletionHandler {
                     "type": "completion",
                     "result": result
                 })
+                .to_string()
             );
         } else {
             use crate::cli::output::OutputEvent;

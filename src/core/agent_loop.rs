@@ -1598,6 +1598,7 @@ impl AgentLoop {
                                 "type": "text",
                                 "text": text_chunk.text
                             })
+                            .to_string()
                         );
                     } else {
                         // Check for thinking tags and suppress content between them
@@ -1750,6 +1751,7 @@ impl AgentLoop {
                                 "signature": reasoning_chunk.signature,
                                 "redacted_data": reasoning_chunk.redacted_data,
                             })
+                            .to_string()
                         );
                     } else {
                         // Show compact thinking indicator instead of raw reasoning dump.
@@ -1806,6 +1808,7 @@ impl AgentLoop {
                                 "stop_reason": usage_chunk.stop_reason,
                                 "id": usage_chunk.id,
                             })
+                            .to_string()
                         );
                     }
                     // Store ApiReqInfo for context management in next turn.
@@ -1944,6 +1947,7 @@ impl AgentLoop {
                                 "id": tool_chunk.id,
                                 "signature": tool_chunk.signature,
                             })
+                            .to_string()
                         );
                     }
                     // Allow partial tool call deltas with arguments even when name is missing.
@@ -3185,7 +3189,7 @@ impl AgentLoop {
                 response_text.as_deref(),
             )
         {
-            tracing::info!(target: "json_output", "{}", event);
+            tracing::info!(target: "json_output", "{}", event.to_string());
         }
 
         // Clear file content cache after each turn (cross-call coordination within a single turn)

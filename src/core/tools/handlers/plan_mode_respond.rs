@@ -82,6 +82,7 @@ impl PlanModeRespondHandler {
                     "type": "plan_response",
                     "response": response
                 })
+                .to_string()
             );
         } else {
             use crate::cli::output::OutputEvent;
