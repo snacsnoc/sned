@@ -856,6 +856,12 @@ impl EditFileHandler {
             }
         }
 
+        // After successful write, mark all written files as requiring re-read
+        // so the model's cached anchors cannot become stale silently.
+        for item in &write_items {
+            Self::mark_must_reread(state, &item.absolute_path);
+        }
+
         // Phase 5: Run post-save diagnostics in batch for all successfully edited files
         // This is more efficient than per-file diagnostics when any_pre_errors is true
         let mut post_diagnostics_by_file: std::collections::HashMap<
@@ -2441,5 +2447,92 @@ edition = "2021"
         );
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_successful_edit_marks_must_reread() {
+        use tempfile::tempdir;
+
+        let _guard = TEST_MUTEX.lock().await;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let raw_content = "line 1\nline 2\nline 3\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+
+        let prep_anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = prep_anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &lines,
+            Some("test-task"),
+        );
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let anchor_l1 = format!("{}§line 1", anchors[0]);
+        let anchor_l2 = format!("{}§line 2", anchors[1]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor_l1,
+                    "edit_type": "replace",
+                    "text": "replaced line 1"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok(), "First edit should succeed: {:?}", result);
+
+        {
+            let state_guard = state.lock().await;
+            let abs_path = file_path
+                .canonicalize()
+                .unwrap_or_else(|_| file_path.clone())
+                .to_string_lossy()
+                .to_string();
+            assert!(
+                state_guard.must_reread_before_edit.contains(&abs_path),
+                "must_reread_before_edit should contain the edited file path after successful edit, got: {:?}",
+                state_guard.must_reread_before_edit
+            );
+        }
+
+        let params2 = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor_l2,
+                    "edit_type": "replace",
+                    "text": "replaced line 2"
+                }]
+            }]
+        });
+
+        let result2 = ToolHandler::execute(&handler, &ctx, params2).await;
+        assert!(
+            result2.is_err(),
+            "Second edit on same file should fail with reread_required_error"
+        );
+        let err_msg = format!("{}", result2.unwrap_err());
+        assert!(
+            err_msg.contains("must re-read"),
+            "Error should mention re-read required, got: {}",
+            err_msg
+        );
     }
 }
