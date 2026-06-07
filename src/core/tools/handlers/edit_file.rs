@@ -73,7 +73,9 @@ impl EditFileHandler {
 
         for file in files {
             let path = file.get("path").and_then(|p| p.as_str()).ok_or_else(|| {
-                ToolError::InvalidInput(error_guidance::missing_parameter("path", 0))
+                ToolError::InvalidInput(
+                    "edit_file requires a 'path' key in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }".to_string()
+                )
             })?;
 
             let edits_raw = file
@@ -100,7 +102,13 @@ impl EditFileHandler {
                                 error_guidance::missing_parameter("anchor", 0)
                             ))
                         })?;
-                let anchor = anchor_raw.lines().next().unwrap_or("").trim();
+                if anchor_raw.contains('\n') {
+                    return Err(ToolError::InvalidInput(format!(
+                        "Multi-line anchor not supported in file '{}'. Anchors must be a single line. Use the exact line content from read_file output.",
+                        path
+                    )));
+                }
+                let anchor = anchor_raw.trim();
 
                 let edit_type = edit_raw
                     .get("edit_type")
@@ -112,7 +120,13 @@ impl EditFileHandler {
                 let end_anchor = edit_raw
                     .get("end_anchor")
                     .and_then(|e| e.as_str())
-                    .map(|s| s.lines().next().unwrap_or("").trim().to_string());
+                    .and_then(|s| {
+                        if s.contains('\n') {
+                            None
+                        } else {
+                            Some(s.trim().to_string())
+                        }
+                    });
 
                 let text = edit_raw.get("text").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -1105,28 +1119,9 @@ impl EditFileHandler {
             all_results.push(formatted);
         }
 
-        // Track consecutive mistakes: increment when any edits failed,
-        // only reset when ALL edits succeeded (no failures at all).
-        let total_mistakes = total_failed + total_overlap;
-        if total_mistakes > 0 {
-            state.consecutive_mistakes += 1;
-            if !json_output {
-                use crate::cli::output::OutputEvent;
-                let overlap_note = if total_overlap > 0 {
-                    format!(" ({} edit(s) overlapped)", total_overlap)
-                } else {
-                    String::new()
-                };
-                output_writer.emit(OutputEvent::plain(format!(
-                    "[edit_file] {} edit(s) failed{} (consecutive_mistakes={})",
-                    total_mistakes,
-                    overlap_note,
-                    state.consecutive_mistakes
-                )));
-            }
-        } else if total_applied > 0 {
-            state.consecutive_mistakes = 0;
-        }
+        // Note: consecutive_mistakes tracking is handled centrally in agent_loop.rs.
+        // edit_file emits diagnostics via output_writer but does not mutate the counter
+        // to avoid double-counting when a single edit_file call has multiple file failures.
 
         let summary = if total_overlap > 0 {
             format!(
@@ -1185,16 +1180,8 @@ impl ToolHandler for EditFileHandler {
             )
             .await;
 
-        if result.is_err() {
-            state.consecutive_mistakes += 1;
-            if !ctx.json_output {
-                use crate::cli::output::OutputEvent;
-                ctx.output_writer.emit(OutputEvent::plain(format!(
-                    "[edit_file] Handler error, incrementing consecutive_mistakes={}",
-                    state.consecutive_mistakes
-                )));
-            }
-        }
+        // Note: consecutive_mistakes tracking is handled centrally in agent_loop.rs.
+        // edit_file does not mutate the counter to avoid double-counting.
 
         result.map(serde_json::Value::String)
     }
@@ -1450,7 +1437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_file_normalizes_multiline_anchors() {
+    async fn test_edit_file_rejects_multiline_anchors() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
@@ -1483,9 +1470,15 @@ mod tests {
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
-            result.is_ok(),
-            "multi-line anchor should be normalized: {:?}",
-            result.err()
+            result.is_err(),
+            "multi-line anchor should be rejected, not normalized: {:?}",
+            result.ok()
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Multi-line anchor"),
+            "Error should mention multi-line anchor rejection: {}",
+            err_msg
         );
     }
 
@@ -1570,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_consecutive_mistakes_increments_on_handler_error() {
+    async fn test_consecutive_mistakes_not_changed_on_handler_error() {
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
@@ -1595,18 +1588,17 @@ mod tests {
             }]
         });
 
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        let mistakes = state.lock().await.consecutive_mistakes;
-        assert!(
-            mistakes >= 1,
-            "consecutive_mistakes should increment on file-not-found edit failure, got {}, result: {:?}",
-            mistakes,
-            result
+        let initial = state.lock().await.consecutive_mistakes;
+        let _result = ToolHandler::execute(&handler, &ctx, params).await;
+        let final_val = state.lock().await.consecutive_mistakes;
+        assert_eq!(
+            final_val, initial,
+            "consecutive_mistakes should NOT be changed by edit_file handler (tracked centrally in agent_loop.rs)"
         );
     }
 
     #[tokio::test]
-    async fn test_consecutive_mistakes_increments_on_failure() {
+    async fn test_consecutive_mistakes_not_changed_on_failure() {
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
@@ -1632,17 +1624,17 @@ mod tests {
             }]
         });
 
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok());
+        let initial = state.lock().await.consecutive_mistakes;
+        let _result = ToolHandler::execute(&handler, &ctx, params).await;
         assert_eq!(
             state.lock().await.consecutive_mistakes,
-            1,
-            "consecutive_mistakes should increment when edits fail"
+            initial,
+            "consecutive_mistakes should NOT be changed by edit_file handler (tracked centrally in agent_loop.rs)"
         );
     }
 
     #[tokio::test]
-    async fn test_consecutive_mistakes_resets_on_success() {
+    async fn test_consecutive_mistakes_not_changed_on_success() {
         let _guard = TEST_MUTEX.lock().await;
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
@@ -1696,10 +1688,11 @@ mod tests {
         assert!(result.is_ok());
         let result_str = result.unwrap().as_str().unwrap().to_string();
         println!("Edit result: {}", result_str);
+        // consecutive_mistakes is tracked centrally in agent_loop.rs, not by edit_file handler
         assert_eq!(
             state.lock().await.consecutive_mistakes,
-            0,
-            "consecutive_mistakes should reset on successful edit. Result: {}",
+            5,
+            "consecutive_mistakes should NOT be changed by edit_file handler. Result: {}",
             result_str
         );
 
