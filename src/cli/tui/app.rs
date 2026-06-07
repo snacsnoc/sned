@@ -806,6 +806,7 @@ impl App {
         // Render the full transcript. Cached row counts keep scroll math cheap,
         // but slicing the render buffer can clip wrapped prompt text.
         {
+            frame.render_widget(Clear, main_output_area);
             let output = Paragraph::new(
                 self.output_lines
                     .iter()
@@ -824,6 +825,7 @@ impl App {
 
         // Render completion box as a distinct block below the main output area.
         if has_completion {
+            frame.render_widget(Clear, completion_area);
             let completion_lines: Vec<Line<'static>> =
                 self.completion_lines.iter().cloned().collect();
             let completion = Paragraph::new(completion_lines)
