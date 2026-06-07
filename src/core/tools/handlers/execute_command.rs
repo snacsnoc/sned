@@ -176,9 +176,6 @@ impl ExecuteCommandHandler {
         use tokio::process::Command;
         use tokio::time::timeout;
 
-        #[cfg(unix)]
-        use libc;
-
         let mut combined_output = String::new();
         let mut all_filtered_names: Vec<String> = Vec::new();
 
@@ -340,14 +337,11 @@ impl ExecuteCommandHandler {
                             // Kill the process group on cancellation
                             #[cfg(unix)]
                             {
-                                // Check liveness first to avoid signaling recycled PIDs
-                                // SAFETY: -child_pid is a process group ID from fork();
-                                // signal 0/SIGTERM/SIGKILL are valid constants
-                                if unsafe { libc::kill(-child_pid, 0) } == 0 {
-                                    let _ = unsafe { libc::kill(-child_pid, libc::SIGTERM) };
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
-                                    let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
-                                }
+                                crate::core::cancellation::terminate_process_group(
+                                    child_pid,
+                                    Duration::from_millis(100),
+                                )
+                                .await;
                             }
                             #[cfg(not(unix))]
                             {
@@ -430,12 +424,11 @@ impl ExecuteCommandHandler {
                                 // Kill the entire process group to ensure grandchildren are terminated
                                 #[cfg(unix)]
                                 {
-                                    // Check liveness first to avoid signaling recycled PIDs
-                                    // SAFETY: -child_pid is a process group ID from fork();
-                                    // signal 0/SIGKILL are valid constants
-                                    if unsafe { libc::kill(-child_pid, 0) } == 0 {
-                                        let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
-                                    }
+                                    crate::core::cancellation::terminate_process_group(
+                                        child_pid,
+                                        Duration::from_millis(100),
+                                    )
+                                    .await;
                                 }
                                 #[cfg(not(unix))]
                                 {
@@ -707,12 +700,11 @@ impl ExecuteCommandHandler {
                 #[cfg(unix)]
                 {
                     if child_pid > 0 {
-                        // Check liveness first to avoid signaling recycled PIDs
-                        // SAFETY: -child_pid is a process group ID from fork();
-                        // signal 0/SIGKILL are valid constants
-                        if unsafe { libc::kill(-child_pid, 0) } == 0 {
-                            let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
-                        }
+                        crate::core::cancellation::terminate_process_group(
+                            child_pid,
+                            Duration::from_millis(100),
+                        )
+                        .await;
                     }
                 }
                 #[cfg(not(unix))]

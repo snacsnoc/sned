@@ -6,8 +6,6 @@ use crate::core::agent_loop::TaskState;
 use crate::core::hooks::{HookData, HookInput, HookManager, HookName, TaskCancelData};
 use crate::storage::disk;
 use crate::storage::state_manager::StateManager;
-#[cfg(unix)]
-use libc;
 use ratatui::crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
 use ratatui::crossterm::execute;
 use std::sync::Arc;
@@ -30,6 +28,34 @@ pub(crate) fn restore_terminal_state() {
     );
     ratatui::restore();
     TERMINAL_INITIALIZED.store(false, Ordering::Release);
+}
+
+/// Terminate a process group with SIGTERM, wait `grace`, then SIGKILL
+/// any survivors. Uses negative PID to signal the entire group, matching
+/// how sned spawns child processes (process_group(0)).
+///
+/// Safety: `pid` must be a process group ID previously registered by sned
+/// (via `child.id()` of a spawned command) or stored in
+/// `TaskState::running_command_pids`. Each signal is gated by a
+/// `kill(pgid, 0)` liveness check to avoid signaling a recycled PGID.
+/// Safe to call multiple times and from multiple sites; normalizes
+/// SIGTERM→wait→SIGKILL escalation across cancellation, timeout, and
+/// subagent paths.
+#[cfg(unix)]
+pub(crate) async fn terminate_process_group(pid: i32, grace: Duration) {
+    use libc::{SIGKILL, SIGTERM};
+    let pgid: i32 = -pid;
+    if unsafe { libc::kill(pgid, 0) } != 0 {
+        return;
+    }
+    let _ = unsafe { libc::kill(pgid, SIGTERM) };
+    tracing::debug!("Sent SIGTERM to PGID -{}", pid);
+    tokio::time::sleep(grace).await;
+    if unsafe { libc::kill(pgid, 0) } != 0 {
+        return;
+    }
+    let _ = unsafe { libc::kill(pgid, SIGKILL) };
+    tracing::debug!("Sent SIGKILL to PGID -{}", pid);
 }
 
 /// Handles task cancellation and cleanup.
@@ -90,32 +116,8 @@ impl CancellationHandler {
                 );
                 #[cfg(unix)]
                 {
-                    use libc;
-
-                    // Send SIGTERM to all processes first (graceful shutdown)
                     for pid in &pids_to_kill {
-                        // Check liveness first to avoid signaling recycled PIDs
-                        // SAFETY: pid is from /proc parsing, checked for liveness with kill(pid, 0).
-                        // SIGTERM is a valid signal constant.
-                        // Use negative PID to kill entire process group (commands spawned with process_group(0))
-                        if unsafe { libc::kill(-*pid, 0) } == 0 {
-                            let _ = unsafe { libc::kill(-*pid, libc::SIGTERM) };
-                            tracing::debug!("Sent SIGTERM to PGID -{}", pid);
-                        }
-                    }
-
-                    // Single global wait for all processes to handle SIGTERM
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                    // Then SIGKILL any remaining processes
-                    for pid in &pids_to_kill {
-                        // SAFETY: pid is from /proc parsing, checked for liveness with kill(pid, 0).
-                        // SIGKILL is a valid signal constant.
-                        // Use negative PID to kill entire process group
-                        if unsafe { libc::kill(-*pid, 0) } == 0 {
-                            let _ = unsafe { libc::kill(-*pid, libc::SIGKILL) };
-                            tracing::debug!("Sent SIGKILL to PGID -{}", pid);
-                        }
+                        terminate_process_group(*pid, Duration::from_millis(100)).await;
                     }
                 }
                 #[cfg(not(unix))]
@@ -458,5 +460,11 @@ mod tests {
             signal_action(&mut last_signal, now + Duration::from_secs(3)),
             SignalAction::Cancel
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_terminate_process_group_noop_for_dead_pid() {
+        terminate_process_group(0x7fffffff, Duration::from_millis(10)).await;
     }
 }

@@ -297,9 +297,11 @@ impl UseSubagentsHandler {
             Err(_) => {
                 #[cfg(unix)]
                 {
-                    if unsafe { libc::kill(-child_pid, 0) } == 0 {
-                        let _ = unsafe { libc::kill(-child_pid, libc::SIGKILL) };
-                    }
+                    crate::core::cancellation::terminate_process_group(
+                        child_pid,
+                        std::time::Duration::from_millis(100),
+                    )
+                    .await;
                 }
                 #[cfg(not(unix))]
                 {

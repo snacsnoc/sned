@@ -563,18 +563,12 @@ async fn cancel_agent(
         #[cfg(unix)]
         {
             let pids = state.running_command_pids.clone();
-
             for pid in &pids {
-                if unsafe { libc::kill(-*pid, 0) } == 0 {
-                    let _ = unsafe { libc::kill(-*pid, libc::SIGTERM) };
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            for pid in &pids {
-                if unsafe { libc::kill(-*pid, 0) } == 0 {
-                    let _ = unsafe { libc::kill(-*pid, libc::SIGKILL) };
-                }
+                crate::core::cancellation::terminate_process_group(
+                    *pid,
+                    Duration::from_millis(100),
+                )
+                .await;
             }
         }
 
