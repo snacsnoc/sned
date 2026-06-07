@@ -521,6 +521,13 @@ impl ReadFileHandler {
                 let path = std::path::Path::new(path_str);
                 state.file_context_tracker.track_file_read(path);
                 state.must_reread_before_edit.remove(path_str);
+                // Track consecutive reads for read-loop detection.
+                // If the same file is read 3+ times in a row with no edit, warn the model.
+                let count = state
+                    .consecutive_reads
+                    .entry(path_str.clone())
+                    .or_insert(0);
+                *count += 1;
             }
         }
     }
@@ -537,6 +544,31 @@ impl ReadFileHandler {
             .execute_with_results(params, anchor_mgr, task_id, output_writer)
             .await?;
         Self::track_read_files(state, &paths, &results);
+
+        // Read-loop detection: if a file was read 3+ times in a row with no
+        // intervening edit, surface a hint so the model doesn't loop forever.
+        if let Some(writer) = output_writer {
+            for path_str in &paths {
+                let count = state
+                    .consecutive_reads
+                    .get(path_str)
+                    .copied()
+                    .unwrap_or(0);
+                if count >= 3 {
+                    use crate::cli::output::OutputEvent;
+                    use ratatui::style::{Color, Style};
+                    writer.emit(OutputEvent::styled(
+                        format!(
+                            "⚠ {} has been read {} times consecutively with no edit. \
+                             If you have the anchors you need, call edit_file now.",
+                            path_str, count
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            }
+        }
+
         Ok(Self::format_results(results))
     }
 
@@ -1152,5 +1184,43 @@ mod tests {
             !line_50_anchor.is_empty(),
             "line 50 anchor should be tracked even though it wasn't in the visible range"
         );
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_reads_counter_increments_and_resets() {
+        use crate::core::agent_types::TaskState;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "hello").unwrap();
+        temp_file.flush().unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let mut state = TaskState::default();
+        let path_str = temp_file.path().to_string_lossy().to_string();
+
+        // Read the file 3 times in a row (no intervening edit).
+        for i in 1..=3 {
+            let params = serde_json::json!({
+                "paths": [temp_file.path().to_str().unwrap()]
+            });
+            let _ = handler
+                .execute(
+                    &mut state,
+                    params,
+                    &anchor_mgr,
+                    Some("test-task"),
+                    None,
+                )
+                .await
+                .expect("read should succeed");
+
+            let count = state
+                .consecutive_reads
+                .get(&path_str)
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(count, i, "consecutive_reads should be {} after {} reads", i, i);
+        }
     }
 }

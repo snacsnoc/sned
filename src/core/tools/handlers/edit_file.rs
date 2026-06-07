@@ -239,6 +239,9 @@ impl EditFileHandler {
     fn mark_must_reread(state: &mut TaskState, path: &str) {
         state.must_reread_before_edit.insert(path.to_string());
         state.file_content_cache.pop(path);
+        // Clear the read-loop counter — a successful re-read after this point
+        // should not compound with prior reads.
+        state.consecutive_reads.remove(path);
     }
 
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
@@ -435,9 +438,50 @@ impl EditFileHandler {
                 .file_context_tracker
                 .track_file_read(Path::new(&batch.absolute_path));
 
+            // Stale-anchor preflight: capture the tracked anchor set BEFORE
+            // reconcile mutates it, so we can detect anchors the model is
+            // reusing from a previous read after the file changed.
+            let pre_reconcile_anchors = anchor_mgr.get_anchors(&batch.absolute_path, task_id);
+
             // Compute line hashes via AnchorStateManager
             let lines = crate::core::file_editor::split_content_lines(&content);
             let anchors = anchor_mgr.reconcile(&batch.absolute_path, &lines, task_id);
+
+            // If the model submitted anchors that exist in the OLD tracked
+            // state but not in the NEW one, the file has changed since its
+            // last read. Surface a clearer error than the generic
+            // "anchor not found" and force a re-read.
+            if let Some(ref old) = pre_reconcile_anchors {
+                let new_set: std::collections::HashSet<&str> =
+                    anchors.iter().map(|s| s.as_str()).collect();
+                let mut stale_anchors: Vec<String> = Vec::new();
+                for edit in &batch.edits {
+                    let anchor_raw = edit.anchor.lines().next().unwrap_or("").trim();
+                    if let Some((name, _)) = anchor_raw.split_once(ANCHOR_DELIMITER) {
+                        let name = name.trim();
+                        if old.iter().any(|a| a == name) && !new_set.contains(name) {
+                            stale_anchors.push(anchor_raw.to_string());
+                        }
+                    }
+                }
+                if !stale_anchors.is_empty() {
+                    Self::mark_must_reread(state, &batch.absolute_path);
+                    let mut msg = String::from(
+                        "Stale anchor detected: this anchor is from a previous read_file call. \
+                         The file has changed since then. Call read_file to refresh anchors.\n\n",
+                    );
+                    msg.push_str("Stale anchors:\n");
+                    for a in &stale_anchors {
+                        msg.push_str(&format!("  - {}\n", a));
+                    }
+                    all_results.push(format!(
+                        "Error preparing edits for {}: {}",
+                        batch.display_path, msg
+                    ));
+                    total_failed += batch.edits.len();
+                    continue;
+                }
+            }
 
             // Prepare edits
             let mut prepared = match processor.prepare_edits(
@@ -860,6 +904,33 @@ impl EditFileHandler {
         // so the model's cached anchors cannot become stale silently.
         for item in &write_items {
             Self::mark_must_reread(state, &item.absolute_path);
+            // Clear the read-loop counter for this file — an edit breaks the loop.
+            state.consecutive_reads.remove(&item.absolute_path);
+        }
+
+        // Emit a hint so the model knows it must re-read before the next edit.
+        // Without this, the model often tries to reuse anchors from a prior read_file
+        // call and hits Hash anchor validation errors, triggering read/edit loops.
+        if !write_items.is_empty() && total_applied > 0 && !json_output {
+            use crate::cli::output::OutputEvent;
+            use ratatui::style::{Color, Style};
+            let written_paths: Vec<String> = write_items
+                .iter()
+                .map(|item| {
+                    std::path::Path::new(&item.absolute_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| item.absolute_path.clone())
+                })
+                .collect();
+            output_writer.emit(OutputEvent::styled(
+                format!(
+                    "✓ {} file(s) changed: {}. Call read_file before the next edit on these files to refresh anchors.",
+                    written_paths.len(),
+                    written_paths.join(", ")
+                ),
+                Style::default().fg(Color::Cyan),
+            ));
         }
 
         // Phase 5: Run post-save diagnostics in batch for all successfully edited files
@@ -2533,6 +2604,93 @@ edition = "2021"
             err_msg.contains("must re-read"),
             "Error should mention re-read required, got: {}",
             err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_anchor_preflight_detects_previous_read() {
+        use tempfile::tempdir;
+
+        let _guard = TEST_MUTEX.lock().await;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let raw_content = "alpha\nbeta\ngamma\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+
+        // Simulate a previous read by reconciling the file once
+        // to populate the anchor state.
+        let anchor_mgr = AnchorStateManager::new();
+        let initial_lines: Vec<String> =
+            raw_content.lines().map(|s| s.to_string()).collect();
+        let initial_anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &initial_lines,
+            Some("test-task"),
+        );
+
+        // Now externally change the file (e.g., user edit or another agent).
+        let new_content = "alpha\nBETA-CHANGED\ngamma\ndelta\n";
+        std::fs::write(&file_path, new_content).unwrap();
+
+        // The model tries to edit using an anchor from the PREVIOUS read
+        // (e.g., "beta" — but the file no longer has "beta", it has
+        // "BETA-CHANGED"). The preflight should catch this and return a
+        // clearer "stale anchor" error rather than a generic "not found".
+        let stale_anchor = format!("{}§beta", initial_anchors[1]);
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": stale_anchor,
+                    "edit_type": "replace",
+                    "text": "new beta"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok(), "Execute should return Ok with error in body: {:?}", result);
+        let body = result
+            .unwrap()
+            .as_str()
+            .map(String::from)
+            .unwrap_or_default();
+        assert!(
+            body.contains("Stale anchor detected"),
+            "Result should mention stale anchor detection, got: {}",
+            body
+        );
+        assert!(
+            body.contains("previous read_file"),
+            "Result should explain the anchor is from a previous read, got: {}",
+            body
+        );
+
+        // must_reread_before_edit should now contain the file path
+        let state_guard = state.lock().await;
+        let abs_path = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.clone())
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            state_guard.must_reread_before_edit.contains(&abs_path),
+            "must_reread_before_edit should be set after stale anchor detection"
         );
     }
 }
