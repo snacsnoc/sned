@@ -549,7 +549,7 @@ async fn spawn_agent_task(
 async fn cancel_agent(
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    agent_done: &Arc<tokio::sync::Notify>,
+    _agent_done: &Arc<tokio::sync::Notify>,
     agent_busy: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     if let Some(sh) = state_handle.lock().await.as_ref() {
@@ -574,11 +574,6 @@ async fn cancel_agent(
 
     if let Some(task) = agent_task.lock().await.take() {
         task.abort();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            agent_done.notified().await
-        })
-        .await
-        .ok();
     }
 
     // Reset unconditionally: covers both abort (epilogue never runs) and
@@ -3414,6 +3409,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_key_event_allows_shutdown_submit_while_agent_busy() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.input = App::new_textarea(vec!["/exit".to_string()]);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(matches!(action, Some(Action::Submit(text)) if text == "/exit"));
+        assert!(app.input.lines().join("\n").is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_plan_replace_is_rejected_while_plan_is_running() -> anyhow::Result<()> {
         use crate::cli::slash_commands::{CliOnlyCommand, PlanSubcommand};
         use crate::core::plan_state::{PlanState, PlanStepStatus};
@@ -4014,5 +4035,31 @@ mod tests {
             "agent_busy atomic must be reset to false after cancel_agent, \
              otherwise subsequent prompts are enqueued forever"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_agent_returns_without_waiting_for_agent_done() {
+        use std::time::Duration;
+        use tokio::task::JoinHandle;
+
+        let task_slot: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        *task_slot.lock().await = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>> =
+            Arc::new(Mutex::new(None));
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            cancel_agent(&state_handle, &task_slot, &agent_done, &agent_busy),
+        )
+        .await
+        .expect("cancel_agent should not wait for agent_done notification")
+        .unwrap();
+
+        assert!(!agent_busy.load(Ordering::Relaxed));
     }
 }
