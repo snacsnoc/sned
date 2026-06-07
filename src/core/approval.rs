@@ -35,9 +35,12 @@ pub fn approval_test_guard() -> std::sync::MutexGuard<'static, ()> {
     // Recover from poisoning: a sibling test may have panicked while holding
     // the lock. The poisoned state carries no data we care about — global
     // approval state is reset per-test — so we proceed to the next test.
-    APPROVAL_TEST_MUTEX
+    let guard = APPROVAL_TEST_MUTEX
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(|e| e.into_inner());
+    set_approval_prompt_active(false);
+    clear_approval_prompt_scroll();
+    guard
 }
 
 const SAFE_BASE_COMMANDS: &[&str] = &[
@@ -1578,6 +1581,7 @@ mod tests {
         // SECURITY TEST (F-01): Non-interactive stdin (piped input, CI, scripts)
         // should DENY tool execution by default to prevent automated attacks.
         // User must explicitly pass --yolo or --auto-approve-all for non-interactive use.
+        let _env_lock = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
         let output_writer: crate::cli::output::OutputWriterArc =
             std::sync::Arc::new(crate::cli::output::StderrOutputWriter);
