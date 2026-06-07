@@ -1511,12 +1511,26 @@ impl AgentLoop {
         let stream_handle = tokio::spawn(async move {
             let mut stream = stream;
             use tokio_stream::StreamExt;
-            while let Some(chunk) = stream.next().await {
-                if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
-                if tx.send(chunk).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    chunk = stream.next() => {
+                        match chunk {
+                            Some(c) => {
+                                if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
+                                    break;
+                                }
+                                if tx.send(c).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                    }
                 }
             }
         });
