@@ -1031,28 +1031,29 @@ async fn process_anthropic_event(
         },
         AnthropicStreamEvent::ContentBlockStop => {
             if !last_tool_call.id.is_empty() && !last_tool_call.name.is_empty() {
-                let validated_args = crate::providers::validate_tool_call_args(
+                if let Some(validated_args) = crate::providers::validate_tool_call_args(
                     &last_tool_call.arguments,
                     "Anthropic",
                     "at content_block_stop",
-                );
-                try_send_chunk(
-                    tx,
-                    ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                        tool_call: ApiStreamToolCall {
-                            call_id: Some(last_tool_call.id.clone()),
-                            function: ApiStreamToolCallFunction {
-                                id: Some(last_tool_call.id.clone()),
-                                name: Some(last_tool_call.name.clone()),
-                                arguments: Some(validated_args),
+                ) {
+                    try_send_chunk(
+                        tx,
+                        ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                            tool_call: ApiStreamToolCall {
+                                call_id: Some(last_tool_call.id.clone()),
+                                function: ApiStreamToolCallFunction {
+                                    id: Some(last_tool_call.id.clone()),
+                                    name: Some(last_tool_call.name.clone()),
+                                    arguments: Some(validated_args),
+                                },
+                                signature: None,
                             },
+                            id: None,
                             signature: None,
-                        },
-                        id: None,
-                        signature: None,
-                    }),
-                    "tool_calls",
-                );
+                        }),
+                        "tool_calls",
+                    );
+                }
             }
             last_tool_call.id.clear();
             last_tool_call.name.clear();

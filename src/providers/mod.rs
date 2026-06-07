@@ -686,13 +686,15 @@ impl Default for SseLineBuffer {
 }
 
 /// Validate and optionally repair tool call arguments JSON.
-/// Returns valid JSON string. Falls back to "{}" if repair fails.
-pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -> String {
+/// Returns `Some(valid_json)` on success, or `None` when the JSON is
+/// unrepairable — the caller should skip the tool call rather than
+/// executing it with empty/semantically-wrong arguments.
+pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -> Option<String> {
     if args.is_empty() {
-        return "{}".to_string();
+        return Some("{}".to_string());
     }
     match serde_json::from_str::<serde_json::Value>(args) {
-        Ok(_) => args.to_string(),
+        Ok(_) => Some(args.to_string()),
         Err(e) => {
             tracing::warn!(
                 "{} tool call arguments JSON invalid {} ({}), attempting repair. args_preview={}",
@@ -705,14 +707,14 @@ pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -
             let repaired = repair_json_args(args);
 
             if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
-                repaired
+                Some(repaired)
             } else {
                 tracing::warn!(
-                    "{} tool call arguments JSON repair failed {}, using empty object",
+                    "{} tool call arguments JSON repair failed {}, skipping tool call",
                     provider_name,
                     context
                 );
-                "{}".to_string()
+                None
             }
         }
     }
@@ -1128,14 +1130,14 @@ mod tests {
     fn test_validate_tool_call_args_ignores_braces_in_strings() {
         let args = r#"{"text": "hello {world}"}"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        assert_eq!(result, args);
+        assert_eq!(result, Some(args.to_string()));
     }
 
     #[test]
     fn test_validate_tool_call_args_repairs_missing_close_brace() {
-        let args = r#"{"path": "/tmp/test""#;
+        let args = r#"{"path": "/tmp/test"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test");
     }
 
@@ -1143,7 +1145,7 @@ mod tests {
     fn test_validate_tool_call_args_handles_braces_inside_string_values() {
         let args = r#"{"pattern": "{name} placeholder", "count": 5"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["pattern"], "{name} placeholder");
         assert_eq!(parsed["count"], 5);
     }
@@ -1152,25 +1154,25 @@ mod tests {
     fn test_validate_tool_call_args_fallback_on_unrepairable() {
         let args = r#"totally not json"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        assert_eq!(result, "{}");
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_validate_tool_call_args_empty_returns_empty_object() {
-        assert_eq!(validate_tool_call_args("", "test", "unit"), "{}");
+        assert_eq!(validate_tool_call_args("", "test", "unit"), Some("{}".to_string()));
     }
 
     #[test]
     fn test_validate_tool_call_args_valid_json_passes_through() {
         let args = r#"{"a": 1, "b": [2, 3]}"#;
-        assert_eq!(validate_tool_call_args(args, "test", "unit"), args);
+        assert_eq!(validate_tool_call_args(args, "test", "unit"), Some(args.to_string()));
     }
 
     #[test]
     fn test_validate_tool_call_args_repairs_unterminated_string() {
         let args = r#"{"path": "/tmp/test"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test");
     }
 
@@ -1178,7 +1180,7 @@ mod tests {
     fn test_validate_tool_call_args_strips_prefix_garbage() {
         let args = r#"garbage{"path": "/tmp/test"}"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test");
     }
 
@@ -1186,14 +1188,14 @@ mod tests {
     fn test_validate_tool_call_args_repairs_unterminated_string_with_close_brace() {
         let args = r#"{"path": "/tmp/test}"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["path"], "/tmp/test}");
     }
 
     #[test]
     fn test_validate_tool_call_args_just_open_brace_repairs() {
         let result = validate_tool_call_args("{", "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
         assert!(parsed.is_object());
     }
 }
