@@ -12,7 +12,7 @@ fn env_colors_disabled() -> bool {
 // Re-evaluate on every call so tests that mutate NO_COLOR mid-process take
 // effect immediately. The cost is one std::env::var + one is_terminal() per
 // call, which is negligible for human-scale output.
-fn stdout_colors_disabled() -> bool {
+pub fn stdout_colors_disabled() -> bool {
     env_colors_disabled() || !std::io::stdout().is_terminal()
 }
 

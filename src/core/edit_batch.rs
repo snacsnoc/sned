@@ -17,7 +17,6 @@ pub struct FileEditBatch {
     pub absolute_path: String,
     pub display_path: String,
     pub edits: Vec<Edit>,
-    pub was_stringified: bool,
 }
 
 /// Result of preparing edits for a file.
@@ -104,7 +103,6 @@ impl BatchProcessor {
                         absolute_path: absolute_path.clone(),
                         display_path: display_path.clone(),
                         edits: edits.clone(),
-                        was_stringified: false,
                     });
                 }
             }
@@ -233,13 +231,18 @@ impl BatchProcessor {
 
     /// Generates diff for a batch.
     pub fn generate_diff(&self, display_path: &str, prepared: &PreparedEdits) -> String {
-        let mut diff = format!(
-            "{}{} Update File: {}{}\n\n",
-            crate::cli::colors::style::BOLD,
-            crate::cli::colors::style::CYAN,
-            crate::cli::colors::file_path(display_path),
-            crate::cli::colors::style::RESET
-        );
+        let mut diff = String::new();
+        if !crate::cli::colors::stdout_colors_disabled() {
+            diff.push_str(&format!(
+                "{}{} Update File: {}{}\n\n",
+                crate::cli::colors::style::BOLD,
+                crate::cli::colors::style::CYAN,
+                crate::cli::colors::file_path(display_path),
+                crate::cli::colors::style::RESET
+            ));
+        } else {
+            diff.push_str(&format!("Update File: {}\n\n", display_path));
+        }
 
         for applied in &prepared.applied_edits {
             let edit_type = &applied.edit.edit_type;
@@ -264,25 +267,38 @@ impl BatchProcessor {
                 replace_lines = applied.edit.text.lines().map(|s| s.to_string()).collect();
             }
 
-            diff.push_str(&format!(
-                "{}<<<<<<< SEARCH{}\n",
-                crate::cli::colors::style::RED,
-                crate::cli::colors::style::RESET
-            ));
+            let colored = !crate::cli::colors::stdout_colors_disabled();
+            if colored {
+                diff.push_str(&format!(
+                    "{}<<<<<<< SEARCH{}\n",
+                    crate::cli::colors::style::RED,
+                    crate::cli::colors::style::RESET
+                ));
+            } else {
+                diff.push_str("<<<<<<< SEARCH\n");
+            }
             for line in &search_lines {
                 diff.push_str(&crate::cli::colors::diff_removal(line));
                 diff.push('\n');
             }
-            diff.push_str(&format!("{}=======\n", crate::cli::colors::style::GREEN));
+            if colored {
+                diff.push_str(&format!("{}=======\n", crate::cli::colors::style::GREEN));
+            } else {
+                diff.push_str("=======\n");
+            }
             for line in &replace_lines {
                 diff.push_str(&crate::cli::colors::diff_addition(line));
                 diff.push('\n');
             }
-            diff.push_str(&format!(
-                "{}>>>>>>> REPLACE{}\n\n",
-                crate::cli::colors::style::DIM,
-                crate::cli::colors::style::RESET
-            ));
+            if colored {
+                diff.push_str(&format!(
+                    "{}>>>>>>> REPLACE{}\n\n",
+                    crate::cli::colors::style::DIM,
+                    crate::cli::colors::style::RESET
+                ));
+            } else {
+                diff.push_str(">>>>>>> REPLACE\n\n");
+            }
         }
 
         diff
@@ -295,7 +311,6 @@ impl BatchProcessor {
         prepared: &PreparedEdits,
         final_lines: &[String],
         final_hashes: &[String],
-        was_stringified: bool,
         diagnostics: Option<&DiagnosticsResult>,
         user_edits: Option<&str>,
         auto_formatting_edits: Option<&str>,
@@ -400,10 +415,6 @@ impl BatchProcessor {
                 String::new()
             }
         );
-
-        if was_stringified {
-            results.push("Note: You provided the 'files' parameter as a stringified JSON array. While this was successfully parsed and applied, you should provide it as a native JSON array in the future.".to_string());
-        }
 
         // Add diagnostics feedback
         if let Some(diag) = diagnostics {
@@ -737,7 +748,6 @@ mod tests {
             &prepared,
             &final_lines,
             &final_hashes,
-            false,
             None,
             None,
             None,
@@ -784,7 +794,6 @@ mod tests {
             &prepared,
             &final_lines,
             &final_hashes,
-            false,
             None,
             None,
             None,
@@ -832,7 +841,6 @@ mod tests {
             &prepared,
             &final_lines,
             &final_hashes,
-            false,
             Some(&diagnostics),
             None,
             None,
@@ -876,7 +884,6 @@ mod tests {
             &prepared,
             &final_lines,
             &final_hashes,
-            false,
             None,
             Some(user_edits),
             None,
@@ -919,7 +926,6 @@ mod tests {
             &prepared,
             &final_lines,
             &final_hashes,
-            false,
             None,
             None,
             Some(auto_fmt),

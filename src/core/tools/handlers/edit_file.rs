@@ -1061,7 +1061,6 @@ impl EditFileHandler {
                 &file_result.prepared,
                 &file_result.final_lines,
                 &file_result.final_hashes,
-                false,
                 diagnostics.as_ref(),
                 None,
                 None,
