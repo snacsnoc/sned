@@ -116,8 +116,7 @@ impl PromptBuilder {
               - Keep responses short and CLI-friendly.\n\
               - Use tools instead of long prose whenever possible.\n\
               - If no tools are needed or available, answer directly in text and keep it brief.\n\
-              - When the task is complete, return the result through the required completion tool.\n\
-              - Mention `/reportbug` only when the user is reporting product issues or asking how to report one.\n\n\
+              - When the task is complete, return the result through the required completion tool.\n\n\
               CODE GENERATION\n\
               - Only create the files and abstractions explicitly requested.\n\
               - Do not add docstrings unless requested.\n\

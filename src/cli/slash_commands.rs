@@ -11,7 +11,6 @@ pub enum SlashCommand {
     NewTask,
     Smol,
     NewRule,
-    ReportBug,
     ExplainChanges,
     SkillCommand { name: String },
     WorkflowCommand { name: String },
@@ -23,7 +22,6 @@ impl SlashCommand {
             "newtask" => Some(SlashCommand::NewTask),
             "compact" => Some(SlashCommand::Smol),
             "newrule" => Some(SlashCommand::NewRule),
-            "reportbug" => Some(SlashCommand::ReportBug),
             "explain-changes" => Some(SlashCommand::ExplainChanges),
             _ => None,
         }
@@ -79,7 +77,6 @@ impl SlashCommand {
             SlashCommand::NewTask => NEW_TASK_INSTRUCTION,
             SlashCommand::Smol => CONDENSE_INSTRUCTION,
             SlashCommand::NewRule => NEW_RULE_INSTRUCTION,
-            SlashCommand::ReportBug => REPORT_BUG_INSTRUCTION,
             SlashCommand::ExplainChanges => EXPLAIN_CHANGES_INSTRUCTION,
             SlashCommand::SkillCommand { .. } => "",
             SlashCommand::WorkflowCommand { .. } => "",
@@ -768,13 +765,6 @@ pub fn build_slash_command_entries(
             requires_args: true,
         },
         SlashCommandEntry {
-            name: "reportbug".to_string(),
-            description: "Report a bug in sned".to_string(),
-            aliases: vec!["bug".to_string()],
-            category: SlashCommandCategory::Agent,
-            requires_args: false,
-        },
-        SlashCommandEntry {
             name: "explain-changes".to_string(),
             description: "Explain recent code changes".to_string(),
             aliases: vec!["explain".to_string()],
@@ -1053,14 +1043,6 @@ pub fn format_help_text() -> String {
         "  {}{}{}  - {}Create a new Snad rule based on your conversation{}\n",
         style::CYAN,
         "/newrule",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Submit a bug report to GitHub{}\n",
-        style::CYAN,
-        "/reportbug",
         style::DIM,
         style::RESET,
         style::DIM
@@ -1459,15 +1441,6 @@ Use when:
   - You want to codify a pattern from your current work
   - Creating project-specific conventions
   - Documenting recurring workflows"#
-        }
-
-        "reportbug" => {
-            r#"Submits a bug report to GitHub.
-
-Use when:
-  - You encounter unexpected behavior
-  - Found a regression or crash
-  - Want to report a feature request"#
         }
 
         "explain-changes" => {
@@ -2108,20 +2081,6 @@ Below is the user's input when they indicated that they wanted to create a new p
 </explicit_instructions>
 "#;
 
-const REPORT_BUG_INSTRUCTION: &str = r#"<explicit_instructions type="report_bug">
-The user has explicitly asked you to help them submit a bug to the Sned github page (you MUST now help them with this irrespective of what your conversation up to this point in time was). To do so you will use the report_bug tool which is defined below. However, you must first ensure that you have collected all required information to fill in all the parameters for the tool call. If any of the the required information is apparent through your previous conversation with the user, you can suggest how to fill in those entries. However you should NOT assume you know what the issue about unless it's clear.
-Otherwise, you should converse with the user until you are able to gather all the required details. When conversing with the user, make sure you ask for/reference all required information/fields. When referencing the fields, use human friendly versions like "Steps to reproduce" rather than "steps_to_reproduce". Only then should you use the report_bug tool call.
-The report_bug tool can be used in either of the PLAN or ACT modes.
-
-The report_bug tool call is defined below:
-
-Description:
-Your task is to fill in all of the required fields for a issue/bug report on github. You should attempt to get the user to be as verbose as possible with their description of the bug/issue they encountered. Still, it's okay, when the user is unaware of some of the details, to set those fields as "N/A".
-
-Below is the user's input when they indicated that they wanted to submit a Github issue.
-</explicit_instructions>
-"#;
-
 const EXPLAIN_CHANGES_INSTRUCTION: &str = r#"<explicit_instructions type="explain_changes">
 The user has explicitly asked you to explain the changes you have made to the code. You should provide a clear, detailed explanation of what changes were made, why they were made, and how they affect the codebase. Include specific file names, function names, and line numbers where relevant.
 
@@ -2243,12 +2202,6 @@ mod tests {
     fn test_process_newrule_command() {
         let result = process_slash_command("/newrule");
         assert!(result.contains("<explicit_instructions type=\"new_rule\">"));
-    }
-
-    #[test]
-    fn test_process_reportbug_command() {
-        let result = process_slash_command("/reportbug");
-        assert!(result.contains("<explicit_instructions type=\"report_bug\">"));
     }
 
     #[test]
