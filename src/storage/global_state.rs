@@ -299,13 +299,6 @@ fn load_global_state_legacy() -> GlobalState {
             Err(error) => {
                 // Create backup of corrupted file before discarding
                 if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
-                    eprintln!(
-                        "WARNING: Corrupted global state at '{}'. \
-                         Backed up to '{}' for potential recovery. \
-                         Starting with default settings.",
-                        path.display(),
-                        backup_path.display()
-                    );
                     tracing::warn!(
                         file_path = %path.display(),
                         backup_path = %backup_path.display(),
@@ -313,11 +306,6 @@ fn load_global_state_legacy() -> GlobalState {
                         "Created backup of corrupted global state JSON"
                     );
                 } else {
-                    eprintln!(
-                        "WARNING: Corrupted global state at '{}'. \
-                         Failed to create backup. Starting with default settings.",
-                        path.display()
-                    );
                     tracing::warn!(
                         file_path = %path.display(),
                         error = %error,
@@ -382,11 +370,10 @@ pub fn load_global_state_with_integrity() -> GlobalState {
                     "Global state checksum mismatch - file may be corrupted or tampered"
                 );
                 if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
-                    eprintln!(
-                        "WARNING: Global state integrity check failed at '{}'. \
-                             Backed up to '{}' for investigation. Starting with default settings.",
-                        path.display(),
-                        backup_path.display()
+                    tracing::warn!(
+                        file_path = %path.display(),
+                        backup_path = %backup_path.display(),
+                        "Global state integrity check failed; backed up corrupted file"
                     );
                 }
                 return GlobalState::default();
@@ -398,13 +385,6 @@ pub fn load_global_state_with_integrity() -> GlobalState {
                 Err(error) => {
                     // Create backup of corrupted file
                     if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
-                        eprintln!(
-                            "WARNING: Corrupted global state at '{}'. \
-                             Backed up to '{}' for potential recovery. \
-                             Starting with default settings.",
-                            path.display(),
-                            backup_path.display()
-                        );
                         tracing::warn!(
                             file_path = %path.display(),
                             backup_path = %backup_path.display(),

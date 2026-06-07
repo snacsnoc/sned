@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use ulid::Ulid;
 
 use std::time::Instant;
@@ -1200,6 +1201,10 @@ pub struct StateManager {
     /// Last persistence time
     last_persist: Mutex<Option<Instant>>,
 
+    /// True if workspace_state has unsaved changes since the last
+    /// persist_workspace_state() call. Skips the disk write when false.
+    workspace_state_dirty: AtomicBool,
+
     /// Secrets store for file-backed storage
     secrets_store: SecretsStore,
 
@@ -1224,6 +1229,7 @@ impl StateManager {
             pending_task_states: Mutex::new(HashMap::with_capacity(4)),
             pending_secrets: Mutex::new(HashSet::new()),
             last_persist: Mutex::new(None),
+            workspace_state_dirty: AtomicBool::new(false),
             secrets_store,
             state_dir,
         })
@@ -1238,6 +1244,14 @@ impl StateManager {
         let settings_dir = self.state_dir.join("..").join("settings");
         let _ = crate::storage::disk::cleanup_orphaned_temp_files(
             &settings_dir,
+            std::time::Duration::from_secs(86400), // 24 hours
+        );
+
+        // TaskStorage uses atomic_write_file too; orphaned .tmp.*.json
+        // files in the tasks dir need the same cleanup on startup.
+        let tasks_dir = self.state_dir.join("..").join("tasks");
+        let _ = crate::storage::disk::cleanup_orphaned_temp_files(
+            &tasks_dir,
             std::time::Duration::from_secs(86400), // 24 hours
         );
 
@@ -1782,13 +1796,6 @@ impl StateManager {
             Err(e) => {
                 // Create backup of corrupted file before discarding
                 if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
-                    eprintln!(
-                        "WARNING: Corrupted global settings at '{}'. \
-                         Backed up to '{}' for potential recovery. \
-                         Starting with default settings.",
-                        file_path.display(),
-                        backup_path.display()
-                    );
                     tracing::warn!(
                         file_path = %file_path.display(),
                         backup_path = %backup_path.display(),
@@ -1796,11 +1803,6 @@ impl StateManager {
                         "Created backup of corrupted global settings JSON"
                     );
                 } else {
-                    eprintln!(
-                        "WARNING: Corrupted global settings at '{}'. \
-                         Failed to create backup. Starting with default settings.",
-                        file_path.display()
-                    );
                     tracing::warn!(
                         file_path = %file_path.display(),
                         error = %e,
@@ -1825,13 +1827,6 @@ impl StateManager {
             Err(e) => {
                 // Create backup of corrupted file before discarding
                 if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
-                    eprintln!(
-                        "WARNING: Corrupted workspace state at '{}'. \
-                         Backed up to '{}' for potential recovery. \
-                         Starting with empty state.",
-                        file_path.display(),
-                        backup_path.display()
-                    );
                     tracing::warn!(
                         file_path = %file_path.display(),
                         backup_path = %backup_path.display(),
@@ -1839,11 +1834,6 @@ impl StateManager {
                         "Created backup of corrupted workspace state JSON"
                     );
                 } else {
-                    eprintln!(
-                        "WARNING: Corrupted workspace state at '{}'. \
-                         Failed to create backup. Starting with empty state.",
-                        file_path.display()
-                    );
                     tracing::warn!(
                         file_path = %file_path.display(),
                         error = %e,
@@ -2091,8 +2081,13 @@ impl StateManager {
     }
 
     /// Persist workspace state to disk.
-    /// Writes the entire workspace state atomically.
+    /// Writes the entire workspace state atomically. Skips the write
+    /// when the dirty flag is false (no mutations since last persist).
     fn persist_workspace_state(&self) -> io::Result<()> {
+        if !self.workspace_state_dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+
         let workspace_state = self
             .workspace_state
             .read()
@@ -2346,6 +2341,33 @@ mod tests {
 
             let history = manager2.get_task_history();
             assert!(history.iter().any(|h| h.id == "persist-test"));
+        });
+    }
+
+    #[test]
+    fn test_workspace_state_dirty_flag_skips_unchanged_writes() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+
+            // Capture the file mtime after initialize (which is a no-op
+            // persist because no workspace_state mutator has run, but
+            // the dirty flag starts false so persist_workspace_state
+            // short-circuits).
+            let file_path = manager.state_dir.join("workspace_state.json");
+            let initial_exists = file_path.exists();
+
+            // Run persist multiple times; since workspace_state is
+            // never mutated, the dirty flag stays false and no write
+            // happens.
+            for _ in 0..3 {
+                manager.persist().unwrap();
+            }
+
+            // The file should not have been created by persist (it only
+            // exists if load_workspace_state saw it on disk, which it
+            // didn't in a fresh temp dir).
+            assert!(!file_path.exists() || initial_exists);
         });
     }
 
