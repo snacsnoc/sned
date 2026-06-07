@@ -1931,6 +1931,28 @@ async fn handle_cli_only_command(
     Ok(false)
 }
 
+/// Export the current conversation history to the given path.
+/// Returns true if the export succeeded, false otherwise.
+async fn export_conversation(
+    session: &Arc<Mutex<InteractiveSession>>,
+    export_path: &str,
+    json_output: bool,
+) -> bool {
+    let history = session.lock().await.agent_loop().await.get_conversation_history().await;
+    if let Ok(mut export_data) = serde_json::to_string_pretty(&history) {
+        export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
+        if let Err(e) = crate::storage::disk::atomic_write_file(export_path, &export_data) {
+            if !json_output {
+                eprintln!("Warning: Failed to write export file: {}", e);
+            }
+        } else if !json_output {
+            println!("Conversation exported to: {} (secrets redacted)", export_path);
+        }
+        return true;
+    }
+    false
+}
+
 /// Main ratatui event loop.
 async fn run_main_loop(
     terminal: &mut ratatui::DefaultTerminal,
@@ -2191,20 +2213,7 @@ async fn run_main_loop(
                             }
                             // Always export on exit, even if the agent errored out.
                             if let Some(ref export_path) = task_opts.export {
-                                let history = session.lock().await.agent_loop().await.get_conversation_history().await;
-                                if let Ok(mut export_data) = serde_json::to_string_pretty(&history) {
-                                    export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
-                                    if let Err(e) = crate::storage::disk::atomic_write_file(export_path, &export_data) {
-                                        if !task_opts.json {
-                                            eprintln!("Warning: Failed to write export file: {}", e);
-                                        }
-                                    } else if !task_opts.json {
-                                        println!(
-                                            "Conversation exported to: {} (secrets redacted)",
-                                            export_path
-                                        );
-                                    }
-                                }
+                                export_conversation(&session, export_path, task_opts.json).await;
                             }
                             return Ok(());
                         }
@@ -2341,20 +2350,7 @@ async fn run_main_loop(
                                         if should_exit {
                                             // Always export on exit, even if the agent errored out.
                                             if let Some(ref export_path) = task_opts.export {
-                                                let history = session.lock().await.agent_loop().await.get_conversation_history().await;
-                                                if let Ok(mut export_data) = serde_json::to_string_pretty(&history) {
-                                                    export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
-                                                    if let Err(e) = crate::storage::disk::atomic_write_file(export_path, &export_data) {
-                                                        if !task_opts.json {
-                                                            eprintln!("Warning: Failed to write export file: {}", e);
-                                                        }
-                                                    } else if !task_opts.json {
-                                                        println!(
-                                                            "Conversation exported to: {} (secrets redacted)",
-                                                            export_path
-                                                        );
-                                                    }
-                                                }
+                                                export_conversation(&session, export_path, task_opts.json).await;
                                             }
                                             return Ok(());
                                         }
