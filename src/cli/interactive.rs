@@ -2189,6 +2189,23 @@ async fn run_main_loop(
                                 app.mention_search_active = false;
                                 app.mention_search_query.clear();
                             }
+                            // Always export on exit, even if the agent errored out.
+                            if let Some(ref export_path) = task_opts.export {
+                                let history = session.lock().await.agent_loop().await.get_conversation_history().await;
+                                if let Ok(mut export_data) = serde_json::to_string_pretty(&history) {
+                                    export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
+                                    if let Err(e) = crate::storage::disk::atomic_write_file(export_path, &export_data) {
+                                        if !task_opts.json {
+                                            eprintln!("Warning: Failed to write export file: {}", e);
+                                        }
+                                    } else if !task_opts.json {
+                                        println!(
+                                            "Conversation exported to: {} (secrets redacted)",
+                                            export_path
+                                        );
+                                    }
+                                }
+                            }
                             return Ok(());
                         }
 
@@ -2322,6 +2339,23 @@ async fn run_main_loop(
                                         )
                                         .await?;
                                         if should_exit {
+                                            // Always export on exit, even if the agent errored out.
+                                            if let Some(ref export_path) = task_opts.export {
+                                                let history = session.lock().await.agent_loop().await.get_conversation_history().await;
+                                                if let Ok(mut export_data) = serde_json::to_string_pretty(&history) {
+                                                    export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
+                                                    if let Err(e) = crate::storage::disk::atomic_write_file(export_path, &export_data) {
+                                                        if !task_opts.json {
+                                                            eprintln!("Warning: Failed to write export file: {}", e);
+                                                        }
+                                                    } else if !task_opts.json {
+                                                        println!(
+                                                            "Conversation exported to: {} (secrets redacted)",
+                                                            export_path
+                                                        );
+                                                    }
+                                                }
+                                            }
                                             return Ok(());
                                         }
                                         continue;
