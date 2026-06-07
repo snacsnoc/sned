@@ -550,10 +550,18 @@ async fn spawn_agent_task(
 /// Uses the same graceful shutdown sequence as CancellationHandler::abort_task:
 /// SIGTERM → 100ms wait → SIGKILL. This gives running commands a chance to
 /// clean up (flush output, close files, etc.) before being force-killed.
+///
+/// `task.abort()` cancels the entire spawned future — including the
+/// epilogue that would normally reset `agent_busy` and notify `agent_done`
+/// — so without an explicit reset the atomic would stay `true` after
+/// Ctrl+C. The next `/plan`/message submission would then be enqueued
+/// forever, since the queue is consumed by the agent's `run()` loop,
+/// which is no longer running.
 async fn cancel_agent(
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     agent_done: &Arc<tokio::sync::Notify>,
+    agent_busy: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     if let Some(sh) = state_handle.lock().await.as_ref() {
         let mut state = sh.lock().await;
@@ -583,6 +591,12 @@ async fn cancel_agent(
         .await
         .ok();
     }
+
+    // Reset unconditionally: covers both abort (epilogue never runs) and
+    // natural completion (epilogue may have run before abort, setting the
+    // same value). Without this, a Ctrl+C during a busy agent leaves the
+    // atomic stuck at `true` and any subsequent prompt is enqueued.
+    agent_busy.store(false, Ordering::Relaxed);
 
     Ok(())
 }
@@ -2127,7 +2141,13 @@ async fn run_main_loop(
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 app.force_bottom();
-                                cancel_agent(&state_handle, &agent_task, &agent_done).await?;
+                                cancel_agent(
+                                    &state_handle,
+                                    &agent_task,
+                                    &agent_done,
+                                    &agent_busy,
+                                )
+                                .await?;
                                 app.push_plain("^C");
                                 app.agent_busy = false;
                                 continue;
@@ -2189,7 +2209,13 @@ async fn run_main_loop(
 
                         // If agent is busy, cancel it
                         if agent_busy.load(Ordering::Relaxed) {
-                            cancel_agent(&state_handle, &agent_task, &agent_done).await?;
+                            cancel_agent(
+                                &state_handle,
+                                &agent_task,
+                                &agent_done,
+                                &agent_busy,
+                            )
+                            .await?;
                             app.agent_busy = false;
                             app.push_styled("^C cancelled", Style::default().fg(theme::WARNING_FG));
                             app.push_styled(
@@ -3752,5 +3778,44 @@ mod tests {
         assert_eq!(state.last_injected_plan_state_hash, None);
 
         Ok(())
+    }
+
+    /// Regression test for the "Ctrl+C then /plan stalls" bug.
+    ///
+    /// `cancel_agent` aborts the spawned task, but `task.abort()` also
+    /// cancels the task's epilogue — the code that resets `agent_busy`
+    /// to `false` and notifies `agent_done`. Without an explicit reset
+    /// in `cancel_agent`, the atomic would stay `true` after Ctrl+C and
+    /// the next message submission would be enqueued (because the
+    /// enqueue-vs-spawn branch sees `agent_busy == true`) into a queue
+    /// that nothing consumes (the agent's `run()` loop is gone).
+    #[tokio::test]
+    async fn test_cancel_agent_resets_busy_atomic_after_abort() {
+        use std::time::Duration;
+        use tokio::task::JoinHandle;
+
+        // Stuck-agent stand-in: a 60-second sleep. Abort will cancel it
+        // before the sleep returns, so the epilogue (which doesn't
+        // exist for this stand-in anyway) never runs.
+        let task_slot: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        *task_slot.lock().await = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        // None state_handle skips the `running_command_pids` block.
+        let state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>> =
+            Arc::new(Mutex::new(None));
+
+        cancel_agent(&state_handle, &task_slot, &agent_done, &agent_busy)
+            .await
+            .unwrap();
+
+        assert!(
+            !agent_busy.load(Ordering::Relaxed),
+            "agent_busy atomic must be reset to false after cancel_agent, \
+             otherwise subsequent prompts are enqueued forever"
+        );
     }
 }
