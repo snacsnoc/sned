@@ -489,10 +489,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_ripgrep_availability_cached() {
+        use std::sync::OnceLock;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Create a fresh OnceLock for testing by using a separate static
         static TEST_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+        let test_once = OnceLock::new();
 
         // Reset counter
         TEST_CALL_COUNT.store(0, Ordering::Relaxed);
@@ -507,14 +508,14 @@ mod tests {
         };
 
         // First call initializes
-        let result1 = *RIPGREP_AVAILABLE.get_or_init(&check_availability);
+        let result1 = *test_once.get_or_init(&check_availability);
 
         // Verify cache is initialized
-        assert!(RIPGREP_AVAILABLE.get().is_some());
+        assert!(test_once.get().is_some());
         let calls_after_first = TEST_CALL_COUNT.load(Ordering::Relaxed);
 
         // Second call should use cached value
-        let result2 = *RIPGREP_AVAILABLE.get_or_init(&check_availability);
+        let result2 = *test_once.get_or_init(&check_availability);
         let calls_after_second = TEST_CALL_COUNT.load(Ordering::Relaxed);
 
         // Results should be consistent

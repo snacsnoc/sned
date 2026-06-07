@@ -744,9 +744,19 @@ impl EditExecutor {
         normalized_line_hashes: &[String],
         lines: &[String],
     ) -> (usize, Option<String>) {
-        let anchor_raw = raw_anchor.lines().next().unwrap_or("").trim();
+        let anchor_raw = raw_anchor.trim();
         if anchor_raw.is_empty() {
             return (usize::MAX, Some(format!("{} is missing.", anchor_type)));
+        }
+
+        if anchor_raw.contains('\n') || anchor_raw.contains('\r') {
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{} contains multiple lines. Anchors must refer to a single line only in the format Anchor{}{}line_text{}.",
+                    anchor_type, ANCHOR_DELIMITER, "{", "}"
+                )),
+            );
         }
 
         let (anchor_name, provided_content) = split_anchor(anchor_raw);
@@ -796,21 +806,6 @@ impl EditExecutor {
                 Some(format!(
                     "{} \"{}\" not found in the file. Please ensure you are using the latest anchors from the most recent read_file output. COPY THE EXACT ANCHOR STRING FROM read_file OUTPUT (e.g., \"Crawler§void draw_game_over() {{\"). Do NOT modify the anchor text or omit the Word§ prefix.",
                     anchor_type, anchor_name
-                )),
-            );
-        }
-
-        // Check for newlines in provided content
-        if provided_content.contains('\n') || provided_content.contains('\r') {
-            tracing::debug!(
-                "Anchor resolution failed: provided content contains newlines. anchor_name={}",
-                anchor_name
-            );
-            return (
-                usize::MAX,
-                Some(format!(
-                    "{} \"{}\" exists, but the provided code line contains a newline character. Anchors must refer to a single line only in the format Anchor{}{}line_text{}.",
-                    anchor_type, anchor_name, ANCHOR_DELIMITER, "{", "}"
                 )),
             );
         }
@@ -1442,6 +1437,25 @@ mod tests {
         let (idx, error) = executor.resolve_anchor("anchor", "L1§wrong content", &hashes, &lines);
         assert_eq!(idx, usize::MAX);
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn test_edit_executor_rejects_multiline_anchor_input() {
+        let executor = EditExecutor::new();
+        let lines = vec!["def hello():".to_string(), "    return 42".to_string()];
+        let hashes = vec!["Apple".to_string(), "Banana".to_string()];
+
+        let (idx, error) = executor.resolve_anchor(
+            "anchor",
+            "Apple§def hello():\nBanana§    return 42",
+            &hashes,
+            &lines,
+        );
+
+        assert_eq!(idx, usize::MAX);
+        let message = error.expect("multiline anchors should be rejected");
+        assert!(message.contains("multiple lines"));
+        assert!(message.contains("single line only"));
     }
 
     #[test]
