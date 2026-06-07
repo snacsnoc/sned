@@ -203,6 +203,10 @@ fn print_model_line_with_prefix_if_pending(
     }
 }
 
+fn stream_error_is_retryable(error: &str) -> bool {
+    error.contains("(retryable)")
+}
+
 fn sanitize_model_text_for_display(line: &str) -> Cow<'_, str> {
     if line.chars().all(|ch| !ch.is_control() && ch != '\t') {
         Cow::Borrowed(line)
@@ -1443,11 +1447,6 @@ impl AgentLoop {
             }
         }
 
-        // Create channel for stream chunks with large buffer to prevent
-        // backpressure deadlocks when the provider emits faster than the
-        // consumer processes (e.g. during very long responses).
-        let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(10_000);
-
         let state_clone = self.state.clone();
         let history_clone = self.conversation_history.clone();
         let provider = self.config.provider.lock().unwrap().clone();
@@ -1475,394 +1474,420 @@ impl AgentLoop {
             }
         }
 
-        let stream = match create_message_with_retry(
-            provider.clone(),
-            request,
-            state_clone.clone(),
-            retry_config,
-            self.config.json_output,
-            Some(self.config.output_writer.clone()),
-            Some(self.cancelled.clone()),
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!(error = %e, "provider request failed");
-                let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
-                let consecutive_failures = {
-                    let state = self.state.lock().await;
-                    state.consecutive_provider_failures
-                };
-                let message = if consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES {
-                    format!(
-                        "{}\nProvider has failed {} consecutive requests. Retry after the provider recovers, or use /model to switch providers.",
-                        actionable.display(),
-                        consecutive_failures
-                    )
-                } else {
-                    actionable.display()
-                };
-                return TurnResult::Error(message);
-            }
-        };
+        let mut stream_retry_attempt = 0usize;
+        let (
+            accumulated_text,
+            accumulated_reasoning,
+            accumulated_signature,
+            accumulated_text_signature,
+            accumulated_redacted_data,
+            mut tool_calls_map,
+            tool_call_order,
+            snipped_blocks_this_turn,
+        ) = 'provider_stream_attempt: loop {
+            // Create channel for stream chunks with large buffer to prevent
+            // backpressure deadlocks when the provider emits faster than the
+            // consumer processes (e.g. during very long responses).
+            let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(10_000);
 
-        let cancelled_flag = self.cancelled.clone();
-        let stream_handle = tokio::spawn(async move {
-            let mut stream = stream;
-            use tokio_stream::StreamExt;
-            'stream: loop {
-                tokio::select! {
-                    chunk = stream.next() => {
-                        match chunk {
-                            Some(c) => {
-                                if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
-                                    break 'stream;
-                                }
-                                // Race the send against cancellation so a slow
-                                // consumer (UI backpressure, full bounded channel)
-                                // doesn't block Ctrl+C response. If cancellation
-                                // wins, the chunk is dropped — acceptable since
-                                // the user is cancelling.
-                                let mut send_fut = Box::pin(tx.send(c));
-                                loop {
-                                    tokio::select! {
-                                        result = send_fut.as_mut() => {
-                                            if result.is_err() {
-                                                break 'stream;
-                                            }
-                                            break;
-                                        }
-                                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                                            if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
-                                                break 'stream;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            None => break 'stream,
-                        }
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                        if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
-                            break 'stream;
-                        }
-                    }
-                }
-            }
-        });
-
-        // 4. Process stream chunks
-        let mut accumulated_text = String::new();
-        let mut first_chunk_received = false;
-        let mut accumulated_reasoning = String::new();
-        let mut accumulated_signature: Option<String> = None;
-        let mut accumulated_text_signature: Option<String> = None;
-        let mut accumulated_redacted_data: Vec<String> = Vec::new();
-        // Use HashMap for O(1) merge + Vec to preserve insertion order (P4)
-        let mut tool_calls_map: HashMap<String, ApiStreamToolCall> = HashMap::with_capacity(4);
-        let mut tool_call_order: Vec<String> = Vec::new();
-        let mut tool_call_detected = false;
-        let mut display_buffer = String::new();
-        let mut in_code_block = false;
-        let mut code_block_lang = String::new();
-        let mut code_block_buffer: Vec<String> = Vec::new();
-        let mut code_block_full_buffer: Vec<String> = Vec::new();
-        let mut code_block_lines: usize = 0;
-        let mut code_block_snipped = false;
-        let code_block_display_limit = code_block_display_limit(self.config.interactive_mode);
-        let snipped_block_start_index = {
-            let state = self.state.lock().await;
-            state.snipped_code_blocks.len()
-        };
-        let mut snipped_blocks_this_turn: Vec<SnippedCodeBlock> = Vec::new();
-        let mut reasoning_preview_shown = false;
-        let mut stream_errored = false;
-        let mut in_thinking_tag = false;
-
-        // Track time to first token for UX feedback on slow connections
-        let first_chunk_start = std::time::Instant::now();
-        let mut slow_connection_warned = false;
-
-        // Buffer flush timing to reduce syscalls on high-latency connections (P9)
-        let mut last_flush_time = Instant::now();
-        let flush_interval = std::time::Duration::from_millis(50);
-
-        // Turn indicator is prepended to the first output line, not emitted separately,
-        // so it appears on the same line as the start of the response.
-        let mut turn_indicator_pending = true;
-
-        while let Some(chunk) = rx.recv().await {
-            // Check for cancellation during stream processing so Ctrl+C
-            // takes effect promptly instead of waiting for the full stream.
-            // Uses lock-free AtomicBool to avoid mutex contention on every chunk.
-            if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                tracing::info!("cancellation detected during stream processing, aborting turn");
-                return TurnResult::Cancelled;
-            }
-
-            // Warn about slow connection if waiting >3s for first token
-            if !first_chunk_received
-                && !slow_connection_warned
-                && first_chunk_start.elapsed().as_secs() >= 3
+            let stream = match create_message_with_retry(
+                provider.clone(),
+                request.clone(),
+                state_clone.clone(),
+                retry_config,
+                self.config.json_output,
+                Some(self.config.output_writer.clone()),
+                Some(self.cancelled.clone()),
+            )
+            .await
             {
-                slow_connection_warned = true;
-                self.config.output_writer.emit(OutputEvent::dim_yellow(
-                    "⏳ Waiting for API response (slow connection?)...",
-                ));
-            }
-
-            if !first_chunk_received {
-                if crate::cli::output::timing_enabled() {
-                    let mut state = self.state.lock().await;
-                    if state.first_provider_chunk_time.is_none() {
-                        state.first_provider_chunk_time = Some(std::time::Instant::now());
-                    }
-                }
-                first_chunk_received = true;
-            }
-
-            match chunk {
-                ApiStreamChunk::Text(text_chunk) => {
-                    tracing::debug!(text = %text_chunk.text, "received text chunk");
-                    if self.config.json_output {
-                        tracing::info!(
-                            target: "json_output",
-                            "{}",
-                            serde_json::json!({
-                                "type": "text",
-                                "text": text_chunk.text
-                            })
-                            .to_string()
-                        );
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!(error = %e, "provider request failed");
+                    let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
+                    let consecutive_failures = {
+                        let state = self.state.lock().await;
+                        state.consecutive_provider_failures
+                    };
+                    let message = if consecutive_failures
+                        >= DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES
+                    {
+                        format!(
+                            "{}\nProvider has failed {} consecutive requests. Retry after the provider recovers, or use /model to switch providers.",
+                            actionable.display(),
+                            consecutive_failures
+                        )
                     } else {
-                        // Check for thinking tags and suppress content between them
-                        let text = &text_chunk.text;
-                        let mut processed = String::new();
-                        let mut pos = 0;
+                        actionable.display()
+                    };
+                    return TurnResult::Error(message);
+                }
+            };
 
-                        while pos < text.len() {
-                            // Check for thinking start tag
-                            if !in_thinking_tag {
-                                if let Some(tag_start) = text[pos..].find("<!-- think -->") {
-                                    let abs_start = pos + tag_start;
-                                    processed.push_str(&text[pos..abs_start]);
-                                    in_thinking_tag = true;
-                                    pos = abs_start + "<!-- think -->".len();
-                                    continue;
-                                } else if let Some(tag_start) = text[pos..].find("<think>") {
-                                    let abs_start = pos + tag_start;
-                                    processed.push_str(&text[pos..abs_start]);
-                                    in_thinking_tag = true;
-                                    pos = abs_start + "<think>".len();
-                                    continue;
+            let cancelled_flag = self.cancelled.clone();
+            let stream_handle = tokio::spawn(async move {
+                let mut stream = stream;
+                use tokio_stream::StreamExt;
+                'stream: loop {
+                    tokio::select! {
+                        chunk = stream.next() => {
+                            match chunk {
+                                Some(c) => {
+                                    if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
+                                        break 'stream;
+                                    }
+                                    // Race the send against cancellation so a slow
+                                    // consumer (UI backpressure, full bounded channel)
+                                    // doesn't block Ctrl+C response. If cancellation
+                                    // wins, the chunk is dropped — acceptable since
+                                    // the user is cancelling.
+                                    let mut send_fut = Box::pin(tx.send(c));
+                                    loop {
+                                        tokio::select! {
+                                            result = send_fut.as_mut() => {
+                                                if result.is_err() {
+                                                    break 'stream;
+                                                }
+                                                break;
+                                            }
+                                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                                if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
+                                                    break 'stream;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-
-                            // Check for thinking end tag
-                            if in_thinking_tag {
-                                if let Some(tag_start) = text[pos..].find("<!-- /think -->") {
-                                    let abs_start = pos + tag_start;
-                                    in_thinking_tag = false;
-                                    pos = abs_start + "<!-- /think -->".len();
-                                    continue;
-                                } else if let Some(tag_start) = text[pos..].find("</think>") {
-                                    let abs_start = pos + tag_start;
-                                    in_thinking_tag = false;
-                                    pos = abs_start + "</think>".len();
-                                    continue;
-                                }
-                                // Skip content while inside thinking tag
-                                pos = text.len();
-                            } else {
-                                // Not in thinking tag, output remaining text
-                                processed.push_str(&text[pos..]);
-                                pos = text.len();
+                                None => break 'stream,
                             }
                         }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                            if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
+                                break 'stream;
+                            }
+                        }
+                    }
+                }
+            });
 
-                        // Only display non-thinking content
-                        if !processed.is_empty() {
-                            self.record_first_displayable_text_time().await;
-                            display_buffer.push_str(&processed);
-                            while let Some(nl_pos) = display_buffer.find('\n') {
-                                // Extract line and trim in one pass (reduces allocations)
-                                let line = display_buffer[..nl_pos].to_string();
-                                display_buffer.drain(..=nl_pos);
-                                let trimmed_line = line.trim();
+            // 4. Process stream chunks
+            let mut accumulated_text = String::new();
+            let mut first_chunk_received = false;
+            let mut accumulated_reasoning = String::new();
+            let mut accumulated_signature: Option<String> = None;
+            let mut accumulated_text_signature: Option<String> = None;
+            let mut accumulated_redacted_data: Vec<String> = Vec::new();
+            // Use HashMap for O(1) merge + Vec to preserve insertion order (P4)
+            let mut tool_calls_map: HashMap<String, ApiStreamToolCall> = HashMap::with_capacity(4);
+            let mut tool_call_order: Vec<String> = Vec::new();
+            let mut tool_call_detected = false;
+            let mut display_buffer = String::new();
+            let mut in_code_block = false;
+            let mut code_block_lang = String::new();
+            let mut code_block_buffer: Vec<String> = Vec::new();
+            let mut code_block_full_buffer: Vec<String> = Vec::new();
+            let mut code_block_lines: usize = 0;
+            let mut code_block_snipped = false;
+            let code_block_display_limit = code_block_display_limit(self.config.interactive_mode);
+            let snipped_block_start_index = {
+                let state = self.state.lock().await;
+                state.snipped_code_blocks.len()
+            };
+            let mut snipped_blocks_this_turn: Vec<SnippedCodeBlock> = Vec::new();
+            let mut reasoning_preview_shown = false;
+            let mut stream_errored = false;
+            let mut retryable_stream_error_before_output: Option<String> = None;
+            let mut in_thinking_tag = false;
+            let mut emitted_output_this_attempt = false;
 
-                                if trimmed_line.starts_with("```") {
-                                    if in_code_block {
-                                        print_code_block(
-                                            &code_block_buffer,
-                                            &code_block_lang,
-                                            &self.config.output_writer,
-                                        );
-                                        if code_block_snipped {
-                                            let index = if self.config.interactive_mode {
-                                                Some(push_snipped_code_block(
-                                                    &mut snipped_blocks_this_turn,
-                                                    snipped_block_start_index,
-                                                    &code_block_lang,
-                                                    &code_block_full_buffer,
-                                                ))
-                                            } else {
-                                                None
-                                            };
-                                            self.config.output_writer.emit(OutputEvent::dim(
-                                                snipped_code_block_hint(index),
-                                            ));
+            // Track time to first token for UX feedback on slow connections
+            let first_chunk_start = std::time::Instant::now();
+            let mut slow_connection_warned = false;
+
+            // Buffer flush timing to reduce syscalls on high-latency connections (P9)
+            let mut last_flush_time = Instant::now();
+            let flush_interval = std::time::Duration::from_millis(50);
+
+            // Turn indicator is prepended to the first output line, not emitted separately,
+            // so it appears on the same line as the start of the response.
+            let mut turn_indicator_pending = true;
+
+            while let Some(chunk) = rx.recv().await {
+                // Check for cancellation during stream processing so Ctrl+C
+                // takes effect promptly instead of waiting for the full stream.
+                // Uses lock-free AtomicBool to avoid mutex contention on every chunk.
+                if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::info!("cancellation detected during stream processing, aborting turn");
+                    return TurnResult::Cancelled;
+                }
+
+                // Warn about slow connection if waiting >3s for first token
+                if !first_chunk_received
+                    && !slow_connection_warned
+                    && first_chunk_start.elapsed().as_secs() >= 3
+                {
+                    slow_connection_warned = true;
+                    emitted_output_this_attempt = true;
+                    self.config.output_writer.emit(OutputEvent::dim_yellow(
+                        "⏳ Waiting for API response (slow connection?)...",
+                    ));
+                }
+
+                if !first_chunk_received && !matches!(&chunk, ApiStreamChunk::Error(_)) {
+                    if crate::cli::output::timing_enabled() {
+                        let mut state = self.state.lock().await;
+                        if state.first_provider_chunk_time.is_none() {
+                            state.first_provider_chunk_time = Some(std::time::Instant::now());
+                        }
+                    }
+                    first_chunk_received = true;
+                }
+
+                match chunk {
+                    ApiStreamChunk::Text(text_chunk) => {
+                        tracing::debug!(text = %text_chunk.text, "received text chunk");
+                        if self.config.json_output {
+                            tracing::info!(
+                                target: "json_output",
+                                "{}",
+                                serde_json::json!({
+                                    "type": "text",
+                                    "text": text_chunk.text
+                                })
+                                .to_string()
+                            );
+                        } else {
+                            // Check for thinking tags and suppress content between them
+                            let text = &text_chunk.text;
+                            let mut processed = String::new();
+                            let mut pos = 0;
+
+                            while pos < text.len() {
+                                // Check for thinking start tag
+                                if !in_thinking_tag {
+                                    if let Some(tag_start) = text[pos..].find("<!-- think -->") {
+                                        let abs_start = pos + tag_start;
+                                        processed.push_str(&text[pos..abs_start]);
+                                        in_thinking_tag = true;
+                                        pos = abs_start + "<!-- think -->".len();
+                                        continue;
+                                    } else if let Some(tag_start) = text[pos..].find("<think>") {
+                                        let abs_start = pos + tag_start;
+                                        processed.push_str(&text[pos..abs_start]);
+                                        in_thinking_tag = true;
+                                        pos = abs_start + "<think>".len();
+                                        continue;
+                                    }
+                                }
+
+                                // Check for thinking end tag
+                                if in_thinking_tag {
+                                    if let Some(tag_start) = text[pos..].find("<!-- /think -->") {
+                                        let abs_start = pos + tag_start;
+                                        in_thinking_tag = false;
+                                        pos = abs_start + "<!-- /think -->".len();
+                                        continue;
+                                    } else if let Some(tag_start) = text[pos..].find("</think>") {
+                                        let abs_start = pos + tag_start;
+                                        in_thinking_tag = false;
+                                        pos = abs_start + "</think>".len();
+                                        continue;
+                                    }
+                                    // Skip content while inside thinking tag
+                                    pos = text.len();
+                                } else {
+                                    // Not in thinking tag, output remaining text
+                                    processed.push_str(&text[pos..]);
+                                    pos = text.len();
+                                }
+                            }
+
+                            // Only display non-thinking content
+                            if !processed.is_empty() {
+                                self.record_first_displayable_text_time().await;
+                                display_buffer.push_str(&processed);
+                                while let Some(nl_pos) = display_buffer.find('\n') {
+                                    // Extract line and trim in one pass (reduces allocations)
+                                    let line = display_buffer[..nl_pos].to_string();
+                                    display_buffer.drain(..=nl_pos);
+                                    let trimmed_line = line.trim();
+
+                                    if trimmed_line.starts_with("```") {
+                                        if in_code_block {
+                                            print_code_block(
+                                                &code_block_buffer,
+                                                &code_block_lang,
+                                                &self.config.output_writer,
+                                            );
+                                            if code_block_snipped {
+                                                let index = if self.config.interactive_mode {
+                                                    Some(push_snipped_code_block(
+                                                        &mut snipped_blocks_this_turn,
+                                                        snipped_block_start_index,
+                                                        &code_block_lang,
+                                                        &code_block_full_buffer,
+                                                    ))
+                                                } else {
+                                                    None
+                                                };
+                                                self.config.output_writer.emit(OutputEvent::dim(
+                                                    snipped_code_block_hint(index),
+                                                ));
+                                            }
+                                            in_code_block = false;
+                                            code_block_lang.clear();
+                                            code_block_buffer.clear();
+                                            code_block_full_buffer.clear();
+                                            code_block_lines = 0;
+                                            code_block_snipped = false;
+                                        } else {
+                                            in_code_block = true;
+                                            code_block_lang =
+                                                code_fence_language(trimmed_line).to_string();
+                                            code_block_buffer.clear();
+                                            code_block_full_buffer.clear();
+                                            code_block_lines = 0;
+                                            code_block_snipped = false;
                                         }
-                                        in_code_block = false;
-                                        code_block_lang.clear();
-                                        code_block_buffer.clear();
-                                        code_block_full_buffer.clear();
-                                        code_block_lines = 0;
-                                        code_block_snipped = false;
-                                    } else {
-                                        in_code_block = true;
-                                        code_block_lang =
-                                            code_fence_language(trimmed_line).to_string();
-                                        code_block_buffer.clear();
-                                        code_block_full_buffer.clear();
-                                        code_block_lines = 0;
-                                        code_block_snipped = false;
+
+                                        emitted_output_this_attempt = true;
+                                        print_model_line_with_prefix_if_pending(
+                                            trimmed_line,
+                                            &self.config.output_writer,
+                                            &mut turn_indicator_pending,
+                                        );
+                                        continue;
                                     }
 
+                                    if in_code_block {
+                                        code_block_lines += 1;
+                                        // For code blocks, preserve leading indentation (only trim end)
+                                        let code_line = line.trim_end().to_string();
+                                        code_block_full_buffer.push(code_line.clone());
+                                        if code_block_lines > code_block_display_limit {
+                                            code_block_snipped = true;
+                                            // Prevent CPU spinning on pause
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                500,
+                                            ))
+                                            .await;
+                                            continue;
+                                        }
+
+                                        code_block_buffer.push(code_line);
+                                        continue;
+                                    }
+
+                                    // Regular content - already trimmed
+                                    self.record_first_output_emit_time().await;
+                                    emitted_output_this_attempt = true;
                                     print_model_line_with_prefix_if_pending(
                                         trimmed_line,
                                         &self.config.output_writer,
                                         &mut turn_indicator_pending,
                                     );
-                                    continue;
                                 }
-
-                                if in_code_block {
-                                    code_block_lines += 1;
-                                    // For code blocks, preserve leading indentation (only trim end)
-                                    let code_line = line.trim_end().to_string();
-                                    code_block_full_buffer.push(code_line.clone());
-                                    if code_block_lines > code_block_display_limit {
-                                        code_block_snipped = true;
-                                        // Prevent CPU spinning on pause
-                                        tokio::time::sleep(std::time::Duration::from_millis(500))
-                                            .await;
-                                        continue;
-                                    }
-
-                                    code_block_buffer.push(code_line);
-                                    continue;
+                                // Buffer flush to ~50ms frames to reduce syscalls on high-latency connections (P9)
+                                if last_flush_time.elapsed() >= flush_interval {
+                                    self.config.output_writer.flush();
+                                    last_flush_time = Instant::now();
                                 }
-
-                                // Regular content - already trimmed
-                                self.record_first_output_emit_time().await;
-                                print_model_line_with_prefix_if_pending(
-                                    trimmed_line,
-                                    &self.config.output_writer,
-                                    &mut turn_indicator_pending,
-                                );
-                            }
-                            // Buffer flush to ~50ms frames to reduce syscalls on high-latency connections (P9)
-                            if last_flush_time.elapsed() >= flush_interval {
-                                self.config.output_writer.flush();
-                                last_flush_time = Instant::now();
                             }
                         }
+                        if text_chunk.signature.is_some() {
+                            accumulated_text_signature = text_chunk.signature.clone();
+                        }
+                        accumulated_text.push_str(&text_chunk.text);
                     }
-                    if text_chunk.signature.is_some() {
-                        accumulated_text_signature = text_chunk.signature.clone();
-                    }
-                    accumulated_text.push_str(&text_chunk.text);
-                }
-                ApiStreamChunk::Reasoning(reasoning_chunk) => {
-                    self.record_first_reasoning_chunk_time().await;
-                    if self.config.json_output {
-                        tracing::info!(
-                            target: "json_output",
-                            "{}",
-                            serde_json::json!({
-                                "type": "reasoning",
-                                "reasoning": reasoning_chunk.reasoning,
-                                "signature": reasoning_chunk.signature,
-                                "redacted_data": reasoning_chunk.redacted_data,
-                            })
-                            .to_string()
-                        );
-                    } else {
-                        // Show compact thinking indicator instead of raw reasoning dump.
-                        // Collects first non-empty line as a summary, displays with Ɵ symbol.
-                        if !reasoning_preview_shown {
-                            let first_line = reasoning_chunk
-                                .reasoning
-                                .lines()
-                                .find(|l| !l.trim().is_empty())
-                                .map(|l| l.trim().to_string());
+                    ApiStreamChunk::Reasoning(reasoning_chunk) => {
+                        self.record_first_reasoning_chunk_time().await;
+                        if self.config.json_output {
+                            tracing::info!(
+                                target: "json_output",
+                                "{}",
+                                serde_json::json!({
+                                    "type": "reasoning",
+                                    "reasoning": reasoning_chunk.reasoning,
+                                    "signature": reasoning_chunk.signature,
+                                    "redacted_data": reasoning_chunk.redacted_data,
+                                })
+                                .to_string()
+                            );
+                        } else {
+                            // Show compact thinking indicator instead of raw reasoning dump.
+                            // Collects first non-empty line as a summary, displays with Ɵ symbol.
+                            if !reasoning_preview_shown {
+                                let first_line = reasoning_chunk
+                                    .reasoning
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .map(|l| l.trim().to_string());
 
-                            if let Some(summary) = first_line {
-                                // Truncate summary to fit on one line
-                                let term_width = crossterm::terminal::size()
-                                    .map(|(cols, _)| cols as usize)
-                                    .unwrap_or(80);
-                                let max_summary_len = term_width.saturating_sub(6); // Account for "  Ɵ " prefix
-                                let truncated = if summary.len() > max_summary_len {
-                                    let safe_end = summary
-                                        .floor_char_boundary(max_summary_len.saturating_sub(3));
-                                    format!("{}...", &summary[..safe_end])
-                                } else {
-                                    summary
-                                };
+                                if let Some(summary) = first_line {
+                                    // Truncate summary to fit on one line
+                                    let term_width = crossterm::terminal::size()
+                                        .map(|(cols, _)| cols as usize)
+                                        .unwrap_or(80);
+                                    let max_summary_len = term_width.saturating_sub(6); // Account for "  Ɵ " prefix
+                                    let truncated = if summary.len() > max_summary_len {
+                                        let safe_end = summary
+                                            .floor_char_boundary(max_summary_len.saturating_sub(3));
+                                        format!("{}...", &summary[..safe_end])
+                                    } else {
+                                        summary
+                                    };
 
-                                self.config
-                                    .output_writer
-                                    .emit(OutputEvent::dim(format!("  Ɵ {}", truncated)));
-                                reasoning_preview_shown = true;
+                                    self.config
+                                        .output_writer
+                                        .emit(OutputEvent::dim(format!("  Ɵ {}", truncated)));
+                                    reasoning_preview_shown = true;
+                                    emitted_output_this_attempt = true;
+                                }
                             }
                         }
+                        accumulated_reasoning.push_str(&reasoning_chunk.reasoning);
+                        if reasoning_chunk.signature.is_some() {
+                            accumulated_signature = reasoning_chunk.signature.clone();
+                        }
+                        if let Some(redacted_data) = reasoning_chunk.redacted_data {
+                            accumulated_redacted_data.push(redacted_data);
+                        }
                     }
-                    accumulated_reasoning.push_str(&reasoning_chunk.reasoning);
-                    if reasoning_chunk.signature.is_some() {
-                        accumulated_signature = reasoning_chunk.signature.clone();
-                    }
-                    if let Some(redacted_data) = reasoning_chunk.redacted_data {
-                        accumulated_redacted_data.push(redacted_data);
-                    }
-                }
-                ApiStreamChunk::Usage(usage_chunk) => {
-                    if self.config.json_output {
-                        tracing::info!(
-                            target: "json_output",
-                            "{}",
-                            serde_json::json!({
-                                "type": "usage",
-                                "input_tokens": usage_chunk.input_tokens,
-                                "output_tokens": usage_chunk.output_tokens,
-                                "cache_write_tokens": usage_chunk.cache_write_tokens,
-                                "cache_read_tokens": usage_chunk.cache_read_tokens,
-                                "reasoning_tokens": usage_chunk.reasoning_tokens,
-                                "total_cost": usage_chunk.total_cost,
-                                "stop_reason": usage_chunk.stop_reason,
-                                "id": usage_chunk.id,
-                            })
-                            .to_string()
+                    ApiStreamChunk::Usage(usage_chunk) => {
+                        if self.config.json_output {
+                            tracing::info!(
+                                target: "json_output",
+                                "{}",
+                                serde_json::json!({
+                                    "type": "usage",
+                                    "input_tokens": usage_chunk.input_tokens,
+                                    "output_tokens": usage_chunk.output_tokens,
+                                    "cache_write_tokens": usage_chunk.cache_write_tokens,
+                                    "cache_read_tokens": usage_chunk.cache_read_tokens,
+                                    "reasoning_tokens": usage_chunk.reasoning_tokens,
+                                    "total_cost": usage_chunk.total_cost,
+                                    "stop_reason": usage_chunk.stop_reason,
+                                    "id": usage_chunk.id,
+                                })
+                                .to_string()
+                            );
+                        }
+                        // Store ApiReqInfo for context management in next turn.
+                        // Merge with previous info: some providers (Anthropic) send
+                        // usage in two chunks (input tokens in message_start, output
+                        // tokens in message_delta). The second chunk hardcodes
+                        // input_tokens=0, so we preserve the first chunk's values
+                        // when the new chunk sends 0.
+                        let mut state = self.state.lock().await;
+                        let prev_info = state.last_api_req_info.as_ref();
+                        let context_window_info = crate::core::context::get_context_window_info(
+                            self.config.provider.lock().unwrap().as_ref(),
                         );
-                    }
-                    // Store ApiReqInfo for context management in next turn.
-                    // Merge with previous info: some providers (Anthropic) send
-                    // usage in two chunks (input tokens in message_start, output
-                    // tokens in message_delta). The second chunk hardcodes
-                    // input_tokens=0, so we preserve the first chunk's values
-                    // when the new chunk sends 0.
-                    let mut state = self.state.lock().await;
-                    let prev_info = state.last_api_req_info.as_ref();
-                    let context_window_info = crate::core::context::get_context_window_info(
-                        self.config.provider.lock().unwrap().as_ref(),
-                    );
-                    let context_window = context_window_info.context_window;
-                    let guard = self.config.provider.lock().unwrap();
-                    let provider_name = guard.name().to_string();
-                    drop(guard);
-                    let context_usage_pct =
+                        let context_window = context_window_info.context_window;
+                        let guard = self.config.provider.lock().unwrap();
+                        let provider_name = guard.name().to_string();
+                        drop(guard);
+                        let context_usage_pct =
                         crate::core::context::context_window::calculate_context_usage_percentage(
                             usage_chunk.input_tokens,
                             usage_chunk.output_tokens,
@@ -1871,283 +1896,320 @@ impl AgentLoop {
                             context_window,
                             &provider_name,
                         );
-                    let tokens_in = if usage_chunk.input_tokens > 0 {
-                        usage_chunk.input_tokens
-                    } else {
-                        prev_info.and_then(|r| r.tokens_in).unwrap_or(0)
-                    };
-                    let tokens_out = if usage_chunk.output_tokens > 0 {
-                        usage_chunk.output_tokens
-                    } else {
-                        prev_info.and_then(|r| r.tokens_out).unwrap_or(0)
-                    };
-                    state.last_api_req_info = Some(ApiReqInfo {
-                        request: None,
-                        tokens_in: Some(tokens_in),
-                        tokens_out: Some(tokens_out),
-                        cache_writes: usage_chunk
-                            .cache_write_tokens
-                            .or(prev_info.and_then(|r| r.cache_writes)),
-                        cache_reads: usage_chunk
-                            .cache_read_tokens
-                            .or(prev_info.and_then(|r| r.cache_reads)),
-                        reasoning_tokens: usage_chunk
-                            .reasoning_tokens
-                            .or(prev_info.and_then(|r| r.reasoning_tokens)),
-                        cost: usage_chunk.total_cost.or(prev_info.and_then(|r| r.cost)),
-                        context_window: Some(context_window),
-                        context_usage_percentage: Some(context_usage_pct),
-                    });
-                    if usage_chunk.input_tokens > 0 {
-                        state.cumulative_tokens_in = state
-                            .cumulative_tokens_in
-                            .saturating_add(usage_chunk.input_tokens);
-                    }
-                    if usage_chunk.output_tokens > 0 {
-                        state.cumulative_tokens_out = state
-                            .cumulative_tokens_out
-                            .saturating_add(usage_chunk.output_tokens);
-                    }
-                    if let Some(cache_writes) = usage_chunk.cache_write_tokens
-                        && cache_writes > 0
-                    {
-                        state.cumulative_cache_writes =
-                            state.cumulative_cache_writes.saturating_add(cache_writes);
-                    }
-                    if let Some(cache_reads) = usage_chunk.cache_read_tokens
-                        && cache_reads > 0
-                    {
-                        state.cumulative_cache_reads =
-                            state.cumulative_cache_reads.saturating_add(cache_reads);
-                    }
-                    if let Some(reasoning_tokens) = usage_chunk.reasoning_tokens
-                        && reasoning_tokens > 0
-                    {
-                        state.cumulative_reasoning_tokens = state
-                            .cumulative_reasoning_tokens
-                            .saturating_add(reasoning_tokens);
-                    }
-                    if let Some(cost) = usage_chunk.total_cost
-                        && cost > 0.0
-                    {
-                        state.cumulative_cost += cost;
-                    }
-                }
-                ApiStreamChunk::ToolCalls(tool_chunk) => {
-                    // Print separator when first tool call is detected
-                    if !tool_call_detected && !self.config.json_output {
-                        self.config.output_writer.flush();
-                        tool_call_detected = true;
-                    }
-
-                    let tc = tool_chunk.tool_call;
-                    let key = tc
-                        .call_id
-                        .clone()
-                        .unwrap_or_else(|| tc.function.id.clone().unwrap_or_default());
-                    // Prevent empty-key collisions when provider sends tool calls without IDs.
-                    // Two calls both keyed by "" would overwrite each other in tool_calls_map.
-                    let key = if key.is_empty() {
-                        ulid::Ulid::new().to_string()
-                    } else {
-                        key
-                    };
-                    tracing::info!(
-                        tool_name = ?tc.function.name,
-                        tool_id = ?key,
-                        has_args = tc.function.arguments.is_some(),
-                        "received tool call from stream"
-                    );
-
-                    // Print tool call header only on first appearance of this tool call key
-                    if !self.config.json_output && !tool_calls_map.contains_key(&key) {
-                        let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
-                        self.config
-                            .output_writer
-                            .emit(OutputEvent::tool_call(format!("▶ {}", tool_name)));
-                    }
-                    if self.config.json_output {
-                        tracing::info!(
-                            target: "json_output",
-                            "{}",
-                            serde_json::json!({
-                                "type": "tool_calls",
-                                "tool_call": {
-                                    "call_id": tc.call_id,
-                                    "function": {
-                                        "id": tc.function.id,
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments,
-                                    }
-                                },
-                                "id": tool_chunk.id,
-                                "signature": tool_chunk.signature,
-                            })
-                            .to_string()
-                        );
-                    }
-                    // Allow partial tool call deltas with arguments even when name is missing.
-                    // Provider may send name in a later chunk; merge logic assembles complete call.
-                    let args_absent = tc.function.arguments.is_none()
-                        || tc.function.arguments.as_ref().is_some_and(|a| a.is_empty());
-                    if (tc.function.name.is_none()
-                        || tc.function.name.as_ref().is_some_and(|n| n.is_empty()))
-                        && args_absent
-                    {
-                        tracing::warn!(
-                            "received tool call with empty name and no arguments, skipping"
-                        );
-                        continue;
-                    }
-                    // Merge partial tool call chunks by ID using HashMap for O(1) lookup (P4)
-                    // Preserve insertion order via tool_call_order vec
-                    if let Some(existing) = tool_calls_map.get_mut(&key) {
-                        if let Some(new_args) = tc.function.arguments
-                            && !new_args.is_empty()
+                        let tokens_in = if usage_chunk.input_tokens > 0 {
+                            usage_chunk.input_tokens
+                        } else {
+                            prev_info.and_then(|r| r.tokens_in).unwrap_or(0)
+                        };
+                        let tokens_out = if usage_chunk.output_tokens > 0 {
+                            usage_chunk.output_tokens
+                        } else {
+                            prev_info.and_then(|r| r.tokens_out).unwrap_or(0)
+                        };
+                        state.last_api_req_info = Some(ApiReqInfo {
+                            request: None,
+                            tokens_in: Some(tokens_in),
+                            tokens_out: Some(tokens_out),
+                            cache_writes: usage_chunk
+                                .cache_write_tokens
+                                .or(prev_info.and_then(|r| r.cache_writes)),
+                            cache_reads: usage_chunk
+                                .cache_read_tokens
+                                .or(prev_info.and_then(|r| r.cache_reads)),
+                            reasoning_tokens: usage_chunk
+                                .reasoning_tokens
+                                .or(prev_info.and_then(|r| r.reasoning_tokens)),
+                            cost: usage_chunk.total_cost.or(prev_info.and_then(|r| r.cost)),
+                            context_window: Some(context_window),
+                            context_usage_percentage: Some(context_usage_pct),
+                        });
+                        if usage_chunk.input_tokens > 0 {
+                            state.cumulative_tokens_in = state
+                                .cumulative_tokens_in
+                                .saturating_add(usage_chunk.input_tokens);
+                        }
+                        if usage_chunk.output_tokens > 0 {
+                            state.cumulative_tokens_out = state
+                                .cumulative_tokens_out
+                                .saturating_add(usage_chunk.output_tokens);
+                        }
+                        if let Some(cache_writes) = usage_chunk.cache_write_tokens
+                            && cache_writes > 0
                         {
-                            let merged = existing
-                                .function
-                                .arguments
-                                .as_ref()
-                                .map(|a| a.clone() + &new_args)
-                                .unwrap_or(new_args);
-                            // Validate merged argument size
-                            if merged.len() > MAX_TOOL_ARGUMENT_SIZE {
+                            state.cumulative_cache_writes =
+                                state.cumulative_cache_writes.saturating_add(cache_writes);
+                        }
+                        if let Some(cache_reads) = usage_chunk.cache_read_tokens
+                            && cache_reads > 0
+                        {
+                            state.cumulative_cache_reads =
+                                state.cumulative_cache_reads.saturating_add(cache_reads);
+                        }
+                        if let Some(reasoning_tokens) = usage_chunk.reasoning_tokens
+                            && reasoning_tokens > 0
+                        {
+                            state.cumulative_reasoning_tokens = state
+                                .cumulative_reasoning_tokens
+                                .saturating_add(reasoning_tokens);
+                        }
+                        if let Some(cost) = usage_chunk.total_cost
+                            && cost > 0.0
+                        {
+                            state.cumulative_cost += cost;
+                        }
+                    }
+                    ApiStreamChunk::ToolCalls(tool_chunk) => {
+                        // Print separator when first tool call is detected
+                        if !tool_call_detected && !self.config.json_output {
+                            self.config.output_writer.flush();
+                            tool_call_detected = true;
+                        }
+
+                        let tc = tool_chunk.tool_call;
+                        let key = tc
+                            .call_id
+                            .clone()
+                            .unwrap_or_else(|| tc.function.id.clone().unwrap_or_default());
+                        // Prevent empty-key collisions when provider sends tool calls without IDs.
+                        // Two calls both keyed by "" would overwrite each other in tool_calls_map.
+                        let key = if key.is_empty() {
+                            ulid::Ulid::new().to_string()
+                        } else {
+                            key
+                        };
+                        tracing::info!(
+                            tool_name = ?tc.function.name,
+                            tool_id = ?key,
+                            has_args = tc.function.arguments.is_some(),
+                            "received tool call from stream"
+                        );
+
+                        // Print tool call header only on first appearance of this tool call key
+                        if !self.config.json_output && !tool_calls_map.contains_key(&key) {
+                            let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
+                            self.config
+                                .output_writer
+                                .emit(OutputEvent::tool_call(format!("▶ {}", tool_name)));
+                            emitted_output_this_attempt = true;
+                        }
+                        if self.config.json_output {
+                            tracing::info!(
+                                target: "json_output",
+                                "{}",
+                                serde_json::json!({
+                                    "type": "tool_calls",
+                                    "tool_call": {
+                                        "call_id": tc.call_id,
+                                        "function": {
+                                            "id": tc.function.id,
+                                            "name": tc.function.name,
+                                            "arguments": tc.function.arguments,
+                                        }
+                                    },
+                                    "id": tool_chunk.id,
+                                    "signature": tool_chunk.signature,
+                                })
+                                .to_string()
+                            );
+                        }
+                        // Allow partial tool call deltas with arguments even when name is missing.
+                        // Provider may send name in a later chunk; merge logic assembles complete call.
+                        let args_absent = tc.function.arguments.is_none()
+                            || tc.function.arguments.as_ref().is_some_and(|a| a.is_empty());
+                        if (tc.function.name.is_none()
+                            || tc.function.name.as_ref().is_some_and(|n| n.is_empty()))
+                            && args_absent
+                        {
+                            tracing::warn!(
+                                "received tool call with empty name and no arguments, skipping"
+                            );
+                            continue;
+                        }
+                        // Merge partial tool call chunks by ID using HashMap for O(1) lookup (P4)
+                        // Preserve insertion order via tool_call_order vec
+                        if let Some(existing) = tool_calls_map.get_mut(&key) {
+                            if let Some(new_args) = tc.function.arguments
+                                && !new_args.is_empty()
+                            {
+                                let merged = existing
+                                    .function
+                                    .arguments
+                                    .as_ref()
+                                    .map(|a| a.clone() + &new_args)
+                                    .unwrap_or(new_args);
+                                // Validate merged argument size
+                                if merged.len() > MAX_TOOL_ARGUMENT_SIZE {
+                                    let truncated =
+                                        truncate_json_arguments(&merged, MAX_TOOL_ARGUMENT_SIZE);
+                                    if truncated.was_repaired {
+                                        tracing::warn!(
+                                            "Tool call arguments were truncated AND repaired (original JSON was malformed)"
+                                        );
+                                    }
+                                    existing.function.arguments = Some(truncated.value);
+                                } else {
+                                    existing.function.arguments = Some(merged);
+                                }
+                            }
+                            if tc.function.name.is_some() {
+                                existing.function.name = tc.function.name;
+                            }
+                            if tc.call_id.is_some() {
+                                existing.call_id = tc.call_id;
+                            }
+                        } else {
+                            // Validate initial argument size
+                            if let Some(ref args) = tc.function.arguments
+                                && args.len() > MAX_TOOL_ARGUMENT_SIZE
+                            {
                                 let truncated =
-                                    truncate_json_arguments(&merged, MAX_TOOL_ARGUMENT_SIZE);
+                                    truncate_json_arguments(args, MAX_TOOL_ARGUMENT_SIZE);
                                 if truncated.was_repaired {
                                     tracing::warn!(
                                         "Tool call arguments were truncated AND repaired (original JSON was malformed)"
                                     );
                                 }
-                                existing.function.arguments = Some(truncated.value);
-                            } else {
-                                existing.function.arguments = Some(merged);
+                                let mut truncated_tc = tc.clone();
+                                truncated_tc.function.arguments = Some(truncated.value);
+                                tool_call_order.push(key.clone());
+                                tool_calls_map.insert(key, truncated_tc);
+                                continue;
                             }
-                        }
-                        if tc.function.name.is_some() {
-                            existing.function.name = tc.function.name;
-                        }
-                        if tc.call_id.is_some() {
-                            existing.call_id = tc.call_id;
-                        }
-                    } else {
-                        // Validate initial argument size
-                        if let Some(ref args) = tc.function.arguments
-                            && args.len() > MAX_TOOL_ARGUMENT_SIZE
-                        {
-                            let truncated = truncate_json_arguments(args, MAX_TOOL_ARGUMENT_SIZE);
-                            if truncated.was_repaired {
-                                tracing::warn!(
-                                    "Tool call arguments were truncated AND repaired (original JSON was malformed)"
-                                );
-                            }
-                            let mut truncated_tc = tc.clone();
-                            truncated_tc.function.arguments = Some(truncated.value);
                             tool_call_order.push(key.clone());
-                            tool_calls_map.insert(key, truncated_tc);
-                            continue;
+                            tool_calls_map.insert(key, tc);
                         }
-                        tool_call_order.push(key.clone());
-                        tool_calls_map.insert(key, tc);
+                    }
+                    ApiStreamChunk::Error(err) => {
+                        tracing::error!(error = %err, "received error chunk from provider stream");
+                        if stream_retry_attempt == 0
+                            && !first_chunk_received
+                            && !emitted_output_this_attempt
+                            && stream_error_is_retryable(&err)
+                        {
+                            retryable_stream_error_before_output = Some(err);
+                            break;
+                        }
+                        stream_errored = true;
+                        if self.config.json_output {
+                            tracing::info!(
+                                target: "json_output",
+                                "{}",
+                                serde_json::json!({
+                                    "type": "error",
+                                    "error": err
+                                })
+                            );
+                            emitted_output_this_attempt = true;
+                        } else {
+                            // Emit to output_writer so TUI users see the error in the output pane
+                            self.config
+                                .output_writer
+                                .emit(OutputEvent::plain(format!("Error: {}", err)));
+                            emitted_output_this_attempt = true;
+                        }
                     }
                 }
-                ApiStreamChunk::Error(err) => {
-                    tracing::error!(error = %err, "received error chunk from provider stream");
-                    stream_errored = true;
-                    if self.config.json_output {
-                        tracing::info!(
-                            target: "json_output",
-                            "{}",
-                            serde_json::json!({
-                                "type": "error",
-                                "error": err
-                            })
-                        );
+            }
+
+            // Final flush: print any remaining buffered content and ensure newline
+            if in_code_block && !self.config.json_output {
+                let remaining = display_buffer.trim_end().to_string();
+                if !remaining.is_empty() {
+                    code_block_lines += 1;
+                    code_block_full_buffer.push(remaining.clone());
+                    if code_block_lines <= code_block_display_limit {
+                        code_block_buffer.push(remaining);
                     } else {
-                        // Emit to output_writer so TUI users see the error in the output pane
-                        self.config
-                            .output_writer
-                            .emit(OutputEvent::plain(format!("Error: {}", err)));
+                        code_block_snipped = true;
                     }
                 }
-            }
-        }
-
-        // Final flush: print any remaining buffered content and ensure newline
-        if in_code_block && !self.config.json_output {
-            let remaining = display_buffer.trim_end().to_string();
-            if !remaining.is_empty() {
-                code_block_lines += 1;
-                code_block_full_buffer.push(remaining.clone());
-                if code_block_lines <= code_block_display_limit {
-                    code_block_buffer.push(remaining);
-                } else {
-                    code_block_snipped = true;
-                }
-            }
-            print_code_block(
-                &code_block_buffer,
-                &code_block_lang,
-                &self.config.output_writer,
-            );
-            if code_block_snipped {
-                let index = if self.config.interactive_mode {
-                    Some(push_snipped_code_block(
-                        &mut snipped_blocks_this_turn,
-                        snipped_block_start_index,
-                        &code_block_lang,
-                        &code_block_full_buffer,
-                    ))
-                } else {
-                    None
-                };
-                self.config
-                    .output_writer
-                    .emit(OutputEvent::dim(snipped_code_block_hint(index)));
-            }
-            self.config.output_writer.flush();
-        } else if !display_buffer.is_empty() && !self.config.json_output {
-            let remaining = display_buffer.trim_end().to_string();
-            if !remaining.is_empty() {
-                self.record_first_output_emit_time().await;
-                print_model_line_with_prefix_if_pending(
-                    &remaining,
+                print_code_block(
+                    &code_block_buffer,
+                    &code_block_lang,
                     &self.config.output_writer,
-                    &mut turn_indicator_pending,
                 );
+                if code_block_snipped {
+                    let index = if self.config.interactive_mode {
+                        Some(push_snipped_code_block(
+                            &mut snipped_blocks_this_turn,
+                            snipped_block_start_index,
+                            &code_block_lang,
+                            &code_block_full_buffer,
+                        ))
+                    } else {
+                        None
+                    };
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::dim(snipped_code_block_hint(index)));
+                }
+                self.config.output_writer.flush();
+            } else if !display_buffer.is_empty() && !self.config.json_output {
+                let remaining = display_buffer.trim_end().to_string();
+                if !remaining.is_empty() {
+                    self.record_first_output_emit_time().await;
+                    print_model_line_with_prefix_if_pending(
+                        &remaining,
+                        &self.config.output_writer,
+                        &mut turn_indicator_pending,
+                    );
+                }
+            } else if !self.config.json_output {
+                self.config.output_writer.flush();
             }
-        } else if !self.config.json_output {
-            self.config.output_writer.flush();
-        }
 
-        // Wait for stream to complete
-        if let Err(e) = stream_handle.await {
-            let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
-            return TurnResult::Error(actionable.display());
-        }
+            // Wait for stream to complete
+            if let Err(e) = stream_handle.await {
+                let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
+                return TurnResult::Error(actionable.display());
+            }
 
-        // If stream errored mid-response, note the partial content in the error
-        if stream_errored {
-            let partial_note = if !accumulated_text.is_empty() || !accumulated_reasoning.is_empty()
-            {
-                format!(
-                    " (partial response of {} text chars{} discarded)",
-                    accumulated_text.len(),
-                    if !accumulated_reasoning.is_empty() {
-                        format!(" + {} reasoning chars", accumulated_reasoning.len())
+            if let Some(err) = retryable_stream_error_before_output {
+                {
+                    let mut state = self.state.lock().await;
+                    state.did_automatically_retry_failed_api_request = true;
+                }
+                stream_retry_attempt += 1;
+                tracing::warn!(
+                    attempt = stream_retry_attempt,
+                    error = %err,
+                    "retrying provider stream after pre-output transport failure"
+                );
+                continue 'provider_stream_attempt;
+            }
+
+            // If stream errored mid-response, note the partial content in the error
+            if stream_errored {
+                let partial_note =
+                    if !accumulated_text.is_empty() || !accumulated_reasoning.is_empty() {
+                        format!(
+                            " (partial response of {} text chars{} discarded)",
+                            accumulated_text.len(),
+                            if !accumulated_reasoning.is_empty() {
+                                format!(" + {} reasoning chars", accumulated_reasoning.len())
+                            } else {
+                                String::new()
+                            }
+                        )
                     } else {
                         String::new()
-                    }
-                )
-            } else {
-                String::new()
-            };
-            return TurnResult::Error(format!(
-                "Provider stream error{} - retry the request.",
-                partial_note
-            ));
-        }
+                    };
+                return TurnResult::Error(format!(
+                    "Provider stream error{} - retry the request.",
+                    partial_note
+                ));
+            }
+            break (
+                accumulated_text,
+                accumulated_reasoning,
+                accumulated_signature,
+                accumulated_text_signature,
+                accumulated_redacted_data,
+                tool_calls_map,
+                tool_call_order,
+                snipped_blocks_this_turn,
+            );
+        };
 
         if !snipped_blocks_this_turn.is_empty() {
             let mut state = self.state.lock().await;
@@ -4217,6 +4279,20 @@ mod tests {
         }
     }
 
+    fn drain_rendered_output(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::cli::output::OutputEvent>,
+    ) -> Vec<String> {
+        let mut rendered = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
+                crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
+            }
+        }
+        rendered
+    }
+
     #[test]
     fn test_resolve_tool_profile_applies_yolo_over_cached_profile() {
         let profile = resolve_tool_profile(
@@ -4319,6 +4395,95 @@ mod tests {
         assert_eq!(
             state.consecutive_provider_failures,
             DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retryable_stream_error_before_output_retries_once() {
+        let provider = Arc::new(crate::providers::mock::MockProvider::new(vec![
+            crate::providers::mock::MockResponse::Stream(vec![
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                    "OpenAI SSE stream error: error decoding response body (retryable)".to_string(),
+                )),
+            ]),
+            crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+        ]));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-stream-retry-before-output");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        let result = agent.execute_turn().await;
+
+        assert!(matches!(result, TurnResult::Continue));
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("recovered output"))
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("error decoding response body"))
+        );
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retryable_stream_error_after_output_does_not_retry() {
+        let provider = Arc::new(crate::providers::mock::MockProvider::new(vec![
+            crate::providers::mock::MockResponse::Stream(vec![
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Text(
+                    ApiStreamTextChunk {
+                        text: "partial output\n".to_string(),
+                        id: None,
+                        signature: None,
+                    },
+                )),
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                    "OpenAI SSE stream error: error decoding response body (retryable)".to_string(),
+                )),
+            ]),
+            crate::providers::mock::MockResponse::Text("should not be used\n".to_string()),
+        ]));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-stream-retry-after-output");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        let result = agent.execute_turn().await;
+
+        match result {
+            TurnResult::Error(message) => {
+                assert!(message.contains("Provider stream error"));
+            }
+            other => panic!("expected stream error, got {:?}", other),
+        }
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(rendered.iter().any(|line| line.contains("partial output")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("error decoding response body"))
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("should not be used"))
+        );
+        assert!(
+            !agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
         );
     }
 

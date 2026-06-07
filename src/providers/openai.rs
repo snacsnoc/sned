@@ -15,6 +15,7 @@ use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 
 /// Configuration for the OpenAI provider.
@@ -291,6 +292,41 @@ impl OpenAiProvider {
 
         Ok(body)
     }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+fn format_stream_error_diagnostics(headers: &HeaderMap, elapsed: Duration) -> String {
+    let mut parts = vec![format!("elapsed={}ms", elapsed.as_millis())];
+    for name in [
+        "content-encoding",
+        "content-type",
+        "transfer-encoding",
+        "content-length",
+        "server",
+        "x-request-id",
+        "openai-request-id",
+        "cf-ray",
+    ] {
+        if let Some(value) = header_value(headers, name) {
+            parts.push(format!("{name}={value}"));
+        }
+    }
+    parts.join(", ")
+}
+
+fn is_retryable_stream_transport_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timeout")
+        || error.contains("connection")
+        || error.contains("incomplete")
+        || error.contains("decode")
+        || error.contains("decoding")
 }
 
 fn convert_user_blocks(
@@ -917,6 +953,8 @@ impl Provider for OpenAiProvider {
             .into());
         }
 
+        let response_headers = response.headers().clone();
+        let stream_started_at = Instant::now();
         let stream = response.bytes_stream();
         // Use large buffer (10_000) to match agent_loop channel and prevent backpressure deadlocks
         // when the consumer is slow (same pattern as agent_loop.rs:726)
@@ -957,17 +995,24 @@ impl Provider for OpenAiProvider {
                         .await;
                     }
                     Err(e) => {
-                        let error_msg = format!("OpenAI SSE stream error: {}", e);
-                        let is_retryable = e.to_string().contains("timeout")
-                            || e.to_string().contains("connection")
-                            || e.to_string().contains("incomplete")
-                            || e.to_string().contains("decode");
-                        tracing::debug!(error = %e, retryable = is_retryable, "OpenAI SSE bytes_stream error");
+                        let diagnostics = format_stream_error_diagnostics(
+                            &response_headers,
+                            stream_started_at.elapsed(),
+                        );
+                        let error_text = e.to_string();
+                        let is_retryable = is_retryable_stream_transport_error(&error_text);
+                        tracing::error!(
+                            error = %e,
+                            retryable = is_retryable,
+                            diagnostics = %diagnostics,
+                            "OpenAI SSE bytes_stream error"
+                        );
                         try_send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
-                                "{}{}",
-                                error_msg,
+                                "OpenAI SSE stream error: {}; diagnostics: {}{}",
+                                e,
+                                diagnostics,
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
                             "error",
@@ -1942,6 +1987,34 @@ mod tests {
         let _provider = OpenAiProvider::new(config).unwrap();
         // Test passes if provider constructs successfully with provider_name set
         // Error body preservation is verified by ProviderHttpError storing raw body string
+    }
+
+    #[test]
+    fn test_format_stream_error_diagnostics_includes_elapsed_and_relevant_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("cf-ray", HeaderValue::from_static("abc123"));
+
+        let diagnostics = format_stream_error_diagnostics(&headers, Duration::from_millis(1532));
+
+        assert!(diagnostics.contains("elapsed=1532ms"));
+        assert!(diagnostics.contains("content-encoding=gzip"));
+        assert!(diagnostics.contains("content-type=text/event-stream"));
+        assert!(diagnostics.contains("cf-ray=abc123"));
+    }
+
+    #[test]
+    fn test_retryable_stream_transport_error_detects_decode_failures() {
+        assert!(is_retryable_stream_transport_error(
+            "error decoding response body"
+        ));
+        assert!(!is_retryable_stream_transport_error(
+            "invalid request payload"
+        ));
     }
 }
 #[cfg(test)]
