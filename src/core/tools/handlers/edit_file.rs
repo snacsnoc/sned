@@ -1373,26 +1373,30 @@ mod tests {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
-        std::fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
+        let raw_content = "line 1\nline 2\nline 3\n";
+        std::fs::write(&file_path, raw_content).unwrap();
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
         let ctx = ToolContext::new(
             state,
             None,
             dir.path().to_path_buf(),
-            AnchorStateManager::new(),
+            anchor_mgr,
             false,
             "test-task".to_string(),
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
-        let anchor = format!("{}§line 1", crate::core::hash_utils::content_hash("line 1"));
+        let anchor = format!("{}§line 1", anchors[0]);
         let stringified_files = serde_json::json!({
             "files": format!(
                 r#"[{{"path": "test.txt", "edits": [{{"anchor": "{}", "edit_type": "replace", "text": "{}§replaced"}}]}}]"#,
                 anchor,
-                crate::core::hash_utils::content_hash("line 1"),
+                anchors[0],
             )
         });
         let result = ToolHandler::execute(&handler, &ctx, stringified_files).await;
@@ -1401,6 +1405,48 @@ mod tests {
             "stringified files array should parse: {:?}",
             result.err()
         );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "replaced\nline 2\nline 3\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_strips_leaked_anchor_prefixes_from_replacement_text() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let raw_content = "line 1\nline 2\nline 3\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§line 1", anchors[0]);
+        let stringified_files = serde_json::json!({
+            "files": format!(
+                r#"[{{"path": "test.txt", "edits": [{{"anchor": "{}", "edit_type": "replace", "text": "f38ef2139e8cc75d§GymnoglossErratic §        replacement();"}}]}}]"#,
+                anchor,
+            )
+        });
+        let result = ToolHandler::execute(&handler, &ctx, stringified_files).await;
+        assert!(
+            result.is_ok(),
+            "replacement text with leaked anchors should still apply: {:?}",
+            result.err()
+        );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "        replacement();\nline 2\nline 3\n");
     }
 
     #[tokio::test]

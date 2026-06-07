@@ -18,7 +18,7 @@ pub const ANCHOR_DELIMITER: &str = "§";
 
 static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"\b[A-Z][a-zA-Z0-9]*?{}",
+        r"(?m)^[ \t]*(?:[A-Z][a-zA-Z0-9]*|[0-9a-f]{{8,16}})\s*{}",
         regex::escape(ANCHOR_DELIMITER)
     ))
     .unwrap()
@@ -75,15 +75,25 @@ pub fn split_anchor(raw_anchor: &str) -> (String, String) {
 
 /// Strips anchor prefixes from content.
 ///
-/// Removes anchor word patterns (e.g., "Apple§content" → "content").
+/// Removes anchor prefixes from the start of each line.
+///
+/// This tolerates both read_file anchors (`Apple§content`) and the
+/// hash-prefixed "updated anchor" lines shown in edit diffs
+/// (`deadbeef§Apple §content`).
 ///
 pub fn strip_hashes(content: &str) -> String {
     if content.is_empty() {
         return String::new();
     }
 
-    // Regex matches anchor patterns (alphabetic words starting with capital letter) followed by delimiter
-    ANCHOR_STRIP_REGEX.replace_all(content, "").to_string()
+    let mut stripped = content.to_string();
+    loop {
+        let next = ANCHOR_STRIP_REGEX.replace_all(&stripped, "").into_owned();
+        if next == stripped {
+            return next;
+        }
+        stripped = next;
+    }
 }
 
 /// Extracts the ID from a line reference.
@@ -145,6 +155,27 @@ mod tests {
         let content = "Apple§alpha\nL10§beta\nDemographicFragile§gamma";
         let stripped = strip_hashes(content);
         assert_eq!(stripped, "alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn test_strip_hashes_hash_prefixed_updated_anchors() {
+        let content = "f38ef2139e8cc75d§GymnoglossErratic §        keep me";
+        let stripped = strip_hashes(content);
+        assert_eq!(stripped, "        keep me");
+    }
+
+    #[test]
+    fn test_strip_hashes_preserves_indentation_after_anchor() {
+        let content = "        FontalEvaporative §        CGRect r;";
+        let stripped = strip_hashes(content);
+        assert_eq!(stripped, "        CGRect r;");
+    }
+
+    #[test]
+    fn test_strip_hashes_preserves_trailing_newline() {
+        let content = "811c9dc5§line 1\n";
+        let stripped = strip_hashes(content);
+        assert_eq!(stripped, "line 1\n");
     }
 
     #[test]
