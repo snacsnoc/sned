@@ -300,6 +300,8 @@ impl EditFileHandler {
                 Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
             } else if files_value.and_then(|f| f.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
                 Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
+            } else if files_value.and_then(|f| f.as_str()).and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok()).map(|a| a.is_empty()).unwrap_or(false) {
+                Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
             } else {
                 Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}].", files_value.unwrap()).to_string())
             };
@@ -1214,6 +1216,102 @@ mod tests {
                 .unwrap()
                 .contains("No files specified")
         );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_missing_files_exact_message() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().as_str().unwrap(),
+            "No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_empty_array_exact_message() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().as_str().unwrap(),
+            "No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_stringified_empty_array_exact_message() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": "[]"})).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().as_str().unwrap(),
+            "No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_wrong_type_exact_message() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": 42})).await;
+        assert!(result.is_ok());
+        let result_val = result.unwrap();
+        let msg = result_val.as_str().unwrap();
+        assert!(
+            msg.starts_with("Failed to parse 'files' parameter."),
+            "Should get parse failure message, got: {}",
+            msg
+        );
+        assert!(msg.contains("42"), "Error should mention the actual value");
     }
 
     #[tokio::test]
