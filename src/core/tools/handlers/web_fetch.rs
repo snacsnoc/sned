@@ -6,6 +6,7 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use url::Url;
 
@@ -38,6 +39,62 @@ fn fetch_timeout() -> std::time::Duration {
             .unwrap_or(30);
         std::time::Duration::from_secs(secs)
     })
+}
+
+/// Consume a chunked response body into a `Vec<u8>` with a hard memory
+/// cap. Returns `(bytes, truncated, content_length)`.
+///
+/// `truncated` is set when either the `Content-Length` header declared a
+/// body larger than `max_size` (so the caller knows the body was
+/// abbreviated even if the stream finished without hitting the cap), or
+/// the byte stream itself crossed the cap mid-read. At most `max_size`
+/// bytes are retained regardless of the actual body size — this is the
+/// fix for the response-body DoS where `response.bytes().await` would
+/// allocate the full body before truncating.
+async fn read_response_capped(
+    response: reqwest::Response,
+    max_size: usize,
+) -> Result<(Vec<u8>, bool, Option<u64>), reqwest::Error> {
+    let content_length = response.content_length();
+    let stream = response
+        .bytes_stream()
+        .map(|r| r.map(|b| b.to_vec()));
+    let (buf, truncated) = collect_capped(content_length, stream, max_size).await?;
+    Ok((buf, truncated, content_length))
+}
+
+/// Inner loop of `read_response_capped`, decoupled from `reqwest::Response`
+/// so it can be unit-tested with a synthetic `futures::stream::iter`.
+async fn collect_capped<E, S>(
+    content_length: Option<u64>,
+    stream: S,
+    max_size: usize,
+) -> Result<(Vec<u8>, bool), E>
+where
+    E: std::fmt::Display,
+    S: futures::Stream<Item = Result<Vec<u8>, E>> + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut stream = stream;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buf.len() + chunk.len() > max_size {
+            let take = max_size - buf.len();
+            buf.extend_from_slice(&chunk[..take]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    if !truncated {
+        if let Some(len) = content_length {
+            if len as usize > max_size {
+                truncated = true;
+            }
+        }
+    }
+    Ok((buf, truncated))
 }
 
 /// Web fetch handler for fetching URLs and returning page content as text.
@@ -311,24 +368,24 @@ impl WebFetchHandler {
                 )));
             }
 
-            let mut bytes = response.bytes().await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to read response body: {}", e))
-            })?;
-
             let max_size = max_response_size();
-            let original_len = bytes.len();
-            let truncated = original_len > max_size;
-            if truncated {
-                bytes.truncate(max_size);
-            }
+            let (bytes, truncated, content_length) = read_response_capped(response, max_size)
+                .await
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to read response body: {}", e))
+                })?;
 
             let html = String::from_utf8_lossy(&bytes).to_string();
             let text = html_to_text(&html);
 
             return if truncated {
+                let full_size_note = match content_length {
+                    Some(len) => format!(", full size was {} bytes", len),
+                    None => ", Content-Length not declared".to_string(),
+                };
                 Ok(format!(
-                    "Successfully fetched {} (response truncated at {} bytes, full size was {} bytes). Content:\n\n{}",
-                    url, max_size, original_len, text
+                    "Successfully fetched {} (response truncated at {} bytes{}). Content:\n\n{}",
+                    url, max_size, full_size_note, text
                 ))
             } else {
                 Ok(format!(
@@ -582,5 +639,60 @@ mod tests {
         assert!(WebFetchHandler::validate_url("http://[::ffff:192.168.1.1]").is_err());
         assert!(WebFetchHandler::validate_url("http://[::ffff:172.16.0.1]").is_err());
         assert!(WebFetchHandler::validate_url("http://[::ffff:169.254.169.254]").is_err());
+    }
+
+    fn chunk_stream(chunks: Vec<Vec<u8>>) -> impl futures::Stream<Item = Result<Vec<u8>, String>> {
+        futures::stream::iter(chunks.into_iter().map(Ok::<_, String>))
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_under_limit() {
+        let s = chunk_stream(vec![b"hello ".to_vec(), b"world".to_vec()]);
+        let (buf, truncated) = collect_capped(None, s, 1024).await.unwrap();
+        assert_eq!(buf, b"hello world".to_vec());
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_mid_stream_truncates() {
+        // 8-byte cap, 11 bytes total across three chunks. The third
+        // chunk crosses the cap and must be cut at the boundary.
+        let s = chunk_stream(vec![
+            b"hello ".to_vec(),
+            b"world".to_vec(),
+            b"extra".to_vec(),
+        ]);
+        let (buf, truncated) = collect_capped(None, s, 8).await.unwrap();
+        assert_eq!(buf, b"hello wo".to_vec());
+        assert_eq!(buf.len(), 8);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_content_length_over_limit() {
+        // Body fits in the cap, but Content-Length declares a larger
+        // body. The caller should still know the response was truncated.
+        let s = chunk_stream(vec![b"small".to_vec()]);
+        let (buf, truncated) = collect_capped(Some(1_000_000), s, 1024).await.unwrap();
+        assert_eq!(buf, b"small".to_vec());
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_empty_stream() {
+        let s = chunk_stream(vec![]);
+        let (buf, truncated) = collect_capped(None, s, 1024).await.unwrap();
+        assert!(buf.is_empty());
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_exact_limit_not_truncated() {
+        // Body size equals cap exactly: no truncation from stream,
+        // and no Content-Length, so we report the full body as read.
+        let s = chunk_stream(vec![b"abcdefgh".to_vec()]);
+        let (buf, truncated) = collect_capped(None, s, 8).await.unwrap();
+        assert_eq!(buf.len(), 8);
+        assert!(!truncated);
     }
 }
