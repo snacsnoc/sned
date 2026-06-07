@@ -2618,13 +2618,20 @@ edition = "2021"
         let raw_content = "alpha\nbeta\ngamma\n";
         std::fs::write(&file_path, raw_content).unwrap();
 
+        // Canonicalize the path so it matches what the handler's
+        // resolve_sanitized_path produces (macOS tempdir uses a symlink
+        // that canonicalize resolves to /private/var/folders/...).
+        let canonical_path = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.clone());
+
         // Simulate a previous read by reconciling the file once
         // to populate the anchor state.
         let anchor_mgr = AnchorStateManager::new();
         let initial_lines: Vec<String> =
             raw_content.lines().map(|s| s.to_string()).collect();
         let initial_anchors = anchor_mgr.reconcile(
-            file_path.to_str().unwrap(),
+            canonical_path.to_str().unwrap(),
             &initial_lines,
             Some("test-task"),
         );
