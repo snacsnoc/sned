@@ -615,12 +615,15 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame) {
         let has_plan = self.plan_state_cache.is_some();
 
-        if has_plan {
-            // Layout with plan panel on the right
-            let [main_area, plan_area] =
-                Layout::horizontal([Constraint::Min(40), Constraint::Length(35)])
-                    .areas(frame.area());
+        // Reserve the plan area even when no plan is active so the
+        // Clear widget below can wipe stale plan content from the
+        // right 35 columns after the plan is dismissed.
+        let [_main_area, plan_area] =
+            Layout::horizontal([Constraint::Min(40), Constraint::Length(35)])
+                .areas(frame.area());
 
+        if has_plan {
+            let main_area = _main_area;
             let [output_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(1),
@@ -640,8 +643,11 @@ impl App {
             if self.model_picker_active {
                 self.render_model_picker_overlay(frame, output_area);
             }
+            frame.render_widget(Clear, plan_area);
             self.render_plan_panel(frame, plan_area);
         } else {
+            frame.render_widget(Clear, plan_area);
+
             let [output_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(1),
