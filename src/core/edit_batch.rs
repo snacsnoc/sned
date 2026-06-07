@@ -48,6 +48,7 @@ pub struct BatchResult {
     pub final_content: Option<String>,
     pub resolved_count: usize,
     pub failed_count: usize,
+    pub overlap: bool,
     /// Net lines added (additions minus removals) for session summary.
     pub lines_added: u32,
     /// Net lines removed for session summary.
@@ -204,8 +205,9 @@ impl BatchProcessor {
             return BatchResult {
                 success: false,
                 final_content: None,
-                resolved_count: 0,
-                failed_count: batch.resolved_edits.len() + batch.failed_edits.len(),
+                resolved_count: batch.resolved_edits.len(),
+                failed_count: batch.failed_edits.len(),
+                overlap: true,
                 lines_added: 0,
                 lines_removed: 0,
             };
@@ -224,6 +226,7 @@ impl BatchProcessor {
             final_content: Some(batch.final_content.clone()),
             resolved_count: batch.resolved_edits.len(),
             failed_count: batch.failed_edits.len(),
+            overlap: false,
             lines_added: added_count as u32,
             lines_removed: removed_count as u32,
         }
@@ -851,8 +854,9 @@ mod tests {
         let result = processor.apply_batch(&mut prepared, "overlap.rs", "overlap.rs");
 
         assert!(!result.success);
-        assert_eq!(result.resolved_count, 0);
-        assert_eq!(result.failed_count, 3);
+        assert!(result.overlap);
+        assert_eq!(result.resolved_count, 2);
+        assert_eq!(result.failed_count, 1);
     }
 
     #[test]

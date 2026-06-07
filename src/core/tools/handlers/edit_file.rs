@@ -13,7 +13,7 @@ use crate::core::agent_loop::TaskState;
 use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
 use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits};
 use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard, FileEditorError};
-use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes};
+use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor};
 use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
 use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{
@@ -192,6 +192,21 @@ impl EditFileHandler {
                         },
                         ANCHOR_DELIMITER
                     ));
+                } else {
+                    let (anchor_name, _) = split_anchor(anchor);
+                    if anchor_name.is_empty() || anchor_name.chars().all(|c| c.is_ascii_digit())
+                    {
+                        invalid_anchors.push(format!(
+                            "  - File '{}': anchor '{}' must include a non-numeric anchor name before the '{}' delimiter",
+                            path,
+                            if anchor.chars().count() > 50 {
+                                format!("{}...", anchor.chars().take(50).collect::<String>())
+                            } else {
+                                anchor.to_string()
+                            },
+                            ANCHOR_DELIMITER
+                        ));
+                    }
                 }
 
                 if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a| a.as_str()) {
@@ -207,6 +222,22 @@ impl EditFileHandler {
                             },
                             ANCHOR_DELIMITER
                         ));
+                    } else {
+                        let (end_anchor_name, _) = split_anchor(end_anchor);
+                        if end_anchor_name.is_empty()
+                            || end_anchor_name.chars().all(|c| c.is_ascii_digit())
+                        {
+                            invalid_anchors.push(format!(
+                                "  - File '{}': end_anchor '{}' must include a non-numeric anchor name before the '{}' delimiter",
+                                path,
+                                if end_anchor.chars().count() > 50 {
+                                    format!("{}...", end_anchor.chars().take(50).collect::<String>())
+                                } else {
+                                    end_anchor.to_string()
+                                },
+                                ANCHOR_DELIMITER
+                            ));
+                        }
                     }
                 }
             }
@@ -332,6 +363,7 @@ impl EditFileHandler {
         let mut all_results: Vec<String> = Vec::new();
         let mut total_applied = 0usize;
         let mut total_failed = 0usize;
+        let mut total_overlap = 0usize;
         let mut total_edits = 0usize;
         let mut diff_previews: Vec<String> = Vec::new();
         let mut prepared_batches: Vec<(crate::core::edit_batch::FileEditBatch, PreparedEdits)> =
@@ -657,8 +689,13 @@ impl EditFileHandler {
                 Self::mark_must_reread(state, &batch.absolute_path);
             }
 
-            total_applied += result.resolved_count;
+            if result.success {
+                total_applied += result.resolved_count;
+            }
             total_failed += result.failed_count;
+            if result.overlap {
+                total_overlap += result.resolved_count;
+            }
 
             // Record file change for session summary
             if result.success && result.resolved_count > 0 {
@@ -1070,25 +1107,43 @@ impl EditFileHandler {
 
         // Track consecutive mistakes: increment when any edits failed,
         // only reset when ALL edits succeeded (no failures at all).
-        if total_failed > 0 {
+        let total_mistakes = total_failed + total_overlap;
+        if total_mistakes > 0 {
             state.consecutive_mistakes += 1;
             if !json_output {
                 use crate::cli::output::OutputEvent;
+                let overlap_note = if total_overlap > 0 {
+                    format!(" ({} edit(s) overlapped)", total_overlap)
+                } else {
+                    String::new()
+                };
                 output_writer.emit(OutputEvent::plain(format!(
-                    "[edit_file] {} edit(s) failed (consecutive_mistakes={})",
-                    total_failed, state.consecutive_mistakes
+                    "[edit_file] {} edit(s) failed{} (consecutive_mistakes={})",
+                    total_mistakes,
+                    overlap_note,
+                    state.consecutive_mistakes
                 )));
             }
         } else if total_applied > 0 {
             state.consecutive_mistakes = 0;
         }
 
-        let summary = format!(
-            "Edited {} file(s): {} edit(s) applied, {} edit(s) failed.",
-            files.len(),
-            total_applied,
-            total_failed
-        );
+        let summary = if total_overlap > 0 {
+            format!(
+                "Edited {} file(s): {} edit(s) applied, {} edit(s) failed, {} edit(s) overlapped.",
+                files.len(),
+                total_applied,
+                total_failed,
+                total_overlap
+            )
+        } else {
+            format!(
+                "Edited {} file(s): {} edit(s) applied, {} edit(s) failed.",
+                files.len(),
+                total_applied,
+                total_failed
+            )
+        };
 
         Ok(format!(
             "{}\n\n{}",
@@ -2484,8 +2539,45 @@ edition = "2021"
             err_msg.contains("..."),
             "Long anchor should be truncated with ellipsis"
         );
-        assert!(!err_msg.contains("你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界"), 
-                "Long anchor should be truncated, not show full 80-char string");
+        assert!(
+            !err_msg.contains("你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界"),
+            "Long anchor should be truncated, not show full 80-char string"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_anchors_rejects_invalid_anchor_name() {
+        let _guard = TEST_MUTEX.lock().await;
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": "123§line 1",
+                    "text": "replacement"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err(), "invalid anchor name should fail validation");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Hash anchor validation failed"));
+        assert!(err_msg.contains("anchor name"));
     }
 
     #[tokio::test]
@@ -2565,6 +2657,61 @@ edition = "2021"
                 edit_type
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_overlap_edits_report_overlap_summary() {
+        use tempfile::tempdir;
+
+        let _guard = TEST_MUTEX.lock().await;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let lines = crate::core::file_editor::split_content_lines(&content);
+        let hashes = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [
+                    {
+                        "anchor": format!("{}§line1", hashes[0]),
+                        "end_anchor": format!("{}§line2", hashes[1]),
+                        "text": "alpha"
+                    },
+                    {
+                        "anchor": format!("{}§line2", hashes[1]),
+                        "end_anchor": format!("{}§line3", hashes[2]),
+                        "text": "beta"
+                    }
+                ]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok(), "overlap failure should still return a summary");
+        let output = result.unwrap().as_str().unwrap().to_string();
+        assert!(output.contains("0 edit(s) applied"), "got: {}", output);
+        assert!(output.contains("0 edit(s) failed"), "got: {}", output);
+        assert!(output.contains("2 edit(s) overlapped"), "got: {}", output);
     }
 
     #[tokio::test]

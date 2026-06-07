@@ -62,7 +62,7 @@ impl FileEditorError {
 // Constants
 // ============================================================================
 
-static ANCHOR_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static ANCHOR_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Allow word anchors (Apple) and line-number anchors (L1, L2, etc.) for large-file fallback
     Regex::new(r"^[A-Z][a-zA-Z0-9]*$").unwrap()
 });
