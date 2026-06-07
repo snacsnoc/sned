@@ -14,6 +14,9 @@ pub fn get_provider_from_env() -> Option<&'static str> {
     if std::env::var("OPENROUTER_API_KEY").is_ok() {
         return Some("openrouter");
     }
+    if std::env::var("OPENAI_API_BASE").is_ok() && std::env::var("OPENAI_API_KEY").is_ok() {
+        return Some("openai");
+    }
     if std::env::var("OPENAI_API_KEY").is_ok() {
         return Some("openai-native");
     }
@@ -25,9 +28,6 @@ pub fn get_provider_from_env() -> Option<&'static str> {
     }
     if std::env::var("DEEPSEEK_API_KEY").is_ok() {
         return Some("deepseek");
-    }
-    if std::env::var("OPENAI_API_BASE").is_ok() {
-        return Some("openai");
     }
     None
 }
@@ -41,6 +41,7 @@ mod tests {
         let vars = [
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
+            "OPENAI_API_BASE",
             "GEMINI_API_KEY",
             "MINIMAX_API_KEY",
             "MINIMAX_CN_API_KEY",
@@ -113,9 +114,17 @@ mod tests {
 
         clear_test_env_vars();
 
-        // Test OPENAI_API_BASE alone
+        // Test OPENAI_API_BASE alone (should return None without OPENAI_API_KEY)
         // SAFETY: single-threaded test; sequential env mutation
         unsafe { env::set_var("OPENAI_API_BASE", "https://custom.example.com/v1") };
+        assert_eq!(get_provider_from_env(), None);
+
+        clear_test_env_vars();
+
+        // Test OPENAI_API_BASE + OPENAI_API_KEY together
+        // SAFETY: single-threaded test; sequential env mutation
+        unsafe { env::set_var("OPENAI_API_BASE", "https://custom.example.com/v1") };
+        unsafe { env::set_var("OPENAI_API_KEY", "sk-test") };
         assert_eq!(get_provider_from_env(), Some("openai"));
 
         clear_test_env_vars();
