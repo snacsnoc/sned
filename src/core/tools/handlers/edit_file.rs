@@ -102,13 +102,18 @@ impl EditFileHandler {
                                 error_guidance::missing_parameter("anchor", 0)
                             ))
                         })?;
-                if anchor_raw.contains('\n') {
+                let anchor = anchor_raw
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if anchor.is_empty() {
                     return Err(ToolError::InvalidInput(format!(
-                        "Multi-line anchor not supported in file '{}'. Anchors must be a single line. Use the exact line content from read_file output.",
+                        "Anchor is empty in file '{}'. Copy the exact 'Word§line content' string from read_file output. Example: \"Crawler§void draw_game_over() {{\"",
                         path
                     )));
                 }
-                let anchor = anchor_raw.trim();
 
                 let edit_type = edit_raw
                     .get("edit_type")
@@ -331,7 +336,7 @@ impl EditFileHandler {
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
         let files_value = params.get("files");
-        let files = files_value
+        let files: Vec<serde_json::Value> = files_value
             .and_then(|f| f.as_array().cloned())
             .or_else(|| {
                 files_value
@@ -345,8 +350,15 @@ impl EditFileHandler {
                 Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
             } else if files_value.and_then(|f| f.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
                 Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
-            } else if files_value.and_then(|f| f.as_str()).and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok()).map(|a| a.is_empty()).unwrap_or(false) {
-                Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
+            } else if let Some(s) = files_value.and_then(|f| f.as_str()) {
+                match serde_json::from_str::<Vec<serde_json::Value>>(s) {
+                    Ok(parsed) if parsed.is_empty() => Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string()),
+                    Ok(_) => unreachable!("files vec is empty but parse succeeded with non-empty"),
+                    Err(e) => Ok(format!(
+                        "Failed to parse 'files' parameter as a JSON array string. The 'files' parameter must be a JSON array of {{path, edits}} objects, e.g. [{{\"path\":\"file.rs\",\"edits\":[...]}}]. Parse error: {}",
+                        e
+                    )),
+                }
             } else {
                 Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}].", files_value.unwrap()).to_string())
             };
@@ -1437,7 +1449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_file_rejects_multiline_anchors() {
+    async fn test_edit_file_accepts_first_line_of_multiline_anchor() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
@@ -1456,29 +1468,24 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let anchor = format!("{}§line 1", crate::core::hash_utils::content_hash("line 1"));
-        let multiline_anchor = format!("{}\nline 2", anchor);
+        let multiline_anchor = format!("{}\nignored trailing line", anchor);
         let params = serde_json::json!({
             "files": [{
                 "path": "test.txt",
                 "edits": [{
                     "anchor": multiline_anchor,
                     "edit_type": "replace",
-                    "end_anchor": multiline_anchor,
-                    "text": format!("{}§replaced", crate::core::hash_utils::content_hash("line 1"))
+                    "end_anchor": anchor,
+                    "text": "replaced"
                 }]
             }]
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
+        let err_str = result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
         assert!(
-            result.is_err(),
-            "multi-line anchor should be rejected, not normalized: {:?}",
-            result.ok()
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Multi-line anchor"),
-            "Error should mention multi-line anchor rejection: {}",
-            err_msg
+            result.is_ok(),
+            "multi-line anchor should be normalized to first line, not rejected: err={}",
+            err_str
         );
     }
 
