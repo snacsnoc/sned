@@ -285,19 +285,24 @@ impl EditFileHandler {
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
-        let files = params
-            .get("files")
+        let files_value = params.get("files");
+        let files = files_value
             .and_then(|f| f.as_array().cloned())
             .or_else(|| {
-                params
-                    .get("files")
+                files_value
                     .and_then(|f| f.as_str())
                     .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
             })
             .unwrap_or_default();
 
         if files.is_empty() {
-            return Ok("No files specified".to_string());
+            return if files_value.is_none() {
+                Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
+            } else if files_value.and_then(|f| f.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
+                Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
+            } else {
+                Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}].", files_value.unwrap()).to_string())
+            };
         }
 
         self.validate_anchors(&files, workspace_root)?;

@@ -2026,8 +2026,8 @@ async fn run_main_loop(
         }
     }
 
-    const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(10);
-    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(15);
+    const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(1);
+    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
     let mut timing = TimingSummary {
         enabled: timing_enabled,
