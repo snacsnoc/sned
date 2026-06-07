@@ -2552,7 +2552,7 @@ pub async fn run_interactive_shell_inner(
     }
 
     // 2. Create output channel (bounded to prevent memory exhaustion during output floods)
-    let (output_tx, mut output_rx) = mpsc::channel(4096);
+    let (output_tx, mut output_rx) = mpsc::channel(8192);
     let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(output_tx));
 
     // 3. Build session
