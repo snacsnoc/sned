@@ -61,7 +61,7 @@ tui-approval-scroll   Scroll away, then verify approval prompt stays visible
 tui-history-navigation Type prompts, press Up arrow, verify previous prompt appears
 tui-slash-commands    Type /help, verify help text renders in output
 tui-auto-scroll       Type multiple prompts, verify output scrolls to show latest
-tui-model-switch      Type /model anthropic/claude-sonnet-4, verify switch message renders
+tui-model-switch      Type /model mock/mock-model, verify switch message renders
 help                  --help shows usage
 version               --version shows version
 invalid-flag           Invalid flag returns an error
@@ -110,7 +110,7 @@ test_description() {
         tui-history-navigation) echo "Type prompts, press Up arrow, verify previous prompt appears in input" ;;
         tui-slash-commands) echo "Type /help, verify help text renders in output" ;;
         tui-auto-scroll) echo "Type multiple prompts, verify output scrolls to show latest" ;;
-        tui-model-switch) echo "Type /model anthropic/claude-sonnet-4, verify switch message renders" ;;
+        tui-model-switch) echo "Type /model mock/mock-model, verify switch message renders" ;;
         help) echo "--help shows usage" ;;
         version) echo "--version shows version" ;;
         invalid-flag) echo "Invalid flag returns an error" ;;
@@ -1273,7 +1273,7 @@ try:
                 os.write(fd, b"\x1b[1;1R")
             text = buf.decode("utf-8", "replace")
             if "type a prompt" in text and not sent_model:
-                os.write(fd, b"/model anthropic/claude-sonnet-4\r")
+                os.write(fd, b"/model mock/mock-model\r")
                 sent_model = True
             if sent_model and "Model switched to" in text and not sent_exit:
                 time.sleep(0.25)
@@ -1302,7 +1302,7 @@ try:
 
     if not sent_model:
         print("TUI_TEST_FAIL /model command was not sent")
-    elif "Model switched to anthropic/claude-sonnet-4" not in clean:
+    elif "Model switched to mock/mock-model" not in clean:
         print("TUI_TEST_FAIL 'Model switched to' message not found in output")
     elif exit_code not in (0, None):
         print(f"TUI_TEST_FAIL sned exited with {exit_code}")
