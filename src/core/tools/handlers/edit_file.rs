@@ -2995,4 +2995,187 @@ edition = "2021"
             "must_reread_before_edit should be set after stale anchor detection"
         );
     }
+
+    /// Contract test: read_file output → edit_file roundtrip must succeed.
+    ///
+    /// This guards against the recurrence of the edit_file bug where the model
+    /// would submit anchors in a format that edit_file could not accept. The
+    /// read_file handler formats lines as `{anchor}§{content}`. An edit_file
+    /// call that uses those exact anchor strings must succeed.
+    #[tokio::test]
+    async fn test_edit_file_accepts_read_file_anchor_format() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("contract.rs");
+        let raw_content = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("contract-task"));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "contract-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§fn alpha() {{}}", anchors[0]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "contract.rs",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "fn alpha() { /* updated */ }"
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "edit_file must accept the exact anchor format produced by read_file: {:?}",
+            result.err()
+        );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert!(updated.contains("/* updated */"));
+    }
+
+    /// Regression test: the model sends multiple `§`-delimited pairs concatenated
+    /// across newlines (see convo-2222-export-12.json). The parser must take the
+    /// first line, not reject the whole input.
+    #[tokio::test]
+    async fn test_edit_file_accepts_concatenated_anchor_pairs() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("concat.c");
+        std::fs::write(&file_path, "static int\nload_ax_hiservices(void)\n{\n").unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = "static int\nload_ax_hiservices(void)\n{"
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("regr-task"));
+        let first_anchor = format!("{}§static int", anchors[0]);
+        let concatenated = format!(
+            "{}\nFiduciaryRegular§load_ax_hiservices(void)\nInvitationCompliance§{{",
+            first_anchor
+        );
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "regr-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": [{
+                "path": "concat.c",
+                "edits": [{
+                    "anchor": concatenated,
+                    "edit_type": "replace",
+                    "text": "static int replaced"
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "concatenated §-delimited anchor pairs must be normalized to first line: {:?}",
+            result.err()
+        );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "static int replaced\nload_ax_hiservices(void)\n{\n");
+    }
+
+    /// Error message quality: when parse_edits fails, the error must teach the
+    /// model the correct format. An error that doesn't mention `read_file` or
+    /// `§` leaves the model guessing.
+    #[tokio::test]
+    async fn test_edit_file_anchor_error_teaches_read_file_format() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "teach-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": [{
+                "path": "teach.rs",
+                "edits": [{
+                    "anchor": "",
+                    "edit_type": "replace",
+                    "text": "x"
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        let err = result.err().expect("empty anchor should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_file"),
+            "empty-anchor error must reference read_file output so the model can self-correct, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains('§'),
+            "empty-anchor error must show the § delimiter so the model uses the correct format, got: {}",
+            msg
+        );
+    }
+
+    /// Stringified JSON parse error: when `files` is a string that fails to
+    /// parse as JSON, the error must surface the actual serde_json error so
+    /// the model can diagnose the problem.
+    #[tokio::test]
+    async fn test_edit_file_stringified_json_surfaces_parse_error() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "json-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": "this is not valid json {["
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok(), "invalid stringified JSON should return Ok with error message");
+        let msg = result.unwrap().as_str().unwrap().to_string();
+        assert!(
+            msg.contains("Parse error") || msg.contains("parse error"),
+            "stringified JSON parse failure must surface the actual parse error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("files"),
+            "error must name the 'files' parameter, got: {}",
+            msg
+        );
+    }
 }
