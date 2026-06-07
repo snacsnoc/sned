@@ -109,5 +109,7 @@ fn test_secret_keys_list() {
     assert!(keys.contains(&"apiKey"));
     assert!(keys.contains(&"openAiApiKey"));
     assert!(keys.contains(&"geminiApiKey"));
-    assert_eq!(keys.len(), 39); // As per state-keys.ts (39 items)
+    assert!(!keys.contains(&"groqApiKey"));
+    assert!(!keys.contains(&"xaiApiKey"));
+    assert_eq!(keys.len(), 37); // Groq/xAI keys were removed with those providers
 }

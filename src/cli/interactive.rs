@@ -40,6 +40,60 @@ fn format_context_window(tokens: u64) -> String {
     }
 }
 
+fn build_user_message_content(
+    clean_prompt: String,
+    image_paths: Vec<String>,
+    model_info: crate::providers::ModelInfo,
+    output_writer: &OutputWriterArc,
+    show_image_warnings: bool,
+) -> crate::providers::MessageContent {
+    let supports_images = model_info.supports_images.unwrap_or(false);
+    let image_blocks = if !image_paths.is_empty() && !supports_images {
+        if show_image_warnings {
+            output_writer.emit(OutputEvent::warning(format!(
+                "Model '{}' does not support images. Ignoring {} image(s).",
+                model_info.name.as_deref().unwrap_or("unknown"),
+                image_paths.len()
+            )));
+        }
+        Vec::new()
+    } else {
+        crate::cli::image_input::load_images_to_content_blocks(&image_paths)
+    };
+
+    if image_blocks.is_empty() {
+        crate::providers::MessageContent::Text(clean_prompt)
+    } else {
+        let mut blocks: Vec<crate::providers::UserContentBlock> = Vec::new();
+        if !clean_prompt.is_empty() {
+            blocks.push(crate::providers::UserContentBlock::Text(
+                crate::providers::TextContentBlock {
+                    text: clean_prompt,
+                    shared: crate::providers::SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            ));
+        }
+        for img_block in image_blocks {
+            blocks.push(crate::providers::UserContentBlock::Image(img_block));
+        }
+        crate::providers::MessageContent::UserBlocks(blocks)
+    }
+}
+
+fn strip_active_slash_command(text: &str) -> Option<String> {
+    let query = crate::cli::slash_commands::extract_slash_query(text)?;
+    let start = text.rfind(&format!("/{}", query))?;
+    Some(format!(
+        "{}{}",
+        &text[..start],
+        &text[start + query.len() + 1..]
+    ))
+}
+
 pub struct InteractiveSession {
     agent_loop: Arc<tokio::sync::Mutex<crate::core::agent_loop::AgentLoop>>,
     hook_manager: Arc<crate::core::hooks::HookManager>,
@@ -283,44 +337,20 @@ impl InteractiveSession {
                 }
             }
 
-            let model_info = agent.lock().await.get_provider().get_model().info;
-            let supports_images = model_info.supports_images.unwrap_or(false);
-            let image_blocks = if !all_image_paths.is_empty() && !supports_images {
-                if !self.task_opts.json {
-                    agent.lock().await.output_writer().emit(
-                        crate::cli::output::OutputEvent::warning(format!(
-                            "Model '{}' does not support images. Ignoring {} image(s).",
-                            model_info.name.as_deref().unwrap_or("unknown"),
-                            all_image_paths.len()
-                        )),
-                    );
-                }
-                Vec::new()
-            } else {
-                crate::cli::image_input::load_images_to_content_blocks(&all_image_paths)
+            let (model_info, output_writer) = {
+                let agent_lock = agent.lock().await;
+                (
+                    agent_lock.get_provider().get_model().info,
+                    Arc::clone(agent_lock.output_writer()),
+                )
             };
-
-            let user_content = if image_blocks.is_empty() {
-                crate::providers::MessageContent::Text(clean_prompt)
-            } else {
-                let mut blocks: Vec<crate::providers::UserContentBlock> = Vec::new();
-                if !clean_prompt.is_empty() {
-                    blocks.push(crate::providers::UserContentBlock::Text(
-                        crate::providers::TextContentBlock {
-                            text: clean_prompt,
-                            shared: crate::providers::SharedContentFields {
-                                call_id: None,
-                                signature: None,
-                            },
-                            reasoning_details: None,
-                        },
-                    ));
-                }
-                for img_block in image_blocks {
-                    blocks.push(crate::providers::UserContentBlock::Image(img_block));
-                }
-                crate::providers::MessageContent::UserBlocks(blocks)
-            };
+            let user_content = build_user_message_content(
+                clean_prompt,
+                all_image_paths,
+                model_info,
+                &output_writer,
+                !self.task_opts.json,
+            );
 
             initial_messages.push(crate::providers::StorageMessage {
                 id: None,
@@ -456,6 +486,7 @@ async fn spawn_agent_task(
     agent_done: &Arc<tokio::sync::Notify>,
     agent_start_time: &Arc<Mutex<Option<Instant>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    output_writer: OutputWriterArc,
 ) -> anyhow::Result<()> {
     agent_busy.store(true, Ordering::Relaxed);
     *agent_start_time.lock().await = Some(Instant::now());
@@ -469,17 +500,26 @@ async fn spawn_agent_task(
         let sess = session_clone.lock().await;
         let agent_loop = sess.agent_loop.clone();
         let state_manager = sess.state_manager.clone();
+        let output_writer = Arc::clone(&output_writer);
         drop(sess);
 
         // Build initial message from prompt
         let processed_prompt = crate::cli::slash_commands::process_slash_command(&prompt);
-        let (clean_prompt, _parsed_image_paths) =
+        let (clean_prompt, parsed_image_paths) =
             crate::cli::image_input::parse_images_from_input(&processed_prompt);
+        let model_info = agent_loop.lock().await.get_provider().get_model().info;
+        let user_content = build_user_message_content(
+            clean_prompt,
+            parsed_image_paths,
+            model_info,
+            &output_writer,
+            true,
+        );
 
         let initial_messages = vec![crate::providers::StorageMessage {
             id: None,
             role: crate::providers::MessageRole::User,
-            content: crate::providers::MessageContent::Text(clean_prompt),
+            content: user_content,
             model_info: None,
             metrics: None,
             ts: Some(chrono::Utc::now().timestamp_millis() as u64),
@@ -492,12 +532,13 @@ async fn spawn_agent_task(
         };
         drop(agent_loop);
 
-        agent_busy_clone.store(false, Ordering::Relaxed);
-        agent_done_clone.notify_one();
-
         if let Err(e) = result {
+            output_writer.emit(OutputEvent::warning(format!("Agent task failed: {}", e)));
             tracing::error!("Agent task failed: {}", e);
         }
+
+        agent_busy_clone.store(false, Ordering::Relaxed);
+        agent_done_clone.notify_one();
     });
 
     *agent_task.lock().await = Some(handle);
@@ -528,24 +569,16 @@ async fn cancel_agent(
                     let _ = unsafe { libc::kill(-*pid, libc::SIGTERM) };
                 }
             }
-
-            drop(state);
-
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-            let mut state = sh.lock().await;
             for pid in &pids {
                 if unsafe { libc::kill(-*pid, 0) } == 0 {
                     let _ = unsafe { libc::kill(-*pid, libc::SIGKILL) };
                 }
             }
-            state.running_command_pids.clear();
         }
 
-        #[cfg(not(unix))]
-        {
-            state.running_command_pids.clear();
-        }
+        state.running_command_pids.clear();
     }
 
     if let Some(task) = agent_task.lock().await.take() {
@@ -677,7 +710,12 @@ async fn handle_key_event(
             if let Some(sender) = take_followup_sender(task_id) {
                 let text = app.get_input_with_expanded_pastes();
                 app.push_user_message(&text, output_writer);
-                let _ = sender.send(text);
+                if sender.send(text).is_err() {
+                    app.push_styled(
+                        "Response discarded - prompt closed.",
+                        Style::default().fg(theme::WARNING_FG),
+                    );
+                }
                 app.input = App::new_textarea(Vec::new());
             }
             return Ok(None);
@@ -839,9 +877,7 @@ async fn handle_key_event(
         app.slash_command_results.clear();
         app.slash_command_selected = 0;
         let text = app.input.lines().join("\n");
-        if let Some(query) = crate::cli::slash_commands::extract_slash_query(&text) {
-            let start = text.find('/').unwrap_or(0);
-            let new_text = format!("{}{}", &text[..start], &text[start + query.len() + 1..]);
+        if let Some(new_text) = strip_active_slash_command(&text) {
             app.input = App::new_textarea(vec![new_text]);
         }
         return Ok(None);
@@ -933,6 +969,7 @@ async fn handle_cli_only_command(
     cli_cmd: crate::cli::slash_commands::CliOnlyCommand,
     text: &str,
     app: &mut App,
+    output_writer: &OutputWriterArc,
     session: &Arc<Mutex<InteractiveSession>>,
     task_id: &str,
     agent_busy: &Arc<AtomicBool>,
@@ -1771,6 +1808,7 @@ async fn handle_cli_only_command(
                                 agent_done,
                                 agent_start_time,
                                 agent_task,
+                                output_writer.clone(),
                             )
                             .await?;
                             app.agent_busy = true;
@@ -1826,6 +1864,7 @@ async fn handle_cli_only_command(
                                 agent_done,
                                 agent_start_time,
                                 agent_task,
+                                output_writer.clone(),
                             )
                             .await?;
                             app.agent_busy = true;
@@ -2233,6 +2272,7 @@ async fn run_main_loop(
                                                 &agent_done,
                                                 &agent_start_time,
                                                 &agent_task,
+                                                output_writer.clone(),
                                             )
                                             .await?;
                                             app.agent_busy = true;
@@ -2249,6 +2289,7 @@ async fn run_main_loop(
                                             cli_cmd,
                                             &text,
                                             app,
+                                            &output_writer,
                                             &session,
                                             &task_id,
                                             &agent_busy,
@@ -2320,6 +2361,7 @@ async fn run_main_loop(
                                         &agent_done,
                                         &agent_start_time,
                                         &agent_task,
+                                        output_writer.clone(),
                                     )
                                     .await?;
                                     app.agent_busy = true;
@@ -2855,6 +2897,133 @@ mod tests {
         reset_prompt_state();
     }
 
+    struct NullOutputWriter;
+
+    impl crate::cli::output::OutputWriter for NullOutputWriter {
+        fn emit(&self, _event: crate::cli::output::OutputEvent) {}
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn test_build_user_message_content_includes_images() {
+        use std::sync::Arc;
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "sned-interactive-image-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&tmp_path, b"not-a-real-png-but-valid-by-extension").unwrap();
+
+        let writer: OutputWriterArc = Arc::new(NullOutputWriter);
+        let model_info = crate::providers::ModelInfo {
+            name: Some("image-model".to_string()),
+            supports_images: Some(true),
+            ..Default::default()
+        };
+
+        let content = build_user_message_content(
+            "hello".to_string(),
+            vec![tmp_path.to_string_lossy().into_owned()],
+            model_info,
+            &writer,
+            true,
+        );
+
+        std::fs::remove_file(&tmp_path).unwrap();
+
+        let crate::providers::MessageContent::UserBlocks(blocks) = content else {
+            panic!("Expected UserBlocks");
+        };
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0] {
+            crate::providers::UserContentBlock::Text(text) => assert_eq!(text.text, "hello"),
+            _ => panic!("Expected text block first"),
+        }
+        match &blocks[1] {
+            crate::providers::UserContentBlock::Image(image) => match &image.source {
+                crate::providers::ImageSource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert!(!data.is_empty());
+                }
+                _ => panic!("Expected base64 image source"),
+            },
+            _ => panic!("Expected image block second"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_message_content_warns_when_images_unsupported() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Default)]
+        struct CapturingWriter {
+            events: StdMutex<Vec<crate::cli::output::OutputEvent>>,
+        }
+
+        impl crate::cli::output::OutputWriter for CapturingWriter {
+            fn emit(&self, event: crate::cli::output::OutputEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+
+            fn flush(&self) {}
+        }
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "sned-interactive-image-unsupported-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&tmp_path, b"still-valid-by-extension").unwrap();
+
+        let writer = Arc::new(CapturingWriter::default());
+        let model_info = crate::providers::ModelInfo {
+            name: Some("text-only".to_string()),
+            supports_images: Some(false),
+            ..Default::default()
+        };
+        let writer_arc: OutputWriterArc = writer.clone();
+
+        let content = build_user_message_content(
+            "hello".to_string(),
+            vec![tmp_path.to_string_lossy().into_owned()],
+            model_info,
+            &writer_arc,
+            true,
+        );
+
+        std::fs::remove_file(&tmp_path).unwrap();
+
+        assert!(matches!(
+            content,
+            crate::providers::MessageContent::Text(text) if text == "hello"
+        ));
+        let events = writer.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let crate::cli::output::OutputEvent::Line(line) = &events[0] else {
+            panic!("Expected warning line");
+        };
+        let rendered = line.to_string();
+        assert!(rendered.contains("does not support images"));
+        assert!(rendered.contains("Ignoring 1 image(s)"));
+    }
+
+    #[test]
+    fn test_strip_active_slash_command_uses_last_command_position() {
+        let text = "foo/bar /baz";
+        assert_eq!(
+            strip_active_slash_command(text).as_deref(),
+            Some("foo/bar ")
+        );
+    }
+
     #[test]
     fn test_approval_result_for_key_only_accepts_prompt_shortcuts() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3091,6 +3260,7 @@ mod tests {
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
         let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
             sess.agent_loop().await.task_id().to_string()
@@ -3102,6 +3272,7 @@ mod tests {
             )),
             "/plan replace 1. Replaced step one\n2. Replaced step two",
             &mut app,
+            &output_writer,
             &session,
             &task_id,
             &agent_busy,
@@ -3198,6 +3369,7 @@ mod tests {
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
         let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
             sess.agent_loop().await.task_id().to_string()
@@ -3207,6 +3379,7 @@ mod tests {
             CliOnlyCommand::PlanApprove,
             "/plan approve",
             &mut app,
+            &output_writer,
             &session,
             &task_id,
             &agent_busy,
@@ -3316,6 +3489,7 @@ mod tests {
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
         let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
             sess.agent_loop().await.task_id().to_string()
@@ -3325,6 +3499,7 @@ mod tests {
             CliOnlyCommand::PlanPause,
             "/plan pause",
             &mut app,
+            &output_writer,
             &session,
             &task_id,
             &agent_busy,
@@ -3424,6 +3599,7 @@ mod tests {
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
         let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
             sess.agent_loop().await.task_id().to_string()
@@ -3433,6 +3609,7 @@ mod tests {
             CliOnlyCommand::PlanResume,
             "/plan resume",
             &mut app,
+            &output_writer,
             &session,
             &task_id,
             &agent_busy,
@@ -3542,6 +3719,7 @@ mod tests {
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
         let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
             sess.agent_loop().await.task_id().to_string()
@@ -3551,6 +3729,7 @@ mod tests {
             CliOnlyCommand::PlanAbort,
             "/plan abort",
             &mut app,
+            &output_writer,
             &session,
             &task_id,
             &agent_busy,
