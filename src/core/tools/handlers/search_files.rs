@@ -63,8 +63,14 @@ impl SearchFilesHandler {
             // --color: never (we handle highlighting)
             // -H: print filename (always, even for single file)
             // --max-count: limit matches per file (prevents huge single-file results)
+            // --hidden: match grep -r behavior for dotfiles and hidden directories
             let mut c = Command::new("rg");
-            c.args(["--line-number", "--color=never", "--with-filename"]);
+            c.args([
+                "--line-number",
+                "--color=never",
+                "--with-filename",
+                "--hidden",
+            ]);
 
             // Limit per-file to prevent huge results from single files
             let max_per_file = std::env::var(SEARCH_MAX_LINES_ENV)
@@ -185,12 +191,7 @@ impl SearchFilesHandler {
             ));
         }
 
-        let chars: Vec<char> = regex.chars().collect();
-        let group_count = chars
-            .iter()
-            .enumerate()
-            .filter(|&(ref i, &c)| c == '(' && (*i == 0 || chars[*i - 1] != '\\'))
-            .count();
+        let group_count = regex_group_count(regex);
         if group_count > 10 {
             return Err(ToolError::InvalidInput(
                 "Regex pattern too complex (max 10 groups)".to_string(),
@@ -213,6 +214,26 @@ impl SearchFilesHandler {
     pub fn new() -> Self {
         Self
     }
+}
+
+fn regex_group_count(regex: &str) -> usize {
+    let mut count = 0usize;
+    let mut consecutive_backslashes = 0usize;
+
+    for ch in regex.chars() {
+        if ch == '\\' {
+            consecutive_backslashes += 1;
+            continue;
+        }
+
+        if ch == '(' && consecutive_backslashes.is_multiple_of(2) {
+            count += 1;
+        }
+
+        consecutive_backslashes = 0;
+    }
+
+    count
 }
 
 async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyhow::Result<Output> {
@@ -359,6 +380,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_files_includes_hidden_files() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".hidden.txt"), "secret needle").unwrap();
+
+        let handler = SearchFilesHandler::new();
+        let result = handler
+            .search_files(Some(temp_dir.path().to_str().unwrap()), "needle", None)
+            .await
+            .unwrap();
+
+        assert!(result.contains(".hidden.txt:1:secret needle"));
+    }
+
+    #[tokio::test]
     async fn test_search_files_respects_max_count_per_file() {
         let temp_dir = TempDir::new().unwrap();
         let content = (0..150)
@@ -495,5 +530,27 @@ mod tests {
             calls_after_first, 1,
             "expected exactly one availability check"
         );
+    }
+
+    #[test]
+    fn test_regex_group_count_handles_double_escaped_backslashes() {
+        assert_eq!(regex_group_count(r"\(literal\)"), 0);
+        assert_eq!(regex_group_count(r"\\(a)(b)"), 2);
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_too_many_groups_after_escaped_backslash() {
+        let regex = r"\\((a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)";
+        let err = SearchFilesHandler::new()
+            .execute_without_state(Path::new("."), serde_json::json!({ "regex": regex }))
+            .await
+            .unwrap_err();
+
+        match err {
+            ToolError::InvalidInput(message) => {
+                assert!(message.contains("max 10 groups"));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 }
