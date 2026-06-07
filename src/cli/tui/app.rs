@@ -271,6 +271,10 @@ impl App {
                     .cached_visual_rows
                     .saturating_add(line_rows)
                     .saturating_sub(removed_rows);
+                // Auto-scroll to bottom when new output arrives (unless approval-pinned)
+                if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
+                    self.force_bottom();
+                }
                 return;
             }
         }
@@ -819,12 +823,15 @@ impl App {
             frame.render_widget(completion, completion_area);
         }
 
-        // Scrollbar on output pane (render inside the border)
+        // Scrollbar on output pane (render inside the border).
+        // Use output_rows (not total_rows) so the scrollbar thumb
+        // reflects only the output pane content — completion rows are
+        // rendered separately and must not affect scroll geometry.
         self.scrollbar_state = self
             .scrollbar_state
-            .content_length(total_rows)
-            .viewport_content_length(content_height.max(1))
-            .position(scroll_y as usize);
+            .content_length(output_rows)
+            .viewport_content_length(content_height.max(1).min(output_rows))
+            .position(scroll_y.min(output_rows as u16) as usize);
         frame.render_stateful_widget(
             Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
@@ -974,8 +981,10 @@ impl App {
         let folded = char_count > self.paste_fold_threshold;
 
         if folded {
-            // Create a marker for the folded paste
-            let marker = format!("[pasted {} chars]", char_count);
+            // Create a unique, non-user-inputtable marker for the folded paste.
+            // Index-based format prevents collisions with user-typed text and
+            // handles duplicate pastes correctly (each paste gets a distinct marker).
+            let marker = format!("\x00SNED_PASTE_{}", self.paste_chunks.len());
 
             // Insert the marker at cursor position
             self.input.insert_str(&marker);
@@ -1521,6 +1530,42 @@ mod tests {
 
         app.clear_pastes();
         assert!(app.paste_chunks.is_empty());
+    }
+
+    #[test]
+    fn test_get_input_with_expanded_pastes_handles_duplicates_and_no_collisions() {
+        let mut app = App::new();
+
+        // Simulate two separate pastes (same content, different markers)
+        app.paste_chunks.push(PasteChunk {
+            marker: "\x00SNED_PASTE_0".to_string(),
+            content: "first paste content".to_string(),
+            start_line: 0,
+            expanded: false,
+        });
+        app.paste_chunks.push(PasteChunk {
+            marker: "\x00SNED_PASTE_1".to_string(),
+            content: "first paste content".to_string(),
+            start_line: 0,
+            expanded: false,
+        });
+
+        // Simulate textarea with both markers (same content pasted twice)
+        app.input = App::new_textarea(vec![
+            "\x00SNED_PASTE_0".to_string(),
+            "some text".to_string(),
+            "\x00SNED_PASTE_1".to_string(),
+        ]);
+
+        let result = app.get_input_with_expanded_pastes();
+        assert_eq!(result, "first paste content\nsome text\nfirst paste content");
+        assert!(app.paste_chunks.is_empty(), "paste_chunks should be drained after expansion");
+
+        // Verify user-typed literal marker is NOT expanded when no paste chunk exists
+        let mut app2 = App::new();
+        app2.input = App::new_textarea(vec!["[pasted 500 chars]".to_string()]);
+        let result2 = app2.get_input_with_expanded_pastes();
+        assert_eq!(result2, "[pasted 500 chars]");
     }
 
     #[test]
