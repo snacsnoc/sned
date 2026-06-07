@@ -1629,7 +1629,7 @@ impl AgentLoop {
                     slow_connection_warned = true;
                     emitted_output_this_attempt = true;
                     self.config.output_writer.emit(OutputEvent::dim_yellow(
-                        "⏳ Waiting for API response (slow connection?)...",
+                        "⏳ Waiting for API response...",
                     ));
                 }
 
