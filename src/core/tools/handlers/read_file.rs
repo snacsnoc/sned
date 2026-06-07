@@ -414,13 +414,16 @@ impl ReadFileHandler {
                         path, line_count
                     )));
                 }
-                if line_count >= progress_interval {
-                    writer.emit(crate::cli::output::OutputEvent::dim(format!(
-                        "  Read {} lines from {}",
-                        line_count, path
-                    )));
-                }
             }
+        }
+
+        if let Some(writer) = output_writer
+            && line_count >= progress_interval
+        {
+            writer.emit(crate::cli::output::OutputEvent::dim(format!(
+                "  Read {} lines from {}",
+                line_count, path
+            )));
         }
 
         // Join lines for content_hash — this is the same as the old read_to_string
@@ -523,10 +526,7 @@ impl ReadFileHandler {
                 state.must_reread_before_edit.remove(path_str);
                 // Track consecutive reads for read-loop detection.
                 // If the same file is read 3+ times in a row with no edit, warn the model.
-                let count = state
-                    .consecutive_reads
-                    .entry(path_str.clone())
-                    .or_insert(0);
+                let count = state.consecutive_reads.entry(path_str.clone()).or_insert(0);
                 *count += 1;
             }
         }
@@ -549,11 +549,7 @@ impl ReadFileHandler {
         // intervening edit, surface a hint so the model doesn't loop forever.
         if let Some(writer) = output_writer {
             for path_str in &paths {
-                let count = state
-                    .consecutive_reads
-                    .get(path_str)
-                    .copied()
-                    .unwrap_or(0);
+                let count = state.consecutive_reads.get(path_str).copied().unwrap_or(0);
                 if count >= 3 {
                     use crate::cli::output::OutputEvent;
                     use ratatui::style::{Color, Style};
@@ -660,6 +656,21 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
+    use tokio::sync::mpsc;
+
+    fn drain_rendered_output(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::cli::output::OutputEvent>,
+    ) -> Vec<String> {
+        let mut rendered = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
+                crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
+            }
+        }
+        rendered
+    }
 
     #[test]
     fn test_content_hash_empty() {
@@ -915,6 +926,30 @@ mod tests {
             .await;
 
         assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn test_read_full_file_emits_progress_without_flooding_output() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 0..5001 {
+            writeln!(temp_file, "line {}", i).unwrap();
+        }
+
+        let handler = ReadFileHandler::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let result = handler
+            .read_full_file(temp_file.path().to_str().unwrap(), Some(&writer))
+            .await;
+
+        assert!(result.is_ok());
+        let rendered = drain_rendered_output(&mut rx);
+        assert_eq!(rendered.len(), 2);
+        assert!(rendered[0].contains("Reading"));
+        assert!(rendered[0].contains("5000 lines"));
+        assert!(rendered[1].contains("Read 5001 lines"));
     }
 
     #[tokio::test]
@@ -1205,22 +1240,16 @@ mod tests {
                 "paths": [temp_file.path().to_str().unwrap()]
             });
             let _ = handler
-                .execute(
-                    &mut state,
-                    params,
-                    &anchor_mgr,
-                    Some("test-task"),
-                    None,
-                )
+                .execute(&mut state, params, &anchor_mgr, Some("test-task"), None)
                 .await
                 .expect("read should succeed");
 
-            let count = state
-                .consecutive_reads
-                .get(&path_str)
-                .copied()
-                .unwrap_or(0);
-            assert_eq!(count, i, "consecutive_reads should be {} after {} reads", i, i);
+            let count = state.consecutive_reads.get(&path_str).copied().unwrap_or(0);
+            assert_eq!(
+                count, i,
+                "consecutive_reads should be {} after {} reads",
+                i, i
+            );
         }
     }
 }

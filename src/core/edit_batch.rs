@@ -205,7 +205,7 @@ impl BatchProcessor {
                 success: false,
                 final_content: None,
                 resolved_count: 0,
-                failed_count: batch.resolved_edits.len(),
+                failed_count: batch.resolved_edits.len() + batch.failed_edits.len(),
                 lines_added: 0,
                 lines_removed: 0,
             };
@@ -465,6 +465,11 @@ impl BatchProcessor {
     ) -> String {
         let context_count = 3;
         let mut res: Vec<String> = Vec::new();
+        let final_range_end = if applied.start_idx < final_lines.len() {
+            Some(applied.end_idx.min(final_lines.len() - 1))
+        } else {
+            None
+        };
 
         // Context before (from original)
         let before_start = applied.original_start_idx.saturating_sub(context_count);
@@ -476,10 +481,9 @@ impl BatchProcessor {
         }
 
         // Deletion summary
-        let final_hashes_set: std::collections::HashSet<&String> = final_hashes
-            [applied.start_idx..=applied.end_idx]
-            .iter()
-            .collect();
+        let final_hashes_set: std::collections::HashSet<&String> = final_range_end
+            .map(|end| final_hashes[applied.start_idx..=end].iter().collect())
+            .unwrap_or_default();
         let mut truly_removed_count = 0;
         for i in applied.original_start_idx..=applied.original_end_idx {
             if !final_hashes_set.contains(&prepared.line_hashes[i]) {
@@ -513,27 +517,34 @@ impl BatchProcessor {
             [applied.original_start_idx..=applied.original_end_idx]
             .iter()
             .collect();
-        for i in applied.start_idx..=applied.end_idx {
-            let hash = &final_hashes[i];
-            let prefix = if original_hashes_set.contains(hash) {
-                " "
-            } else {
-                "+"
-            };
-            res.push(format!(
-                "{}{}",
-                prefix,
-                format_line_with_hash(&final_lines[i], hash)
-            ));
+        if let Some(end) = final_range_end {
+            for i in applied.start_idx..=end {
+                let hash = &final_hashes[i];
+                let prefix = if original_hashes_set.contains(hash) {
+                    " "
+                } else {
+                    "+"
+                };
+                res.push(format!(
+                    "{}{}",
+                    prefix,
+                    format_line_with_hash(&final_lines[i], hash)
+                ));
+            }
         }
 
         // Context after (from final)
-        let after_end = (final_lines.len() - 1).min(applied.end_idx + context_count);
-        for i in applied.end_idx + 1..=after_end {
-            res.push(format!(
-                " {}",
-                format_line_with_hash(&final_lines[i], &final_hashes[i])
-            ));
+        if let Some(last_idx) = final_lines.len().checked_sub(1) {
+            let after_start = applied.end_idx.saturating_add(1);
+            let after_end = last_idx.min(applied.end_idx.saturating_add(context_count));
+            if after_start <= after_end {
+                for i in after_start..=after_end {
+                    res.push(format!(
+                        " {}",
+                        format_line_with_hash(&final_lines[i], &final_hashes[i])
+                    ));
+                }
+            }
         }
 
         res.join("\n")
@@ -549,6 +560,11 @@ impl BatchProcessor {
         let context_before_count = 3;
         let context_after_count = 3;
         let mut res: Vec<String> = Vec::new();
+        let final_range_end = if applied.start_idx < final_lines.len() {
+            Some(applied.end_idx.min(final_lines.len() - 1))
+        } else {
+            None
+        };
 
         let before_start = applied
             .original_start_idx
@@ -560,10 +576,9 @@ impl BatchProcessor {
             )));
         }
 
-        let final_hashes_set: std::collections::HashSet<&String> = final_hashes
-            [applied.start_idx..=applied.end_idx]
-            .iter()
-            .collect();
+        let final_hashes_set: std::collections::HashSet<&String> = final_range_end
+            .map(|end| final_hashes[applied.start_idx..=end].iter().collect())
+            .unwrap_or_default();
         for i in applied.original_start_idx..=applied.original_end_idx {
             if !final_hashes_set.contains(&prepared.line_hashes[i]) {
                 res.push(crate::cli::colors::diff_removal(&format_line_with_hash(
@@ -577,22 +592,29 @@ impl BatchProcessor {
             [applied.original_start_idx..=applied.original_end_idx]
             .iter()
             .collect();
-        for i in applied.start_idx..=applied.end_idx {
-            let hash = &final_hashes[i];
-            let line = format_line_with_hash(&final_lines[i], hash);
-            if original_hashes_set.contains(hash) {
-                res.push(crate::cli::colors::diff_context(&line));
-            } else {
-                res.push(crate::cli::colors::diff_addition(&line));
+        if let Some(end) = final_range_end {
+            for i in applied.start_idx..=end {
+                let hash = &final_hashes[i];
+                let line = format_line_with_hash(&final_lines[i], hash);
+                if original_hashes_set.contains(hash) {
+                    res.push(crate::cli::colors::diff_context(&line));
+                } else {
+                    res.push(crate::cli::colors::diff_addition(&line));
+                }
             }
         }
 
-        let after_end = (final_lines.len() - 1).min(applied.end_idx + context_after_count);
-        for i in applied.end_idx + 1..=after_end {
-            res.push(crate::cli::colors::diff_context(&format_line_with_hash(
-                &final_lines[i],
-                &final_hashes[i],
-            )));
+        if let Some(last_idx) = final_lines.len().checked_sub(1) {
+            let after_start = applied.end_idx.saturating_add(1);
+            let after_end = last_idx.min(applied.end_idx.saturating_add(context_after_count));
+            if after_start <= after_end {
+                for i in after_start..=after_end {
+                    res.push(crate::cli::colors::diff_context(&format_line_with_hash(
+                        &final_lines[i],
+                        &final_hashes[i],
+                    )));
+                }
+            }
         }
 
         res.join("\n")
@@ -718,6 +740,122 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_processor_full_diff_handles_deleting_entire_file() {
+        let task_id = "full_delete_test";
+        let anchor_mgr = AnchorStateManager::new();
+        anchor_mgr.reset(Some(task_id));
+
+        let processor = BatchProcessor::new(DiffMode::Full);
+
+        let content = "only line";
+        let lines = split_content_lines(content);
+        let hashes = anchor_mgr.reconcile("/tmp/full_delete.rs", &lines, Some(task_id));
+
+        let edits = vec![Edit {
+            anchor: format!("{}§only line", hashes[0]),
+            end_anchor: Some(format!("{}§only line", hashes[0])),
+            edit_type: "replace".to_string(),
+            text: String::new(),
+        }];
+
+        let mut prepared = processor
+            .prepare_edits(
+                "/tmp/full_delete.rs",
+                "full_delete.rs",
+                content,
+                &edits,
+                &hashes,
+            )
+            .unwrap();
+        let result = processor.apply_batch(&mut prepared, "full_delete.rs", "full_delete.rs");
+
+        assert!(result.success);
+        assert_eq!(result.final_content.as_deref(), Some(""));
+        assert!(prepared.diff.contains("- only line"));
+    }
+
+    #[test]
+    fn test_batch_processor_additions_only_handles_deleting_last_line() {
+        let task_id = "delete_last_line_test";
+        let anchor_mgr = AnchorStateManager::new();
+        anchor_mgr.reset(Some(task_id));
+
+        let processor = BatchProcessor::new(DiffMode::AdditionsOnly);
+
+        let content = "line1\nline2";
+        let lines = split_content_lines(content);
+        let hashes = anchor_mgr.reconcile("/tmp/delete_last.rs", &lines, Some(task_id));
+
+        let edits = vec![Edit {
+            anchor: format!("{}§line2", hashes[1]),
+            end_anchor: Some(format!("{}§line2", hashes[1])),
+            edit_type: "replace".to_string(),
+            text: String::new(),
+        }];
+
+        let mut prepared = processor
+            .prepare_edits(
+                "/tmp/delete_last.rs",
+                "delete_last.rs",
+                content,
+                &edits,
+                &hashes,
+            )
+            .unwrap();
+        let result = processor.apply_batch(&mut prepared, "delete_last.rs", "delete_last.rs");
+
+        assert!(result.success);
+        assert_eq!(result.final_content.as_deref(), Some("line1"));
+        assert!(!prepared.diff.is_empty());
+    }
+
+    #[test]
+    fn test_batch_processor_overlap_counts_all_failed_edits() {
+        let task_id = "overlap_count_test";
+        let anchor_mgr = AnchorStateManager::new();
+        anchor_mgr.reset(Some(task_id));
+
+        let processor = BatchProcessor::new(DiffMode::Full);
+
+        let content = "line1\nline2\nline3";
+        let lines = split_content_lines(content);
+        let hashes = anchor_mgr.reconcile("/tmp/overlap.rs", &lines, Some(task_id));
+
+        let edits = vec![
+            Edit {
+                anchor: format!("{}§line1", hashes[0]),
+                end_anchor: Some(format!("{}§line2", hashes[1])),
+                edit_type: "replace".to_string(),
+                text: "alpha".to_string(),
+            },
+            Edit {
+                anchor: format!("{}§line2", hashes[1]),
+                end_anchor: Some(format!("{}§line3", hashes[2])),
+                edit_type: "replace".to_string(),
+                text: "beta".to_string(),
+            },
+            Edit {
+                anchor: "bogus§missing".to_string(),
+                end_anchor: Some("bogus§missing".to_string()),
+                edit_type: "replace".to_string(),
+                text: "gamma".to_string(),
+            },
+        ];
+
+        let mut prepared = processor
+            .prepare_edits("/tmp/overlap.rs", "overlap.rs", content, &edits, &hashes)
+            .unwrap();
+        assert_eq!(prepared.resolved_edits.len(), 2);
+        assert_eq!(prepared.failed_edits.len(), 1);
+
+        let result = processor.apply_batch(&mut prepared, "overlap.rs", "overlap.rs");
+
+        assert!(!result.success);
+        assert_eq!(result.resolved_count, 0);
+        assert_eq!(result.failed_count, 3);
+    }
+
+    #[test]
     fn test_batch_processor_format_result() {
         let task_id = "format_test";
         let anchor_mgr = AnchorStateManager::new();
@@ -744,14 +882,8 @@ mod tests {
         let final_lines = prepared.final_lines.clone();
         let final_hashes = anchor_mgr.reconcile("/tmp/format.rs", &final_lines, Some(task_id));
 
-        let formatted = processor.format_result(
-            &prepared,
-            &final_lines,
-            &final_hashes,
-            None,
-            None,
-            None,
-        );
+        let formatted =
+            processor.format_result(&prepared, &final_lines, &final_hashes, None, None, None);
 
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
         assert!(formatted.contains("NOTE the UPDATED anchors below"));
@@ -790,14 +922,8 @@ mod tests {
         let final_lines = prepared.final_lines.clone();
         let final_hashes = anchor_mgr.reconcile("/tmp/additions.rs", &final_lines, Some(task_id));
 
-        let formatted = processor.format_result(
-            &prepared,
-            &final_lines,
-            &final_hashes,
-            None,
-            None,
-            None,
-        );
+        let formatted =
+            processor.format_result(&prepared, &final_lines, &final_hashes, None, None, None);
 
         // In additions-only mode, deleted lines should show as "X lines have been deleted"
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
