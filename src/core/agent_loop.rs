@@ -1511,24 +1511,42 @@ impl AgentLoop {
         let stream_handle = tokio::spawn(async move {
             let mut stream = stream;
             use tokio_stream::StreamExt;
-            loop {
+            'stream: loop {
                 tokio::select! {
                     chunk = stream.next() => {
                         match chunk {
                             Some(c) => {
                                 if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
-                                    break;
+                                    break 'stream;
                                 }
-                                if tx.send(c).await.is_err() {
-                                    break;
+                                // Race the send against cancellation so a slow
+                                // consumer (UI backpressure, full bounded channel)
+                                // doesn't block Ctrl+C response. If cancellation
+                                // wins, the chunk is dropped — acceptable since
+                                // the user is cancelling.
+                                let mut send_fut = Box::pin(tx.send(c));
+                                loop {
+                                    tokio::select! {
+                                        result = send_fut.as_mut() => {
+                                            if result.is_err() {
+                                                break 'stream;
+                                            }
+                                            break;
+                                        }
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                            if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
+                                                break 'stream;
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            None => break,
+                            None => break 'stream,
                         }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                         if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
-                            break;
+                            break 'stream;
                         }
                     }
                 }
