@@ -301,6 +301,14 @@ impl App {
         self.cached_wrap_width = None;
     }
 
+    /// Clear the completion box and invalidate cached layout for the next render.
+    pub fn clear_completion_lines(&mut self) {
+        self.needs_redraw = true;
+        self.completion_lines.clear();
+        self.cached_completion_rows = 0;
+        self.cached_wrap_width = None;
+    }
+
     /// Push a plain text line.
     pub fn push_plain(&mut self, text: impl Into<String>) {
         self.push_output(Line::from(text.into()));
@@ -318,8 +326,7 @@ impl App {
 
     /// Push a user message with proper formatting (splits on newlines).
     pub fn push_user_message(&mut self, text: &str, writer: &OutputWriterArc) {
-        self.completion_lines.clear();
-        self.cached_completion_rows = 0;
+        self.clear_completion_lines();
         let style = Style::default()
             .fg(theme::PROMPT_FG)
             .add_modifier(Modifier::BOLD);

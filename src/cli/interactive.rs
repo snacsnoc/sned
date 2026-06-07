@@ -427,6 +427,7 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 }
             }
             OutputEvent::Completion(result) => {
+                app.clear_completion_lines();
                 for line in
                     crate::cli::markdown::render_completion_markdown("🚀 Task Completed: ", &result)
                 {
@@ -2943,6 +2944,63 @@ mod tests {
 
         assert_eq!(app.scroll_mode, ScrollMode::Auto);
         assert_eq!(app.scroll_offset, 0);
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_replaces_previous_completion_box() {
+        use crate::cli::output::OutputEvent;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::Completion("first completion".to_string()))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let first_rendered = app
+            .completion_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            first_rendered.contains("first completion"),
+            "expected first completion to render, got: {first_rendered}"
+        );
+
+        tx.try_send(OutputEvent::Completion("second completion".to_string()))
+            .unwrap();
+        drain_output(&mut rx, &mut app);
+
+        let second_rendered = app
+            .completion_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !second_rendered.contains("first completion"),
+            "previous completion box should be replaced, got: {second_rendered}"
+        );
+        assert!(
+            second_rendered.contains("second completion"),
+            "expected second completion to replace the first, got: {second_rendered}"
+        );
 
         reset_prompt_state();
     }
