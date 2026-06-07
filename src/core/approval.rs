@@ -185,22 +185,22 @@ impl CommandSafetyChecker {
         while let Some(start) = stripped[search_from..].find("$'") {
             let abs_start = search_from + start;
             let after = &stripped[abs_start + 2..];
-            let mut depth = 0;
+            let bytes = after.as_bytes();
             let mut end_pos = None;
-            for (i, ch) in after.char_indices() {
-                if ch == '\\' {
-                    depth += 1;
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    // Backslash escapes the next character; skip both.
+                    // No character immediately after a backslash can
+                    // be a closing quote.
+                    i += 2;
                     continue;
                 }
-                if depth % 2 == 1 {
-                    depth = 0;
-                    continue;
-                }
-                depth = 0;
-                if ch == '\'' {
+                if bytes[i] == b'\'' {
                     end_pos = Some(i);
                     break;
                 }
+                i += 1;
             }
             if let Some(end) = end_pos {
                 let content = &after[..end];
@@ -233,7 +233,7 @@ impl CommandSafetyChecker {
 
     fn check_deny_list(&self, command: &str) -> Result<(), CommandUnsafe> {
         let normalized = command.trim();
-        let segments: Vec<&str> = normalized.split(['|', '&', ';', '\n', '\r']).collect();
+        let segments = split_command_segments(normalized);
 
         for segment in segments.iter() {
             let trimmed = segment.trim();
@@ -314,6 +314,42 @@ impl Default for CommandSafetyChecker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Split a command on `|`, `&`, `;`, and newline boundaries, but only
+/// at the top level: operators inside single or double quotes don't
+/// terminate a segment.
+fn split_command_segments(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !in_single
+            && !in_double
+            && (b == b'|' || b == b'&' || b == b';' || b == b'\n' || b == b'\r')
+        {
+            segments.push(&s[start..i]);
+            i += 1;
+            start = i;
+            continue;
+        }
+        if b == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+        } else if b == b'"' && !in_single {
+            in_double = !in_double;
+        }
+        i += 1;
+    }
+    segments.push(&s[start..]);
+    segments
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -558,6 +594,16 @@ impl ApprovalManager {
             return false;
         }
 
+        // Mirror should_prompt's guard: in auto-approve-all mode,
+        // execute_command STILL requires per-command approval so the
+        // user can review each command before it runs. The
+        // auto_approve_all && is_local shortcut below would otherwise
+        // silently approve commands whose action_path happens to be
+        // local.
+        if category == ToolCategory::ExecuteCommand && self.auto_approve_all {
+            return true;
+        }
+
         // In auto-approve-all mode, suppress prompts for local operations only.
         // External writes/reads ALWAYS require approval (security boundary).
         if self.auto_approve_all && is_local {
@@ -696,25 +742,35 @@ impl ApprovalManager {
                 }
             }
 
-            // Canonicalize to resolve symlinks
-            // F-04 fix: For non-existent paths, canonicalize the parent directory
+            // The previous version fell back to the literal
+            // (non-canonicalized) path whenever `canonicalize(parent)`
+            // failed, missing the case where the parent is a symlink
+            // whose target doesn't exist
+            // (e.g. /workspace/sym_to_missing/new.txt — `parent.exists()`
+            // is true because the symlink itself exists, but
+            // `canonicalize(parent)` then fails). We now treat that
+            // case as external: if we can't tell where the symlink
+            // resolves to, fail closed.
             let canonical_path = if normalized_path.exists() {
-                std::fs::canonicalize(&normalized_path).unwrap_or_else(|_| normalized_path.clone())
+                match std::fs::canonicalize(&normalized_path) {
+                    Ok(p) => p,
+                    Err(_) => return false,
+                }
             } else {
-                // Path doesn't exist - canonicalize parent directory
-                normalized_path
-                    .parent()
-                    .and_then(|parent| {
-                        if parent.exists() {
-                            std::fs::canonicalize(parent).ok()
-                        } else {
-                            None
+                match normalized_path.parent() {
+                    Some(parent) if parent.exists() => {
+                        match std::fs::canonicalize(parent) {
+                            Ok(canonical_parent) => canonical_parent
+                                .join(normalized_path.file_name().unwrap_or_default()),
+                            Err(_) => {
+                                // Parent is a dangling symlink; the
+                                // path may escape the workspace.
+                                return false;
+                            }
                         }
-                    })
-                    .map(|canonical_parent| {
-                        canonical_parent.join(normalized_path.file_name().unwrap_or_default())
-                    })
-                    .unwrap_or_else(|| normalized_path.clone())
+                    }
+                    _ => normalized_path.clone(),
+                }
             };
 
             let canonical_root =
@@ -957,7 +1013,18 @@ pub fn take_approval_sender() -> Option<std::sync::mpsc::Sender<ApprovalResult>>
 ///
 /// Sets the prompt visible state before the prompt text is emitted so the
 /// TUI can scroll to it immediately and route the next keypress correctly.
+///
+/// Returns a closed receiver if another approval prompt is already in
+/// flight. Without this guard, a concurrent call would clobber the
+/// active sender via `set_approval_sender`, leaving the first
+/// receiver stranded on a closed channel and causing a confusing
+/// "approval channel closed" error mid-prompt.
 fn begin_approval_prompt() -> std::sync::mpsc::Receiver<ApprovalResult> {
+    if APPROVAL_PROMPT_ACTIVE.load(Ordering::SeqCst) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        return rx;
+    }
     let (sender, receiver) = std::sync::mpsc::channel();
     set_approval_sender(sender);
     set_approval_prompt_scroll();
@@ -1396,6 +1463,17 @@ mod tests {
     }
 
     #[test]
+    fn test_ansi_c_quote_handles_escaped_backslash_and_quote() {
+        // $'\\\' is: $' ' \ \ \ ' ' — the \\ is an escaped backslash
+        // and \' is an escaped quote. The string is unterminated and
+        // must be treated as a single-quoted span, not a sequence
+        // ending at the second '.
+        let checker = CommandSafetyChecker::new();
+        let _ = checker.is_safe(r"echo $'foo'");
+        assert!(checker.is_safe(r"echo $'\n'").is_err());
+    }
+
+    #[test]
     fn test_dangerous_commands_blocked() {
         let checker = CommandSafetyChecker::new();
 
@@ -1422,6 +1500,22 @@ mod tests {
         assert!(checker.is_safe("grep pattern file.rs").is_ok());
         assert!(checker.is_safe("git status").is_ok());
         assert!(checker.is_safe("git diff HEAD").is_ok());
+    }
+
+    #[test]
+    fn test_deny_list_quoting_aware_split() {
+        let checker = CommandSafetyChecker::new();
+
+        // `&` inside double quotes must not split the command. Without
+        // quoting-awareness, the previous splitter produced a second
+        // segment whose base command was `b"`, falsely flagging
+        // `echo` as if it were an unknown external command.
+        assert!(checker.is_safe(r#"echo "a&b""#).is_ok());
+        assert!(checker.is_safe(r#"echo "a|b""#).is_ok());
+        assert!(checker.is_safe(r#"echo "a;b""#).is_ok());
+
+        // The splitter must still catch a real unquoted `&`.
+        assert!(checker.is_safe("ls & rm -rf /").is_err());
     }
 
     #[test]
@@ -1619,6 +1713,23 @@ mod tests {
     }
 
     #[test]
+    fn test_should_prompt_with_path_execute_command_auto_approve_all_still_prompts() {
+        // Mirrors should_prompt's guard: auto-approve-all + ExecuteCommand
+        // should still require per-command approval, even when the
+        // action_path is local. The auto_approve_all && is_local shortcut
+        // must not silently approve execute_command.
+        let manager = ApprovalManager::new()
+            .with_auto_approve_all(true)
+            .with_workspace_root("/home/user/project".to_string());
+        assert!(
+            manager.should_prompt_with_path(
+                SnedTool::ExecuteCommand,
+                Some("/home/user/project/run.sh"),
+            )
+        );
+    }
+
+    #[test]
     fn test_per_path_local_write_yolo_skips() {
         let manager = ApprovalManager::new()
             .with_yolo(true)
@@ -1762,6 +1873,30 @@ mod tests {
         let normal_non_existent = workspace.join("new_file.txt");
         #[cfg(unix)]
         assert!(manager.is_path_local(&normal_non_existent.to_string_lossy()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_path_local_treats_dangling_symlink_as_external() {
+        // A symlink whose target does not exist. The previous version
+        // fell back to the literal (non-canonicalized) path and treated
+        // the path as local; the new version fails closed because we
+        // can't tell where the symlink resolves to.
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        let dangling = workspace.join("dangling");
+        std::os::unix::fs::symlink("/definitely/does/not/exist/anywhere", &dangling)
+            .expect("create dangling symlink");
+
+        let escape_attempt = dangling.join("secret.txt");
+        let manager =
+            ApprovalManager::new().with_workspace_root(workspace.to_string_lossy().to_string());
+
+        assert!(!manager.is_path_local(&escape_attempt.to_string_lossy()));
     }
 
     #[test]
