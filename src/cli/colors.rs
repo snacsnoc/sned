@@ -450,9 +450,11 @@ pub fn hyperlink_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
 
     #[test]
     fn test_colorize_returns_plain_when_no_color_set() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         if std::env::var("NO_COLOR").is_ok() || std::env::var("TERM").as_deref() == Ok("dumb") {
             let result = colorize("hello", style::RED);
             assert_eq!(
@@ -464,6 +466,7 @@ mod tests {
 
     #[test]
     fn test_colorize_contains_ansi_when_tty() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         if std::env::var("NO_COLOR").is_err()
             && std::env::var("TERM").as_deref() != Ok("dumb")
             && std::io::stdout().is_terminal()
@@ -479,6 +482,7 @@ mod tests {
 
     #[test]
     fn test_colorize_stderr_returns_plain_when_no_color_set() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         if std::env::var("NO_COLOR").is_ok() || std::env::var("TERM").as_deref() == Ok("dumb") {
             let result = colorize_stderr("hello", style::RED);
             assert_eq!(
@@ -490,6 +494,7 @@ mod tests {
 
     #[test]
     fn test_env_colors_disabled_respects_no_color() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let original = std::env::var("NO_COLOR").ok();
         // SAFETY: single-threaded test; env mutation guarded by sequential execution
         unsafe {
@@ -507,6 +512,7 @@ mod tests {
 
     #[test]
     fn test_env_colors_disabled_respects_term_dumb() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let original = std::env::var("TERM").ok();
         // SAFETY: single-threaded test; env mutation guarded by sequential execution
         unsafe {
@@ -530,6 +536,7 @@ mod tests {
 
     #[test]
     fn test_badge_stderr_uses_stderr_tty_check() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         // badge_stderr should check stderr TTY status, not stdout
         if std::env::var("NO_COLOR").is_err()
             && std::env::var("TERM").as_deref() != Ok("dumb")

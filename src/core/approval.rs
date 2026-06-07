@@ -1340,6 +1340,7 @@ fn build_combined_approval_prompt(
 mod tests {
     use super::*;
     use std::sync::{LazyLock, Mutex as StdMutex};
+    use crate::test_support::env_lock;
 
     static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
@@ -1581,7 +1582,7 @@ mod tests {
         // SECURITY TEST (F-01): Non-interactive stdin (piped input, CI, scripts)
         // should DENY tool execution by default to prevent automated attacks.
         // User must explicitly pass --yolo or --auto-approve-all for non-interactive use.
-        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
         let output_writer: crate::cli::output::OutputWriterArc =
             std::sync::Arc::new(crate::cli::output::StderrOutputWriter);

@@ -17,5 +17,8 @@ pub mod services;
 pub mod storage;
 pub mod terminal;
 
+#[cfg(test)]
+pub mod test_support;
+
 // Re-export crate as `sned` for use in main.rs and tests
 pub use crate as sned;

@@ -5449,11 +5449,13 @@ mod tests {
         use crate::core::approval::ApprovalManager;
         use crate::core::tools::ToolRegistry;
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use crate::test_support::env_lock;
 
         // Force non-interactive denial path. cargo test allocates a PTY for
         // stdin, so is_terminal() returns true and the channel-based path
         // would otherwise block/close instead of returning Denied.
         // SAFETY: single-threaded test; sequential env mutation.
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
 
         let config = AgentConfig {

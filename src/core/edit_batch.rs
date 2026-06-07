@@ -596,9 +596,7 @@ impl BatchProcessor {
 mod tests {
     use super::*;
     use crate::core::file_editor::AnchorStateManager;
-    use std::sync::{LazyLock, Mutex as StdMutex};
-
-    static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+    use crate::test_support::env_lock;
 
     #[test]
     fn test_batch_processor_group_edits() {
@@ -1001,7 +999,7 @@ mod tests {
     fn test_generate_diff_respects_no_color() {
         // Set NO_COLOR to test plain text output
         // SAFETY: single-threaded test; sequential env mutation
-        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         unsafe {
             std::env::set_var("NO_COLOR", "1");
         }
