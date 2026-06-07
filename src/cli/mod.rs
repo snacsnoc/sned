@@ -80,25 +80,56 @@ fn tracing_mode(json_output: bool, verbose: bool) -> TracingMode {
     }
 }
 
-fn init_tracing(mode: TracingMode, debug: bool) {
+fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
     match mode {
         TracingMode::JsonOnly => {
             tracing_subscriber::registry().with(JsonOutputLayer).init();
         }
         TracingMode::Human { verbose } => {
             let log_level = if verbose || debug { "debug" } else { "warn" };
-            let registry = tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(std::io::stderr)
-                        .with_filter(
-                            EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| EnvFilter::new(format!("sned={}", log_level))),
-                        ),
-                )
-                .with(JsonOutputLayer);
+            let env_filter = EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(format!("sned={}", log_level)));
 
-            // Add file logging when debug mode is enabled
+            use tracing_subscriber::fmt::writer::BoxMakeWriter;
+
+            // In TUI mode, route tracing to a log file to keep warnings
+            // from corrupting the alternate screen display.  Non-TUI mode
+            // writes to stderr as before.  BoxMakeWriter provides a
+            // type-erased wrapper so both branches share the same
+            // `Layer<…>` type.
+            let writer: BoxMakeWriter = if tui_mode {
+                let path = std::env::temp_dir().join(format!(
+                    "sned-tui-{}.log",
+                    std::process::id()
+                ));
+                match std::fs::File::create(&path) {
+                    Ok(file) => {
+                        eprintln!(
+                            "[sned] TUI mode: tracing output redirected to {}",
+                            path.display()
+                        );
+                        BoxMakeWriter::new(std::sync::Arc::new(file))
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[sned] Warning: could not create TUI trace log {}: {}",
+                            path.display(),
+                            e
+                        );
+                        // Fallback to stderr if file creation fails.
+                        BoxMakeWriter::new(|| std::io::stderr())
+                    }
+                }
+            } else {
+                BoxMakeWriter::new(|| std::io::stderr())
+            };
+
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_filter(env_filter);
+
+            let registry = tracing_subscriber::registry().with(fmt_layer).with(JsonOutputLayer);
+
             if debug {
                 let log_file = std::fs::File::create("/tmp/sned-debug.log")
                     .expect("Failed to create debug log file");
@@ -1282,9 +1313,25 @@ pub fn run() -> anyhow::Result<()> {
     let cli = parse();
     apply_config_override(&cli);
 
+    // The dispatch table for the `None` subcommand decides at runtime
+    // whether to enter the interactive TUI shell. We mirror that
+    // decision here so tracing can be redirected to a log file in TUI
+    // mode (stderr writes inside the alternate screen corrupt the
+    // display).
+    let tui_mode = cli.command.is_none()
+        && !cli.root_opts.continue_task
+        && cli.root_opts.task_id.is_none()
+        && interactive::should_start_interactive_shell(
+            false,
+            io::stdin().is_terminal(),
+            io::stdout().is_terminal(),
+            cli.task_opts.json,
+        );
+
     init_tracing(
         tracing_mode(cli.task_opts.json, cli.task_opts.verbose),
         cli.task_opts.debug,
+        tui_mode,
     );
 
     match cli.command {
