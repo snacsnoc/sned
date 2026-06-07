@@ -554,12 +554,12 @@ async fn process_gemini_sse_line(
     {
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
             if !completed_tool_call_ids.contains(call_id) {
-                completed_tool_call_ids.insert(call_id.clone());
                 if let Some(validated_args) = crate::providers::validate_tool_call_args(
                     args,
                     "Gemini",
                     "on finish",
                 ) {
+                    completed_tool_call_ids.insert(call_id.clone());
                     try_send_chunk(
                         tx,
                         ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
