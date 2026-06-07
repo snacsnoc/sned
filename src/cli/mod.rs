@@ -52,7 +52,14 @@ where
                         _field: &tracing::field::Field,
                         value: &dyn std::fmt::Debug,
                     ) {
-                        self.0 = serde_json::Value::String(format!("{:?}", value)).to_string();
+                        let raw = format!("{:?}", value);
+                        self.0 = match serde_json::from_str::<serde_json::Value>(&raw) {
+                            Ok(parsed) => match parsed {
+                                serde_json::Value::String(inner) => inner,
+                                other => other.to_string(),
+                            },
+                            Err(_) => serde_json::Value::String(raw).to_string(),
+                        };
                     }
                     fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
                         self.0 = value.to_string();
