@@ -374,29 +374,17 @@ impl InteractiveSession {
         // Always export on exit, even if the agent errored out.
         // This ensures the conversation is saved for debugging failed runs.
         if let Some(export_path) = self.task_opts.export.clone() {
-            let history = agent.lock().await.get_conversation_history().await;
-            match serde_json::to_string_pretty(&history) {
-                Ok(mut export_data) => {
-                    export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
-                    if let Err(e) =
-                        crate::storage::disk::atomic_write_file(&export_path, &export_data)
-                    {
-                        if !self.task_opts.json {
-                            eprintln!("Warning: Failed to write export file: {}", e);
-                        }
-                    } else if !self.task_opts.json {
-                        println!(
-                            "Conversation exported to: {} (secrets redacted)",
-                            export_path
-                        );
-                    }
-                }
-                Err(e) => {
-                    if !self.task_opts.json {
-                        eprintln!("Warning: Failed to serialize conversation: {}", e);
-                    }
-                }
-            }
+            let output_writer = {
+                let agent_lock = agent.lock().await;
+                Arc::clone(agent_lock.output_writer())
+            };
+            let export_result = export_agent_conversation(&agent, &export_path).await;
+            report_conversation_export(
+                &output_writer,
+                self.task_opts.json,
+                &export_result,
+                true,
+            );
         }
 
         run_result?;
@@ -1932,26 +1920,59 @@ async fn handle_cli_only_command(
     Ok(false)
 }
 
+fn serialize_conversation_export<T: serde::Serialize>(history: &T) -> Result<String, String> {
+    serde_json::to_string_pretty(history)
+        .map(|json| crate::cli::redact::redact_secrets(&json).into_owned())
+        .map_err(|e| format!("Failed to serialize conversation: {}", e))
+}
+
+fn write_conversation_export(export_path: &str, export_data: &str) -> Result<String, String> {
+    crate::storage::disk::atomic_write_file(export_path, export_data)
+        .map_err(|e| format!("Failed to write export file: {}", e))?;
+    Ok(format!(
+        "Conversation exported to: {} (secrets redacted)",
+        export_path
+    ))
+}
+
+fn report_conversation_export(
+    output_writer: &OutputWriterArc,
+    json_output: bool,
+    result: &Result<String, String>,
+    announce_success: bool,
+) {
+    if json_output {
+        return;
+    }
+
+    match result {
+        Ok(message) if announce_success => {
+            output_writer.emit(OutputEvent::info(message));
+        }
+        Err(message) => {
+            output_writer.emit(OutputEvent::warning(message));
+        }
+        Ok(_) => {}
+    }
+}
+
 /// Export the current conversation history to the given path.
-/// Returns true if the export succeeded, false otherwise.
 async fn export_conversation(
     session: &Arc<Mutex<InteractiveSession>>,
     export_path: &str,
-    json_output: bool,
-) -> bool {
+) -> Result<String, String> {
     let history = session.lock().await.agent_loop().await.get_conversation_history().await;
-    if let Ok(mut export_data) = serde_json::to_string_pretty(&history) {
-        export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
-        if let Err(e) = crate::storage::disk::atomic_write_file(export_path, &export_data) {
-            if !json_output {
-                eprintln!("Warning: Failed to write export file: {}", e);
-            }
-        } else if !json_output {
-            println!("Conversation exported to: {} (secrets redacted)", export_path);
-        }
-        return true;
-    }
-    false
+    let export_data = serialize_conversation_export(&history)?;
+    write_conversation_export(export_path, &export_data)
+}
+
+async fn export_agent_conversation(
+    agent: &Arc<Mutex<crate::core::agent_loop::AgentLoop>>,
+    export_path: &str,
+) -> Result<String, String> {
+    let history = agent.lock().await.get_conversation_history().await;
+    let export_data = serialize_conversation_export(&history)?;
+    write_conversation_export(export_path, &export_data)
 }
 
 /// Main ratatui event loop.
@@ -2214,7 +2235,14 @@ async fn run_main_loop(
                             }
                             // Always export on exit, even if the agent errored out.
                             if let Some(ref export_path) = task_opts.export {
-                                export_conversation(&session, export_path, task_opts.json).await;
+                                let export_result =
+                                    export_conversation(&session, export_path).await;
+                                report_conversation_export(
+                                    &output_writer,
+                                    task_opts.json,
+                                    &export_result,
+                                    true,
+                                );
                             }
                             return Ok(());
                         }
@@ -2351,7 +2379,15 @@ async fn run_main_loop(
                                         if should_exit {
                                             // Always export on exit, even if the agent errored out.
                                             if let Some(ref export_path) = task_opts.export {
-                                                export_conversation(&session, export_path, task_opts.json).await;
+                                                let export_result =
+                                                    export_conversation(&session, export_path)
+                                                        .await;
+                                                report_conversation_export(
+                                                    &output_writer,
+                                                    task_opts.json,
+                                                    &export_result,
+                                                    true,
+                                                );
                                             }
                                             return Ok(());
                                         }
@@ -2514,21 +2550,8 @@ async fn run_main_loop(
         // Export conversation after each completed turn when --export is set.
         if agent_completed {
             if let Some(export_path) = task_opts.export.clone() {
-                let history = session
-                    .lock()
-                    .await
-                    .agent_loop()
-                    .await
-                    .get_conversation_history()
-                    .await;
-                if let Ok(mut export_data) = serde_json::to_string_pretty(&history) {
-                    export_data = crate::cli::redact::redact_secrets(&export_data).into_owned();
-                    if let Err(e) =
-                        crate::storage::disk::atomic_write_file(&export_path, &export_data)
-                    {
-                        eprintln!("Warning: Failed to write export file: {}", e);
-                    }
-                }
+                let export_result = export_conversation(&session, &export_path).await;
+                report_conversation_export(&output_writer, task_opts.json, &export_result, false);
             }
         }
 
@@ -2724,6 +2747,7 @@ pub fn render_interactive_prompt_prefix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::ser::{Error as _, Serialize, Serializer};
 
     fn reset_prompt_state() {
         crate::core::approval::clear_approval_prompt_scroll();
@@ -3121,6 +3145,91 @@ mod tests {
         let rendered = line.to_string();
         assert!(rendered.contains("does not support images"));
         assert!(rendered.contains("Ignoring 1 image(s)"));
+    }
+
+    #[test]
+    fn test_serialize_conversation_export_reports_failure() {
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                Err(S::Error::custom("boom"))
+            }
+        }
+
+        let result = serialize_conversation_export(&FailingSerialize);
+        let err = result.expect_err("serialization should fail");
+        assert!(err.contains("Failed to serialize conversation"));
+        assert!(err.contains("boom"));
+    }
+
+    #[test]
+    fn test_write_conversation_export_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = write_conversation_export(dir.path().to_str().unwrap(), "[]");
+        let err = result.expect_err("writing to a directory should fail");
+        assert!(err.contains("Failed to write export file"));
+    }
+
+    #[test]
+    fn test_report_conversation_export_emits_warning_for_failure() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Default)]
+        struct CapturingWriter {
+            events: StdMutex<Vec<crate::cli::output::OutputEvent>>,
+        }
+
+        impl crate::cli::output::OutputWriter for CapturingWriter {
+            fn emit(&self, event: crate::cli::output::OutputEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+
+            fn flush(&self) {}
+        }
+
+        let writer = Arc::new(CapturingWriter::default());
+        let writer_arc: OutputWriterArc = writer.clone();
+        let result = Err("Failed to write export file: boom".to_string());
+        report_conversation_export(&writer_arc, false, &result, true);
+
+        let events = writer.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let crate::cli::output::OutputEvent::Line(line) = &events[0] else {
+            panic!("Expected warning line");
+        };
+        let rendered = line.to_string();
+        assert!(rendered.contains("Warning"));
+        assert!(rendered.contains("Failed to write export file"));
+    }
+
+    #[test]
+    fn test_report_conversation_export_suppresses_turn_success() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Default)]
+        struct CapturingWriter {
+            events: StdMutex<Vec<crate::cli::output::OutputEvent>>,
+        }
+
+        impl crate::cli::output::OutputWriter for CapturingWriter {
+            fn emit(&self, event: crate::cli::output::OutputEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+
+            fn flush(&self) {}
+        }
+
+        let writer = Arc::new(CapturingWriter::default());
+        let writer_arc: OutputWriterArc = writer.clone();
+        let result = Ok("Conversation exported to: /tmp/out.json (secrets redacted)".to_string());
+        report_conversation_export(&writer_arc, false, &result, false);
+
+        let events = writer.events.lock().unwrap();
+        assert!(events.is_empty(), "per-turn export should stay silent on success");
     }
 
     #[test]
