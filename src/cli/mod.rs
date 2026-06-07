@@ -1322,7 +1322,7 @@ pub fn run() -> anyhow::Result<()> {
         && !cli.root_opts.continue_task
         && cli.root_opts.task_id.is_none()
         && interactive::should_start_interactive_shell(
-            false,
+            cli.prompt.is_some(),
             io::stdin().is_terminal(),
             io::stdout().is_terminal(),
             cli.task_opts.json,
