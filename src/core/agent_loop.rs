@@ -1507,10 +1507,14 @@ impl AgentLoop {
             }
         };
 
+        let cancelled_flag = self.cancelled.clone();
         let stream_handle = tokio::spawn(async move {
             let mut stream = stream;
             use tokio_stream::StreamExt;
             while let Some(chunk) = stream.next().await {
+                if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
                 if tx.send(chunk).await.is_err() {
                     break;
                 }
