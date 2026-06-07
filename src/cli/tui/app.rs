@@ -335,6 +335,7 @@ impl App {
             let content = format!("{}{}", prefix, line);
             writer.emit(OutputEvent::styled(content, style));
         }
+        self.force_bottom();
     }
 
     pub fn force_bottom(&mut self) {
@@ -1820,5 +1821,33 @@ mod tests {
             rendered.contains("MARKER_COMPLETION_TEXT"),
             "completion line should appear in rendered buffer; got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn test_push_user_message_forces_bottom_for_multiline_submit() {
+        use std::sync::Arc;
+
+        struct NoopWriter;
+
+        impl crate::cli::output::OutputWriter for NoopWriter {
+            fn emit(&self, _event: crate::cli::output::OutputEvent) {}
+
+            fn flush(&self) {}
+        }
+
+        let mut app = App::new();
+        app.set_content_height(5);
+        app.set_content_width(80);
+        for index in 0..20 {
+            app.push_plain(format!("line {}", index));
+        }
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 7;
+
+        let writer: Arc<dyn crate::cli::output::OutputWriter> = Arc::new(NoopWriter);
+        app.push_user_message("first line\nsecond line\nthird line", &writer);
+
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert_eq!(app.scroll_offset, 0);
     }
 }
