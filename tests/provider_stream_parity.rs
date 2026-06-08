@@ -9,7 +9,7 @@ use sned::providers::{
     anthropic::{
         AnthropicToolCallState, finish_anthropic_sse_to_chunks, parse_anthropic_sse_to_chunks,
     },
-    openai::{finish_openai_sse_to_chunks, parse_openai_sse_to_chunks},
+    openai::{OpenAiStreamDeltaState, finish_openai_sse_to_chunks, parse_openai_sse_to_chunks},
 };
 
 // ============================================================================
@@ -19,6 +19,7 @@ use sned::providers::{
 async fn collect_openai_chunks(sse: &str) -> Vec<ApiStreamChunk> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(100);
     let mut buffer = SseLineBuffer::default();
+    let mut delta_state = OpenAiStreamDeltaState::default();
     let mut accumulated_tool_calls = std::collections::HashMap::new();
     let mut completed_tool_call_indices = std::collections::HashSet::new();
     let mut last_stop_reason = None;
@@ -27,6 +28,7 @@ async fn collect_openai_chunks(sse: &str) -> Vec<ApiStreamChunk> {
         sse.as_bytes(),
         &mut buffer,
         &tx,
+        &mut delta_state,
         &mut accumulated_tool_calls,
         &mut completed_tool_call_indices,
         &mut last_stop_reason,
@@ -37,6 +39,7 @@ async fn collect_openai_chunks(sse: &str) -> Vec<ApiStreamChunk> {
     finish_openai_sse_to_chunks(
         &mut buffer,
         &tx,
+        &mut delta_state,
         &mut accumulated_tool_calls,
         &mut completed_tool_call_indices,
         &mut last_stop_reason,

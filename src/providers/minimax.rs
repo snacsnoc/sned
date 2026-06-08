@@ -863,6 +863,161 @@ fn parse_minimax_xml_tool_call(xml: &str) -> Option<(String, serde_json::Value)>
     Some((tool_name, serde_json::Value::Object(params)))
 }
 
+#[derive(Debug, Default)]
+struct MinimaxReasoningState {
+    emitted_reasoning: String,
+    in_thinking_tag: bool,
+}
+
+fn longest_reasoning_overlap(left: &str, right: &str) -> usize {
+    let max_overlap = left.len().min(right.len());
+    for overlap in (1..=max_overlap).rev() {
+        if !left.is_char_boundary(left.len() - overlap) || !right.is_char_boundary(overlap) {
+            continue;
+        }
+        if left[left.len() - overlap..] == right[..overlap] {
+            return overlap;
+        }
+    }
+    0
+}
+
+fn normalize_minimax_reasoning_delta(
+    state: &mut MinimaxReasoningState,
+    reasoning: String,
+) -> Option<String> {
+    if reasoning.is_empty() {
+        return None;
+    }
+
+    let overlap = longest_reasoning_overlap(&state.emitted_reasoning, &reasoning);
+    let normalized = reasoning[overlap..].to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    state.emitted_reasoning.push_str(&normalized);
+    Some(normalized)
+}
+
+fn emit_minimax_reasoning(
+    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    reasoning_state: &mut MinimaxReasoningState,
+    event_id: &str,
+    reasoning: String,
+    chunk_type: &str,
+) {
+    if let Some(reasoning) = normalize_minimax_reasoning_delta(reasoning_state, reasoning) {
+        try_send_chunk(
+            tx,
+            ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+                reasoning,
+                details: None,
+                signature: None,
+                redacted_data: None,
+                id: Some(event_id.to_string()),
+            }),
+            chunk_type,
+        );
+    }
+}
+
+fn find_next_think_open(text: &str) -> Option<(usize, usize)> {
+    let tag = text.find("<think>");
+    let comment = text.find("<!-- think -->");
+    match (tag, comment) {
+        (Some(a), Some(b)) => {
+            if a <= b {
+                Some((a, "<think>".len()))
+            } else {
+                Some((b, "<!-- think -->".len()))
+            }
+        }
+        (Some(a), None) => Some((a, "<think>".len())),
+        (None, Some(b)) => Some((b, "<!-- think -->".len())),
+        (None, None) => None,
+    }
+}
+
+fn find_next_think_close(text: &str) -> Option<(usize, usize)> {
+    let tag = text.find("</think>");
+    let comment = text.find("<!-- /think -->");
+    match (tag, comment) {
+        (Some(a), Some(b)) => {
+            if a <= b {
+                Some((a, "</think>".len()))
+            } else {
+                Some((b, "<!-- /think -->".len()))
+            }
+        }
+        (Some(a), None) => Some((a, "</think>".len())),
+        (None, Some(b)) => Some((b, "<!-- /think -->".len())),
+        (None, None) => None,
+    }
+}
+
+fn process_minimax_content_delta(
+    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    event_id: &str,
+    content: &str,
+    pending_text: &mut String,
+    pending_text_signature: &mut Option<String>,
+    reasoning_state: &mut MinimaxReasoningState,
+) {
+    let mut pos = 0usize;
+    let mut force_flush_visible = false;
+
+    while pos < content.len() {
+        if !reasoning_state.in_thinking_tag {
+            if let Some((tag_start, tag_len)) = find_next_think_open(&content[pos..]) {
+                let abs_start = pos + tag_start;
+                pending_text.push_str(&content[pos..abs_start]);
+                *pending_text_signature = Some(event_id.to_string());
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id);
+                reasoning_state.in_thinking_tag = true;
+                pos = abs_start + tag_len;
+                continue;
+            }
+
+            pending_text.push_str(&content[pos..]);
+            *pending_text_signature = Some(event_id.to_string());
+            break;
+        }
+
+        if let Some((tag_start, tag_len)) = find_next_think_close(&content[pos..]) {
+            let abs_start = pos + tag_start;
+            emit_minimax_reasoning(
+                tx,
+                reasoning_state,
+                event_id,
+                content[pos..abs_start].to_string(),
+                "reasoning_from_content",
+            );
+            reasoning_state.in_thinking_tag = false;
+            force_flush_visible = true;
+            pos = abs_start + tag_len;
+            continue;
+        }
+
+        emit_minimax_reasoning(
+            tx,
+            reasoning_state,
+            event_id,
+            content[pos..].to_string(),
+            "reasoning_from_content",
+        );
+        break;
+    }
+
+    if !reasoning_state.in_thinking_tag {
+        if force_flush_visible && !pending_text.is_empty() {
+            flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id);
+        } else if minimax_text_buffer_should_flush(pending_text) {
+            flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id);
+        }
+    }
+}
+
 async fn process_minimax_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
@@ -872,6 +1027,7 @@ async fn process_minimax_sse_line(
     xml_buffer: &mut String,
     pending_text: &mut String,
     pending_text_signature: &mut Option<String>,
+    reasoning_state: &mut MinimaxReasoningState,
 ) {
     let line = line.trim();
     if line.is_empty() || line == "data: [DONE]" || line == "[DONE]" {
@@ -889,30 +1045,22 @@ async fn process_minimax_sse_line(
             // Handle reasoning_content (MiniMax M2.7+ interleaved thinking)
             if let Some(reasoning) = &choice.delta.reasoning_content {
                 flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
-                try_send_chunk(
+                emit_minimax_reasoning(
                     tx,
-                    ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
-                        reasoning: reasoning.clone(),
-                        details: None,
-                        signature: None,
-                        redacted_data: None,
-                        id: Some(event.id.clone()),
-                    }),
+                    reasoning_state,
+                    &event.id,
+                    reasoning.clone(),
                     "reasoning",
                 );
             }
             // Handle reasoning_details array (MiniMax with reasoning_split=true)
             for detail in &choice.delta.reasoning_details {
                 flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
-                try_send_chunk(
+                emit_minimax_reasoning(
                     tx,
-                    ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
-                        reasoning: detail.text.clone(),
-                        details: None,
-                        signature: None,
-                        redacted_data: None,
-                        id: Some(event.id.clone()),
-                    }),
+                    reasoning_state,
+                    &event.id,
+                    detail.text.clone(),
                     "reasoning_details",
                 );
             }
@@ -949,18 +1097,14 @@ async fn process_minimax_sse_line(
                     }
                     extract_and_emit_xml_tool_calls(xml_buffer, tx, &event.id);
                 } else {
-                    pending_text.push_str(content);
-                    if minimax_text_buffer_should_flush(pending_text) {
-                        *pending_text_signature = Some(event.id.clone());
-                        flush_minimax_text_buffer(
-                            tx,
-                            pending_text,
-                            pending_text_signature,
-                            &event.id,
-                        );
-                    } else {
-                        *pending_text_signature = Some(event.id.clone());
-                    }
+                    process_minimax_content_delta(
+                        tx,
+                        &event.id,
+                        content,
+                        pending_text,
+                        pending_text_signature,
+                        reasoning_state,
+                    );
                 }
             }
 
@@ -1168,6 +1312,7 @@ impl Provider for MinimaxProvider {
             let mut xml_buffer = String::new();
             let mut pending_text = String::new();
             let mut pending_text_signature: Option<String> = None;
+            let mut reasoning_state = MinimaxReasoningState::default();
             let mut stream_errored = false;
 
             while let Some(result) = stream.next().await {
@@ -1186,6 +1331,7 @@ impl Provider for MinimaxProvider {
                                 &mut xml_buffer,
                                 &mut pending_text,
                                 &mut pending_text_signature,
+                                &mut reasoning_state,
                             )
                             .await;
                         }
@@ -1225,6 +1371,7 @@ impl Provider for MinimaxProvider {
                         &mut xml_buffer,
                         &mut pending_text,
                         &mut pending_text_signature,
+                        &mut reasoning_state,
                     )
                     .await;
                 }
@@ -1951,6 +2098,7 @@ mod tests {
         let mut xml_buffer = String::new();
         let mut pending_text = String::new();
         let mut pending_text_signature: Option<String> = None;
+        let mut reasoning_state = MinimaxReasoningState::default();
 
         assert!(buffer.push_chunk(first).is_empty());
         for line in buffer.push_chunk(second) {
@@ -1963,6 +2111,7 @@ mod tests {
                 &mut xml_buffer,
                 &mut pending_text,
                 &mut pending_text_signature,
+                &mut reasoning_state,
             )
             .await;
         }
@@ -1991,6 +2140,7 @@ mod tests {
         let mut xml_buffer = String::new();
         let mut pending_text = String::new();
         let mut pending_text_signature: Option<String> = None;
+        let mut reasoning_state = MinimaxReasoningState::default();
         let (tx, mut rx) = mpsc::channel(4);
 
         let first =
@@ -2004,6 +2154,7 @@ mod tests {
             &mut xml_buffer,
             &mut pending_text,
             &mut pending_text_signature,
+            &mut reasoning_state,
         )
         .await;
         assert!(rx.try_recv().is_err(), "partial text should stay buffered");
@@ -2019,6 +2170,7 @@ mod tests {
             &mut xml_buffer,
             &mut pending_text,
             &mut pending_text_signature,
+            &mut reasoning_state,
         )
         .await;
 
@@ -2032,6 +2184,148 @@ mod tests {
             }
             other => panic!("expected text chunk, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_minimax_reasoning_chunks_strip_overlapping_prefixes() {
+        let mut accumulated_tool_calls = std::collections::HashMap::with_capacity(4);
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut xml_buffer = String::new();
+        let mut pending_text = String::new();
+        let mut pending_text_signature: Option<String> = None;
+        let mut reasoning_state = MinimaxReasoningState::default();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        for line in [
+            r#"data: {"id":"evt_1","choices":[{"index":0,"delta":{"reasoning_content":"The"}}]}"#,
+            r#"data: {"id":"evt_2","choices":[{"index":0,"delta":{"reasoning_content":"The user"}}]}"#,
+            r#"data: {"id":"evt_3","choices":[{"index":0,"delta":{"reasoning_content":" user wants"}}]}"#,
+        ] {
+            process_minimax_sse_line(
+                line,
+                &tx,
+                &mut accumulated_tool_calls,
+                &mut completed_tool_call_indices,
+                &mut last_stop_reason,
+                &mut xml_buffer,
+                &mut pending_text,
+                &mut pending_text_signature,
+                &mut reasoning_state,
+            )
+            .await;
+        }
+
+        let mut reasoning = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let ApiStreamChunk::Reasoning(reasoning_chunk) = chunk {
+                reasoning.push_str(&reasoning_chunk.reasoning);
+            }
+        }
+
+        assert_eq!(reasoning, "The user wants");
+    }
+
+    #[tokio::test]
+    async fn test_minimax_content_think_tags_emit_reasoning_not_visible_text() {
+        let mut accumulated_tool_calls = std::collections::HashMap::with_capacity(4);
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut xml_buffer = String::new();
+        let mut pending_text = String::new();
+        let mut pending_text_signature: Option<String> = None;
+        let mut reasoning_state = MinimaxReasoningState::default();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        process_minimax_sse_line(
+            r#"data: {"id":"evt_1","choices":[{"index":0,"delta":{"content":"Visible prefix <think>hidden analysis</think> visible answer"}}]}"#,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            &mut xml_buffer,
+            &mut pending_text,
+            &mut pending_text_signature,
+            &mut reasoning_state,
+        )
+        .await;
+        flush_minimax_text_buffer(&tx, &mut pending_text, &mut pending_text_signature, "flush");
+
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                ApiStreamChunk::Text(text_chunk) => visible.push_str(&text_chunk.text),
+                ApiStreamChunk::Reasoning(reasoning_chunk) => {
+                    reasoning.push_str(&reasoning_chunk.reasoning)
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(visible, "Visible prefix  visible answer");
+        assert_eq!(reasoning, "hidden analysis");
+    }
+
+    #[tokio::test]
+    async fn test_minimax_content_think_close_flushes_visible_answer_promptly() {
+        let mut accumulated_tool_calls = std::collections::HashMap::with_capacity(4);
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut xml_buffer = String::new();
+        let mut pending_text = String::new();
+        let mut pending_text_signature: Option<String> = None;
+        let mut reasoning_state = MinimaxReasoningState::default();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        process_minimax_sse_line(
+            r#"data: {"id":"evt_1","choices":[{"index":0,"delta":{"content":"I<think>hidden start"}}]}"#,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            &mut xml_buffer,
+            &mut pending_text,
+            &mut pending_text_signature,
+            &mut reasoning_state,
+        )
+        .await;
+
+        let first_chunk = rx.try_recv().expect("prefix should flush before think block");
+        match first_chunk {
+            ApiStreamChunk::Text(text_chunk) => assert_eq!(text_chunk.text, "I"),
+            other => panic!("expected text chunk, got {other:?}"),
+        }
+
+        process_minimax_sse_line(
+            r#"data: {"id":"evt_2","choices":[{"index":0,"delta":{"content":" and more</think>final answer"}}]}"#,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            &mut xml_buffer,
+            &mut pending_text,
+            &mut pending_text_signature,
+            &mut reasoning_state,
+        )
+        .await;
+
+        let mut reasoning = String::new();
+        let mut answer = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                ApiStreamChunk::Reasoning(reasoning_chunk) => {
+                    reasoning.push_str(&reasoning_chunk.reasoning);
+                }
+                ApiStreamChunk::Text(text_chunk) => {
+                    answer.push_str(&text_chunk.text);
+                }
+                other => panic!("unexpected chunk after think close: {other:?}"),
+            }
+        }
+
+        assert_eq!(reasoning, "hidden start and more");
+        assert_eq!(answer, "final answer");
     }
 
     #[test]
@@ -2108,6 +2402,7 @@ mod tests {
         let mut xml_buffer = String::new();
         let mut pending_text = String::new();
         let mut pending_text_signature = None;
+        let mut reasoning_state = MinimaxReasoningState::default();
 
         // Chunk 1: tool call id + name + first args fragment
         process_minimax_sse_line(
@@ -2119,6 +2414,7 @@ mod tests {
             &mut xml_buffer,
             &mut pending_text,
             &mut pending_text_signature,
+            &mut reasoning_state,
         )
         .await;
 
@@ -2132,6 +2428,7 @@ mod tests {
             &mut xml_buffer,
             &mut pending_text,
             &mut pending_text_signature,
+            &mut reasoning_state,
         )
         .await;
 

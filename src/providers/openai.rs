@@ -562,9 +562,43 @@ fn try_send_chunk(
     }
 }
 
+#[derive(Debug, Default)]
+pub struct OpenAiStreamDeltaState {
+    emitted_reasoning: String,
+}
+
+fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
+    let max_overlap = left.len().min(right.len());
+    for overlap in (1..=max_overlap).rev() {
+        if !left.is_char_boundary(left.len() - overlap) || !right.is_char_boundary(overlap) {
+            continue;
+        }
+        if left[left.len() - overlap..] == right[..overlap] {
+            return overlap;
+        }
+    }
+    0
+}
+
+fn normalize_reasoning_delta(state: &mut OpenAiStreamDeltaState, reasoning: String) -> Option<String> {
+    if reasoning.is_empty() {
+        return None;
+    }
+
+    let overlap = longest_suffix_prefix_overlap(&state.emitted_reasoning, &reasoning);
+    let normalized = reasoning[overlap..].to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    state.emitted_reasoning.push_str(&normalized);
+    Some(normalized)
+}
+
 async fn process_openai_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    delta_state: &mut OpenAiStreamDeltaState,
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
@@ -604,7 +638,7 @@ async fn process_openai_sse_line(
             }
 
             if let Some(reasoning) = delta.reasoning_content
-                && !reasoning.is_empty()
+                && let Some(reasoning) = normalize_reasoning_delta(delta_state, reasoning)
             {
                 try_send_chunk(
                     tx,
@@ -792,6 +826,7 @@ pub async fn parse_openai_sse_to_chunks(
     chunk: &[u8],
     buffer: &mut crate::providers::SseLineBuffer,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    delta_state: &mut OpenAiStreamDeltaState,
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
@@ -802,6 +837,7 @@ pub async fn parse_openai_sse_to_chunks(
         process_openai_sse_line(
             &line,
             tx,
+            delta_state,
             accumulated_tool_calls,
             completed_tool_call_indices,
             last_stop_reason,
@@ -818,6 +854,7 @@ pub async fn parse_openai_sse_to_chunks(
 pub async fn finish_openai_sse_to_chunks(
     buffer: &mut crate::providers::SseLineBuffer,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    delta_state: &mut OpenAiStreamDeltaState,
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
@@ -828,6 +865,7 @@ pub async fn finish_openai_sse_to_chunks(
         process_openai_sse_line(
             &line,
             tx,
+            delta_state,
             accumulated_tool_calls,
             completed_tool_call_indices,
             last_stop_reason,
@@ -966,6 +1004,7 @@ impl Provider for OpenAiProvider {
         tokio::spawn(async move {
             let mut stream = stream;
             let mut sse_buffer = crate::providers::SseLineBuffer::default();
+            let mut delta_state = OpenAiStreamDeltaState::default();
             let mut accumulated_tool_calls: std::collections::HashMap<
                 usize,
                 (String, String, String),
@@ -986,6 +1025,7 @@ impl Provider for OpenAiProvider {
                             bytes.as_ref(),
                             &mut sse_buffer,
                             &tx,
+                            &mut delta_state,
                             &mut accumulated_tool_calls,
                             &mut completed_tool_call_indices,
                             &mut last_stop_reason,
@@ -1026,6 +1066,7 @@ impl Provider for OpenAiProvider {
                 finish_openai_sse_to_chunks(
                     &mut sse_buffer,
                     &tx,
+                    &mut delta_state,
                     &mut accumulated_tool_calls,
                     &mut completed_tool_call_indices,
                     &mut last_stop_reason,
@@ -1415,6 +1456,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_openai_sse_line_emits_stop_reason_without_usage() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut delta_state = OpenAiStreamDeltaState::default();
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
@@ -1424,6 +1466,7 @@ mod tests {
         process_openai_sse_line(
             r#"data: {"id":"chatcmpl_123","choices":[{"delta":{},"finish_reason":"stop"}]}"#,
             &tx,
+            &mut delta_state,
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
@@ -1439,6 +1482,7 @@ mod tests {
     async fn test_finish_openai_sse_to_chunks_skips_content_filter_tool_calls() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut buffer = SseLineBuffer::default();
+        let mut delta_state = OpenAiStreamDeltaState::default();
         let mut accumulated_tool_calls = std::collections::HashMap::from([(
             0usize,
             (
@@ -1455,6 +1499,7 @@ mod tests {
         finish_openai_sse_to_chunks(
             &mut buffer,
             &tx,
+            &mut delta_state,
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
@@ -2016,10 +2061,73 @@ mod tests {
             "invalid request payload"
         ));
     }
+
+    #[test]
+    fn test_normalize_reasoning_delta_strips_overlapping_prefixes() {
+        let mut state = OpenAiStreamDeltaState::default();
+
+        assert_eq!(
+            normalize_reasoning_delta(&mut state, "The".to_string()).as_deref(),
+            Some("The")
+        );
+        assert_eq!(
+            normalize_reasoning_delta(&mut state, "The user".to_string()).as_deref(),
+            Some(" user")
+        );
+        assert_eq!(
+            normalize_reasoning_delta(&mut state, " user wants".to_string()).as_deref(),
+            Some(" wants")
+        );
+        assert_eq!(
+            normalize_reasoning_delta(&mut state, " wants me".to_string()).as_deref(),
+            Some(" me")
+        );
+        assert_eq!(state.emitted_reasoning, "The user wants me");
+    }
+
+    #[tokio::test]
+    async fn test_process_openai_sse_line_normalizes_overlapping_reasoning_chunks() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
+        let model_info: Option<crate::providers::OpenAiCompatibleModelInfo> = None;
+
+        for line in [
+            r#"data: {"id":"chatcmpl_123","choices":[{"delta":{"reasoning_content":"The"},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl_123","choices":[{"delta":{"reasoning_content":"The user"},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl_123","choices":[{"delta":{"reasoning_content":" user wants"},"finish_reason":null}]}"#,
+        ] {
+            process_openai_sse_line(
+                line,
+                &tx,
+                &mut delta_state,
+                &mut accumulated_tool_calls,
+                &mut completed_tool_call_indices,
+                &mut last_stop_reason,
+                &model_info,
+                &mut usage_sent,
+            )
+            .await;
+        }
+
+        let mut reasoning = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let ApiStreamChunk::Reasoning(reasoning_chunk) = chunk {
+                reasoning.push_str(&reasoning_chunk.reasoning);
+            }
+        }
+
+        assert_eq!(reasoning, "The user wants");
+    }
 }
 #[cfg(test)]
 mod debug_test {
-    use crate::providers::openai::{finish_openai_sse_to_chunks, parse_openai_sse_to_chunks};
+    use crate::providers::openai::{
+        OpenAiStreamDeltaState, finish_openai_sse_to_chunks, parse_openai_sse_to_chunks,
+    };
     use crate::providers::{ApiStreamChunk, SseLineBuffer};
 
     #[tokio::test]
@@ -2036,6 +2144,7 @@ data: [DONE]
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(100);
         let mut buffer = SseLineBuffer::default();
+        let mut delta_state = OpenAiStreamDeltaState::default();
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
@@ -2045,6 +2154,7 @@ data: [DONE]
             sse.as_bytes(),
             &mut buffer,
             &tx,
+            &mut delta_state,
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
@@ -2055,6 +2165,7 @@ data: [DONE]
         finish_openai_sse_to_chunks(
             &mut buffer,
             &tx,
+            &mut delta_state,
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
@@ -2082,6 +2193,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(100);
         let mut buffer = SseLineBuffer::default();
+        let mut delta_state = OpenAiStreamDeltaState::default();
         let mut accumulated_tool_calls = std::collections::HashMap::new();
         let mut completed_tool_call_indices = std::collections::HashSet::new();
         let mut last_stop_reason: Option<String> = None;
@@ -2122,6 +2234,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
             sse.as_bytes(),
             &mut buffer,
             &tx,
+            &mut delta_state,
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
@@ -2132,6 +2245,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
         finish_openai_sse_to_chunks(
             &mut buffer,
             &tx,
+            &mut delta_state,
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
