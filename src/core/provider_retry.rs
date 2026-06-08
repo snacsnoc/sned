@@ -7,7 +7,6 @@ use crate::cli::output::OutputEvent;
 use crate::core::agent_types::TaskState;
 use crate::core::context::context_window;
 use crate::providers::{ApiStream, Provider, ProviderError, ProviderRequest};
-use std::convert::TryFrom;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
