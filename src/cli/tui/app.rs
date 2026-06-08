@@ -627,8 +627,7 @@ impl App {
         // Clear widget below can wipe stale plan content from the
         // right 35 columns after the plan is dismissed.
         let [_main_area, plan_area] =
-            Layout::horizontal([Constraint::Min(40), Constraint::Length(35)])
-                .areas(frame.area());
+            Layout::horizontal([Constraint::Min(40), Constraint::Length(35)]).areas(frame.area());
 
         if has_plan {
             let main_area = _main_area;
@@ -1574,8 +1573,14 @@ mod tests {
         ]);
 
         let result = app.get_input_with_expanded_pastes();
-        assert_eq!(result, "first paste content\nsome text\nfirst paste content");
-        assert!(app.paste_chunks.is_empty(), "paste_chunks should be drained after expansion");
+        assert_eq!(
+            result,
+            "first paste content\nsome text\nfirst paste content"
+        );
+        assert!(
+            app.paste_chunks.is_empty(),
+            "paste_chunks should be drained after expansion"
+        );
 
         // Verify user-typed literal marker is NOT expanded when no paste chunk exists
         let mut app2 = App::new();

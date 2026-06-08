@@ -379,12 +379,7 @@ impl InteractiveSession {
                 Arc::clone(agent_lock.output_writer())
             };
             let export_result = export_agent_conversation(&agent, &export_path).await;
-            report_conversation_export(
-                &output_writer,
-                self.task_opts.json,
-                &export_result,
-                true,
-            );
+            report_conversation_export(&output_writer, self.task_opts.json, &export_result, true);
         }
 
         run_result?;
@@ -1956,7 +1951,13 @@ async fn export_conversation(
     session: &Arc<Mutex<InteractiveSession>>,
     export_path: &str,
 ) -> Result<String, String> {
-    let history = session.lock().await.agent_loop().await.get_conversation_history().await;
+    let history = session
+        .lock()
+        .await
+        .agent_loop()
+        .await
+        .get_conversation_history()
+        .await;
     let export_data = serialize_conversation_export(&history)?;
     write_conversation_export(export_path, &export_data)
 }
@@ -2180,13 +2181,8 @@ async fn run_main_loop(
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 app.force_bottom();
-                                cancel_agent(
-                                    &state_handle,
-                                    &agent_task,
-                                    &agent_done,
-                                    &agent_busy,
-                                )
-                                .await?;
+                                cancel_agent(&state_handle, &agent_task, &agent_done, &agent_busy)
+                                    .await?;
                                 app.push_plain("^C");
                                 app.agent_busy = false;
                                 continue;
@@ -2259,13 +2255,8 @@ async fn run_main_loop(
 
                         // If agent is busy, cancel it
                         if agent_busy.load(Ordering::Relaxed) {
-                            cancel_agent(
-                                &state_handle,
-                                &agent_task,
-                                &agent_done,
-                                &agent_busy,
-                            )
-                            .await?;
+                            cancel_agent(&state_handle, &agent_task, &agent_done, &agent_busy)
+                                .await?;
                             app.agent_busy = false;
                             app.push_styled("^C cancelled", Style::default().fg(theme::WARNING_FG));
                             app.push_styled(
@@ -3224,7 +3215,10 @@ mod tests {
         report_conversation_export(&writer_arc, false, &result, false);
 
         let events = writer.events.lock().unwrap();
-        assert!(events.is_empty(), "per-turn export should stay silent on success");
+        assert!(
+            events.is_empty(),
+            "per-turn export should stay silent on success"
+        );
     }
 
     #[test]
