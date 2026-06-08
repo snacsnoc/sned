@@ -44,27 +44,27 @@ where
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-            if event.metadata().target() == "json_output" {
-                struct MessageVisitor(String);
-                impl tracing::field::Visit for MessageVisitor {
-                    fn record_debug(
-                        &mut self,
-                        _field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        let raw = format!("{:?}", value);
-                        self.0 = match serde_json::from_str::<serde_json::Value>(&raw) {
-                            Ok(parsed) => match parsed {
-                                serde_json::Value::String(inner) => inner,
-                                other => other.to_string(),
-                            },
-                            Err(_) => serde_json::Value::String(raw).to_string(),
-                        };
-                    }
-                    fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
-                        self.0 = value.to_string();
-                    }
+        if event.metadata().target() == "json_output" {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let raw = format!("{:?}", value);
+                    self.0 = match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(parsed) => match parsed {
+                            serde_json::Value::String(inner) => inner,
+                            other => other.to_string(),
+                        },
+                        Err(_) => serde_json::Value::String(raw).to_string(),
+                    };
                 }
+                fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+                    self.0 = value.to_string();
+                }
+            }
             let mut visitor = MessageVisitor(String::new());
             event.record(&mut visitor);
             let mut stdout = std::io::stdout().lock();
@@ -105,10 +105,8 @@ fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
             // type-erased wrapper so both branches share the same
             // `Layer<…>` type.
             let writer: BoxMakeWriter = if tui_mode {
-                let path = std::env::temp_dir().join(format!(
-                    "sned-tui-{}.log",
-                    std::process::id()
-                ));
+                let path =
+                    std::env::temp_dir().join(format!("sned-tui-{}.log", std::process::id()));
                 match std::fs::File::create(&path) {
                     Ok(file) => {
                         eprintln!(
@@ -135,7 +133,9 @@ fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
                 .with_writer(writer)
                 .with_filter(env_filter);
 
-            let registry = tracing_subscriber::registry().with(fmt_layer).with(JsonOutputLayer);
+            let registry = tracing_subscriber::registry()
+                .with(fmt_layer)
+                .with(JsonOutputLayer);
 
             if debug {
                 let log_file = std::fs::File::create("/tmp/sned-debug.log")
@@ -897,6 +897,8 @@ pub(crate) fn create_provider(
         "mock" => {
             if std::env::var_os("SNED_MOCK_APPROVAL_SCROLL").is_some() {
                 Arc::new(crate::providers::mock::MockProvider::approval_scroll_scenario())
+            } else if std::env::var_os("SNED_MOCK_BUSY_STREAM").is_some() {
+                Arc::new(crate::providers::mock::MockProvider::busy_stream_scenario())
             } else {
                 Arc::new(
                     crate::providers::mock::MockProvider::single_text_response_repeat(

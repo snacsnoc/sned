@@ -142,6 +142,33 @@ impl MockProvider {
             MockResponse::ToolCalls(vec![attempt_completion]),
         ])
     }
+
+    pub fn busy_stream_scenario() -> Self {
+        let mut events = Vec::new();
+        events.push(MockStreamEvent::Chunk(ApiStreamChunk::Text(
+            ApiStreamTextChunk {
+                text: "busy stream start\n".to_string(),
+                id: None,
+                signature: None,
+            },
+        )));
+
+        for i in 0..400 {
+            events.push(MockStreamEvent::Chunk(ApiStreamChunk::Text(
+                ApiStreamTextChunk {
+                    text: format!(
+                        "busy stream chunk {:03}: keeping the TUI output channel active\n",
+                        i
+                    ),
+                    id: None,
+                    signature: None,
+                },
+            )));
+            events.push(MockStreamEvent::Delay(Duration::from_millis(20)));
+        }
+
+        Self::new_with_repeat(vec![MockResponse::Stream(events)])
+    }
 }
 
 #[async_trait]

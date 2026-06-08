@@ -150,7 +150,9 @@ impl EditFileHandler {
         Some(repaired)
     }
 
-    fn parse_stringified_files_array(raw: &str) -> Result<Vec<serde_json::Value>, serde_json::Error> {
+    fn parse_stringified_files_array(
+        raw: &str,
+    ) -> Result<Vec<serde_json::Value>, serde_json::Error> {
         match serde_json::from_str::<Vec<serde_json::Value>>(raw) {
             Ok(files) => Ok(files),
             Err(err) if err.classify() == serde_json::error::Category::Eof => {
@@ -165,10 +167,7 @@ impl EditFileHandler {
         }
     }
 
-    fn apply_top_level_path_fallback(
-        files: &mut [serde_json::Value],
-        fallback_path: Option<&str>,
-    ) {
+    fn apply_top_level_path_fallback(files: &mut [serde_json::Value], fallback_path: Option<&str>) {
         let Some(path) = fallback_path else {
             return;
         };
@@ -331,8 +330,7 @@ impl EditFileHandler {
                     ));
                 } else {
                     let (anchor_name, _) = split_anchor(&anchor);
-                    if anchor_name.is_empty() || anchor_name.chars().all(|c| c.is_ascii_digit())
-                    {
+                    if anchor_name.is_empty() || anchor_name.chars().all(|c| c.is_ascii_digit()) {
                         invalid_anchors.push(format!(
                             "  - File '{}': anchor '{}' must include a non-numeric anchor name before the '{}' delimiter",
                             path,
@@ -347,14 +345,14 @@ impl EditFileHandler {
                 }
 
                 if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a| a.as_str()) {
-                    let end_anchor = match Self::normalized_anchor("end_anchor", path, end_anchor_raw)
-                    {
-                        Ok(anchor) => anchor,
-                        Err(message) => {
-                            invalid_anchors.push(format!("  - {}", message));
-                            continue;
-                        }
-                    };
+                    let end_anchor =
+                        match Self::normalized_anchor("end_anchor", path, end_anchor_raw) {
+                            Ok(anchor) => anchor,
+                            Err(message) => {
+                                invalid_anchors.push(format!("  - {}", message));
+                                continue;
+                            }
+                        };
                     if !end_anchor.contains(ANCHOR_DELIMITER) {
                         invalid_anchors.push(format!(
                             "  - File '{}': end_anchor '{}' is missing the '{}' delimiter",
@@ -479,7 +477,11 @@ impl EditFileHandler {
         if files.is_empty() {
             return if files_value.is_none() {
                 Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
-            } else if files_value.and_then(|f| f.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
+            } else if files_value
+                .and_then(|f| f.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(false)
+            {
                 Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
             } else if files_value.and_then(|f| f.as_str()).is_some() {
                 match parsed_stringified_files.unwrap() {
@@ -1550,7 +1552,8 @@ mod tests {
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
-        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("path-fallback"));
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("path-fallback"));
         let ctx = ToolContext::new(
             state,
             None,
@@ -1593,7 +1596,8 @@ mod tests {
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
-        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("repair-task"));
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("repair-task"));
         let ctx = ToolContext::new(
             state,
             None,
@@ -1620,6 +1624,50 @@ mod tests {
         );
         let updated = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(updated, "repaired\nline 2\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_runlog_style_multi_edit_stringified_payload() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("BUGS.md");
+        let raw_content = "alpha\nbeta\ngamma\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("runlog-task"));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "runlog-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let first_anchor = format!("{}§alpha", anchors[0]);
+        let second_anchor = format!("{}§beta", anchors[1]);
+        let params = serde_json::json!({
+            "path": "BUGS.md",
+            "files": format!(
+                r#"[{{"edits":[{{"anchor":"{}","edit_type":"replace","text":"first"}},{{"anchor":"{}","edit_type":"replace","text":"second"}}]}}"#,
+                first_anchor,
+                second_anchor,
+            )
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "runlog-style top-level path + truncated stringified payload should recover: {:?}",
+            result.err()
+        );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "first\nsecond\ngamma\n");
     }
 
     #[tokio::test]
@@ -2870,7 +2918,10 @@ edition = "2021"
         });
 
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_err(), "invalid anchor name should fail validation");
+        assert!(
+            result.is_err(),
+            "invalid anchor name should fail validation"
+        );
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("Hash anchor validation failed"));
         assert!(err_msg.contains("anchor name"));
@@ -3003,7 +3054,10 @@ edition = "2021"
         });
 
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok(), "overlap failure should still return a summary");
+        assert!(
+            result.is_ok(),
+            "overlap failure should still return a summary"
+        );
         let output = result.unwrap().as_str().unwrap().to_string();
         assert!(output.contains("0 edit(s) applied"), "got: {}", output);
         assert!(output.contains("0 edit(s) failed"), "got: {}", output);
@@ -3078,11 +3132,8 @@ edition = "2021"
 
         let prep_anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
-        let anchors = prep_anchor_mgr.reconcile(
-            file_path.to_str().unwrap(),
-            &lines,
-            Some("test-task"),
-        );
+        let anchors =
+            prep_anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
@@ -3173,8 +3224,7 @@ edition = "2021"
         // Simulate a previous read by reconciling the file once
         // to populate the anchor state.
         let anchor_mgr = AnchorStateManager::new();
-        let initial_lines: Vec<String> =
-            raw_content.lines().map(|s| s.to_string()).collect();
+        let initial_lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
         let initial_anchors = anchor_mgr.reconcile(
             canonical_path.to_str().unwrap(),
             &initial_lines,
@@ -3216,7 +3266,11 @@ edition = "2021"
         });
 
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok(), "Execute should return Ok with error in body: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Execute should return Ok with error in body: {:?}",
+            result
+        );
         let body = result
             .unwrap()
             .as_str()
@@ -3415,7 +3469,10 @@ edition = "2021"
             "files": "this is not valid json {["
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok(), "invalid stringified JSON should return Ok with error message");
+        assert!(
+            result.is_ok(),
+            "invalid stringified JSON should return Ok with error message"
+        );
         let msg = result.unwrap().as_str().unwrap().to_string();
         assert!(
             msg.contains("Parse error") || msg.contains("parse error"),

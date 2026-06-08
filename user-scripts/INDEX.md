@@ -272,7 +272,7 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 
 ### `tui-smoke-test.sh`
 
-**What:** Canonical smoke test for the ratatui interactive shell and nearby CLI dispatch. It rebuilds sned, starts the TUI in a pty with `SNED_NO_ALTERNATE_SCREEN=1`, verifies the startup banner renders, sends `/exit`, and checks clean shutdown. It uses the mock provider, so no API key or network is required.
+**What:** Canonical smoke test for the ratatui interactive shell and nearby CLI dispatch. It rebuilds sned, starts the TUI in a pty with `SNED_NO_ALTERNATE_SCREEN=1`, verifies the startup banner renders, sends `/exit`, checks clean shutdown, and includes a busy-stream exit probe using the mock provider. It uses the mock provider, so no API key or network is required.
 
 **Usage:**
 ```bash
@@ -294,6 +294,7 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 - ✅ **After ANY change to `src/cli/tui/`** → Run all tests
 - ✅ **After ANY change to `src/terminal/input.rs`** → Run all tests
 - ✅ **After output-routing changes (`OutputWriter`, approval prompts, agent output)** → Run all tests
+- ✅ **After provider streaming changes that could flood TUI output** → Run all tests
 - ✅ **Before committing TUI work** → Run all tests
 - ✅ **User reports TUI startup/display bugs** → Run `--test tui-startup-exit --verbose`
 - ❌ **Not needed for**: Non-TUI changes (storage, providers, tools, etc.)
@@ -301,6 +302,7 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 **Why Use It:**
 - **Catches startup regressions**: Verifies ratatui can initialize in a pty and render the banner
 - **Catches dispatch regressions**: Verifies help/version/error/json/yolo CLI paths still work
+- **Catches busy-exit starvation**: Verifies `/exit` still works while a mock provider is actively streaming output
 - **Agent-safe**: Uses temp `SNED_DIR`/`SNED_DATA_DIR`, mock provider, and no live network
 - **Always builds first**: Runs `cargo build` automatically so you test latest changes
 - **Reference document**: `docs/TUI_STATE_MACHINE.md` defines the state machine and manual checks
@@ -317,6 +319,7 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 | Test Name | What It Verifies |
 |-----------|------------------|
 | `tui-startup-exit` | Ratatui starts in a pty, banner renders, `/exit` exits cleanly |
+| `tui-busy-exit` | While a mock provider streams output, `/exit` still shuts down promptly |
 | `help` | `--help` shows usage |
 | `version` | `--version` shows version |
 | `invalid-flag` | Invalid flag returns an error |
@@ -325,7 +328,7 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 
 **Known Limits:**
 - This is a smoke test, not the old full state-machine suite.
-- It does not automate busy-state queueing, approval keystrokes, resize, or multi-turn agent behavior.
+- It does not automate approval keystrokes, resize, or multi-turn agent behavior.
 - Those remain manual checks from `docs/TUI_STATE_MACHINE.md` or future Rust integration-test work.
 
 **Prerequisites:**
