@@ -913,7 +913,7 @@ async fn process_anthropic_event(
                         reasoning: "[Redacted thinking block]".to_string(),
                         details: None,
                         signature: None,
-                        redacted_data: Some(data.clone()),
+                        redacted_data: Some(data),
                         id: None,
                     }),
                     "reasoning",

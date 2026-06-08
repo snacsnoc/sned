@@ -861,7 +861,6 @@ pub(crate) fn create_provider(
                 .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
                 .unwrap_or_default();
             let model_id_str = model_id
-                .clone()
                 .unwrap_or_else(|| "deepseek-chat".to_string());
             Arc::new(crate::providers::deepseek::DeepSeekProvider::new(
                 crate::providers::deepseek::DeepSeekConfig {
@@ -880,7 +879,6 @@ pub(crate) fn create_provider(
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .unwrap_or_default();
             let model_id_str = model_id
-                .clone()
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4.5".to_string());
             Arc::new(crate::providers::openrouter::OpenRouterProvider::new(
                 crate::providers::openrouter::OpenRouterConfig {

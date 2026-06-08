@@ -751,7 +751,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
         }
     };
 
-    state_manager.set_secret(secret_key, api_key.clone());
+    state_manager.set_secret(secret_key, api_key);
     println!("Stored API key for {}", provider);
 
     // Persist model ID if provided (applies to both act and plan modes)

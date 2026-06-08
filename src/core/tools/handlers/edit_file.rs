@@ -488,7 +488,7 @@ impl EditFileHandler {
                         )),
                     }
                 } else {
-                    Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}].", value).to_string())
+                    Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}].", value))
                 }
             } else {
                 Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
