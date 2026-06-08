@@ -28,7 +28,7 @@ use std::pin::Pin;
 // ============================================================================
 
 /// A reasoning detail parameter, used by OpenRouter and Sned providers.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReasoningDetailParam {
     #[serde(rename = "type")]
     pub detail_type: String,
@@ -39,7 +39,7 @@ pub struct ReasoningDetailParam {
 }
 
 /// Shared fields across all content blocks.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SharedContentFields {
     /// The call ID associated with this content block.
     pub call_id: Option<String>,

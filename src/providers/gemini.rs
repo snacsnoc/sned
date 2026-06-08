@@ -845,8 +845,8 @@ fn get_gemini_model_info(model_id: &str) -> ModelInfo {
     // Default model info for unknown Gemini models
     let mut info = ModelInfo {
         name: Some(model_id.to_string()),
-        max_tokens: Some(65536),
-        context_window: Some(1048576),
+        max_tokens: Some(65_536),
+        context_window: Some(1_048_576),
         supports_images: Some(true),
         supports_prompt_cache: true,
         supports_reasoning: Some(true),
@@ -952,7 +952,7 @@ fn get_gemini_model_info(model_id: &str) -> ModelInfo {
             supports_thinking_level: Some(true),
         });
     } else if model_id.contains("gemini-2.5-pro") {
-        info.context_window = Some(1048576);
+        info.context_window = Some(1_048_576);
         info.input_price = Some(2.5);
         info.output_price = Some(15.0);
         info.thinking_config = Some(ThinkingConfig {
@@ -963,7 +963,7 @@ fn get_gemini_model_info(model_id: &str) -> ModelInfo {
             supports_thinking_level: Some(false),
         });
     } else if model_id.contains("gemini-2.5-flash-lite") {
-        info.context_window = Some(1048576);
+        info.context_window = Some(1_048_576);
         info.input_price = Some(0.1);
         info.output_price = Some(0.4);
         info.thinking_config = Some(ThinkingConfig {
@@ -974,7 +974,7 @@ fn get_gemini_model_info(model_id: &str) -> ModelInfo {
             supports_thinking_level: Some(false),
         });
     } else if model_id.contains("gemini-2.5-flash") {
-        info.context_window = Some(1048576);
+        info.context_window = Some(1_048_576);
         info.input_price = Some(0.3);
         info.output_price = Some(2.5);
         info.thinking_config = Some(ThinkingConfig {

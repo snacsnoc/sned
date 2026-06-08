@@ -24,7 +24,7 @@ pub fn get_mention_regex() -> &'static Regex {
 }
 
 /// Parsed mention with its type.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mention {
     File(String),
     Folder(String),

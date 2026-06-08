@@ -689,8 +689,8 @@ fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
     if model_id.contains("opus") {
         ModelInfo {
             name: Some("claude-opus-4-6".to_string()),
-            max_tokens: Some(128000),
-            context_window: Some(200000),
+            max_tokens: Some(128_000),
+            context_window: Some(200_000),
             supports_images: Some(true),
             supports_prompt_cache: true,
             supports_reasoning: Some(true),
@@ -712,8 +712,8 @@ fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
     } else if model_id.contains("haiku") {
         ModelInfo {
             name: Some("claude-haiku-4-5-20251001".to_string()),
-            max_tokens: Some(64000),
-            context_window: Some(200000),
+            max_tokens: Some(64_000),
+            context_window: Some(200_000),
             supports_images: Some(true),
             supports_prompt_cache: true,
             supports_reasoning: Some(false),
@@ -736,8 +736,8 @@ fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
         // Default to Claude Sonnet 4.6
         ModelInfo {
             name: Some("claude-sonnet-4-6".to_string()),
-            max_tokens: Some(64000),
-            context_window: Some(200000),
+            max_tokens: Some(64_000),
+            context_window: Some(200_000),
             supports_images: Some(true),
             supports_prompt_cache: true,
             supports_reasoning: Some(true),

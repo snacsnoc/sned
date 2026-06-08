@@ -1,6 +1,6 @@
 //! Stream parsing and thinking-section detection for model output.
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThinkOpenKind {
     /// Opened by ```think — only ``` closes it (code fences inside thinking are preserved)
     CodeFenceThink,

@@ -16,6 +16,7 @@ Use the script that matches the job:
 | Regenerate repo map | `regen-infiniloom.sh` | Use after structural changes |
 | Check Zig setup | `setup-zig-0.15.sh` | Only for libghostty-rs / Zig issues |
 | **Test TUI changes** | `tui-smoke-test.sh` | **Run after ANY change to interactive.rs or tui/** |
+| **Curated pedantic clippy** | `clippy-curated.sh` | Pedantic + nursery with doc/style lints filtered out |
 
 **Default flow**
 1. If the user did not already name a task, run `list-open-todos.sh`.
@@ -265,6 +266,43 @@ printf '%s\n' src/**/*.rs | ./user-scripts/pack-task-context.sh
 - `.infiniloom/context.md` - Source code context (12K tokens)
 
 **Dependencies:** `infiniloom` CLI tool
+
+---
+
+## Code Quality
+
+### `clippy-curated.sh`
+
+**What:** Curated pedantic + nursery clippy pass for sned. Enables the noisy lint groups while filtering out:
+- Documentation lints (`missing_errors_doc`, `missing_panics_doc`, `doc_markdown`)
+- Stylistic preferences (`option_if_let_else`, `items_after_statements`, `too_many_lines`, `similar_names`, `module_name_repetitions`)
+- Numeric cast worries (`cast_possible_truncation`, `cast_precision_loss`, `cast_sign_loss`, `cast_lossless`, `cast_possible_wrap`)
+- Perf hints that don't apply (`missing_const_for_fn`)
+
+**Usage:**
+```bash
+# Show all warnings
+./user-scripts/clippy-curated.sh
+
+# Treat warnings as errors (CI mode)
+./user-scripts/clippy-curated.sh --strict
+```
+
+**When to Use (LLM Agent Decision Tree):**
+- ✅ **After a non-trivial Rust change** → Run to catch real perf/correctness lints
+- ✅ **Before marking a refactor task DONE** → Run to verify no slop introduced
+- ✅ **User asks "any slop to fix"** → Run and address the actionable lints
+- ✅ **In a CI gate** → Run with `--strict` to fail on any curated lint
+- ❌ **Don't run for**: Single-line fixes, doc-only changes, test-only changes
+- ❌ **Don't run `--strict` on**: The full repo (it currently reports 1500+ warnings; address in batches)
+
+**Why Use It:**
+- **Catches real issues**: Perf (`redundant_clone`, `inefficient_clone`, `or_fun_call`), correctness (`unwrap_used`, `panic_in_result_fn`), suspicious patterns
+- **Suppresses noise**: Doc/style lints are excluded so the output is actionable
+- **Same target as dev build**: Uses `CARGO_TARGET_DIR=/tmp/sned-target` by default
+- **Composable with validation**: Pairs with `cargo test --lib <filter>` for fix-and-verify loops
+
+**Dependencies:** cargo, clippy (installed via `rustup component add clippy`)
 
 ---
 

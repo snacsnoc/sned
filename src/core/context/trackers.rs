@@ -528,7 +528,7 @@ impl FileContextTracker {
 // ============================================================================
 
 /// Metadata entry for model usage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMetadataEntry {
     pub ts: u64,
     pub model_id: String,
@@ -537,7 +537,7 @@ pub struct ModelMetadataEntry {
 }
 
 /// State of a file in context.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileRecordState {
     Active,
@@ -545,7 +545,7 @@ pub enum FileRecordState {
 }
 
 /// Source of a file record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileRecordSource {
     ReadTool,
@@ -555,7 +555,7 @@ pub enum FileRecordSource {
 }
 
 /// Metadata entry for a file in context.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMetadataEntry {
     pub path: String,
     pub record_state: FileRecordState,
@@ -566,7 +566,7 @@ pub struct FileMetadataEntry {
 }
 
 /// Metadata about the environment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentMetadata {
     pub os_name: String,
     pub os_version: String,
@@ -577,7 +577,7 @@ pub struct EnvironmentMetadata {
 }
 
 /// Metadata entry for environment history.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentMetadataEntry {
     pub ts: u64,
     pub os_name: String,

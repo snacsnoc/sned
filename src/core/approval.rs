@@ -457,7 +457,7 @@ impl std::error::Error for PathPatternError {}
 
 /// Per-action auto-approval settings, ported from
 /// `autoApprove.ts` `autoApprovalSettings.actions`.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AutoApprovalSettings {
     pub read_files: bool,
     pub read_files_externally: bool,

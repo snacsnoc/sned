@@ -282,7 +282,7 @@ impl AnchorStateManager {
 
         loop {
             // Mix salt into hash for collision resolution
-            let mixed_hash = line_hash.wrapping_add(salt.wrapping_mul(0x9e3779b9));
+            let mixed_hash = line_hash.wrapping_add(salt.wrapping_mul(0x9e37_79b9));
 
             // Select two words deterministically from hash
             let idx1 = (mixed_hash as usize) % dict_len;
@@ -618,7 +618,7 @@ fn diff_arrays(old: &[u64], new: &[u64]) -> Vec<DiffChange> {
 
 /// An individual edit operation.
 ///
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
     pub anchor: String,
     pub end_anchor: Option<String>,

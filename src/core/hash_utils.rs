@@ -31,10 +31,10 @@ static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Generates a 32-bit FNV-1a hash for the given content string.
 ///
 pub fn content_hash(content: &str) -> String {
-    let mut h: u32 = 2166136261; // FNV-1a offset basis
+    let mut h: u32 = 2_166_136_261; // FNV-1a offset basis
     for byte in content.bytes() {
         h ^= byte as u32;
-        h = h.wrapping_mul(16777619); // FNV-1a prime
+        h = h.wrapping_mul(16_777_619); // FNV-1a prime
     }
     format!("{:08x}", h)
 }
@@ -45,10 +45,10 @@ pub fn compute_hashes(lines: &[String]) -> Vec<u64> {
     lines
         .iter()
         .map(|line| {
-            let mut h: u64 = 14695981039346656037;
+            let mut h: u64 = 14_695_981_039_346_656_037;
             for byte in line.bytes() {
                 h ^= byte as u64;
-                h = h.wrapping_mul(1099511628211);
+                h = h.wrapping_mul(1_099_511_628_211);
             }
             h
         })

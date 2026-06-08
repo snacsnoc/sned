@@ -463,7 +463,7 @@ fn ensure_tool_results_follow_tool_use(messages: &mut [StorageMessage]) {
 }
 
 /// How much of the conversation to keep when truncating.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncationKeep {
     None,
     LastTwo,

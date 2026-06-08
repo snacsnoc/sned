@@ -68,7 +68,7 @@ pub struct BatchProcessor {
 }
 
 /// Diff output mode.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DiffMode {
     #[default]
     Full,

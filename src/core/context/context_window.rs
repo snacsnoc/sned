@@ -129,7 +129,7 @@ pub fn validate_context_window(
 }
 
 /// Information about the context window for a given provider.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextWindowInfo {
     /// The raw context window size reported by the model.
     pub context_window: u64,

@@ -56,7 +56,7 @@ pub struct SkillMetadata {
 }
 
 /// Skill source type
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillSource {
     Project,
     Global,

@@ -211,8 +211,8 @@ impl MinimaxProvider {
         match model_id.as_str() {
             "MiniMax-M2.7" => ModelInfo {
                 name: Some("MiniMax-M2.7".to_string()),
-                max_tokens: Some(128000),
-                context_window: Some(204800),
+                max_tokens: Some(128_000),
+                context_window: Some(204_800),
                 supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -242,8 +242,8 @@ impl MinimaxProvider {
             },
             "MiniMax-M2.7-highspeed" => ModelInfo {
                 name: Some("MiniMax-M2.7-highspeed".to_string()),
-                max_tokens: Some(128000),
-                context_window: Some(204800),
+                max_tokens: Some(128_000),
+                context_window: Some(204_800),
                 supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -272,8 +272,8 @@ impl MinimaxProvider {
             },
             "MiniMax-M2.5" => ModelInfo {
                 name: Some("MiniMax-M2.5".to_string()),
-                max_tokens: Some(16384),
-                context_window: Some(204800),
+                max_tokens: Some(16_384),
+                context_window: Some(204_800),
                 supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -303,8 +303,8 @@ impl MinimaxProvider {
             },
             "MiniMax-M2.5-highspeed" => ModelInfo {
                 name: Some("MiniMax-M2.5-highspeed".to_string()),
-                max_tokens: Some(16384),
-                context_window: Some(204800),
+                max_tokens: Some(16_384),
+                context_window: Some(204_800),
                 supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -333,8 +333,8 @@ impl MinimaxProvider {
             },
             "MiniMax-M2.1" => ModelInfo {
                 name: Some("MiniMax-M2.1".to_string()),
-                max_tokens: Some(16384),
-                context_window: Some(204800),
+                max_tokens: Some(16_384),
+                context_window: Some(204_800),
                 supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -364,8 +364,8 @@ impl MinimaxProvider {
             },
             "MiniMax-M2.1-highspeed" => ModelInfo {
                 name: Some("MiniMax-M2.1-highspeed".to_string()),
-                max_tokens: Some(16384),
-                context_window: Some(204800),
+                max_tokens: Some(16_384),
+                context_window: Some(204_800),
                 supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -392,8 +392,8 @@ impl MinimaxProvider {
             },
             "MiniMax-M2" => ModelInfo {
                 name: Some("MiniMax-M2".to_string()),
-                max_tokens: Some(16384),
-                context_window: Some(204800),
+                max_tokens: Some(16_384),
+                context_window: Some(204_800),
                 supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
@@ -422,8 +422,8 @@ impl MinimaxProvider {
             },
             _ => ModelInfo {
                 name: Some(model_id),
-                max_tokens: Some(128000),
-                context_window: Some(204800),
+                max_tokens: Some(128_000),
+                context_window: Some(204_800),
                 supports_images: Some(false),
                 supports_prompt_cache: true,
                 supports_reasoning: Some(true),
