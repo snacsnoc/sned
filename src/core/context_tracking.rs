@@ -80,6 +80,7 @@ impl EnvironmentContextTracker {
         })
     }
 
+    #[allow(clippy::unused_self)]
     fn is_same_environment(
         &self,
         a: &crate::storage::task_storage::EnvironmentMetadataEntry,

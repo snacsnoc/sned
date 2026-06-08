@@ -274,6 +274,7 @@ async fn handle_shutdown_signal(
 ///
 /// First SIGINT/Ctrl+C or SIGTERM requests cooperative cancellation. A repeated
 /// signal within two seconds waits briefly for active atomic writes, then exits.
+#[allow(clippy::unused_async)]
 pub async fn setup_ctrl_c_handler(state: Arc<Mutex<TaskState>>) {
     let last_signal = Arc::new(Mutex::new(None));
 

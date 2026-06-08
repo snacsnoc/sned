@@ -320,6 +320,7 @@ impl FileContextTracker {
     /// Track a file operation with metadata persistence.
     ///
     /// Records the file operation in the metadata and persists to disk if `task_id` is set.
+    #[allow(clippy::unused_async)]
     pub async fn track_file_context(&mut self, path: &str, source: FileRecordSource) {
         self.add_file_to_file_context_tracker(path, source);
         // Also track for mtime-based stale detection

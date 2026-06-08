@@ -715,6 +715,7 @@ impl HookManager {
 
     /// Validate hook output structure
     /// SECURITY (F-03): Validate content of context_modification to detect prompt injection
+    #[allow(clippy::unused_self)]
     fn validate_hook_output(&self, output: &HookOutput) -> Result<(), String> {
         // Check cancel is boolean if present
         // cancel field is validated by type system (Option<bool>)

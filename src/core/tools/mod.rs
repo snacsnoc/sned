@@ -397,6 +397,7 @@ pub fn resolve_sanitized_path(
 #[async_trait::async_trait]
 pub trait ToolHandler: Send + Sync {
     /// Execute the tool with the given input.
+    #[allow(clippy::unused_async, clippy::unused_self)]
     async fn execute(
         &self,
         ctx: &ToolContext,

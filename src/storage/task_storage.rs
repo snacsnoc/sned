@@ -99,6 +99,7 @@ impl TaskStorage {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn read_json_with_backup<T>(&self, file_path: &Path) -> Option<T>
     where
         T: for<'de> Deserialize<'de>,

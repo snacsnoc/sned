@@ -1863,6 +1863,7 @@ impl StateManager {
         pending.insert(key);
     }
 
+    #[allow(clippy::unused_self)]
     fn read_task_settings_with_backup(
         &self,
         file_path: &Path,
@@ -2014,6 +2015,7 @@ impl StateManager {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)]
     fn persist_full_global_state(
         &self,
         state: &GlobalState,

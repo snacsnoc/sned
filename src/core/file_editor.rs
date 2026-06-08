@@ -270,6 +270,7 @@ impl AnchorStateManager {
     ///
     /// Uses the hash to select words from the dictionary, applying a salt counter
     /// on collision to find an unused combination.
+    #[allow(clippy::unused_self)]
     fn get_word_for_hash(
         &self,
         line_hash: u64,

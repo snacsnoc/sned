@@ -459,6 +459,7 @@ impl BatchProcessor {
         format!("{}\n\n{}", summary, results.join("\n\n---\n\n"))
     }
 
+    #[allow(clippy::unused_self)]
     fn get_addition_only_diff_block(
         &self,
         prepared: &PreparedEdits,
@@ -553,6 +554,7 @@ impl BatchProcessor {
         res.join("\n")
     }
 
+    #[allow(clippy::unused_self)]
     fn get_diff_block(
         &self,
         prepared: &PreparedEdits,

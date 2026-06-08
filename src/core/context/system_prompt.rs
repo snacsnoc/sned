@@ -164,6 +164,7 @@ impl PromptBuilder {
         .collect()
     }
 
+    #[allow(clippy::unused_self)]
     fn post_process(&self, prompt: String) -> String {
         let mut result = prompt;
 

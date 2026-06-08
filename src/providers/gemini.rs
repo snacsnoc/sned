@@ -392,6 +392,7 @@ fn try_send_chunk(
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn process_gemini_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
@@ -639,6 +640,7 @@ async fn process_gemini_sse_line(
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn finish_gemini_sse_to_chunks(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &mut HashMap<String, (String, String, String, Option<String>)>,

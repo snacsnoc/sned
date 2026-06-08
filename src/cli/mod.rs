@@ -1085,6 +1085,7 @@ fn setup_hook_manager(
     Arc::new(hook_manager)
 }
 
+#[allow(clippy::unused_async)]
 async fn build_task_components(
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,

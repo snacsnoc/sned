@@ -145,6 +145,7 @@ impl CommandSafetyChecker {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)]
     fn check_common(&self, command: &str) -> Result<(), CommandUnsafe> {
         let normalized = command.trim();
         if normalized.contains("$(") || normalized.contains('`') {
@@ -159,6 +160,7 @@ impl CommandSafetyChecker {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)]
     fn check_shell_syntax(&self, command: &str) -> Result<(), CommandUnsafe> {
         let mut normalized = command.trim();
 

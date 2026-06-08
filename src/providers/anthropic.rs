@@ -829,6 +829,7 @@ pub async fn finish_anthropic_sse_to_chunks(
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn process_anthropic_event(
     event: AnthropicStreamEvent,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,

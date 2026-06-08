@@ -1018,6 +1018,7 @@ fn process_minimax_content_delta(
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn process_minimax_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
