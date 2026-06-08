@@ -407,13 +407,13 @@ impl ReadFileHandler {
             lines.push(line);
             line_count += 1;
 
-            if let Some(writer) = output_writer {
-                if line_count.is_multiple_of(progress_interval) {
-                    writer.emit(crate::cli::output::OutputEvent::dim(format!(
-                        "  Reading {}: {} lines...",
-                        path, line_count
-                    )));
-                }
+            if let Some(writer) = output_writer
+                && line_count.is_multiple_of(progress_interval)
+            {
+                writer.emit(crate::cli::output::OutputEvent::dim(format!(
+                    "  Reading {}: {} lines...",
+                    path, line_count
+                )));
             }
         }
 

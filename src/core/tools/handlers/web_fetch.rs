@@ -87,12 +87,11 @@ where
         }
         buf.extend_from_slice(&chunk);
     }
-    if !truncated {
-        if let Some(len) = content_length {
-            if len as usize > max_size {
-                truncated = true;
-            }
-        }
+    if !truncated
+        && let Some(len) = content_length
+        && (len as usize) > max_size
+    {
+        truncated = true;
     }
     Ok((buf, truncated))
 }

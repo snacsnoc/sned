@@ -201,7 +201,7 @@ impl OutputWriter for ChannelOutputWriter {
             let count = self
                 .dropped_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count % 100 == 0 {
+            if count.is_multiple_of(100) {
                 tracing::warn!(
                     dropped = count + 1,
                     "Output channel full; TUI render loop is falling behind. \

@@ -126,11 +126,7 @@ impl EditFileHandler {
                         return None;
                     }
                 }
-                ']' => {
-                    if stack.pop() != Some('[') {
-                        return None;
-                    }
-                }
+                ']' if stack.pop() != Some('[') => return None,
                 _ => {}
             }
         }
@@ -475,25 +471,27 @@ impl EditFileHandler {
         Self::apply_top_level_path_fallback(&mut files, top_level_path);
 
         if files.is_empty() {
-            return if files_value.is_none() {
-                Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
-            } else if files_value
-                .and_then(|f| f.as_array())
-                .map(|a| a.is_empty())
-                .unwrap_or(false)
-            {
-                Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
-            } else if files_value.and_then(|f| f.as_str()).is_some() {
-                match parsed_stringified_files.unwrap() {
-                    Ok(parsed) if parsed.is_empty() => Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string()),
-                    Ok(_) => unreachable!("files vec is empty but parse succeeded with non-empty"),
-                    Err(e) => Ok(format!(
-                        "Failed to parse 'files' parameter as a JSON array string. The 'files' parameter must be a JSON array of {{path, edits}} objects, e.g. [{{\"path\":\"file.rs\",\"edits\":[...]}}]. Parse error: {}",
-                        e
-                    )),
+            return if let Some(value) = files_value {
+                if value
+                    .as_array()
+                    .map(|a| a.is_empty())
+                    .unwrap_or(false)
+                {
+                    Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
+                } else if value.as_str().is_some() {
+                    match parsed_stringified_files.unwrap() {
+                        Ok(parsed) if parsed.is_empty() => Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string()),
+                        Ok(_) => unreachable!("files vec is empty but parse succeeded with non-empty"),
+                        Err(e) => Ok(format!(
+                            "Failed to parse 'files' parameter as a JSON array string. The 'files' parameter must be a JSON array of {{path, edits}} objects, e.g. [{{\"path\":\"file.rs\",\"edits\":[...]}}]. Parse error: {}",
+                            e
+                        )),
+                    }
+                } else {
+                    Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}].", value).to_string())
                 }
             } else {
-                Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}].", files_value.unwrap()).to_string())
+                Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
             };
         }
 

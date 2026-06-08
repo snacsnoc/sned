@@ -761,7 +761,7 @@ impl App {
         let _ = self.total_visual_rows(wrap_width);
         // +2 accounts for top and bottom borders of the completion Block widget.
         let completion_height: u16 = if has_completion {
-            ((self.cached_completion_rows + 2) as u16).min(output_area.height as u16)
+            ((self.cached_completion_rows + 2) as u16).min(output_area.height)
         } else {
             0
         };

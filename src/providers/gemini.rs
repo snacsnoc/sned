@@ -553,31 +553,31 @@ async fn process_gemini_sse_line(
         && !matches!(finish.as_str(), "RECITATION" | "BLOCKED")
     {
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
-            if !completed_tool_call_ids.contains(call_id) {
-                if let Some(validated_args) = crate::providers::validate_tool_call_args(
+            if !completed_tool_call_ids.contains(call_id)
+                && let Some(validated_args) = crate::providers::validate_tool_call_args(
                     args,
                     "Gemini",
                     "on finish",
-                ) {
-                    completed_tool_call_ids.insert(call_id.clone());
-                    try_send_chunk(
-                        tx,
-                        ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                            tool_call: ApiStreamToolCall {
-                                call_id: Some(id.clone()),
-                                function: ApiStreamToolCallFunction {
-                                    id: Some(id.clone()),
-                                    name: Some(name.clone()),
-                                    arguments: Some(validated_args),
-                                },
-                                signature: signature.clone(),
+                )
+            {
+                completed_tool_call_ids.insert(call_id.clone());
+                try_send_chunk(
+                    tx,
+                    ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                        tool_call: ApiStreamToolCall {
+                            call_id: Some(id.clone()),
+                            function: ApiStreamToolCallFunction {
+                                id: Some(id.clone()),
+                                name: Some(name.clone()),
+                                arguments: Some(validated_args),
                             },
-                            id: Some(response_id.clone()),
                             signature: signature.clone(),
-                        }),
-                        "tool_calls",
-                    );
-                }
+                        },
+                        id: Some(response_id.clone()),
+                        signature: signature.clone(),
+                    }),
+                    "tool_calls",
+                );
             }
         }
     }
@@ -654,31 +654,31 @@ async fn finish_gemini_sse_to_chunks(
     ) {
         // Flush accumulated tool calls on stream end.
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
-            if !completed_tool_call_ids.contains(call_id) {
-                if let Some(validated_args) = crate::providers::validate_tool_call_args(
+            if !completed_tool_call_ids.contains(call_id)
+                && let Some(validated_args) = crate::providers::validate_tool_call_args(
                     args,
                     "Gemini",
                     "at stream end",
-                ) {
-                    completed_tool_call_ids.insert(call_id.clone());
-                    try_send_chunk(
-                        tx,
-                        ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                            tool_call: ApiStreamToolCall {
-                                call_id: Some(id.clone()),
-                                function: ApiStreamToolCallFunction {
-                                    id: Some(id.clone()),
-                                    name: Some(name.clone()),
-                                    arguments: Some(validated_args),
-                                },
-                                signature: signature.clone(),
+                )
+            {
+                completed_tool_call_ids.insert(call_id.clone());
+                try_send_chunk(
+                    tx,
+                    ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                        tool_call: ApiStreamToolCall {
+                            call_id: Some(id.clone()),
+                            function: ApiStreamToolCallFunction {
+                                id: Some(id.clone()),
+                                name: Some(name.clone()),
+                                arguments: Some(validated_args),
                             },
-                            id: None,
                             signature: signature.clone(),
-                        }),
-                        "tool_calls",
-                    );
-                }
+                        },
+                        id: None,
+                        signature: signature.clone(),
+                    }),
+                    "tool_calls",
+                );
             }
         }
     }

@@ -1189,31 +1189,30 @@ async fn process_minimax_sse_line(
                     if !id.is_empty()
                         && !name.is_empty()
                         && !completed_tool_call_indices.contains(idx)
-                    {
-                        if let Some(validated_args) = crate::providers::validate_tool_call_args(
+                        && let Some(validated_args) = crate::providers::validate_tool_call_args(
                             args,
                             "MiniMax",
                             "on finish_reason:tool_calls",
-                        ) {
-                            completed_tool_call_indices.insert(*idx);
-                            try_send_chunk(
-                                tx,
-                                ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                                    tool_call: ApiStreamToolCall {
-                                        call_id: Some(id.clone()),
-                                        function: ApiStreamToolCallFunction {
-                                            id: Some(id.clone()),
-                                            name: Some(name.clone()),
-                                            arguments: Some(validated_args),
-                                        },
-                                        signature: None,
+                        )
+                    {
+                        completed_tool_call_indices.insert(*idx);
+                        try_send_chunk(
+                            tx,
+                            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                                tool_call: ApiStreamToolCall {
+                                    call_id: Some(id.clone()),
+                                    function: ApiStreamToolCallFunction {
+                                        id: Some(id.clone()),
+                                        name: Some(name.clone()),
+                                        arguments: Some(validated_args),
                                     },
-                                    id: Some(event.id.clone()),
                                     signature: None,
-                                }),
-                                "tool_calls",
-                            );
-                        }
+                                },
+                                id: Some(event.id.clone()),
+                                signature: None,
+                            }),
+                            "tool_calls",
+                        );
                     }
                 }
             }
@@ -1394,30 +1393,29 @@ impl Provider for MinimaxProvider {
                     if !id.is_empty()
                         && !name.is_empty()
                         && !completed_tool_call_indices.contains(idx)
-                    {
-                        if let Some(validated_args) = crate::providers::validate_tool_call_args(
+                        && let Some(validated_args) = crate::providers::validate_tool_call_args(
                             args,
                             "MiniMax",
                             "at stream end",
-                        ) {
-                            try_send_chunk(
-                                &tx,
-                                ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                                    tool_call: ApiStreamToolCall {
-                                        call_id: Some(id.clone()),
-                                        function: ApiStreamToolCallFunction {
-                                            id: Some(id.clone()),
-                                            name: Some(name.clone()),
-                                            arguments: Some(validated_args),
-                                        },
-                                        signature: None,
+                        )
+                    {
+                        try_send_chunk(
+                            &tx,
+                            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                                tool_call: ApiStreamToolCall {
+                                    call_id: Some(id.clone()),
+                                    function: ApiStreamToolCallFunction {
+                                        id: Some(id.clone()),
+                                        name: Some(name.clone()),
+                                        arguments: Some(validated_args),
                                     },
-                                    id: None,
                                     signature: None,
-                                }),
-                                "tool_calls",
-                            );
-                        }
+                                },
+                                id: None,
+                                signature: None,
+                            }),
+                            "tool_calls",
+                        );
                     }
                 }
             }

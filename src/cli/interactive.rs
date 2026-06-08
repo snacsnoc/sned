@@ -2629,11 +2629,11 @@ async fn run_main_loop(
         }
 
         // Export conversation after each completed turn when --export is set.
-        if agent_completed {
-            if let Some(export_path) = task_opts.export.clone() {
-                let export_result = export_conversation(&session, &export_path).await;
-                report_conversation_export(&output_writer, task_opts.json, &export_result, false);
-            }
+        if agent_completed
+            && let Some(export_path) = task_opts.export.clone()
+        {
+            let export_result = export_conversation(&session, &export_path).await;
+            report_conversation_export(&output_writer, task_opts.json, &export_result, false);
         }
 
         // 5. Update elapsed time for status bar

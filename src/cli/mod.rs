@@ -122,11 +122,11 @@ fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
                             e
                         );
                         // Fallback to stderr if file creation fails.
-                        BoxMakeWriter::new(|| std::io::stderr())
+                        BoxMakeWriter::new(std::io::stderr)
                     }
                 }
             } else {
-                BoxMakeWriter::new(|| std::io::stderr())
+                BoxMakeWriter::new(std::io::stderr)
             };
 
             let fmt_layer = tracing_subscriber::fmt::layer()

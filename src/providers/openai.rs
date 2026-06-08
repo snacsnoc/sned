@@ -730,31 +730,30 @@ async fn process_openai_sse_line(
                         if !completed_tool_call_indices.contains(idx)
                             && !id.is_empty()
                             && !name.is_empty()
-                        {
-                            if let Some(validated_args) = crate::providers::validate_tool_call_args(
+                            && let Some(validated_args) = crate::providers::validate_tool_call_args(
                                 args,
                                 "OpenAI",
                                 "on finish_reason:tool_calls",
-                            ) {
-                                completed_tool_call_indices.insert(*idx);
-                                try_send_chunk(
-                                    tx,
-                                    ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                                        tool_call: ApiStreamToolCall {
-                                            call_id: Some(id.clone()),
-                                            function: ApiStreamToolCallFunction {
-                                                id: Some(id.clone()),
-                                                name: Some(name.clone()),
-                                                arguments: Some(validated_args),
-                                            },
-                                            signature: None,
+                            )
+                        {
+                            completed_tool_call_indices.insert(*idx);
+                            try_send_chunk(
+                                tx,
+                                ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                                    tool_call: ApiStreamToolCall {
+                                        call_id: Some(id.clone()),
+                                        function: ApiStreamToolCallFunction {
+                                            id: Some(id.clone()),
+                                            name: Some(name.clone()),
+                                            arguments: Some(validated_args),
                                         },
-                                        id: Some(chunk.id.clone()),
                                         signature: None,
-                                    }),
-                                    "tool_calls",
-                                );
-                            }
+                                    },
+                                    id: Some(chunk.id.clone()),
+                                    signature: None,
+                                }),
+                                "tool_calls",
+                            );
                         }
                     }
                 }
@@ -883,29 +882,30 @@ pub async fn finish_openai_sse_to_chunks(
 
         for idx in sorted_indices {
             let (id, name, args) = &accumulated_tool_calls[idx];
-            if !completed_tool_call_indices.contains(idx) && !id.is_empty() && !name.is_empty() {
-                if let Some(validated_args) =
+            if !completed_tool_call_indices.contains(idx)
+                && !id.is_empty()
+                && !name.is_empty()
+                && let Some(validated_args) =
                     crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end")
-                {
-                    completed_tool_call_indices.insert(*idx);
-                    try_send_chunk(
-                        tx,
-                        ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
-                            tool_call: ApiStreamToolCall {
-                                call_id: Some(id.clone()),
-                                function: ApiStreamToolCallFunction {
-                                    id: Some(id.clone()),
-                                    name: Some(name.clone()),
-                                    arguments: Some(validated_args),
-                                },
-                                signature: None,
+            {
+                completed_tool_call_indices.insert(*idx);
+                try_send_chunk(
+                    tx,
+                    ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                        tool_call: ApiStreamToolCall {
+                            call_id: Some(id.clone()),
+                            function: ApiStreamToolCallFunction {
+                                id: Some(id.clone()),
+                                name: Some(name.clone()),
+                                arguments: Some(validated_args),
                             },
-                            id: None,
                             signature: None,
-                        }),
-                        "tool_calls",
-                    );
-                }
+                        },
+                        id: None,
+                        signature: None,
+                    }),
+                    "tool_calls",
+                );
             }
         }
     }
