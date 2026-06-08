@@ -4,6 +4,7 @@
 
 use crate::core::context::context_manager::ApiReqInfo;
 use crate::providers::Provider;
+use crate::providers::StorageMessage;
 use lru::LruCache;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -158,6 +159,9 @@ pub struct TaskState {
     pub last_injected_plan_state_hash: Option<u64>,
     /// Exact denied tool calls for the current recovery context.
     pub denied_tool_actions: Vec<DeniedToolAction>,
+    /// Exact user-authored message of the most recent request that safely failed before any
+    /// tool execution, and can therefore be retried verbatim.
+    pub retryable_failed_request: Option<StorageMessage>,
 }
 
 /// Stats for a single file's changes in a session.
@@ -224,6 +228,7 @@ impl Default for TaskState {
             plan_state: None,
             last_injected_plan_state_hash: None,
             denied_tool_actions: Vec::new(),
+            retryable_failed_request: None,
         }
     }
 }

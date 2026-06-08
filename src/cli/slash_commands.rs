@@ -252,6 +252,7 @@ pub enum CliOnlyCommand {
     Changes,
     HelpOption(String),
     Queue,
+    Retry,
     Plan(PlanSubcommand),
     PlanPrompt(String),
     PlanApprove,
@@ -352,6 +353,7 @@ impl CliOnlyCommand {
             "expand" => Some(CliOnlyCommand::Expand),
             "changes" => Some(CliOnlyCommand::Changes),
             "queue" => Some(CliOnlyCommand::Queue),
+            "retry" => Some(CliOnlyCommand::Retry),
             "model" => Some(CliOnlyCommand::ModelSwitch(String::new())),
             "plan" => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
             "plan approve" => Some(CliOnlyCommand::PlanApprove),
@@ -432,6 +434,7 @@ impl CliOnlyCommand {
                 | CliOnlyCommand::Expand
                 | CliOnlyCommand::Changes
                 | CliOnlyCommand::Queue
+                | CliOnlyCommand::Retry
                 | CliOnlyCommand::Plan(_)
                 | CliOnlyCommand::PlanPrompt(_)
                 | CliOnlyCommand::PlanApprove
@@ -804,6 +807,13 @@ pub fn build_slash_command_entries(
             name: "history".to_string(),
             description: "Show command history".to_string(),
             aliases: vec!["h".to_string()],
+            category: SlashCommandCategory::Local,
+            requires_args: false,
+        },
+        SlashCommandEntry {
+            name: "retry".to_string(),
+            description: "Retry the last safe failed request verbatim".to_string(),
+            aliases: vec![],
             category: SlashCommandCategory::Local,
             requires_args: false,
         },
@@ -1244,6 +1254,14 @@ pub fn format_help_text() -> String {
         style::RESET,
         style::DIM
     ));
+    s.push_str(&format!(
+        "  {}{}{}  - {}Retry the last safe failed request verbatim{}\n\n",
+        style::CYAN,
+        "/retry",
+        style::DIM,
+        style::RESET,
+        style::DIM
+    ));
 
     s.push_str(&format!(
         "{}{}Keyboard Shortcuts:{}\n",
@@ -1658,6 +1676,17 @@ Use when:
   - Checking queue order and count
 
 Note: Local commands (/help, /stats, etc.) execute immediately even when the agent is busy."#
+        }
+
+        "retry" => {
+            r#"Retries the most recent safe failed request verbatim.
+
+Use when:
+  - A provider request or stream failed before tool execution
+  - Sned says the request is retryable
+  - You want to resend the exact failed request without retyping it
+
+Note: If the agent is busy, /retry is queued to run next."#
         }
 
         "plan" => {
@@ -2261,6 +2290,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cli_only_retry() {
+        let result = get_cli_only_command("/retry");
+        assert_eq!(result, Some(CliOnlyCommand::Retry));
+    }
+
+    #[test]
     fn test_parse_cli_only_skills() {
         let result = get_cli_only_command("/skills");
         assert_eq!(result, Some(CliOnlyCommand::Skills));
@@ -2291,6 +2326,13 @@ mod tests {
         let text = format_help_for_command("unknowncmd");
         assert!(text.contains("Unknown command"));
         assert!(text.contains("unknowncmd"));
+    }
+
+    #[test]
+    fn test_format_help_for_command_retry() {
+        let text = format_help_for_command("retry");
+        assert!(text.contains("Retries the most recent safe failed request verbatim"));
+        assert!(text.contains("queued to run next"));
     }
 
     #[test]

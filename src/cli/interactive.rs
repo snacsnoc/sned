@@ -189,6 +189,23 @@ impl InteractiveSession {
         Some(self.agent_loop.lock().await.message_queue_handle())
     }
 
+    async fn retryable_failed_request(&self) -> Option<crate::providers::StorageMessage> {
+        let state_handle = self.agent_loop.lock().await.state_handle();
+        state_handle.lock().await.retryable_failed_request.clone()
+    }
+
+    async fn prepend_retryable_failed_request(
+        &self,
+        message: crate::providers::StorageMessage,
+    ) -> bool {
+        if let crate::providers::MessageContent::Text(text) = message.content {
+            self.queue_handle().await.prepend_text_message(text).await;
+            true
+        } else {
+            false
+        }
+    }
+
     async fn state_handle(&self) -> Arc<tokio::sync::Mutex<crate::core::agent_types::TaskState>> {
         self.agent_loop.lock().await.state_handle()
     }
@@ -472,22 +489,14 @@ async fn spawn_agent_task(
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     output_writer: OutputWriterArc,
 ) -> anyhow::Result<()> {
-    agent_busy.store(true, Ordering::Relaxed);
-    *agent_start_time.lock().await = Some(Instant::now());
-
     let session_clone = Arc::clone(session);
     let prompt = prompt.to_string();
-    let agent_busy_clone = Arc::clone(agent_busy);
-    let agent_done_clone = Arc::clone(agent_done);
-
-    let handle = tokio::spawn(async move {
+    let output_writer = Arc::clone(&output_writer);
+    let agent_loop = {
         let sess = session_clone.lock().await;
-        let agent_loop = sess.agent_loop.clone();
-        let state_manager = sess.state_manager.clone();
-        let output_writer = Arc::clone(&output_writer);
-        drop(sess);
-
-        // Build initial message from prompt
+        sess.agent_loop.clone()
+    };
+    let initial_message = {
         let processed_prompt = crate::cli::slash_commands::process_slash_command(&prompt);
         let (clean_prompt, parsed_image_paths) =
             crate::cli::image_input::parse_images_from_input(&processed_prompt);
@@ -499,25 +508,70 @@ async fn spawn_agent_task(
             &output_writer,
             true,
         );
-
-        let initial_messages = vec![crate::providers::StorageMessage {
+        crate::providers::StorageMessage {
             id: None,
             role: crate::providers::MessageRole::User,
             content: user_content,
             model_info: None,
             metrics: None,
             ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-        }];
+        }
+    };
+
+    spawn_agent_task_from_message(
+        session,
+        initial_message,
+        agent_busy,
+        agent_done,
+        agent_start_time,
+        agent_task,
+        output_writer,
+    )
+    .await
+}
+
+async fn spawn_agent_task_from_message(
+    session: &Arc<Mutex<InteractiveSession>>,
+    initial_message: crate::providers::StorageMessage,
+    agent_busy: &Arc<AtomicBool>,
+    agent_done: &Arc<tokio::sync::Notify>,
+    agent_start_time: &Arc<Mutex<Option<Instant>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    output_writer: OutputWriterArc,
+) -> anyhow::Result<()> {
+    agent_busy.store(true, Ordering::Relaxed);
+    *agent_start_time.lock().await = Some(Instant::now());
+
+    let session_clone = Arc::clone(session);
+    let agent_busy_clone = Arc::clone(agent_busy);
+    let agent_done_clone = Arc::clone(agent_done);
+
+    let handle = tokio::spawn(async move {
+        let sess = session_clone.lock().await;
+        let agent_loop = sess.agent_loop.clone();
+        let state_manager = sess.state_manager.clone();
+        let output_writer = Arc::clone(&output_writer);
+        drop(sess);
+        let initial_messages = vec![initial_message];
 
         let result = {
             let mut agent = agent_loop.lock().await;
             agent.reset_cancellation().await;
             agent.run(initial_messages, state_manager).await
         };
+        let retry_available = {
+            let state_handle = agent_loop.lock().await.state_handle();
+            state_handle.lock().await.retryable_failed_request.is_some()
+        };
         drop(agent_loop);
 
         if let Err(e) = result {
             output_writer.emit(OutputEvent::warning(format!("Agent task failed: {}", e)));
+            if retry_available {
+                output_writer.emit(OutputEvent::warning(
+                    "Retry available: type /retry to resend the last failed request verbatim.",
+                ));
+            }
             tracing::error!("Agent task failed: {}", e);
         }
 
@@ -1145,6 +1199,47 @@ async fn handle_cli_only_command(
             } else {
                 app.push_plain("No message queue available.");
             }
+        }
+        CliOnlyCommand::Retry => {
+            let retry_message = {
+                let sess = session.lock().await;
+                sess.retryable_failed_request().await
+            };
+
+            let Some(retry_message) = retry_message else {
+                app.push_plain("No safe failed request is available to retry.");
+                return Ok(false);
+            };
+
+            if agent_busy.load(Ordering::Relaxed) {
+                let sess = session.lock().await;
+                if !sess.prepend_retryable_failed_request(retry_message).await {
+                    app.push_plain(
+                        "The last failed request includes non-text content. Wait for idle, then run /retry again.",
+                    );
+                    return Ok(false);
+                }
+                let count = sess.queue_handle().await.queued_message_count().await;
+                app.push_styled(
+                    format!("Retry queued to run next ({} in queue).", count),
+                    theme::dim_style(),
+                );
+            } else {
+                spawn_agent_task_from_message(
+                    session,
+                    retry_message,
+                    agent_busy,
+                    agent_done,
+                    agent_start_time,
+                    agent_task,
+                    output_writer.clone(),
+                )
+                .await?;
+                app.agent_busy = true;
+                app.push_styled("Retrying last failed request verbatim.", theme::dim_style());
+            }
+            app.force_bottom();
+            return Ok(false);
         }
         CliOnlyCommand::Undo | CliOnlyCommand::CheckpointUndo => {
             let sess = session.lock().await;
@@ -3425,6 +3520,176 @@ mod tests {
         assert!(matches!(action, Some(Action::Submit(text)) if text == "/exit"));
         assert!(app.input.lines().join("\n").is_empty());
 
+        Ok(())
+    }
+
+    fn retry_test_task_opts() -> TaskOptions {
+        TaskOptions {
+            act: false,
+            plan: false,
+            yolo: false,
+            auto_approve_all: false,
+            timeout: None,
+            model: None,
+            provider: Some("mock".to_string()),
+            base_url: None,
+            api_key: None,
+            verbose: false,
+            cwd: None,
+            config: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_consecutive_mistakes: None,
+            json: false,
+            double_check_completion: false,
+            auto_condense: true,
+            no_token_display: false,
+            subagents: false,
+            is_subagent: false,
+            user_agent: None,
+            hooks_dir: None,
+            export: None,
+            image: vec![],
+            track_changes: false,
+            max_context_turns: None,
+            max_tokens: None,
+            debug: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_command_reports_when_no_failed_request_exists() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                retry_test_task_opts(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::Retry,
+            "/retry",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &retry_test_task_opts(),
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("No safe failed request is available to retry")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_retry_command_queues_failed_request_to_run_next_when_busy() -> anyhow::Result<()>
+    {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                retry_test_task_opts(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        {
+            let state_handle = {
+                let sess = session.lock().await;
+                sess.agent_loop().await.state_handle()
+            };
+            let mut state = state_handle.lock().await;
+            state.retryable_failed_request = Some(crate::providers::StorageMessage {
+                id: None,
+                role: crate::providers::MessageRole::User,
+                content: crate::providers::MessageContent::Text("retry me".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+        }
+        {
+            let sess = session.lock().await;
+            sess.queue_handle()
+                .await
+                .enqueue_text_message("older queued message".to_string())
+                .await;
+        }
+
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::Retry,
+            "/retry",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &retry_test_task_opts(),
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        let queued = {
+            let sess = session.lock().await;
+            sess.queue_handle().await.peek_queued_messages(2).await
+        };
+        assert_eq!(
+            queued,
+            vec!["retry me".to_string(), "older queued message".to_string()]
+        );
         Ok(())
     }
 

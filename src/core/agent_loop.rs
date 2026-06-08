@@ -392,6 +392,52 @@ impl MessageQueueHandle {
         }
     }
 
+    pub async fn prepend_text_message(&self, text: String) {
+        let msg = StorageMessage {
+            id: Some(AgentLoop::next_message_id(&self.message_counter)),
+            role: MessageRole::User,
+            content: MessageContent::Text(text),
+            model_info: None,
+            metrics: None,
+            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+        };
+        let max_queue_len = message_queue_max_len();
+        let mut mq = self.queue.lock().await;
+        mq.push_front(msg);
+
+        let mut dropped = 0usize;
+        while mq.len() > max_queue_len {
+            mq.pop_back();
+            dropped += 1;
+        }
+
+        let count = mq.len();
+        drop(mq);
+
+        if dropped > 0 {
+            warn!(
+                max_queue_len,
+                dropped,
+                "message queue exceeded its limit; dropped {} queued message(s) from the back",
+                dropped
+            );
+            if !self.json_output {
+                info!(
+                    "[sned] Warning: queue overflow — dropped {} queued message(s) (limit is {})",
+                    dropped, max_queue_len
+                );
+            }
+        }
+
+        if !self.json_output && count > 0 {
+            info!(
+                "[sned] Message queued to run next ({} message{} in queue)",
+                count,
+                if count == 1 { "" } else { "s" }
+            );
+        }
+    }
+
     pub async fn queued_message_count(&self) -> usize {
         self.queue.lock().await.len()
     }
@@ -436,9 +482,20 @@ pub struct AgentLoop {
     /// Monotonically increasing counter for generating unique message IDs.
     /// Shared via Arc so static methods (execute_tool_with_hooks_internal) can also generate IDs.
     message_counter: Arc<std::sync::atomic::AtomicUsize>,
+    current_turn_retry_candidate: Option<StorageMessage>,
 }
 
 impl AgentLoop {
+    fn current_turn_retry_candidate(history: &[StorageMessage]) -> Option<StorageMessage> {
+        history.iter().rev().find_map(|message| {
+            if message.role == MessageRole::User {
+                Some(message.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     fn parse_tool_arguments(
         tool_name: &str,
         tool_id: &str,
@@ -624,6 +681,7 @@ impl AgentLoop {
                 crate::core::context_tracking::EnvironmentContextTracker::new(&task_id),
             ),
             message_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            current_turn_retry_candidate: None,
         }
     }
 
@@ -760,6 +818,11 @@ impl AgentLoop {
         tracing::debug!(target: "sned::agent_loop", "AgentLoop::run() called with {} initial messages", initial_messages.len());
         // Store state_manager for use during execution
         self.state_manager = Some(state_manager.clone());
+        self.current_turn_retry_candidate = initial_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+            .cloned();
 
         // Initialize conversation history
         // On resume, history may already be populated from disk - append instead of replace
@@ -1013,6 +1076,7 @@ impl AgentLoop {
                 if let Some(queued_message) = mq.pop_front() {
                     let queue_remaining = mq.len();
                     drop(mq);
+                    self.current_turn_retry_candidate = Some(queued_message.clone());
                     if !self.config.json_output {
                         if queue_remaining > 0 {
                             info!(
@@ -1058,6 +1122,7 @@ impl AgentLoop {
             // Execute one turn
             match self.execute_turn().await {
                 TurnResult::Continue => {
+                    self.current_turn_retry_candidate = None;
                     if dequeued_message_for_notification && !self.config.json_output {
                         info!("\n[sned] Queued message sent to provider\n");
                     }
@@ -1065,6 +1130,7 @@ impl AgentLoop {
                     continue;
                 }
                 TurnResult::Complete => {
+                    self.current_turn_retry_candidate = None;
                     if dequeued_message_for_notification && !self.config.json_output {
                         info!("\n[sned] Queued message sent to provider\n");
                     }
@@ -1076,6 +1142,7 @@ impl AgentLoop {
                         if let Some(queued_message) = mq.pop_front() {
                             let queue_remaining = mq.len();
                             drop(mq);
+                            self.current_turn_retry_candidate = Some(queued_message.clone());
                             if !self.config.json_output {
                                 if queue_remaining > 0 {
                                     info!(
@@ -1192,6 +1259,7 @@ impl AgentLoop {
                     return Ok(());
                 }
                 TurnResult::Cancelled => {
+                    self.current_turn_retry_candidate = None;
                     // Force-save conversation history immediately on cancellation (W4 fix)
                     // Bypass the 5-turn debounce to prevent data loss
                     if let Some(ref storage) = self.deps.task_storage {
@@ -1233,6 +1301,7 @@ impl AgentLoop {
                     return Ok(());
                 }
                 TurnResult::Error(e) => {
+                    self.current_turn_retry_candidate = None;
                     // Emit error to output (visible in TUI and logged)
                     self.config.output_writer.emit(OutputEvent::error(&e));
 
@@ -1326,6 +1395,13 @@ impl AgentLoop {
 
         // 2. Apply context pruning if enabled
         let pruned_history = self.prune_conversation_history(truncated_history);
+        if self.current_turn_retry_candidate.is_none() {
+            self.current_turn_retry_candidate = Self::current_turn_retry_candidate(&pruned_history);
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.retryable_failed_request = None;
+        }
 
         // 3. Create provider request
         // Build system prompt with context
@@ -1504,6 +1580,10 @@ impl AgentLoop {
                 Ok(stream) => stream,
                 Err(e) => {
                     error!(error = %e, "provider request failed");
+                    if let Some(ref retry_message) = self.current_turn_retry_candidate {
+                        let mut state = self.state.lock().await;
+                        state.retryable_failed_request = Some(retry_message.clone());
+                    }
                     let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
                     let consecutive_failures = {
                         let state = self.state.lock().await;
@@ -1628,9 +1708,9 @@ impl AgentLoop {
                 {
                     slow_connection_warned = true;
                     emitted_output_this_attempt = true;
-                    self.config.output_writer.emit(OutputEvent::dim_yellow(
-                        "⏳ Waiting for API response...",
-                    ));
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::dim_yellow("⏳ Waiting for API response..."));
                 }
 
                 if !first_chunk_received && !matches!(&chunk, ApiStreamChunk::Error(_)) {
@@ -2180,6 +2260,10 @@ impl AgentLoop {
 
             // If stream errored mid-response, note the partial content in the error
             if stream_errored {
+                if let Some(ref retry_message) = self.current_turn_retry_candidate {
+                    let mut state = self.state.lock().await;
+                    state.retryable_failed_request = Some(retry_message.clone());
+                }
                 let partial_note =
                     if !accumulated_text.is_empty() || !accumulated_reasoning.is_empty() {
                         format!(
@@ -4396,6 +4480,72 @@ mod tests {
             state.consecutive_provider_failures,
             DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES
         );
+    }
+
+    #[tokio::test]
+    async fn test_provider_failure_captures_retryable_failed_request() {
+        let mut agent = AgentLoop::new(test_agent_config(
+            Arc::new(ErrorProvider),
+            "test-provider-failure-captures-retry",
+        ));
+        let message = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("keep working on this bug".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .push(message.clone());
+
+        let result = agent.execute_turn().await;
+
+        assert!(matches!(result, TurnResult::Error(_)));
+        let state = agent.state.lock().await;
+        assert_eq!(state.retryable_failed_request, Some(message));
+    }
+
+    #[tokio::test]
+    async fn test_successful_turn_clears_stale_retryable_failed_request() {
+        let provider = Arc::new(crate::providers::mock::MockProvider::single_text_response(
+            "done",
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-clear-stale-retry"));
+        {
+            let mut state = agent.state.lock().await;
+            state.retryable_failed_request = Some(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("stale".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+        }
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("fresh request".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+
+        let result = agent.execute_turn().await;
+
+        assert!(matches!(
+            result,
+            TurnResult::Continue | TurnResult::Complete
+        ));
+        assert!(agent.state.lock().await.retryable_failed_request.is_none());
     }
 
     #[tokio::test]
