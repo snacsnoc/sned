@@ -114,7 +114,7 @@ pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
 
     // Match @/path/to/image.ext patterns
     let at_path_regex =
-        regex::Regex::new(r#"(?:^|\s)@(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))"#).expect("valid regex");
+        regex::Regex::new(r"(?:^|\s)@(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))").expect("valid regex");
     for cap in at_path_regex.captures_iter(input) {
         if let Some(m) = cap.get(1) {
             let path = m.as_str().to_string();
@@ -126,7 +126,7 @@ pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
 
     // Match standalone absolute paths that look like images
     let standalone_regex =
-        regex::Regex::new(r#"(?:^|\s)(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))(?:\s|$)"#)
+        regex::Regex::new(r"(?:^|\s)(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))(?:\s|$)")
             .expect("valid regex");
     for cap in standalone_regex.captures_iter(input) {
         if let Some(m) = cap.get(1) {
