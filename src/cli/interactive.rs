@@ -2191,6 +2191,16 @@ async fn run_main_loop(
         {
             let t = std::time::Instant::now();
             drain_output(output_rx, app);
+            // Surface channel overflow to the user. The writer silently
+            // drops events on a full channel (src/cli/output.rs:198-213);
+            // if the dropped event was the approval prompt, the user
+            // cannot see it and must blindly hit "y". The status bar
+            // shows a warning when overflow is detected.
+            if output_writer.take_overflow_signal() {
+                app.output_overflow = true;
+                app.output_overflow_count = output_writer.dropped_count();
+                app.needs_redraw = true;
+            }
             let us = t.elapsed().as_micros() as u64;
             timing.drain_total_us += us;
             timing.drain_count += 1;

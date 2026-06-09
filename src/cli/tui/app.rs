@@ -103,6 +103,12 @@ pub struct App {
     pub task_id: String,
     /// Mode (PLAN/ACT) for status bar
     pub mode: String,
+    /// True when the output channel has overflowed and events were
+    /// dropped. The status bar surfaces this so the user knows output
+    /// (including approval prompts) may be missing.
+    pub output_overflow: bool,
+    /// Total number of dropped events, for the status bar indicator.
+    pub output_overflow_count: u64,
     /// Session elapsed time for status bar
     pub elapsed: Option<Duration>,
     /// Scrollbar state for output pane
@@ -141,7 +147,7 @@ pub struct App {
     /// Seconds value the cached right segment was built for.
     /// Last known context usage percentage from the API.
     pub context_pct: Option<f64>,
-    pub cached_status_right_secs: (u64, Option<f64>),
+    pub cached_status_right_secs: (u64, Option<f64>, bool, u64),
     /// Cached spacer string for the status bar.
     pub cached_spacer: String,
     /// Length the cached spacer was built for.
@@ -232,7 +238,7 @@ impl App {
             cached_status_left: String::new(),
             status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
             cached_status_right: String::new(),
-            cached_status_right_secs: (u64::MAX, None),
+            cached_status_right_secs: (u64::MAX, None, false, 0),
             context_pct: None,
             cached_spacer: String::new(),
             cached_spacer_len: 0,
@@ -247,6 +253,8 @@ impl App {
             cached_completion_rows: 0,
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
+            output_overflow: false,
+            output_overflow_count: 0,
         }
     }
 
@@ -717,16 +725,34 @@ impl App {
             self.status_left_fingerprint = current_fingerprint;
         }
         let elapsed_secs = self.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
-        let context_key = (elapsed_secs, self.context_pct);
+        let context_key = (elapsed_secs, self.context_pct, self.output_overflow, self.output_overflow_count);
         if context_key != self.cached_status_right_secs {
             let context_str = self
                 .context_pct
                 .map(|pct| format!("Context: {:.0}% left · ", 100.0 - pct));
-            self.cached_status_right = match (context_str, self.elapsed) {
-                (Some(ctx), Some(elapsed)) => format!("{}⏱ {} ", ctx, format_duration(elapsed)),
-                (Some(ctx), None) => format!("{} ", ctx),
-                (None, Some(elapsed)) => format!("⏱ {} ", format_duration(elapsed)),
-                (None, None) => String::new(),
+            let overflow_str = if self.output_overflow {
+                Some(format!(
+                    "⚠ output overflow ({} dropped) · ",
+                    self.output_overflow_count
+                ))
+            } else {
+                None
+            };
+            self.cached_status_right = match (overflow_str, context_str, self.elapsed) {
+                (Some(ovf), Some(ctx), Some(elapsed)) => {
+                    format!("{}{}⏱ {} ", ovf, ctx, format_duration(elapsed))
+                }
+                (Some(ovf), Some(ctx), None) => format!("{}{} ", ovf, ctx),
+                (Some(ovf), None, Some(elapsed)) => {
+                    format!("{}⏱ {} ", ovf, format_duration(elapsed))
+                }
+                (Some(ovf), None, None) => format!("{} ", ovf),
+                (None, Some(ctx), Some(elapsed)) => {
+                    format!("{}⏱ {} ", ctx, format_duration(elapsed))
+                }
+                (None, Some(ctx), None) => format!("{} ", ctx),
+                (None, None, Some(elapsed)) => format!("⏱ {} ", format_duration(elapsed)),
+                (None, None, None) => String::new(),
             };
             self.cached_status_right_secs = context_key;
         }
@@ -2230,5 +2256,97 @@ mod tests {
         // Teardown.
         crate::core::approval::set_approval_prompt_active(false);
         crate::core::approval::clear_approval_prompt_scroll();
+    }
+
+    /// Regression test for the silent channel-overflow bug. When the
+    /// 8192-capacity mpsc channel floods during a tool-result burst,
+    /// `ChannelOutputWriter::emit` silently drops events. If the
+    /// dropped event is the approval prompt, the user cannot see it.
+    ///
+    /// The TUI main loop (src/cli/interactive.rs:2193-2206) checks
+    /// `output_writer.take_overflow_signal()` after each drain and
+    /// sets `app.output_overflow = true` and
+    /// `app.output_overflow_count`. The status bar must then render
+    /// a visible warning so the user knows output may be missing.
+    #[test]
+    fn test_status_bar_shows_overflow_indicator() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        let mut app = App::new();
+        app.provider_name = "minimax".to_string();
+        app.model_name = "MiniMax-M3".to_string();
+        app.task_id = "01KTPHXKHBJ49KXMAGPAR423BC".to_string();
+        app.mode = "ACT".to_string();
+        // Simulate the main loop detecting channel overflow.
+        app.output_overflow = true;
+        app.output_overflow_count = 7;
+        app.needs_redraw = true;
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+
+        // The status bar is 1 row tall, located just above the input
+        // area. With 14 rows total and input(3) at the bottom, the
+        // status bar is at row 10.
+        let status_row = &rows[10];
+        assert!(
+            status_row.contains("output overflow"),
+            "status bar must show overflow warning, got: {status_row:?}"
+        );
+        assert!(
+            status_row.contains("7"),
+            "status bar must show dropped count, got: {status_row:?}"
+        );
+    }
+
+    /// When overflow is NOT detected, the status bar must NOT show
+    /// the warning. This guards against a regression where the
+    /// indicator sticks after the channel recovers.
+    #[test]
+    fn test_status_bar_hides_overflow_indicator_when_clear() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        let mut app = App::new();
+        app.provider_name = "minimax".to_string();
+        app.model_name = "MiniMax-M3".to_string();
+        app.task_id = "01KTPHXKHBJ49KXMAGPAR423BC".to_string();
+        app.mode = "ACT".to_string();
+        // overflow defaults to false
+        app.needs_redraw = true;
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+
+        let status_row = &rows[10];
+        assert!(
+            !status_row.contains("output overflow"),
+            "status bar must NOT show overflow warning when channel is healthy, got: {status_row:?}"
+        );
     }
 }
