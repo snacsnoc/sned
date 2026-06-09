@@ -13,7 +13,7 @@ use crate::core::agent_loop::TaskState;
 use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
 use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits};
 use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard, FileEditorError};
-use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor};
+use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor, strip_hashes, unescape_text};
 use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
 use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{
@@ -237,13 +237,20 @@ impl EditFileHandler {
                     .transpose()
                     .map_err(ToolError::InvalidInput)?;
 
-                let text = edit_raw.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                let text_raw = edit_raw.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                // Interpret JSON-style escape sequences (\n, \t, \\, \", \r, \0)
+                // so models that submit the replacement as a JSON string
+                // (common for smaller or non-frontier models like gemma-4)
+                // don't get the literal backslash + letter written into the
+                // file. Then strip leaked anchor prefixes that the model may
+                // have copy-pasted from the diff output.
+                let text = strip_hashes(&unescape_text(text_raw));
 
                 edits.push(Edit {
                     anchor,
                     end_anchor,
                     edit_type: edit_type.to_string(),
-                    text: text.to_string(),
+                    text,
                 });
             }
 
@@ -3347,6 +3354,127 @@ edition = "2021"
         );
         let updated = std::fs::read_to_string(&file_path).unwrap();
         assert!(updated.contains("/* updated */"));
+    }
+
+    /// Contract test: when a model (e.g. gemma-4-12b via OpenAI-compatible
+    /// API) submits the `text` field with JSON-style escape sequences meant
+    /// to represent file content, edit_file must interpret them and write
+    /// real newlines/tabs/etc. to the file. Previously these landed verbatim
+    /// as two characters (backslash + letter) and corrupted the source.
+    /// See convo_export-gemma-4-openai-api.json for the exact failure mode.
+    #[tokio::test]
+    async fn test_edit_file_interprets_text_escape_sequences() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("escape.c");
+        let raw_content = "fn alpha() {}\nfn beta() {}\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("escape-task"));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "escape-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§fn alpha() {{}}", anchors[0]);
+        // The `text` field uses `\n` (backslash + n, the JSON escape for
+        // newline) for line breaks, and `\t` for indentation. This is the
+        // exact shape gemma-4 submitted in the run log.
+        let text_with_escapes = "fn alpha() {\\n    /* replaced */\\n}";
+        let params = serde_json::json!({
+            "files": [{
+                "path": "escape.c",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": text_with_escapes
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "edit_file must accept escape sequences in text: {:?}",
+            result.err()
+        );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        // The file must contain REAL newlines and tabs, not the literal
+        // two-character sequences `\n` and `\t`.
+        assert!(
+            updated.contains("fn alpha() {\n    /* replaced */\n}"),
+            "file must contain real newlines from interpreted escapes, got:\n{updated:?}"
+        );
+        assert!(
+            !updated.contains("\\n"),
+            "file must NOT contain literal backslash-n, got:\n{updated:?}"
+        );
+        assert!(
+            !updated.contains("\\t"),
+            "file must NOT contain literal backslash-t, got:\n{updated:?}"
+        );
+    }
+
+    /// Contract test: when the model submits the `text` field with
+    /// quadruple-backslash escapes (`\\\\n` in JSON), the unescape must
+    /// produce a literal `\n` (two chars) in the file. This is the
+    /// escape hatch for the rare case where the model genuinely wants
+    /// a backslash + n sequence in the file content (e.g. a regex).
+    #[tokio::test]
+    async fn test_edit_file_preserves_quadruple_backslash_as_literal() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("literal.c");
+        let raw_content = "fn alpha() {}\nfn beta() {}\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("literal-task"));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "literal-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§fn alpha() {{}}", anchors[0]);
+        // `\\\\n` in JSON decodes to `\\n` in Rust, which unescape_text
+        // interprets as a single literal backslash. The file gets `\n`.
+        // Then the unescape sees `n` as a plain char. Result: literal `\n`.
+        let text_literal = "/* regex: \\\\n matches backslash-n */";
+        let params = serde_json::json!({
+            "files": [{
+                "path": "literal.c",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": text_literal
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            updated.contains("/* regex: \\n matches backslash-n */"),
+            "quadruple backslash must produce literal backslash-n in file, got:\n{updated:?}"
+        );
     }
 
     /// Regression test: the model sends multiple `§`-delimited pairs concatenated

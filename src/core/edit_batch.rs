@@ -384,29 +384,6 @@ impl BatchProcessor {
             );
         }
 
-        // Check for literal \n in applied edits
-        for applied in &prepared.applied_edits {
-            if applied.edit.text.contains("\\n") {
-                let anchor_name = applied
-                    .edit
-                    .anchor
-                    .split("§")
-                    .next()
-                    .unwrap_or(&applied.edit.anchor);
-                let end_anchor_part = applied
-                    .edit
-                    .end_anchor
-                    .as_ref()
-                    .map_or_else(String::new, |ea| {
-                        format!(" and ending with {}", ea.split("§").next().unwrap_or(ea))
-                    });
-                results.push(format!(
-                    "Your edit starting with {}{} inserted a '\\n' literal in the code because you supplied double backslash '\\\\n'. If you meant to add a newline char instead, update it using '\\n' in the next call. You do not need escape characters in the text portion",
-                    anchor_name, end_anchor_part
-                ));
-            }
-        }
-
         let line_changes = format!(" (+{}, -{} lines)", total_added, total_removed);
         let summary = format!(
             "Applied {} edit(s) successfully{}. NOTE the UPDATED anchors below.{}",

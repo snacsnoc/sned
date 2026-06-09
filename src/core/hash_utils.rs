@@ -108,6 +108,73 @@ pub fn extract_id(reference: &str) -> String {
     }
 }
 
+/// Interpret common escape sequences in the `text` field of `edit_file`.
+///
+/// Models (especially smaller or non-frontier ones) often submit the
+/// `text` replacement with JSON-style escape sequences that were meant
+/// to represent file content: `\n` for a newline, `\t` for a tab, `\\`
+/// for a literal backslash, `\"` for a quote. Without interpretation,
+/// these land verbatim in the file as two characters (backslash + letter)
+/// and corrupt the source.
+///
+/// This mirrors how shell / C string literals are commonly read, and
+/// matches the model's expectation from the post-hoc warning emitted
+/// at `edit_batch.rs:387-410` (now removed in favor of this fix).
+///
+/// To write a literal `\n` (backslash + n) to the file, the model must
+/// send `\\n` in the JSON, which decodes to `\n` in Rust and is then
+/// interpreted here as a single newline. To write a literal `\n` as
+/// two characters, the model must send `\\\\n` in JSON.
+pub fn unescape_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some('t') => {
+                    chars.next();
+                    out.push('\t');
+                }
+                Some('r') => {
+                    chars.next();
+                    out.push('\r');
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                Some('"') => {
+                    chars.next();
+                    out.push('"');
+                }
+                Some('0') => {
+                    chars.next();
+                    out.push('\0');
+                }
+                Some(other) => {
+                    // Unknown escape: keep the backslash and the next char
+                    // verbatim so the model sees a clear "I don't know"
+                    // rather than silent data loss.
+                    out.push(c);
+                    out.push(*other);
+                    chars.next();
+                }
+                None => {
+                    // Trailing backslash with nothing after: keep verbatim.
+                    out.push(c);
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +271,70 @@ mod tests {
         // Verify hashes are deterministic
         let hashes2 = compute_hashes(&lines);
         assert_eq!(hashes, hashes2);
+    }
+
+    #[test]
+    fn test_unescape_text_interprets_newline() {
+        // The common model bug: JSON-decoded `\n` (backslash + n) must
+        // become a real newline. This is the gemma-4 failure mode.
+        let input = "static int f(void) {\\n    return 0;\\n}";
+        let expected = "static int f(void) {\n    return 0;\n}";
+        assert_eq!(unescape_text(input), expected);
+    }
+
+    #[test]
+    fn test_unescape_text_interprets_tab_carriage_return() {
+        assert_eq!(unescape_text("a\\tb"), "a\tb");
+        assert_eq!(unescape_text("a\\rb"), "a\rb");
+    }
+
+    #[test]
+    fn test_unescape_text_interprets_backslash_and_quote() {
+        // `\\` in JSON decodes to `\` in Rust, which our unescape
+        // interprets as a literal backslash.
+        assert_eq!(unescape_text("path\\\\to\\\\file"), "path\\to\\file");
+        // `\"` in JSON decodes to `"` in Rust.
+        assert_eq!(unescape_text("say \\\"hi\\\""), "say \"hi\"");
+    }
+
+    #[test]
+    fn test_unescape_text_double_backslash_preserves_newline_meaning() {
+        // The model wants a real newline: sends `\n` in JSON.
+        // Our unescape produces a newline. Correct.
+        assert_eq!(unescape_text("\\n"), "\n");
+    }
+
+    #[test]
+    fn test_unescape_text_quadruple_backslash_writes_literal_backslash_n() {
+        // The model wants a literal `\n` (two chars) in the file:
+        // sends `\\n` in JSON, which decodes to `\n` in Rust, which
+        // our unescape interprets as newline. To get a literal `\n`
+        // the model must send `\\\\n` in JSON, which decodes to `\\n`
+        // in Rust, which our unescape interprets as `\n` (two chars).
+        let input = "\\\\n";
+        let expected = "\\n";
+        assert_eq!(unescape_text(input), expected);
+    }
+
+    #[test]
+    fn test_unescape_text_passes_through_plain_text() {
+        // No escapes: identical input/output.
+        assert_eq!(unescape_text("hello world"), "hello world");
+        assert_eq!(unescape_text(""), "");
+    }
+
+    #[test]
+    fn test_unescape_text_preserves_unknown_escapes() {
+        // `\x` is not a recognized escape: keep both chars verbatim
+        // so the model sees a clear "I don't know" rather than
+        // silent data loss.
+        assert_eq!(unescape_text("\\x"), "\\x");
+        assert_eq!(unescape_text("\\u0041"), "\\u0041");
+    }
+
+    #[test]
+    fn test_unescape_text_preserves_trailing_backslash() {
+        // Trailing `\` with nothing after: keep verbatim.
+        assert_eq!(unescape_text("path\\"), "path\\");
     }
 }
