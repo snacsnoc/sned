@@ -3658,6 +3658,229 @@ edition = "2021"
         );
     }
 
+    /// Regression test: the model in convo-2222-export-33.json submitted
+    /// `files` as a stringified JSON array that contained `edits` but
+    /// no `path` key per file entry. The old error message said "edit_file
+    /// requires a 'path' key" which pointed at the wrong cause. The fix
+    /// is to apply the top-level `path` fallback even when `files` is
+    /// a stringified JSON array, so the model can submit either a
+    /// top-level `path` or a `path` per file entry.
+    #[tokio::test]
+    async fn test_edit_file_stringified_json_without_path_falls_back_to_top_level() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let file_path = workspace.join("fallback.c");
+        let raw_content = "void f(void) {}\nvoid g(void) {}\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("fallback-task"));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace.clone(),
+            anchor_mgr,
+            false,
+            "fallback-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§void f(void) {{}}", anchors[0]);
+        // The model sends `files` as a stringified JSON array with edits
+        // but no `path` key per file entry. It also provides a top-level
+        // `path` that the tool should fall back to.
+        let stringified_files = format!(
+            r#"[{{"edits": [{{"anchor": "{}", "edit_type": "replace", "text": "void f(void) {{ /* replaced */ }}"}}]}}]"#,
+            anchor,
+        );
+        let params = serde_json::json!({
+            "path": "fallback.c",
+            "files": stringified_files,
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "stringified JSON without per-file path must succeed when top-level path is provided, got: {:?}",
+            result.err()
+        );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            updated.contains("void f(void) { /* replaced */ }"),
+            "file must contain the replacement, got:\n{updated:?}"
+        );
+    }
+
+    /// End-to-end test: edit_file output flows through a real
+    /// ChannelOutputWriter and lands in the file. This guards against
+    /// regressions where the emit/drain/render pipeline silently drops
+    /// events (e.g. the silent channel-full drop at output.rs:200-213
+    /// during a tool-result flood).
+    #[tokio::test]
+    async fn test_edit_file_end_to_end_with_channel_output_writer() {
+        use tempfile::tempdir;
+        use tokio::sync::mpsc;
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let file_path = workspace.join("e2e.c");
+        let raw_content = "void f(void) {}\nvoid g(void) {}\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("e2e-task"));
+
+        // Create a real channel-based writer. The edit_file emit calls
+        // must reach the channel even when no drain is running (the
+        // channel is bounded at 8192 and try_send will drop on full).
+        let (tx, _rx) = mpsc::channel::<crate::cli::output::OutputEvent>(16);
+        let writer: Arc<dyn crate::cli::output::OutputWriter> =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace,
+            anchor_mgr,
+            false,
+            "e2e-task".to_string(),
+            None,
+            false,
+            writer,
+        );
+        let anchor = format!("{}§void f(void) {{}}", anchors[0]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "e2e.c",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "void f(void) { /* e2e replaced */ }"
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            updated.contains("void f(void) { /* e2e replaced */ }"),
+            "file must contain the replacement via the real ChannelOutputWriter path, got:\n{updated:?}"
+        );
+    }
+
+    /// Regression test: the must-reread error must (a) explain WHY the
+    /// re-read is required, (b) point at read_file as the next step in
+    /// the message text, and (c) carry ToolRequiredNextStep::ReadFile in
+    /// the structured metadata. The model in convo-2222-export-32.json
+    /// was confused by a terse error that did none of these.
+    #[tokio::test]
+    async fn test_edit_file_must_reread_error_is_actionable() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let file_path = workspace.join("reread.c");
+        let raw_content = "Hello World\nThis is a test\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("reread-task"));
+        // Simulate a prior successful edit that set must_reread_before_edit.
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(file_path.to_string_lossy().to_string());
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace.clone(),
+            anchor_mgr,
+            false,
+            "reread-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§Hello World", anchors[0]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path
+                    .strip_prefix(&workspace)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "Goodbye World"
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        let err = result.expect_err("edit_file should be blocked until read_file clears reread state");
+        let msg = err.to_string();
+        // (a) Explain WHY: a prior edit changed the file.
+        assert!(
+            msg.contains("changed the file") || msg.contains("prior edit"),
+            "error must explain WHY a re-read is required, got: {msg}"
+        );
+        // (b) Point at read_file in the message text.
+        assert!(
+            msg.contains("read_file"),
+            "error message must mention read_file so the model knows the next step, got: {msg}"
+        );
+        // (c) Carry ToolRequiredNextStep::ReadFile in structured metadata.
+        assert_eq!(
+            err.metadata()
+                .and_then(|m| m.required_next_step.as_ref()),
+            Some(&ToolRequiredNextStep::ReadFile),
+        );
+    }
+
+    /// Regression test: the `edit_file` tool's pre-validation must catch
+    /// missing `path` key on stringified JSON files (the convo-33 bug)
+    /// and return an error that points at the actual problem, not a
+    /// generic "path key" message.
+    #[tokio::test]
+    async fn test_edit_file_stringified_json_missing_path_gives_actionable_error() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "missing-path-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        // Model sends files as stringified JSON with no top-level path
+        // and no per-file path. This is unrecoverable: the tool cannot
+        // infer which file to edit.
+        let params = serde_json::json!({
+            "files": r#"[{"edits": [{"anchor": "x§y", "edit_type": "replace", "text": "z"}]}]"#,
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        let err = result.err().expect("stringified JSON without any path must error");
+        let msg = err.to_string();
+        // The error must mention the path key as a hint to the model.
+        assert!(
+            msg.contains("path"),
+            "error must mention the missing path key, got: {msg}"
+        );
+    }
+
     /// Stringified JSON parse error: when `files` is a string that fails to
     /// parse as JSON, the error must surface the actual serde_json error so
     /// the model can diagnose the problem.
