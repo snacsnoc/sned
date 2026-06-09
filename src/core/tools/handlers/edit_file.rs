@@ -86,17 +86,34 @@ impl EditFileHandler {
             ));
         }
 
-        if let Some(first_line) = anchor.lines().next() {
-            let first_line = first_line.trim();
-            if !first_line.is_empty() {
-                return Ok(first_line.to_string());
+        // Distinguish two kinds of multi-line input:
+        //
+        // 1. Concatenated anchors — the model pasted multiple complete
+        //    `Word§content` lines from the diff output separated by
+        //    newlines. The first line is a complete anchor. Take it.
+        //
+        // 2. Truly multi-line anchor — the model's anchor spans
+        //    multiple physical lines (e.g. `Word§\nNextWord§content`).
+        //    The first line is incomplete (ends with `§` with no
+        //    content after it). Reject with a clear error.
+        if anchor.contains('\n') {
+            let first_line = anchor.lines().next().unwrap_or("").trim();
+            if first_line.ends_with(ANCHOR_DELIMITER) {
+                let preview = if first_line.chars().count() > 60 {
+                    format!("{}...", first_line.chars().take(60).collect::<String>())
+                } else {
+                    first_line.to_string()
+                };
+                return Err(format!(
+                    "File '{}': '{}' is a multi-line anchor that starts with an incomplete line ('{}' ends with the '{}' delimiter but has no content after it). Anchors must be a single complete physical line from the read_file output (format: 'Word§line content'). If you want to replace a range of lines, use 'anchor' for the first line and 'end_anchor' for the last line.",
+                    path, field_name, preview, ANCHOR_DELIMITER
+                ));
             }
+            // First line is complete (has content after §). Use it.
+            return Ok(first_line.to_string());
         }
 
-        Err(format!(
-            "File '{}': '{}' is empty. Copy the exact 'Word§line content' string from read_file output.",
-            path, field_name
-        ))
+        Ok(anchor.to_string())
     }
 
     fn repair_truncated_files_json(raw: &str) -> Option<String> {
@@ -3588,6 +3605,56 @@ edition = "2021"
             msg.contains('§'),
             "empty-anchor error must show the § delimiter so the model uses the correct format, got: {}",
             msg
+        );
+    }
+
+    /// Regression test: the model submits an anchor that spans multiple
+    /// physical lines (e.g. `Word§\nNextWord§content`). The first line
+    /// is incomplete (ends with `§` with no content after it). The tool
+    /// must reject this with a clear error pointing at the incomplete
+    /// first line, not silently truncate to a useless first-line-only
+    /// anchor. See convo-2222-export-33.json.
+    #[tokio::test]
+    async fn test_edit_file_rejects_incomplete_multiline_anchor() {
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "multiline-anchor-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        // First line is just `Word§` with no content after the delimiter.
+        // The second line continues with another anchor.
+        let params = serde_json::json!({
+            "files": [{
+                "path": "multiline.c",
+                "edits": [{
+                    "anchor": "Countertop§\nElectrochemicalMorphology§static int show_window(void) {",
+                    "edit_type": "replace",
+                    "text": "static int show_window(void) {}"
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        let err = result.err().expect("incomplete multi-line anchor must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multi-line"),
+            "error must call out the multi-line anchor problem, got: {msg}"
+        );
+        assert!(
+            msg.contains("Countertop§"),
+            "error must preview the incomplete first line, got: {msg}"
+        );
+        assert!(
+            msg.contains("end_anchor"),
+            "error must point the model at the end_anchor solution for range replacements, got: {msg}"
         );
     }
 
