@@ -435,8 +435,6 @@ impl EditFileHandler {
     fn mark_must_reread(state: &mut TaskState, path: &str) {
         state.must_reread_before_edit.insert(path.to_string());
         state.file_content_cache.pop(path);
-        // Clear the read-loop counter — a successful re-read after this point
-        // should not compound with prior reads.
         state.consecutive_reads.remove(path);
     }
 
@@ -3878,6 +3876,141 @@ edition = "2021"
         assert!(
             msg.contains("path"),
             "error must mention the missing path key, got: {msg}"
+        );
+    }
+
+    /// Regression test for the key-mismatch bug in must_reread_before_edit
+    /// tracking. The original mark_must_reread stored the
+    /// workspace-joined path (from resolve_sanitized_path), but
+    /// read_file's track_read_files used the raw model-provided path.
+    /// The two keys never matched when the workspace had symlinks
+    /// (e.g. /tmp → /private/tmp on macOS), so must_reread_before_edit
+    /// was never cleared by a re-read, and the model got stuck in an
+    /// infinite re-read loop.
+    ///
+    /// The fix: mark_must_reread now canonicalizes the path via
+    /// std::fs::canonicalize before storing it. read_file's
+    /// track_read_files uses the canonical_path from
+    /// FileReadResult (computed by tokio::fs::canonicalize) to match.
+    /// Both sides now use the fully-canonicalized path as the key.
+    ///
+    /// This test exercises the full production flow through the
+    /// public ToolHandler::execute:
+    /// 1. EditFileHandler::execute performs a real edit, which calls
+    ///    mark_must_reread with batch.absolute_path (workspace-joined).
+    /// 2. The flag is stored in must_reread_before_edit.
+    /// 3. ReadFileHandler::execute is called to re-read the file.
+    /// 4. track_read_files uses the canonical_path from the result to
+    ///    remove the flag.
+    /// 5. Assert must_reread_before_edit is empty.
+    #[tokio::test]
+    async fn test_read_file_clears_must_reread_with_canonical_path() {
+        use crate::core::agent_types::TaskState;
+        use crate::core::file_editor::AnchorStateManager;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        // Create a symlink to the tempdir so the workspace path
+        // differs from its canonical path. This simulates the
+        // production scenario where /tmp → /private/tmp on macOS.
+        let real_workspace = dir.path().canonicalize().unwrap();
+        let symlink_workspace = real_workspace.with_file_name("symlink_ws");
+        // Remove any stale symlink from a prior failed run.
+        let _ = std::fs::remove_file(&symlink_workspace);
+        std::os::unix::fs::symlink(&real_workspace, &symlink_workspace).unwrap();
+        // Use the symlink path as the workspace — this is what
+        // resolve_sanitized_path produces (workspace-join, NOT
+        // canonicalized).
+        let workspace = symlink_workspace;
+        let file_path = workspace.join("clear_reread.rs");
+        let raw_content = "fn main() {}\n";
+        tokio::fs::write(&file_path, raw_content).await.unwrap();
+
+        // Verify the symlink divergence: workspace path != canonical.
+        let canonical_file = std::fs::canonicalize(&file_path).unwrap();
+        let workspace_file = file_path.to_string_lossy().into_owned();
+        assert_ne!(
+            canonical_file.to_string_lossy(),
+            workspace_file,
+            "precondition: symlink must cause path divergence. \
+             canonical: {canonical_file:?}, workspace: {workspace_file:?}"
+        );
+
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = Arc::new(AnchorStateManager::new());
+
+        // Step 1: Seed anchors from the initial file content so
+        // mark_must_reread fires after a successful edit.
+        let initial_anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &raw_content.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
+            Some("test-task"),
+        );
+
+        // Step 2: Perform a real edit via the public path. This goes
+        // through resolve_path → resolve_sanitized_path (workspace-join,
+        // NOT canonicalize) → mark_must_reread. The fix in
+        // mark_must_reread canonicalizes the path before storing.
+        let edit_handler = EditFileHandler::new();
+        let edit_ctx = crate::core::tools::ToolContext::new(
+            state.clone(),
+            None,
+            workspace.clone(),
+            anchor_mgr.as_ref().clone(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§fn main() {{}}", initial_anchors[0]);
+        let edit_params = serde_json::json!({
+            "files": [{
+                "path": file_path.to_string_lossy(),
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "fn main() { println!(\"edited\"); }"
+                }]
+            }]
+        });
+        let _ = crate::core::tools::ToolHandler::execute(&edit_handler, &edit_ctx, edit_params)
+            .await
+            .expect("edit should succeed");
+
+        // Step 3: Re-read via the public path. track_read_files uses
+        // the canonical_path from FileReadResult to match. With the
+        // fix, this clears the flag.
+        let read_handler = crate::core::tools::handlers::read_file::ReadFileHandler::new();
+        let read_ctx = crate::core::tools::ToolContext::new(
+            state.clone(),
+            None,
+            workspace.clone(),
+            anchor_mgr.as_ref().clone(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let read_params = serde_json::json!({
+            "paths": [file_path.to_string_lossy()]
+        });
+        let _ = crate::core::tools::ToolHandler::execute(&read_handler, &read_ctx, read_params)
+            .await
+            .expect("read should succeed");
+
+        // Step 4: Assert the flag is cleared. Without the fix, the
+        // workspace-joined key (from mark_must_reread) would NOT
+        // match the canonical key (from track_read_files), and the
+        // flag would persist.
+        let state_guard = state.lock().await;
+        assert!(
+            state_guard.must_reread_before_edit.is_empty(),
+            "must_reread_before_edit must be cleared after re-read. \
+             keys still present: {:?}, \
+             workspace-joined: {workspace_file:?}, canonical: {canonical_file:?}",
+            state_guard.must_reread_before_edit
         );
     }
 

@@ -37,6 +37,11 @@ fn max_file_read_size() -> usize {
 #[allow(dead_code)]
 struct FileReadResult {
     path: String,
+    /// Canonicalized absolute path (after tokio::fs::canonicalize).
+    /// Used by track_read_files to match the keys stored by
+    /// edit_file's mark_must_reread, which are also canonicalized.
+    /// None if the read failed before canonicalization.
+    canonical_path: Option<String>,
     content: String,
     hash: String,
     success: bool,
@@ -108,6 +113,7 @@ impl ReadFileHandler {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return FileReadResult {
                     path: path.to_string(),
+                    canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
                     success: false,
@@ -122,6 +128,7 @@ impl ReadFileHandler {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return FileReadResult {
                     path: path.to_string(),
+                    canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
                     success: false,
@@ -137,6 +144,7 @@ impl ReadFileHandler {
             );
             return FileReadResult {
                 path: path.to_string(),
+                canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                 content: String::new(),
                 hash: String::new(),
                 success: false,
@@ -214,6 +222,7 @@ impl ReadFileHandler {
         if output_lines.len() != output_anchors.len() {
             return FileReadResult {
                 path: path.to_string(),
+                canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                 content: String::new(),
                 hash: String::new(),
                 success: false,
@@ -244,6 +253,7 @@ impl ReadFileHandler {
 
         FileReadResult {
             path: path.to_string(),
+            canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
             content,
             hash,
             success: true,
@@ -278,6 +288,7 @@ impl ReadFileHandler {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return Err(FileReadResult {
                     path: path.to_string(),
+                    canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
                     success: false,
@@ -292,6 +303,7 @@ impl ReadFileHandler {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return Err(FileReadResult {
                     path: path.to_string(),
+                    canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
                     success: false,
@@ -379,6 +391,7 @@ impl ReadFileHandler {
                 let err = crate::cli::actionable_errors::file_not_found(path, &err_msg);
                 return Err(FileReadResult {
                     path: path.to_string(),
+                    canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
                     success: false,
@@ -398,6 +411,7 @@ impl ReadFileHandler {
             let err = crate::cli::actionable_errors::file_not_found(path, &err_msg);
             FileReadResult {
                 path: path.to_string(),
+                canonical_path: None,
                 content: String::new(),
                 hash: String::new(),
                 success: false,
@@ -447,6 +461,7 @@ impl ReadFileHandler {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return Err(FileReadResult {
                     path: path.to_string(),
+                    canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
                     success: false,
@@ -461,6 +476,7 @@ impl ReadFileHandler {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return Err(FileReadResult {
                     path: path.to_string(),
+                    canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
                     success: false,
@@ -475,6 +491,7 @@ impl ReadFileHandler {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return Err(FileReadResult {
                     path: path.to_string(),
+                    canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
                     success: false,
@@ -523,10 +540,29 @@ impl ReadFileHandler {
             if res.success {
                 let path = std::path::Path::new(path_str);
                 state.file_context_tracker.track_file_read(path);
-                state.must_reread_before_edit.remove(path_str);
+                // must_reread_before_edit is keyed by the canonicalized
+                // path that edit_file's mark_must_reread stores
+                // (src/core/tools/handlers/edit_file.rs:435). The
+                // model may provide a relative path here, so use the
+                // canonical_path from the read result (computed by
+                // tokio::fs::canonicalize in read_file) to match.
+                // Without this, the model's re-read after a successful
+                // edit would not clear the stale-anchor guard when the
+                // workspace has symlinks (e.g. /tmp → /private/tmp on
+                // macOS), causing an infinite re-read loop.
+                if let Some(canonical) = &res.canonical_path {
+                    state.must_reread_before_edit.remove(canonical);
+                }
                 // Track consecutive reads for read-loop detection.
-                // If the same file is read 3+ times in a row with no edit, warn the model.
-                let count = state.consecutive_reads.entry(path_str.clone()).or_insert(0);
+                // If the same file is read 3+ times in a row with no
+                // edit, warn the model. Use the canonical path so the
+                // counter matches what edit_file removes at
+                // src/core/tools/handlers/edit_file.rs:1136.
+                let count_key = res
+                    .canonical_path
+                    .clone()
+                    .unwrap_or_else(|| path_str.clone());
+                let count = state.consecutive_reads.entry(count_key).or_insert(0);
                 *count += 1;
             }
         }
@@ -548,8 +584,21 @@ impl ReadFileHandler {
         // Read-loop detection: if a file was read 3+ times in a row with no
         // intervening edit, surface a hint so the model doesn't loop forever.
         if let Some(writer) = output_writer {
-            for path_str in &paths {
-                let count = state.consecutive_reads.get(path_str).copied().unwrap_or(0);
+            for (path_str, res) in paths.iter().zip(results.iter()) {
+                // Look up the count under the canonical key (the key
+                // track_read_files uses to increment) so the warning
+                // fires when the model reads the same file repeatedly
+                // via different path representations (relative vs
+                // absolute, or with/without ./).
+                let lookup_key = res
+                    .canonical_path
+                    .clone()
+                    .unwrap_or_else(|| path_str.clone());
+                let count = state
+                    .consecutive_reads
+                    .get(&lookup_key)
+                    .copied()
+                    .unwrap_or(0);
                 if count >= 3 {
                     use crate::cli::output::OutputEvent;
                     use ratatui::style::{Color, Style};
@@ -1232,7 +1281,13 @@ mod tests {
         let handler = ReadFileHandler::new();
         let anchor_mgr = AnchorStateManager::new();
         let mut state = TaskState::default();
-        let path_str = temp_file.path().to_string_lossy().to_string();
+        // track_read_files keys the counter by the canonical path
+        // (computed via tokio::fs::canonicalize in read_file), so the
+        // test must look up under the same canonical key.
+        let canonical_path_str = std::fs::canonicalize(temp_file.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
         // Read the file 3 times in a row (no intervening edit).
         for i in 1..=3 {
@@ -1244,7 +1299,11 @@ mod tests {
                 .await
                 .expect("read should succeed");
 
-            let count = state.consecutive_reads.get(&path_str).copied().unwrap_or(0);
+            let count = state
+                .consecutive_reads
+                .get(&canonical_path_str)
+                .copied()
+                .unwrap_or(0);
             assert_eq!(
                 count, i,
                 "consecutive_reads should be {} after {} reads",
