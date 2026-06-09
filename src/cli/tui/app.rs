@@ -1833,14 +1833,13 @@ mod tests {
     #[test]
     fn test_push_user_message_forces_bottom_for_multiline_submit() {
         use std::sync::Arc;
+        use tokio::sync::mpsc;
 
-        struct NoopWriter;
+        let _approval_guard = crate::core::approval::approval_test_guard();
 
-        impl crate::cli::output::OutputWriter for NoopWriter {
-            fn emit(&self, _event: crate::cli::output::OutputEvent) {}
-
-            fn flush(&self) {}
-        }
+        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(8);
+        let writer: Arc<dyn crate::cli::output::OutputWriter> =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 
         let mut app = App::new();
         app.set_content_height(5);
@@ -1851,10 +1850,385 @@ mod tests {
         app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 7;
 
-        let writer: Arc<dyn crate::cli::output::OutputWriter> = Arc::new(NoopWriter);
         app.push_user_message("first line\nsecond line\nthird line", &writer);
 
+        // Verify the lines actually landed in the channel and that
+        // drain pulls them into output_lines, updating scroll state.
+        // This guards the regression that motivated the
+        // "drain_output before immediate render" fix in interactive.rs.
+        crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
+
+        // 3 user lines + 20 baseline lines = 23 total.
+        assert_eq!(
+            app.output_lines.len(),
+            23,
+            "expected 3 user lines to be added to output_lines after drain"
+        );
         assert_eq!(app.scroll_mode, ScrollMode::Auto);
         assert_eq!(app.scroll_offset, 0);
+
+        // The three pushed lines must be the last three in output_lines,
+        // in order, with the multiline-tail prefix on lines 2 and 3.
+        let last_three: Vec<String> = app
+            .output_lines
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(last_three[0], "❯ first line");
+        assert_eq!(last_three[1], "  second line");
+        assert_eq!(last_three[2], "  third line");
+    }
+
+    /// Contract test: after a multiline submit + drain + render, the bottom
+    /// visible row of the output pane must contain the last line of the
+    /// submitted message. This is the user-visible bug ("only renders first
+    /// line") that the existing scroll-state-only test failed to catch.
+    #[test]
+    fn test_multiline_submit_bottom_row_contains_last_line() {
+        use std::sync::Arc;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use tokio::sync::mpsc;
+
+        let _approval_guard = crate::core::approval::approval_test_guard();
+
+        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(8);
+        let writer: Arc<dyn crate::cli::output::OutputWriter> =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        // 80x24 terminal with a 22-row content area (status + input + borders).
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        let mut app = App::new();
+        // Seed enough output to push old content out of the bottom rows.
+        for index in 0..50 {
+            app.push_plain(format!("old line {}", index));
+        }
+        // Pretend the user had scrolled up so Manual mode is active; a
+        // correct drain+force_bottom must snap back to Auto at offset 0.
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 10;
+
+        // Initial render to populate cached_wrap_width and viewport state.
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial render should succeed");
+
+        // The full pipeline: emit async -> drain -> force bottom -> render.
+        app.push_user_message("first line\nsecond line\nthird line", &writer);
+        crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
+        app.force_bottom();
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("post-submit render should succeed");
+
+        // Render the buffer and assert the bottom visible row contains
+        // the last line of the multiline message.
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let height = buffer.area.height as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+        let bottom_row = rows
+            .last()
+            .expect("terminal buffer must have at least one row");
+
+        // Find any row in the lower half of the output area that contains
+        // the tail of the multiline message. The output pane occupies
+        // roughly the upper `height - 4` rows; the last 3 rows are the
+        // status bar / input / border. We assert that *some* visible row
+        // in the bottom 10 rows of the output area contains "third line".
+        let output_bottom_rows = rows
+            .iter()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>();
+        let found = output_bottom_rows
+            .iter()
+            .any(|row| row.contains("third line"));
+
+        assert!(
+            found,
+            "bottom of rendered output should contain 'third line' (last line of \
+             multiline submit). bottom row: {bottom_row:?}, lower rows: {output_bottom_rows:?}"
+        );
+
+        // Sanity: the user must NOT still be in Manual mode at offset 10
+        // after a multiline submit (the original bug surface).
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert_eq!(app.scroll_offset, 0);
+
+        // Height must match what we asked the backend for.
+        assert_eq!(height, 24);
+        // And the buffer must contain all three lines somewhere.
+        let all_rendered = rows.join("\n");
+        assert!(all_rendered.contains("first line"));
+        assert!(all_rendered.contains("second line"));
+        assert!(all_rendered.contains("third line"));
+    }
+
+    /// Contract test for the "approval prompt invisible after multi-line tool
+    /// output" bug. The reported scenario: Gemini streams a tool result
+    /// (multi-line), then the agent immediately requests approval for the
+    /// next tool. The approval prompt was being scrolled out of view or
+    /// failing to pin to the bottom, so the user could not see it.
+    ///
+    /// This test reproduces the post-`begin_approval_prompt` state, then
+    /// drains both the tool result AND the approval prompt emit, then
+    /// renders, and asserts the approval prompt text appears in the
+    /// visible bottom rows of the output pane.
+    #[test]
+    fn test_approval_prompt_visible_after_multiline_tool_result() {
+        use std::sync::Arc;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use tokio::sync::mpsc;
+
+        let _approval_guard = crate::core::approval::approval_test_guard();
+
+        // Simulate the approval prompt being armed BEFORE the emit lands,
+        // which is exactly what begin_approval_prompt() does in
+        // src/core/approval.rs:1027-1038.
+        crate::core::approval::set_approval_prompt_active(true);
+        crate::core::approval::set_approval_prompt_scroll();
+
+        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(16);
+        let writer: Arc<dyn crate::cli::output::OutputWriter> =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        // 80x24 terminal: ~20 rows for the output area, minus 2 for borders
+        // = ~18 rows of content.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        let mut app = App::new();
+        // Seed enough content to push old lines out of the visible bottom
+        // and force the viewport to scroll.
+        for index in 0..50 {
+            app.push_plain(format!("old line {}", index));
+        }
+        // Initial render to populate cached_wrap_width and viewport state.
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial render should succeed");
+
+        // Simulate a multi-line tool result (e.g. execute_command output).
+        // In production this comes from agent_loop.rs:3018-3028 which emits
+        // one event per line up to MAX_COMMAND_RESULT_DISPLAY_LINES.
+        let tool_result_lines = [
+            "  ✓ src/foo.rs",
+            "    line 1 of output",
+            "    line 2 of output",
+            "    line 3 of output",
+            "    line 4 of output",
+            "    line 5 of output",
+        ];
+        for line in tool_result_lines {
+            writer.emit(crate::cli::output::OutputEvent::dim(line.to_string()));
+        }
+
+        // Simulate the approval prompt emit. The prompt is RawAnsi with a
+        // trailing \n, which ansi_to_ratatui_lines splits into one Line per
+        // visible row. We use a representative multi-line approval prompt
+        // shape (matches the structure from build_tool_approval_prompt).
+        let prompt = "\n\
+                      \x1b[33m🔧 Tool:\x1b[0m \x1b[1medit_file\x1b[0m\n\
+                      \x1b[2m  path: src/baz.rs\x1b[0m\n\
+                      Execute this tool? (y/n/always): ";
+        writer.emit(crate::cli::output::OutputEvent::RawAnsi(
+            format!("{}\n", prompt),
+        ));
+
+        // Full pipeline: drain + clamp + render. This is what the main
+        // loop does on every tick (interactive.rs:2165-2252).
+        crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("post-prompt render should succeed");
+
+        // Assert the scroll mode is ApprovalPinned so the user can't be
+        // scrolled away from the prompt.
+        assert_eq!(
+            app.scroll_mode,
+            ScrollMode::ApprovalPinned,
+            "scroll mode must be ApprovalPinned while approval prompt is active"
+        );
+
+        // Read the rendered buffer and assert the approval prompt text is
+        // visible in the bottom rows of the output pane.
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+
+        // The output pane occupies the upper rows; status bar (1) and
+        // input area (3) are at the bottom. Scan the bottom 10 rows of
+        // the output pane for the approval prompt.
+        let output_bottom_rows: Vec<&String> =
+            rows.iter().rev().take(10).collect();
+
+        // The "Execute this tool?" line is the user-visible prompt anchor.
+        let has_prompt_question = output_bottom_rows
+            .iter()
+            .any(|row| row.contains("Execute this tool?"));
+
+        // The tool name "edit_file" should also be visible.
+        let has_tool_name = output_bottom_rows
+            .iter()
+            .any(|row| row.contains("edit_file"));
+
+        // The tool result lines should be visible above the prompt.
+        let has_tool_result = output_bottom_rows
+            .iter()
+            .any(|row| row.contains("line 5 of output"));
+
+        assert!(
+            has_prompt_question,
+            "approval prompt question must be visible in bottom rows. \
+             bottom rows: {output_bottom_rows:?}"
+        );
+        assert!(
+            has_tool_name,
+            "approval prompt tool name must be visible in bottom rows. \
+             bottom rows: {output_bottom_rows:?}"
+        );
+        assert!(
+            has_tool_result,
+            "tool result must remain visible above the prompt. \
+             bottom rows: {output_bottom_rows:?}"
+        );
+
+        // Teardown: clear the approval state so the test guard's
+        // cleanup sees a clean slate.
+        crate::core::approval::set_approval_prompt_active(false);
+        crate::core::approval::clear_approval_prompt_scroll();
+    }
+
+    /// Contract test for the race where the approval scroll flag is set
+    /// (by `begin_approval_prompt`) BEFORE the prompt emit lands in the
+    /// channel. The first drain call should consume the flag and pin;
+    /// the second drain (after the prompt actually arrives) should keep
+    /// the pin via the `is_approval_prompt_active()` branch.
+    ///
+    /// The user reported this exact sequence (multi-line tool output →
+    /// approval prompt) left the prompt invisible. This test pins down
+    /// the expected behavior across the two-drain sequence.
+    #[test]
+    fn test_approval_prompt_visible_when_flag_set_before_emit() {
+        use std::sync::Arc;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use tokio::sync::mpsc;
+
+        let _approval_guard = crate::core::approval::approval_test_guard();
+
+        // Step 1: Begin approval prompt. In production this is what
+        // approval.rs:1035 does — sets the scroll flag BEFORE the
+        // prompt emit lands in the channel.
+        crate::core::approval::set_approval_prompt_active(true);
+        crate::core::approval::set_approval_prompt_scroll();
+
+        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(16);
+        let writer: Arc<dyn crate::cli::output::OutputWriter> =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        let mut app = App::new();
+        for index in 0..50 {
+            app.push_plain(format!("old line {}", index));
+        }
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial render should succeed");
+
+        // Step 2: Multi-line tool result emit.
+        let tool_result_lines = [
+            "  ✓ src/foo.rs",
+            "    line 1 of output",
+            "    line 2 of output",
+            "    line 3 of output",
+            "    line 4 of output",
+        ];
+        for line in tool_result_lines {
+            writer.emit(crate::cli::output::OutputEvent::dim(line.to_string()));
+        }
+
+        // Step 3: First drain — flag is already set, tool result lands.
+        // This should consume the flag and pin.
+        crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
+        assert_eq!(
+            app.scroll_mode,
+            ScrollMode::ApprovalPinned,
+            "first drain must pin the scroll (flag was set before emit)"
+        );
+
+        // Step 4: Prompt emit happens AFTER the first drain (this is the
+        // exact race that begin_approval_prompt creates).
+        let prompt = "\n\
+                      \x1b[33m🔧 Tool:\x1b[0m \x1b[1medit_file\x1b[0m\n\
+                      Execute this tool? (y/n/always): ";
+        writer.emit(crate::cli::output::OutputEvent::RawAnsi(
+            format!("{}\n", prompt),
+        ));
+
+        // Step 5: Second drain — flag is already consumed, but
+        // is_approval_prompt_active() is still true, so the else-if
+        // branch should re-pin.
+        crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
+        assert_eq!(
+            app.scroll_mode,
+            ScrollMode::ApprovalPinned,
+            "second drain must keep the pin via is_approval_prompt_active()"
+        );
+
+        // Step 6: Render and verify the prompt is visible.
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("post-prompt render should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+
+        let output_bottom_rows: Vec<&String> =
+            rows.iter().rev().take(10).collect();
+
+        let has_prompt_question = output_bottom_rows
+            .iter()
+            .any(|row| row.contains("Execute this tool?"));
+
+        assert!(
+            has_prompt_question,
+            "approval prompt must be visible after the two-drain sequence. \
+             This is the exact bug the user reported: multi-line tool output \
+             followed by an approval prompt left the prompt invisible. \
+             bottom rows: {output_bottom_rows:?}"
+        );
+
+        // Teardown.
+        crate::core::approval::set_approval_prompt_active(false);
+        crate::core::approval::clear_approval_prompt_scroll();
     }
 }

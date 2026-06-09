@@ -466,6 +466,34 @@ fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> a
     Ok(())
 }
 
+/// Drain the output channel, force the scroll to the bottom, sync the
+/// viewport, and re-render. Used immediately after `push_user_message` so
+/// the user's just-submitted text is visible before the agent starts
+/// streaming its response.
+fn drain_and_render_user_submit(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    output_rx: &mut mpsc::Receiver<OutputEvent>,
+) -> anyhow::Result<()> {
+    drain_output(output_rx, app);
+    app.force_bottom();
+    sync_scroll_viewport(terminal, app)?;
+    terminal.draw(|f| app.render(f))?;
+    Ok(())
+}
+
+/// Test-only: drain the output channel into the app buffer without any
+/// terminal-side rendering. Exposed `pub(crate)` so the TUI tests in
+/// `cli::tui::app` can verify the emit → drain pipeline against a real
+/// `ChannelOutputWriter` without standing up a full `ratatui::DefaultTerminal`.
+#[cfg(test)]
+pub(crate) fn drain_output_for_test(
+    rx: &mut mpsc::Receiver<OutputEvent>,
+    app: &mut App,
+) {
+    drain_output(rx, app);
+}
+
 fn approval_result_for_key(key: &KeyEvent) -> Option<ApprovalResult> {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2433,9 +2461,14 @@ async fn run_main_loop(
                                             .await?;
                                             app.agent_busy = true;
                                         }
-                                        app.force_bottom();
-                                        sync_scroll_viewport(terminal, app)?;
-                                        terminal.draw(|f| app.render(f))?;
+                                        // Drain the channel, snap to bottom, and
+                                        // re-render so the just-submitted prompt is
+                                        // visible before the agent starts streaming.
+                                        drain_and_render_user_submit(
+                                            terminal,
+                                            app,
+                                            output_rx,
+                                        )?;
                                         continue;
                                     }
 
@@ -2534,10 +2567,14 @@ async fn run_main_loop(
                                     .await?;
                                     app.agent_busy = true;
                                 }
-                                // Render immediately to show user message before agent starts streaming
-                                app.force_bottom();
-                                sync_scroll_viewport(terminal, app)?;
-                                terminal.draw(|f| app.render(f))?;
+                                // Drain the channel, snap to bottom, and
+                                // re-render so the just-submitted prompt is
+                                // visible before the agent starts streaming.
+                                drain_and_render_user_submit(
+                                    terminal,
+                                    app,
+                                    output_rx,
+                                )?;
                             }
                         }
                     }
