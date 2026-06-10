@@ -643,9 +643,9 @@ async fn process_gemini_sse_line(
 #[allow(clippy::unused_async)]
 async fn finish_gemini_sse_to_chunks(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
-    accumulated_tool_calls: &mut HashMap<String, (String, String, String, Option<String>)>,
+    accumulated_tool_calls: &HashMap<String, (String, String, String, Option<String>)>,
     completed_tool_call_ids: &mut HashSet<String>,
-    last_stop_reason: &mut Option<String>,
+    last_stop_reason: &Option<String>,
     last_grounding_metadata: &mut Option<serde_json::Value>,
 ) {
     // Do not flush tool calls if the model was blocked or only emitted

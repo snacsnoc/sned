@@ -55,7 +55,7 @@ impl ListSkillsHandler {
         Ok(response)
     }
 
-    pub async fn execute(
+    pub fn execute(
         &self,
         state: &mut TaskState,
         _params: serde_json::Value,
@@ -169,7 +169,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let result = handler.execute(&mut state, serde_json::json!({})).await;
+        let result = handler.execute(&mut state, serde_json::json!({}));
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("# AVAILABLE SKILLS"));
@@ -195,7 +195,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handler.execute(&mut state, serde_json::json!({})).await;
+        let result = handler.execute(&mut state, serde_json::json!({}));
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("fs-skill: Filesystem discovered skill"));

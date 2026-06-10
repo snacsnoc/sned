@@ -7,7 +7,7 @@ impl NewTaskHandler {
         Self
     }
 
-    pub async fn execute(
+    pub fn execute(
         &self,
         state: &mut TaskState,
         params: serde_json::Value,
@@ -49,7 +49,6 @@ impl ToolHandler for NewTaskHandler {
     ) -> Result<serde_json::Value, ToolError> {
         let mut state = ctx.state.lock().await;
         Self::execute(self, &mut state, params)
-            .await
             .map(serde_json::Value::String)
     }
 
@@ -67,7 +66,7 @@ mod tests {
         let handler = NewTaskHandler::new();
         let mut state = TaskState::default();
 
-        let result = handler.execute(&mut state, serde_json::json!({})).await;
+        let result = handler.execute(&mut state, serde_json::json!({}));
         assert!(result.is_err());
         assert!(state.consecutive_mistakes > 0);
     }
@@ -83,8 +82,7 @@ mod tests {
                 serde_json::json!({
                     "context": "Test context summary"
                 }),
-            )
-            .await;
+            );
 
         assert!(result.is_ok());
         assert!(state.consecutive_mistakes == 0);

@@ -14,7 +14,7 @@ pub struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = self._file.unlock();
+        self._file.unlock();
     }
 }
 
@@ -423,7 +423,7 @@ impl TaskStorage {
                     .unwrap()
                     .as_millis() as i64
             });
-            let file_name = format!("conversation_history_{}.json", ts);
+            let file_name = format!("conversation_history_{ts}.json");
             let file_path = self.task_dir.join(&file_name);
 
             let data = serde_json::to_string(history)
@@ -456,7 +456,7 @@ impl TaskStorage {
             .open(&lock_path)?;
 
         file.try_lock()
-            .map_err(|e| io::Error::other(format!("Task is locked by another process: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("Task is locked by another process: {e}")))?;
 
         Ok(LockGuard { _file: file })
     }
@@ -474,7 +474,7 @@ impl TaskStorage {
             .open(&lock_path)?;
 
         file.lock()
-            .map_err(|e| io::Error::other(format!("Failed to acquire lock: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("Failed to acquire lock: {e}")))?;
 
         Ok(LockGuard { _file: file })
     }

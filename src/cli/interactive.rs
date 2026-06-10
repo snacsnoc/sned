@@ -210,7 +210,7 @@ impl InteractiveSession {
         self.agent_loop.lock().await.state_handle()
     }
 
-    async fn clear_compacted_summary(&mut self) -> bool {
+    async fn clear_compacted_summary(&self) -> bool {
         self.agent_loop.lock().await.clear_compacted_summary().await
     }
 

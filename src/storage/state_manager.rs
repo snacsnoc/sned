@@ -1088,85 +1088,85 @@ impl std::str::FromStr for GlobalStateKey {
 impl std::fmt::Display for GlobalStateKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GlobalStateKey::SnedVersion => write!(f, "snedVersion"),
-            GlobalStateKey::TaskHistory => write!(f, "taskHistory"),
-            GlobalStateKey::FavoritedModelIds => write!(f, "favoritedModelIds"),
-            GlobalStateKey::TerminalReuseEnabled => write!(f, "terminalReuseEnabled"),
-            GlobalStateKey::IsNewUser => write!(f, "isNewUser"),
-            GlobalStateKey::Mode => write!(f, "mode"),
-            GlobalStateKey::SubagentsEnabled => write!(f, "subagentsEnabled"),
-            GlobalStateKey::GlobalSnedRulesToggles => write!(f, "globalSnedRulesToggles"),
-            GlobalStateKey::EnableCheckpoints => write!(f, "enableCheckpoints"),
-            GlobalStateKey::ActModeApiProvider => write!(f, "actModeApiProvider"),
-            GlobalStateKey::PlanModeApiProvider => write!(f, "planModeApiProvider"),
-            GlobalStateKey::ActModeApiModelId => write!(f, "actModeApiModelId"),
-            GlobalStateKey::PlanModeApiModelId => write!(f, "planModeApiModelId"),
-            GlobalStateKey::AzureApiVersion => write!(f, "azureApiVersion"),
-            GlobalStateKey::PreferredLanguage => write!(f, "preferredLanguage"),
-            GlobalStateKey::TelemetrySetting => write!(f, "telemetrySetting"),
-            GlobalStateKey::DefaultTerminalProfile => write!(f, "defaultTerminalProfile"),
-            GlobalStateKey::CustomPrompt => write!(f, "customPrompt"),
-            GlobalStateKey::WorktreeAutoOpenPath => write!(f, "worktreeAutoOpenPath"),
-            GlobalStateKey::LastShownAnnouncementId => write!(f, "lastShownAnnouncementId"),
-            GlobalStateKey::WritePromptMetadataDirectory => {
+            Self::SnedVersion => write!(f, "snedVersion"),
+            Self::TaskHistory => write!(f, "taskHistory"),
+            Self::FavoritedModelIds => write!(f, "favoritedModelIds"),
+            Self::TerminalReuseEnabled => write!(f, "terminalReuseEnabled"),
+            Self::IsNewUser => write!(f, "isNewUser"),
+            Self::Mode => write!(f, "mode"),
+            Self::SubagentsEnabled => write!(f, "subagentsEnabled"),
+            Self::GlobalSnedRulesToggles => write!(f, "globalSnedRulesToggles"),
+            Self::EnableCheckpoints => write!(f, "enableCheckpoints"),
+            Self::ActModeApiProvider => write!(f, "actModeApiProvider"),
+            Self::PlanModeApiProvider => write!(f, "planModeApiProvider"),
+            Self::ActModeApiModelId => write!(f, "actModeApiModelId"),
+            Self::PlanModeApiModelId => write!(f, "planModeApiModelId"),
+            Self::AzureApiVersion => write!(f, "azureApiVersion"),
+            Self::PreferredLanguage => write!(f, "preferredLanguage"),
+            Self::TelemetrySetting => write!(f, "telemetrySetting"),
+            Self::DefaultTerminalProfile => write!(f, "defaultTerminalProfile"),
+            Self::CustomPrompt => write!(f, "customPrompt"),
+            Self::WorktreeAutoOpenPath => write!(f, "worktreeAutoOpenPath"),
+            Self::LastShownAnnouncementId => write!(f, "lastShownAnnouncementId"),
+            Self::WritePromptMetadataDirectory => {
                 write!(f, "writePromptMetadataDirectory")
             }
-            GlobalStateKey::LiteLlmBaseUrl => write!(f, "liteLlmBaseUrl"),
-            GlobalStateKey::AnthropicBaseUrl => write!(f, "anthropicBaseUrl"),
-            GlobalStateKey::OpenAiBaseUrl => write!(f, "openAiBaseUrl"),
-            GlobalStateKey::OpenRouterBaseUrl => write!(f, "openRouterBaseUrl"),
-            GlobalStateKey::GeminiBaseUrl => write!(f, "geminiBaseUrl"),
-            GlobalStateKey::AwsRegion => write!(f, "awsRegion"),
-            GlobalStateKey::OpenTelemetryMetricsExporter => {
+            Self::LiteLlmBaseUrl => write!(f, "liteLlmBaseUrl"),
+            Self::AnthropicBaseUrl => write!(f, "anthropicBaseUrl"),
+            Self::OpenAiBaseUrl => write!(f, "openAiBaseUrl"),
+            Self::OpenRouterBaseUrl => write!(f, "openRouterBaseUrl"),
+            Self::GeminiBaseUrl => write!(f, "geminiBaseUrl"),
+            Self::AwsRegion => write!(f, "awsRegion"),
+            Self::OpenTelemetryMetricsExporter => {
                 write!(f, "openTelemetryMetricsExporter")
             }
-            GlobalStateKey::OpenTelemetryLogsExporter => write!(f, "openTelemetryLogsExporter"),
-            GlobalStateKey::OpenTelemetryOtlpProtocol => write!(f, "openTelemetryOtlpProtocol"),
-            GlobalStateKey::OpenTelemetryOtlpEndpoint => write!(f, "openTelemetryOtlpEndpoint"),
-            GlobalStateKey::OpenTelemetryOtlpMetricsProtocol => {
+            Self::OpenTelemetryLogsExporter => write!(f, "openTelemetryLogsExporter"),
+            Self::OpenTelemetryOtlpProtocol => write!(f, "openTelemetryOtlpProtocol"),
+            Self::OpenTelemetryOtlpEndpoint => write!(f, "openTelemetryOtlpEndpoint"),
+            Self::OpenTelemetryOtlpMetricsProtocol => {
                 write!(f, "openTelemetryOtlpMetricsProtocol")
             }
-            GlobalStateKey::OpenTelemetryOtlpMetricsEndpoint => {
+            Self::OpenTelemetryOtlpMetricsEndpoint => {
                 write!(f, "openTelemetryOtlpMetricsEndpoint")
             }
-            GlobalStateKey::OpenTelemetryOtlpLogsProtocol => {
+            Self::OpenTelemetryOtlpLogsProtocol => {
                 write!(f, "openTelemetryOtlpLogsProtocol")
             }
-            GlobalStateKey::OpenTelemetryOtlpLogsEndpoint => {
+            Self::OpenTelemetryOtlpLogsEndpoint => {
                 write!(f, "openTelemetryOtlpLogsEndpoint")
             }
-            GlobalStateKey::ShellIntegrationTimeout => write!(f, "shellIntegrationTimeout"),
-            GlobalStateKey::TerminalOutputLineLimit => write!(f, "terminalOutputLineLimit"),
-            GlobalStateKey::MaxConsecutiveMistakes => write!(f, "maxConsecutiveMistakes"),
-            GlobalStateKey::OpenTelemetryMetricExportInterval => {
+            Self::ShellIntegrationTimeout => write!(f, "shellIntegrationTimeout"),
+            Self::TerminalOutputLineLimit => write!(f, "terminalOutputLineLimit"),
+            Self::MaxConsecutiveMistakes => write!(f, "maxConsecutiveMistakes"),
+            Self::OpenTelemetryMetricExportInterval => {
                 write!(f, "openTelemetryMetricExportInterval")
             }
-            GlobalStateKey::OpenTelemetryLogBatchSize => write!(f, "openTelemetryLogBatchSize"),
-            GlobalStateKey::OpenTelemetryLogBatchTimeout => {
+            Self::OpenTelemetryLogBatchSize => write!(f, "openTelemetryLogBatchSize"),
+            Self::OpenTelemetryLogBatchTimeout => {
                 write!(f, "openTelemetryLogBatchTimeout")
             }
-            GlobalStateKey::OpenTelemetryLogMaxQueueSize => {
+            Self::OpenTelemetryLogMaxQueueSize => {
                 write!(f, "openTelemetryLogMaxQueueSize")
             }
-            GlobalStateKey::RequestTimeoutMs => write!(f, "requestTimeoutMs"),
-            GlobalStateKey::PlanActSeparateModelsSetting => {
+            Self::RequestTimeoutMs => write!(f, "requestTimeoutMs"),
+            Self::PlanActSeparateModelsSetting => {
                 write!(f, "planActSeparateModelsSetting")
             }
-            GlobalStateKey::StrictPlanModeEnabled => write!(f, "strictPlanModeEnabled"),
-            GlobalStateKey::HooksEnabled => write!(f, "hooksEnabled"),
-            GlobalStateKey::UseAutoCondense => write!(f, "useAutoCondense"),
-            GlobalStateKey::ShowTokenUsage => write!(f, "showTokenUsage"),
-            GlobalStateKey::SnedWebToolsEnabled => write!(f, "snedWebToolsEnabled"),
-            GlobalStateKey::WorktreesEnabled => write!(f, "worktreesEnabled"),
-            GlobalStateKey::BackgroundEditEnabled => write!(f, "backgroundEditEnabled"),
-            GlobalStateKey::OptOutOfRemoteConfig => write!(f, "optOutOfRemoteConfig"),
-            GlobalStateKey::DoubleCheckCompletionEnabled => {
+            Self::StrictPlanModeEnabled => write!(f, "strictPlanModeEnabled"),
+            Self::HooksEnabled => write!(f, "hooksEnabled"),
+            Self::UseAutoCondense => write!(f, "useAutoCondense"),
+            Self::ShowTokenUsage => write!(f, "showTokenUsage"),
+            Self::SnedWebToolsEnabled => write!(f, "snedWebToolsEnabled"),
+            Self::WorktreesEnabled => write!(f, "worktreesEnabled"),
+            Self::BackgroundEditEnabled => write!(f, "backgroundEditEnabled"),
+            Self::OptOutOfRemoteConfig => write!(f, "optOutOfRemoteConfig"),
+            Self::DoubleCheckCompletionEnabled => {
                 write!(f, "doubleCheckCompletionEnabled")
             }
-            GlobalStateKey::OpenTelemetryEnabled => write!(f, "openTelemetryEnabled"),
-            GlobalStateKey::OpenTelemetryOtlpInsecure => write!(f, "openTelemetryOtlpInsecure"),
-            GlobalStateKey::WritePromptMetadataEnabled => write!(f, "writePromptMetadataEnabled"),
-            GlobalStateKey::EnableParallelToolCalling => write!(f, "enableParallelToolCalling"),
+            Self::OpenTelemetryEnabled => write!(f, "openTelemetryEnabled"),
+            Self::OpenTelemetryOtlpInsecure => write!(f, "openTelemetryOtlpInsecure"),
+            Self::WritePromptMetadataEnabled => write!(f, "writePromptMetadataEnabled"),
+            Self::EnableParallelToolCalling => write!(f, "enableParallelToolCalling"),
         }
     }
 }
@@ -1244,7 +1244,7 @@ impl StateManager {
         let settings_dir = self.state_dir.join("..").join("settings");
         let _ = crate::storage::disk::cleanup_orphaned_temp_files(
             &settings_dir,
-            std::time::Duration::from_secs(86400), // 24 hours
+            std::time::Duration::from_hours(24), // 24 hours
         );
 
         // TaskStorage uses atomic_write_file too; orphaned .tmp.*.json
@@ -1252,55 +1252,57 @@ impl StateManager {
         let tasks_dir = self.state_dir.join("..").join("tasks");
         let _ = crate::storage::disk::cleanup_orphaned_temp_files(
             &tasks_dir,
-            std::time::Duration::from_secs(86400), // 24 hours
+            std::time::Duration::from_hours(24), // 24 hours
         );
 
         // Load global state
         let global_state = self.load_global_state()?;
-        *self.global_state.write().unwrap_or_else(|e| e.into_inner()) = global_state;
+        *self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner) = global_state;
 
         // Generate machine ID if not present
         let mut needs_persist = false;
         {
-            let mut state = self.global_state.write().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.sned_generated_machine_id.is_none() {
                 let machine_id = Ulid::new().to_string();
                 state.sned_generated_machine_id = Some(machine_id);
                 needs_persist = true;
             }
+            drop(state);
         }
 
         // Persist immediately if we generated a new machine ID
         if needs_persist {
             let settings_dir = self.state_dir.join("..").join("settings");
             fs::create_dir_all(&settings_dir)?;
-            let state = self.global_state.read().unwrap_or_else(|e| e.into_inner());
+            let state = self.global_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             let data = serde_json::to_string_pretty(&*state)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            drop(state);
             let file_path = settings_dir.join("global_settings.json");
             crate::storage::disk::atomic_write_file(&file_path, &data)?;
         }
 
         // Load secrets
         let secrets = self.secrets_store.load();
-        *self.secrets.write().unwrap_or_else(|e| e.into_inner()) = secrets;
+        *self.secrets.write().unwrap_or_else(std::sync::PoisonError::into_inner) = secrets;
 
         // Load workspace state (if exists)
         if let Ok(workspace_state) = self.load_workspace_state() {
             *self
                 .workspace_state
                 .write()
-                .unwrap_or_else(|e| e.into_inner()) = workspace_state;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = workspace_state;
         }
 
         // Load task states from disk (SM4 fix)
         let tasks_dir = self.state_dir.join("..").join("tasks");
         if tasks_dir.exists() {
-            let mut task_states = self.task_state.write().unwrap_or_else(|e| e.into_inner());
+            let mut task_states = self.task_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut pending_task_states = self
                 .pending_task_states
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             if let Ok(entries) = fs::read_dir(&tasks_dir) {
                 for entry in entries.flatten() {
@@ -1327,6 +1329,8 @@ impl StateManager {
                     }
                 }
             }
+            drop(task_states);
+            drop(pending_task_states);
         }
 
         Ok(())
@@ -1336,7 +1340,7 @@ impl StateManager {
     /// Reads from `sned_generated_machine_id` field.
     /// Falls back to "anonymous" if not set.
     pub fn get_distinct_id(&self) -> String {
-        let state = self.global_state.read().unwrap_or_else(|e| e.into_inner());
+        let state = self.global_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .sned_generated_machine_id
             .clone()
@@ -1349,7 +1353,7 @@ impl StateManager {
     pub fn get_task_history(&self) -> Vec<HistoryItem> {
         self.global_state
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .task_history
             .clone()
     }
@@ -1358,14 +1362,14 @@ impl StateManager {
     pub fn set_task_history(&self, history: Vec<HistoryItem>) {
         self.global_state
             .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .task_history = history;
         self.mark_global_key_pending("taskHistory".to_string());
     }
 
     /// Add a task to history (or update existing)
     pub fn add_task_to_history(&self, item: HistoryItem) {
-        let mut state = self.global_state.write().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         state.task_history.retain(|h| h.id != item.id);
         state.task_history.push(item);
@@ -1377,7 +1381,7 @@ impl StateManager {
 
     /// Remove a task from history
     pub fn remove_task_from_history(&self, task_id: &str) {
-        let mut state = self.global_state.write().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.task_history.retain(|h| h.id != task_id);
         drop(state);
         self.mark_global_key_pending("taskHistory".to_string());
@@ -1387,7 +1391,7 @@ impl StateManager {
     pub fn find_task_in_history(&self, task_id: &str) -> Option<HistoryItem> {
         self.global_state
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .task_history
             .iter()
             .find(|h| h.id == task_id)
@@ -1398,15 +1402,12 @@ impl StateManager {
     pub fn get_most_recent_task_for_workspace(&self, workspace_path: &str) -> Option<HistoryItem> {
         self.global_state
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .task_history
             .iter()
             .filter(|h| {
                 // Check if workspace path matches
-                h.workspace_root_path
-                    .as_ref()
-                    .map(|p| p == workspace_path)
-                    .unwrap_or(false)
+                h.workspace_root_path.as_ref().is_some_and(|p| p == workspace_path)
             })
             .max_by_key(|h| h.ts)
             .cloned()
@@ -1419,8 +1420,9 @@ impl StateManager {
     where
         T: Clone + for<'de> Deserialize<'de>,
     {
-        let state = self.global_state.read().unwrap_or_else(|e| e.into_inner());
+        let state = self.global_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let json_value = key.get_json_value(&state)?;
+        drop(state);
         match serde_json::from_value(json_value) {
             Ok(value) => Some(value),
             Err(error) => {
@@ -1437,14 +1439,14 @@ impl StateManager {
     /// Get a config value by string key name.
     pub fn get_config_value(&self, key: &str) -> Option<String> {
         let enum_key = key.parse::<GlobalStateKey>().ok()?;
-        let state = self.global_state.read().unwrap_or_else(|e| e.into_inner());
+        let state = self.global_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         enum_key.get_string_value(&state)
     }
 
     /// Set a global state key (typed enum version)
     pub fn set_global_state_key(&self, key: GlobalStateKey, value: serde_json::Value) {
         {
-            let mut state = self.global_state.write().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             key.set_json_value(&mut state, value);
         }
         self.mark_global_key_pending(key.to_string());
@@ -1464,10 +1466,9 @@ impl StateManager {
         value: String,
     ) -> Result<(), ConfigFieldError> {
         // First, check if the key is valid
-        let key_info = VALID_CONFIG_KEYS.iter().find(|k| k.name == key);
-        let key_info = match key_info {
-            Some(info) => info,
-            None => return Err(ConfigFieldError::UnsupportedField(key.to_string())),
+        let Some(key_info) = VALID_CONFIG_KEYS.iter().find(|k| k.name == key)
+        else {
+            return Err(ConfigFieldError::UnsupportedField(key.to_string()));
         };
 
         // Validate value type matches expected type
@@ -1490,7 +1491,7 @@ impl StateManager {
             _ => {} // String fields accept any value
         }
 
-        let mut state = self.global_state.write().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let handled = match key {
             // String fields
             "mode" => {
@@ -1651,19 +1652,18 @@ impl StateManager {
                 true
             }
             "hooks_enabled" => {
-                state.hooks_enabled = matches!(value.to_lowercase().as_str(), "true" | "1");
+                state.hooks_enabled =
+                    matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
             "use_auto_condense" => {
-                state.use_auto_condense = matches!(value.to_lowercase().as_str(), "true" | "1");
+                state.use_auto_condense =
+                    matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
             "show_token_usage" => {
-                state.show_token_usage = matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "subagents_enabled" => {
-                state.subagents_enabled = matches!(value.to_lowercase().as_str(), "true" | "1");
+                state.show_token_usage =
+                    matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
             "sned_web_tools_enabled" => {
@@ -1672,7 +1672,8 @@ impl StateManager {
                 true
             }
             "worktrees_enabled" => {
-                state.worktrees_enabled = matches!(value.to_lowercase().as_str(), "true" | "1");
+                state.worktrees_enabled =
+                    matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
             "background_edit_enabled" => {
@@ -1712,6 +1713,7 @@ impl StateManager {
             }
             _ => false,
         };
+        drop(state);
 
         if handled {
             self.mark_global_key_pending(key.to_string());
@@ -1725,7 +1727,7 @@ impl StateManager {
     pub fn get_auto_approve_patterns(&self) -> Vec<String> {
         self.global_state
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .auto_approve_patterns
             .clone()
     }
@@ -1734,7 +1736,7 @@ impl StateManager {
     pub fn get_task_state(&self, task_id: &str, key: &str) -> Option<serde_json::Value> {
         self.task_state
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(task_id)
             .and_then(|state| state.get(key).cloned())
     }
@@ -1742,19 +1744,21 @@ impl StateManager {
     /// Set task state for a specific task
     pub fn set_task_state(&self, task_id: &str, key: &str, value: serde_json::Value) {
         {
-            let mut task_states = self.task_state.write().unwrap_or_else(|e| e.into_inner());
+            let mut task_states = self.task_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             let task_state = task_states.entry(task_id.to_string()).or_default();
             task_state.insert(key.to_string(), value);
+            drop(task_states);
         }
 
         let mut pending = self
             .pending_task_states
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending
             .entry(task_id.to_string())
             .or_default()
             .insert(key.to_string());
+        drop(pending);
     }
 
     // ==================== Secrets ====================
@@ -1763,7 +1767,7 @@ impl StateManager {
     pub fn get_secret(&self, key: &str) -> Option<String> {
         self.secrets
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .cloned()
     }
@@ -1771,7 +1775,7 @@ impl StateManager {
     /// Set a secret
     pub fn set_secret(&self, key: &str, value: String) {
         {
-            let mut secrets = self.secrets.write().unwrap_or_else(|e| e.into_inner());
+            let mut secrets = self.secrets.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             secrets.insert(key.to_string(), value);
         }
         self.mark_secret_pending(key.to_string());
@@ -1850,7 +1854,7 @@ impl StateManager {
         let mut pending = self
             .pending_global_keys
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.insert(key);
     }
 
@@ -1859,7 +1863,7 @@ impl StateManager {
         let mut pending = self
             .pending_secrets
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.insert(key);
     }
 
@@ -1902,7 +1906,7 @@ impl StateManager {
             let pending = self
                 .pending_global_keys
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.clone()
         };
 
@@ -1911,7 +1915,7 @@ impl StateManager {
             let mut pending = self
                 .pending_global_keys
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for key in &global_keys {
                 pending.remove(key);
             }
@@ -1922,7 +1926,7 @@ impl StateManager {
             let pending = self
                 .pending_task_states
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.clone()
         };
 
@@ -1931,7 +1935,7 @@ impl StateManager {
             let mut pending = self
                 .pending_task_states
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for task_id in task_states.keys() {
                 pending.remove(task_id);
             }
@@ -1942,7 +1946,7 @@ impl StateManager {
             let pending = self
                 .pending_secrets
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.clone()
         };
 
@@ -1951,7 +1955,7 @@ impl StateManager {
             let mut pending = self
                 .pending_secrets
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for key in &secrets {
                 pending.remove(key);
             }
@@ -1961,7 +1965,7 @@ impl StateManager {
         self.persist_workspace_state()?;
 
         // Update last persist time
-        *self.last_persist.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        *self.last_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
 
         Ok(())
     }
@@ -1984,7 +1988,7 @@ impl StateManager {
         let state = self
             .global_state
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let settings_dir = self.state_dir.join("..").join("settings");
         fs::create_dir_all(&settings_dir)?;
@@ -2034,7 +2038,7 @@ impl StateManager {
         &self,
         task_states: &HashMap<String, HashSet<String>>,
     ) -> io::Result<()> {
-        let states = self.task_state.read().unwrap_or_else(|e| e.into_inner());
+        let states = self.task_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         for (task_id, keys) in task_states {
             if let Some(task_state) = states.get(task_id) {
@@ -2043,12 +2047,13 @@ impl StateManager {
 
                 // Read existing settings for read-merge-write (SM3 fix)
                 let file_path = task_dir.join("settings.json");
-                let mut existing_settings = serde_json::Map::new();
-                if file_path.exists()
+                let mut existing_settings = if file_path.exists()
                     && let Some(parsed) = self.read_task_settings_with_backup(&file_path)
                 {
-                    existing_settings = parsed;
-                }
+                    parsed
+                } else {
+                    serde_json::Map::new()
+                };
 
                 // Merge pending keys into existing settings
                 for key in keys {
@@ -2070,7 +2075,7 @@ impl StateManager {
 
     /// Persist secrets to disk
     fn persist_secrets(&self, keys: &HashSet<String>) -> io::Result<()> {
-        let secrets = self.secrets.read().unwrap_or_else(|e| e.into_inner());
+        let secrets = self.secrets.read().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Use secrets_store.set() for each key to do proper read-merge-write
         // This prevents overwriting the entire file with only pending keys (S7 fix)
@@ -2093,11 +2098,12 @@ impl StateManager {
         let workspace_state = self
             .workspace_state
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let file_path = self.state_dir.join("workspace_state.json");
         let data = serde_json::to_string_pretty(&*workspace_state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        drop(workspace_state);
 
         crate::storage::disk::atomic_write_file(&file_path, &data)?;
         Ok(())
@@ -2106,6 +2112,7 @@ impl StateManager {
 
 /// Task history operations
 /// List tasks with pagination
+#[must_use]
 pub fn list_tasks(items: &[HistoryItem], page: usize, limit: usize) -> (Vec<HistoryItem>, usize) {
     let total = items.len();
     let start = (page - 1) * limit;
@@ -2125,6 +2132,7 @@ pub fn sort_by_timestamp(items: &mut [HistoryItem]) {
 }
 
 /// Get total pages
+#[must_use]
 pub fn total_pages(total: usize, limit: usize) -> usize {
     total.div_ceil(limit)
 }
@@ -2140,7 +2148,7 @@ mod tests {
         let _guard = TEST_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().join("data");
@@ -2420,7 +2428,7 @@ mod tests {
         *manager
             .global_state
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = serde_json::from_value(initial_state).unwrap();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = serde_json::from_value(initial_state).unwrap();
 
         manager.set_global_state_key(
             GlobalStateKey::TerminalReuseEnabled,
@@ -2451,7 +2459,7 @@ mod tests {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 self.0
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(buf);
                 Ok(buf.len())
             }
@@ -2483,7 +2491,7 @@ mod tests {
             assert!(value.is_none());
 
             let log_output =
-                String::from_utf8(captured.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                String::from_utf8(captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
                     .unwrap();
             assert!(log_output.contains("failed to deserialize global state value"));
             assert!(log_output.contains("key=terminalReuseEnabled"));

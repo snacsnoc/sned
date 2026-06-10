@@ -120,7 +120,7 @@ impl UseSkillHandler {
         Ok(activation_message)
     }
 
-    pub async fn execute(
+    pub fn execute(
         &self,
         state: &mut TaskState,
         params: serde_json::Value,
@@ -272,7 +272,7 @@ mod tests {
     async fn test_use_skill_missing_param() {
         let handler = UseSkillHandler::new();
         let mut state = TaskState::default();
-        let result = handler.execute(&mut state, serde_json::json!({})).await;
+        let result = handler.execute(&mut state, serde_json::json!({}));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("skill_name"));
@@ -295,8 +295,7 @@ mod tests {
             .execute(
                 &mut state,
                 serde_json::json!({"skill_name": "missing-skill"}),
-            )
-            .await;
+            );
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("Error: Skill \"missing-skill\" not found"));
@@ -336,8 +335,7 @@ mod tests {
         };
 
         let result = handler
-            .execute(&mut state, serde_json::json!({"skill_name": "test-skill"}))
-            .await;
+            .execute(&mut state, serde_json::json!({"skill_name": "test-skill"}));
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("Skill \"test-skill\" is now active"));
@@ -376,8 +374,7 @@ mod tests {
             .execute(
                 &mut state,
                 serde_json::json!({"skill_name": "minimal-skill"}),
-            )
-            .await;
+            );
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("Minimal instructions."));
@@ -426,8 +423,7 @@ mod tests {
         };
 
         let result = handler
-            .execute(&mut state, serde_json::json!({"skill_name": "test-skill"}))
-            .await;
+            .execute(&mut state, serde_json::json!({"skill_name": "test-skill"}));
         assert!(result.is_ok());
         let text = result.unwrap();
 
