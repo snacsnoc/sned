@@ -1157,9 +1157,6 @@ pub(crate) fn followup_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(followup_timeout_secs())
 }
 
-/// No-op retained for Ctrl+C handler compatibility; the approval channel was removed.
-pub fn clear_approval_sender() {}
-
 // ============================================================================
 // Followup Question Input
 // ============================================================================

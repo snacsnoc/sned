@@ -203,12 +203,6 @@ impl ChannelOutputWriter {
             overflow_signaled: std::sync::atomic::AtomicBool::new(false),
         }
     }
-
-    /// Peek at the overflow signal without consuming it.
-    pub fn has_overflow(&self) -> bool {
-        self.overflow_signaled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
 
 impl OutputWriter for ChannelOutputWriter {

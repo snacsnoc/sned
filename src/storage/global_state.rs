@@ -285,40 +285,6 @@ pub fn load_global_state() -> GlobalState {
     load_global_state_with_integrity()
 }
 
-/// Load global state from legacy format (no integrity validation)
-/// Only used for backward compatibility or testing.
-#[allow(dead_code)]
-fn load_global_state_legacy() -> GlobalState {
-    let path = get_sned_home_path()
-        .join("data")
-        .join("settings")
-        .join("global_settings.json");
-    match fs::read_to_string(&path) {
-        Ok(contents) => match serde_json::from_str(&contents) {
-            Ok(state) => state,
-            Err(error) => {
-                // Create backup of corrupted file before discarding
-                if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
-                    tracing::warn!(
-                        file_path = %path.display(),
-                        backup_path = %backup_path.display(),
-                        error = %error,
-                        "Created backup of corrupted global state JSON"
-                    );
-                } else {
-                    tracing::warn!(
-                        file_path = %path.display(),
-                        error = %error,
-                        "Failed to parse global state JSON and backup failed"
-                    );
-                }
-                GlobalState::default()
-            }
-        },
-        Err(_) => GlobalState::default(),
-    }
-}
-
 fn get_sned_home_path() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join(".sned"))
