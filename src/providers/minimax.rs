@@ -2225,6 +2225,101 @@ mod tests {
         assert_eq!(reasoning, "The user wants");
     }
 
+    /// Regression tests for Unicode edge cases in
+    /// `longest_reasoning_overlap`. The function uses
+    /// `is_char_boundary` to avoid splitting multi-byte UTF-8
+    /// sequences, but the existing tests only exercise ASCII.
+    /// These tests guard against regressions where a refactor
+    /// drops the char-boundary check and silently corrupts
+    /// CJK / emoji / combining-character content.
+
+    #[test]
+    fn test_longest_reasoning_overlap_ascii() {
+        assert_eq!(longest_reasoning_overlap("hello world", "world peace"), 5);
+        assert_eq!(longest_reasoning_overlap("abc", "xyz"), 0);
+        assert_eq!(longest_reasoning_overlap("", "anything"), 0);
+        assert_eq!(longest_reasoning_overlap("anything", ""), 0);
+    }
+
+    #[test]
+    fn test_longest_reasoning_overlap_cjk() {
+        // CJK characters are 3 bytes each in UTF-8. The overlap
+        // must be measured in bytes but only at char boundaries.
+        let left = "思考一下这个问题的解决方案";
+        let right = "方案应该是这样的";
+        // "方案" is the overlapping 6-byte (2-char) suffix/prefix.
+        assert_eq!(longest_reasoning_overlap(left, right), 6);
+    }
+
+    #[test]
+    fn test_longest_reasoning_overlap_cjk_no_overlap() {
+        let left = "思考问题";
+        let right = "完全不同的内容";
+        assert_eq!(longest_reasoning_overlap(left, right), 0);
+    }
+
+    #[test]
+    fn test_longest_reasoning_overlap_emoji() {
+        // Emoji are 4 bytes each in UTF-8. An overlap at a
+        // non-char-boundary would be a bug.
+        let left = "I love 🦀 Rust";
+        let right = "🦀 Rust is great";
+        // "🦀 Rust" is the overlap: 4 + 1 + 4 = 9 bytes (2 chars).
+        assert_eq!(longest_reasoning_overlap(left, right), 9);
+    }
+
+    #[test]
+    fn test_longest_reasoning_overlap_combining_characters() {
+        // "é" can be encoded as a single codepoint (U+00E9, 2 bytes)
+        // or as "e" + combining acute (U+0065 U+0301, 3 bytes).
+        // The overlap must respect char boundaries in both forms.
+        let left = "café"; // precomposed é
+        let right = "fé"; // shares "fé" suffix/prefix
+        // "fé" = 1 + 2 = 3 bytes.
+        assert_eq!(longest_reasoning_overlap(left, right), 3);
+    }
+
+    #[test]
+    fn test_longest_reasoning_overlap_mixed_scripts() {
+        // Mixed ASCII + CJK. The overlap must not split a CJK
+        // character mid-byte.
+        let left = "answer: 思考";
+        let right = "思考过程";
+        // "思考" is 6 bytes (2 × 3-byte CJK chars).
+        assert_eq!(longest_reasoning_overlap(left, right), 6);
+    }
+
+    #[test]
+    fn test_longest_reasoning_overlap_does_not_split_multibyte() {
+        // Construct a case where a naive byte-based overlap
+        // (without is_char_boundary checks) would find a
+        // "false positive" by matching partial bytes of a
+        // CJK character.
+        //
+        // "思考" is 6 bytes: [0xE6, 0x80, 0x9D, 0xE8, 0x80, 0x83]
+        // If left = "X思考" and right = "考Y", a naive byte
+        // check might try to match "考" (bytes 3..6) against
+        // the start of right. "考" is 3 bytes [0xxE8,0x80,0x83].
+        // right starts with "考Y" = [0xE8,0x80,0x83,0x59].
+        // The last 3 bytes of left ARE the first 3 bytes of right
+        // (both are "考"), so overlap = 3 is correct.
+        // This test verifies the char-boundary check does NOT
+        // prevent a legitimate same-character overlap.
+        let left = "X思考";
+        let right = "考Y";
+        assert_eq!(longest_reasoning_overlap(left, right), 3);
+    }
+
+    #[test]
+    fn test_longest_reasoning_overlap_emoji_in_middle() {
+        // Emoji in the middle of both strings, with the overlap
+        // landing on the emoji itself.
+        let left = "hello 🌍 world";
+        let right = "🌍 world peace";
+        // "🌍 world" = 4 + 1 + 5 = 10 bytes.
+        assert_eq!(longest_reasoning_overlap(left, right), 10);
+    }
+
     #[tokio::test]
     async fn test_minimax_content_think_tags_emit_reasoning_not_visible_text() {
         let mut accumulated_tool_calls = std::collections::HashMap::with_capacity(4);

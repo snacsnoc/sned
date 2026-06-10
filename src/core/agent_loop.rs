@@ -73,6 +73,14 @@ const MAX_COMMAND_RESULT_DISPLAY_LINES: usize = 8;
 /// Default concurrency limit for parallel non-grouped tool execution.
 /// Prevents I/O contention when many tools run simultaneously.
 const DEFAULT_TOOL_CONCURRENCY: usize = 12;
+/// Maximum number of times a single provider stream can be retried
+/// within one turn when the stream fails before any output is
+/// emitted. Without this cap, a provider returning repeated retryable
+/// transport errors would loop indefinitely. Set equal to
+/// DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES so the user-facing
+/// behavior matches the request-level cap.
+const MAX_STREAM_RETRY_ATTEMPTS: usize =
+    DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES as usize;
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
 
@@ -2269,6 +2277,20 @@ impl AgentLoop {
             }
 
             if let Some(err) = retryable_stream_error_before_output {
+                if stream_retry_attempt >= MAX_STREAM_RETRY_ATTEMPTS {
+                    tracing::error!(
+                        attempts = stream_retry_attempt + 1,
+                        error = %err,
+                        "stream retry cap exceeded; surfacing error to user"
+                    );
+                    let actionable =
+                        crate::cli::actionable_errors::provider_error(&err);
+                    return TurnResult::Error(format!(
+                        "Provider stream failed after {} attempts: {}",
+                        stream_retry_attempt + 1,
+                        actionable.display()
+                    ));
+                }
                 {
                     let mut state = self.state.lock().await;
                     state.did_automatically_retry_failed_api_request = true;
