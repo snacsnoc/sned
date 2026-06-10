@@ -253,7 +253,7 @@ pub type OutputWriterArc = Arc<dyn OutputWriter>;
 pub fn timing_enabled() -> bool {
     matches!(
         std::env::var("SNED_TIMING").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
     )
 }
 

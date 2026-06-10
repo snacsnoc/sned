@@ -572,9 +572,8 @@ pub fn process_slash_command_with_context(
                         skill_name
                     );
                     return format!("{}{}{}", instruction, activation_note, text_after);
-                } else {
-                    return format!("{}\n{}", instruction, text_after);
                 }
+                return format!("{}\n{}", instruction, text_after);
             }
         } else if slash_cmd.is_workflow_command() {
             if let Some(workflow_name) = slash_cmd.workflow_name()

@@ -8,15 +8,14 @@ fn main() {
         .output()
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
 
     // Get build profile (debug/release)
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
 
     // Set environment variables for use in the main code
-    println!("cargo:rustc-env=GIT_COMMIT_HASH={}", commit_hash);
-    println!("cargo:rustc-env=BUILD_PROFILE={}", profile);
+    println!("cargo:rustc-env=GIT_COMMIT_HASH={commit_hash}");
+    println!("cargo:rustc-env=BUILD_PROFILE={profile}");
 
     // Rebuild if git HEAD changes
     println!("cargo:rerun-if-changed=.git/HEAD");
@@ -27,7 +26,7 @@ fn main() {
         if head_content.starts_with("ref: ") {
             // HEAD points to a branch ref
             let ref_path = head_content.strip_prefix("ref: ").unwrap_or(head_content);
-            println!("cargo:rerun-if-changed=.git/{}", ref_path);
+            println!("cargo:rerun-if-changed=.git/{ref_path}");
         }
         // If HEAD is detached (contains commit hash directly),
         // the .git/HEAD watch above is sufficient
