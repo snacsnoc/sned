@@ -4555,6 +4555,94 @@ mod tests {
         assert_eq!(state.retryable_failed_request, Some(message));
     }
 
+    /// Regression test for the `consecutive_mistakes` cap. When the
+    /// model returns an empty response (no text, no tool calls, no
+    /// reasoning) N times in a row where N = `max_consecutive_mistakes`,
+    /// the turn must terminate with `TurnResult::Error("Max consecutive
+    /// mistakes reached")` rather than continuing indefinitely.
+    ///
+    /// The existing test `test_provider_failure_threshold_surfaces_
+    /// recovery_message` covers the `consecutive_provider_failures`
+    /// cap (request-level, not turn-level). This test covers the
+    /// turn-level `consecutive_mistakes` cap.
+    ///
+    /// Note: `execute_turn` consumes one provider response per call. The
+    /// outer TUI loop would call `execute_turn` again when the turn
+    /// returns `TurnResult::Continue`. This test simulates that loop
+    /// by calling `execute_turn` up to `max_consecutive_mistakes` times
+    /// and asserts the final call returns `TurnResult::Error`.
+    #[tokio::test]
+    async fn test_max_consecutive_mistakes_terminates_turn() {
+        let max_mistakes = 3; // matches test_agent_config default
+        // Provide max_mistakes empty responses; the cap should fire on
+        // the last one. Sentinel: must NOT be consumed.
+        let mut all_responses: Vec<crate::providers::mock::MockResponse> = (0..max_mistakes)
+            .map(|_| crate::providers::mock::MockResponse::Stream(vec![]))
+            .collect();
+        all_responses.push(crate::providers::mock::MockResponse::Text(
+            "SENTINEL_NOT_CONSUMED\n".to_string(),
+        ));
+
+        let provider = Arc::new(crate::providers::mock::MockProvider::new(all_responses));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-max-consecutive-mistakes");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        // Simulate the outer loop calling execute_turn until it
+        // returns a final result (Error or completion). On the cap-th
+        // turn, it should return Error instead of Continue.
+        let mut final_result = None;
+        for _ in 0..(max_mistakes + 1) {
+            let result = agent.execute_turn().await;
+            match &result {
+                TurnResult::Error(_) => {
+                    final_result = Some(result);
+                    break;
+                }
+                TurnResult::Continue => {
+                    // Continue the loop, consuming the next response.
+                    continue;
+                }
+                _ => panic!(
+                    "unexpected turn result before cap: {result:?}. The model \
+                     should produce empty responses until the cap fires."
+                ),
+            }
+        }
+
+        match final_result {
+            Some(TurnResult::Error(message)) => {
+                assert!(
+                    message.contains("Max consecutive mistakes reached"),
+                    "error must indicate consecutive mistakes cap was hit, got: {message}"
+                );
+            }
+            Some(other) => panic!(
+                "expected TurnResult::Error after {max_mistakes} empty responses, \
+                 got {other:?}. If the consecutive_mistakes cap is broken, the \
+                 agent would continue and consume the sentinel response."
+            ),
+            None => panic!(
+                "consecutive_mistakes cap never fired after {max_mistakes} empty responses"
+            ),
+        }
+        // The sentinel must NOT have been consumed.
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            !rendered.iter().any(|line| line.contains("SENTINEL_NOT_CONSUMED")),
+            "sentinel response was consumed — the consecutive_mistakes \
+             cap did not fire. rendered: {rendered:?}"
+        );
+        // The state should reflect consecutive_mistakes = 3.
+        let state = agent.state.lock().await;
+        assert_eq!(
+            state.consecutive_mistakes, max_mistakes,
+            "consecutive_mistakes must reach the cap, got: {}",
+            state.consecutive_mistakes
+        );
+    }
+
     #[tokio::test]
     async fn test_successful_turn_clears_stale_retryable_failed_request() {
         let provider = Arc::new(crate::providers::mock::MockProvider::single_text_response(
@@ -4682,6 +4770,24 @@ mod tests {
                 .did_automatically_retry_failed_api_request
         );
     }
+
+    /// Regression test for the MAX_STREAM_RETRY_ATTEMPTS cap added in
+    /// commit 719927e. The original test (test_retryable_stream_error_
+    /// before_output_retries_once at line 4598) only covered the happy
+    /// path: one retryable error, then recovery.
+    ///
+    /// NOTE: this test was attempted but could not be made to fail
+    /// without changing production code. The cap at agent_loop.rs:2280
+    /// is guarded by `if stream_retry_attempt == 0` in the chunk
+    /// handler (line 2196), which means the cap only fires on the first
+    /// attempt's error. On attempts 2+, the error falls through to the
+    /// mid-output error path (line 2295) which returns "Provider stream
+    /// error - retry the request." The cap code at line 2280 is
+    /// effectively a 1-shot guard that never fires in practice for >1
+    /// retryable errors. A follow-up fix is needed to either: (a) move
+    /// the cap check outside the `stream_retry_attempt == 0` guard,
+    /// or (b) increment the retry counter in the mid-output error path.
+    /// Skipped per plan: no production code changes.
 
     #[tokio::test]
     async fn test_run_preserves_pending_cancellation_until_observed() {
@@ -6375,6 +6481,20 @@ mod tests {
         assert!(hint.contains("read_file"));
         assert!(hint.contains("/tmp/a.rs"));
         assert!(hint.contains("/tmp/b.rs"));
+    }
+
+    /// Test that the recovery hint returns None when no paths are
+    /// stale. This is the inverse of `test_reread_recovery_hint_lists_
+    /// stale_paths` and guards against a refactor that emits a hint
+    /// even when there's nothing to re-read.
+    #[test]
+    fn test_reread_recovery_hint_returns_none_when_no_stale_paths() {
+        let state = TaskState::default();
+        let hint = AgentLoop::reread_recovery_hint(&state);
+        assert!(
+            hint.is_none(),
+            "hint must be None when must_reread_before_edit is empty, got: {hint:?}"
+        );
     }
 
     #[test]

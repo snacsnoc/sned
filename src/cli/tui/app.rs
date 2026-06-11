@@ -2440,4 +2440,124 @@ mod tests {
              The bug causes stale content to bleed through on real terminals."
         );
     }
+
+    /// Test that the overflow count surfaced in the status bar
+    /// matches the actual number of dropped events. The TUI main
+    /// loop sets `app.output_overflow_count = output_writer.dropped_count()`
+    /// (src/cli/interactive.rs:2201), so the count must be accurate.
+    /// An inaccurate count would mislead the user about whether the
+    /// session is reliable.
+    #[test]
+    fn test_overflow_indicator_dropped_count_matches_actual_drops() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        let mut app = App::new();
+        app.provider_name = "minimax".to_string();
+        app.model_name = "MiniMax-M3".to_string();
+        app.task_id = "01KTPHXKHBJ49KXMAGPAR423BC".to_string();
+        app.mode = "ACT".to_string();
+
+        // Simulate the main loop having detected exactly 4 dropped
+        // events. The status bar must show "4" not "0" or any other
+        // number.
+        let actual_dropped_count = 4u64;
+        app.output_overflow = true;
+        app.output_overflow_count = actual_dropped_count;
+        app.needs_redraw = true;
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+
+        // The status bar is 1 row tall at row 10 (14 total, 1 status,
+        // 3 input).
+        let status_row = &rows[10];
+        assert!(
+            status_row.contains(&format!("{actual_dropped_count} dropped")),
+            "status bar must show exact dropped count, got: {status_row:?}"
+        );
+        assert!(
+            status_row.contains("output overflow"),
+            "status bar must show overflow warning, got: {status_row:?}"
+        );
+    }
+
+    /// Test that the overflow indicator and an approval prompt
+    /// coexist in the same render frame. The user's original bug
+    /// report was: "approval prompt dropped because channel was full,
+    /// user had to blindly hit y." This test verifies that AFTER
+    /// the channel overflow, when an approval prompt IS emitted and
+    /// drained successfully, both the overflow indicator AND the
+    /// approval prompt are visible.
+    #[test]
+    fn test_overflow_indicator_persists_during_approval_prompt() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+
+        let mut app = App::new();
+        app.provider_name = "minimax".to_string();
+        app.model_name = "MiniMax-M3".to_string();
+        app.task_id = "01KTPHXKHBJ49KXMAGPAR423BC".to_string();
+        app.mode = "ACT".to_string();
+        // Overflow already happened earlier in the session.
+        app.output_overflow = true;
+        app.output_overflow_count = 3;
+        // An approval prompt was successfully drained and pushed to
+        // the output buffer.
+        app.push_plain("\x1b[33m🔧 Tool:\x1b[0m \x1b[1mexecute_command\x1b[0m".to_string());
+        app.push_plain("Execute this tool? (y/n/always): ".to_string());
+        app.needs_redraw = true;
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+
+        // The approval prompt must be in the output pane (rows 0..10).
+        let output_rows: Vec<&String> = rows.iter().take(10).collect();
+        let has_approval = output_rows
+            .iter()
+            .any(|row| row.contains("Execute this tool?"));
+        assert!(
+            has_approval,
+            "approval prompt must be visible in the output pane. \
+             output rows: {output_rows:?}"
+        );
+
+        // The status bar must STILL show the overflow indicator (sticky
+        // warning, per the design from commit a1da7ea).
+        let status_row = &rows[10];
+        assert!(
+            status_row.contains("output overflow"),
+            "status bar must still show overflow warning during approval prompt. \
+             status_row: {status_row:?}"
+        );
+        assert!(
+            status_row.contains("3"),
+            "status bar must show the dropped count during approval prompt. \
+             status_row: {status_row:?}"
+        );
+    }
 }
