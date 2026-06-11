@@ -14,7 +14,7 @@ pub struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        self._file.unlock();
+        let _ = self._file.unlock();
     }
 }
 

@@ -1176,7 +1176,7 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::ResetCompact => {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             if sess.clear_compacted_summary().await {
                 let sh = sess.agent_loop().await.state_handle();
                 {
