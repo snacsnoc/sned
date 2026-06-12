@@ -2193,8 +2193,7 @@ impl AgentLoop {
                     }
                     ApiStreamChunk::Error(err) => {
                         tracing::error!(error = %err, "received error chunk from provider stream");
-                        if stream_retry_attempt == 0
-                            && !first_chunk_received
+                        if !first_chunk_received
                             && !emitted_output_this_attempt
                             && stream_error_is_retryable(&err)
                         {
