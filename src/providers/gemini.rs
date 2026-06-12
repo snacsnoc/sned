@@ -808,9 +808,9 @@ impl Provider for GeminiProvider {
             if !tx.is_closed() && !stream_errored {
                 finish_gemini_sse_to_chunks(
                     &tx,
-                    &mut accumulated_tool_calls,
+                    &accumulated_tool_calls,
                     &mut completed_tool_call_ids,
-                    &mut last_stop_reason,
+                    &last_stop_reason,
                     &mut last_grounding_metadata,
                 )
                 .await;
@@ -1637,9 +1637,9 @@ mod tests {
 
         finish_gemini_sse_to_chunks(
             &tx,
-            &mut accumulated_tool_calls,
+            &accumulated_tool_calls,
             &mut completed_tool_call_ids,
-            &mut last_stop_reason,
+            &last_stop_reason,
             &mut last_grounding_metadata,
         )
         .await;

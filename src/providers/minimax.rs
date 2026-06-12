@@ -1241,7 +1241,7 @@ async fn process_minimax_sse_line(
                     reasoning_tokens: None,
                     thoughts_token_count: None,
                     total_cost: None,
-                    stop_reason: stop_reason,
+                    stop_reason,
                     id: Some(event.id.clone()),
                 }),
                 "usage",
