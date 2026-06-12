@@ -391,6 +391,7 @@ mod tests {
     /// 1. The dropped event does NOT land in the receiver.
     /// 2. The overflow signal is set.
     /// 3. `dropped_count()` reflects the lost event.
+    ///
     /// The TUI main loop uses these signals to surface a user-visible
     /// warning in the status bar (src/cli/tui/app.rs output_overflow
     /// field) so the user knows output (including approval prompts) may

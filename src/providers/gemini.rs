@@ -1622,7 +1622,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(8);
-        let mut accumulated_tool_calls = HashMap::from([(
+        let accumulated_tool_calls = HashMap::from([(
             "call-1".to_string(),
             (
                 "call-1".to_string(),
@@ -1632,7 +1632,7 @@ mod tests {
             ),
         )]);
         let mut completed_tool_call_ids = HashSet::new();
-        let mut last_stop_reason = Some("BLOCKED".to_string());
+        let last_stop_reason = Some("BLOCKED".to_string());
         let mut last_grounding_metadata = None;
 
         finish_gemini_sse_to_chunks(

@@ -3592,7 +3592,7 @@ edition = "2021"
             }]
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        let err = result.err().expect("empty anchor should error");
+        let err = result.expect_err("empty anchor should error");
         let msg = err.to_string();
         assert!(
             msg.contains("read_file"),
@@ -3640,7 +3640,7 @@ edition = "2021"
             }]
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        let err = result.err().expect("incomplete multi-line anchor must error");
+        let err = result.expect_err("incomplete multi-line anchor must error");
         let msg = err.to_string();
         assert!(
             msg.contains("multi-line"),
@@ -3870,7 +3870,7 @@ edition = "2021"
             "files": r#"[{"edits": [{"anchor": "x§y", "edit_type": "replace", "text": "z"}]}]"#,
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        let err = result.err().expect("stringified JSON without any path must error");
+        let err = result.expect_err("stringified JSON without any path must error");
         let msg = err.to_string();
         // The error must mention the path key as a hint to the model.
         assert!(
