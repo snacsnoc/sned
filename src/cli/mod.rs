@@ -592,9 +592,16 @@ fn run_task(
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
 ) -> anyhow::Result<()> {
+    let json_mode = task_opts.json;
     let rt = tokio::runtime::Runtime::new()?;
     let task_id = rt.block_on(run_task_inner(prompt, task_opts, root_opts))?;
-    println!("Session: {task_id}");
+    // In JSON mode stdout is reserved for structured events, so route
+    // the session ID to stderr to keep stdout parseable as JSONL.
+    if json_mode {
+        eprintln!("Session: {task_id}");
+    } else {
+        println!("Session: {task_id}");
+    }
     Ok(())
 }
 

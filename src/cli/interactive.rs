@@ -2922,7 +2922,13 @@ pub async fn run_interactive_shell_inner(
         auto_approve,
     )
     .await?;
-    println!("Session: {task_id}");
+    // In JSON mode stdout is reserved for structured events, so route
+    // the session ID to stderr to keep stdout parseable as JSONL.
+    if task_opts.json {
+        eprintln!("Session: {task_id}");
+    } else {
+        println!("Session: {task_id}");
+    }
     Ok(())
 }
 pub fn should_start_interactive_shell(
