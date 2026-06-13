@@ -231,9 +231,10 @@ fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriter
     }
 }
 
-/// Like `print_model_line`, but if `pending` is true, prepends the turn indicator
-/// "♦ " to the first emitted line and clears the flag. This keeps the indicator
-/// on the same line as the start of the response instead of on its own line.
+/// Like `print_model_line`, but if `pending` is true, emits a separate
+/// turn-indicator line ("♦") before the model output and clears the flag.
+/// The indicator is emitted as `OutputEvent::TurnIndicator` so that
+/// `finalize_turn_stream` does not strip it when re-rendering as markdown.
 fn print_model_line_with_prefix_if_pending(
     line: &str,
     output_writer: &crate::cli::output::OutputWriterArc,
@@ -241,11 +242,9 @@ fn print_model_line_with_prefix_if_pending(
 ) {
     if *pending && !line.trim().is_empty() {
         *pending = false;
-        let prefixed = format!("♦ {}", line);
-        print_model_line(&prefixed, output_writer);
-    } else {
-        print_model_line(line, output_writer);
+        output_writer.emit(crate::cli::output::OutputEvent::turn_indicator("♦"));
     }
+    print_model_line(line, output_writer);
 }
 
 fn stream_error_is_retryable(error: &str) -> bool {
@@ -4433,6 +4432,7 @@ mod tests {
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}
+                crate::cli::output::OutputEvent::TurnIndicator(line) => rendered.push(line.to_string()),
             }
         }
         rendered

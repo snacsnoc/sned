@@ -446,6 +446,12 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             OutputEvent::TurnEnd { accumulated_text } => {
                 app.finalize_turn_stream(&accumulated_text);
             }
+            OutputEvent::TurnIndicator(line) => {
+                // Push directly to output_lines without recording in
+                // turn_stream_line_indices, so finalize_turn_stream
+                // does not strip the indicator when re-rendering.
+                app.push_output(line);
+            }
         }
     }
     if crate::core::approval::take_approval_prompt_scroll()

@@ -30,6 +30,10 @@ pub enum OutputEvent {
     /// In non-interactive output paths (e.g. one-shot/JSON), this is a
     /// no-op marker.
     TurnEnd { accumulated_text: String },
+    /// A turn indicator line (e.g. "♦"). Emitted separately from
+    /// streamed model text so that `finalize_turn_stream` does not
+    /// strip it when re-rendering the turn as markdown.
+    TurnIndicator(Line<'static>),
 }
 
 impl OutputEvent {
@@ -138,6 +142,17 @@ impl OutputEvent {
             Style::default().fg(theme::ACCENT),
         )))
     }
+
+    /// Emit a turn indicator line (e.g. "♦"). This is a separate event
+    /// from `Line` so that `finalize_turn_stream` does not strip it
+    /// when re-rendering the turn as markdown.
+    pub fn turn_indicator(text: impl Into<String>) -> Self {
+        use crate::cli::tui::theme;
+        OutputEvent::TurnIndicator(Line::from(Span::styled(
+            text.into(),
+            Style::default().fg(theme::ACCENT),
+        )))
+    }
 }
 
 /// Trait for writing output events.
@@ -188,6 +203,9 @@ impl OutputWriter for StderrOutputWriter {
             // TurnEnd is a TUI-only re-render signal; in one-shot/JSON
             // output the streamed text was already written live.
             OutputEvent::TurnEnd { .. } => {}
+            // TurnIndicator is a TUI-only signal; in one-shot/JSON the
+            // streamed text was already written live.
+            OutputEvent::TurnIndicator(_) => {}
         }
     }
 
