@@ -810,6 +810,12 @@ async fn handle_key_event(
                     );
                 }
                 app.input = App::new_textarea(Vec::new());
+                // Same early-return issue: slash mode evaluation at end of
+                // handle_key_event() never runs for followup entries.
+                app.slash_command_active = false;
+                app.slash_command_results.clear();
+                app.slash_command_selected = 0;
+                app.slash_command_completed_text = None;
             }
             return Ok(None);
         }
@@ -822,6 +828,12 @@ async fn handle_key_event(
             if is_shutdown_submit(&text) {
                 app.input = App::new_textarea(Vec::new());
                 app.clear_pastes();
+                // Same early-return issue as main submit: slash mode evaluation
+                // at end of handle_key_event() never runs.
+                app.slash_command_active = false;
+                app.slash_command_results.clear();
+                app.slash_command_selected = 0;
+                app.slash_command_completed_text = None;
                 return Ok(Some(Action::Submit(text)));
             }
 
@@ -848,6 +860,13 @@ async fn handle_key_event(
             // Clear textarea and paste tracking
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
+            // Clear slash command picker state — Enter handler returns early so
+            // the slash mode evaluation at the end of handle_key_event() never
+            // runs for Enter submissions, leaving slash_command_active=true.
+            app.slash_command_active = false;
+            app.slash_command_results.clear();
+            app.slash_command_selected = 0;
+            app.slash_command_completed_text = None;
             // Submit to agent
             return Ok(Some(Action::Submit(text)));
         }
