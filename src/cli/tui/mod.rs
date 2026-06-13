@@ -8,6 +8,8 @@ pub mod history;
 pub mod plan_panel;
 pub mod theme;
 
+pub use app::StreamKind;
+
 pub use ansi_converter::ansi_to_ratatui_lines;
 pub use app::{App, format_duration};
 pub use history::FileHistory;

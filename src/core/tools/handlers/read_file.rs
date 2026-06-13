@@ -424,20 +424,24 @@ impl ReadFileHandler {
             if let Some(writer) = output_writer
                 && line_count.is_multiple_of(progress_interval)
             {
-                writer.emit(crate::cli::output::OutputEvent::dim(format!(
-                    "  Reading {}: {} lines...",
-                    path, line_count
-                )));
+                use crate::cli::tui::theme::INFO_FG;
+                use ratatui::style::{Modifier, Style};
+                writer.emit(crate::cli::output::OutputEvent::tool_output_line(
+                    format!("  Reading {}: {} lines...", path, line_count),
+                    Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+                ));
             }
         }
 
         if let Some(writer) = output_writer
             && line_count >= progress_interval
         {
-            writer.emit(crate::cli::output::OutputEvent::dim(format!(
-                "  Read {} lines from {}",
-                line_count, path
-            )));
+            use crate::cli::tui::theme::INFO_FG;
+            use ratatui::style::{Modifier, Style};
+            writer.emit(crate::cli::output::OutputEvent::tool_output_line(
+                format!("  Read {} lines from {}", line_count, path),
+                Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+            ));
         }
 
         // Join lines for content_hash — this is the same as the old read_to_string
@@ -601,14 +605,15 @@ impl ReadFileHandler {
                     .unwrap_or(0);
                 if count >= 3 {
                     use crate::cli::output::OutputEvent;
-                    use ratatui::style::{Color, Style};
-                    writer.emit(OutputEvent::styled(
+                    use crate::cli::tui::theme::WARNING_FG;
+                    use ratatui::style::Style;
+                    writer.emit(OutputEvent::tool_output_line(
                         format!(
                             "⚠ {} has been read {} times consecutively with no edit. \
                              If you have the anchors you need, call edit_file now.",
                             path_str, count
                         ),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(WARNING_FG),
                     ));
                 }
             }
@@ -714,6 +719,7 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ToolOutputLine(line) => rendered.push(line.to_string()),
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}

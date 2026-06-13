@@ -77,24 +77,25 @@ impl CondenseHandler {
         // INTERACTIVE APPROVAL: Show summary and wait for user response
         if !ctx.json_output {
             use crate::cli::output::OutputEvent;
-            use ratatui::style::{Color, Modifier, Style};
+            use ratatui::style::{Modifier, Style};
             let timeout_secs = crate::core::approval::followup_timeout().as_secs();
-            ctx.output_writer.emit(OutputEvent::styled(
+            use crate::cli::tui::theme::{ACCENT, WARNING_FG};
+            ctx.output_writer.emit(OutputEvent::tool_output_line(
                 "\n[Sned wants to condense the conversation]",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(WARNING_FG),
             ));
-            ctx.output_writer.emit(OutputEvent::styled(
+            ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("{}\n", final_summary),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
-            ctx.output_writer.emit(OutputEvent::styled(
+            ctx.output_writer.emit(OutputEvent::tool_output_line(
                 "Press Enter to accept, or provide feedback: ",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(ACCENT),
             ));
-            ctx.output_writer.emit(OutputEvent::dim(format!(
-                "(waiting up to {}s for your response)",
-                timeout_secs
-            )));
+            ctx.output_writer.emit(OutputEvent::tool_output_line(
+                format!("(waiting up to {}s for your response)", timeout_secs),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
             ctx.output_writer.flush();
 
             // Use channel-based input to avoid blocking tokio worker and fighting TUI stdin

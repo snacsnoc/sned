@@ -172,10 +172,12 @@ impl UseSubagentsHandler {
         let emit_progress = progress_writer.is_some();
         if let Some(ref writer) = progress_writer {
             use crate::cli::output::OutputEvent;
-            writer.emit(OutputEvent::info(format!(
-                "Subagent {} started",
-                subagent_index + 1
-            )));
+            use crate::cli::tui::theme::INFO_FG;
+            use ratatui::style::{Modifier, Style};
+            writer.emit(OutputEvent::tool_output_line(
+                format!("Subagent {} started", subagent_index + 1),
+                Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+            ));
         }
 
         let mut child = match cmd.spawn() {
@@ -183,11 +185,12 @@ impl UseSubagentsHandler {
             Err(e) => {
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
-                    writer.emit(OutputEvent::error(format!(
-                        "Subagent {} failed to start: {}",
-                        subagent_index + 1,
-                        e
-                    )));
+                    use crate::cli::tui::theme::ERROR_FG;
+                    use ratatui::style::Style;
+                    writer.emit(OutputEvent::tool_output_line(
+                        format!("Subagent {} failed to start: {}", subagent_index + 1, e),
+                        Style::default().fg(ERROR_FG),
+                    ));
                 }
                 return SubagentResult {
                     status: "failed".to_string(),
@@ -248,10 +251,12 @@ impl UseSubagentsHandler {
                 if status.success() {
                     if let Some(ref writer) = progress_writer {
                         use crate::cli::output::OutputEvent;
-                        writer.emit(OutputEvent::info(format!(
-                            "Subagent {} completed",
-                            subagent_index + 1
-                        )));
+                        use crate::cli::tui::theme::INFO_FG;
+                        use ratatui::style::{Modifier, Style};
+                        writer.emit(OutputEvent::tool_output_line(
+                            format!("Subagent {} completed", subagent_index + 1),
+                            Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+                        ));
                     }
                     SubagentResult {
                         status: "completed".to_string(),
@@ -262,10 +267,12 @@ impl UseSubagentsHandler {
                 } else {
                     if let Some(ref writer) = progress_writer {
                         use crate::cli::output::OutputEvent;
-                        writer.emit(OutputEvent::warning(format!(
-                            "Subagent {} failed",
-                            subagent_index + 1
-                        )));
+                        use crate::cli::tui::theme::WARNING_FG;
+                        use ratatui::style::Style;
+                        writer.emit(OutputEvent::tool_output_line(
+                            format!("Subagent {} failed", subagent_index + 1),
+                            Style::default().fg(WARNING_FG),
+                        ));
                     }
                     SubagentResult {
                         status: "failed".to_string(),
@@ -282,11 +289,12 @@ impl UseSubagentsHandler {
             Ok(Err(e)) => {
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
-                    writer.emit(OutputEvent::error(format!(
-                        "Subagent {} wait failed: {}",
-                        subagent_index + 1,
-                        e
-                    )));
+                    use crate::cli::tui::theme::ERROR_FG;
+                    use ratatui::style::Style;
+                    writer.emit(OutputEvent::tool_output_line(
+                        format!("Subagent {} wait failed: {}", subagent_index + 1, e),
+                        Style::default().fg(ERROR_FG),
+                    ));
                 }
                 SubagentResult {
                     status: "failed".to_string(),
@@ -310,11 +318,15 @@ impl UseSubagentsHandler {
                 let _ = child.wait().await;
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
-                    writer.emit(OutputEvent::warning(format!(
-                        "Subagent {} timed out after {} seconds",
-                        subagent_index + 1,
-                        timeout_secs
-                    )));
+                    use crate::cli::tui::theme::WARNING_FG;
+                    use ratatui::style::Style;
+                    writer.emit(OutputEvent::tool_output_line(
+                        format!(
+                            "Subagent {} timed out after {} seconds",
+                            subagent_index + 1, timeout_secs
+                        ),
+                        Style::default().fg(WARNING_FG),
+                    ));
                 }
                 SubagentResult {
                     status: "failed".to_string(),
@@ -466,10 +478,12 @@ impl UseSubagentsHandler {
 
         if !json_output {
             use crate::cli::output::OutputEvent;
-            output_writer.emit(OutputEvent::info(format!(
-                "Running {} subagent(s) in parallel...",
-                prompts.len()
-            )));
+            use crate::cli::tui::theme::INFO_FG;
+            use ratatui::style::{Modifier, Style};
+            output_writer.emit(OutputEvent::tool_output_line(
+                format!("Running {} subagent(s) in parallel...", prompts.len()),
+                Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+            ));
         }
 
         let mut handles = Vec::new();
@@ -613,7 +627,12 @@ impl UseSubagentsHandler {
 
         if !json_output {
             use crate::cli::output::OutputEvent;
-            output_writer.emit(OutputEvent::info(summary.clone()));
+            use crate::cli::tui::theme::INFO_FG;
+            use ratatui::style::{Modifier, Style};
+            output_writer.emit(OutputEvent::tool_output_line(
+                summary.clone(),
+                Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+            ));
         }
 
         Ok(summary)
@@ -714,6 +733,7 @@ mod tests {
         fn emit(&self, event: OutputEvent) {
             let text = match event {
                 OutputEvent::Line(line) => line.to_string(),
+                OutputEvent::ToolOutputLine(line) => line.to_string(),
                 OutputEvent::RawAnsi(text) => text,
                 OutputEvent::Completion(_) => String::new(),
                 OutputEvent::TurnEnd { .. } => return,

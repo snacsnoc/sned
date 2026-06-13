@@ -420,10 +420,10 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
         saw_output = true;
         match event {
             OutputEvent::Line(line) => {
-                // Record the line index for turn-end markdown re-render
-                // BEFORE pushing, so the index points at the line being
-                // added.
-                app.push_stream_line(line);
+                app.push_stream_line(line, crate::cli::tui::StreamKind::Model);
+            }
+            OutputEvent::ToolOutputLine(line) => {
+                app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
             }
             OutputEvent::RawAnsi(s) => {
                 // Raw ANSI events (code blocks) are already styled. We
@@ -3318,7 +3318,7 @@ mod tests {
         );
 
         // The recorded indices buffer is cleared after finalize.
-        assert!(app.turn_stream_line_indices.is_empty());
+        assert!(app.turn_stream_entries.is_empty());
 
         reset_prompt_state();
     }

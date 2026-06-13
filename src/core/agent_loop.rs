@@ -12,6 +12,7 @@
 //! reverse order when possible.
 
 use crate::cli::output::OutputEvent;
+use crate::cli::tui::theme::{ERROR_FG, PROMPT_FG};
 pub use crate::core::agent_types::{
     AgentConfig, AgentError, AgentMode, SnippedCodeBlock, TaskState, TurnResult,
 };
@@ -3059,9 +3060,9 @@ impl AgentLoop {
                         let status = if is_error { "✗" } else { "✓" };
                         self.config
                             .output_writer
-                            .emit(OutputEvent::error_or_success(
+                            .emit(OutputEvent::tool_output_line(
                                 format!("  {} {}", status, stats),
-                                is_error,
+                                Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
                             ));
                     } else if tool_name == "execute_command" {
                         let max_lines = MAX_COMMAND_RESULT_DISPLAY_LINES;
@@ -3070,9 +3071,9 @@ impl AgentLoop {
                         let first_line = displayed.lines().next().unwrap_or("");
                         self.config
                             .output_writer
-                            .emit(OutputEvent::error_or_success(
+                            .emit(OutputEvent::tool_output_line(
                                 format!("  {} {}", status, first_line),
-                                is_error,
+                                Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
                             ));
                     } else if !matches!(tool_name.as_str(), "plan_mode_respond" | "ask_followup_question" | "condense" | "use_subagents") {
                         let max_lines = MAX_TOOL_RESULT_DISPLAY_LINES;
@@ -3080,23 +3081,28 @@ impl AgentLoop {
                         let status = if is_error { "✗" } else { "✓" };
                         let mut display_lines = displayed.lines();
                         let first = display_lines.next().unwrap_or("");
+                        let tool_style =
+                            Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG });
                         self.config
                             .output_writer
-                            .emit(OutputEvent::error_or_success(
+                            .emit(OutputEvent::tool_output_line(
                                 format!("  {} {}", status, first),
-                                is_error,
+                                tool_style,
                             ));
                         for line in display_lines.take(2) {
                             self.config
                                 .output_writer
-                                .emit(OutputEvent::dim(format!("    {}", line)));
+                                .emit(OutputEvent::tool_output_line(
+                                    format!("    {}", line),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ));
                         }
                         let total_lines = displayed.lines().count();
                         if total_lines > 3 {
-                            self.config.output_writer.emit(OutputEvent::dim(format!(
-                                "    ... {} more lines",
-                                total_lines - 3
-                            )));
+                            self.config.output_writer.emit(OutputEvent::tool_output_line(
+                                format!("    ... {} more lines", total_lines - 3),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ));
                         }
                     }
                 }
@@ -3224,7 +3230,7 @@ impl AgentLoop {
                     drop(state);
 
                     if plan_completed && !self.config.json_output {
-                        self.config.output_writer.emit(OutputEvent::styled(
+                        self.config.output_writer.emit(OutputEvent::tool_output_line(
                             "✓ Plan complete. All steps executed successfully.",
                             Style::default()
                                 .fg(Color::Green)
@@ -3319,7 +3325,10 @@ impl AgentLoop {
             if !edit_files.is_empty() && !self.config.json_output {
                 self.config
                     .output_writer
-                    .emit(OutputEvent::dim(format_heat_map(&edit_files)));
+                    .emit(OutputEvent::tool_output_line(
+                        format_heat_map(&edit_files),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
 
                 // Auto-commit to shadow git after file-modifying turns
                 // Only commit if files were actually modified (not just attempted or failed)
@@ -3381,7 +3390,10 @@ impl AgentLoop {
                 if !parts.is_empty() {
                     self.config
                         .output_writer
-                        .emit(OutputEvent::dim(format!("  📝 {}", parts.join(", "))));
+                        .emit(OutputEvent::tool_output_line(
+                            format!("  📝 {}", parts.join(", ")),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ));
                 }
             }
         }
@@ -3435,16 +3447,19 @@ impl AgentLoop {
                 let context_pct = api_req_info.context_usage_percentage.unwrap_or(0.0);
 
                 if context_pct >= 95.0 {
-                    self.config.output_writer.emit(OutputEvent::yellow(
+                    self.config.output_writer.emit(OutputEvent::tool_output_line(
                         "⚠ 95% context window — /compact or start new session".to_string(),
+                        Style::default().fg(Color::Yellow),
                     ));
                 } else if context_pct >= 80.0 {
-                    self.config.output_writer.emit(OutputEvent::yellow(
+                    self.config.output_writer.emit(OutputEvent::tool_output_line(
                         "⚠ 80% context window used — consider /compact".to_string(),
+                        Style::default().fg(Color::Yellow),
                     ));
                 } else if context_pct >= 50.0 {
-                    self.config.output_writer.emit(OutputEvent::dim(
+                    self.config.output_writer.emit(OutputEvent::tool_output_line(
                         "ℹ 50% context window used — use /compact to free space before starting new topics".to_string(),
+                        Style::default().add_modifier(Modifier::DIM),
                     ));
                 }
             }
@@ -3475,9 +3490,18 @@ impl AgentLoop {
             // emits as raw text, defeating the markdown render.
             let markdown_text = response_text.as_deref().unwrap_or("");
             if !self.config.json_output && !markdown_text.is_empty() {
-                self.config.output_writer.emit(OutputEvent::TurnEnd {
-                    accumulated_text: markdown_text.to_string(),
-                });
+                // Strip tool-call status lines that were already rendered as
+                // separate OutputEvent::Line/RawAnsi events. Including them in
+                // the TurnEnd payload causes duplicate rendering in the TUI.
+                let stripped =
+                    crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
+                if !stripped.is_empty() {
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::TurnEnd {
+                            accumulated_text: stripped,
+                        });
+                }
             }
             if !self.config.interactive_mode
                 && !self.config.json_output
@@ -3507,18 +3531,30 @@ impl AgentLoop {
             // markdown is not corrupted by raw thinking-tag HTML.
             let markdown_text = response_text.as_deref().unwrap_or("");
             if !self.config.json_output && !markdown_text.is_empty() {
-                self.config.output_writer.emit(OutputEvent::TurnEnd {
-                    accumulated_text: markdown_text.to_string(),
-                });
+                let stripped =
+                    crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
+                if !stripped.is_empty() {
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::TurnEnd {
+                            accumulated_text: stripped,
+                        });
+                }
             }
             TurnResult::Complete
         } else {
             // Same turn-end signal for the "more turns coming" branch.
             let markdown_text = response_text.as_deref().unwrap_or("");
             if !self.config.json_output && !markdown_text.is_empty() {
-                self.config.output_writer.emit(OutputEvent::TurnEnd {
-                    accumulated_text: markdown_text.to_string(),
-                });
+                let stripped =
+                    crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
+                if !stripped.is_empty() {
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::TurnEnd {
+                            accumulated_text: stripped,
+                        });
+                }
             }
             TurnResult::Continue
         }
@@ -4447,6 +4483,7 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ToolOutputLine(line) => rendered.push(line.to_string()),
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}

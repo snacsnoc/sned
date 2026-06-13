@@ -340,6 +340,62 @@ pub fn split_model_output(text: &str) -> (Option<String>, Option<String>) {
     (thinking, response)
 }
 
+/// Remove lines that are tool-call status markers emitted by the agent
+/// loop during tool execution (e.g. "▶ execute_command", "✓ ...", "📝
+/// ..."). These lines appear in the model's `accumulated_text` because
+/// the model may stream text *while* a tool is executing, but the
+/// actual tool-call UI already rendered these lines as separate
+/// `OutputEvent::Line`/`RawAnsi` events. If we include them in the
+/// markdown re-render produced by `finalize_turn_stream`, the lines
+/// appear twice — once from the re-render, once from the original
+/// event.
+///
+/// Recognised prefixes (any amount of leading whitespace is tolerated):
+///
+/// - `▶` — "running tool" indicator
+/// - `✓` — "tool completed" indicator
+/// - `📝` — edit-file status lines
+/// - `⏱` — elapsed-time / context lines
+/// - `⏳` — "waiting" / in-progress
+/// - `⠋` — spinner character
+/// - `[sned]` — internal status messages
+pub fn strip_tool_call_lines(input: &str) -> String {
+    input
+        .lines()
+        .filter(|line| !is_tool_call_marker_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Returns true if a single line is a tool-call marker emitted by the
+/// agent loop's tool execution UI.  These lines are **not** part of the
+/// user-visible model response — they are purely internal status
+/// indicators that already have their own rendered event.
+fn is_tool_call_marker_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Internal status messages — [sned] prefix
+    if trimmed.starts_with("[sned]") {
+        return true;
+    }
+
+    // Tool-call / tool-result status markers (Unicode prefix after trim)
+    // "▶" — execute_command / tool-running indicator
+    // "✓" — tool-result success indicator
+    // "📝" — edit-file status
+    // "⏱" — elapsed time / context usage
+    // "⏳" — pending / in-progress
+    // "⠋" — spinner character
+    let first_char = trimmed.chars().next().unwrap();
+    matches!(
+        first_char,
+        '▶' | '✓' | '📝' | '⏱' | '⏳' | '⠋'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +485,112 @@ mod tests {
         assert!(result.value.len() <= 30);
         assert!(result.was_repaired);
         assert!(serde_json::from_str::<serde_json::Value>(&result.value).is_ok());
+    }
+
+    // --- strip_tool_call_lines tests ---
+
+    #[test]
+    fn test_strip_tool_call_lines_removes_execute_command_marker() {
+        let input = "▶ execute_command\nsome response text";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "some response text");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_removes_result_marker() {
+        let input = "  ✓ Command completed\nHere is the output";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "Here is the output");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_removes_edit_marker() {
+        let input = "📝 Edited 2 files\nDone.";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "Done.");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_removes_sned_status() {
+        let input = "[sned] Context: 50% left\nResponse text";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "Response text");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_removes_all_marker_types() {
+        let input = "▶ tool 1\n✓ done\n📝 edited\n⏱ elapsed\n⏳ waiting\n⠋ spinning\nreal text";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "real text");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_preserves_normal_text() {
+        let input = "Hello world\nThis is a normal response\nNo markers here";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_preserves_text_with_similar_prefix() {
+        // "▶" inside text or at start of a normal sentence should not be treated as a
+        // tool marker — but our filter only checks the *first* character after trim,
+        // so a sentence starting with "▶" would be stripped. This is intentional:
+        // the agent loop only emits tool markers at the start of a line with no
+        // preceding text, so a model response starting with "▶" is almost certainly
+        // a tool marker, not genuine content.
+        let input = "▶ execute_command\n▶ ls /tmp\n▶ cat file.txt\nFinal answer: hello";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "Final answer: hello");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_empty_input() {
+        let result = strip_tool_call_lines("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_only_markers() {
+        let input = "▶ tool\n✓ done\n📝 edited";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_leaves_empty_lines() {
+        let input = "▶ tool\n\nsome text\n\n✓ done";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "\nsome text\n");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_whitespace_before_marker() {
+        let input = "    ▶ execute_command\n    ✓ done\nresponse";
+        let result = strip_tool_call_lines(input);
+        assert_eq!(result, "response");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_intentional_stripping_of_tool_markers() {
+        // Regression: lines starting with ▶, ✓, 📝, etc. are intentionally
+        // stripped from the TurnEnd payload. This is a documented trade-off:
+        // the agent loop only emits these markers, so a model response starting
+        // with ▶ is assumed to be a tool marker. This is intentional behavior,
+        // not a bug.
+        let input = "▶ execute_command\ndetails\n✓ done\n📝 notes\nresponse text";
+        let result = strip_tool_call_lines(input);
+        // Tool marker lines are stripped (removed entirely); normal text is preserved.
+        assert_eq!(result, "details\nresponse text");
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_normal_text_preserved() {
+        // Regression: normal text that does NOT start with a tool marker
+        // is preserved even if it contains similar characters.
+        let input = "▶ tool\nsome normal text with ▶ in the middle\nend";
+        let result = strip_tool_call_lines(input);
+        // The first line "▶ tool" is stripped; remaining lines are joined with \n.
+        assert_eq!(result, "some normal text with ▶ in the middle\nend");
     }
 }

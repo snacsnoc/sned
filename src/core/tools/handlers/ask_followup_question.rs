@@ -29,22 +29,23 @@ impl AskFollowupQuestionHandler {
 
         if !ctx.json_output {
             use crate::cli::output::OutputEvent;
-            use ratatui::style::{Color, Modifier, Style};
+            use ratatui::style::{Modifier, Style};
             let timeout_secs = crate::core::approval::followup_timeout().as_secs();
-            ctx.output_writer.emit(OutputEvent::styled(
+            use crate::cli::tui::theme::{ACCENT, WARNING_FG};
+            ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("\n{} {}\n", "[Sned Question]", question),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(WARNING_FG)
                     .add_modifier(Modifier::BOLD),
             ));
-            ctx.output_writer.emit(OutputEvent::styled(
+            ctx.output_writer.emit(OutputEvent::tool_output_line(
                 "Your answer: ",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(ACCENT),
             ));
-            ctx.output_writer.emit(OutputEvent::dim(format!(
-                "(waiting up to {}s for your response)",
-                timeout_secs
-            )));
+            ctx.output_writer.emit(OutputEvent::tool_output_line(
+                format!("(waiting up to {}s for your response)", timeout_secs),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
             ctx.output_writer.flush();
 
             // Capture task_id for use after spawn_blocking

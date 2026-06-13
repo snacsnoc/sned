@@ -582,13 +582,14 @@ impl EditFileHandler {
                     .was_read_this_session(&batch.display_path)
             {
                 use crate::cli::output::OutputEvent;
-                use ratatui::style::{Color, Style};
-                output_writer.emit(OutputEvent::styled(
+                use crate::cli::tui::theme::WARNING_FG;
+                use ratatui::style::Style;
+                output_writer.emit(OutputEvent::tool_output_line(
                     format!(
                         "⚠ editing {} (not read this session — may have stale assumptions)",
                         batch.display_path
                     ),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(WARNING_FG),
                 ));
             }
 
@@ -1139,7 +1140,8 @@ impl EditFileHandler {
         // call and hits Hash anchor validation errors, triggering read/edit loops.
         if !write_items.is_empty() && total_applied > 0 && !json_output {
             use crate::cli::output::OutputEvent;
-            use ratatui::style::{Color, Style};
+            use crate::cli::tui::theme::ACCENT;
+            use ratatui::style::Style;
             let written_paths: Vec<String> = write_items
                 .iter()
                 .map(|item| {
@@ -1149,13 +1151,13 @@ impl EditFileHandler {
                         .unwrap_or_else(|| item.absolute_path.clone())
                 })
                 .collect();
-            output_writer.emit(OutputEvent::styled(
+            output_writer.emit(OutputEvent::tool_output_line(
                 format!(
                     "✓ {} file(s) changed: {}. Call read_file before the next edit on these files to refresh anchors.",
                     written_paths.len(),
                     written_paths.join(", ")
                 ),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(ACCENT),
             ));
         }
 

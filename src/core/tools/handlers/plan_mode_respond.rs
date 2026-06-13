@@ -86,11 +86,12 @@ impl PlanModeRespondHandler {
             );
         } else {
             use crate::cli::output::OutputEvent;
-            use ratatui::style::{Color, Modifier, Style};
-            ctx.output_writer.emit(OutputEvent::styled(
+            use crate::cli::tui::theme::ACCENT;
+            use ratatui::style::{Modifier, Style};
+            ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("\n📋 Plan Generated\n{}\n", response),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(ACCENT)
                     .add_modifier(Modifier::BOLD),
             ));
         }

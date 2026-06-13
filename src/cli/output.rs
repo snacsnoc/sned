@@ -16,8 +16,12 @@ use tokio::sync::mpsc;
 /// An output event that can be rendered by the TUI or forwarded to stderr.
 #[derive(Clone, Debug)]
 pub enum OutputEvent {
-    /// A line of text with optional styling.
+    /// A line of text with optional styling (model output).
     Line(Line<'static>),
+    /// A line of text with optional styling (tool result, plan status,
+    /// heat map, etc.).  The TUI tags these as `ToolOutput` so they
+    /// are never popped or re-rendered by `finalize_turn_stream`.
+    ToolOutputLine(Line<'static>),
     /// Raw ANSI escape sequences (for PTY output, etc.).
     RawAnsi(String),
     /// Task completion message rendered as a dedicated Block widget.
@@ -153,6 +157,12 @@ impl OutputEvent {
             Style::default().fg(theme::ACCENT),
         )))
     }
+
+    /// Emit a tool-result line. The TUI will never pop or re-render
+    /// these lines during `finalize_turn_stream`.
+    pub fn tool_output_line(text: impl Into<String>, style: ratatui::style::Style) -> Self {
+        OutputEvent::ToolOutputLine(Line::from(Span::styled(text.into(), style)))
+    }
 }
 
 /// Trait for writing output events.
@@ -191,7 +201,9 @@ impl OutputWriter for StderrOutputWriter {
     fn emit(&self, event: OutputEvent) {
         match event {
             OutputEvent::Line(line) => {
-                // For now, just render as plain text (colors come in Phase 1)
+                eprintln!("{}", line);
+            }
+            OutputEvent::ToolOutputLine(line) => {
                 eprintln!("{}", line);
             }
             OutputEvent::RawAnsi(s) => {
@@ -200,11 +212,7 @@ impl OutputWriter for StderrOutputWriter {
             OutputEvent::Completion(result) => {
                 eprintln!("\n[sned] Task Completed: {}", result);
             }
-            // TurnEnd is a TUI-only re-render signal; in one-shot/JSON
-            // output the streamed text was already written live.
             OutputEvent::TurnEnd { .. } => {}
-            // TurnIndicator is a TUI-only signal; in one-shot/JSON the
-            // streamed text was already written live.
             OutputEvent::TurnIndicator(_) => {}
         }
     }

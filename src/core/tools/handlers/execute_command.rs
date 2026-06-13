@@ -189,7 +189,12 @@ impl ExecuteCommandHandler {
             tracing::debug!(command = %cmd_str, cwd = ?cwd, "executing command");
 
             if !json_output {
-                output_writer.emit(OutputEvent::info(format!("Running: {}", cmd_str)));
+                use crate::cli::tui::theme::INFO_FG;
+                use ratatui::style::{Modifier, Style};
+                output_writer.emit(OutputEvent::tool_output_line(
+                    format!("Running: {}", cmd_str),
+                    Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+                ));
             }
 
             // Execute via shell for portability and shell feature support
@@ -274,10 +279,14 @@ impl ExecuteCommandHandler {
                                         // Head: print live
                                         use crate::cli::output::OutputEvent;
                                         use ratatui::style::{Modifier, Style};
-                                        output_writer.emit(OutputEvent::styled(line.clone(), Style::default().add_modifier(Modifier::DIM)));
+                                        output_writer.emit(OutputEvent::tool_output_line(line.clone(), Style::default().add_modifier(Modifier::DIM)));
                                     } else if displayed == half + 1 && !truncated {
                                         // First skipped line: emit condensed note once
-                                        output_writer.emit(OutputEvent::plain("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string()));
+                                        use ratatui::style::{Modifier, Style};
+                                        output_writer.emit(OutputEvent::tool_output_line(
+                                            "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
+                                            Style::default().add_modifier(Modifier::DIM),
+                                        ));
                                         truncated = true;
                                     }
                                 }
@@ -303,11 +312,16 @@ impl ExecuteCommandHandler {
                                     if displayed <= half {
                                         // Head: print live
                                         use crate::cli::output::OutputEvent;
-                                        use ratatui::style::{Color, Style};
-                                        output_writer.emit(OutputEvent::styled(line.clone(), Style::default().fg(Color::Yellow)));
+                                        use crate::cli::tui::theme::WARNING_FG;
+                                        use ratatui::style::Style;
+                                        output_writer.emit(OutputEvent::tool_output_line(line.clone(), Style::default().fg(WARNING_FG)));
                                     } else if displayed == half + 1 && !truncated {
                                         // First skipped line: emit condensed note once
-                                        output_writer.emit(OutputEvent::plain("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string()));
+                                        use ratatui::style::{Modifier, Style};
+                                        output_writer.emit(OutputEvent::tool_output_line(
+                                            "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
+                                            Style::default().add_modifier(Modifier::DIM),
+                                        ));
                                         truncated = true;
                                     }
                                 }
@@ -377,9 +391,13 @@ impl ExecuteCommandHandler {
                                         if displayed <= half {
                                             use crate::cli::output::OutputEvent;
                                             use ratatui::style::{Modifier, Style};
-                                            output_writer.emit(OutputEvent::styled(line.clone(), Style::default().add_modifier(Modifier::DIM)));
+                                            output_writer.emit(OutputEvent::tool_output_line(line.clone(), Style::default().add_modifier(Modifier::DIM)));
                                         } else if displayed == half + 1 && !truncated {
-                                            output_writer.emit(OutputEvent::plain("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string()));
+                                            use ratatui::style::{Modifier, Style};
+                                            output_writer.emit(OutputEvent::tool_output_line(
+                                                "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
+                                                Style::default().add_modifier(Modifier::DIM),
+                                            ));
                                             truncated = true;
                                         }
                                     }
@@ -397,10 +415,15 @@ impl ExecuteCommandHandler {
                                     if !json_output {
                                         if displayed <= half {
                                             use crate::cli::output::OutputEvent;
-                                            use ratatui::style::{Color, Style};
-                                            output_writer.emit(OutputEvent::styled(line.clone(), Style::default().fg(Color::Yellow)));
+                                            use crate::cli::tui::theme::WARNING_FG;
+                                            use ratatui::style::Style;
+                                            output_writer.emit(OutputEvent::tool_output_line(line.clone(), Style::default().fg(WARNING_FG)));
                                         } else if displayed == half + 1 && !truncated {
-                                            output_writer.emit(OutputEvent::plain("... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string()));
+                                            use ratatui::style::{Modifier, Style};
+                                            output_writer.emit(OutputEvent::tool_output_line(
+                                                "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
+                                                Style::default().add_modifier(Modifier::DIM),
+                                            ));
                                             truncated = true;
                                         }
                                     }
@@ -465,12 +488,12 @@ impl ExecuteCommandHandler {
                 let total = displayed;
                 use crate::cli::output::OutputEvent;
                 use ratatui::style::{Modifier, Style};
-                output_writer.emit(OutputEvent::styled(
+                output_writer.emit(OutputEvent::tool_output_line(
                     format!("--- last {} of {} lines ---", tail_buffer.len(), total),
                     Style::default().add_modifier(Modifier::DIM),
                 ));
                 for line in tail_buffer.iter() {
-                    output_writer.emit(OutputEvent::styled(
+                    output_writer.emit(OutputEvent::tool_output_line(
                         line.clone(),
                         Style::default().add_modifier(Modifier::DIM),
                     ));
