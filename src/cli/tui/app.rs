@@ -177,6 +177,11 @@ pub struct App {
     /// append order; popping iterates from the highest index to the
     /// lowest to preserve earlier indices.
     pub turn_stream_line_indices: Vec<usize>,
+    /// The turn indicator line (e.g. "♦") for the current turn. This is
+    /// kept separate from `turn_stream_line_indices` so that
+    /// `finalize_turn_stream` can re-insert it at the top of the markdown
+    /// block instead of stripping it.
+    pub turn_indicator: Option<Line<'static>>,
     /// Whether the model picker is active.
     pub model_picker_active: bool,
     /// Model picker entries.
@@ -261,6 +266,7 @@ impl App {
             slash_command_all_entries: Vec::new(),
             slash_command_completed_text: None,
             turn_stream_line_indices: Vec::new(),
+            turn_indicator: None,
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
@@ -334,6 +340,15 @@ impl App {
         self.turn_stream_line_indices.push(idx);
     }
 
+    /// Store a turn-indicator line (e.g. "♦") for later re-insertion at
+    /// the top of the markdown-rendered block.  This is kept separate
+    /// from `turn_stream_line_indices` so `finalize_turn_stream` can
+    /// re-insert the indicator at the top of the rendered block instead
+    /// of stripping it.
+    pub fn push_turn_indicator(&mut self, line: Line<'static>) {
+        self.turn_indicator = Some(line);
+    }
+
     /// Re-render the lines recorded during the current turn as
     /// markdown. Pops the recorded lines from the tail of the buffer
     /// (highest index first to preserve earlier indices) and pushes
@@ -378,8 +393,18 @@ impl App {
         // immediately when the model streamed them.
         let insert_at = *indices.iter().min().unwrap();
 
+        // Re-insert the turn-indicator line at the top of the rendered
+        // block so it does not appear as an orphaned line between
+        // paragraphs after `finalize_turn_stream` replaces streamed
+        // lines with markdown.
+        let had_indicator = self.turn_indicator.is_some();
+        if let Some(ind) = self.turn_indicator.take() {
+            self.output_lines.insert(insert_at, ind);
+        }
+
+        let offset = if had_indicator { 1 } else { 0 };
         for line in crate::cli::markdown::render_markdown(None, markdown_text) {
-            self.output_lines.insert(insert_at, line);
+            self.output_lines.insert(insert_at + offset, line);
         }
 
         self.needs_redraw = true;
