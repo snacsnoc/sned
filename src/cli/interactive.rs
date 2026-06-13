@@ -842,6 +842,10 @@ async fn handle_key_event(
                     "Approval pending. Type y, n, or a first.",
                     Style::default().fg(theme::WARNING_FG),
                 );
+                app.slash_command_active = false;
+                app.slash_command_results.clear();
+                app.slash_command_selected = 0;
+                app.slash_command_completed_text = None;
                 return Ok(None);
             }
 
