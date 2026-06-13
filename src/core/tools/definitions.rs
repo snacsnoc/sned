@@ -1056,6 +1056,21 @@ mod tests {
     }
 
     #[test]
+    fn test_condense_is_in_active_tool_definitions() {
+        // Regression guard: a model may believe it has no `condense` tool
+        // if the tool is silently dropped from the active set. The full
+        // profile is what gets sent to OpenAI-compatible providers, so
+        // `condense` must be present there.
+        let defs = get_active_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            names.contains(&"condense"),
+            "condense tool must be in active tool definitions so the model can call it; got: {:?}",
+            names
+        );
+    }
+
+    #[test]
     fn test_tool_schema_sizes() {
         let defs = get_active_tool_definitions();
         let mut entries: Vec<(String, usize)> = defs
