@@ -685,12 +685,18 @@ async fn handle_key_event(
         if let Some((new_text, cursor_pos)) =
             crate::cli::slash_commands::apply_slash_completion(&text, &selected)
         {
-            app.input = App::new_textarea(vec![new_text]);
+            app.input = App::new_textarea(vec![new_text.clone()]);
             app.input
                 .move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
             app.slash_command_active = false;
             app.slash_command_results.clear();
             app.slash_command_selected = 0;
+            // Record the post-completion text so the post-text-input
+            // re-evaluation keeps the picker dismissed while the user is
+            // still browsing the completed command (e.g. arrow keys).
+            // The picker re-opens once the user starts a new query
+            // (separator, typed character, or backspace).
+            app.slash_command_completed_text = Some(new_text);
             return true;
         }
 
@@ -1009,24 +1015,45 @@ async fn handle_key_event(
     }
 
     // Check for slash command mode activation / update
+    //
+    // The completed-text guard prevents the picker from re-opening after
+    // a Tab/Enter completion: as long as the input still matches the
+    // completed text, the user is just browsing (arrow keys, escape,
+    // etc.) and the picker should stay hidden. The picker re-opens as
+    // soon as the user starts a new query — a typed character, a
+    // separator (space), or a backspace.
     if let Some(query) = crate::cli::slash_commands::extract_slash_query(&input_text) {
-        if !app.slash_command_active {
+        let still_completed = app
+            .slash_command_completed_text
+            .as_deref()
+            .is_some_and(|completed| completed == input_text);
+        if still_completed {
+            // Picker stays dismissed; clear the completed marker so the
+            // next genuinely-new input can re-enable the picker.
+            app.slash_command_completed_text = None;
+        } else if !app.slash_command_active {
             app.slash_command_active = true;
             app.slash_command_selected = 0;
             app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
                 &app.slash_command_all_entries,
                 &query,
             );
+            app.slash_command_completed_text = None;
         } else {
             app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
                 &app.slash_command_all_entries,
                 &query,
             );
+            app.slash_command_completed_text = None;
         }
     } else if app.slash_command_active {
         app.slash_command_active = false;
         app.slash_command_results.clear();
         app.slash_command_selected = 0;
+        app.slash_command_completed_text = None;
+    } else {
+        // Input is no longer a slash command — drop the completed marker.
+        app.slash_command_completed_text = None;
     }
 
     Ok(None)
@@ -1707,19 +1734,26 @@ async fn handle_cli_only_command(
             let sess = session.lock().await;
             let sh = sess.agent_loop().await.state_handle();
             let mut state = sh.lock().await;
-            if state.plan_state.is_some() {
-                state.plan_state = None;
-                state.last_injected_plan_state_hash = None;
-                state.strict_plan_mode_enabled = true;
-                drop(state);
-                sess.agent_loop_mut()
-                    .await
-                    .set_mode(crate::core::agent_types::AgentMode::Act);
-                app.mode = "ACT".to_string();
-                app.update_placeholder();
+            // Plan mode can be entered via `/plan <prompt>` (or `--plan`)
+            // before any plan_state is created, so the abort path must
+            // check the agent mode rather than only plan_state.is_some().
+            // Otherwise the user gets stuck in plan mode when the model
+            // answers a follow-up question without calling
+            // `plan_mode_respond`, leaving no plan to approve.
+            let had_plan = state.plan_state.is_some();
+            state.plan_state = None;
+            state.last_injected_plan_state_hash = None;
+            state.strict_plan_mode_enabled = true;
+            drop(state);
+            sess.agent_loop_mut()
+                .await
+                .set_mode(crate::core::agent_types::AgentMode::Act);
+            app.mode = "ACT".to_string();
+            app.update_placeholder();
+            if had_plan {
                 app.push_plain("Plan aborted. Already-applied changes are kept.");
             } else {
-                app.push_plain("No active plan to abort.");
+                app.push_plain("Exited plan mode. Ready for act mode.");
             }
         }
         CliOnlyCommand::Plan(_)
@@ -3418,6 +3452,96 @@ mod tests {
         app
     }
 
+    /// Reproduces the user-reported bug: tab completion for `/plan` does
+    /// not dismiss the popup when the completed input is still a valid
+    /// slash command. The fix should keep the popup hidden until the user
+    /// starts a new query (separator, character, or movement).
+    #[tokio::test]
+    async fn test_slash_completion_dismissed_until_new_query() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::{SlashCommandCategory, SlashCommandEntry};
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+
+        // Set up: input `/pl`, picker active with multiple matches.
+        let mut app = App::new();
+        app.input = App::new_textarea(vec!["/pl".to_string()]);
+        app.slash_command_active = true;
+        app.slash_command_results = vec![
+            SlashCommandEntry {
+                name: "plan".to_string(),
+                description: "View or manage the current plan".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Plan,
+                requires_args: false,
+            },
+            SlashCommandEntry {
+                name: "plan-prompt".to_string(),
+                description: "Prompt with plan".to_string(),
+                aliases: vec![],
+                category: SlashCommandCategory::Plan,
+                requires_args: false,
+            },
+        ];
+        app.slash_command_selected = 0;
+        app.slash_command_all_entries = app.slash_command_results.clone();
+
+        // Press Tab to accept "plan"
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "/plan");
+        assert!(
+            !app.slash_command_active,
+            "picker must be hidden immediately after Tab"
+        );
+
+        // After Tab, the picker should stay hidden until the user starts
+        // a new query. Simulate the next key event being a no-op for the
+        // picker (an arrow key). The picker should remain hidden.
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "/plan");
+        assert!(
+            !app.slash_command_active,
+            "picker must stay hidden when user navigates within the completed input"
+        );
+
+        // Once the user types a real new character, the picker should
+        // re-open with refreshed results.
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "/plan ");
+        assert!(
+            app.slash_command_active,
+            "picker must re-open when user types a separator (space) after a completed command"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_handle_key_event_accepts_slash_completion_with_enter() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3468,6 +3592,33 @@ mod tests {
         assert!(!app.slash_command_active);
         assert!(app.slash_command_results.is_empty());
         assert_eq!(app.slash_command_selected, 0);
+
+        // After Tab, render the app and assert the slash command overlay
+        // is NOT in the buffer. This is the user-visible bug:
+        // "Tab completion for /plan doesn't disappear the popup box."
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        let buffer = terminal.backend().buffer().clone();
+        let mut found_overlay = false;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol().contains("Slash Commands") {
+                    found_overlay = true;
+                    break;
+                }
+            }
+            if found_overlay {
+                break;
+            }
+        }
+        assert!(
+            !found_overlay,
+            "slash command overlay must not appear in the rendered buffer after Tab completion"
+        );
 
         Ok(())
     }
@@ -4300,6 +4451,260 @@ mod tests {
         assert!(state.plan_state.is_none());
         assert!(state.strict_plan_mode_enabled);
         assert_eq!(state.last_injected_plan_state_hash, None);
+
+        Ok(())
+    }
+
+    /// Regression test for the user-reported bug: when the user enters
+    /// plan mode via `/plan <prompt>` (or `--plan`) and the model
+    /// answers the follow-up question without calling
+    /// `plan_mode_respond`, no plan_state is ever created. `/plan abort`
+    /// used to be a no-op in that case ("No active plan to abort."),
+    /// leaving the user stuck in plan mode with no way to switch back
+    /// to act mode. The fix checks the agent mode rather than only
+    /// plan_state.is_some() and always transitions to Act.
+    #[tokio::test]
+    async fn test_plan_abort_exits_plan_mode_without_plan_state() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let task_opts = TaskOptions {
+            act: false,
+            plan: true,
+            yolo: false,
+            auto_approve_all: false,
+            timeout: None,
+            model: None,
+            provider: Some("mock".to_string()),
+            base_url: None,
+            api_key: None,
+            verbose: false,
+            cwd: None,
+            config: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_consecutive_mistakes: None,
+            json: false,
+            double_check_completion: false,
+            auto_condense: true,
+            no_token_display: false,
+            subagents: false,
+            is_subagent: false,
+            user_agent: None,
+            hooks_dir: None,
+            export: None,
+            image: vec![],
+            track_changes: false,
+            max_context_turns: None,
+            max_tokens: None,
+            debug: false,
+        };
+        let root_opts = RootOnlyOptions {
+            task_id: None,
+            continue_task: false,
+        };
+
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(task_opts.clone(), root_opts, None).await?,
+        ));
+        let state_handle = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.state_handle()
+        };
+        {
+            let mut state = state_handle.lock().await;
+            // No plan_state — the model answered a follow-up question
+            // without ever calling plan_mode_respond. The agent is
+            // still in Plan mode from the original /plan <prompt>.
+            state.plan_state = None;
+            state.strict_plan_mode_enabled = true;
+        }
+        {
+            let sess = session.lock().await;
+            sess.agent_loop_mut()
+                .await
+                .set_mode(crate::core::agent_types::AgentMode::Plan);
+        }
+
+        let mut app = App::new();
+        app.mode = "PLAN".to_string();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::PlanAbort,
+            "/plan abort",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        assert_eq!(
+            app.mode, "ACT",
+            "/plan abort must transition the user out of plan mode even when no plan_state was created"
+        );
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Exited plan mode")
+        }));
+        let state = state_handle.lock().await;
+        assert!(state.plan_state.is_none());
+        assert!(state.strict_plan_mode_enabled);
+        let sess = session.lock().await;
+        assert_eq!(
+            sess.agent_loop().await.mode(),
+            crate::core::agent_types::AgentMode::Act,
+            "agent loop must also be switched out of Plan mode"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for the `--plan` flag entry path: when the user
+    /// starts a task with `TaskOptions { plan: true, .. }` and the model
+    /// answers a follow-up question without calling `plan_mode_respond`,
+    /// `/plan abort` must still exit plan mode. Unlike
+    /// `test_plan_abort_exits_plan_mode_without_plan_state`, this test
+    /// does NOT explicitly call `set_mode(Plan)` after building the
+    /// session — it relies on the flag-driven `build_task_components`
+    /// initialization in `src/cli/mod.rs:1107` to set Plan mode. This
+    /// guards against a future change to that initialization silently
+    /// breaking the abort path for the `--plan` flag.
+    #[tokio::test]
+    async fn test_plan_abort_exits_plan_mode_from_flag_entry() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let task_opts = TaskOptions {
+            act: false,
+            plan: true,
+            yolo: false,
+            auto_approve_all: false,
+            timeout: None,
+            model: None,
+            provider: Some("mock".to_string()),
+            base_url: None,
+            api_key: None,
+            verbose: false,
+            cwd: None,
+            config: None,
+            thinking: None,
+            reasoning_effort: None,
+            max_consecutive_mistakes: None,
+            json: false,
+            double_check_completion: false,
+            auto_condense: true,
+            no_token_display: false,
+            subagents: false,
+            is_subagent: false,
+            user_agent: None,
+            hooks_dir: None,
+            export: None,
+            image: vec![],
+            track_changes: false,
+            max_context_turns: None,
+            max_tokens: None,
+            debug: false,
+        };
+        let root_opts = RootOnlyOptions {
+            task_id: None,
+            continue_task: false,
+        };
+
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(task_opts.clone(), root_opts, None).await?,
+        ));
+        let state_handle = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.state_handle()
+        };
+
+        // Pre-conditions: the --plan flag must put the agent into Plan
+        // mode without any plan_state being created.
+        {
+            let sess = session.lock().await;
+            assert_eq!(
+                sess.agent_loop().await.mode(),
+                crate::core::agent_types::AgentMode::Plan,
+                "TaskOptions {{ plan: true, .. }} must initialize the agent in Plan mode"
+            );
+        }
+        let state = state_handle.lock().await;
+        assert!(
+            state.plan_state.is_none(),
+            "no plan_state should exist at session start"
+        );
+        drop(state);
+
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::PlanAbort,
+            "/plan abort",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        assert_eq!(
+            app.mode, "ACT",
+            "/plan abort must transition out of plan mode entered via the --plan flag"
+        );
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Exited plan mode")
+        }));
+        let state = state_handle.lock().await;
+        assert!(state.plan_state.is_none());
+        assert!(state.strict_plan_mode_enabled);
+        let sess = session.lock().await;
+        assert_eq!(
+            sess.agent_loop().await.mode(),
+            crate::core::agent_types::AgentMode::Act,
+            "agent loop must also be switched out of Plan mode after --plan flag abort"
+        );
 
         Ok(())
     }

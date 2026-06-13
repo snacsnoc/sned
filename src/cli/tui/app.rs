@@ -164,6 +164,12 @@ pub struct App {
     pub slash_command_selected: usize,
     /// All available slash command entries (unfiltered).
     pub slash_command_all_entries: Vec<crate::cli::slash_commands::SlashCommandEntry>,
+    /// Input text at the moment the slash command picker was last accepted
+    /// (via Tab/Enter). The post-text-input re-evaluation skips re-enabling
+    /// the picker while the current input still matches this value, so a
+    /// completed `/plan` stays dismissed until the user starts a new query
+    /// (separator, character, or backspace).
+    pub slash_command_completed_text: Option<String>,
     /// Whether the model picker is active.
     pub model_picker_active: bool,
     /// Model picker entries.
@@ -246,6 +252,7 @@ impl App {
             slash_command_results: Vec::new(),
             slash_command_selected: 0,
             slash_command_all_entries: Vec::new(),
+            slash_command_completed_text: None,
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
@@ -1679,6 +1686,26 @@ mod tests {
         terminal
             .draw(|frame| app.render(frame))
             .expect("render should succeed");
+
+        // The overlay title contains "Slash Commands" — assert it's NOT in the buffer.
+        let buffer = terminal.backend().buffer().clone();
+        let mut found = false;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol().contains("Slash Commands") {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(
+            !found,
+            "slash command overlay should not render when slash_command_active is false"
+        );
     }
 
     #[test]
