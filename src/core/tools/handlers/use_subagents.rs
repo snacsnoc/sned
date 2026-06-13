@@ -716,6 +716,7 @@ mod tests {
                 OutputEvent::Line(line) => line.to_string(),
                 OutputEvent::RawAnsi(text) => text,
                 OutputEvent::Completion(_) => String::new(),
+                OutputEvent::TurnEnd { .. } => return,
             };
             self.events.lock().unwrap().push(text);
         }

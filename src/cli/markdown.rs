@@ -16,9 +16,21 @@ use ratatui::text::{Line, Span};
 /// into multiple `Line`s. Inline formatting (bold, italic, inline code)
 /// is applied as `Span` styling.
 pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
+    render_markdown(Some(prefix), text)
+}
+
+/// Render arbitrary markdown as terminal-friendly lines.
+///
+/// If `prefix` is `Some`, the prefix is styled and prepended to the first
+/// emitted line (used for the completion box's "🚀 Task Completed: "
+/// banner). If `prefix` is `None`, no banner is applied — the lines
+/// render as plain styled markdown, suitable for re-rendering streamed
+/// agent output after a turn completes.
+pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
+        let banner = prefix.unwrap_or("");
         return vec![Line::from(Span::styled(
-            format!("{}{}", prefix, text),
+            format!("{}{}", banner, text),
             Style::default(),
         ))];
     }
@@ -55,18 +67,20 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
         current_text: &mut String,
         current_spans: &mut Vec<Span<'static>>,
         is_first: bool,
-        prefix: &str,
+        prefix: Option<&str>,
     ) {
         flush_text(out, current_text, current_spans);
         if current_spans.is_empty() && !is_first {
             out.push(Line::from(""));
             return;
         }
-        if is_first {
+        if is_first
+            && let Some(p) = prefix
+        {
             current_spans.insert(
                 0,
                 Span::styled(
-                    prefix.to_string(),
+                    p.to_string(),
                     Style::default().fg(crate::cli::tui::theme::PROMPT_FG),
                 ),
             );
@@ -278,10 +292,14 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
     }
 
     if out.is_empty() {
-        out.push(Line::from(Span::styled(
-            prefix.to_string(),
-            Style::default().fg(crate::cli::tui::theme::PROMPT_FG),
-        )));
+        if let Some(p) = prefix {
+            out.push(Line::from(Span::styled(
+                p.to_string(),
+                Style::default().fg(crate::cli::tui::theme::PROMPT_FG),
+            )));
+        } else {
+            out.push(Line::from(""));
+        }
     }
 
     out
@@ -395,5 +413,48 @@ mod tests {
             "prefix should appear once, got: {:?}",
             lines
         );
+    }
+
+    #[test]
+    fn render_markdown_without_prefix_omits_banner() {
+        // Used for re-rendering streamed agent text. The output must
+        // not contain a banner — no "🚀 " prefix should be applied.
+        //
+        // Note: this test deliberately avoids list rendering. The
+        // markdown module's list-item marker is not currently emitted
+        // (Tag::Item is a no-op); exercising it here would couple
+        // this fix to a pre-existing markdown-rendering gap.
+        let md = "**bold** text and a heading.\n\nA second paragraph.";
+        let lines = render_markdown(None, md);
+        let text = collect_text(&lines);
+        assert!(text.contains("bold"), "got: {}", text);
+        assert!(text.contains("text and a heading"), "got: {}", text);
+        assert!(text.contains("A second paragraph"), "got: {}", text);
+        // No prefix in any line.
+        for (i, line) in lines.iter().enumerate() {
+            let joined: String = line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert!(
+                !joined.contains("🚀"),
+                "line {} unexpectedly contains the banner: {:?}",
+                i,
+                joined
+            );
+        }
+    }
+
+    #[test]
+    fn render_markdown_empty_text_without_prefix_emits_blank_line() {
+        let lines = render_markdown(None, "");
+        // Either an empty line or a no-prefix placeholder — must not
+        // contain any banner glyphs.
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(!joined.contains("🚀"), "got: {}", joined);
     }
 }

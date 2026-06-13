@@ -3486,8 +3486,23 @@ impl AgentLoop {
                     self.config.output_writer.flush();
                 }
             }
+            // Signal turn-end so the TUI can re-render the streamed
+            // model text as formatted markdown. Only meaningful in
+            // interactive TUI mode (the StderrOutputWriter ignores it
+            // and JSON mode doesn't stream text to the output pane).
+            if !self.config.json_output && !accumulated_text.is_empty() {
+                self.config.output_writer.emit(OutputEvent::TurnEnd {
+                    accumulated_text: accumulated_text.clone(),
+                });
+            }
             TurnResult::Complete
         } else {
+            // Same turn-end signal for the "more turns coming" branch.
+            if !self.config.json_output && !accumulated_text.is_empty() {
+                self.config.output_writer.emit(OutputEvent::TurnEnd {
+                    accumulated_text: accumulated_text.clone(),
+                });
+            }
             TurnResult::Continue
         }
     }
@@ -4417,6 +4432,7 @@ mod tests {
                 crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
+                crate::cli::output::OutputEvent::TurnEnd { .. } => {}
             }
         }
         rendered

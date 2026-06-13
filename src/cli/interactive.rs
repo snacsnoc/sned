@@ -419,8 +419,17 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     while let Ok(event) = rx.try_recv() {
         saw_output = true;
         match event {
-            OutputEvent::Line(line) => app.push_output(line),
+            OutputEvent::Line(line) => {
+                // Record the line index for turn-end markdown re-render
+                // BEFORE pushing, so the index points at the line being
+                // added.
+                app.push_stream_line(line);
+            }
             OutputEvent::RawAnsi(s) => {
+                // Raw ANSI events (code blocks) are already styled. We
+                // do NOT record them in turn_stream_line_indices, so
+                // turn-end replacement only re-renders the plain
+                // streamed text and leaves ANSI code blocks untouched.
                 let lines = ansi_to_ratatui_lines(&s);
                 for line in lines {
                     app.push_output(line);
@@ -433,6 +442,9 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 {
                     app.push_completion_line(line);
                 }
+            }
+            OutputEvent::TurnEnd { accumulated_text } => {
+                app.finalize_turn_stream(&accumulated_text);
             }
         }
     }
@@ -3187,6 +3199,89 @@ mod tests {
             second_rendered.contains("second completion"),
             "expected second completion to replace the first, got: {second_rendered}"
         );
+
+        reset_prompt_state();
+    }
+
+    /// End-to-end test for the markdown re-render fix. Streamed model
+    /// text arrives as raw `OutputEvent::Line` events. When
+    /// `OutputEvent::TurnEnd` arrives, `drain_output` should swap the
+    /// streamed raw lines for the markdown-rendered version of the
+    /// original accumulated text.
+    #[test]
+    fn test_drain_output_rerenders_streamed_text_as_markdown_on_turn_end() {
+        use crate::cli::output::OutputEvent;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        // Simulate the agent loop streaming three lines that are
+        // fragments of the original markdown "**bold** text\n\nmore".
+        tx.try_send(OutputEvent::model_output("  **bold"))
+            .unwrap();
+        tx.try_send(OutputEvent::model_output("  text"))
+            .unwrap();
+        tx.try_send(OutputEvent::model_output("  more"))
+            .unwrap();
+        // The agent loop emits TurnEnd with the raw markdown text
+        // when the turn finishes.
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: "**bold** text\n\nmore".to_string(),
+        })
+        .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let rendered: Vec<String> = app
+            .output_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // The raw streamed lines should be gone.
+        assert!(
+            !rendered.iter().any(|s| s.starts_with("  **bold")),
+            "raw streamed lines should be replaced: {:?}",
+            rendered
+        );
+        assert!(
+            !rendered.iter().any(|s| s == "  text"),
+            "raw streamed lines should be replaced: {:?}",
+            rendered
+        );
+        // No 🚀 banner (that's for completion, not agent text).
+        assert!(
+            !rendered.iter().any(|s| s.contains("🚀")),
+            "agent-text re-render must not include the completion banner: {:?}",
+            rendered
+        );
+        // The markdown content should be present.
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("bold"),
+            "rendered content should contain 'bold': {}",
+            joined
+        );
+        assert!(
+            joined.contains("text"),
+            "rendered content should contain 'text': {}",
+            joined
+        );
+        assert!(
+            joined.contains("more"),
+            "rendered content should contain 'more': {}",
+            joined
+        );
+
+        // The recorded indices buffer is cleared after finalize.
+        assert!(app.turn_stream_line_indices.is_empty());
 
         reset_prompt_state();
     }

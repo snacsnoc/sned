@@ -22,6 +22,14 @@ pub enum OutputEvent {
     RawAnsi(String),
     /// Task completion message rendered as a dedicated Block widget.
     Completion(String),
+    /// End of a streamed agent turn. The TUI uses this to re-render
+    /// the raw streamed lines recorded during the turn as formatted
+    /// markdown. The payload is the original (pre-wrap, pre-indent)
+    /// markdown text accumulated by the agent loop.
+    ///
+    /// In non-interactive output paths (e.g. one-shot/JSON), this is a
+    /// no-op marker.
+    TurnEnd { accumulated_text: String },
 }
 
 impl OutputEvent {
@@ -177,6 +185,9 @@ impl OutputWriter for StderrOutputWriter {
             OutputEvent::Completion(result) => {
                 eprintln!("\n[sned] Task Completed: {}", result);
             }
+            // TurnEnd is a TUI-only re-render signal; in one-shot/JSON
+            // output the streamed text was already written live.
+            OutputEvent::TurnEnd { .. } => {}
         }
     }
 

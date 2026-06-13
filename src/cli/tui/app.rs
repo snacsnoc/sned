@@ -170,6 +170,13 @@ pub struct App {
     /// completed `/plan` stays dismissed until the user starts a new query
     /// (separator, character, or backspace).
     pub slash_command_completed_text: Option<String>,
+    /// Indices into `output_lines` of lines that were streamed from the
+    /// model during the current turn. When `OutputEvent::TurnEnd` arrives,
+    /// the TUI pops these lines and replaces them with markdown-rendered
+    /// equivalents of the accumulated raw text. Lines are recorded in
+    /// append order; popping iterates from the highest index to the
+    /// lowest to preserve earlier indices.
+    pub turn_stream_line_indices: Vec<usize>,
     /// Whether the model picker is active.
     pub model_picker_active: bool,
     /// Model picker entries.
@@ -253,6 +260,7 @@ impl App {
             slash_command_selected: 0,
             slash_command_all_entries: Vec::new(),
             slash_command_completed_text: None,
+            turn_stream_line_indices: Vec::new(),
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
@@ -304,6 +312,81 @@ impl App {
         if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
             self.force_bottom();
         }
+    }
+
+    /// Push a model-streamed line and record its index for turn-end
+    /// markdown re-rendering. The index is taken AFTER `push_back`, so
+    /// it points at the line that was just added. On `TurnEnd`, the
+    /// recorded indices are popped and the raw text re-rendered as
+    /// markdown.
+    pub fn push_stream_line(&mut self, line: Line<'static>) {
+        let idx = self.output_lines.len();
+        self.push_output(line);
+        // push_output may have evicted the front of the buffer if it
+        // exceeded 10,000 lines. If our recorded index fell off, drop
+        // it and any earlier recorded indices for this turn — the
+        // eviction means the model output was so long that we cannot
+        // usefully re-render it as a unit anyway.
+        if idx >= self.output_lines.len() {
+            self.turn_stream_line_indices.clear();
+            return;
+        }
+        self.turn_stream_line_indices.push(idx);
+    }
+
+    /// Re-render the lines recorded during the current turn as
+    /// markdown. Pops the recorded lines from the tail of the buffer
+    /// (highest index first to preserve earlier indices) and pushes
+    /// the rendered lines in their place. Resets
+    /// `turn_stream_line_indices`.
+    ///
+    /// `markdown_text` is the raw, pre-wrap, pre-indent text that was
+    /// streamed during the turn. If empty, the streamed lines are
+    /// left in place and the index buffer is just cleared.
+    pub fn finalize_turn_stream(&mut self, markdown_text: &str) {
+        let indices = std::mem::take(&mut self.turn_stream_line_indices);
+        if indices.is_empty() || markdown_text.trim().is_empty() {
+            return;
+        }
+        // Validate the recorded indices are still in-range. If a
+        // 10,000-line eviction happened between recording and
+        // finalizing, fall back to clearing without replacement.
+        let max_idx = *indices.iter().max().unwrap();
+        if max_idx >= self.output_lines.len() {
+            return;
+        }
+
+        // Pop the recorded lines from highest index to lowest to
+        // preserve the relative order of the indices that come before.
+        for &idx in indices.iter().rev() {
+            self.output_lines.remove(idx);
+        }
+
+        // The recorded indices were contiguous in append order
+        // (model-streamed lines are emitted in sequence) but other
+        // events (RawAnsi code blocks) may have interleaved. The
+        // surviving lines between the popped region must be reindexed
+        // — since we popped from the highest index first, indices
+        // before any popped index remain valid. Indices after the
+        // popped region shift down by 1 per popped line.
+        //
+        // For simplicity, the markdown re-render is inserted at the
+        // position of the FIRST popped line (the minimum index). The
+        // result is approximate ordering when RawAnsi code blocks
+        // were interleaved inside the streamed text, but matches what
+        // the user would have seen — code blocks were emitted
+        // immediately when the model streamed them.
+        let insert_at = *indices.iter().min().unwrap();
+
+        for line in crate::cli::markdown::render_markdown(None, markdown_text) {
+            self.output_lines.insert(insert_at, line);
+        }
+
+        self.needs_redraw = true;
+        // Invalidate the visual-row cache: the line count and content
+        // changed, so the cached row count is stale.
+        self.cached_wrap_width = None;
+        self.rebuild_visual_row_cache(self.last_wrap_width());
     }
 
     /// Push a completion line to the completion buffer.
@@ -1705,6 +1788,137 @@ mod tests {
         assert!(
             !found,
             "slash command overlay should not render when slash_command_active is false"
+        );
+    }
+
+    #[test]
+    fn test_push_stream_line_records_indices_for_turn_end() {
+        // Three streamed model-output lines should be recorded as
+        // indices [0, 1, 2] in the order they were pushed. The
+        // recorded indices are what `finalize_turn_stream` pops.
+        let mut app = App::new();
+        app.push_stream_line(Line::from("first"));
+        app.push_stream_line(Line::from("second"));
+        app.push_stream_line(Line::from("third"));
+        assert_eq!(app.turn_stream_line_indices, vec![0, 1, 2]);
+        assert_eq!(app.output_lines.len(), 3);
+    }
+
+    #[test]
+    fn test_finalize_turn_stream_replaces_recorded_lines_with_markdown() {
+        // The user's bug report: agent text is rendered as raw
+        // characters even when it contains markdown. At turn end, the
+        // TUI should swap the streamed raw lines for the
+        // markdown-rendered version of the original text.
+        let mut app = App::new();
+        // Stream three lines that are a wrapped fragment of the
+        // original markdown "**bold** text".
+        app.push_stream_line(Line::from("  **bold"));
+        app.push_stream_line(Line::from("  text"));
+        app.push_stream_line(Line::from("  more"));
+        assert_eq!(app.output_lines.len(), 3);
+
+        app.finalize_turn_stream("**bold** text\n\nmore");
+
+        // The recorded raw lines should be gone. The new lines should
+        // contain the markdown-rendered content (no leading 2-space
+        // indent, bold span styled).
+        let rendered: Vec<String> = app
+            .output_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            !rendered.iter().any(|s| s.starts_with("  **bold")),
+            "raw streamed lines should be replaced: {:?}",
+            rendered
+        );
+        assert!(
+            !rendered.iter().any(|s| s == "  text"),
+            "raw streamed lines should be replaced: {:?}",
+            rendered
+        );
+        // No 🚀 prefix should appear in agent-text re-render.
+        assert!(
+            !rendered.iter().any(|s| s.contains("🚀")),
+            "agent-text re-render must not include the completion banner: {:?}",
+            rendered
+        );
+        assert!(app.turn_stream_line_indices.is_empty());
+    }
+
+    #[test]
+    fn test_finalize_turn_stream_empty_text_is_noop() {
+        // No accumulated text means the streamed lines are not
+        // markdown — leave them in place and just clear the recorded
+        // indices.
+        let mut app = App::new();
+        app.push_stream_line(Line::from("plain text"));
+        app.push_stream_line(Line::from("more plain"));
+        let before: Vec<String> = app
+            .output_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+
+        app.finalize_turn_stream("");
+
+        let after: Vec<String> = app
+            .output_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(after, before);
+        assert!(app.turn_stream_line_indices.is_empty());
+    }
+
+    #[test]
+    fn test_finalize_turn_stream_does_not_consume_ansi_code_block_lines() {
+        // Raw ANSI events (e.g., syntax-highlighted code blocks) are
+        // NOT recorded in turn_stream_line_indices — they are pushed
+        // directly. Turn-end replacement should leave them in place
+        // and only re-render the model-streamed text around them.
+        let mut app = App::new();
+        app.push_stream_line(Line::from("  intro"));
+        // Simulate a code block arriving as raw ANSI (push_output, not
+        // push_stream_line).
+        app.push_output(Line::from("  [code block line]"));
+        app.push_stream_line(Line::from("  outro"));
+        let indices_before = app.turn_stream_line_indices.clone();
+        assert_eq!(indices_before.len(), 2);
+
+        app.finalize_turn_stream("# Title\n\nbody");
+
+        // The code-block line should still be present.
+        let rendered: Vec<String> = app
+            .output_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rendered.iter().any(|s| s.contains("[code block line]")),
+            "ANSI code-block line should be preserved: {:?}",
+            rendered
         );
     }
 

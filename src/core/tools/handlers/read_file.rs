@@ -716,6 +716,7 @@ mod tests {
                 crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
+                crate::cli::output::OutputEvent::TurnEnd { .. } => {}
             }
         }
         rendered
