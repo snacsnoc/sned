@@ -1028,7 +1028,11 @@ impl App {
                     crate::core::file_search::FileType::Folder => "📁",
                     crate::core::file_search::FileType::File => "📄",
                 };
-                let label = format!("{} {}", icon, result.label);
+                let label = format!(
+                    "{} {}",
+                    icon,
+                    crate::core::file_search::truncated_display_path(&result.path)
+                );
                 if i == self.picker_index {
                     Line::from(Span::styled(label, theme::picker_selected_style()))
                 } else {

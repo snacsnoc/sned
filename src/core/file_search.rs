@@ -38,6 +38,21 @@ pub enum FileType {
     Folder,
 }
 
+/// Compute a display path for picker output.
+///
+/// Short paths (≤ 2 components) are shown in full. Long paths are
+/// truncated from the front so the most distinguishing part stays
+/// visible (fzf-style).  E.g. `"a/b/c/d/e/file.rs"` → `"c/d/e/file.rs"`.
+pub fn truncated_display_path(path: &str) -> String {
+    let components: Vec<&str> = path.split('/').collect();
+    if components.len() <= 2 {
+        return path.to_string();
+    }
+    // Keep the last 4 components, drop the rest from the front.
+    let keep = components.len().saturating_sub(4);
+    components[keep..].join("/")
+}
+
 /// Check if a directory name should be excluded from search.
 /// Uses patterns from workspace::DEFAULT_IGNORE_PATTERNS for consistency.
 fn is_excluded_dir(name: &str) -> bool {
@@ -750,5 +765,59 @@ mod tests {
             !paths.iter().any(|p| p.ends_with("cache.sqlite3")),
             "Should exclude cache.sqlite3"
         );
+    }
+
+    #[test]
+    fn test_truncated_display_path_short_paths() {
+        // Short paths (<=2 components) shown in full
+        assert_eq!(truncated_display_path("README.md"), "README.md");
+        assert_eq!(truncated_display_path("src/main.rs"), "src/main.rs");
+        assert_eq!(truncated_display_path("docs/README.md"), "docs/README.md");
+    }
+
+    #[test]
+    fn test_truncated_display_path_long_paths() {
+        // Long paths truncated from the front, keeping last 4 components
+        let input = "a/b/c/d/e/file.rs";
+        assert_eq!(truncated_display_path(input), "c/d/e/file.rs");
+
+        let input = "a/b/c/d/e/f/g/file.rs";
+        assert_eq!(truncated_display_path(input), "e/f/g/file.rs");
+    }
+
+    #[test]
+    fn test_truncated_display_path_boundary() {
+        // Exactly 3 components -> last 4 would exceed, keep all
+        assert_eq!(truncated_display_path("a/b/c"), "a/b/c");
+
+        // Exactly 4 components -> keep all
+        assert_eq!(truncated_display_path("a/b/c/d"), "a/b/c/d");
+
+        // 5 components -> drop first, keep last 4
+        assert_eq!(truncated_display_path("a/b/c/d/e"), "b/c/d/e");
+    }
+
+    #[test]
+    fn test_truncated_display_path_no_trailing_slash() {
+        // Paths with no slashes
+        assert_eq!(truncated_display_path("file.rs"), "file.rs");
+        assert_eq!(truncated_display_path("README.md"), "README.md");
+    }
+
+    #[test]
+    fn test_truncated_display_path_distinguishes_duplicates() {
+        // Two files with the same basename at different depths
+        let root = truncated_display_path("README.md");
+        let nested = truncated_display_path("sql/README.md");
+        let deeper = truncated_display_path("sql/core/README.md");
+
+        // Short paths (<=2 components) shown in full
+        assert_eq!(root, "README.md");
+        assert_eq!(nested, "sql/README.md");
+        assert_eq!(deeper, "sql/core/README.md");
+
+        // All distinct — no collisions
+        assert!(root != nested);
+        assert!(nested != deeper);
     }
 }
