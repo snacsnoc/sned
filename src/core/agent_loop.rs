@@ -3070,7 +3070,7 @@ impl AgentLoop {
                                 format!("  {} {}", status, first_line),
                                 is_error,
                             ));
-                    } else {
+                    } else if !matches!(tool_name.as_str(), "plan_mode_respond" | "ask_followup_question" | "condense" | "use_subagents") {
                         let max_lines = MAX_TOOL_RESULT_DISPLAY_LINES;
                         let displayed = format_tool_result(&result_output.text, max_lines);
                         let status = if is_error { "✗" } else { "✓" };
