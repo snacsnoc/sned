@@ -805,6 +805,12 @@ mod tests {
     }
 
     #[test]
+    fn test_truncated_display_path_empty() {
+        // Empty path: one empty component, returned as-is.
+        assert_eq!(truncated_display_path(""), "");
+    }
+
+    #[test]
     fn test_truncated_display_path_distinguishes_duplicates() {
         // Two files with the same basename at different depths
         let root = truncated_display_path("README.md");

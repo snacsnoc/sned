@@ -361,6 +361,9 @@ impl App {
     pub fn finalize_turn_stream(&mut self, markdown_text: &str) {
         let indices = std::mem::take(&mut self.turn_stream_line_indices);
         if indices.is_empty() || markdown_text.trim().is_empty() {
+            // Drop any pending indicator so it does not linger as an
+            // orphaned line if this turn produced no markdown.
+            self.turn_indicator = None;
             return;
         }
         // Validate the recorded indices are still in-range. If a
@@ -368,6 +371,9 @@ impl App {
         // finalizing, fall back to clearing without replacement.
         let max_idx = *indices.iter().max().unwrap();
         if max_idx >= self.output_lines.len() {
+            // Eviction happened: clear the pending indicator too so
+            // it does not appear as a stray line after the eviction.
+            self.turn_indicator = None;
             return;
         }
 
@@ -403,7 +409,13 @@ impl App {
         }
 
         let offset = if had_indicator { 1 } else { 0 };
-        for line in crate::cli::markdown::render_markdown(None, markdown_text) {
+        // Collect rendered lines, then insert in reverse at the same
+        // position. Each insert is O(1) amortized (tail-shift only),
+        // avoiding the O(n²) cost of inserting each line at a growing
+        // index in a VecDeque.
+        let rendered: Vec<Line<'static>> =
+            crate::cli::markdown::render_markdown(None, markdown_text);
+        for line in rendered.into_iter().rev() {
             self.output_lines.insert(insert_at + offset, line);
         }
 
@@ -1019,20 +1031,28 @@ impl App {
             height: max_height + 2, // +2 for border
         };
 
-        let rows: Vec<Line> = self
+        // Pre-compute display labels once per frame so the inner
+        // closure only does the per-row span/line construction.
+        let labels: Vec<String> = self
             .picker_results
             .iter()
-            .enumerate()
-            .map(|(i, result)| {
+            .map(|result| {
                 let icon = match result.file_type {
                     crate::core::file_search::FileType::Folder => "📁",
                     crate::core::file_search::FileType::File => "📄",
                 };
-                let label = format!(
+                format!(
                     "{} {}",
                     icon,
                     crate::core::file_search::truncated_display_path(&result.path)
-                );
+                )
+            })
+            .collect();
+
+        let rows: Vec<Line> = labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| {
                 if i == self.picker_index {
                     Line::from(Span::styled(label, theme::picker_selected_style()))
                 } else {
