@@ -1125,11 +1125,19 @@ async fn build_task_components(
         let cwd = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                anyhow::anyhow!("--continue requires a valid UTF-8 current directory")
+            })?;
         state_manager
             .get_most_recent_task_for_workspace(&cwd)
             .map(|h| h.id)
-            .unwrap_or_else(|| "task-123".to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No previous task found for workspace '{}'. \
+                     Start a new task without --continue, or use --taskId to specify one.",
+                    cwd
+                )
+            })?
     } else {
         ulid::Ulid::new().to_string()
     };
