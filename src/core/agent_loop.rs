@@ -242,11 +242,13 @@ fn print_model_line_with_prefix_if_pending(
 ) {
     if *pending && !line.trim().is_empty() {
         *pending = false;
-        let prefixed = format!("\u{2666} {}", line);
-        print_model_line(&prefixed, output_writer);
-    } else {
-        print_model_line(line, output_writer);
+        // Emit the turn indicator as a separate event so the TUI stores it
+        // outside the streamed-line buffer. `finalize_turn_stream` pops the
+        // streamed lines and re-renders them as markdown; if the indicator
+        // were part of the streamed text, it would be lost in the re-render.
+        output_writer.emit(crate::cli::output::OutputEvent::turn_indicator("\u{2666}"));
     }
+    print_model_line(line, output_writer);
 }
 
 fn stream_error_is_retryable(error: &str) -> bool {
