@@ -1948,6 +1948,63 @@ mod tests {
     }
 
     #[test]
+    fn test_finalize_turn_stream_reinserts_turn_indicator() {
+        // Verify that when a TurnIndicator is stored via
+        // push_turn_indicator, finalize_turn_stream re-inserts it at
+        // the top of the markdown block instead of leaving it as an
+        // orphaned line.
+        let mut app = App::new();
+        app.push_turn_indicator(Line::from(Span::styled(
+            "♦",
+            Style::default().fg(crate::cli::tui::theme::ACCENT),
+        )));
+        app.push_stream_line(Line::from("  **bold** text"));
+        app.push_stream_line(Line::from("  more"));
+        assert_eq!(app.output_lines.len(), 2); // only streamed lines (indicator stored separately)
+        assert_eq!(app.turn_stream_line_indices.len(), 2); // only stream lines tracked
+
+        app.finalize_turn_stream("**bold** text\n\nmore");
+
+        // The indicator should be at index 0, markdown at index 1+.
+        let first_text: String = app
+            .output_lines
+            .front()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(first_text.contains("♦"), "indicator should be at index 0: {:?}", app.output_lines);
+
+        // Markdown lines follow (no leading 2-space indent).
+        let markdown_lines: Vec<String> = app
+            .output_lines
+            .iter()
+            .skip(1)
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        for line in &markdown_lines {
+            assert!(
+                !line.starts_with("  "),
+                "markdown line should not have indent: {:?}",
+                line
+            );
+        }
+        assert!(
+            markdown_lines.iter().any(|l| l.contains("bold")),
+            "markdown should contain 'bold': {:?}",
+            markdown_lines
+        );
+        assert!(app.turn_indicator.is_none(), "indicator should be cleared");
+        assert!(app.turn_stream_line_indices.is_empty());
+    }
+
+    #[test]
     fn test_wrapped_line_not_clipped_at_viewport_boundary() {
         // This is the exact scenario that caused the clipping bug with the old
         // virtual scrolling approach. A long wrapped line sits at the top of the
