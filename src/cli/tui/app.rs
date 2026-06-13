@@ -399,24 +399,26 @@ impl App {
         // immediately when the model streamed them.
         let insert_at = *indices.iter().min().unwrap();
 
-        // Re-insert the turn-indicator line at the top of the rendered
-        // block so it does not appear as an orphaned line between
-        // paragraphs after `finalize_turn_stream` replaces streamed
-        // lines with markdown.
-        let had_indicator = self.turn_indicator.is_some();
-        if let Some(ind) = self.turn_indicator.take() {
-            self.output_lines.insert(insert_at, ind);
-        }
-
-        let offset = if had_indicator { 1 } else { 0 };
+        // The turn indicator ("\u{2666}") was prepended inline to the
+        // first streamed model line by `print_model_line_with_prefix_if_pending`.
+        // That line was recorded in `turn_stream_line_indices` and is
+        // about to be popped, so prepend the same prefix to the markdown
+        // text before re-rendering. This keeps the indicator on the
+        // same line as the start of the response instead of dropping it
+        // or forcing it onto its own line.
+        let prefixed_markdown = if self.turn_indicator.take().is_some() {
+            format!("\u{2666} {}", markdown_text)
+        } else {
+            markdown_text.to_string()
+        };
         // Collect rendered lines, then insert in reverse at the same
         // position. Each insert is O(1) amortized (tail-shift only),
         // avoiding the O(n²) cost of inserting each line at a growing
         // index in a VecDeque.
         let rendered: Vec<Line<'static>> =
-            crate::cli::markdown::render_markdown(None, markdown_text);
+            crate::cli::markdown::render_markdown(None, &prefixed_markdown);
         for line in rendered.into_iter().rev() {
-            self.output_lines.insert(insert_at + offset, line);
+            self.output_lines.insert(insert_at, line);
         }
 
         self.needs_redraw = true;
@@ -1974,12 +1976,14 @@ mod tests {
     #[test]
     fn test_finalize_turn_stream_reinserts_turn_indicator() {
         // Verify that when a TurnIndicator is stored via
-        // push_turn_indicator, finalize_turn_stream re-inserts it at
-        // the top of the markdown block instead of leaving it as an
-        // orphaned line.
+        // push_turn_indicator, finalize_turn_stream preserves it by
+        // prepending "\u{2666} " to the markdown text before re-rendering,
+        // so the indicator stays on the same line as the first rendered
+        // response line instead of being dropped or pushed onto its own
+        // line.
         let mut app = App::new();
         app.push_turn_indicator(Line::from(Span::styled(
-            "♦",
+            "\u{2666}",
             Style::default().fg(crate::cli::tui::theme::ACCENT),
         )));
         app.push_stream_line(Line::from("  **bold** text"));
@@ -1989,7 +1993,8 @@ mod tests {
 
         app.finalize_turn_stream("**bold** text\n\nmore");
 
-        // The indicator should be at index 0, markdown at index 1+.
+        // The indicator should be prepended inline to the first rendered
+        // markdown line (not a separate line above it).
         let first_text: String = app
             .output_lines
             .front()
@@ -1998,13 +2003,21 @@ mod tests {
             .iter()
             .map(|s| s.content.to_string())
             .collect();
-        assert!(first_text.contains("♦"), "indicator should be at index 0: {:?}", app.output_lines);
+        assert!(
+            first_text.contains("\u{2666}"),
+            "first rendered line should contain the indicator prefix: {:?}",
+            app.output_lines
+        );
+        assert!(
+            first_text.contains("bold"),
+            "first rendered line should still contain the markdown content: {:?}",
+            first_text
+        );
 
-        // Markdown lines follow (no leading 2-space indent).
-        let markdown_lines: Vec<String> = app
+        // No line should be a bare indicator line.
+        let all_lines: Vec<String> = app
             .output_lines
             .iter()
-            .skip(1)
             .map(|l| {
                 l.spans
                     .iter()
@@ -2012,18 +2025,14 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        for line in &markdown_lines {
+        for line in &all_lines {
             assert!(
-                !line.starts_with("  "),
-                "markdown line should not have indent: {:?}",
-                line
+                !(line.trim() == "\u{2666}"),
+                "indicator must not be on its own line: {:?}",
+                all_lines
             );
         }
-        assert!(
-            markdown_lines.iter().any(|l| l.contains("bold")),
-            "markdown should contain 'bold': {:?}",
-            markdown_lines
-        );
+
         assert!(app.turn_indicator.is_none(), "indicator should be cleared");
         assert!(app.turn_stream_line_indices.is_empty());
     }

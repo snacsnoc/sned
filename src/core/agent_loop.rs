@@ -242,9 +242,11 @@ fn print_model_line_with_prefix_if_pending(
 ) {
     if *pending && !line.trim().is_empty() {
         *pending = false;
-        output_writer.emit(crate::cli::output::OutputEvent::turn_indicator("♦"));
+        let prefixed = format!("\u{2666} {}", line);
+        print_model_line(&prefixed, output_writer);
+    } else {
+        print_model_line(line, output_writer);
     }
-    print_model_line(line, output_writer);
 }
 
 fn stream_error_is_retryable(error: &str) -> bool {
