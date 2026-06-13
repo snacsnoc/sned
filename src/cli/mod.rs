@@ -593,7 +593,9 @@ fn run_task(
     root_opts: RootOnlyOptions,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_task_inner(prompt, task_opts, root_opts))
+    let task_id = rt.block_on(run_task_inner(prompt, task_opts, root_opts))?;
+    println!("Session: {task_id}");
+    Ok(())
 }
 
 struct TaskComponents {
@@ -1271,9 +1273,11 @@ async fn run_task_inner(
     prompt: Option<String>,
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let session = InteractiveSession::build(task_opts, root_opts).await?;
-    session.run(prompt).await
+    session.run(prompt).await?;
+    let task_id = session.agent_loop().await.task_id().to_string();
+    Ok(task_id)
 }
 
 fn run_interactive_shell(task_opts: TaskOptions, root_opts: RootOnlyOptions) -> anyhow::Result<()> {
@@ -1327,7 +1331,6 @@ pub fn run() -> anyhow::Result<()> {
     // mode (stderr writes inside the alternate screen corrupt the
     // display).
     let tui_mode = cli.command.is_none()
-        && !cli.root_opts.continue_task
         && cli.root_opts.task_id.is_none()
         && interactive::should_start_interactive_shell(
             cli.prompt.is_some(),
@@ -1386,7 +1389,7 @@ pub fn run() -> anyhow::Result<()> {
                 if stdin_was_piped {
                     anyhow::bail!("Use --continue without piped input.")
                 }
-                return run_task(None, cli.task_opts, cli.root_opts);
+                return run_interactive_shell(cli.task_opts, cli.root_opts);
             }
 
             if stdin_input.as_deref() == Some("") && cli.prompt.is_none() {

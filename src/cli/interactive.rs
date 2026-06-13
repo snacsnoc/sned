@@ -2892,7 +2892,7 @@ pub async fn run_interactive_shell_inner(
         &mut output_rx,
         output_writer,
         session,
-        task_id,
+        task_id.clone(),
         agent_busy,
         agent_done,
         agent_start_time,
@@ -2902,7 +2902,9 @@ pub async fn run_interactive_shell_inner(
         &task_opts,
         auto_approve,
     )
-    .await
+    .await?;
+    println!("Session: {task_id}");
+    Ok(())
 }
 pub fn should_start_interactive_shell(
     has_prompt: bool,
