@@ -3467,6 +3467,16 @@ impl AgentLoop {
                     );
                 }
             }
+            // Use the response-only text (thinking tags stripped) for
+            // markdown re-rendering. accumulated_text contains raw
+            // thinking tags which pulldown_cmark treats as raw HTML and
+            // emits as raw text, defeating the markdown render.
+            let markdown_text = response_text.as_deref().unwrap_or("");
+            if !self.config.json_output && !markdown_text.is_empty() {
+                self.config.output_writer.emit(OutputEvent::TurnEnd {
+                    accumulated_text: markdown_text.to_string(),
+                });
+            }
             if !self.config.interactive_mode
                 && !self.config.json_output
                 && crate::cli::output::timing_enabled()
@@ -3491,17 +3501,21 @@ impl AgentLoop {
             // model text as formatted markdown. Only meaningful in
             // interactive TUI mode (the StderrOutputWriter ignores it
             // and JSON mode doesn't stream text to the output pane).
-            if !self.config.json_output && !accumulated_text.is_empty() {
+            // Use response_text (thinking tags stripped) so the rendered
+            // markdown is not corrupted by raw thinking-tag HTML.
+            let markdown_text = response_text.as_deref().unwrap_or("");
+            if !self.config.json_output && !markdown_text.is_empty() {
                 self.config.output_writer.emit(OutputEvent::TurnEnd {
-                    accumulated_text: accumulated_text.clone(),
+                    accumulated_text: markdown_text.to_string(),
                 });
             }
             TurnResult::Complete
         } else {
             // Same turn-end signal for the "more turns coming" branch.
-            if !self.config.json_output && !accumulated_text.is_empty() {
+            let markdown_text = response_text.as_deref().unwrap_or("");
+            if !self.config.json_output && !markdown_text.is_empty() {
                 self.config.output_writer.emit(OutputEvent::TurnEnd {
-                    accumulated_text: accumulated_text.clone(),
+                    accumulated_text: markdown_text.to_string(),
                 });
             }
             TurnResult::Continue
