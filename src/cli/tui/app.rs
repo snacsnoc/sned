@@ -572,7 +572,18 @@ impl App {
 
     /// Push a turn separator line.
     pub fn push_turn_separator(&mut self) {
-        self.push_output(Line::from(Span::styled("─".repeat(40), theme::dim_style())));
+        let sep_width = self.last_wrap_width().max(20);
+        let diamond = " ♦ ";
+        let remainder = sep_width.saturating_sub(diamond.len());
+        let left = (remainder + 1) / 2;
+        let right = remainder / 2;
+        let sep = format!(
+            "{}{}{}",
+            "─".repeat(left),
+            diamond,
+            "─".repeat(right),
+        );
+        self.push_output(Line::from(Span::styled(sep, theme::dim_style())));
     }
 
     /// Push a user message with proper formatting (splits on newlines).
@@ -761,7 +772,8 @@ impl App {
     }
 
     fn content_wrap_width(content_width: usize) -> usize {
-        content_width.saturating_sub(3).max(1)
+        // 2 chars consumed by block borders.
+        content_width.saturating_sub(2).max(1)
     }
 
     fn line_visual_rows(line: &Line<'_>, wrap_width: usize) -> usize {
@@ -853,6 +865,7 @@ impl App {
             .iter()
             .map(|line| Self::line_visual_rows(line, wrap_width))
             .sum();
+        // Completion box uses the same wrap width (only borders, no gutter).
         let completion_rows: usize = self
             .completion_lines
             .iter()
@@ -1075,19 +1088,18 @@ impl App {
         // but slicing the render buffer can clip wrapped prompt text.
         {
             frame.render_widget(Clear, main_output_area);
-            let output = Paragraph::new(
-                self.output_lines
-                    .iter()
-                    .skip(start_idx)
-                    .take(visible_count)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((visible_scroll_y as u16, 0))
-            .block(
-                theme::border_block(" sned ").padding(ratatui::widgets::Padding::new(1, 0, 0, 0)),
-            );
+            let visible_lines: Vec<Line<'static>> = self.output_lines
+                .iter()
+                .skip(start_idx)
+                .take(visible_count)
+                .cloned()
+                .collect();
+            let output = Paragraph::new(visible_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((visible_scroll_y as u16, 0))
+                .block(
+                    theme::border_block(" sned ").padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
+                );
             frame.render_widget(output, main_output_area);
         }
 

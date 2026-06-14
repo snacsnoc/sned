@@ -159,9 +159,17 @@ impl OutputEvent {
     }
 
     /// Emit a tool-result line. The TUI will never pop or re-render
-    /// these lines during `finalize_turn_stream`.
+    /// these lines during `finalize_turn_stream`. Tool output is dimmed
+    /// to create visual hierarchy against bright model text, except
+    /// for error lines which must stay visible.
     pub fn tool_output_line(text: impl Into<String>, style: ratatui::style::Style) -> Self {
-        OutputEvent::ToolOutputLine(Line::from(Span::styled(text.into(), style)))
+        let is_error = style.fg == Some(crate::cli::tui::theme::ERROR_FG);
+        let final_style = if is_error {
+            style
+        } else {
+            style.add_modifier(ratatui::style::Modifier::DIM)
+        };
+        OutputEvent::ToolOutputLine(Line::from(Span::styled(text.into(), final_style)))
     }
 }
 
