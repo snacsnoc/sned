@@ -66,14 +66,26 @@ impl EditFileHandler {
 
     fn file_entry_path(file: &serde_json::Value) -> Result<&str, String> {
         match file.get("path") {
-            None => Err(
-                "edit_file requires a 'path' key in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
-                    .to_string(),
-            ),
             Some(path) => path.as_str().ok_or_else(|| {
                 "edit_file requires 'path' to be a string in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
                     .to_string()
             }),
+            None => {
+                // Lenient fallback: models commonly put "path" inside the first
+                // edit object instead of at the file-entry level. Extract it
+                // if present so the edit succeeds without a wasted round-trip.
+                if let Some(edits) = file.get("edits").and_then(|e| e.as_array()) {
+                    if let Some(first_edit) = edits.first() {
+                        if let Some(path) = first_edit.get("path").and_then(|p| p.as_str()) {
+                            return Ok(path);
+                        }
+                    }
+                }
+                Err(
+                    "edit_file requires a 'path' key in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
+                        .to_string(),
+                )
+            }
         }
     }
 
@@ -217,11 +229,26 @@ impl EditFileHandler {
                 .get("edits")
                 .and_then(|e| e.as_array())
                 .ok_or_else(|| {
-                    ToolError::InvalidInput(format!(
-                        "Missing 'edits' for file '{}'. {}",
-                        path,
-                        error_guidance::missing_parameter("edits", 0)
-                    ))
+                    // Lenient: models sometimes put anchor/edit_type/text as
+                    // siblings at the file-entry level instead of inside an
+                    // edits array. Detect this and give a targeted error.
+                    let has_anchor = file.get("anchor").and_then(|a| a.as_str()).is_some();
+                    let has_edit_type = file.get("edit_type").and_then(|t| t.as_str()).is_some();
+                    let has_text = file.get("text").and_then(|t| t.as_str()).is_some();
+                    if has_anchor || has_edit_type || has_text {
+                        ToolError::InvalidInput(format!(
+                            "The 'anchor', 'edit_type', and 'text' fields must be inside an 'edits' array, not at the file-entry level.\n\n\
+                             Correct: {{ \"path\": \"{}\", \"edits\": [{{ \"anchor\": \"...\", \"text\": \"...\" }}] }}\n\
+                             Wrong:   {{ \"path\": \"{}\", \"anchor\": \"...\", \"text\": \"...\" }}",
+                            path, path
+                        ))
+                    } else {
+                        ToolError::InvalidInput(format!(
+                            "Missing 'edits' for file '{}'. {}",
+                            path,
+                            error_guidance::missing_parameter("edits", 0)
+                        ))
+                    }
                 })?;
 
             let mut edits = Vec::new();
@@ -310,13 +337,14 @@ impl EditFileHandler {
         workspace_root: &Path,
     ) -> Result<(), ToolError> {
         let mut invalid_anchors = Vec::new();
+        let mut path_errors = Vec::new();
         let mut affected_paths = Vec::new();
 
         for file in files {
             let path = match Self::file_entry_path(file) {
                 Ok(path) => path,
                 Err(message) => {
-                    invalid_anchors.push(format!("  - {}", message));
+                    path_errors.push(format!("  - {}", message));
                     continue;
                 }
             };
@@ -406,6 +434,23 @@ impl EditFileHandler {
                     }
                 }
             }
+        }
+
+        if !path_errors.is_empty() {
+            let mut message = String::from(
+                "Missing 'path' key in file entry. Each object in the 'files' array must have 'path' at the top level (a sibling of 'edits'), not nested inside the edit object.\n\n",
+            );
+            message.push_str("Problems detected:\n");
+            message.push_str(&path_errors.join("\n"));
+            if !invalid_anchors.is_empty() {
+                message.push_str("\n\nAdditionally, anchor issues were found:\n");
+                message.push_str(&invalid_anchors.join("\n"));
+            }
+            message.push_str("\n\nCorrect structure: { \"path\": \"file.py\", \"edits\": [{ \"anchor\": \"...\", \"text\": \"...\" }] }");
+            message.push_str("\nWrong structure: { \"edits\": [{ \"anchor\": \"...\", \"text\": \"...\", \"path\": \"file.py\" }] }");
+            affected_paths.sort();
+            affected_paths.dedup();
+            return Err(ToolError::InvalidInput(message));
         }
 
         if !invalid_anchors.is_empty() {
@@ -912,11 +957,14 @@ impl EditFileHandler {
                 }
             }
 
-            // Store intermediate result for building final output after batch diagnostics
+            // Store intermediate result for building final output after batch diagnostics.
+            // Use split('\n') instead of .lines() to match split_content_lines() semantics:
+            // .lines() strips a trailing empty element, but split('\n') preserves it.
+            // applied_edits indices are based on split('\n') counts, so we must match.
             let final_lines: Vec<String> = result
                 .final_content
                 .as_ref()
-                .map(|c| c.lines().map(|s| s.to_string()).collect())
+                .map(|c| c.split('\n').map(|s| s.to_string()).collect())
                 .unwrap_or_default();
 
             let final_hashes = compute_hashes(&final_lines)
@@ -1810,6 +1858,107 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("requires a 'path' key"));
         assert!(err_msg.contains("src/file.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_path_inside_edit_object_is_accepted() {
+        // Regression: models sometimes put "path" inside the edit object
+        // instead of at the file-entry level. The handler must accept this
+        // leniently rather than failing with a confusing structural error.
+        use tempfile::tempdir;
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines("line 1\nline 2\nline 3\n");
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        // Model sends path inside edit object (common mistake)
+        let anchor = format!("{}§line 2", anchors[1]);
+        let params = serde_json::json!({
+            "files": [{
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "replaced",
+                    "path": "test.txt"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        // Should succeed — path inside edit object is accepted leniently
+        assert!(
+            result.is_ok(),
+            "path inside edit object should be accepted leniently. Got error: {:?}",
+            result.err()
+        );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "line 1\nreplaced\nline 3\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_edit_fields_as_siblings_reports_correct_error() {
+        // Regression: models sometimes put anchor/edit_type/text as siblings
+        // at the file-entry level instead of inside an edits array.
+        // The error must explain the correct structure.
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        // Model sends anchor/text as siblings of path (no edits array)
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.rs",
+                "anchor": "Apple§fn main() {",
+                "edit_type": "replace",
+                "text": "replacement"
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("must be inside an 'edits' array"),
+            "Should explain that edit fields belong in 'edits' array. Got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("Correct:"),
+            "Should show correct structure. Got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("Wrong:"),
+            "Should show wrong structure. Got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
@@ -4053,5 +4202,426 @@ edition = "2021"
             "error must name the 'files' parameter, got: {}",
             msg
         );
+    }
+
+    // =====================================================================
+    // Model-simulation tests
+    //
+    // These tests send the EXACT JSON structures that real models produced
+    // in conversation exports. They simulate model-shaped inputs rather than
+    // constructing clean Rust-native JSON. Each test is annotated with the
+    // conversation export and model that produced the pattern.
+    //
+    // If a test fails, the fix must be a lenient acceptance or a targeted
+    // error message — never a silent rejection that wastes a round-trip.
+    // =====================================================================
+
+    /// Helper: create a temp file, reconcile anchors, return (dir, file_path, anchors).
+    /// The caller must keep `dir` alive for the duration of the test.
+    async fn setup_test_file(
+        content: &str,
+        task_id: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, content).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(content);
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some(task_id));
+        (dir, file_path, anchors)
+    }
+
+    /// Helper: build a ToolContext for a temp dir.
+    fn ctx_for_dir(dir: &tempfile::TempDir, task_id: &str) -> ToolContext {
+        ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            task_id.to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        )
+    }
+
+    // --- Pattern 1: path inside edit object ---
+    // Seen in: prompt 2 (Claude), prompt 3 (Qwen), prompt 4 (Mimo)
+    // Model puts "path" inside the edit object instead of at file-entry level.
+    // The handler must accept this leniently.
+
+    #[tokio::test]
+    async fn model_sim_path_inside_edit_object_accepted() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("line 1\nline 2\nline 3\n", "sim-path-inside").await;
+        let ctx = ctx_for_dir(&dir, "sim-path-inside");
+
+        let anchor = format!("{}§line 2", anchors[1]);
+        // Exact structure from prompt 2 msg_23 (Claude) — path inside edit object
+        let params = serde_json::json!({
+            "files": [{
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "replaced",
+                    "path": "test.txt"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "path inside edit object should be accepted. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("replaced"), "edit should have been applied");
+    }
+
+    // --- Pattern 2: anchor/edit_type/text as siblings ---
+    // Seen in: prompt 3 (Qwen), prompt 4 (Mimo), prompt 6 (DeepSeek)
+    // Model puts anchor, edit_type, text at file-entry level instead of
+    // inside an edits array.
+
+    #[tokio::test]
+    async fn model_sim_edit_fields_as_siblings_gives_targeted_error() {
+        let handler = EditFileHandler::new();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "sim-siblings".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        // Exact structure from prompt 4 msg_13 (Mimo)
+        let params = serde_json::json!({
+            "files": [{
+                "anchor": "SomeWord§    return f\"{result:.4f}\"",
+                "edit_type": "insert_after",
+                "path": "utils.py",
+                "text": "\n\ndef clamp_result(value, min_val, max_val):"
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("must be inside an 'edits' array"),
+            "should explain the structural problem, got: {msg}"
+        );
+        assert!(
+            msg.contains("Correct:") && msg.contains("Wrong:"),
+            "should show correct and wrong structures, got: {msg}"
+        );
+    }
+
+    // --- Pattern 3: end_anchor at file-entry level ---
+    // Seen in: prompt 6 (DeepSeek)
+    // Model puts end_anchor at file-entry level alongside edits.
+
+    #[tokio::test]
+    async fn model_sim_end_anchor_at_file_entry_level_accepted() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("line 1\nline 2\nline 3\n", "sim-end-anchor").await;
+        let ctx = ctx_for_dir(&dir, "sim-end-anchor");
+
+        let anchor = format!("{}§line 1", anchors[0]);
+        let end_anchor = format!("{}§line 2", anchors[1]);
+        // Exact structure from prompt 6 msg_23 (DeepSeek) — end_anchor at file-entry level
+        let params = serde_json::json!({
+            "files": [{
+                "anchor": anchor,
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "replaced"
+                }],
+                "end_anchor": end_anchor,
+                "path": "test.txt"
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "end_anchor at file-entry level should not break. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("replaced"), "edit should have been applied");
+    }
+
+    // --- Pattern 4: anchor at file-entry level alongside edits ---
+    // Seen in: prompt 5 (unknown model), prompt 6 (DeepSeek)
+    // Model puts anchor at file-entry level AND inside edits (redundant).
+
+    #[tokio::test]
+    async fn model_sim_anchor_at_file_entry_alongside_edits_accepted() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("line 1\nline 2\nline 3\n", "sim-anchor-sibling").await;
+        let ctx = ctx_for_dir(&dir, "sim-anchor-sibling");
+
+        let anchor = format!("{}§line 2", anchors[1]);
+        // Exact structure from prompt 5 msg_9 (model puts anchor at file-entry level
+        // alongside edits, with path at file-entry level)
+        let params = serde_json::json!({
+            "files": [{
+                "anchor": anchor,
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "insert_after",
+                    "text": "\n\ndef clamp_result(value, min_val=0, max_val=100):"
+                }],
+                "path": "test.txt"
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "anchor at file-entry level alongside edits should be accepted. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("clamp_result"), "edit should have been applied");
+    }
+
+    // --- Pattern 5: stringified JSON with unescaped quotes in anchor ---
+    // Seen in: prompt 3 (Qwen)
+    // Model sends files as a stringified JSON but the anchor content
+    // contains unescaped double quotes that break JSON parsing.
+
+    #[tokio::test]
+    async fn model_sim_stringified_json_with_unescaped_quotes() {
+        let handler = EditFileHandler::new();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "sim-unescaped".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        // Exact structure from prompt 3 msg_13 (Qwen) — anchor has unescaped quotes
+        let params = serde_json::json!({
+            "files": "[{\"path\": \"utils.py\", \"edits\": [{\"anchor\": \"SomeWord§    return f\"{result:.4f}\".rstrip('0').rstrip('.'), \"edit_type\": \"insert_after\", \"text\": \"\\n\\ndef clamp_result()\"}]}]"
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        // Should return Ok with error message, not panic
+        assert!(result.is_ok());
+        let msg = result.unwrap().as_str().unwrap().to_string();
+        assert!(
+            msg.contains("Parse error") || msg.contains("parse error"),
+            "should surface the JSON parse error, got: {msg}"
+        );
+    }
+
+    // --- Pattern 6: stringified JSON with missing comma ---
+    // Seen in: prompt 4 (Mimo)
+    // Model sends files as stringified JSON with a missing comma between
+    // the closing brace and "path" key.
+
+    #[tokio::test]
+    async fn model_sim_stringified_json_missing_comma() {
+        let handler = EditFileHandler::new();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "sim-missing-comma".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        // Exact structure from prompt 4 msg_23 (Mimo) — missing comma before "path"
+        let params = serde_json::json!({
+            "files": "[{\"edits\": [{\"anchor\": \"Word§line\", \"edit_type\": \"replace\", \"text\": \"new\"}] \"path\": \"test.py\"}]"
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_ok());
+        let msg = result.unwrap().as_str().unwrap().to_string();
+        assert!(
+            msg.contains("Parse error") || msg.contains("parse error"),
+            "should surface the JSON parse error, got: {msg}"
+        );
+    }
+
+    // --- Pattern 7: edits as string at file-entry level ---
+    // Seen in: prompt 3 (Qwen)
+    // Model sends edits as a stringified JSON string instead of an array.
+
+    #[tokio::test]
+    async fn model_sim_edits_as_string_at_file_entry() {
+        let handler = EditFileHandler::new();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "sim-edits-string".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        // Exact structure from prompt 3 msg_21 (Qwen)
+        let params = serde_json::json!({
+            "files": [{
+                "path": "main.py",
+                "edits": "[{\"anchor\": \"Word§line\", \"edit_type\": \"replace\", \"text\": \"new\"}]"
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Missing 'edits'") || msg.contains("edits"),
+            "should report missing/invalid edits, got: {msg}"
+        );
+    }
+
+    // --- Pattern 8: path missing entirely (no path anywhere) ---
+    // Seen in: prompt 2 (Claude), prompt 3 (Qwen)
+    // Model sends edits array with no path at file-entry level and no
+    // path inside the edit object either.
+
+    #[tokio::test]
+    async fn model_sim_path_missing_entirely() {
+        let handler = EditFileHandler::new();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            false,
+            "sim-no-path".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let params = serde_json::json!({
+            "files": [{
+                "edits": [{
+                    "anchor": "Apple§fn main() {",
+                    "text": "replacement"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("requires a 'path' key"),
+            "should report missing path, got: {msg}"
+        );
+    }
+
+    // --- Pattern 9: multiline replace near end of file ending with newline ---
+    // This would have caught the .lines() vs .split('\n') panic.
+    // The file ends with \n, the edit modifies the last lines, and
+    // format_result needs to index into final_hashes.
+
+    #[tokio::test]
+    async fn model_sim_replace_near_end_of_file_with_trailing_newline() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) = setup_test_file(
+            "def add(a, b):\n    return a + b\n\ndef divide(a, b):\n    return a / b\n",
+            "sim-trailing-nl",
+        )
+        .await;
+        let ctx = ctx_for_dir(&dir, "sim-trailing-nl");
+
+        // Replace the last function (near the end of a file that ends with \n)
+        let anchor = format!("{}§    return a / b", anchors[4]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "    if b == 0:\n        return None\n    return a / b"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "replace near end of file with trailing newline should not panic. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("if b == 0"), "edit should have been applied");
+        assert!(content.ends_with('\n'), "trailing newline should be preserved");
+    }
+
+    // --- Pattern 10: multiple edits in one file in one call ---
+    // Seen in: prompt 6 (DeepSeek), prompt 5 (unknown model)
+    // Model sends two edits for the same file in one edit_file call.
+
+    #[tokio::test]
+    async fn model_sim_two_edits_same_file_one_call() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) = setup_test_file(
+            "def format_result(result):\n    return f\"{result:.4f}\"\n\ndef log_operation(a, b):\n    print(f\"{a} + {b}\")\n",
+            "sim-two-edits",
+        )
+        .await;
+        let ctx = ctx_for_dir(&dir, "sim-two-edits");
+
+        let anchor1 = format!("{}§    return f\"{{result:.4f}}\"", anchors[1]);
+        let anchor2 = format!("{}§def log_operation(a, b):", anchors[3]);
+        // Exact pattern from prompt 6 msg_15 (DeepSeek) — two edits in one call
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [
+                    {
+                        "anchor": anchor1,
+                        "edit_type": "insert_after",
+                        "text": "\n\ndef clamp_result(value, min_val, max_val):\n    return value"
+                    },
+                    {
+                        "anchor": anchor2,
+                        "edit_type": "replace",
+                        "text": "from datetime import datetime\n\ndef log_operation(a, b):\n    timestamp = datetime.now().strftime(\"%Y-%m-%d\")\n    print(f\"[{timestamp}] {a} + {b}\")"
+                    }
+                ]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "two edits in one call should succeed. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("clamp_result"), "first edit should be applied");
+        assert!(content.contains("datetime"), "second edit should be applied");
     }
 }
