@@ -39,6 +39,10 @@ pub struct FileIndexEntry {
 pub struct SymbolIndexService {
     files: HashMap<String, FileIndexEntry>,
     project_root: String,
+    /// Optional override for the DB directory. When set, the SQLite database
+    /// is stored here instead of `{project_root}/{INDEX_DIR}`. Used to keep
+    /// the workspace clean by storing the index in a temp directory.
+    index_root: Option<String>,
     db: Option<db::SymbolIndexDatabase>,
     disabled: bool,
 }
@@ -51,6 +55,7 @@ impl SymbolIndexService {
         Self {
             files: HashMap::with_capacity(1024),
             project_root,
+            index_root: None,
             db: None,
             disabled: false,
         }
@@ -63,6 +68,15 @@ impl SymbolIndexService {
         self
     }
 
+    /// Override the directory used for the SQLite database. When set, the
+    /// database is stored at `{index_root}/{INDEX_DIR}` instead of
+    /// `{project_root}/{INDEX_DIR}`. The git exclude entry is skipped because
+    /// the DB no longer lives inside the project tree.
+    pub fn with_index_root(mut self, root: String) -> Self {
+        self.index_root = Some(root);
+        self
+    }
+
     pub fn is_disabled(&self) -> bool {
         self.disabled
     }
@@ -72,20 +86,30 @@ impl SymbolIndexService {
             return Ok(self);
         }
 
-        let db_dir = std::path::Path::new(&self.project_root).join(INDEX_DIR);
+        // Use index_root override if set, otherwise fall back to project_root.
+        let db_base = self
+            .index_root
+            .as_deref()
+            .unwrap_or(&self.project_root);
+        let db_dir = std::path::Path::new(db_base).join(INDEX_DIR);
         std::fs::create_dir_all(&db_dir)?;
 
-        let git_exclude = std::path::Path::new(&self.project_root)
-            .join(".git")
-            .join("info")
-            .join("exclude");
-        if git_exclude.parent().map(|p| p.exists()).unwrap_or(false)
-            && let Ok(content) = std::fs::read_to_string(&git_exclude)
-            && !content.contains(INDEX_DIR)
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&git_exclude) {
-                let _ = writeln!(f, "{}", INDEX_DIR);
+        // Only update the project's git exclude when the DB lives inside the
+        // project tree. When index_root is set (e.g. /tmp), the DB is outside
+        // the project and no exclude entry is needed.
+        if self.index_root.is_none() {
+            let git_exclude = std::path::Path::new(&self.project_root)
+                .join(".git")
+                .join("info")
+                .join("exclude");
+            if git_exclude.parent().map(|p| p.exists()).unwrap_or(false)
+                && let Ok(content) = std::fs::read_to_string(&git_exclude)
+                && !content.contains(INDEX_DIR)
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&git_exclude) {
+                    let _ = writeln!(f, "{}", INDEX_DIR);
+                }
             }
         }
 

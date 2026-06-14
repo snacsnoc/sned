@@ -649,11 +649,29 @@ fn symbol_index_mode_from_env() -> anyhow::Result<SymbolIndexMode> {
     }
 }
 
+/// Hash the cwd to produce a short collision-resistant suffix for the
+/// `/tmp` symbol-index directory name. Uses SHA-256 (not `DefaultHasher`,
+/// which is seeded randomly per process) so the same cwd always maps to
+/// the same suffix across process restarts. The first 16 hex chars of the
+/// digest are used as a short, human-inspectable identifier.
+fn hash_cwd(cwd: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(cwd.as_bytes());
+    // Take the first 8 bytes and format as 16 hex chars.
+    let bytes: [u8; 8] = digest[..8].try_into().unwrap_or([0u8; 8]);
+    format!("{:016x}", u64::from_be_bytes(bytes))
+}
+
 fn build_symbol_index_service(
     cwd_str: String,
     mode: SymbolIndexMode,
 ) -> anyhow::Result<crate::services::symbol_index::SymbolIndexService> {
-    let service = crate::services::symbol_index::SymbolIndexService::new(cwd_str.clone());
+    // Derive a unique /tmp path for the symbol index DB so the workspace
+    // directory stays clean. Each cwd maps to a unique /tmp path via a hash
+    // of the absolute path.
+    let index_root = format!("/tmp/sned-symbol-index-{}", hash_cwd(&cwd_str));
+    let service = crate::services::symbol_index::SymbolIndexService::new(cwd_str.clone())
+        .with_index_root(index_root.clone());
     match mode {
         SymbolIndexMode::Off => Ok(service.disabled()),
         SymbolIndexMode::Memory => Ok(service),
@@ -665,8 +683,10 @@ fn build_symbol_index_service(
                         "Symbol index DB corruption detected, falling back to memory mode: {}",
                         e
                     );
-                    // Delete corrupted DB file so next session can start fresh
-                    let db_dir = std::path::Path::new(&cwd_str)
+                    // Delete corrupted DB file so next session can start fresh.
+                    // Use the same index_root path that was configured for the
+                    // service, not the project-local path.
+                    let db_dir = std::path::Path::new(&index_root)
                         .join(crate::services::symbol_index::INDEX_DIR);
                     let db_path = db_dir.join(crate::services::symbol_index::DB_FILENAME);
                     if db_path.exists() {
@@ -2015,7 +2035,12 @@ mod tests {
         let _ = fs::remove_dir_all(temp_dir);
         fs::create_dir_all(temp_dir).unwrap();
 
-        let db_dir = std::path::Path::new(temp_dir).join(crate::services::symbol_index::INDEX_DIR);
+        // build_symbol_index_service now stores the DB at
+        // /tmp/sned-symbol-index-{hash}/{INDEX_DIR}/data.db. Compute the same
+        // hash the service uses, then create a corrupted DB at that path.
+        let index_root = format!("/tmp/sned-symbol-index-{}", hash_cwd(temp_dir));
+        let db_dir = std::path::Path::new(&index_root)
+            .join(crate::services::symbol_index::INDEX_DIR);
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = db_dir.join(crate::services::symbol_index::DB_FILENAME);
         {
@@ -2045,6 +2070,27 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(temp_dir);
+        let _ = fs::remove_dir_all(&index_root);
+    }
+
+    #[test]
+    fn test_hash_cwd_is_deterministic_across_calls() {
+        // SHA-256 must produce the same hash for the same input regardless
+        // of when it's called. This guards against accidental regression to
+        // a randomized hasher (e.g. DefaultHasher) which would defeat
+        // symbol-index persistence across process restarts.
+        let cwd = "/Users/easto/projects/dirac-fork";
+        let h1 = hash_cwd(cwd);
+        let h2 = hash_cwd(cwd);
+        assert_eq!(h1, h2, "hash_cwd must be deterministic");
+        assert_eq!(h1.len(), 16, "hash output must be 16 hex chars");
+    }
+
+    #[test]
+    fn test_hash_cwd_different_inputs_produce_different_hashes() {
+        let h1 = hash_cwd("/path/one");
+        let h2 = hash_cwd("/path/two");
+        assert_ne!(h1, h2);
     }
 
     #[test]
