@@ -1955,7 +1955,12 @@ impl AgentLoop {
                                 {
                                     self.config
                                         .output_writer
-                                        .emit(OutputEvent::dim(format!("  Ɵ {}", summary)));
+                                        .emit(OutputEvent::tool_output_line(
+                                            format!("  Ɵ {}", summary),
+                                            Style::default()
+                                                .fg(crate::cli::tui::theme::ACCENT)
+                                                .add_modifier(Modifier::ITALIC),
+                                        ));
                                     reasoning_preview_shown = true;
                                     emitted_output_this_attempt = true;
                                 }
@@ -3392,7 +3397,7 @@ impl AgentLoop {
                         .output_writer
                         .emit(OutputEvent::tool_output_line(
                             format!("  📝 {}", parts.join(", ")),
-                            Style::default().add_modifier(Modifier::DIM),
+                            Style::default().fg(crate::cli::tui::theme::INFO_FG),
                         ));
                 }
             }

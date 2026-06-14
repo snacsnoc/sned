@@ -159,15 +159,19 @@ impl OutputEvent {
     }
 
     /// Emit a tool-result line. The TUI will never pop or re-render
-    /// these lines during `finalize_turn_stream`. Tool output is dimmed
-    /// to create visual hierarchy against bright model text, except
-    /// for error lines which must stay visible.
+    /// these lines during `finalize_turn_stream`. Tool output uses
+    /// DarkGray foreground for visual hierarchy against bright model
+    /// text, except for error lines which stay bright red.
     pub fn tool_output_line(text: impl Into<String>, style: ratatui::style::Style) -> Self {
         let is_error = style.fg == Some(crate::cli::tui::theme::ERROR_FG);
         let final_style = if is_error {
             style
-        } else {
+        } else if style.fg.is_some() {
+            // Already has a foreground color — keep it, just add DIM.
             style.add_modifier(ratatui::style::Modifier::DIM)
+        } else {
+            // No foreground set — use DarkGray for subtle appearance.
+            ratatui::style::Style::default().fg(crate::cli::tui::theme::STATUS_FG)
         };
         OutputEvent::ToolOutputLine(Line::from(Span::styled(text.into(), final_style)))
     }
