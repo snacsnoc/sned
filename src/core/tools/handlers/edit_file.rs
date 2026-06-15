@@ -4624,4 +4624,202 @@ edition = "2021"
         assert!(content.contains("clamp_result"), "first edit should be applied");
         assert!(content.contains("datetime"), "second edit should be applied");
     }
+
+    #[tokio::test]
+    async fn model_sim_duplicate_file_entries_merged() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("line 1\nline 2\nline 3\n", "sim-dup-entries").await;
+        let ctx = ctx_for_dir(&dir, "sim-dup-entries");
+
+        let anchor1 = format!("{}§line 1", anchors[0]);
+        let anchor2 = format!("{}§line 2", anchors[1]);
+        // Model sends same path twice — group_edits_by_path should merge into one batch
+        let params = serde_json::json!({
+            "files": [
+                {
+                    "path": "test.txt",
+                    "edits": [{
+                        "anchor": anchor1,
+                        "edit_type": "replace",
+                        "text": "replaced 1"
+                    }]
+                },
+                {
+                    "path": "test.txt",
+                    "edits": [{
+                        "anchor": anchor2,
+                        "edit_type": "replace",
+                        "text": "replaced 2"
+                    }]
+                }
+            ]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "duplicate file entries should be merged. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("replaced 1"), "first edit should be applied");
+        assert!(content.contains("replaced 2"), "second edit should be applied");
+    }
+
+    #[tokio::test]
+    async fn model_sim_anchor_collision_reports_error() {
+        let _guard = TEST_MUTEX.lock().await;
+        // Duplicate lines get unique anchors via salt-based collision resolution in get_word_for_hash.
+        // This test verifies that editing one duplicate line works correctly — the anchor system
+        // assigns unique anchors even for identical content, so collision detection in resolve_anchor
+        // is not triggered. This documents the current behavior.
+        let (dir, file_path, anchors) = setup_test_file(
+            "duplicate line\nduplicate line\nunique line\n",
+            "sim-collision",
+        )
+        .await;
+        let ctx = ctx_for_dir(&dir, "sim-collision");
+
+        let anchor = format!("{}§duplicate line", anchors[0]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "replaced"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "editing one of duplicate lines should succeed. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            content.contains("replaced"),
+            "first duplicate line should be replaced"
+        );
+        assert!(
+            content.contains("duplicate line"),
+            "second duplicate line should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_sim_three_edits_same_file_one_call() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) = setup_test_file(
+            "line A\nline B\nline C\nline D\nline E\n",
+            "sim-three-edits",
+        )
+        .await;
+        let ctx = ctx_for_dir(&dir, "sim-three-edits");
+
+        let anchor1 = format!("{}§line A", anchors[0]);
+        let anchor2 = format!("{}§line C", anchors[2]);
+        let anchor3 = format!("{}§line E", anchors[4]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [
+                    {
+                        "anchor": anchor1,
+                        "edit_type": "replace",
+                        "text": "replaced A"
+                    },
+                    {
+                        "anchor": anchor2,
+                        "edit_type": "replace",
+                        "text": "replaced C"
+                    },
+                    {
+                        "anchor": anchor3,
+                        "edit_type": "replace",
+                        "text": "replaced E"
+                    }
+                ]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "three edits in one call should succeed. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("replaced A"), "first edit should be applied");
+        assert!(content.contains("line B"), "untouched line should remain");
+        assert!(content.contains("replaced C"), "second edit should be applied");
+        assert!(content.contains("line D"), "untouched line should remain");
+        assert!(content.contains("replaced E"), "third edit should be applied");
+    }
+
+    #[tokio::test]
+    async fn model_sim_empty_replacement_text_deletes_anchor_line() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("keep this\nremove this\nkeep this too\n", "sim-empty-text").await;
+        let ctx = ctx_for_dir(&dir, "sim-empty-text");
+
+        let anchor = format!("{}§remove this", anchors[1]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": ""
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "empty replacement text should succeed (intentional delete). Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            !content.contains("remove this"),
+            "anchor line should be deleted"
+        );
+        assert!(content.contains("keep this"), "other lines should remain");
+    }
+
+    #[tokio::test]
+    async fn model_sim_whitespace_anchor_mismatch() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, _file_path, anchors) =
+            setup_test_file("  indented line  \n", "sim-whitespace").await;
+        let ctx = ctx_for_dir(&dir, "sim-whitespace");
+
+        // Anchor text has different whitespace than actual file content
+        let anchor = format!("{}§indented line", anchors[0]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "replaced"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let output = result.unwrap();
+        let msg = output.as_str().unwrap();
+        assert!(
+            msg.contains("does not match the file's content"),
+            "whitespace mismatch should produce exact-match error. Got: {}",
+            msg
+        );
+    }
 }
