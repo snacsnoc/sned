@@ -211,6 +211,11 @@ pub struct App {
     pub completion_lines: VecDeque<Line<'static>>,
     /// Cached completion row count, valid when cached_wrap_width matches.
     pub cached_completion_rows: usize,
+    /// Error box lines rendered as a dedicated Block widget with red border.
+    /// Takes priority over completion_lines when non-empty.
+    pub error_lines: VecDeque<Line<'static>>,
+    /// Cached error row count, valid when cached_wrap_width matches.
+    pub cached_error_rows: usize,
 }
 
 impl App {
@@ -292,6 +297,8 @@ impl App {
             model_picker_selected: 0,
             completion_lines: VecDeque::new(),
             cached_completion_rows: 0,
+            error_lines: VecDeque::new(),
+            cached_error_rows: 0,
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
             output_overflow: false,
@@ -560,6 +567,21 @@ impl App {
         self.cached_wrap_width = None;
     }
 
+    /// Push an error line to the error buffer.
+    pub fn push_error_line(&mut self, line: Line<'static>) {
+        self.needs_redraw = true;
+        self.error_lines.push_back(line);
+        self.cached_wrap_width = None;
+    }
+
+    /// Clear the error box and invalidate cached layout for the next render.
+    pub fn clear_error_lines(&mut self) {
+        self.needs_redraw = true;
+        self.error_lines.clear();
+        self.cached_error_rows = 0;
+        self.cached_wrap_width = None;
+    }
+
     /// Push a plain text line.
     pub fn push_plain(&mut self, text: impl Into<String>) {
         self.push_output(Line::from(text.into()));
@@ -587,14 +609,24 @@ impl App {
     }
 
     /// Push a user message with proper formatting (splits on newlines).
+    /// Multi-line messages get a left border accent for visual grouping.
     pub fn push_user_message(&mut self, text: &str, writer: &OutputWriterArc) {
         self.clear_completion_lines();
         let style = Style::default()
             .fg(theme::PROMPT_FG)
             .add_modifier(Modifier::BOLD);
-        for (i, line) in text.split('\n').enumerate() {
-            let prefix = if i == 0 { "❯ " } else { "  " };
-            let content = format!("{}{}", prefix, line);
+        let lines: Vec<&str> = text.split('\n').collect();
+        let is_multiline = lines.len() > 1;
+        for (i, line) in lines.iter().enumerate() {
+            let content = if is_multiline {
+                if i == 0 {
+                    format!("│ ❯ {}", line)
+                } else {
+                    format!("│   {}", line)
+                }
+            } else {
+                format!("❯ {}", line)
+            };
             writer.emit(OutputEvent::styled(content, style));
         }
         self.force_bottom();
@@ -611,7 +643,9 @@ impl App {
         self.needs_redraw = true;
         self.output_lines.clear();
         self.completion_lines.clear();
+        self.error_lines.clear();
         self.cached_visual_rows = 0;
+        self.cached_error_rows = 0;
         self.cached_wrap_width = Some(self.last_wrap_width());
     }
 
@@ -871,8 +905,16 @@ impl App {
             .iter()
             .map(|line| Self::line_visual_rows(line, wrap_width))
             .sum();
-        self.cached_visual_rows = output_rows.saturating_add(completion_rows);
+        let error_rows: usize = self
+            .error_lines
+            .iter()
+            .map(|line| Self::line_visual_rows(line, wrap_width))
+            .sum();
+        self.cached_visual_rows = output_rows
+            .saturating_add(completion_rows)
+            .saturating_add(error_rows);
         self.cached_completion_rows = completion_rows;
+        self.cached_error_rows = error_rows;
         self.cached_wrap_width = Some(wrap_width);
     }
 
@@ -1031,38 +1073,40 @@ impl App {
     }
 
     fn render_output(&mut self, frame: &mut Frame, output_area: Rect) {
-        // When completion box is present, split the output_area vertically so the
-        // completion block occupies its own region below the main output instead
-        // of overlapping the last rows of the transcript.
+        // Error box takes priority over completion box.
+        let has_error = !self.error_lines.is_empty();
         let has_completion = !self.completion_lines.is_empty();
-        // Rebuild the visual-row cache up front so completion_height reflects
-        // the current completion_lines. Without this, a push_completion_line
+        let has_bottom_box = has_error || has_completion;
+        // Rebuild the visual-row cache up front so bottom_height reflects
+        // the current error_lines/completion_lines. Without this, a push
         // that invalidates cached_wrap_width still leaves the height math
-        // using the stale cached_completion_rows from the prior render.
+        // using the stale cached row count from the prior render.
         let wrap_width = Self::content_wrap_width(output_area.width as usize);
         let _ = self.total_visual_rows(wrap_width);
-        // +2 accounts for top and bottom borders of the completion Block widget.
-        let completion_height: u16 = if has_completion {
+        // +2 accounts for top and bottom borders of the Block widget.
+        let bottom_height: u16 = if has_error {
+            ((self.cached_error_rows + 2) as u16).min(output_area.height)
+        } else if has_completion {
             ((self.cached_completion_rows + 2) as u16).min(output_area.height)
         } else {
             0
         };
-        let main_output_area = if has_completion {
+        let main_output_area = if has_bottom_box {
             Rect {
                 x: output_area.x,
                 y: output_area.y,
                 width: output_area.width,
-                height: output_area.height.saturating_sub(completion_height),
+                height: output_area.height.saturating_sub(bottom_height),
             }
         } else {
             output_area
         };
-        let completion_area = if has_completion {
+        let bottom_area = if has_bottom_box {
             Rect {
                 x: output_area.x,
                 y: output_area.y + main_output_area.height,
                 width: output_area.width,
-                height: completion_height,
+                height: bottom_height,
             }
         } else {
             output_area
@@ -1079,7 +1123,7 @@ impl App {
         // drawn as a separate Block below the main output. Scroll math must
         // therefore be based on output_rows alone, or the bottom of the
         // output gets hidden behind the completion overlay.
-        let output_rows = total_rows.saturating_sub(self.cached_completion_rows);
+        let output_rows = total_rows.saturating_sub(self.cached_completion_rows).saturating_sub(self.cached_error_rows);
         let scroll_y = self.resolved_scroll_y_for(output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y as usize, content_height);
@@ -1103,9 +1147,22 @@ impl App {
             frame.render_widget(output, main_output_area);
         }
 
-        // Render completion box as a distinct block below the main output area.
-        if has_completion {
-            frame.render_widget(Clear, completion_area);
+        // Render error box (priority) or completion box below the main output area.
+        if has_error {
+            frame.render_widget(Clear, bottom_area);
+            let error_lines: Vec<Line<'static>> =
+                self.error_lines.iter().cloned().collect();
+            let error_box = Paragraph::new(error_lines)
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme::ERROR_FG))
+                        .border_type(ratatui::widgets::BorderType::Rounded),
+                );
+            frame.render_widget(error_box, bottom_area);
+        } else if has_completion {
+            frame.render_widget(Clear, bottom_area);
             let completion_lines: Vec<Line<'static>> =
                 self.completion_lines.iter().cloned().collect();
             let completion = Paragraph::new(completion_lines)
@@ -1116,7 +1173,7 @@ impl App {
                         .border_style(Style::default().fg(theme::PROMPT_FG))
                         .border_type(ratatui::widgets::BorderType::Rounded),
                 );
-            frame.render_widget(completion, completion_area);
+            frame.render_widget(completion, bottom_area);
         }
 
         // Scrollbar on output pane (render inside the border).
@@ -2339,6 +2396,82 @@ mod tests {
     }
 
     #[test]
+    fn test_error_line_renders_in_buffer() {
+        // push_error_line must invalidate the visual row cache so
+        // cached_error_rows reflects the new line. The error box
+        // renders with red border and takes priority over completion.
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.force_bottom();
+        app.push_plain("line 1");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial render should succeed");
+
+        app.push_error_line(Line::from(Span::styled(
+            "MARKER_ERROR_TEXT",
+            Style::default().fg(theme::ERROR_FG),
+        )));
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("post-error render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("MARKER_ERROR_TEXT"),
+            "error line should appear in rendered buffer; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_error_box_takes_priority_over_completion() {
+        // When both error_lines and completion_lines are non-empty,
+        // only the error box should render (red border).
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.force_bottom();
+        app.push_plain("line 1");
+
+        // Push both completion and error lines.
+        app.push_completion_line("COMPLETION_MARKER".into());
+        app.push_error_line("ERROR_MARKER".into());
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render with both should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("ERROR_MARKER"),
+            "error box should be visible; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("COMPLETION_MARKER"),
+            "completion box should NOT render when error box is present; got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn test_push_user_message_forces_bottom_for_multiline_submit() {
         use std::sync::Arc;
         use tokio::sync::mpsc;
@@ -2390,9 +2523,9 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert_eq!(last_three[0], "❯ first line");
-        assert_eq!(last_three[1], "  second line");
-        assert_eq!(last_three[2], "  third line");
+        assert_eq!(last_three[0], "│ ❯ first line");
+        assert_eq!(last_three[1], "│   second line");
+        assert_eq!(last_three[2], "│   third line");
     }
 
     /// Contract test: after a multiline submit + drain + render, the bottom
@@ -2917,8 +3050,8 @@ mod tests {
              The bug causes stale content to bleed through on real terminals."
         );
         assert!(
-            has_active_call("completion_area"),
-            "render_output must call Clear on completion_area before drawing the completion Paragraph (fix for 75caee3). \
+            has_active_call("bottom_area"),
+            "render_output must call Clear on bottom_area before drawing the completion/error Paragraph (fix for 75caee3). \
              The bug causes stale content to bleed through on real terminals."
         );
     }

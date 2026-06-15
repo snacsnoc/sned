@@ -738,6 +738,7 @@ mod tests {
                 OutputEvent::Completion(_) => String::new(),
                 OutputEvent::TurnEnd { .. } => return,
                 OutputEvent::TurnIndicator(line) => line.to_string(),
+                OutputEvent::ErrorBox(msg) => msg,
             };
             self.events.lock().unwrap().push(text);
         }

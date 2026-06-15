@@ -19,6 +19,43 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
     render_markdown(Some(prefix), text)
 }
 
+/// Render an error message as terminal-friendly lines with error styling.
+///
+/// The first line is prefixed with `prefix` (e.g. "✗ Error") styled in red.
+/// The error text is rendered as plain styled lines (no markdown parsing).
+pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut first = true;
+    for line in text.split('\n') {
+        if first {
+            first = false;
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("{}: ", prefix),
+                    Style::default()
+                        .fg(ratatui::style::Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(line.to_string(), Style::default()),
+            ]));
+        } else {
+            out.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default(),
+            )));
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(
+            prefix.to_string(),
+            Style::default()
+                .fg(ratatui::style::Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    out
+}
+
 /// Render arbitrary markdown as terminal-friendly lines.
 ///
 /// If `prefix` is `Some`, the prefix is styled and prepended to the first

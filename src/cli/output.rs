@@ -26,6 +26,8 @@ pub enum OutputEvent {
     RawAnsi(String),
     /// Task completion message rendered as a dedicated Block widget.
     Completion(String),
+    /// Error message rendered as a dedicated Block widget with red border.
+    ErrorBox(String),
     /// End of a streamed agent turn. The TUI uses this to re-render
     /// the raw streamed lines recorded during the turn as formatted
     /// markdown. The payload is the original (pre-wrap, pre-indent)
@@ -111,6 +113,10 @@ impl OutputEvent {
             format!("[sned] ERROR: {}", text),
             Style::default().fg(theme::ERROR_FG),
         )))
+    }
+
+    pub fn error_box(text: impl fmt::Display) -> Self {
+        OutputEvent::ErrorBox(text.to_string())
     }
 
     pub fn warning(text: impl fmt::Display) -> Self {
@@ -223,6 +229,24 @@ impl OutputWriter for StderrOutputWriter {
             }
             OutputEvent::Completion(result) => {
                 eprintln!("\n[sned] Task Completed: {}", result);
+            }
+            OutputEvent::ErrorBox(msg) => {
+                if !msg.trim().is_empty() {
+                    let width = crate::cli::text_utils::get_terminal_width();
+                    let box_str = crate::cli::text_utils::draw_error_box("✗ Error", &msg, width);
+                    if crate::cli::colors::stderr_colors_disabled() {
+                        eprint!("{}", box_str);
+                    } else {
+                        for line in box_str.lines() {
+                            eprintln!(
+                                "{}{}{}",
+                                crate::cli::colors::style::RED,
+                                line,
+                                crate::cli::colors::style::RESET
+                            );
+                        }
+                    }
+                }
             }
             OutputEvent::TurnEnd { .. } => {}
             OutputEvent::TurnIndicator(_) => {}

@@ -724,6 +724,7 @@ mod tests {
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}
                 crate::cli::output::OutputEvent::TurnIndicator(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ErrorBox(msg) => rendered.push(msg),
             }
         }
         rendered

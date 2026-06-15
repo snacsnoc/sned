@@ -3205,7 +3205,7 @@ impl AgentLoop {
                     drop(state);
 
                     if let Some(msg) = step_fail_msg {
-                        self.config.output_writer.emit(OutputEvent::error(msg));
+                        self.config.output_writer.emit(OutputEvent::error_box(msg));
                         return TurnResult::Continue;
                     }
 
@@ -4493,6 +4493,7 @@ mod tests {
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}
                 crate::cli::output::OutputEvent::TurnIndicator(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ErrorBox(msg) => rendered.push(msg),
             }
         }
         rendered

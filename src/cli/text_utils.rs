@@ -81,6 +81,70 @@ pub fn draw_completion_box(title: &str, content: &str, width: usize) -> String {
     result
 }
 
+/// Draw a framed box around error text.
+///
+/// Creates a visual frame like:
+/// ╭─ ✗ Error ─────────────────────────────────╮
+/// │ Error message line 1                       │
+/// │ Error message line 2                       │
+/// ╰────────────────────────────────────────────╯
+///
+/// Falls back to plain text when width < 10.
+pub fn draw_error_box(title: &str, content: &str, width: usize) -> String {
+    if width < 10 {
+        return format!("{} {}\n{}\n", "✗", title, content);
+    }
+
+    let inner_width = width.saturating_sub(4);
+    let indent = "  ";
+
+    let wrapped_content = wrap_text(content, inner_width, "");
+
+    let mut result = String::new();
+
+    // Top border: ╭─ ✗ Error ───────────────────╮
+    result.push_str(indent);
+    result.push('╭');
+    result.push('─');
+    result.push(' ');
+    result.push_str(title);
+    result.push(' ');
+
+    let title_len = title.chars().count() + 2;
+    let dash_count = inner_width.saturating_sub(title_len + 1);
+    for _ in 0..dash_count {
+        result.push('─');
+    }
+    result.push('╮');
+    result.push('\n');
+
+    // Content lines: │ content                     │
+    for line in wrapped_content.lines() {
+        result.push_str(indent);
+        result.push('│');
+        result.push(' ');
+        result.push_str(line);
+
+        let padding_needed = inner_width.saturating_sub(line.chars().count() + 1);
+        for _ in 0..padding_needed {
+            result.push(' ');
+        }
+        result.push('│');
+        result.push('\n');
+    }
+
+    // Bottom border: ╰────────────────────────────╯
+    result.push_str(indent);
+    result.push('╰');
+    for _ in 0..(inner_width + 1) {
+        result.push('─');
+    }
+    result.push('╯');
+    result.push('\n');
+
+    result
+}
+
 /// Word-wrap text to fit within the specified width.
 ///
 /// - Breaks lines at word boundaries when possible

@@ -16,7 +16,7 @@ pub fn stdout_colors_disabled() -> bool {
     env_colors_disabled() || !std::io::stdout().is_terminal()
 }
 
-fn stderr_colors_disabled() -> bool {
+pub fn stderr_colors_disabled() -> bool {
     env_colors_disabled() || !std::io::stderr().is_terminal()
 }
 

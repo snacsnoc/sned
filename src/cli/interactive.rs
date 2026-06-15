@@ -443,6 +443,16 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                     app.push_completion_line(line);
                 }
             }
+            OutputEvent::ErrorBox(msg) => {
+                if !msg.trim().is_empty() {
+                    app.clear_error_lines();
+                    for line in
+                        crate::cli::markdown::render_error_markdown("✗ Error", &msg)
+                    {
+                        app.push_error_line(line);
+                    }
+                }
+            }
             OutputEvent::TurnEnd { accumulated_text } => {
                 app.finalize_turn_stream(&accumulated_text);
             }
