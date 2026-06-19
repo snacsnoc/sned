@@ -16,7 +16,7 @@ pub const ACCENT: Color = Color::Cyan;
 pub const STATUS_FG: Color = Color::DarkGray;
 
 /// Prompt echo color (user input confirmation).
-pub const PROMPT_FG: Color = Color::Green;
+pub const PROMPT_FG: Color = Color::LightGreen;
 
 /// Warning color.
 pub const WARNING_FG: Color = Color::Yellow;
