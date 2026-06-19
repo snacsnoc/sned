@@ -589,7 +589,12 @@ impl App {
 
     /// Push a styled text line.
     pub fn push_styled(&mut self, text: impl Into<String>, style: Style) {
-        self.push_output(Line::from(Span::styled(text.into(), style)));
+        let text = text.into();
+        let wrap_width = self.last_wrap_width();
+        let wrapped = crate::cli::text_utils::wrap_text(&text, wrap_width, "");
+        for line in wrapped.lines() {
+            self.push_output(Line::from(Span::styled(line.to_string(), style)));
+        }
     }
 
     /// Push a turn separator line.
