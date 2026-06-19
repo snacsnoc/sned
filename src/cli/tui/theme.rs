@@ -19,7 +19,7 @@ pub const STATUS_FG: Color = Color::DarkGray;
 pub const PROMPT_FG: Color = Color::LightGreen;
 
 /// Warning color.
-pub const WARNING_FG: Color = Color::Yellow;
+pub const WARNING_FG: Color = Color::LightYellow;
 
 /// Error color.
 pub const ERROR_FG: Color = Color::Red;
