@@ -306,8 +306,38 @@ impl App {
         }
     }
 
-    /// Push an output line to the buffer.
+    /// Push an output line to the buffer. Long lines are pre-wrapped
+    /// to `wrap_width` before being pushed, preventing render-time
+    /// wrapping and visual overlap with adjacent content.
     pub fn push_output(&mut self, line: Line<'static>) {
+        let wrap_width = self.last_wrap_width();
+
+        // Pre-wrap: if the line's total width exceeds wrap_width, split it
+        let total_width: usize = line
+            .spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+
+        let lines_to_push: Vec<Line<'static>> =
+            if total_width > wrap_width && wrap_width > 0 {
+                let mut full_text = String::new();
+                for span in &line.spans {
+                    full_text.push_str(span.content.as_ref());
+                }
+                let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
+                wrapped.lines().map(|l| Line::from(l.to_string())).collect()
+            } else {
+                vec![line]
+            };
+
+        for l in lines_to_push {
+            self._push_output_line(l);
+        }
+    }
+
+    /// Internal: push a single pre-wrapped line to the buffer.
+    fn _push_output_line(&mut self, line: Line<'static>) {
         self.needs_redraw = true;
         let wrap_width = self.last_wrap_width();
         let line_rows = Self::line_visual_rows(&line, wrap_width);
@@ -360,18 +390,43 @@ impl App {
         if kind == StreamKind::Model {
             self.turn_had_streamed_line = true;
         }
-        let idx = self.output_lines.len();
-        self.push_output(line);
-        // push_output may have evicted the front of the buffer if it
-        // exceeded 10,000 lines. If our recorded index fell off, drop
-        // it and any earlier recorded indices for this turn — the
-        // eviction means the model output was so long that we cannot
-        // usefully re-render it as a unit anyway.
-        if idx >= self.output_lines.len() {
-            self.turn_stream_entries.clear();
-            return;
+
+        // Pre-wrap: split long lines and record all indices.
+        // We must pre-wrap here (not rely on push_output's pre-wrap) so
+        // we know the exact indices of all pieces for finalize_turn_stream.
+        let wrap_width = self.last_wrap_width();
+        let total_width: usize = line
+            .spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+
+        let lines_to_push: Vec<Line<'static>> =
+            if total_width > wrap_width && wrap_width > 0 {
+                let mut full_text = String::new();
+                for span in &line.spans {
+                    full_text.push_str(span.content.as_ref());
+                }
+                let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
+                wrapped.lines().map(|l| Line::from(l.to_string())).collect()
+            } else {
+                vec![line]
+            };
+
+        for l in lines_to_push {
+            let idx = self.output_lines.len();
+            self.push_output(l);
+            // push_output may have evicted the front of the buffer if it
+            // exceeded 10,000 lines. If our recorded index fell off, drop
+            // it and any earlier recorded indices for this turn — the
+            // eviction means the model output was so long that we cannot
+            // usefully re-render it as a unit anyway.
+            if idx >= self.output_lines.len() {
+                self.turn_stream_entries.clear();
+                return;
+            }
+            self.turn_stream_entries.push((idx, kind));
         }
-        self.turn_stream_entries.push((idx, kind));
     }
 
     /// Store a turn-indicator line (e.g. "♦") for later re-insertion at
@@ -584,7 +639,12 @@ impl App {
 
     /// Push a plain text line.
     pub fn push_plain(&mut self, text: impl Into<String>) {
-        self.push_output(Line::from(text.into()));
+        let text = text.into();
+        let wrap_width = self.last_wrap_width();
+        let wrapped = crate::cli::text_utils::wrap_text(&text, wrap_width, "");
+        for line_text in wrapped.lines() {
+            self.push_output(Line::from(line_text.to_string()));
+        }
     }
 
     /// Push a styled text line.
