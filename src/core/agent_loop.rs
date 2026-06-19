@@ -3528,24 +3528,6 @@ impl AgentLoop {
                     self.config.output_writer.flush();
                 }
             }
-            // Signal turn-end so the TUI can re-render the streamed
-            // model text as formatted markdown. Only meaningful in
-            // interactive TUI mode (the StderrOutputWriter ignores it
-            // and JSON mode doesn't stream text to the output pane).
-            // Use response_text (thinking tags stripped) so the rendered
-            // markdown is not corrupted by raw thinking-tag HTML.
-            let markdown_text = response_text.as_deref().unwrap_or("");
-            if !self.config.json_output && !markdown_text.is_empty() {
-                let stripped =
-                    crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
-                if !stripped.is_empty() {
-                    self.config
-                        .output_writer
-                        .emit(OutputEvent::TurnEnd {
-                            accumulated_text: stripped,
-                        });
-                }
-            }
             TurnResult::Complete
         } else {
             // Same turn-end signal for the "more turns coming" branch.
