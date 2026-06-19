@@ -436,9 +436,24 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 }
             }
             OutputEvent::Completion(result) => {
+                // Check if the completion result matches the last streamed text.
+                // If the model sends its own response as the completion result,
+                // the completion box would duplicate text already in output_lines.
+                let last_streamed = app.output_lines.iter()
+                    .rev()
+                    .take(20) // Check last 20 lines (covers typical response length)
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let is_duplicate = last_streamed.trim() == result.trim();
                 app.clear_completion_lines();
+                let completion_text = if is_duplicate {
+                    "Task Completed"
+                } else {
+                    &result
+                };
                 for line in
-                    crate::cli::markdown::render_completion_markdown("🚀 Task Completed: ", &result)
+                    crate::cli::markdown::render_completion_markdown("🚀 ", completion_text)
                 {
                     app.push_completion_line(line);
                 }
