@@ -992,7 +992,7 @@ impl App {
 
     /// Render the application state to the frame.
     pub fn render(&mut self, frame: &mut Frame) {
-        let has_plan = self.plan_state_cache.is_some();
+        let has_plan = self.plan_state_cache.as_ref().is_some_and(|p| !p.complete);
 
         // Reserve the plan area even when no plan is active so the
         // Clear widget below can wipe stale plan content from the
@@ -3396,5 +3396,32 @@ mod tests {
             "markdown should be appended: {:?}",
             all_lines
         );
+    }
+
+    #[test]
+    fn test_plan_panel_shows_when_incomplete() {
+        let mut app = App::new();
+        let mut plan =
+            crate::core::plan_state::PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
+        plan.mark_step(0, crate::core::plan_state::PlanStepStatus::Done).unwrap();
+        assert!(!plan.complete);
+        app.sync_plan_state_cache(Some(&plan));
+        // has_plan should be true because complete is false
+        let has_plan = app.plan_state_cache.as_ref().is_some_and(|p| !p.complete);
+        assert!(has_plan, "incomplete plan should show panel");
+    }
+
+    #[test]
+    fn test_plan_panel_hides_when_complete() {
+        let mut app = App::new();
+        let mut plan =
+            crate::core::plan_state::PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
+        plan.mark_step(0, crate::core::plan_state::PlanStepStatus::Done).unwrap();
+        plan.mark_step(1, crate::core::plan_state::PlanStepStatus::Done).unwrap();
+        plan.complete = true;
+        app.sync_plan_state_cache(Some(&plan));
+        // has_plan should be false because plan is complete
+        let has_plan = app.plan_state_cache.as_ref().is_some_and(|p| !p.complete);
+        assert!(!has_plan, "complete plan should hide panel");
     }
 }
