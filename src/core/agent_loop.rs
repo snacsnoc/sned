@@ -196,8 +196,8 @@ fn summarize_reasoning(reasoning: &str, term_width: usize) -> Option<String> {
     const PREFIX_COLS: usize = 4;
     // "... " suffix reserves 4 columns when truncation kicks in.
     const SUFFIX_COLS: usize = 4;
-    // Plan panel reserves 35 columns, margins reserve 4 columns.
-    const RESERVED_COLS: usize = 39;
+    // The agent loop doesn't know the plan panel state, so it cannot
+    // reserve columns for it. The TUI's pre-wrap handles overflow.
 
     let first_line = reasoning
         .lines()
@@ -208,7 +208,7 @@ fn summarize_reasoning(reasoning: &str, term_width: usize) -> Option<String> {
         return None;
     }
 
-    let max_chars = term_width.saturating_sub(PREFIX_COLS + SUFFIX_COLS + RESERVED_COLS);
+    let max_chars = term_width.saturating_sub(PREFIX_COLS + SUFFIX_COLS);
     let char_count = first_line.chars().count();
 
     if char_count <= max_chars {
@@ -8413,8 +8413,8 @@ mod tests {
     #[test]
     fn test_summarize_reasoning_returns_full_line_when_it_fits() {
         // 3+ words and short enough to fit — return as-is.
-        // With term_width=80, max_chars = 80 - 4 - 4 - 39 = 33.
-        // The line below is 19 chars, which fits within 33.
+        // With term_width=80, max_chars = 80 - 4 - 4 = 72.
+        // The line below is 14 chars, which fits within 72.
         let line = "The user wants";
         assert_eq!(
             summarize_reasoning(line, 80).as_deref(),
@@ -8428,8 +8428,8 @@ mod tests {
         // boundaries (not byte boundaries).
         let line = "The user wants me to ".to_string() + &"a".repeat(200);
         let summary = summarize_reasoning(&line, 80).expect("should emit");
-        // Reserve is 80 - 4 prefix - 4 suffix - 39 reserved = 33 chars; take is 33 - 3 = 30.
-        let expected_take = 80 - 4 - 4 - 39 - 3;
+        // Reserve is 80 - 4 prefix - 4 suffix = 72 chars; take is 72 - 3 = 69.
+        let expected_take = 80 - 4 - 4 - 3;
         assert_eq!(
             summary.chars().count(),
             expected_take + 3,
