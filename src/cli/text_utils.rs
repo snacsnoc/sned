@@ -39,6 +39,22 @@ pub fn draw_error_box(title: &str, content: &str, width: usize) -> String {
     draw_box(title, content, width, "✗")
 }
 
+/// Truncate `text` so its display width does not exceed `max_width` cols.
+/// Walks char boundaries so multibyte/CJK glyphs are never split.
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > max_width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
 /// Each line must be exactly `width` cols so the right border sits
 /// flush with the terminal edge. Wrapping at `inner_width - 1`
 /// reserves the single space after `│`; padding fills the rest.
@@ -54,19 +70,22 @@ fn draw_box(title: &str, content: &str, width: usize, symbol: &str) -> String {
     let content_width = inner_width.saturating_sub(1);
     let wrapped_content = wrap_text(content, content_width, "");
 
+    // Truncate the title so the top border never exceeds the requested
+    // width: CJK/emoji titles and narrow widths would otherwise overflow.
+    let title_budget = width.saturating_sub(7);
+    let truncated_title = truncate_to_width(title, title_budget);
+    let title_dw = UnicodeWidthStr::width(truncated_title.as_str());
+
     let mut result = String::new();
 
     result.push_str(indent);
     result.push('╭');
     result.push('─');
     result.push(' ');
-    result.push_str(title);
+    result.push_str(&truncated_title);
     result.push(' ');
 
-    // Top border has `─ {title} ` (2 + title chars) before the dashes,
-    // then 1 trailing dash, then ╮.
-    let title_len = title.chars().count() + 2;
-    let dash_count = inner_width.saturating_sub(title_len + 1);
+    let dash_count = width - title_dw - 7;
     for _ in 0..dash_count {
         result.push('─');
     }
@@ -79,7 +98,7 @@ fn draw_box(title: &str, content: &str, width: usize, symbol: &str) -> String {
         result.push(' ');
         result.push_str(line);
 
-        let padding_needed = content_width.saturating_sub(line.chars().count());
+        let padding_needed = content_width.saturating_sub(UnicodeWidthStr::width(line));
         for _ in 0..padding_needed {
             result.push(' ');
         }
@@ -281,6 +300,146 @@ mod tests {
         assert!(result.contains("─╯"));
         assert!(result.contains("Task Completed"));
         assert!(result.contains("Hello World"));
+    }
+
+    /// Every line of the box must equal the requested display width so the
+    /// right border sits flush with the terminal edge.
+    #[test]
+    fn test_draw_completion_box_all_lines_exact_width() {
+        for width in [40usize, 80, 100, 120] {
+            let result = draw_completion_box("Done", "Short content.", width);
+            for (i, line) in result.lines().enumerate() {
+                let w = UnicodeWidthStr::width(line);
+                assert_eq!(
+                    w,
+                    width,
+                    "line {i} (display width={w}) != width={width}: |{line}|",
+                );
+            }
+        }
+    }
+
+    /// Content that fills the inner width must not overflow the box.
+    /// Regression: prior to this fix, wrap_text was called with the
+    /// full inner width and the post-wrap padding saturated to zero,
+    /// pushing the right border out by 3+ columns.
+    #[test]
+    fn test_draw_completion_box_content_fills_inner_width() {
+        // inner_width = width - 4 = 36 for width=40
+        let content_36 = "a".repeat(36);
+        let result = draw_completion_box("T", &content_36, 40);
+        for (i, line) in result.lines().enumerate() {
+            let w = UnicodeWidthStr::width(line);
+            assert_eq!(
+                w,
+                40,
+                "line {i} overflowed: |{line}| (display width={w})",
+            );
+        }
+    }
+
+    /// Wrapping multi-line content must keep every row at exact width.
+    #[test]
+    fn test_draw_completion_box_wrapped_multiline_exact_width() {
+        let content = "this is a fairly long message that should wrap to multiple lines when drawn inside the box at width 40";
+        let result = draw_completion_box("Title", content, 40);
+        for (i, line) in result.lines().enumerate() {
+            let w = UnicodeWidthStr::width(line);
+            assert_eq!(
+                w,
+                40,
+                "line {i} wrong width: |{line}| (display width={w})",
+            );
+        }
+    }
+
+    /// CJK content has chars < display width; padding must use display width
+    /// or the right border overflows.
+    #[test]
+    fn test_draw_completion_box_cjk_content_exact_width() {
+        let result = draw_completion_box("T", "日本語", 40);
+        for (i, line) in result.lines().enumerate() {
+            let w = UnicodeWidthStr::width(line);
+            assert_eq!(
+                w,
+                40,
+                "line {i} overflowed: |{line}| (display width={w})",
+            );
+        }
+    }
+
+    /// CJK title pushes the top border past the requested width when title
+    /// width is measured in chars; measuring in display cols keeps it aligned.
+    #[test]
+    fn test_draw_completion_box_cjk_title_exact_width() {
+        let result = draw_completion_box("タスク", "body", 40);
+        for (i, line) in result.lines().enumerate() {
+            let w = UnicodeWidthStr::width(line);
+            assert_eq!(
+                w,
+                40,
+                "line {i} overflowed: |{line}| (display width={w})",
+            );
+        }
+    }
+
+    /// Same invariant as the completion-box test, but exercising draw_error_box
+    /// to confirm both wrappers share the fixed helper path.
+    #[test]
+    fn test_draw_error_box_all_lines_exact_width() {
+        for width in [40usize, 80, 100] {
+            let result = draw_error_box("Error", "Bad things happened.", width);
+            for (i, line) in result.lines().enumerate() {
+                let w = UnicodeWidthStr::width(line);
+                assert_eq!(
+                    w,
+                    width,
+                    "line {i} (display width={w}) != width={width}: |{line}|",
+                );
+            }
+        }
+    }
+
+    /// Narrow widths with CJK titles previously overflowed the top border;
+    /// the title is now truncated so every line is exactly `width` cols.
+    #[test]
+    fn test_draw_completion_box_cjk_title_narrow_width() {
+        for width in [10usize, 12, 15, 20] {
+            let result = draw_completion_box("タスク", "body", width);
+            for (i, line) in result.lines().enumerate() {
+                let w = UnicodeWidthStr::width(line);
+                assert_eq!(
+                    w,
+                    width,
+                    "width={width} line {i} overflowed: |{line}| (display width={w})",
+                );
+            }
+        }
+    }
+
+    /// Long ASCII title at narrow width must also stay inside the box.
+    #[test]
+    fn test_draw_completion_box_long_ascii_title_narrow_width() {
+        for width in [10usize, 15, 20] {
+            let result = draw_completion_box("Long Task Title", "body", width);
+            for (i, line) in result.lines().enumerate() {
+                let w = UnicodeWidthStr::width(line);
+                assert_eq!(
+                    w,
+                    width,
+                    "width={width} line {i} overflowed: |{line}| (display width={w})",
+                );
+            }
+        }
+    }
+
+    /// Below the threshold, the fallback path is used and width does
+    /// not apply. This guards the width-10 boundary.
+    #[test]
+    fn test_draw_completion_box_below_width_threshold() {
+        let result = draw_completion_box("Done", "Hi", 5);
+        assert!(result.contains("✓ Done"));
+        assert!(result.contains("Hi"));
     }
 
     #[test]
