@@ -31,6 +31,32 @@ pub enum StreamKind {
     ToolOutput,
 }
 
+/// Visual category for an output line.  Drives render-time structural
+/// grouping (blank-line separators between different kinds, no
+/// separators within a block).  Mirrors `output_lines` length-for-length
+/// via `output_line_kinds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// Raw model response text (finalized or streamed).
+    Model,
+    /// Tool-call header line (e.g. "▶ execute_command").
+    ToolHeader,
+    /// Generic tool/system line (action digest, plan status, etc.).
+    ToolOutput,
+    /// Command-execution header (e.g. "Running: <cmd>").
+    CommandHeader,
+    /// Command stdout / stderr / tail lines.
+    CommandOutput,
+    /// Reasoning summary line ("Ɵ ...").
+    Reasoning,
+    /// User-submitted prompt line.
+    UserPrompt,
+    /// Explicit turn separator (e.g. "──── ♦ ────").
+    Separator,
+    /// Pre-styled ANSI line (PTY output, code blocks).
+    RawAnsi,
+}
+
 use crate::cli::colors::spinner_frame;
 use crate::cli::output::{OutputEvent, OutputWriterArc};
 
@@ -72,6 +98,10 @@ pub struct PasteChunk {
 pub struct App {
     /// Output lines buffer (agent output, submitted prompts, etc.)
     pub output_lines: VecDeque<Line<'static>>,
+    /// Per-line visual category.  Always the same length as
+    /// `output_lines`; used by `render_output` to insert blank-line
+    /// separators between different block kinds.
+    pub output_line_kinds: VecDeque<BlockKind>,
     /// Input textarea (live user input)
     pub input: TextArea<'static>,
     /// Whether the agent is currently busy
@@ -242,6 +272,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             output_lines: VecDeque::new(),
+            output_line_kinds: VecDeque::new(),
             input: Self::new_textarea(Vec::new()),
             agent_busy: false,
             reasoning_active: false,
@@ -310,6 +341,13 @@ impl App {
     /// to `wrap_width` before being pushed, preventing render-time
     /// wrapping and visual overlap with adjacent content.
     pub fn push_output(&mut self, line: Line<'static>) {
+        self.push_output_with_kind(line, BlockKind::ToolOutput);
+    }
+
+    /// Push an output line tagged with a structural block kind. Long
+    /// lines are pre-wrapped to `wrap_width` before being pushed, and
+    /// every pushed piece shares the same `kind`.
+    pub fn push_output_with_kind(&mut self, line: Line<'static>, kind: BlockKind) {
         let wrap_width = self.last_wrap_width();
 
         // Pre-wrap: if the line's total width exceeds wrap_width, split it
@@ -332,46 +370,26 @@ impl App {
             };
 
         for l in lines_to_push {
-            self._push_output_line(l);
+            self._push_output_line(l, kind);
         }
     }
 
-    /// Internal: push a single pre-wrapped line to the buffer.
-    fn _push_output_line(&mut self, line: Line<'static>) {
+    /// Internal: push a single pre-wrapped line to the buffer with a
+    /// kind tag.  `output_line_kinds` is kept in lockstep with
+    /// `output_lines` so render-time grouping can walk both buffers
+    /// with the same indices.
+    fn _push_output_line(&mut self, line: Line<'static>, kind: BlockKind) {
         self.needs_redraw = true;
-        let wrap_width = self.last_wrap_width();
-        let line_rows = Self::line_visual_rows(&line, wrap_width);
-        let cache_valid = self.cached_wrap_width == Some(wrap_width);
         self.output_lines.push_back(line);
+        self.output_line_kinds.push_back(kind);
+        // Invalidate the visual-row cache: push changes the line buffer,
+        // which can alter render-time separator insertion. Rebuild on next
+        // access ensures cached_visual_rows matches output_rows_for_render().
+        self.cached_wrap_width = None;
         if self.output_lines.len() > 10_000 {
-            let mut removed_rows = 0usize;
-            while self.output_lines.len() > 10_000 {
-                if cache_valid && let Some(removed) = self.output_lines.pop_front() {
-                    removed_rows += Self::line_visual_rows(&removed, wrap_width);
-                } else {
-                    self.output_lines.pop_front();
-                }
-            }
-            if cache_valid {
-                self.cached_visual_rows = self
-                    .cached_visual_rows
-                    .saturating_add(line_rows)
-                    .saturating_sub(removed_rows);
-                // Auto-scroll to bottom when new output arrives (unless approval-pinned)
-                if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
-                    self.force_bottom();
-                }
-                return;
-            }
+            self.output_lines.pop_front();
+            self.output_line_kinds.pop_front();
         }
-
-        if cache_valid {
-            self.cached_visual_rows = self.cached_visual_rows.saturating_add(line_rows);
-        } else {
-            self.rebuild_visual_row_cache(wrap_width);
-        }
-
-        // Auto-scroll to bottom when new output arrives (unless approval-pinned)
         if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
             self.force_bottom();
         }
@@ -390,6 +408,15 @@ impl App {
         if kind == StreamKind::Model {
             self.turn_had_streamed_line = true;
         }
+
+        // StreamKind maps to a default BlockKind. The interactive.rs
+        // routing layer overrides this default for structurally tagged
+        // emissions (tool headers, command headers, reasoning) by
+        // calling `push_output_with_kind` directly via dedicated events.
+        let block_kind = match kind {
+            StreamKind::Model => BlockKind::Model,
+            StreamKind::ToolOutput => BlockKind::ToolOutput,
+        };
 
         // Pre-wrap: split long lines and record all indices.
         // We must pre-wrap here (not rely on push_output's pre-wrap) so
@@ -415,7 +442,7 @@ impl App {
 
         for l in lines_to_push {
             let idx = self.output_lines.len();
-            self.push_output(l);
+            self.push_output_with_kind(l, block_kind);
             // push_output may have evicted the front of the buffer if it
             // exceeded 10,000 lines. If our recorded index fell off, drop
             // it and any earlier recorded indices for this turn — the
@@ -472,25 +499,26 @@ impl App {
             // Drop any pending indicator so it does not linger as an
             // orphaned line if this turn produced no markdown.
             self.turn_indicator = None;
-            // When no Model entries were recorded but streamed lines were
-            // emitted (direct push), append the re-rendered markdown
-            // after the existing lines instead of replacing them.
-            // This avoids a visual flash on the first turn.
-            if model_indices.is_empty() && had_streamed_line && !markdown_text.trim().is_empty() {
-                let prefixed_markdown = if self.turn_indicator.take().is_some() {
-                    format!("\u{2666} {}", markdown_text)
-                } else {
-                    markdown_text.to_string()
-                };
-                let rendered: Vec<Line<'static>> =
-                    crate::cli::markdown::render_markdown(None, &prefixed_markdown);
-                for line in rendered {
-                    self.output_lines.push_back(line);
+// When no Model entries were recorded but streamed lines were
+                // emitted (direct push), append the re-rendered markdown
+                // after the existing lines instead of replacing them.
+                // This avoids a visual flash on the first turn.
+                if model_indices.is_empty() && had_streamed_line && !markdown_text.trim().is_empty() {
+                    let prefixed_markdown = if self.turn_indicator.take().is_some() {
+                        format!("\u{2666} {}", markdown_text)
+                    } else {
+                        markdown_text.to_string()
+                    };
+                    let rendered: Vec<Line<'static>> =
+                        crate::cli::markdown::render_markdown(None, &prefixed_markdown);
+                    for line in rendered {
+                        self.output_lines.push_back(line);
+                        self.output_line_kinds.push_back(BlockKind::Model);
+                    }
+                    self.needs_redraw = true;
+                    self.cached_wrap_width = None;
+                    self.rebuild_visual_row_cache(self.last_wrap_width());
                 }
-                self.needs_redraw = true;
-                self.cached_wrap_width = None;
-                self.rebuild_visual_row_cache(self.last_wrap_width());
-            }
             return;
         }
 
@@ -554,9 +582,13 @@ impl App {
 
         // Pop only the Model entries from highest index to lowest to
         // preserve the relative order of entries that come before.
-        // ToolOutput entries are NOT popped.
+        // ToolOutput entries are NOT popped.  `output_line_kinds` is
+        // popped in lockstep so render-time grouping stays valid.
         for &idx in model_entry_indices.iter().rev() {
             self.output_lines.remove(idx);
+            if idx < self.output_line_kinds.len() {
+                self.output_line_kinds.remove(idx);
+            }
         }
 
         // The Model entry indices were contiguous in append order
@@ -590,12 +622,32 @@ impl App {
         // Collect rendered lines, then insert in reverse at the same
         // position. Each insert is O(1) amortized (tail-shift only),
         // avoiding the O(n²) cost of inserting each line at a growing
-        // index in a VecDeque.
+        // index in a VecDeque.  `output_line_kinds` is kept in lockstep
+        // so render-time grouping still sees BlockKind::Model for the
+        // re-rendered markdown.
         let rendered: Vec<Line<'static>> =
             crate::cli::markdown::render_markdown(None, &prefixed_markdown);
+        let rendered_count = rendered.len();
         for line in rendered.into_iter().rev() {
             self.output_lines.insert(insert_at, line);
+            self.output_line_kinds.insert(insert_at, BlockKind::Model);
         }
+        // Sanity: lengths should match exactly. If they ever diverge
+        // (e.g. because some external mutation slipped through),
+        // rebuild both from the same buffer to recover.
+        if self.output_lines.len() != self.output_line_kinds.len() {
+            debug_assert_eq!(
+                self.output_lines.len(),
+                self.output_line_kinds.len(),
+                "output_line_kinds drifted from output_lines after finalize"
+            );
+            let drain_to = self.output_lines.len().min(self.output_line_kinds.len());
+            self.output_line_kinds.truncate(drain_to);
+            while self.output_line_kinds.len() < self.output_lines.len() {
+                self.output_line_kinds.push_back(BlockKind::Model);
+            }
+        }
+        let _ = rendered_count;
 
         self.needs_redraw = true;
         // Invalidate the visual-row cache: the line count and content
@@ -670,7 +722,7 @@ impl App {
             diamond,
             "─".repeat(right),
         );
-        self.push_output(Line::from(Span::styled(sep, theme::dim_style())));
+        self.push_output_with_kind(Line::from(Span::styled(sep, theme::dim_style())), BlockKind::Separator);
     }
 
     /// Push a user message with proper formatting (splits on newlines).
@@ -692,7 +744,10 @@ impl App {
             } else {
                 format!("❯ {}", line)
             };
-            writer.emit(OutputEvent::styled(content, style));
+            writer.emit(OutputEvent::UserPromptLine(Line::from(Span::styled(
+                content,
+                style,
+            ))));
         }
         self.force_bottom();
     }
@@ -707,6 +762,7 @@ impl App {
     pub fn clear_output(&mut self) {
         self.needs_redraw = true;
         self.output_lines.clear();
+        self.output_line_kinds.clear();
         self.completion_lines.clear();
         self.error_lines.clear();
         self.cached_visual_rows = 0;
@@ -721,20 +777,11 @@ impl App {
         if start >= self.output_lines.len() {
             return;
         }
-
-        let wrap_width = self.last_wrap_width();
-        if self.cached_wrap_width == Some(wrap_width) {
-            let removed_rows = self
-                .output_lines
-                .drain(start..)
-                .map(|line| Self::line_visual_rows(&line, wrap_width))
-                .sum::<usize>();
-            self.cached_visual_rows = self.cached_visual_rows.saturating_sub(removed_rows);
-        } else {
-            self.output_lines.drain(start..);
-            self.cached_visual_rows = 0;
-            self.cached_wrap_width = None;
-        }
+        self.output_lines.drain(start..);
+        self.output_line_kinds.drain(start..);
+        // Invalidate the visual-row cache: drain changes the line buffer,
+        // which can alter render-time separator insertion.
+        self.cached_wrap_width = None;
     }
 
     pub fn pin_approval_bottom(&mut self) {
@@ -920,16 +967,24 @@ impl App {
         let target_start = scroll_y.min(self.cached_visual_rows);
         let target_end = target_start.saturating_add(content_height.max(1));
 
+        // Walk the same expanded (line, kind) list that the renderer
+        // uses, so separator rows are counted in scroll math and the
+        // returned indices reference the same list the renderer
+        // eventually slices.  `start_idx`/`end_idx` are indices into
+        // `expanded`, NOT into `self.output_lines` — the expanded list
+        // is longer when transition separators are present.
+        let expanded = self.output_rows_for_render();
+        let expanded_len = expanded.len();
         let mut rows_before = 0usize;
-        let mut start_idx = self.output_lines.len();
+        let mut start_idx = expanded_len;
         let mut start_row_offset = 0usize;
-        let mut end_idx = self.output_lines.len().saturating_sub(1);
+        let mut end_idx = expanded_len.saturating_sub(1);
 
-        for (idx, line) in self.output_lines.iter().enumerate() {
+        for (idx, (line, _kind)) in expanded.iter().enumerate() {
             let rows = Self::line_visual_rows(line, wrap_width);
             let rows_after = rows_before.saturating_add(rows);
 
-            if start_idx == self.output_lines.len() && rows_after > target_start {
+            if start_idx == expanded_len && rows_after > target_start {
                 start_idx = idx;
                 start_row_offset = target_start.saturating_sub(rows_before);
             }
@@ -943,8 +998,8 @@ impl App {
             end_idx = idx;
         }
 
-        if start_idx == self.output_lines.len() {
-            start_idx = self.output_lines.len().saturating_sub(1);
+        if start_idx == expanded_len {
+            start_idx = expanded_len.saturating_sub(1);
             start_row_offset = 0;
             end_idx = start_idx;
         }
@@ -960,9 +1015,9 @@ impl App {
 
     fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
         let output_rows: usize = self
-            .output_lines
+            .output_rows_for_render()
             .iter()
-            .map(|line| Self::line_visual_rows(line, wrap_width))
+            .map(|(line, _)| Self::line_visual_rows(line, wrap_width))
             .sum();
         // Completion box uses the same wrap width (only borders, no gutter).
         let completion_rows: usize = self
@@ -981,6 +1036,67 @@ impl App {
         self.cached_completion_rows = completion_rows;
         self.cached_error_rows = error_rows;
         self.cached_wrap_width = Some(wrap_width);
+    }
+
+    /// Returns the renderable output rows: each entry of
+    /// `output_lines` paired with its `BlockKind`, with one blank-line
+    /// separator inserted on every transition between non-Separated
+    /// kinds (so the visual row count matches what `render_output`
+    /// will actually draw).  Used by both the visual-row cache and
+    /// the renderer so they cannot drift.
+    fn output_rows_for_render(&self) -> Vec<(Line<'static>, BlockKind)> {
+        let mut out: Vec<(Line<'static>, BlockKind)> = Vec::with_capacity(self.output_lines.len());
+        let mut prev: Option<BlockKind> = None;
+        for (line, kind) in self.output_lines.iter().zip(self.output_line_kinds.iter()) {
+            if let Some(p) = prev
+                && Self::should_insert_separator(p, *kind)
+            {
+                out.push((Line::from(""), BlockKind::Separator));
+            }
+            out.push((line.clone(), *kind));
+            prev = Some(*kind);
+        }
+        out
+    }
+
+    /// Predicate for whether a blank-line separator should be drawn
+    /// between two consecutive output block kinds.  Explicit
+    /// `BlockKind::Separator` lines are themselves visual boundaries,
+    /// so no extra separator is inserted around them.
+    fn should_insert_separator(prev: BlockKind, next: BlockKind) -> bool {
+        if prev == next {
+            return false;
+        }
+        if prev == BlockKind::Separator || next == BlockKind::Separator {
+            return false;
+        }
+        match (prev, next) {
+            (BlockKind::CommandHeader, BlockKind::CommandOutput) => false,
+            (BlockKind::CommandOutput, BlockKind::CommandOutput) => false,
+            (BlockKind::ToolOutput, BlockKind::ToolOutput) => false,
+            (BlockKind::Reasoning, BlockKind::Reasoning) => false,
+            (BlockKind::Model, BlockKind::Model) => false,
+            (
+                BlockKind::Model,
+                BlockKind::ToolHeader
+                | BlockKind::CommandHeader
+                | BlockKind::ToolOutput
+                | BlockKind::CommandOutput
+                | BlockKind::Reasoning
+                | BlockKind::UserPrompt,
+            ) => true,
+            (
+                BlockKind::ToolOutput
+                | BlockKind::CommandOutput
+                | BlockKind::ToolHeader
+                | BlockKind::CommandHeader
+                | BlockKind::Reasoning
+                | BlockKind::UserPrompt,
+                BlockKind::Model,
+            ) => true,
+            (_, BlockKind::UserPrompt) => true,
+            _ => false,
+        }
     }
 
     fn total_visual_rows(&mut self, wrap_width: usize) -> usize {
@@ -1195,13 +1311,18 @@ impl App {
 
         // Render the full transcript. Cached row counts keep scroll math cheap,
         // but slicing the render buffer can clip wrapped prompt text.
+        // `output_rows_for_render` returns the same expanded (line, kind)
+        // list that the visual-row cache was built from, so the visible
+        // slice and the scroll math stay in lockstep after separator
+        // insertion.
         {
             frame.render_widget(Clear, main_output_area);
-            let visible_lines: Vec<Line<'static>> = self.output_lines
-                .iter()
+            let expanded = self.output_rows_for_render();
+            let visible_lines: Vec<Line<'static>> = expanded
+                .into_iter()
                 .skip(start_idx)
                 .take(visible_count)
-                .cloned()
+                .map(|(line, _)| line)
                 .collect();
             let output = Paragraph::new(visible_lines)
                 .wrap(Wrap { trim: false })
@@ -2784,10 +2905,10 @@ mod tests {
             .collect();
 
         // The output pane occupies the upper rows; status bar (1) and
-        // input area (3) are at the bottom. Scan the bottom 10 rows of
-        // the output pane for the approval prompt.
+        // input area (3) are at the bottom. Scan the bottom 15 rows of
+        // the terminal to cover the output pane content above the status/input.
         let output_bottom_rows: Vec<&String> =
-            rows.iter().rev().take(10).collect();
+            rows.iter().rev().take(15).collect();
 
         // The "Execute this tool?" line is the user-visible prompt anchor.
         let has_prompt_question = output_bottom_rows
@@ -2919,7 +3040,7 @@ mod tests {
             .collect();
 
         let output_bottom_rows: Vec<&String> =
-            rows.iter().rev().take(10).collect();
+            rows.iter().rev().take(15).collect();
 
         let has_prompt_question = output_bottom_rows
             .iter()

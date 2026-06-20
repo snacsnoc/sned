@@ -33,6 +33,15 @@ pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut first = true;
     for raw_line in text.split('\n') {
+        // Wrap is no-op for empty input, so route blank \n\n segments
+        // through here explicitly to keep author-supplied vertical spacing.
+        if raw_line.is_empty() {
+            out.push(Line::from(""));
+            // Do not consume `first` on leading blanks — the prefix must
+            // attach to the first non-blank content line, not a blank line.
+            continue;
+        }
+
         // The first physical line of the message carries the prefix,
         // so its wrap budget is smaller than continuation lines.
         let width_budget = if first { first_width } else { continuation_width };
@@ -577,5 +586,73 @@ mod tests {
         let md = "1. first\n2. second\n3. third";
         let lines = render_markdown(None, md);
         assert_eq!(lines.len(), 3, "expected 3 lines, got: {:?}", lines);
+    }
+
+    /// Regression: prior to this fix, render_error_markdown emitted each
+    /// \n-split line verbatim, so a long error message overflowed the
+    /// terminal instead of wrapping.
+    #[test]
+    fn render_error_markdown_wraps_long_error_text() {
+        let long = "this is a very long error message that absolutely should be wrapped to fit the terminal width when rendered in the one-shot non-interactive output path";
+        let lines = render_error_markdown("✗ Error", long);
+        assert!(
+            lines.len() > 1,
+            "expected wrap into multiple lines, got {} line(s): {:?}",
+            lines.len(),
+            lines
+        );
+        // No emitted line should be wider than the terminal — wrapping
+        // must have split the input before any row overflowed.
+        let term_width = crate::cli::text_utils::get_terminal_width();
+        for (i, line) in lines.iter().enumerate() {
+            let width: usize = line
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(
+                width <= term_width,
+                "line {i} overflowed terminal width {term_width}: width={width} content={:?}",
+                line.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+            );
+        }
+    }
+
+    /// The first line must carry the red-bold prefix; continuation
+    /// lines must not repeat it.
+    #[test]
+    fn render_error_markdown_prefix_only_on_first_line() {
+        let long = "first part of error that fills more than a line of output so it must wrap second part";
+        let lines = render_error_markdown("✗ Error", long);
+        let first_text: String =
+            lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_text.starts_with("✗ Error"));
+        for line in &lines[1..] {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !text.starts_with("✗ Error"),
+                "continuation line must not repeat the prefix: {text}"
+            );
+        }
+    }
+
+    /// Explicit blank lines in the error text must be preserved. Prior to this
+    /// fix, `wrap_text("", ...)` produced no output, collapsing authored spacing.
+    #[test]
+    fn render_error_markdown_preserves_blank_lines() {
+        let lines = render_error_markdown("✗ Error", "first\n\nthird");
+        assert_eq!(lines.len(), 3, "expected 3 lines, got {:?}", lines);
+        let first_text: String =
+            lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_text.contains("first"));
+        let middle_text: String =
+            lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            middle_text.is_empty(),
+            "expected blank middle line, got: {middle_text:?}",
+        );
+        let last_text: String =
+            lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(last_text.contains("third"));
     }
 }
