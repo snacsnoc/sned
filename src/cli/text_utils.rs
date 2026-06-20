@@ -25,60 +25,7 @@ pub fn stderr_is_tty() -> bool {
 /// │ Content line 2                             │
 /// ╰────────────────────────────────────────────╯
 pub fn draw_completion_box(title: &str, content: &str, width: usize) -> String {
-    if width < 10 {
-        return format!("{} {}\n{}\n", "✓", title, content);
-    }
-
-    let inner_width = width.saturating_sub(4); // Account for borders and padding
-    let indent = "  ";
-
-    // Wrap content to fit inside the box
-    let wrapped_content = wrap_text(content, inner_width, "");
-
-    // Build the box
-    let mut result = String::new();
-
-    // Top border: ╭─ Title ───────────────────╮
-    result.push_str(indent);
-    result.push('╭');
-    result.push('─');
-    result.push(' ');
-    result.push_str(title);
-    result.push(' ');
-
-    let title_len = title.chars().count() + 2; // "+ " around title
-    let dash_count = inner_width.saturating_sub(title_len + 1);
-    for _ in 0..dash_count {
-        result.push('─');
-    }
-    result.push('╮');
-    result.push('\n');
-
-    // Content lines: │ content                     │
-    for line in wrapped_content.lines() {
-        result.push_str(indent);
-        result.push('│');
-        result.push(' ');
-        result.push_str(line);
-
-        let padding_needed = inner_width.saturating_sub(line.chars().count() + 1);
-        for _ in 0..padding_needed {
-            result.push(' ');
-        }
-        result.push('│');
-        result.push('\n');
-    }
-
-    // Bottom border: ╰────────────────────────────╯
-    result.push_str(indent);
-    result.push('╰');
-    for _ in 0..(inner_width + 1) {
-        result.push('─');
-    }
-    result.push('╯');
-    result.push('\n');
-
-    result
+    draw_box(title, content, width, "✓")
 }
 
 /// Draw a framed box around error text.
@@ -88,21 +35,27 @@ pub fn draw_completion_box(title: &str, content: &str, width: usize) -> String {
 /// │ Error message line 1                       │
 /// │ Error message line 2                       │
 /// ╰────────────────────────────────────────────╯
-///
-/// Falls back to plain text when width < 10.
 pub fn draw_error_box(title: &str, content: &str, width: usize) -> String {
+    draw_box(title, content, width, "✗")
+}
+
+/// Each line must be exactly `width` cols so the right border sits
+/// flush with the terminal edge. Wrapping at `inner_width - 1`
+/// reserves the single space after `│`; padding fills the rest.
+fn draw_box(title: &str, content: &str, width: usize, symbol: &str) -> String {
+    // Below ~10 cols the borders and padding can no longer coexist,
+    // so emit a plain fallback instead of a malformed box.
     if width < 10 {
-        return format!("{} {}\n{}\n", "✗", title, content);
+        return format!("{} {}\n{}\n", symbol, title, content);
     }
 
     let inner_width = width.saturating_sub(4);
     let indent = "  ";
-
-    let wrapped_content = wrap_text(content, inner_width, "");
+    let content_width = inner_width.saturating_sub(1);
+    let wrapped_content = wrap_text(content, content_width, "");
 
     let mut result = String::new();
 
-    // Top border: ╭─ ✗ Error ───────────────────╮
     result.push_str(indent);
     result.push('╭');
     result.push('─');
@@ -110,6 +63,8 @@ pub fn draw_error_box(title: &str, content: &str, width: usize) -> String {
     result.push_str(title);
     result.push(' ');
 
+    // Top border has `─ {title} ` (2 + title chars) before the dashes,
+    // then 1 trailing dash, then ╮.
     let title_len = title.chars().count() + 2;
     let dash_count = inner_width.saturating_sub(title_len + 1);
     for _ in 0..dash_count {
@@ -118,14 +73,13 @@ pub fn draw_error_box(title: &str, content: &str, width: usize) -> String {
     result.push('╮');
     result.push('\n');
 
-    // Content lines: │ content                     │
     for line in wrapped_content.lines() {
         result.push_str(indent);
         result.push('│');
         result.push(' ');
         result.push_str(line);
 
-        let padding_needed = inner_width.saturating_sub(line.chars().count() + 1);
+        let padding_needed = content_width.saturating_sub(line.chars().count());
         for _ in 0..padding_needed {
             result.push(' ');
         }
@@ -133,10 +87,9 @@ pub fn draw_error_box(title: &str, content: &str, width: usize) -> String {
         result.push('\n');
     }
 
-    // Bottom border: ╰────────────────────────────╯
     result.push_str(indent);
     result.push('╰');
-    for _ in 0..(inner_width + 1) {
+    for _ in 0..inner_width {
         result.push('─');
     }
     result.push('╯');

@@ -23,26 +23,39 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
 ///
 /// The first line is prefixed with `prefix` (e.g. "✗ Error") styled in red.
 /// The error text is rendered as plain styled lines (no markdown parsing).
+/// Lines that exceed the terminal width are word-wrapped.
 pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
+    let wrap_width = crate::cli::text_utils::get_terminal_width();
+    let prefix_width = unicode_width::UnicodeWidthStr::width(prefix) + 2;
+    let first_width = wrap_width.saturating_sub(prefix_width).max(1);
+    let continuation_width = wrap_width.max(1);
+
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut first = true;
-    for line in text.split('\n') {
-        if first {
-            first = false;
-            out.push(Line::from(vec![
-                Span::styled(
-                    format!("{}: ", prefix),
-                    Style::default()
-                        .fg(ratatui::style::Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(line.to_string(), Style::default()),
-            ]));
-        } else {
-            out.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default(),
-            )));
+    for raw_line in text.split('\n') {
+        // The first physical line of the message carries the prefix,
+        // so its wrap budget is smaller than continuation lines.
+        let width_budget = if first { first_width } else { continuation_width };
+        let wrapped = crate::cli::text_utils::wrap_text(raw_line, width_budget, "");
+
+        for (i, line) in wrapped.lines().enumerate() {
+            if first && i == 0 {
+                first = false;
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}: ", prefix),
+                        Style::default()
+                            .fg(ratatui::style::Color::Red)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(line.to_string(), Style::default()),
+                ]));
+            } else {
+                out.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default(),
+                )));
+            }
         }
     }
     if out.is_empty() {
@@ -169,7 +182,30 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                     in_code_block = true;
                 }
                 Tag::List(_) => {}
-                Tag::Item => {}
+                Tag::Item => {
+                    // Flush any accumulated spans from the previous item.
+                    // Guard against flushing empty spans to avoid spurious
+                    // blank lines between list items.
+                    if !current_spans.is_empty() {
+                        flush_line(
+                            &mut out,
+                            &mut current_text,
+                            &mut current_spans,
+                            *is_first_line,
+                            prefix,
+                        );
+                    } else if *is_first_line && let Some(p) = prefix {
+                        // If this is the very first item and we skipped the
+                        // flush because spans were empty, still apply the prefix
+                        // (e.g., "🚀 ") to the first line by inserting it now.
+                        current_spans.push(Span::styled(
+                            p.to_string(),
+                            Style::default().fg(crate::cli::tui::theme::PROMPT_FG),
+                        ));
+                    }
+                    *is_first_line = false;
+                    pending_list_prefix = Some("• ".to_string());
+                }
                 Tag::Table(_) => {
                     in_table = true;
                 }
@@ -493,5 +529,53 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(!joined.contains("🚀"), "got: {}", joined);
+    }
+
+    #[test]
+    fn list_items_render_on_separate_lines_with_bullet() {
+        let md = "* one\n* two\n* three";
+        let lines = render_markdown(None, md);
+        assert_eq!(lines.len(), 3, "expected 3 lines, got: {:?}", lines);
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.starts_with("• "),
+                "expected bullet prefix, got: {}",
+                text
+            );
+        }
+        assert!(collect_text(&lines).contains("one"));
+        assert!(collect_text(&lines).contains("two"));
+        assert!(collect_text(&lines).contains("three"));
+    }
+
+    #[test]
+    fn list_items_with_completion_prefix() {
+        let md = "* one\n* two\n* three";
+        let lines = render_completion_markdown("🚀 ", md);
+        // First line gets the "🚀 " prefix + "• " bullet
+        // Remaining lines get only the "• " bullet
+        assert!(lines.len() >= 3);
+        // First line should have both prefixes
+        let first_text: String =
+            lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_text.contains("🚀"));
+        assert!(first_text.contains("• "));
+        // Subsequent lines should have bullet but not the completion prefix
+        for line in &lines[1..] {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.starts_with("• "),
+                "expected bullet prefix on line, got: {}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn nested_list_items_preserve_structure() {
+        let md = "1. first\n2. second\n3. third";
+        let lines = render_markdown(None, md);
+        assert_eq!(lines.len(), 3, "expected 3 lines, got: {:?}", lines);
     }
 }

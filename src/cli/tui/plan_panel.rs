@@ -1,6 +1,7 @@
 //! Plan panel widget for displaying the interactive plan workflow.
 
 use super::theme;
+use crate::cli::markdown::render_markdown;
 use crate::core::plan_state::{PlanState, PlanStepStatus};
 use ratatui::{
     Frame,
@@ -103,10 +104,23 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
             Style::default()
         };
 
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} {}.", step.status_icon(), step.index + 1), style),
-            Span::styled(format!(" {}", step.description), style),
-        ]));
+        // Render description as markdown, then prepend the status icon + step number
+        // to the first line.
+        let rendered = render_markdown(None, &step.description);
+        let prefix = Span::styled(format!("{} {}.", step.status_icon(), step.index + 1), style);
+        for (i, mut line) in rendered.into_iter().enumerate() {
+            if i == 0 {
+                // Prepend the prefix to the first line
+                let mut new_spans = vec![prefix.clone()];
+                new_spans.extend(line.spans);
+                line = Line::from(new_spans);
+            }
+            // Apply the step's style to all spans
+            for span in &mut line.spans {
+                span.style = span.style.patch(style);
+            }
+            lines.push(line);
+        }
     }
 
     // Approval prompt when not yet approved
