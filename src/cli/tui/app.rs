@@ -53,8 +53,6 @@ pub enum BlockKind {
     UserPrompt,
     /// Explicit turn separator (e.g. "──── ♦ ────").
     Separator,
-    /// Pre-styled ANSI line (PTY output, code blocks).
-    RawAnsi,
 }
 
 use crate::cli::colors::spinner_frame;
@@ -627,7 +625,6 @@ impl App {
         // re-rendered markdown.
         let rendered: Vec<Line<'static>> =
             crate::cli::markdown::render_markdown(None, &prefixed_markdown);
-        let rendered_count = rendered.len();
         for line in rendered.into_iter().rev() {
             self.output_lines.insert(insert_at, line);
             self.output_line_kinds.insert(insert_at, BlockKind::Model);
@@ -647,8 +644,6 @@ impl App {
                 self.output_line_kinds.push_back(BlockKind::Model);
             }
         }
-        let _ = rendered_count;
-
         self.needs_redraw = true;
         // Invalidate the visual-row cache: the line count and content
         // changed, so the cached row count is stale.
@@ -1072,10 +1067,6 @@ impl App {
         }
         match (prev, next) {
             (BlockKind::CommandHeader, BlockKind::CommandOutput) => false,
-            (BlockKind::CommandOutput, BlockKind::CommandOutput) => false,
-            (BlockKind::ToolOutput, BlockKind::ToolOutput) => false,
-            (BlockKind::Reasoning, BlockKind::Reasoning) => false,
-            (BlockKind::Model, BlockKind::Model) => false,
             (
                 BlockKind::Model,
                 BlockKind::ToolHeader
