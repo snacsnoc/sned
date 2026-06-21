@@ -40,6 +40,19 @@ fn format_context_window(tokens: u64) -> String {
     }
 }
 
+const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 16_384;
+
+fn parse_output_channel_capacity(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_OUTPUT_CHANNEL_CAPACITY)
+}
+
+fn output_channel_capacity() -> usize {
+    let raw = std::env::var("SNED_OUTPUT_CHANNEL_CAPACITY").ok();
+    parse_output_channel_capacity(raw.as_deref())
+}
+
 fn build_user_message_content(
     clean_prompt: String,
     image_paths: Vec<String>,
@@ -2354,9 +2367,9 @@ async fn run_main_loop(
         }
     }
 
-    const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(8);
-    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(8);
     const BUSY_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+    const BUSY_POLL_INTERVAL: Duration = BUSY_REDRAW_INTERVAL;
+    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(8);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
     let mut last_draw_at: Option<std::time::Instant> = None;
     let mut timing = TimingSummary {
@@ -2488,8 +2501,9 @@ async fn run_main_loop(
             app.needs_redraw = false;
         }
 
-        // 3. Poll for events. Busy-state redraw does not need 60 FPS; a slower
-        // cadence keeps the TUI responsive without wasting most cycles on the spinner.
+        // 3. Poll for events. Busy-state polling matches the redraw cadence so
+        // streaming does not burn extra wakeups between frames, while idle mode
+        // stays tighter to preserve typing responsiveness.
         let poll_interval = if app.agent_busy {
             BUSY_POLL_INTERVAL
         } else {
@@ -2918,8 +2932,9 @@ pub async fn run_interactive_shell_inner(
         app.cwd = cwd.to_string_lossy().to_string();
     }
 
-    // 2. Create output channel (bounded to prevent memory exhaustion during output floods)
-    let (output_tx, mut output_rx) = mpsc::channel(8192);
+    // 2. Create output channel (bounded to prevent memory exhaustion during
+    // output floods while absorbing larger streaming bursts before overflow).
+    let (output_tx, mut output_rx) = mpsc::channel(output_channel_capacity());
     let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(output_tx));
 
     // 3. Build session
@@ -3196,6 +3211,27 @@ mod tests {
         assert_eq!(rendered, vec!["final partial"]);
 
         reset_prompt_state();
+    }
+
+    #[test]
+    fn test_parse_output_channel_capacity_accepts_positive_override() {
+        assert_eq!(parse_output_channel_capacity(Some("32768")), 32_768);
+    }
+
+    #[test]
+    fn test_parse_output_channel_capacity_falls_back_for_invalid_values() {
+        assert_eq!(
+            parse_output_channel_capacity(None),
+            DEFAULT_OUTPUT_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            parse_output_channel_capacity(Some("0")),
+            DEFAULT_OUTPUT_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            parse_output_channel_capacity(Some("invalid")),
+            DEFAULT_OUTPUT_CHANNEL_CAPACITY
+        );
     }
 
     #[test]
