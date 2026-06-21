@@ -1407,7 +1407,9 @@ impl StateManager {
             .iter()
             .filter(|h| {
                 // Check if workspace path matches
-                h.workspace_root_path.as_ref().is_some_and(|p| p == workspace_path)
+                h.workspace_root_path
+                    .as_ref()
+                    .is_some_and(|p| workspace_paths_match(p, workspace_path))
             })
             .max_by_key(|h| h.ts)
             .cloned()
@@ -2137,6 +2139,20 @@ pub fn total_pages(total: usize, limit: usize) -> usize {
     total.div_ceil(limit)
 }
 
+fn workspace_paths_match(history_path: &str, workspace_path: &str) -> bool {
+    if history_path == workspace_path {
+        return true;
+    }
+
+    match (
+        Path::new(history_path).canonicalize(),
+        Path::new(workspace_path).canonicalize(),
+    ) {
+        (Ok(history), Ok(workspace)) => history == workspace,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2234,6 +2250,45 @@ mod tests {
             let history = manager.get_task_history();
             assert_eq!(history.len(), 1);
             assert_eq!(history[0].id, "task-2");
+        });
+    }
+
+    #[test]
+    fn test_get_most_recent_task_for_workspace_matches_canonical_equivalent_paths() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+            manager.set_task_history(Vec::new());
+
+            let workspace_root = TempDir::new().unwrap();
+            let workspace = workspace_root.path().join("workspace");
+            fs::create_dir_all(&workspace).unwrap();
+
+            let older = HistoryItem {
+                id: "task-1".to_string(),
+                ts: 1000,
+                task: "Older".to_string(),
+                workspace_root_path: Some(workspace.join(".").to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            let newer = HistoryItem {
+                id: "task-2".to_string(),
+                ts: 2000,
+                task: "Newer".to_string(),
+                workspace_root_path: Some(
+                    workspace.join("subdir/..").to_string_lossy().into_owned(),
+                ),
+                ..Default::default()
+            };
+
+            fs::create_dir_all(workspace.join("subdir")).unwrap();
+            manager.add_task_to_history(older);
+            manager.add_task_to_history(newer);
+
+            let found = manager
+                .get_most_recent_task_for_workspace(workspace.to_str().unwrap())
+                .unwrap();
+            assert_eq!(found.id, "task-2");
         });
     }
 
