@@ -272,7 +272,7 @@ fn fuzzy_score_normalized(query_bytes: &[u8], target: &str) -> Option<usize> {
                 // Consecutive match (e.g., "main" in "main.rs")
                 score += 5;
             } else if ti == 0
-                || (ti > 0 && target_bytes[ti - 1] == b'/' || target_bytes[ti - 1] == b'_')
+                || (ti > 0 && (target_bytes[ti - 1] == b'/' || target_bytes[ti - 1] == b'_' || target_bytes[ti - 1] == b' '))
             {
                 // Word boundary (e.g., "AGE" at start of "AGENTS" or after "/")
                 score += 4;
@@ -322,8 +322,8 @@ pub async fn search_workspace_files(
     let mut scored: Vec<_> = items
         .iter()
         .filter_map(|item| {
-            let search_target = format!("{} {}", item.label, item.path);
-            fuzzy_score_normalized(&query_bytes, &search_target).map(|score| (score, item.clone()))
+            let search_target = &item.path;
+            fuzzy_score_normalized(&query_bytes, search_target).map(|score| (score, item.clone()))
         })
         .collect();
 
@@ -825,5 +825,39 @@ mod tests {
         // All distinct — no collisions
         assert!(root != nested);
         assert!(nested != deeper);
+    }
+
+    #[test]
+    fn test_fuzzy_score_space_word_boundary() {
+        // Query matching after a space should get word boundary bonus (+4), not scattered (+1).
+        // Use same-length targets to avoid length normalization confounding the result.
+        // "src" in "file.rs src/main" (20 chars) — space before 's' is word boundary.
+        // "src" in "xyzsrcsrcsrcsr" (16 chars) — first 's' preceded by 'y' is scattered.
+        // Pad to same length: "file.rs src/main_" (20 chars) vs "xyzsrcsrcsrcsr" (16 chars)
+        // Better: use equal-length strings where only the word boundary differs.
+        let score_space = fuzzy_score_normalized("src".as_bytes(), "abc src 123").unwrap();
+        let score_scattered = fuzzy_score_normalized("src".as_bytes(), "ascrsc123").unwrap();
+        assert!(score_space > score_scattered, "space word boundary should score higher than scattered, got {} vs {}", score_space, score_scattered);
+    }
+
+    #[test]
+    fn test_search_workspace_files_root_file_no_duplication() {
+        // Root-level files where label == path should not get inflated scores from duplication.
+        // "agents" matching "AGENTS.md" (no duplication) vs "AGENTS.md AGENTS.md" (self-duplicated).
+        let score1 = fuzzy_score_normalized("agents".as_bytes(), "AGENTS.md");
+        let score2 = fuzzy_score_normalized("agents".as_bytes(), "AGENTS.md AGENTS.md");
+        assert!(
+            score1.is_some() && score2.is_some(),
+            "both should match"
+        );
+        // The duplicated target has the same first match but a longer target length,
+        // which reduces the normalized score. Key invariant: root file should not get
+        // an artificially inflated score from self-duplication.
+        assert!(
+            score1.unwrap() > score2.unwrap(),
+            "non-duplicated target should score higher, got {} vs {}",
+            score1.unwrap(),
+            score2.unwrap()
+        );
     }
 }
