@@ -739,6 +739,11 @@ mod tests {
                 OutputEvent::TurnEnd { .. } => return,
                 OutputEvent::TurnIndicator(line) => line.to_string(),
                 OutputEvent::ErrorBox(msg) => msg,
+                OutputEvent::ToolHeaderLine(line) => line.to_string(),
+                OutputEvent::CommandHeaderLine(line) => line.to_string(),
+                OutputEvent::CommandOutputLine(line) => line.to_string(),
+                OutputEvent::ReasoningLine(line) => line.to_string(),
+                OutputEvent::UserPromptLine(line) => line.to_string(),
             };
             self.events.lock().unwrap().push(text);
         }

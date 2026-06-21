@@ -41,6 +41,7 @@ use crate::storage::state_manager::StateManager;
 use crate::storage::task_storage::TaskStorage;
 use futures::future::FutureExt;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hasher;
@@ -1960,14 +1961,15 @@ impl AgentLoop {
                                 if let Some(summary) =
                                     summarize_reasoning(&reasoning_chunk.reasoning, term_width)
                                 {
+                                    let reasoning_line = Line::from(Span::styled(
+                                        format!("  Ɵ {}", summary),
+                                        Style::default()
+                                            .fg(crate::cli::tui::theme::ACCENT)
+                                            .add_modifier(Modifier::ITALIC),
+                                    ));
                                     self.config
                                         .output_writer
-                                        .emit(OutputEvent::tool_output_line(
-                                            format!("  Ɵ {}", summary),
-                                            Style::default()
-                                                .fg(crate::cli::tui::theme::ACCENT)
-                                                .add_modifier(Modifier::ITALIC),
-                                        ));
+                                        .emit(OutputEvent::ReasoningLine(reasoning_line));
                                     reasoning_preview_shown = true;
                                     emitted_output_this_attempt = true;
                                 }
@@ -4483,6 +4485,11 @@ mod tests {
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}
                 crate::cli::output::OutputEvent::TurnIndicator(line) => rendered.push(line.to_string()),
                 crate::cli::output::OutputEvent::ErrorBox(msg) => rendered.push(msg),
+                crate::cli::output::OutputEvent::ToolHeaderLine(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::CommandHeaderLine(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::CommandOutputLine(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ReasoningLine(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::UserPromptLine(line) => rendered.push(line.to_string()),
             }
         }
         rendered

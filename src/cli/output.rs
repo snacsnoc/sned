@@ -22,6 +22,18 @@ pub enum OutputEvent {
     /// heat map, etc.).  The TUI tags these as `ToolOutput` so they
     /// are never popped or re-rendered by `finalize_turn_stream`.
     ToolOutputLine(Line<'static>),
+    /// Tool-call header line (e.g. "▶ execute_command").  Tagged
+    /// separately from `Line` so render-time grouping can recognise
+    /// the start of a tool block.
+    ToolHeaderLine(Line<'static>),
+    /// Command-execution header (e.g. "Running: <cmd>").
+    CommandHeaderLine(Line<'static>),
+    /// Command stdout / stderr / tail output line.
+    CommandOutputLine(Line<'static>),
+    /// Reasoning summary line ("Ɵ ...").
+    ReasoningLine(Line<'static>),
+    /// User-submitted prompt line ("❯ ..." or multi-line "│ ❯ ...").
+    UserPromptLine(Line<'static>),
     /// Raw ANSI escape sequences (for PTY output, etc.).
     RawAnsi(String),
     /// Task completion message rendered as a dedicated Block widget.
@@ -139,7 +151,7 @@ impl OutputEvent {
 
     pub fn tool_call(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
+        OutputEvent::ToolHeaderLine(Line::from(Span::styled(
             text.into(),
             Style::default().fg(theme::TOOL_CALL_FG),
         )))
@@ -180,6 +192,34 @@ impl OutputEvent {
             ratatui::style::Style::default().fg(crate::cli::tui::theme::STATUS_FG)
         };
         OutputEvent::ToolOutputLine(Line::from(Span::styled(text.into(), final_style)))
+    }
+
+    /// Emit a command-execution header line (e.g. "Running: <cmd>").
+    /// Tagged separately so render-time grouping can keep the header
+    /// visually anchored to its stdout/stderr block.
+    pub fn command_header_line(text: impl Into<String>) -> Self {
+        OutputEvent::CommandHeaderLine(Line::from(text.into()))
+    }
+
+    /// Emit a command stdout / stderr / tail line.  Tagged as a
+    /// `CommandOutput` block so consecutive output lines are grouped
+    /// without blank separators between them.
+    pub fn command_output_line(text: impl Into<String>) -> Self {
+        OutputEvent::CommandOutputLine(Line::from(text.into()))
+    }
+
+    /// Emit a reasoning-summary line (e.g. "Ɵ ...").  Tagged
+    /// separately so render-time grouping can recognise the start of a
+    /// reasoning block without confusing it with model prose.
+    pub fn reasoning_line(text: impl Into<String>) -> Self {
+        OutputEvent::ReasoningLine(Line::from(text.into()))
+    }
+
+    /// Emit a user-prompt line (e.g. "❯ ..." or "│ ❯ ...").  Routed
+    /// to the TUI buffer with `BlockKind::UserPrompt` so render-time
+    /// grouping gives it a visual boundary above.
+    pub fn user_prompt_line(text: impl Into<String>) -> Self {
+        OutputEvent::UserPromptLine(Line::from(text.into()))
     }
 }
 
@@ -250,6 +290,21 @@ impl OutputWriter for StderrOutputWriter {
             }
             OutputEvent::TurnEnd { .. } => {}
             OutputEvent::TurnIndicator(_) => {}
+            OutputEvent::ToolHeaderLine(line) => {
+                eprintln!("{}", line);
+            }
+            OutputEvent::CommandHeaderLine(line) => {
+                eprintln!("{}", line);
+            }
+            OutputEvent::CommandOutputLine(line) => {
+                eprintln!("{}", line);
+            }
+            OutputEvent::ReasoningLine(line) => {
+                eprintln!("{}", line);
+            }
+            OutputEvent::UserPromptLine(line) => {
+                eprintln!("{}", line);
+            }
         }
     }
 

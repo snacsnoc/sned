@@ -425,6 +425,21 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             OutputEvent::ToolOutputLine(line) => {
                 app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
             }
+            OutputEvent::ToolHeaderLine(line) => {
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
+            }
+            OutputEvent::CommandHeaderLine(line) => {
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandHeader);
+            }
+            OutputEvent::CommandOutputLine(line) => {
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
+            }
+            OutputEvent::ReasoningLine(line) => {
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::Reasoning);
+            }
+            OutputEvent::UserPromptLine(line) => {
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
+            }
             OutputEvent::RawAnsi(s) => {
                 // Raw ANSI events (code blocks) are already styled. We
                 // do NOT record them in turn_stream_line_indices, so

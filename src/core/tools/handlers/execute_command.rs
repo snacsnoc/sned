@@ -6,6 +6,7 @@ use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_string_array};
 use async_trait::async_trait;
+use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -191,10 +192,11 @@ impl ExecuteCommandHandler {
             if !json_output {
                 use crate::cli::tui::theme::INFO_FG;
                 use ratatui::style::{Modifier, Style};
-                output_writer.emit(OutputEvent::tool_output_line(
+                let header = Line::from(Span::styled(
                     format!("Running: {}", cmd_str),
                     Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
                 ));
+                output_writer.emit(OutputEvent::CommandHeaderLine(header));
             }
 
             // Execute via shell for portability and shell feature support
@@ -279,14 +281,17 @@ impl ExecuteCommandHandler {
                                         // Head: print live
                                         use crate::cli::output::OutputEvent;
                                         use ratatui::style::{Modifier, Style};
-                                        output_writer.emit(OutputEvent::tool_output_line(line.clone(), Style::default().add_modifier(Modifier::DIM)));
+                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                            line.clone(),
+                                            Style::default().add_modifier(Modifier::DIM),
+                                        ))));
                                     } else if displayed == half + 1 && !truncated {
                                         // First skipped line: emit condensed note once
                                         use ratatui::style::{Modifier, Style};
-                                        output_writer.emit(OutputEvent::tool_output_line(
+                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                             "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
                                             Style::default().add_modifier(Modifier::DIM),
-                                        ));
+                                        ))));
                                         truncated = true;
                                     }
                                 }
@@ -314,14 +319,17 @@ impl ExecuteCommandHandler {
                                         use crate::cli::output::OutputEvent;
                                         use crate::cli::tui::theme::WARNING_FG;
                                         use ratatui::style::Style;
-                                        output_writer.emit(OutputEvent::tool_output_line(line.clone(), Style::default().fg(WARNING_FG)));
+                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                            line.clone(),
+                                            Style::default().fg(WARNING_FG),
+                                        ))));
                                     } else if displayed == half + 1 && !truncated {
                                         // First skipped line: emit condensed note once
                                         use ratatui::style::{Modifier, Style};
-                                        output_writer.emit(OutputEvent::tool_output_line(
+                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                             "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
                                             Style::default().add_modifier(Modifier::DIM),
-                                        ));
+                                        ))));
                                         truncated = true;
                                     }
                                 }
@@ -391,13 +399,16 @@ impl ExecuteCommandHandler {
                                         if displayed <= half {
                                             use crate::cli::output::OutputEvent;
                                             use ratatui::style::{Modifier, Style};
-                                            output_writer.emit(OutputEvent::tool_output_line(line.clone(), Style::default().add_modifier(Modifier::DIM)));
+                                            output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                                line.clone(),
+                                                Style::default().add_modifier(Modifier::DIM),
+                                            ))));
                                         } else if displayed == half + 1 && !truncated {
                                             use ratatui::style::{Modifier, Style};
-                                            output_writer.emit(OutputEvent::tool_output_line(
+                                            output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                                 "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
                                                 Style::default().add_modifier(Modifier::DIM),
-                                            ));
+                                            ))));
                                             truncated = true;
                                         }
                                     }
@@ -417,13 +428,16 @@ impl ExecuteCommandHandler {
                                             use crate::cli::output::OutputEvent;
                                             use crate::cli::tui::theme::WARNING_FG;
                                             use ratatui::style::Style;
-                                            output_writer.emit(OutputEvent::tool_output_line(line.clone(), Style::default().fg(WARNING_FG)));
+                                            output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                                line.clone(),
+                                                Style::default().fg(WARNING_FG),
+                                            ))));
                                         } else if displayed == half + 1 && !truncated {
                                             use ratatui::style::{Modifier, Style};
-                                            output_writer.emit(OutputEvent::tool_output_line(
+                                            output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                                 "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
                                                 Style::default().add_modifier(Modifier::DIM),
-                                            ));
+                                            ))));
                                             truncated = true;
                                         }
                                     }
@@ -488,15 +502,15 @@ impl ExecuteCommandHandler {
                 let total = displayed;
                 use crate::cli::output::OutputEvent;
                 use ratatui::style::{Modifier, Style};
-                output_writer.emit(OutputEvent::tool_output_line(
+                output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                     format!("--- last {} of {} lines ---", tail_buffer.len(), total),
                     Style::default().add_modifier(Modifier::DIM),
-                ));
+                ))));
                 for line in tail_buffer.iter() {
-                    output_writer.emit(OutputEvent::tool_output_line(
+                    output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                         line.clone(),
                         Style::default().add_modifier(Modifier::DIM),
-                    ));
+                    ))));
                 }
             }
 
