@@ -585,6 +585,7 @@ impl App {
         if can_skip_reinsert {
             // Prepend the turn indicator to the first rendered line's
             // first span instead of doing a full pop+reinsert.
+            let mut prefixed_turn_indicator = false;
             if let Some(first) = rendered.first_mut() {
                 if self.turn_indicator.take().is_some() {
                     // Prepend "♦ " to the first span of the first line.
@@ -595,7 +596,11 @@ impl App {
                     ));
                     new_spans.extend(first.spans.iter().cloned());
                     first.spans = new_spans;
+                    prefixed_turn_indicator = true;
                 }
+            }
+            if prefixed_turn_indicator {
+                self.output_lines[model_entry_indices[0]] = rendered[0].clone();
             }
             self.needs_redraw = true;
             self.cached_wrap_width = None;
@@ -2583,6 +2588,40 @@ mod tests {
             );
         }
 
+        assert!(app.turn_indicator.is_none(), "indicator should be cleared");
+        assert!(app.turn_stream_entries.is_empty());
+    }
+
+    #[test]
+    fn test_finalize_turn_stream_noop_reinsert_preserves_turn_indicator() {
+        let mut app = App::new();
+        app.push_turn_indicator(Line::from(Span::styled(
+            "\u{2666}",
+            Style::default().fg(crate::cli::tui::theme::ACCENT),
+        )));
+        app.push_stream_line(Line::from("plain line"), StreamKind::Model);
+
+        app.finalize_turn_stream("plain line");
+
+        assert_eq!(app.output_lines.len(), 1);
+        let first_text: String = app
+            .output_lines
+            .front()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            first_text.contains("\u{2666}"),
+            "first rendered line should contain the indicator prefix: {:?}",
+            app.output_lines
+        );
+        assert!(
+            first_text.contains("plain line"),
+            "first rendered line should still contain the markdown content: {:?}",
+            first_text
+        );
         assert!(app.turn_indicator.is_none(), "indicator should be cleared");
         assert!(app.turn_stream_entries.is_empty());
     }
