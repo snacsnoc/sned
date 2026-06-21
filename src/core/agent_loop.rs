@@ -1810,10 +1810,14 @@ impl AgentLoop {
                     return TurnResult::Cancelled;
                 }
 
-                // Warn about slow connection if waiting >3s for first token
+                // Warn about slow connection if waiting >1s for first token.
+                // 1s gives the user immediate visual feedback (the spinner is
+                // already running, but a yellow warning reassures them the
+                // request is in flight). The previous 3s threshold left users
+                // wondering if the request had died.
                 if !first_chunk_received
                     && !slow_connection_warned
-                    && first_chunk_start.elapsed().as_secs() >= 3
+                    && first_chunk_start.elapsed().as_secs() >= 1
                 {
                     slow_connection_warned = true;
                     emitted_output_this_attempt = true;
