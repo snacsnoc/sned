@@ -580,7 +580,10 @@ fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
     0
 }
 
-fn normalize_reasoning_delta(state: &mut OpenAiStreamDeltaState, reasoning: String) -> Option<String> {
+fn normalize_reasoning_delta(
+    state: &mut OpenAiStreamDeltaState,
+    reasoning: String,
+) -> Option<String> {
     if reasoning.is_empty() {
         return None;
     }

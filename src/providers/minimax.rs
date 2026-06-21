@@ -2385,7 +2385,9 @@ mod tests {
         )
         .await;
 
-        let first_chunk = rx.try_recv().expect("prefix should flush before think block");
+        let first_chunk = rx
+            .try_recv()
+            .expect("prefix should flush before think block");
         match first_chunk {
             ApiStreamChunk::Text(text_chunk) => assert_eq!(text_chunk.text, "I"),
             other => panic!("expected text chunk, got {other:?}"),

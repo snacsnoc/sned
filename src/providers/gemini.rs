@@ -555,11 +555,8 @@ async fn process_gemini_sse_line(
     {
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
             if !completed_tool_call_ids.contains(call_id)
-                && let Some(validated_args) = crate::providers::validate_tool_call_args(
-                    args,
-                    "Gemini",
-                    "on finish",
-                )
+                && let Some(validated_args) =
+                    crate::providers::validate_tool_call_args(args, "Gemini", "on finish")
             {
                 completed_tool_call_ids.insert(call_id.clone());
                 try_send_chunk(
@@ -657,11 +654,8 @@ async fn finish_gemini_sse_to_chunks(
         // Flush accumulated tool calls on stream end.
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
             if !completed_tool_call_ids.contains(call_id)
-                && let Some(validated_args) = crate::providers::validate_tool_call_args(
-                    args,
-                    "Gemini",
-                    "at stream end",
-                )
+                && let Some(validated_args) =
+                    crate::providers::validate_tool_call_args(args, "Gemini", "at stream end")
             {
                 completed_tool_call_ids.insert(call_id.clone());
                 try_send_chunk(
