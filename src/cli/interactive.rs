@@ -11,6 +11,7 @@ use crate::core::approval::{ApprovalResult, is_approval_prompt_active, take_appr
 use futures::FutureExt;
 use ratatui::crossterm::event::{
     EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::style::Style;
@@ -828,9 +829,7 @@ async fn handle_key_event(
         if let Some((new_text, cursor_pos)) =
             crate::cli::slash_commands::apply_slash_completion(&text, &selected)
         {
-            app.input = App::new_textarea(vec![new_text.clone()]);
-            app.input
-                .move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
+            app.set_input_text_and_cursor(&new_text, cursor_pos);
             app.slash_command_active = false;
             app.slash_command_results.clear();
             app.slash_command_selected = 0;
@@ -854,7 +853,7 @@ async fn handle_key_event(
     {
         let entry = &app.model_picker_results[app.model_picker_selected];
         let model_spec = format!("{}/{}", entry.provider, entry.model_id);
-        app.input = App::new_textarea(vec![model_spec]);
+        app.set_input_text(&model_spec);
         app.input.move_cursor(tui_textarea::CursorMove::End);
         app.model_picker_active = false;
         app.model_picker_results.clear();
@@ -877,9 +876,7 @@ async fn handle_key_event(
                 &result.path,
                 result.file_type,
             );
-            app.input = App::new_textarea(vec![new_text]);
-            app.input
-                .move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos as u16));
+            app.set_input_text_and_cursor(&new_text, cursor_pos);
             app.picker_active = false;
             app.picker_results.clear();
             app.mention_search_active = false;
@@ -1052,20 +1049,18 @@ async fn handle_key_event(
             app.history_draft = Some(app.input.lines().join("\n"));
         }
         if let Some(entry) = app.history.navigate_up() {
-            app.input = App::new_textarea(vec![entry.to_string()]);
+            let entry = entry.to_string();
+            app.set_input_text(&entry);
         }
         return Ok(None);
     }
     if key.code == KeyCode::Down && !app.picker_active && app.history.is_navigating() {
         if let Some(entry) = app.history.navigate_down() {
-            app.input = App::new_textarea(vec![entry.to_string()]);
+            let entry = entry.to_string();
+            app.set_input_text(&entry);
         } else {
             let draft = app.history_draft.take().unwrap_or_default();
-            app.input = if draft.is_empty() {
-                App::new_textarea(Vec::new())
-            } else {
-                App::new_textarea(draft.split('\n').map(|s| s.to_string()).collect())
-            };
+            app.set_input_text(&draft);
         }
         return Ok(None);
     }
@@ -1119,7 +1114,7 @@ async fn handle_key_event(
         app.slash_command_selected = 0;
         let text = app.input.lines().join("\n");
         if let Some(new_text) = strip_active_slash_command(&text) {
-            app.input = App::new_textarea(vec![new_text]);
+            app.set_input_text(&new_text);
         }
         return Ok(None);
     }
@@ -2921,8 +2916,14 @@ pub async fn run_interactive_shell_inner(
         ratatui::init()
     };
 
-    // Enable bracketed paste mode and mouse capture for proper paste handling and scroll wheel support
-    execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
+    // Enable keyboard enhancement flags so Shift+Enter arrives distinctly
+    // from Enter on terminals that support CSI-u / kitty keyboard protocol.
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnableBracketedPaste, EnableMouseCapture)?;
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
 
     crate::core::cancellation::TERMINAL_INITIALIZED
         .store(true, std::sync::atomic::Ordering::Release);
@@ -4043,6 +4044,99 @@ mod tests {
             !found_overlay,
             "slash command overlay must not appear in the rendered buffer after Tab completion"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_shift_enter_inserts_newline() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.input = App::new_textarea(vec!["hello".to_string()]);
+        app.input.move_cursor(tui_textarea::CursorMove::End);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert_eq!(app.input.lines(), ["hello", ""]);
+        assert_eq!(app.input.cursor(), (1, 0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_submits_multiline_input() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.input = App::new_textarea(vec!["hello".to_string(), "world".to_string()]);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(matches!(action, Some(Action::Submit(text)) if text == "hello\nworld"));
+        assert_eq!(app.input.lines(), [""]);
+
+        reset_prompt_state();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_history_up_walks_most_recent_entries() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.history.push("first command".to_string());
+        app.history.push("second command".to_string());
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "second command");
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "first command");
 
         Ok(())
     }

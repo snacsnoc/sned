@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
+const INPUT_MAX_VISIBLE_LINES: usize = 6;
+
 /// Distinguishes model-streamed prose from tool-result or system lines
 /// in the TUI output buffer.  Only `Model` lines are tracked by
 /// `turn_stream_entries` and popped during `finalize_turn_stream`.
@@ -257,6 +259,45 @@ impl App {
         input.set_placeholder_text("❯ ");
         input.set_cursor_line_style(Style::default());
         input
+    }
+
+    fn textarea_lines_from_text(text: &str) -> Vec<String> {
+        text.split('\n').map(str::to_owned).collect()
+    }
+
+    fn cursor_row_col_for_text(text: &str, byte_offset: usize) -> (u16, u16) {
+        let clamped = byte_offset.min(text.len());
+        let mut row = 0usize;
+        let mut line_start = 0usize;
+        for (idx, ch) in text.char_indices() {
+            if idx >= clamped {
+                break;
+            }
+            if ch == '\n' {
+                row += 1;
+                line_start = idx + 1;
+            }
+        }
+        let col = text[line_start..clamped].chars().count();
+        (
+            row.min(u16::MAX as usize) as u16,
+            col.min(u16::MAX as usize) as u16,
+        )
+    }
+
+    pub fn set_input_text(&mut self, text: &str) {
+        self.input = Self::new_textarea(Self::textarea_lines_from_text(text));
+    }
+
+    pub fn set_input_text_and_cursor(&mut self, text: &str, byte_offset: usize) {
+        self.set_input_text(text);
+        let (row, col) = Self::cursor_row_col_for_text(text, byte_offset);
+        self.input
+            .move_cursor(tui_textarea::CursorMove::Jump(row, col));
+    }
+
+    pub fn input_height(&self) -> u16 {
+        (self.input.lines().len().clamp(1, INPUT_MAX_VISIBLE_LINES) as u16) + 2
     }
 
     /// Update the textarea placeholder based on current mode.
@@ -1247,7 +1288,7 @@ impl App {
             let [output_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(self.input_height()),
             ])
             .areas(main_area);
 
@@ -1271,7 +1312,7 @@ impl App {
             let [output_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(self.input_height()),
             ])
             .areas(frame.area());
 
@@ -2258,6 +2299,30 @@ mod tests {
         app2.input = App::new_textarea(vec!["[pasted 500 chars]".to_string()]);
         let result2 = app2.get_input_with_expanded_pastes();
         assert_eq!(result2, "[pasted 500 chars]");
+    }
+
+    #[test]
+    fn test_set_input_text_and_cursor_preserves_multiline_position() {
+        let mut app = App::new();
+        let text = "first line\nsecond line\nthird";
+        let cursor = "first line\nsecond".len();
+
+        app.set_input_text_and_cursor(text, cursor);
+
+        assert_eq!(app.input.lines(), ["first line", "second line", "third"]);
+        assert_eq!(app.input.cursor(), (1, "second".chars().count()));
+    }
+
+    #[test]
+    fn test_input_height_caps_visible_lines() {
+        let mut app = App::new();
+        assert_eq!(app.input_height(), 3);
+
+        app.set_input_text("one\ntwo\nthree\nfour");
+        assert_eq!(app.input_height(), 6);
+
+        app.set_input_text("1\n2\n3\n4\n5\n6\n7\n8");
+        assert_eq!(app.input_height(), 8);
     }
 
     #[test]
