@@ -46,7 +46,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::time::Instant;
+
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
@@ -1744,10 +1744,6 @@ impl AgentLoop {
             let first_chunk_start = std::time::Instant::now();
             let mut slow_connection_warned = false;
 
-            // Buffer flush timing to reduce syscalls on high-latency connections (P9)
-            let mut last_flush_time = Instant::now();
-            let flush_interval = std::time::Duration::from_millis(50);
-
             // Turn indicator is prepended to the first output line, not emitted separately,
             // so it appears on the same line as the start of the response.
             let mut turn_indicator_pending = true;
@@ -1926,11 +1922,6 @@ impl AgentLoop {
                                         &self.config.output_writer,
                                         &mut turn_indicator_pending,
                                     );
-                                }
-                                // Buffer flush to ~50ms frames to reduce syscalls on high-latency connections (P9)
-                                if last_flush_time.elapsed() >= flush_interval {
-                                    self.config.output_writer.flush();
-                                    last_flush_time = Instant::now();
                                 }
                             }
                         }

@@ -315,7 +315,12 @@ impl OutputWriter for StderrOutputWriter {
 
 /// Output writer that sends events through an mpsc channel.
 ///
-/// The channel is unbounded; the render loop drains it on each frame tick.
+/// The channel is bounded to 8192 entries (see `mpsc::channel(8192)` in
+/// `run_interactive_shell_inner`). When the buffer is full, events are
+/// dropped silently and a counter is incremented; the TUI's main loop
+/// reads this counter via `dropped_count()` and surfaces a user-visible
+/// "⚠ output overflow (N dropped)" warning in the status bar. The render
+/// loop drains the channel on each frame tick.
 pub struct ChannelOutputWriter {
     tx: mpsc::Sender<OutputEvent>,
     dropped_count: std::sync::atomic::AtomicU64,
