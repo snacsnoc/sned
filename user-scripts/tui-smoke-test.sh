@@ -660,6 +660,7 @@ test_ctrlc_quit_empty() {
     SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -873,6 +874,7 @@ test_json_no_prompt() {
     SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -954,6 +956,7 @@ test_tui_history_navigation() {
     SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -990,10 +993,12 @@ sent_first = False
 sent_second = False
 sent_up = False
 sent_exit = False
-first_responded = False
-second_responded = False
+up_offset = None
 exit_code = None
 deadline = time.time() + 15
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
 
 try:
     while time.time() < deadline:
@@ -1008,26 +1013,24 @@ try:
             buf += data
             if b"\x1b[6n" in data:
                 os.write(fd, b"\x1b[1;1R")
-            text = buf.decode("utf-8", "replace")
+            text = strip_ansi(buf.decode("utf-8", "replace"))
+            compact_text = re.sub(r"\s+", "", text)
             if "type a prompt" in text and not sent_first:
                 os.write(fd, b"first command\r")
                 sent_first = True
             # Wait for the first command to get a mock response before sending the second
-            if sent_first and "Mock provider" in text and not sent_second:
+            response_count = compact_text.count("taskcompletedsuccessfully")
+            if sent_first and response_count >= 1 and not sent_second:
                 time.sleep(0.3)
                 os.write(fd, b"second command\r")
                 sent_second = True
             # Wait for the second command to get a mock response before pressing Up
-            if sent_second and "Mock provider" in text and not first_responded:
-                first_responded = True
-            if sent_second and first_responded and not sent_up:
-                # Count mock responses to ensure second command was processed
-                response_count = text.count("Mock provider")
-                if response_count >= 2 and not sent_up:
-                    time.sleep(0.3)
-                    # Up arrow: \x1b[A
-                    os.write(fd, b"\x1b[A")
-                    sent_up = True
+            if sent_second and response_count >= 2 and not sent_up:
+                time.sleep(0.3)
+                # Up arrow: \x1b[A
+                os.write(fd, b"\x1b[A")
+                up_offset = len(buf)
+                sent_up = True
             if sent_up and not sent_exit:
                 time.sleep(0.5)
                 os.write(fd, b"/exit\r")
@@ -1048,20 +1051,23 @@ try:
         except ChildProcessError:
             exit_code = 0
 
-    text = buf.decode("utf-8", "replace")
+    raw_text = buf.decode("utf-8", "replace")
+    text = strip_ansi(raw_text)
     if verbose:
-        print(text)
+        print(raw_text)
 
-    # After pressing Up, the input field should show "first command" (previous history entry)
-    # The textarea renders input text, so it will appear in the pty output
+    # After pressing Up from an empty prompt, history should restore the
+    # most recent submitted command.
+    post_up_text = strip_ansi(buf[up_offset:].decode("utf-8", "replace")) if up_offset else ""
+    compact_post_up_text = re.sub(r"\s+", "", post_up_text)
     if not sent_first:
         print("TUI_TEST_FAIL first prompt was not sent")
     elif not sent_second:
         print("TUI_TEST_FAIL second prompt was not sent")
     elif not sent_up:
         print("TUI_TEST_FAIL Up arrow was not sent")
-    elif "first command" not in text:
-        print("TUI_TEST_FAIL previous prompt 'first command' not found after Up arrow")
+    elif "secondcommand" not in compact_post_up_text:
+        print("TUI_TEST_FAIL previous prompt 'second command' not found after Up arrow")
     elif exit_code not in (0, None):
         print(f"TUI_TEST_FAIL sned exited with {exit_code}")
     else:
