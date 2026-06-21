@@ -150,7 +150,7 @@ export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
 | `SNED_COMMAND_OUTPUT_LIMIT` | Command output truncation limit (bytes) | `10240` |
 | `SNED_SEARCH_TIMEOUT_SECS` | File search timeout | `30` |
 | `SNED_FETCH_TIMEOUT_SECS` | Web fetch timeout | `30` |
-| `SNED_HOOK_TIMEOUT_MS` | Hook execution timeout | `60000` |
+| `SNED_HOOK_TIMEOUT_MS` | Hook execution timeout | `10000` |
 | `SNED_DIR` | Config directory | `~/.sned` |
 | `SNED_DATA_DIR` | Data directory | `~/.sned/data` |
 | `SNED_NO_ALTERNATE_SCREEN` | Use inline viewport (no alternate screen) | (not set) |
