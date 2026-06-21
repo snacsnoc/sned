@@ -3251,23 +3251,20 @@ edition = "2021"
 
     #[tokio::test]
     async fn test_prepare_edits_failure_increments_total_failed() {
-        use std::fs;
+        use tempfile::tempdir;
 
         let _guard = TEST_MUTEX.lock().await;
 
-        let temp_dir = "test_prepare_fail_tmp";
-        let _ = fs::remove_dir_all(temp_dir);
-        fs::create_dir_all(temp_dir).unwrap();
-
-        let file_path = format!("{}/test.txt", temp_dir);
-        fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
 
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
             state,
             None,
-            std::env::current_dir().unwrap(),
+            dir.path().to_path_buf(),
             AnchorStateManager::new(),
             false,
             "test-task".to_string(),
@@ -3300,8 +3297,6 @@ edition = "2021"
             "Summary should report 0 applied or mention failures, got: {}",
             output
         );
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]
