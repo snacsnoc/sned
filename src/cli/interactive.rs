@@ -458,7 +458,9 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 // command output are not mixed into the comparison — otherwise the
                 // joined string is multi-line and never matches a single-line
                 // completion result.
-                let last_streamed = app.output_lines.iter()
+                let last_streamed = app
+                    .output_lines
+                    .iter()
                     .zip(app.output_line_kinds.iter())
                     .filter(|(_, kind)| **kind == crate::cli::tui::BlockKind::Model)
                     .rev()
@@ -473,8 +475,7 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 } else {
                     &result
                 };
-                for line in
-                    crate::cli::markdown::render_completion_markdown("🚀 ", completion_text)
+                for line in crate::cli::markdown::render_completion_markdown("🚀 ", completion_text)
                 {
                     app.push_completion_line(line);
                 }
@@ -482,9 +483,7 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             OutputEvent::ErrorBox(msg) => {
                 if !msg.trim().is_empty() {
                     app.clear_error_lines();
-                    for line in
-                        crate::cli::markdown::render_error_markdown("✗ Error", &msg)
-                    {
+                    for line in crate::cli::markdown::render_error_markdown("✗ Error", &msg) {
                         app.push_error_line(line);
                     }
                 }
@@ -546,15 +545,19 @@ fn drain_and_render_user_submit(
     Ok(())
 }
 
+fn record_submit_history(app: &mut App, text: &str) {
+    app.history.push(text.to_string());
+    if let Err(e) = append_to_history(text) {
+        tracing::warn!("Failed to save command history: {}", e);
+    }
+}
+
 /// Test-only: drain the output channel into the app buffer without any
 /// terminal-side rendering. Exposed `pub(crate)` so the TUI tests in
 /// `cli::tui::app` can verify the emit → drain pipeline against a real
 /// `ChannelOutputWriter` without standing up a full `ratatui::DefaultTerminal`.
 #[cfg(test)]
-pub(crate) fn drain_output_for_test(
-    rx: &mut mpsc::Receiver<OutputEvent>,
-    app: &mut App,
-) {
+pub(crate) fn drain_output_for_test(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     drain_output(rx, app);
 }
 
@@ -581,45 +584,36 @@ async fn spawn_agent_task(
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     output_writer: OutputWriterArc,
 ) -> anyhow::Result<()> {
+    agent_busy.store(true, Ordering::Relaxed);
+    *agent_start_time.lock().await = Some(Instant::now());
+
     let session_clone = Arc::clone(session);
     let prompt = prompt.to_string();
     let output_writer = Arc::clone(&output_writer);
-    let agent_loop = {
-        let sess = session_clone.lock().await;
-        sess.agent_loop.clone()
-    };
-    let initial_message = {
-        let processed_prompt = crate::cli::slash_commands::process_slash_command(&prompt);
-        let (clean_prompt, parsed_image_paths) =
-            crate::cli::image_input::parse_images_from_input(&processed_prompt);
-        let model_info = agent_loop.lock().await.get_provider().get_model().info;
-        let user_content = build_user_message_content(
-            clean_prompt,
-            parsed_image_paths,
-            model_info,
-            &output_writer,
-            true,
-        );
-        crate::providers::StorageMessage {
-            id: None,
-            role: crate::providers::MessageRole::User,
-            content: user_content,
-            model_info: None,
-            metrics: None,
-            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-        }
-    };
+    let agent_busy_clone = Arc::clone(agent_busy);
+    let agent_done_clone = Arc::clone(agent_done);
 
-    spawn_agent_task_from_message(
-        session,
-        initial_message,
-        agent_busy,
-        agent_done,
-        agent_start_time,
-        agent_task,
-        output_writer,
-    )
-    .await
+    let handle = tokio::spawn(async move {
+        let sess = session_clone.lock().await;
+        let agent_loop = sess.agent_loop.clone();
+        let state_manager = sess.state_manager.clone();
+        drop(sess);
+
+        let initial_message =
+            build_initial_message_from_prompt(&prompt, &agent_loop, &output_writer).await;
+        run_agent_task(
+            agent_loop,
+            state_manager,
+            vec![initial_message],
+            output_writer,
+            agent_busy_clone,
+            agent_done_clone,
+        )
+        .await;
+    });
+
+    *agent_task.lock().await = Some(handle);
+    Ok(())
 }
 
 async fn spawn_agent_task_from_message(
@@ -642,37 +636,85 @@ async fn spawn_agent_task_from_message(
         let sess = session_clone.lock().await;
         let agent_loop = sess.agent_loop.clone();
         let state_manager = sess.state_manager.clone();
-        let output_writer = Arc::clone(&output_writer);
         drop(sess);
-        let initial_messages = vec![initial_message];
-
-        let result = {
-            let mut agent = agent_loop.lock().await;
-            agent.reset_cancellation().await;
-            agent.run(initial_messages, state_manager).await
-        };
-        let retry_available = {
-            let state_handle = agent_loop.lock().await.state_handle();
-            state_handle.lock().await.retryable_failed_request.is_some()
-        };
-        drop(agent_loop);
-
-        if let Err(e) = result {
-            output_writer.emit(OutputEvent::warning(format!("Agent task failed: {}", e)));
-            if retry_available {
-                output_writer.emit(OutputEvent::warning(
-                    "Retry available: type /retry to resend the last failed request verbatim.",
-                ));
-            }
-            tracing::error!("Agent task failed: {}", e);
-        }
-
-        agent_busy_clone.store(false, Ordering::Relaxed);
-        agent_done_clone.notify_one();
+        run_agent_task(
+            agent_loop,
+            state_manager,
+            vec![initial_message],
+            output_writer,
+            agent_busy_clone,
+            agent_done_clone,
+        )
+        .await;
     });
 
     *agent_task.lock().await = Some(handle);
     Ok(())
+}
+
+async fn build_initial_message_from_prompt(
+    prompt: &str,
+    agent_loop: &Arc<tokio::sync::Mutex<crate::core::agent_loop::AgentLoop>>,
+    output_writer: &OutputWriterArc,
+) -> crate::providers::StorageMessage {
+    let processed_prompt = crate::cli::slash_commands::process_slash_command(prompt);
+    let (clean_prompt, parsed_image_paths) =
+        crate::cli::image_input::parse_images_from_input(&processed_prompt);
+
+    let content = if parsed_image_paths.is_empty() {
+        crate::providers::MessageContent::Text(clean_prompt)
+    } else {
+        let model_info = agent_loop.lock().await.get_provider().get_model().info;
+        build_user_message_content(
+            clean_prompt,
+            parsed_image_paths,
+            model_info,
+            output_writer,
+            true,
+        )
+    };
+
+    crate::providers::StorageMessage {
+        id: None,
+        role: crate::providers::MessageRole::User,
+        content,
+        model_info: None,
+        metrics: None,
+        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+    }
+}
+
+async fn run_agent_task(
+    agent_loop: Arc<tokio::sync::Mutex<crate::core::agent_loop::AgentLoop>>,
+    state_manager: Arc<crate::storage::state_manager::StateManager>,
+    initial_messages: Vec<crate::providers::StorageMessage>,
+    output_writer: OutputWriterArc,
+    agent_busy: Arc<AtomicBool>,
+    agent_done: Arc<tokio::sync::Notify>,
+) {
+    let result = {
+        let mut agent = agent_loop.lock().await;
+        agent.reset_cancellation().await;
+        agent.run(initial_messages, state_manager).await
+    };
+    let retry_available = {
+        let state_handle = agent_loop.lock().await.state_handle();
+        state_handle.lock().await.retryable_failed_request.is_some()
+    };
+    drop(agent_loop);
+
+    if let Err(e) = result {
+        output_writer.emit(OutputEvent::warning(format!("Agent task failed: {}", e)));
+        if retry_available {
+            output_writer.emit(OutputEvent::warning(
+                "Retry available: type /retry to resend the last failed request verbatim.",
+            ));
+        }
+        tracing::error!("Agent task failed: {}", e);
+    }
+
+    agent_busy.store(false, Ordering::Relaxed);
+    agent_done.notify_one();
 }
 
 /// Cancel running agent task.
@@ -2538,9 +2580,13 @@ async fn run_main_loop(
                     {
                         match action {
                             Action::Submit(text) => {
-                                // Save to command history and reset navigation
-                                append_to_history(&text);
-                                app.history.reload();
+                                // Make the echoed submit visible before any
+                                // command bookkeeping or agent startup work.
+                                drain_and_render_user_submit(terminal, app, output_rx)?;
+
+                                // Save to command history without rereading the
+                                // history file on the hot path.
+                                record_submit_history(app, &text);
 
                                 // Check for CLI-only slash commands FIRST
                                 if let Some(cli_cmd) =
@@ -2592,14 +2638,6 @@ async fn run_main_loop(
                                             .await?;
                                             app.agent_busy = true;
                                         }
-                                        // Drain the channel, snap to bottom, and
-                                        // re-render so the just-submitted prompt is
-                                        // visible before the agent starts streaming.
-                                        drain_and_render_user_submit(
-                                            terminal,
-                                            app,
-                                            output_rx,
-                                        )?;
                                         continue;
                                     }
 
@@ -2698,14 +2736,6 @@ async fn run_main_loop(
                                     .await?;
                                     app.agent_busy = true;
                                 }
-                                // Drain the channel, snap to bottom, and
-                                // re-render so the just-submitted prompt is
-                                // visible before the agent starts streaming.
-                                drain_and_render_user_submit(
-                                    terminal,
-                                    app,
-                                    output_rx,
-                                )?;
                             }
                         }
                     }
@@ -2797,9 +2827,7 @@ async fn run_main_loop(
         }
 
         // Export conversation after each completed turn when --export is set.
-        if agent_completed
-            && let Some(export_path) = task_opts.export.clone()
-        {
+        if agent_completed && let Some(export_path) = task_opts.export.clone() {
             let export_result = export_conversation(&session, &export_path).await;
             report_conversation_export(&output_writer, task_opts.json, &export_result, false);
         }
@@ -3421,12 +3449,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         // Simulate the agent loop streaming three lines that are
         // fragments of the original markdown "**bold** text\n\nmore".
-        tx.try_send(OutputEvent::model_output("  **bold"))
-            .unwrap();
-        tx.try_send(OutputEvent::model_output("  text"))
-            .unwrap();
-        tx.try_send(OutputEvent::model_output("  more"))
-            .unwrap();
+        tx.try_send(OutputEvent::model_output("  **bold")).unwrap();
+        tx.try_send(OutputEvent::model_output("  text")).unwrap();
+        tx.try_send(OutputEvent::model_output("  more")).unwrap();
         // The agent loop emits TurnEnd with the raw markdown text
         // when the turn finishes.
         tx.try_send(OutputEvent::TurnEnd {

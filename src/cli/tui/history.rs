@@ -3,7 +3,9 @@
 //! Manages loading, navigating, and persisting command history
 //! to the sned data directory.
 
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 fn get_history_file_path() -> PathBuf {
     crate::storage::disk::get_sned_dir().join("cli_history")
@@ -44,36 +46,27 @@ pub(crate) fn load_command_history() -> Vec<String> {
     }
 }
 
+fn append_command_to_history(history_path: &Path, command: &str) -> io::Result<()> {
+    if command.trim().is_empty() {
+        return Ok(());
+    }
+
+    let dir = history_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path)?;
+    writeln!(file, "{command}")?;
+    Ok(())
+}
+
 /// Append a command to the history file.
 /// Creates the file if it doesn't exist.
-/// Trims the file to the configured max if it grows too large.
-pub(crate) fn append_to_history(command: &str) {
-    if command.trim().is_empty() {
-        return;
-    }
-
+pub(crate) fn append_to_history(command: &str) -> io::Result<()> {
     let history_path = get_history_file_path();
-    let default_path = PathBuf::from(".");
-    let dir = history_path.parent().unwrap_or(&default_path);
-
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!("Failed to create history directory: {}", e);
-        return;
-    }
-
-    let mut history = load_command_history();
-
-    history.push(command.to_string());
-
-    let max = max_history_lines();
-    if history.len() > max {
-        history = history[history.len() - max..].to_vec();
-    }
-
-    let content = history.join("\n") + "\n";
-    if let Err(e) = crate::storage::disk::atomic_write_file(&history_path, &content) {
-        tracing::warn!("Failed to save command history: {}", e);
-    }
+    append_command_to_history(&history_path, command)
 }
 
 /// File-backed command history with navigation state.
@@ -93,6 +86,21 @@ impl FileHistory {
             entries: load_command_history(),
             index: -1,
         }
+    }
+
+    /// Record a submitted command in the in-memory history list.
+    pub fn push(&mut self, command: String) {
+        if command.trim().is_empty() {
+            return;
+        }
+
+        self.entries.push(command);
+        let max = max_history_lines();
+        if self.entries.len() > max {
+            let keep_from = self.entries.len() - max;
+            self.entries.drain(..keep_from);
+        }
+        self.index = -1;
     }
 
     /// Navigate backward in history (Up arrow).
@@ -141,5 +149,38 @@ impl FileHistory {
     /// Get a reference to the underlying entries (for `/history` command).
     pub fn entries(&self) -> &[String] {
         &self.entries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_append_command_to_history_appends_lines() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let history_path = temp_dir.path().join("cli_history");
+
+        append_command_to_history(&history_path, "first").unwrap();
+        append_command_to_history(&history_path, "second").unwrap();
+
+        let content = std::fs::read_to_string(&history_path).unwrap();
+        assert_eq!(content, "first\nsecond\n");
+    }
+
+    #[test]
+    fn test_file_history_push_appends_in_memory_and_resets_navigation() {
+        let mut history = FileHistory {
+            entries: vec!["first".to_string()],
+            index: 3,
+        };
+
+        history.push("second".to_string());
+
+        assert_eq!(
+            history.entries().to_vec(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert!(!history.is_navigating());
     }
 }
