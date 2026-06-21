@@ -527,6 +527,15 @@ pub struct AgentLoop {
     /// Clone of `TaskState::is_cancelled_atomic` for lock-free reads
     /// in the hot-path streaming loop (avoids mutex per chunk).
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Lock-free once-per-turn flags for the three `record_first_*_time`
+    /// helpers below. Each call takes `state.lock().await` to write the
+    /// `Instant`; subsequent calls skip the lock entirely once the
+    /// corresponding flag is set. The TUI main loop also reads
+    /// `TaskState` on every iteration via `try_lock`, so reducing mutex
+    /// acquisitions on the streaming hot path cuts contention.
+    first_output_emit_recorded: std::sync::atomic::AtomicBool,
+    first_reasoning_chunk_recorded: std::sync::atomic::AtomicBool,
+    first_displayable_text_recorded: std::sync::atomic::AtomicBool,
     anchor_mgr: AnchorStateManager,
     conversation_history: Arc<Mutex<Vec<StorageMessage>>>,
     message_queue: Arc<Mutex<VecDeque<StorageMessage>>>,
@@ -680,7 +689,25 @@ impl AgentLoop {
     }
 
     async fn record_first_output_emit_time(&self) {
+        // Atomic fast-path: only the first chunk takes the state mutex.
+        // Subsequent chunks on the same turn see the flag set and
+        // return without contending with the TUI main loop's
+        // `try_lock` reads.
+        if self
+            .first_output_emit_recorded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let mut state = self.state.lock().await;
+        // Double-check under the lock in case another task claimed
+        // the flag while we were waiting.
+        if self
+            .first_output_emit_recorded
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         if state.first_output_emit_time.is_none() {
             if crate::cli::output::timing_enabled() {
                 let now = std::time::Instant::now();
@@ -694,7 +721,19 @@ impl AgentLoop {
     }
 
     async fn record_first_reasoning_chunk_time(&self) {
+        if self
+            .first_reasoning_chunk_recorded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let mut state = self.state.lock().await;
+        if self
+            .first_reasoning_chunk_recorded
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         if state.first_reasoning_chunk_time.is_none() {
             if crate::cli::output::timing_enabled() {
                 state.first_reasoning_chunk_time = Some(std::time::Instant::now());
@@ -707,8 +746,19 @@ impl AgentLoop {
         if !crate::cli::output::timing_enabled() {
             return;
         }
-
+        if self
+            .first_displayable_text_recorded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let mut state = self.state.lock().await;
+        if self
+            .first_displayable_text_recorded
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         if state.first_displayable_text_time.is_none() {
             state.first_displayable_text_time = Some(std::time::Instant::now());
         }
@@ -726,6 +776,9 @@ impl AgentLoop {
             config,
             state: Arc::new(Mutex::new(state)),
             cancelled,
+            first_output_emit_recorded: std::sync::atomic::AtomicBool::new(false),
+            first_reasoning_chunk_recorded: std::sync::atomic::AtomicBool::new(false),
+            first_displayable_text_recorded: std::sync::atomic::AtomicBool::new(false),
             anchor_mgr: AnchorStateManager::new(),
             conversation_history: Arc::new(Mutex::new(Vec::new())),
             message_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -8478,5 +8531,92 @@ mod tests {
         let summary = summarize_reasoning("The user wants me to read it", 4)
             .expect("should emit");
         assert!(summary.ends_with("..."));
+    }
+
+    /// The `record_first_*_time` helpers use an atomic flag so that
+    /// only the first chunk on a turn takes `state.lock().await`.
+    /// Subsequent calls on the same turn must observe the flag and
+    /// return without touching the mutex. We verify the contract by
+    /// observing the side-effect that the helper ALWAYS performs
+    /// (setting `reasoning_active`); the `Instant` write is gated on
+    /// `timing_enabled()` and is only set in instrumented sessions.
+    #[tokio::test]
+    async fn test_record_first_output_emit_time_atomic_fast_path() {
+        use crate::providers::mock::{MockProvider, MockResponse};
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::new(vec![MockResponse::Stream(vec![])]));
+        let agent = AgentLoop::new(test_agent_config(provider, "test-atomic-fast-path"));
+
+        // Set reasoning_active to true so the first call's
+        // `reasoning_active = false` is observable.
+        {
+            let mut state = agent.state.lock().await;
+            state.reasoning_active = true;
+        }
+        assert!(!agent.first_output_emit_recorded.load(std::sync::atomic::Ordering::Acquire));
+
+        // First call claims the flag and performs the state mutation.
+        agent.record_first_output_emit_time().await;
+        assert!(agent.first_output_emit_recorded.load(std::sync::atomic::Ordering::Acquire));
+        {
+            let state = agent.state.lock().await;
+            assert!(!state.reasoning_active, "first call must clear reasoning_active");
+        }
+
+        // Reset state and call again. The atomic flag must short-circuit
+        // the second call, so the state mutation must NOT happen.
+        {
+            let mut state = agent.state.lock().await;
+            state.reasoning_active = true;
+        }
+        agent.record_first_output_emit_time().await;
+        {
+            let state = agent.state.lock().await;
+            assert!(
+                state.reasoning_active,
+                "atomic fast-path must skip the state write after the first claim"
+            );
+        }
+    }
+
+    /// Same contract for the reasoning-chunk timing helper.
+    #[tokio::test]
+    async fn test_record_first_reasoning_chunk_time_atomic_fast_path() {
+        use crate::providers::mock::{MockProvider, MockResponse};
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::new(vec![MockResponse::Stream(vec![])]));
+        let agent = AgentLoop::new(test_agent_config(provider, "test-reasoning-fast-path"));
+
+        assert!(!agent
+            .first_reasoning_chunk_recorded
+            .load(std::sync::atomic::Ordering::Acquire));
+        {
+            let mut state = agent.state.lock().await;
+            state.reasoning_active = false;
+        }
+
+        // First call claims the flag and sets reasoning_active = true.
+        agent.record_first_reasoning_chunk_time().await;
+        assert!(agent
+            .first_reasoning_chunk_recorded
+            .load(std::sync::atomic::Ordering::Acquire));
+        {
+            let state = agent.state.lock().await;
+            assert!(state.reasoning_active, "first call must set reasoning_active");
+        }
+
+        // Reset and call again; flag must short-circuit.
+        {
+            let mut state = agent.state.lock().await;
+            state.reasoning_active = false;
+        }
+        agent.record_first_reasoning_chunk_time().await;
+        {
+            let state = agent.state.lock().await;
+            assert!(
+                !state.reasoning_active,
+                "atomic fast-path must skip the state write after the first claim"
+            );
+        }
     }
 }
