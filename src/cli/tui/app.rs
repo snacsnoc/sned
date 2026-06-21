@@ -219,6 +219,10 @@ pub struct App {
     /// Entries are recorded in append order; popping iterates from the
     /// highest index to the lowest to preserve earlier indices.
     pub turn_stream_entries: Vec<(usize, StreamKind)>,
+    /// The most recent streamed logical line (start index, visual line
+    /// count, kind). Used for in-place partial-line updates while a
+    /// response is still streaming.
+    pub last_stream_group: Option<(usize, usize, StreamKind)>,
     /// The turn indicator line (e.g. "♦") for the current turn. This is
     /// kept separate from `turn_stream_line_indices` so that
     /// `finalize_turn_stream` can re-insert it at the top of the
@@ -319,6 +323,7 @@ impl App {
             slash_command_all_entries: Vec::new(),
             slash_command_completed_text: None,
             turn_stream_entries: Vec::new(),
+            last_stream_group: None,
             turn_indicator: None,
             turn_had_streamed_line: false,
             model_picker_active: false,
@@ -355,17 +360,16 @@ impl App {
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum();
 
-        let lines_to_push: Vec<Line<'static>> =
-            if total_width > wrap_width && wrap_width > 0 {
-                let mut full_text = String::new();
-                for span in &line.spans {
-                    full_text.push_str(span.content.as_ref());
-                }
-                let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
-                wrapped.lines().map(|l| Line::from(l.to_string())).collect()
-            } else {
-                vec![line]
-            };
+        let lines_to_push: Vec<Line<'static>> = if total_width > wrap_width && wrap_width > 0 {
+            let mut full_text = String::new();
+            for span in &line.spans {
+                full_text.push_str(span.content.as_ref());
+            }
+            let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
+            wrapped.lines().map(|l| Line::from(l.to_string())).collect()
+        } else {
+            vec![line]
+        };
 
         for l in lines_to_push {
             self._push_output_line(l, kind);
@@ -407,51 +411,52 @@ impl App {
             self.turn_had_streamed_line = true;
         }
 
-        // StreamKind maps to a default BlockKind. The interactive.rs
-        // routing layer overrides this default for structurally tagged
-        // emissions (tool headers, command headers, reasoning) by
-        // calling `push_output_with_kind` directly via dedicated events.
-        let block_kind = match kind {
-            StreamKind::Model => BlockKind::Model,
-            StreamKind::ToolOutput => BlockKind::ToolOutput,
+        let lines_to_push = self.prewrap_stream_line(line);
+        self.push_stream_group(lines_to_push, kind);
+    }
+
+    /// Replace the most recent streamed logical line. Used for partial
+    /// model-line updates so the TUI can repaint the current line
+    /// without duplicating transcript entries.
+    pub fn replace_last_stream_line(&mut self, line: Line<'static>, kind: StreamKind) {
+        if kind == StreamKind::Model {
+            self.turn_had_streamed_line = true;
+        }
+
+        let Some((start_idx, visual_line_count, last_kind)) = self.last_stream_group else {
+            self.push_stream_line(line, kind);
+            return;
         };
 
-        // Pre-wrap: split long lines and record all indices.
-        // We must pre-wrap here (not rely on push_output's pre-wrap) so
-        // we know the exact indices of all pieces for finalize_turn_stream.
-        let wrap_width = self.last_wrap_width();
-        let total_width: usize = line
-            .spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum();
-
-        let lines_to_push: Vec<Line<'static>> =
-            if total_width > wrap_width && wrap_width > 0 {
-                let mut full_text = String::new();
-                for span in &line.spans {
-                    full_text.push_str(span.content.as_ref());
-                }
-                let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
-                wrapped.lines().map(|l| Line::from(l.to_string())).collect()
-            } else {
-                vec![line]
-            };
-
-        for l in lines_to_push {
-            let idx = self.output_lines.len();
-            self.push_output_with_kind(l, block_kind);
-            // push_output may have evicted the front of the buffer if it
-            // exceeded 10,000 lines. If our recorded index fell off, drop
-            // it and any earlier recorded indices for this turn — the
-            // eviction means the model output was so long that we cannot
-            // usefully re-render it as a unit anyway.
-            if idx >= self.output_lines.len() {
-                self.turn_stream_entries.clear();
-                return;
-            }
-            self.turn_stream_entries.push((idx, kind));
+        let expected_len = start_idx.saturating_add(visual_line_count);
+        if last_kind != kind
+            || expected_len != self.output_lines.len()
+            || visual_line_count == 0
+            || self.turn_stream_entries.len() < visual_line_count
+        {
+            self.push_stream_line(line, kind);
+            return;
         }
+
+        let tail_entries =
+            &self.turn_stream_entries[self.turn_stream_entries.len() - visual_line_count..];
+        let tail_matches = tail_entries
+            .iter()
+            .enumerate()
+            .all(|(offset, (idx, entry_kind))| *entry_kind == kind && *idx == start_idx + offset);
+        if !tail_matches {
+            self.push_stream_line(line, kind);
+            return;
+        }
+
+        for _ in 0..visual_line_count {
+            self.output_lines.pop_back();
+            self.output_line_kinds.pop_back();
+            self.turn_stream_entries.pop();
+        }
+
+        let lines_to_push = self.prewrap_stream_line(line);
+        self.push_stream_group(lines_to_push, kind);
     }
 
     /// Store a turn-indicator line (e.g. "♦") for later re-insertion at
@@ -483,6 +488,7 @@ impl App {
     /// different styling.
     pub fn finalize_turn_stream(&mut self, markdown_text: &str) {
         let entries = std::mem::take(&mut self.turn_stream_entries);
+        self.last_stream_group = None;
         let had_streamed_line = std::mem::take(&mut self.turn_had_streamed_line);
 
         // Filter to Model entries only — tool output lines must never
@@ -497,35 +503,32 @@ impl App {
             // Drop any pending indicator so it does not linger as an
             // orphaned line if this turn produced no markdown.
             self.turn_indicator = None;
-// When no Model entries were recorded but streamed lines were
-                // emitted (direct push), append the re-rendered markdown
-                // after the existing lines instead of replacing them.
-                // This avoids a visual flash on the first turn.
-                if model_indices.is_empty() && had_streamed_line && !markdown_text.trim().is_empty() {
-                    let prefixed_markdown = if self.turn_indicator.take().is_some() {
-                        format!("\u{2666} {}", markdown_text)
-                    } else {
-                        markdown_text.to_string()
-                    };
-                    let rendered: Vec<Line<'static>> =
-                        crate::cli::markdown::render_markdown(None, &prefixed_markdown);
-                    for line in rendered {
-                        self.output_lines.push_back(line);
-                        self.output_line_kinds.push_back(BlockKind::Model);
-                    }
-                    self.needs_redraw = true;
-                    self.cached_wrap_width = None;
-                    self.rebuild_visual_row_cache(self.last_wrap_width());
+            // When no Model entries were recorded but streamed lines were
+            // emitted (direct push), append the re-rendered markdown
+            // after the existing lines instead of replacing them.
+            // This avoids a visual flash on the first turn.
+            if model_indices.is_empty() && had_streamed_line && !markdown_text.trim().is_empty() {
+                let prefixed_markdown = if self.turn_indicator.take().is_some() {
+                    format!("\u{2666} {}", markdown_text)
+                } else {
+                    markdown_text.to_string()
+                };
+                let rendered: Vec<Line<'static>> =
+                    crate::cli::markdown::render_markdown(None, &prefixed_markdown);
+                for line in rendered {
+                    self.output_lines.push_back(line);
+                    self.output_line_kinds.push_back(BlockKind::Model);
                 }
+                self.needs_redraw = true;
+                self.cached_wrap_width = None;
+                self.rebuild_visual_row_cache(self.last_wrap_width());
+            }
             return;
         }
 
         // Extract just the Model indices for the no-op-reinsert check
         // and for popping/insertion.
-        let model_entry_indices: Vec<usize> = model_indices
-            .iter()
-            .map(|(idx, _)| *idx)
-            .collect();
+        let model_entry_indices: Vec<usize> = model_indices.iter().map(|(idx, _)| *idx).collect();
 
         // No-op-reinsert optimization: if the rendered line count equals
         // the popped Model line count and every rendered line has the same
@@ -536,15 +539,14 @@ impl App {
         let mut rendered: Vec<Line<'static>> =
             crate::cli::markdown::render_markdown(None, markdown_text);
         let can_skip_reinsert = rendered.len() == model_entry_indices.len()
-            && rendered
-                .iter()
-                .zip(model_entry_indices.iter())
-                .all(|(rendered_line, popped_idx)| {
+            && rendered.iter().zip(model_entry_indices.iter()).all(
+                |(rendered_line, popped_idx)| {
                     self.output_lines
                         .get(*popped_idx)
                         .map(|popped| rendered_line == popped)
                         .unwrap_or(false)
-                });
+                },
+            );
 
         if can_skip_reinsert {
             // Prepend the turn indicator to the first rendered line's
@@ -694,6 +696,58 @@ impl App {
         }
     }
 
+    fn prewrap_stream_line(&self, line: Line<'static>) -> Vec<Line<'static>> {
+        let wrap_width = self.last_wrap_width();
+        let total_width: usize = line
+            .spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+
+        if total_width > wrap_width && wrap_width > 0 {
+            let mut full_text = String::new();
+            for span in &line.spans {
+                full_text.push_str(span.content.as_ref());
+            }
+            let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
+            wrapped.lines().map(|l| Line::from(l.to_string())).collect()
+        } else {
+            vec![line]
+        }
+    }
+
+    fn push_stream_group(&mut self, lines_to_push: Vec<Line<'static>>, kind: StreamKind) {
+        // StreamKind maps to a default BlockKind. The interactive.rs
+        // routing layer overrides this default for structurally tagged
+        // emissions (tool headers, command headers, reasoning) by
+        // calling `push_output_with_kind` directly via dedicated events.
+        let block_kind = match kind {
+            StreamKind::Model => BlockKind::Model,
+            StreamKind::ToolOutput => BlockKind::ToolOutput,
+        };
+        let start_idx = self.output_lines.len();
+        let mut pushed = 0usize;
+
+        for line in lines_to_push {
+            let idx = self.output_lines.len();
+            self.push_output_with_kind(line, block_kind);
+            // push_output may have evicted the front of the buffer if it
+            // exceeded 10,000 lines. If our recorded index fell off, drop
+            // it and any earlier recorded indices for this turn — the
+            // eviction means the model output was so long that we cannot
+            // usefully re-render it as a unit anyway.
+            if idx >= self.output_lines.len() {
+                self.turn_stream_entries.clear();
+                self.last_stream_group = None;
+                return;
+            }
+            self.turn_stream_entries.push((idx, kind));
+            pushed = pushed.saturating_add(1);
+        }
+
+        self.last_stream_group = Some((start_idx, pushed, kind));
+    }
+
     /// Push a styled text line.
     pub fn push_styled(&mut self, text: impl Into<String>, style: Style) {
         let text = text.into();
@@ -711,13 +765,11 @@ impl App {
         let remainder = sep_width.saturating_sub(diamond.len());
         let left = (remainder + 1) / 2;
         let right = remainder / 2;
-        let sep = format!(
-            "{}{}{}",
-            "─".repeat(left),
-            diamond,
-            "─".repeat(right),
+        let sep = format!("{}{}{}", "─".repeat(left), diamond, "─".repeat(right),);
+        self.push_output_with_kind(
+            Line::from(Span::styled(sep, theme::dim_style())),
+            BlockKind::Separator,
         );
-        self.push_output_with_kind(Line::from(Span::styled(sep, theme::dim_style())), BlockKind::Separator);
     }
 
     /// Push a user message with proper formatting (splits on newlines).
@@ -740,8 +792,7 @@ impl App {
                 format!("❯ {}", line)
             };
             writer.emit(OutputEvent::UserPromptLine(Line::from(Span::styled(
-                content,
-                style,
+                content, style,
             ))));
         }
         self.force_bottom();
@@ -760,6 +811,10 @@ impl App {
         self.output_line_kinds.clear();
         self.completion_lines.clear();
         self.error_lines.clear();
+        self.turn_stream_entries.clear();
+        self.last_stream_group = None;
+        self.turn_indicator = None;
+        self.turn_had_streamed_line = false;
         self.cached_visual_rows = 0;
         self.cached_error_rows = 0;
         self.cached_wrap_width = Some(self.last_wrap_width());
@@ -774,6 +829,7 @@ impl App {
         }
         self.output_lines.drain(start..);
         self.output_line_kinds.drain(start..);
+        self.last_stream_group = None;
         // Invalidate the visual-row cache: drain changes the line buffer,
         // which can alter render-time separator insertion.
         self.cached_wrap_width = None;
@@ -968,32 +1024,43 @@ impl App {
         // eventually slices.  `start_idx`/`end_idx` are indices into
         // `expanded`, NOT into `self.output_lines` — the expanded list
         // is longer when transition separators are present.
-        let expanded = self.output_rows_for_render();
-        let expanded_len = expanded.len();
+        let mut expanded_len = 0usize;
         let mut rows_before = 0usize;
-        let mut start_idx = expanded_len;
+        let mut start_idx = usize::MAX;
         let mut start_row_offset = 0usize;
-        let mut end_idx = expanded_len.saturating_sub(1);
+        let mut end_idx = 0usize;
 
-        for (idx, (line, _kind)) in expanded.iter().enumerate() {
-            let rows = Self::line_visual_rows(line, wrap_width);
+        let mut done = false;
+        self.for_each_output_row(|line, _kind| {
+            if done {
+                return;
+            }
+            let idx = expanded_len;
+            expanded_len = expanded_len.saturating_add(1);
+            let rows = Self::output_row_visual_rows(line, wrap_width);
             let rows_after = rows_before.saturating_add(rows);
 
-            if start_idx == expanded_len && rows_after > target_start {
+            if start_idx == usize::MAX && rows_after > target_start {
                 start_idx = idx;
                 start_row_offset = target_start.saturating_sub(rows_before);
             }
 
             if rows_after >= target_end {
                 end_idx = idx;
-                break;
+                rows_before = rows_after;
+                done = true;
+                return;
             }
 
             rows_before = rows_after;
             end_idx = idx;
+        });
+
+        if expanded_len == 0 {
+            return (0, 0, 0);
         }
 
-        if start_idx == expanded_len {
+        if start_idx == usize::MAX {
             start_idx = expanded_len.saturating_sub(1);
             start_row_offset = 0;
             end_idx = start_idx;
@@ -1009,11 +1076,11 @@ impl App {
     }
 
     fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
-        let output_rows: usize = self
-            .output_rows_for_render()
-            .iter()
-            .map(|(line, _)| Self::line_visual_rows(line, wrap_width))
-            .sum();
+        let mut output_rows = 0usize;
+        self.for_each_output_row(|line, _| {
+            output_rows =
+                output_rows.saturating_add(Self::output_row_visual_rows(line, wrap_width));
+        });
         // Completion box uses the same wrap width (only borders, no gutter).
         let completion_rows: usize = self
             .completion_lines
@@ -1039,19 +1106,46 @@ impl App {
     /// kinds (so the visual row count matches what `render_output`
     /// will actually draw).  Used by both the visual-row cache and
     /// the renderer so they cannot drift.
+    #[allow(dead_code)]
     fn output_rows_for_render(&self) -> Vec<(Line<'static>, BlockKind)> {
         let mut out: Vec<(Line<'static>, BlockKind)> = Vec::with_capacity(self.output_lines.len());
+        self.for_each_output_row(|line, kind| {
+            out.push((line.cloned().unwrap_or_else(|| Line::from("")), kind));
+        });
+        out
+    }
+
+    fn for_each_output_row(&self, mut visitor: impl FnMut(Option<&Line<'static>>, BlockKind)) {
         let mut prev: Option<BlockKind> = None;
         for (line, kind) in self.output_lines.iter().zip(self.output_line_kinds.iter()) {
             if let Some(p) = prev
                 && Self::should_insert_separator(p, *kind)
             {
-                out.push((Line::from(""), BlockKind::Separator));
+                visitor(None, BlockKind::Separator);
             }
-            out.push((line.clone(), *kind));
+            visitor(Some(line), *kind);
             prev = Some(*kind);
         }
-        out
+    }
+
+    fn output_row_visual_rows(line: Option<&Line<'static>>, wrap_width: usize) -> usize {
+        match line {
+            Some(line) => Self::line_visual_rows(line, wrap_width),
+            None => 1,
+        }
+    }
+
+    fn collect_output_rows_range(&self, start_idx: usize, take_count: usize) -> Vec<Line<'static>> {
+        let end_idx = start_idx.saturating_add(take_count);
+        let mut expanded_idx = 0usize;
+        let mut visible_lines = Vec::with_capacity(take_count);
+        self.for_each_output_row(|line, _| {
+            if expanded_idx >= start_idx && expanded_idx < end_idx {
+                visible_lines.push(line.cloned().unwrap_or_else(|| Line::from("")));
+            }
+            expanded_idx = expanded_idx.saturating_add(1);
+        });
+        visible_lines
     }
 
     /// Predicate for whether a blank-line separator should be drawn
@@ -1195,7 +1289,12 @@ impl App {
             self.status_left_fingerprint = current_fingerprint;
         }
         let elapsed_secs = self.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
-        let context_key = (elapsed_secs, self.context_pct, self.output_overflow, self.output_overflow_count);
+        let context_key = (
+            elapsed_secs,
+            self.context_pct,
+            self.output_overflow,
+            self.output_overflow_count,
+        );
         if context_key != self.cached_status_right_secs {
             let context_str = self
                 .context_pct
@@ -1295,7 +1394,9 @@ impl App {
         // drawn as a separate Block below the main output. Scroll math must
         // therefore be based on output_rows alone, or the bottom of the
         // output gets hidden behind the completion overlay.
-        let output_rows = total_rows.saturating_sub(self.cached_completion_rows).saturating_sub(self.cached_error_rows);
+        let output_rows = total_rows
+            .saturating_sub(self.cached_completion_rows)
+            .saturating_sub(self.cached_error_rows);
         let scroll_y = self.resolved_scroll_y_for(output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y as usize, content_height);
@@ -1308,18 +1409,13 @@ impl App {
         // insertion.
         {
             frame.render_widget(Clear, main_output_area);
-            let expanded = self.output_rows_for_render();
-            let visible_lines: Vec<Line<'static>> = expanded
-                .into_iter()
-                .skip(start_idx)
-                .take(visible_count)
-                .map(|(line, _)| line)
-                .collect();
+            let visible_lines = self.collect_output_rows_range(start_idx, visible_count);
             let output = Paragraph::new(visible_lines)
                 .wrap(Wrap { trim: false })
                 .scroll((visible_scroll_y as u16, 0))
                 .block(
-                    theme::border_block(" sned ").padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
+                    theme::border_block(" sned ")
+                        .padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
                 );
             frame.render_widget(output, main_output_area);
         }
@@ -1327,8 +1423,7 @@ impl App {
         // Render error box (priority) or completion box below the main output area.
         if has_error {
             frame.render_widget(Clear, bottom_area);
-            let error_lines: Vec<Line<'static>> =
-                self.error_lines.iter().cloned().collect();
+            let error_lines: Vec<Line<'static>> = self.error_lines.iter().cloned().collect();
             let error_box = Paragraph::new(error_lines)
                 .wrap(Wrap { trim: false })
                 .block(
@@ -2211,8 +2306,59 @@ mod tests {
         app.push_stream_line(Line::from("first"), StreamKind::Model);
         app.push_stream_line(Line::from("second"), StreamKind::Model);
         app.push_stream_line(Line::from("third"), StreamKind::Model);
-        assert_eq!(app.turn_stream_entries, vec![(0, StreamKind::Model), (1, StreamKind::Model), (2, StreamKind::Model)]);
+        assert_eq!(
+            app.turn_stream_entries,
+            vec![
+                (0, StreamKind::Model),
+                (1, StreamKind::Model),
+                (2, StreamKind::Model)
+            ]
+        );
         assert_eq!(app.output_lines.len(), 3);
+    }
+
+    #[test]
+    fn test_replace_last_stream_line_reuses_tail_indices() {
+        let mut app = App::new();
+        app.last_content_width = 14;
+
+        app.push_stream_line(Line::from("first"), StreamKind::Model);
+        app.push_stream_line(
+            Line::from("this streamed line wraps across rows"),
+            StreamKind::Model,
+        );
+
+        let before = app.turn_stream_entries.clone();
+        assert!(
+            before.len() >= 3,
+            "expected wrapped stream line to span multiple visual rows"
+        );
+
+        app.replace_last_stream_line(
+            Line::from("updated streamed line wraps differently"),
+            StreamKind::Model,
+        );
+
+        assert_eq!(app.turn_stream_entries[0], (0, StreamKind::Model));
+        assert_eq!(
+            app.output_lines.front().map(ToString::to_string).as_deref(),
+            Some("first")
+        );
+        assert!(
+            app.output_lines
+                .iter()
+                .skip(1)
+                .any(|line| line.to_string().contains("updated")),
+            "replacement should update the tail group in place"
+        );
+        assert!(
+            app.turn_stream_entries
+                .iter()
+                .skip(1)
+                .enumerate()
+                .all(|(offset, (idx, kind))| { *kind == StreamKind::Model && *idx == offset + 1 }),
+            "tail indices should be rewritten to the replacement group"
+        );
     }
 
     #[test]
@@ -2711,9 +2857,9 @@ mod tests {
     /// line") that the existing scroll-state-only test failed to catch.
     #[test]
     fn test_multiline_submit_bottom_row_contains_last_line() {
-        use std::sync::Arc;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        use std::sync::Arc;
         use tokio::sync::mpsc;
 
         let _approval_guard = crate::core::approval::approval_test_guard();
@@ -2769,11 +2915,7 @@ mod tests {
         // roughly the upper `height - 4` rows; the last 3 rows are the
         // status bar / input / border. We assert that *some* visible row
         // in the bottom 10 rows of the output area contains "third line".
-        let output_bottom_rows = rows
-            .iter()
-            .rev()
-            .take(10)
-            .collect::<Vec<_>>();
+        let output_bottom_rows = rows.iter().rev().take(10).collect::<Vec<_>>();
         let found = output_bottom_rows
             .iter()
             .any(|row| row.contains("third line"));
@@ -2810,9 +2952,9 @@ mod tests {
     /// visible bottom rows of the output pane.
     #[test]
     fn test_approval_prompt_visible_after_multiline_tool_result() {
-        use std::sync::Arc;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        use std::sync::Arc;
         use tokio::sync::mpsc;
 
         let _approval_guard = crate::core::approval::approval_test_guard();
@@ -2866,9 +3008,10 @@ mod tests {
                       \x1b[33m🔧 Tool:\x1b[0m \x1b[1medit_file\x1b[0m\n\
                       \x1b[2m  path: src/baz.rs\x1b[0m\n\
                       Execute this tool? (y/n/always): ";
-        writer.emit(crate::cli::output::OutputEvent::RawAnsi(
-            format!("{}\n", prompt),
-        ));
+        writer.emit(crate::cli::output::OutputEvent::RawAnsi(format!(
+            "{}\n",
+            prompt
+        )));
 
         // Full pipeline: drain + clamp + render. This is what the main
         // loop does on every tick (interactive.rs:2165-2252).
@@ -2898,8 +3041,7 @@ mod tests {
         // The output pane occupies the upper rows; status bar (1) and
         // input area (3) are at the bottom. Scan the bottom 15 rows of
         // the terminal to cover the output pane content above the status/input.
-        let output_bottom_rows: Vec<&String> =
-            rows.iter().rev().take(15).collect();
+        let output_bottom_rows: Vec<&String> = rows.iter().rev().take(15).collect();
 
         // The "Execute this tool?" line is the user-visible prompt anchor.
         let has_prompt_question = output_bottom_rows
@@ -2949,9 +3091,9 @@ mod tests {
     /// the expected behavior across the two-drain sequence.
     #[test]
     fn test_approval_prompt_visible_when_flag_set_before_emit() {
-        use std::sync::Arc;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        use std::sync::Arc;
         use tokio::sync::mpsc;
 
         let _approval_guard = crate::core::approval::approval_test_guard();
@@ -3003,9 +3145,10 @@ mod tests {
         let prompt = "\n\
                       \x1b[33m🔧 Tool:\x1b[0m \x1b[1medit_file\x1b[0m\n\
                       Execute this tool? (y/n/always): ";
-        writer.emit(crate::cli::output::OutputEvent::RawAnsi(
-            format!("{}\n", prompt),
-        ));
+        writer.emit(crate::cli::output::OutputEvent::RawAnsi(format!(
+            "{}\n",
+            prompt
+        )));
 
         // Step 5: Second drain — flag is already consumed, but
         // is_approval_prompt_active() is still true, so the else-if
@@ -3030,8 +3173,7 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect();
 
-        let output_bottom_rows: Vec<&String> =
-            rows.iter().rev().take(15).collect();
+        let output_bottom_rows: Vec<&String> = rows.iter().rev().take(15).collect();
 
         let has_prompt_question = output_bottom_rows
             .iter()
@@ -3217,9 +3359,9 @@ mod tests {
         let source = include_str!("app.rs");
         let has_active_call = |area_arg: &str| -> bool {
             let needle = format!("render_widget(Clear, {})", area_arg);
-            source.lines().any(|line| {
-                !line.trim_start().starts_with("//") && line.contains(&needle)
-            })
+            source
+                .lines()
+                .any(|line| !line.trim_start().starts_with("//") && line.contains(&needle))
         };
         assert!(
             has_active_call("main_output_area"),

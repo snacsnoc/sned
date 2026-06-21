@@ -323,7 +323,8 @@ impl UseSubagentsHandler {
                     writer.emit(OutputEvent::tool_output_line(
                         format!(
                             "Subagent {} timed out after {} seconds",
-                            subagent_index + 1, timeout_secs
+                            subagent_index + 1,
+                            timeout_secs
                         ),
                         Style::default().fg(WARNING_FG),
                     ));
@@ -733,6 +734,7 @@ mod tests {
         fn emit(&self, event: OutputEvent) {
             let text = match event {
                 OutputEvent::Line(line) => line.to_string(),
+                OutputEvent::ModelUpdateLine(line) => line.to_string(),
                 OutputEvent::ToolOutputLine(line) => line.to_string(),
                 OutputEvent::RawAnsi(text) => text,
                 OutputEvent::Completion(_) => String::new(),

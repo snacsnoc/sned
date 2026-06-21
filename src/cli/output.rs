@@ -18,6 +18,10 @@ use tokio::sync::mpsc;
 pub enum OutputEvent {
     /// A line of text with optional styling (model output).
     Line(Line<'static>),
+    /// Replace the most recent streamed model line in-place. Used for
+    /// throttled partial-line updates so the TUI can show in-progress
+    /// text without appending duplicate transcript lines.
+    ModelUpdateLine(Line<'static>),
     /// A line of text with optional styling (tool result, plan status,
     /// heat map, etc.).  The TUI tags these as `ToolOutput` so they
     /// are never popped or re-rendered by `finalize_turn_stream`.
@@ -259,6 +263,9 @@ impl OutputWriter for StderrOutputWriter {
     fn emit(&self, event: OutputEvent) {
         match event {
             OutputEvent::Line(line) => {
+                eprintln!("{}", line);
+            }
+            OutputEvent::ModelUpdateLine(line) => {
                 eprintln!("{}", line);
             }
             OutputEvent::ToolOutputLine(line) => {

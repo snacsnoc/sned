@@ -81,8 +81,8 @@ const DEFAULT_TOOL_CONCURRENCY: usize = 12;
 /// transport errors would loop indefinitely. Set equal to
 /// DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES so the user-facing
 /// behavior matches the request-level cap.
-const MAX_STREAM_RETRY_ATTEMPTS: usize =
-    DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES as usize;
+const MAX_STREAM_RETRY_ATTEMPTS: usize = DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES as usize;
+const PARTIAL_MODEL_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
 
@@ -240,6 +240,17 @@ fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriter
     }
 }
 
+fn update_model_line(line: &str, output_writer: &crate::cli::output::OutputWriterArc) {
+    let sanitized = sanitize_model_text_for_display(line);
+    if sanitized.trim().is_empty() {
+        return;
+    }
+    output_writer.emit(OutputEvent::ModelUpdateLine(Line::from(Span::styled(
+        sanitized.into_owned(),
+        Style::default().fg(crate::cli::tui::theme::ACCENT),
+    ))));
+}
+
 /// Like `print_model_line`, but if `pending` is true, emits a separate
 /// turn-indicator line ("♦") before the model output and clears the flag.
 /// The indicator is emitted as `OutputEvent::TurnIndicator` so that
@@ -258,6 +269,20 @@ fn print_model_line_with_prefix_if_pending(
         output_writer.emit(crate::cli::output::OutputEvent::turn_indicator("\u{2666}"));
     }
     print_model_line(line, output_writer);
+}
+
+fn update_model_line_with_prefix_if_pending(
+    line: &str,
+    output_writer: &crate::cli::output::OutputWriterArc,
+    pending: &mut bool,
+) {
+    if *pending && !line.trim().is_empty() {
+        *pending = false;
+        output_writer.emit(crate::cli::output::OutputEvent::turn_indicator("\u{2666}"));
+        print_model_line(line, output_writer);
+        return;
+    }
+    update_model_line(line, output_writer);
 }
 
 fn stream_error_is_retryable(error: &str) -> bool {
@@ -1792,6 +1817,8 @@ impl AgentLoop {
             let mut retryable_stream_error_before_output: Option<String> = None;
             let mut in_thinking_tag = false;
             let mut emitted_output_this_attempt = false;
+            let mut partial_line_displayed = false;
+            let mut last_partial_flush_at: Option<std::time::Instant> = None;
 
             // Track time to first token for UX feedback on slow connections
             let first_chunk_start = std::time::Instant::now();
@@ -1949,6 +1976,8 @@ impl AgentLoop {
                                             &self.config.output_writer,
                                             &mut turn_indicator_pending,
                                         );
+                                        partial_line_displayed = false;
+                                        last_partial_flush_at = None;
                                         continue;
                                     }
 
@@ -1974,11 +2003,50 @@ impl AgentLoop {
                                     // Regular content - already trimmed
                                     self.record_first_output_emit_time().await;
                                     emitted_output_this_attempt = true;
-                                    print_model_line_with_prefix_if_pending(
-                                        trimmed_line,
-                                        &self.config.output_writer,
-                                        &mut turn_indicator_pending,
-                                    );
+                                    if partial_line_displayed {
+                                        update_model_line_with_prefix_if_pending(
+                                            trimmed_line,
+                                            &self.config.output_writer,
+                                            &mut turn_indicator_pending,
+                                        );
+                                        partial_line_displayed = false;
+                                        last_partial_flush_at = None;
+                                    } else {
+                                        print_model_line_with_prefix_if_pending(
+                                            trimmed_line,
+                                            &self.config.output_writer,
+                                            &mut turn_indicator_pending,
+                                        );
+                                    }
+                                }
+
+                                let trimmed_partial = display_buffer.trim_end();
+                                let should_flush_partial = self.config.interactive_mode
+                                    && !self.config.json_output
+                                    && !in_code_block
+                                    && !trimmed_partial.is_empty()
+                                    && !trimmed_partial.trim_start().starts_with("```")
+                                    && last_partial_flush_at.is_none_or(|last| {
+                                        last.elapsed() >= PARTIAL_MODEL_FLUSH_INTERVAL
+                                    });
+                                if should_flush_partial {
+                                    self.record_first_output_emit_time().await;
+                                    emitted_output_this_attempt = true;
+                                    if partial_line_displayed {
+                                        update_model_line_with_prefix_if_pending(
+                                            trimmed_partial,
+                                            &self.config.output_writer,
+                                            &mut turn_indicator_pending,
+                                        );
+                                    } else {
+                                        print_model_line_with_prefix_if_pending(
+                                            trimmed_partial,
+                                            &self.config.output_writer,
+                                            &mut turn_indicator_pending,
+                                        );
+                                        partial_line_displayed = true;
+                                    }
+                                    last_partial_flush_at = Some(std::time::Instant::now());
                                 }
                             }
                         }
@@ -2328,11 +2396,19 @@ impl AgentLoop {
                 let remaining = display_buffer.trim_end().to_string();
                 if !remaining.is_empty() {
                     self.record_first_output_emit_time().await;
-                    print_model_line_with_prefix_if_pending(
-                        &remaining,
-                        &self.config.output_writer,
-                        &mut turn_indicator_pending,
-                    );
+                    if partial_line_displayed {
+                        update_model_line_with_prefix_if_pending(
+                            &remaining,
+                            &self.config.output_writer,
+                            &mut turn_indicator_pending,
+                        );
+                    } else {
+                        print_model_line_with_prefix_if_pending(
+                            &remaining,
+                            &self.config.output_writer,
+                            &mut turn_indicator_pending,
+                        );
+                    }
                 }
             } else if !self.config.json_output {
                 self.config.output_writer.flush();
@@ -2351,8 +2427,7 @@ impl AgentLoop {
                         error = %err,
                         "stream retry cap exceeded; surfacing error to user"
                     );
-                    let actionable =
-                        crate::cli::actionable_errors::provider_error(&err);
+                    let actionable = crate::cli::actionable_errors::provider_error(&err);
                     return TurnResult::Error(format!(
                         "Provider stream failed after {} attempts: {}",
                         stream_retry_attempt + 1,
@@ -3140,7 +3215,13 @@ impl AgentLoop {
                                 format!("  {} {}", status, first_line),
                                 Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
                             ));
-                    } else if !matches!(tool_name.as_str(), "plan_mode_respond" | "ask_followup_question" | "condense" | "use_subagents") {
+                    } else if !matches!(
+                        tool_name.as_str(),
+                        "plan_mode_respond"
+                            | "ask_followup_question"
+                            | "condense"
+                            | "use_subagents"
+                    ) {
                         let max_lines = MAX_TOOL_RESULT_DISPLAY_LINES;
                         let displayed = format_tool_result(&result_output.text, max_lines);
                         let status = if is_error { "✗" } else { "✓" };
@@ -3164,10 +3245,12 @@ impl AgentLoop {
                         }
                         let total_lines = displayed.lines().count();
                         if total_lines > 3 {
-                            self.config.output_writer.emit(OutputEvent::tool_output_line(
-                                format!("    ... {} more lines", total_lines - 3),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ));
+                            self.config
+                                .output_writer
+                                .emit(OutputEvent::tool_output_line(
+                                    format!("    ... {} more lines", total_lines - 3),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ));
                         }
                     }
                 }
@@ -3295,12 +3378,14 @@ impl AgentLoop {
                     drop(state);
 
                     if plan_completed && !self.config.json_output {
-                        self.config.output_writer.emit(OutputEvent::tool_output_line(
-                            "✓ Plan complete. All steps executed successfully.",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                        ));
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::tool_output_line(
+                                "✓ Plan complete. All steps executed successfully.",
+                                Style::default()
+                                    .fg(Color::Green)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
                     }
                     if plan_completed {
                         self.set_mode(AgentMode::Act);
@@ -3512,15 +3597,19 @@ impl AgentLoop {
                 let context_pct = api_req_info.context_usage_percentage.unwrap_or(0.0);
 
                 if context_pct >= 95.0 {
-                    self.config.output_writer.emit(OutputEvent::tool_output_line(
-                        "⚠ 95% context window — /compact or start new session".to_string(),
-                        Style::default().fg(Color::Yellow),
-                    ));
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::tool_output_line(
+                            "⚠ 95% context window — /compact or start new session".to_string(),
+                            Style::default().fg(Color::Yellow),
+                        ));
                 } else if context_pct >= 80.0 {
-                    self.config.output_writer.emit(OutputEvent::tool_output_line(
-                        "⚠ 80% context window used — consider /compact".to_string(),
-                        Style::default().fg(Color::Yellow),
-                    ));
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::tool_output_line(
+                            "⚠ 80% context window used — consider /compact".to_string(),
+                            Style::default().fg(Color::Yellow),
+                        ));
                 } else if context_pct >= 50.0 {
                     self.config.output_writer.emit(OutputEvent::tool_output_line(
                         "ℹ 50% context window used — use /compact to free space before starting new topics".to_string(),
@@ -3558,14 +3647,11 @@ impl AgentLoop {
                 // Strip tool-call status lines that were already rendered as
                 // separate OutputEvent::Line/RawAnsi events. Including them in
                 // the TurnEnd payload causes duplicate rendering in the TUI.
-                let stripped =
-                    crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
+                let stripped = crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
                 if !stripped.is_empty() {
-                    self.config
-                        .output_writer
-                        .emit(OutputEvent::TurnEnd {
-                            accumulated_text: stripped,
-                        });
+                    self.config.output_writer.emit(OutputEvent::TurnEnd {
+                        accumulated_text: stripped,
+                    });
                 }
             }
             if !self.config.interactive_mode
@@ -3593,14 +3679,11 @@ impl AgentLoop {
             // Same turn-end signal for the "more turns coming" branch.
             let markdown_text = response_text.as_deref().unwrap_or("");
             if !self.config.json_output && !markdown_text.is_empty() {
-                let stripped =
-                    crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
+                let stripped = crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
                 if !stripped.is_empty() {
-                    self.config
-                        .output_writer
-                        .emit(OutputEvent::TurnEnd {
-                            accumulated_text: stripped,
-                        });
+                    self.config.output_writer.emit(OutputEvent::TurnEnd {
+                        accumulated_text: stripped,
+                    });
                 }
             }
             TurnResult::Continue
@@ -4530,17 +4613,34 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::ToolOutputLine(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ModelUpdateLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::ToolOutputLine(line) => {
+                    rendered.push(line.to_string())
+                }
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}
-                crate::cli::output::OutputEvent::TurnIndicator(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::TurnIndicator(line) => {
+                    rendered.push(line.to_string())
+                }
                 crate::cli::output::OutputEvent::ErrorBox(msg) => rendered.push(msg),
-                crate::cli::output::OutputEvent::ToolHeaderLine(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::CommandHeaderLine(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::CommandOutputLine(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::ReasoningLine(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::UserPromptLine(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ToolHeaderLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::CommandHeaderLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::CommandOutputLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::ReasoningLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::UserPromptLine(line) => {
+                    rendered.push(line.to_string())
+                }
             }
         }
         rendered
@@ -4582,6 +4682,7 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 OutputEvent::Line(line) => emitted.push(line.to_string()),
+                OutputEvent::ModelUpdateLine(line) => emitted.push(line.to_string()),
                 other => panic!("unexpected output event: {:?}", other),
             }
         }
@@ -4746,14 +4847,16 @@ mod tests {
                  got {other:?}. If the consecutive_mistakes cap is broken, the \
                  agent would continue and consume the sentinel response."
             ),
-            None => panic!(
-                "consecutive_mistakes cap never fired after {max_mistakes} empty responses"
-            ),
+            None => {
+                panic!("consecutive_mistakes cap never fired after {max_mistakes} empty responses")
+            }
         }
         // The sentinel must NOT have been consumed.
         let rendered = drain_rendered_output(&mut rx);
         assert!(
-            !rendered.iter().any(|line| line.contains("SENTINEL_NOT_CONSUMED")),
+            !rendered
+                .iter()
+                .any(|line| line.contains("SENTINEL_NOT_CONSUMED")),
             "sentinel response was consumed — the consecutive_mistakes \
              cap did not fire. rendered: {rendered:?}"
         );
@@ -8474,10 +8577,7 @@ mod tests {
         // With term_width=80, max_chars = 80 - 4 - 4 = 72.
         // The line below is 14 chars, which fits within 72.
         let line = "The user wants";
-        assert_eq!(
-            summarize_reasoning(line, 80).as_deref(),
-            Some(line)
-        );
+        assert_eq!(summarize_reasoning(line, 80).as_deref(), Some(line));
     }
 
     #[test]
@@ -8515,15 +8615,8 @@ mod tests {
         // the chars we explicitly put in the input (ASCII letters,
         // spaces, the '.' truncation suffix). No mid-codepoint slicing.
         for c in summary.chars() {
-            let ok = c == '.'
-                || c == ' '
-                || c.is_ascii_alphabetic()
-                || (c as u32) >= 0x4E00;
-            assert!(
-                ok,
-                "unexpected char in output: {c:?} (U+{:04X})",
-                c as u32
-            );
+            let ok = c == '.' || c == ' ' || c.is_ascii_alphabetic() || (c as u32) >= 0x4E00;
+            assert!(ok, "unexpected char in output: {c:?} (U+{:04X})", c as u32);
         }
         assert!(summary.is_char_boundary(summary.len()));
     }
@@ -8532,8 +8625,7 @@ mod tests {
     fn test_summarize_reasoning_handles_tiny_term_width() {
         // Pathological narrow terminal: term_width < prefix + suffix.
         // Must not panic and must return at least the "..." suffix.
-        let summary = summarize_reasoning("The user wants me to read it", 4)
-            .expect("should emit");
+        let summary = summarize_reasoning("The user wants me to read it", 4).expect("should emit");
         assert!(summary.ends_with("..."));
     }
 
@@ -8557,14 +8649,25 @@ mod tests {
             let mut state = agent.state.lock().await;
             state.reasoning_active = true;
         }
-        assert!(!agent.first_output_emit_recorded.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !agent
+                .first_output_emit_recorded
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
 
         // First call claims the flag and performs the state mutation.
         agent.record_first_output_emit_time().await;
-        assert!(agent.first_output_emit_recorded.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            agent
+                .first_output_emit_recorded
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
         {
             let state = agent.state.lock().await;
-            assert!(!state.reasoning_active, "first call must clear reasoning_active");
+            assert!(
+                !state.reasoning_active,
+                "first call must clear reasoning_active"
+            );
         }
 
         // Reset state and call again. The atomic flag must short-circuit
@@ -8591,9 +8694,11 @@ mod tests {
             Arc::new(MockProvider::new(vec![MockResponse::Stream(vec![])]));
         let agent = AgentLoop::new(test_agent_config(provider, "test-reasoning-fast-path"));
 
-        assert!(!agent
-            .first_reasoning_chunk_recorded
-            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !agent
+                .first_reasoning_chunk_recorded
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
         {
             let mut state = agent.state.lock().await;
             state.reasoning_active = false;
@@ -8601,12 +8706,17 @@ mod tests {
 
         // First call claims the flag and sets reasoning_active = true.
         agent.record_first_reasoning_chunk_time().await;
-        assert!(agent
-            .first_reasoning_chunk_recorded
-            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            agent
+                .first_reasoning_chunk_recorded
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
         {
             let state = agent.state.lock().await;
-            assert!(state.reasoning_active, "first call must set reasoning_active");
+            assert!(
+                state.reasoning_active,
+                "first call must set reasoning_active"
+            );
         }
 
         // Reset and call again; flag must short-circuit.

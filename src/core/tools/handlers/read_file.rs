@@ -719,17 +719,34 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::ToolOutputLine(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ModelUpdateLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::ToolOutputLine(line) => {
+                    rendered.push(line.to_string())
+                }
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}
-                crate::cli::output::OutputEvent::TurnIndicator(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::TurnIndicator(line) => {
+                    rendered.push(line.to_string())
+                }
                 crate::cli::output::OutputEvent::ErrorBox(msg) => rendered.push(msg),
-                crate::cli::output::OutputEvent::ToolHeaderLine(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::CommandHeaderLine(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::CommandOutputLine(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::ReasoningLine(line) => rendered.push(line.to_string()),
-                crate::cli::output::OutputEvent::UserPromptLine(line) => rendered.push(line.to_string()),
+                crate::cli::output::OutputEvent::ToolHeaderLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::CommandHeaderLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::CommandOutputLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::ReasoningLine(line) => {
+                    rendered.push(line.to_string())
+                }
+                crate::cli::output::OutputEvent::UserPromptLine(line) => {
+                    rendered.push(line.to_string())
+                }
             }
         }
         rendered

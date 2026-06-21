@@ -422,6 +422,9 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             OutputEvent::Line(line) => {
                 app.push_stream_line(line, crate::cli::tui::StreamKind::Model);
             }
+            OutputEvent::ModelUpdateLine(line) => {
+                app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
+            }
             OutputEvent::ToolOutputLine(line) => {
                 app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
             }
