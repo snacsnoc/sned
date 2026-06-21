@@ -454,10 +454,16 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 // Check if the completion result matches the last streamed text.
                 // If the model sends its own response as the completion result,
                 // the completion box would duplicate text already in output_lines.
+                // Filter to BlockKind::Model so tool headers, tool results, and
+                // command output are not mixed into the comparison — otherwise the
+                // joined string is multi-line and never matches a single-line
+                // completion result.
                 let last_streamed = app.output_lines.iter()
+                    .zip(app.output_line_kinds.iter())
+                    .filter(|(_, kind)| **kind == crate::cli::tui::BlockKind::Model)
                     .rev()
                     .take(20) // Check last 20 lines (covers typical response length)
-                    .map(|line| line.to_string())
+                    .map(|(line, _)| line.to_string())
                     .collect::<Vec<_>>()
                     .join("\n");
                 let is_duplicate = last_streamed.trim() == result.trim();
@@ -2998,6 +3004,7 @@ pub fn render_interactive_prompt_prefix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::text::Line;
     use serde::ser::{Error as _, Serialize, Serializer};
 
     fn reset_prompt_state() {
@@ -3275,6 +3282,125 @@ mod tests {
         assert!(
             second_rendered.contains("second completion"),
             "expected second completion to replace the first, got: {second_rendered}"
+        );
+
+        reset_prompt_state();
+    }
+
+    /// Regression test: when a model's streamed text matches the
+    /// completion result, the completion box should show "Task
+    /// Completed" instead of duplicating the model text. The dedup
+    /// must filter by BlockKind::Model so tool headers, tool results,
+    /// and command output interleaved in `output_lines` do not break
+    /// the comparison.
+    #[test]
+    fn test_drain_output_completion_dedup_filters_by_model_kind() {
+        use crate::cli::output::OutputEvent;
+        use crate::cli::tui::BlockKind;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let model_text = "Read and understood both AGENTS.md and README.md.";
+        let tool_output_text = "  ✓ Read and understood both AGENTS.md and README.md.";
+
+        let (tx, mut rx) = mpsc::channel(8);
+        // Stream model text — ends up as BlockKind::Model in output_lines.
+        tx.try_send(OutputEvent::Line(Line::from(model_text)))
+            .unwrap();
+        // Emit a tool header — BlockKind::ToolHeader.
+        tx.try_send(OutputEvent::tool_call("▶ attempt_completion"))
+            .unwrap();
+        // Emit a tool result — BlockKind::ToolOutput.
+        tx.try_send(OutputEvent::ToolOutputLine(Line::from(tool_output_text)))
+            .unwrap();
+        // Emit the completion with text identical to the streamed model line.
+        tx.try_send(OutputEvent::Completion(model_text.to_string()))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let rendered = app
+            .completion_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rendered.contains(model_text),
+            "completion box must not duplicate model text, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("Task Completed"),
+            "completion box should show 'Task Completed' for duplicate text, got: {rendered}"
+        );
+
+        // The interleaved non-Model lines must still be present in
+        // output_lines for the TUI to render them — only the
+        // completion box is deduped.
+        let kinds: Vec<&BlockKind> = app.output_line_kinds.iter().collect();
+        assert!(
+            kinds.contains(&&BlockKind::ToolHeader),
+            "tool header should still be in output_lines"
+        );
+        assert!(
+            kinds.contains(&&BlockKind::ToolOutput),
+            "tool output should still be in output_lines"
+        );
+        assert!(
+            kinds.contains(&&BlockKind::Model),
+            "model line should still be in output_lines"
+        );
+
+        reset_prompt_state();
+    }
+
+    /// Sanity check: when the completion text is genuinely different
+    /// from any streamed model line, the full result is shown.
+    #[test]
+    fn test_drain_output_completion_dedup_keeps_unique_text() {
+        use crate::cli::output::OutputEvent;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::Line(Line::from("Model prose line")))
+            .unwrap();
+        tx.try_send(OutputEvent::tool_call("▶ attempt_completion"))
+            .unwrap();
+        tx.try_send(OutputEvent::Completion(
+            "Different completion text".to_string(),
+        ))
+        .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let rendered = app
+            .completion_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("Different completion text"),
+            "unique completion text should be shown verbatim, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Task Completed"),
+            "unique completion must not be replaced with 'Task Completed', got: {rendered}"
         );
 
         reset_prompt_state();
