@@ -483,33 +483,14 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                     app.push_output(line);
                 }
             }
-            OutputEvent::Completion(result) => {
+            OutputEvent::Completion(_) => {
                 flush_model_update(app, &mut pending_model_update);
-                // Check if the completion result matches the last streamed text.
-                // If the model sends its own response as the completion result,
-                // the completion box would duplicate text already in output_lines.
-                // Filter to BlockKind::Model so tool headers, tool results, and
-                // command output are not mixed into the comparison — otherwise the
-                // joined string is multi-line and never matches a single-line
-                // completion result.
-                let last_streamed = app
-                    .output_lines
-                    .iter()
-                    .zip(app.output_line_kinds.iter())
-                    .filter(|(_, kind)| **kind == crate::cli::tui::BlockKind::Model)
-                    .rev()
-                    .take(20) // Check last 20 lines (covers typical response length)
-                    .map(|(line, _)| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let is_duplicate = last_streamed.trim() == result.trim();
+                // Completion box is a thin status indicator — the result text
+                // is already visible as ToolOutputLine in the main output, so
+                // we never duplicate it here.
                 app.clear_completion_lines();
-                let completion_text = if is_duplicate {
-                    "Task Completed"
-                } else {
-                    &result
-                };
-                for line in crate::cli::markdown::render_completion_markdown("🚀 ", completion_text)
+                for line in
+                    crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed")
                 {
                     app.push_completion_line(line);
                 }
@@ -3374,6 +3355,9 @@ mod tests {
         let mut app = App::new();
         drain_output(&mut rx, &mut app);
 
+        // Completion box always shows "Task Completed" — the actual result
+        // text is visible as ToolOutputLine in the main output, so we never
+        // duplicate it in the completion box.
         let first_rendered = app
             .completion_lines
             .iter()
@@ -3386,8 +3370,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            first_rendered.contains("first completion"),
-            "expected first completion to render, got: {first_rendered}"
+            first_rendered.contains("Task Completed"),
+            "expected 'Task Completed' to render, got: {first_rendered}"
         );
 
         tx.try_send(OutputEvent::Completion("second completion".to_string()))
@@ -3406,12 +3390,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !second_rendered.contains("first completion"),
-            "previous completion box should be replaced, got: {second_rendered}"
+            second_rendered.contains("Task Completed"),
+            "completion box should still show 'Task Completed', got: {second_rendered}"
         );
+        // Verify the box was cleared and re-rendered (not appended).
         assert!(
-            second_rendered.contains("second completion"),
-            "expected second completion to replace the first, got: {second_rendered}"
+            second_rendered.lines().count() <= first_rendered.lines().count(),
+            "completion box should be replaced, not appended to"
         );
 
         reset_prompt_state();
@@ -3486,51 +3471,6 @@ mod tests {
         assert!(
             kinds.contains(&&BlockKind::Model),
             "model line should still be in output_lines"
-        );
-
-        reset_prompt_state();
-    }
-
-    /// Sanity check: when the completion text is genuinely different
-    /// from any streamed model line, the full result is shown.
-    #[test]
-    fn test_drain_output_completion_dedup_keeps_unique_text() {
-        use crate::cli::output::OutputEvent;
-
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
-
-        let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::Line(Line::from("Model prose line")))
-            .unwrap();
-        tx.try_send(OutputEvent::tool_call("▶ attempt_completion"))
-            .unwrap();
-        tx.try_send(OutputEvent::Completion(
-            "Different completion text".to_string(),
-        ))
-        .unwrap();
-
-        let mut app = App::new();
-        drain_output(&mut rx, &mut app);
-
-        let rendered = app
-            .completion_lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            rendered.contains("Different completion text"),
-            "unique completion text should be shown verbatim, got: {rendered}"
-        );
-        assert!(
-            !rendered.contains("Task Completed"),
-            "unique completion must not be replaced with 'Task Completed', got: {rendered}"
         );
 
         reset_prompt_state();
