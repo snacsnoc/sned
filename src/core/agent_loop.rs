@@ -1820,10 +1820,6 @@ impl AgentLoop {
             let mut partial_line_displayed = false;
             let mut last_partial_flush_at: Option<std::time::Instant> = None;
 
-            // Track time to first token for UX feedback on slow connections
-            let first_chunk_start = std::time::Instant::now();
-            let mut slow_connection_warned = false;
-
             // Turn indicator is prepended to the first output line, not emitted separately,
             // so it appears on the same line as the start of the response.
             let mut turn_indicator_pending = true;
@@ -1835,22 +1831,6 @@ impl AgentLoop {
                 if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                     tracing::info!("cancellation detected during stream processing, aborting turn");
                     return TurnResult::Cancelled;
-                }
-
-                // Warn about slow connection if waiting >1s for first token.
-                // 1s gives the user immediate visual feedback (the spinner is
-                // already running, but a yellow warning reassures them the
-                // request is in flight). The previous 3s threshold left users
-                // wondering if the request had died.
-                if !first_chunk_received
-                    && !slow_connection_warned
-                    && first_chunk_start.elapsed().as_secs() >= 1
-                {
-                    slow_connection_warned = true;
-                    emitted_output_this_attempt = true;
-                    self.config
-                        .output_writer
-                        .emit(OutputEvent::dim_yellow("⏳ Waiting for API response..."));
                 }
 
                 if !first_chunk_received && !matches!(&chunk, ApiStreamChunk::Error(_)) {
