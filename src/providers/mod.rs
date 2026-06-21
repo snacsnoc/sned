@@ -585,47 +585,24 @@ impl SseLineBuffer {
     /// Push bytes into the buffer and return complete lines.
     /// Made public for benchmarking.
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Vec<String> {
-        if self.skip_next_newline {
-            // Skip leading newline from overflow recovery, then process rest
-            if let Some(newline_idx) = chunk.iter().position(|&b| b == b'\n') {
-                self.skip_next_newline = false;
-                if newline_idx + 1 < chunk.len() {
-                    return self.push_chunk(&chunk[newline_idx + 1..]);
-                }
+        let mut chunk = chunk;
+        while self.skip_next_newline || self.limit_exceeded {
+            let Some(newline_idx) = chunk.iter().position(|&b| b == b'\n') else {
+                return Vec::new();
+            };
+            self.skip_next_newline = false;
+            self.limit_exceeded = false;
+            chunk = &chunk[newline_idx + 1..];
+            if chunk.is_empty() {
                 return Vec::new();
             }
-            // Still waiting for the terminating newline of the oversized line.
-            // Discard this chunk — it's part of the overflow line, not new data.
-            return Vec::new();
-        }
-
-        if self.limit_exceeded {
-            // Find next newline to recover from overflow
-            if let Some(newline_idx) = chunk.iter().position(|&b| b == b'\n') {
-                self.limit_exceeded = false;
-                if newline_idx + 1 < chunk.len() {
-                    return self.push_chunk(&chunk[newline_idx + 1..]);
-                }
-                return Vec::new();
-            }
-            return Vec::new();
         }
 
         self.pending.extend_from_slice(chunk);
 
         if self.pending.len() >= self.max_line_length {
             if let Some(last_newline) = self.pending.iter().rposition(|&b| b == b'\n') {
-                let complete_lines = self.pending.drain(..=last_newline).collect::<Vec<u8>>();
-                let mut lines = Vec::new();
-                for line_bytes in complete_lines.split(|&b| b == b'\n') {
-                    let mut line = line_bytes.to_vec();
-                    if matches!(line.last(), Some(b'\r')) {
-                        line.pop();
-                    }
-                    if !line.is_empty() {
-                        lines.push(String::from_utf8_lossy(&line).into_owned());
-                    }
-                }
+                let lines = self.take_complete_lines(last_newline + 1);
                 if self.pending.len() >= self.max_line_length {
                     self.pending.clear();
                     self.limit_exceeded = true;
@@ -638,18 +615,11 @@ impl SseLineBuffer {
             }
         }
 
-        let mut lines = Vec::new();
-        while let Some(newline_idx) = self.pending.iter().position(|&b| b == b'\n') {
-            let mut line_bytes = self.pending.drain(..=newline_idx).collect::<Vec<u8>>();
-            if matches!(line_bytes.last(), Some(b'\n')) {
-                line_bytes.pop();
-            }
-            if matches!(line_bytes.last(), Some(b'\r')) {
-                line_bytes.pop();
-            }
-            lines.push(String::from_utf8_lossy(&line_bytes).into_owned());
-        }
-        lines
+        self.pending
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|idx| self.take_complete_lines(idx + 1))
+            .unwrap_or_default()
     }
 
     pub(crate) fn finish(&mut self) -> Option<String> {
@@ -671,6 +641,23 @@ impl SseLineBuffer {
         } else {
             None
         }
+    }
+
+    fn take_complete_lines(&mut self, split_at: usize) -> Vec<String> {
+        let remaining = self.pending.split_off(split_at);
+        let complete = std::mem::replace(&mut self.pending, remaining);
+        let mut lines = Vec::new();
+        for line_bytes in complete.split(|&b| b == b'\n') {
+            let line_bytes = if matches!(line_bytes.last(), Some(b'\r')) {
+                &line_bytes[..line_bytes.len().saturating_sub(1)]
+            } else {
+                line_bytes
+            };
+            if !line_bytes.is_empty() {
+                lines.push(String::from_utf8_lossy(line_bytes).into_owned());
+            }
+        }
+        lines
     }
 }
 
@@ -1159,13 +1146,19 @@ mod tests {
 
     #[test]
     fn test_validate_tool_call_args_empty_returns_empty_object() {
-        assert_eq!(validate_tool_call_args("", "test", "unit"), Some("{}".to_string()));
+        assert_eq!(
+            validate_tool_call_args("", "test", "unit"),
+            Some("{}".to_string())
+        );
     }
 
     #[test]
     fn test_validate_tool_call_args_valid_json_passes_through() {
         let args = r#"{"a": 1, "b": [2, 3]}"#;
-        assert_eq!(validate_tool_call_args(args, "test", "unit"), Some(args.to_string()));
+        assert_eq!(
+            validate_tool_call_args(args, "test", "unit"),
+            Some(args.to_string())
+        );
     }
 
     #[test]

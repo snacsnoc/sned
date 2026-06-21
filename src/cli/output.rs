@@ -347,7 +347,11 @@ impl ChannelOutputWriter {
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
+        let is_lossy_update = matches!(event, OutputEvent::ModelUpdateLine(_));
         if self.tx.try_send(event).is_err() {
+            if is_lossy_update {
+                return;
+            }
             let count = self
                 .dropped_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -588,6 +592,28 @@ mod tests {
         assert!(
             !writer.take_overflow_signal(),
             "take_overflow_signal must be edge-triggered (false after consume)"
+        );
+    }
+
+    #[test]
+    fn test_channel_overflow_ignores_lossy_model_updates() {
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+        use ratatui::text::Line;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let writer = ChannelOutputWriter::new(tx);
+
+        writer.emit(OutputEvent::plain("line 1"));
+        writer.emit(OutputEvent::ModelUpdateLine(Line::from("partial")));
+
+        assert!(
+            !writer.take_overflow_signal(),
+            "lossy model updates should not trigger the global overflow warning"
+        );
+        assert_eq!(
+            writer.dropped_count(),
+            0,
+            "lossy model updates should not count as dropped durable output"
         );
     }
 }

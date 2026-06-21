@@ -416,34 +416,50 @@ fn is_shutdown_submit(text: &str) -> bool {
 /// Drain output channel into app buffer.
 fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     let mut saw_output = false;
+    let mut pending_model_update: Option<ratatui::text::Line<'static>> = None;
+
+    let flush_model_update = |app: &mut App, pending: &mut Option<ratatui::text::Line<'static>>| {
+        if let Some(line) = pending.take() {
+            app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
+        }
+    };
+
     while let Ok(event) = rx.try_recv() {
         saw_output = true;
         match event {
             OutputEvent::Line(line) => {
+                flush_model_update(app, &mut pending_model_update);
                 app.push_stream_line(line, crate::cli::tui::StreamKind::Model);
             }
             OutputEvent::ModelUpdateLine(line) => {
-                app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
+                pending_model_update = Some(line);
             }
             OutputEvent::ToolOutputLine(line) => {
+                flush_model_update(app, &mut pending_model_update);
                 app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
             }
             OutputEvent::ToolHeaderLine(line) => {
+                flush_model_update(app, &mut pending_model_update);
                 app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
             }
             OutputEvent::CommandHeaderLine(line) => {
+                flush_model_update(app, &mut pending_model_update);
                 app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandHeader);
             }
             OutputEvent::CommandOutputLine(line) => {
+                flush_model_update(app, &mut pending_model_update);
                 app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
             }
             OutputEvent::ReasoningLine(line) => {
+                flush_model_update(app, &mut pending_model_update);
                 app.push_output_with_kind(line, crate::cli::tui::BlockKind::Reasoning);
             }
             OutputEvent::UserPromptLine(line) => {
+                flush_model_update(app, &mut pending_model_update);
                 app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
             }
             OutputEvent::RawAnsi(s) => {
+                flush_model_update(app, &mut pending_model_update);
                 // Raw ANSI events (code blocks) are already styled. We
                 // do NOT record them in turn_stream_line_indices, so
                 // turn-end replacement only re-renders the plain
@@ -454,6 +470,7 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 }
             }
             OutputEvent::Completion(result) => {
+                flush_model_update(app, &mut pending_model_update);
                 // Check if the completion result matches the last streamed text.
                 // If the model sends its own response as the completion result,
                 // the completion box would duplicate text already in output_lines.
@@ -484,6 +501,7 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 }
             }
             OutputEvent::ErrorBox(msg) => {
+                flush_model_update(app, &mut pending_model_update);
                 if !msg.trim().is_empty() {
                     app.clear_error_lines();
                     for line in crate::cli::markdown::render_error_markdown("✗ Error", &msg) {
@@ -492,9 +510,11 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
                 }
             }
             OutputEvent::TurnEnd { accumulated_text } => {
+                flush_model_update(app, &mut pending_model_update);
                 app.finalize_turn_stream(&accumulated_text);
             }
             OutputEvent::TurnIndicator(line) => {
+                flush_model_update(app, &mut pending_model_update);
                 // Store the indicator separately from streamed lines so
                 // finalize_turn_stream can re-insert it at the top of
                 // the markdown block instead of stripping it.
@@ -502,6 +522,7 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
             }
         }
     }
+    flush_model_update(app, &mut pending_model_update);
     if crate::core::approval::take_approval_prompt_scroll()
         || crate::core::approval::take_followup_prompt_scroll()
     {
@@ -2333,9 +2354,11 @@ async fn run_main_loop(
         }
     }
 
-    const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(1);
-    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+    const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(8);
+    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(8);
+    const BUSY_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
+    let mut last_draw_at: Option<std::time::Instant> = None;
     let mut timing = TimingSummary {
         enabled: timing_enabled,
         session_start_time: app.start_time,
@@ -2439,10 +2462,20 @@ async fn run_main_loop(
         }
 
         // 2. Render (skip if nothing changed)
-        if app.needs_redraw || app.has_resized {
+        let should_render = if app.needs_redraw || app.has_resized {
+            if app.agent_busy {
+                last_draw_at.is_none_or(|last| last.elapsed() >= BUSY_REDRAW_INTERVAL)
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        if should_render {
             {
                 let t = std::time::Instant::now();
                 terminal.draw(|f| app.render(f))?;
+                last_draw_at = Some(std::time::Instant::now());
                 timing.draw_total_us += t.elapsed().as_micros() as u64;
                 timing.draw_count += 1;
                 if timing_enabled
@@ -3132,6 +3165,35 @@ mod tests {
         drain_output(&mut rx, &mut app);
 
         assert_eq!(app.scroll_mode, ScrollMode::Auto);
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_coalesces_model_update_bursts() {
+        use crate::cli::output::OutputEvent;
+        use ratatui::text::Line;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(OutputEvent::Line(Line::from("initial")))
+            .unwrap();
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 1")))
+            .unwrap();
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 2")))
+            .unwrap();
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("final partial")))
+            .unwrap();
+
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        drain_output(&mut rx, &mut app);
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert_eq!(rendered, vec!["final partial"]);
 
         reset_prompt_state();
     }
