@@ -372,7 +372,7 @@ impl App {
         };
 
         for l in lines_to_push {
-            self._push_output_line(l, kind);
+            self._push_output_line(l, kind, wrap_width);
         }
     }
 
@@ -380,17 +380,26 @@ impl App {
     /// kind tag.  `output_line_kinds` is kept in lockstep with
     /// `output_lines` so render-time grouping can walk both buffers
     /// with the same indices.
-    fn _push_output_line(&mut self, line: Line<'static>, kind: BlockKind) {
+    fn _push_output_line(&mut self, line: Line<'static>, kind: BlockKind, wrap_width: usize) {
+        let previous_kind = self.output_line_kinds.back().copied();
         self.needs_redraw = true;
         self.output_lines.push_back(line);
         self.output_line_kinds.push_back(kind);
-        // Invalidate the visual-row cache: push changes the line buffer,
-        // which can alter render-time separator insertion. Rebuild on next
-        // access ensures cached_visual_rows matches output_rows_for_render().
-        self.cached_wrap_width = None;
+        self.cached_visible_window = None;
         if self.output_lines.len() > 10_000 {
             self.output_lines.pop_front();
             self.output_line_kinds.pop_front();
+            self.cached_wrap_width = None;
+            self.cached_visible_window = None;
+        } else if self.cached_wrap_width == Some(wrap_width) {
+            // Hot path: keep the cached row count in sync for simple appends
+            // so the next render does not need to rescan the whole transcript.
+            let added_rows = Self::line_visual_rows(self.output_lines.back().unwrap(), wrap_width)
+                .saturating_add(
+                    previous_kind.is_some_and(|prev| Self::should_insert_separator(prev, kind))
+                        as usize,
+                );
+            self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
         if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
             self.force_bottom();
@@ -448,6 +457,31 @@ impl App {
             self.push_stream_line(line, kind);
             return;
         }
+
+        let block_kind = match kind {
+            StreamKind::Model => BlockKind::Model,
+            StreamKind::ToolOutput => BlockKind::ToolOutput,
+        };
+        let wrap_width = self.last_wrap_width();
+        if self.cached_wrap_width == Some(wrap_width) {
+            let tail_start = self.output_lines.len() - visual_line_count;
+            let mut removed_rows: usize = self
+                .output_lines
+                .iter()
+                .skip(tail_start)
+                .take(visual_line_count)
+                .map(|line| Self::line_visual_rows(line, wrap_width))
+                .sum();
+            if let Some(prev_kind) = tail_start
+                .checked_sub(1)
+                .and_then(|idx| self.output_line_kinds.get(idx).copied())
+                && Self::should_insert_separator(prev_kind, block_kind)
+            {
+                removed_rows = removed_rows.saturating_add(1);
+            }
+            self.cached_visual_rows = self.cached_visual_rows.saturating_sub(removed_rows);
+        }
+        self.cached_visible_window = None;
 
         for _ in 0..visual_line_count {
             self.output_lines.pop_back();
@@ -818,6 +852,7 @@ impl App {
         self.cached_visual_rows = 0;
         self.cached_error_rows = 0;
         self.cached_wrap_width = Some(self.last_wrap_width());
+        self.cached_visible_window = None;
     }
 
     /// Drain output from the given index onward and keep the visual-row cache in sync.
@@ -833,6 +868,7 @@ impl App {
         // Invalidate the visual-row cache: drain changes the line buffer,
         // which can alter render-time separator insertion.
         self.cached_wrap_width = None;
+        self.cached_visible_window = None;
     }
 
     pub fn pin_approval_bottom(&mut self) {
@@ -1837,13 +1873,21 @@ mod tests {
     fn test_cached_visual_rows_tracks_push_clear_and_drain() {
         let mut app = App::new();
         app.set_content_width(24);
+        let wrap_width = app.last_wrap_width();
+
+        // Prime the cache so the common push path can update it
+        // incrementally instead of invalidating the whole transcript.
+        assert_eq!(app.total_visual_rows(wrap_width), 0);
+        assert_eq!(app.cached_wrap_width, Some(wrap_width));
 
         app.push_plain("short line");
-        let wrap_width = app.last_wrap_width();
         let first_total = app.total_visual_rows(wrap_width);
+        assert_eq!(app.cached_wrap_width, Some(wrap_width));
         assert_eq!(app.cached_visual_rows, first_total);
 
         app.push_plain("this line is intentionally long enough to wrap twice");
+        assert_eq!(app.cached_wrap_width, Some(wrap_width));
+        assert!(app.cached_visual_rows > first_total);
         let second_total = app.total_visual_rows(wrap_width);
         assert_eq!(app.cached_visual_rows, second_total);
         assert!(second_total >= first_total);
