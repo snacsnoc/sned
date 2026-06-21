@@ -979,12 +979,15 @@ impl AgentLoop {
             let task = task_text.clone().unwrap_or_default();
             let task_id = self.config.task_id.clone();
 
-            // Hook execution timeout: 60 seconds default (configurable via SNED_HOOK_TIMEOUT_MS)
+            // Hook execution timeout: 10 seconds default (configurable via SNED_HOOK_TIMEOUT_MS).
+            // Lower than the previous 60s because a misbehaving TaskStart hook (e.g. a
+            // slow `git status` on a large repo) blocks the entire submit path for the
+            // full timeout. Users with legitimate slow hooks opt in via the env var.
             let timeout_ms = std::env::var("SNED_HOOK_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|&v| v > 0)
-                .unwrap_or(60_000);
+                .unwrap_or(10_000);
             let timeout_duration = std::time::Duration::from_millis(timeout_ms);
 
             // Note: HookManager::task_start is synchronous, so we use tokio::task::spawn_blocking
