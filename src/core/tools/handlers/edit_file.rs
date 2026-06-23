@@ -74,12 +74,11 @@ impl EditFileHandler {
                 // Lenient fallback: models commonly put "path" inside the first
                 // edit object instead of at the file-entry level. Extract it
                 // if present so the edit succeeds without a wasted round-trip.
-                if let Some(edits) = file.get("edits").and_then(|e| e.as_array()) {
-                    if let Some(first_edit) = edits.first() {
-                        if let Some(path) = first_edit.get("path").and_then(|p| p.as_str()) {
-                            return Ok(path);
-                        }
-                    }
+                if let Some(edits) = file.get("edits").and_then(|e| e.as_array())
+                    && let Some(first_edit) = edits.first()
+                    && let Some(path) = first_edit.get("path").and_then(|p| p.as_str())
+                {
+                    return Ok(path);
                 }
                 Err(
                     "edit_file requires a 'path' key in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"

@@ -1938,8 +1938,7 @@ async fn handle_cli_only_command(
                                 app.push_plain("Cannot add steps while plan is running. Use /plan pause first.");
                             } else if step_text.trim().is_empty() {
                                 app.push_plain("Usage: /plan add <after_step> <description>");
-                            } else {
-                                if after_step == 0 {
+            } else if after_step == 0 {
                                     match plan
                                         .insert_step_at_beginning(step_text.trim().to_string())
                                     {
@@ -1966,7 +1965,6 @@ async fn handle_cli_only_command(
                                         Err(e) => app.push_plain(format!("Error: {}", e)),
                                     }
                                 }
-                            }
                         }
                         PlanSubcommand::Remove(step_num) => {
                             if plan.approved && !plan.paused {

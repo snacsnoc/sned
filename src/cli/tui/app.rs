@@ -627,9 +627,10 @@ impl App {
             // Prepend the turn indicator to the first rendered line's
             // first span instead of doing a full pop+reinsert.
             let mut prefixed_turn_indicator = false;
-            if let Some(first) = rendered.first_mut() {
-                if self.turn_indicator.take().is_some() {
-                    // Prepend "♦ " to the first span of the first line.
+            if let Some(first) = rendered.first_mut()
+                && self.turn_indicator.take().is_some()
+            {
+                // Prepend "♦ " to the first span of the first line.
                     let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
                     new_spans.push(Span::styled(
                         "\u{2666} ",
@@ -637,9 +638,8 @@ impl App {
                     ));
                     new_spans.extend(first.spans.iter().cloned());
                     first.spans = new_spans;
-                    prefixed_turn_indicator = true;
-                }
-            }
+                prefixed_turn_indicator = true;
+        }
             if prefixed_turn_indicator {
                 self.output_lines[model_entry_indices[0]] = rendered[0].clone();
             }
@@ -843,7 +843,7 @@ impl App {
         let sep_width = self.last_wrap_width().max(20);
         let diamond = " ♦ ";
         let remainder = sep_width.saturating_sub(diamond.len());
-        let left = (remainder + 1) / 2;
+        let left = remainder.div_ceil(2);
         let right = remainder / 2;
         let sep = format!("{}{}{}", "─".repeat(left), diamond, "─".repeat(right),);
         self.push_output_with_kind(
