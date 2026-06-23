@@ -7,7 +7,9 @@ pub mod definitions;
 pub mod handlers;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -153,7 +155,7 @@ impl SnedTool {
 
 /// Registry of tool handlers.
 pub struct ToolRegistry {
-    handlers: HashMap<SnedTool, Arc<dyn ToolHandler>>,
+    handlers: HashMap<SnedTool, Arc<dyn ToolHandler + Send + Sync>>,
 }
 
 impl Default for ToolRegistry {
@@ -170,12 +172,12 @@ impl ToolRegistry {
     }
 
     /// Register a tool handler.
-    pub fn register(&mut self, tool: SnedTool, handler: Arc<dyn ToolHandler>) {
+    pub fn register(&mut self, tool: SnedTool, handler: Arc<dyn ToolHandler + Send + Sync>) {
         self.handlers.insert(tool, handler);
     }
 
     /// Get a handler for a tool.
-    pub fn get_handler(&self, tool: &SnedTool) -> Option<Arc<dyn ToolHandler>> {
+    pub fn get_handler(&self, tool: &SnedTool) -> Option<Arc<dyn ToolHandler + Send + Sync>> {
         self.handlers.get(tool).cloned()
     }
 
@@ -394,15 +396,13 @@ pub fn resolve_sanitized_path(
 }
 
 /// Trait for tool handlers.
-#[async_trait::async_trait]
 pub trait ToolHandler: Send + Sync {
     /// Execute the tool with the given input.
-    #[allow(clippy::unused_async, clippy::unused_self)]
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError>;
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>;
 
     /// Get a description of what the tool does.
     fn description(&self, params: &serde_json::Value) -> String;
@@ -473,18 +473,15 @@ pub fn coerce_string_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-
     struct DummyHandler;
 
-    #[async_trait]
     impl ToolHandler for DummyHandler {
-        async fn execute(
+        fn execute(
             &self,
             _ctx: &ToolContext,
             params: serde_json::Value,
-        ) -> Result<serde_json::Value, ToolError> {
-            Ok(params)
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+            Box::pin(async move { Ok(params) })
         }
 
         fn description(&self, _params: &serde_json::Value) -> String {

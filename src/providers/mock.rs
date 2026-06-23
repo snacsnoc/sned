@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use std::time::Duration;
 
 use crate::providers::{
@@ -8,10 +7,12 @@ use crate::providers::{
 };
 
 /// A mock provider for testing that returns predefined responses.
+#[derive(Debug)]
 pub struct MockProvider {
     responses: Vec<MockResponse>,
     response_index: std::sync::Mutex<usize>,
     repeat_last: bool,
+    context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ impl MockProvider {
             responses,
             response_index: std::sync::Mutex::new(0),
             repeat_last: false,
+            context_window: None,
         }
     }
 
@@ -49,6 +51,16 @@ impl MockProvider {
             responses,
             response_index: std::sync::Mutex::new(0),
             repeat_last: true,
+            context_window: None,
+        }
+    }
+
+    pub fn new_with_context_window(responses: Vec<MockResponse>, context_window: u64) -> Self {
+        Self {
+            responses,
+            response_index: std::sync::Mutex::new(0),
+            repeat_last: false,
+            context_window: Some(context_window),
         }
     }
 
@@ -171,7 +183,6 @@ impl MockProvider {
     }
 }
 
-#[async_trait]
 impl Provider for MockProvider {
     async fn create_message(&self, _request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         let (_index, response) = {
@@ -276,7 +287,7 @@ impl Provider for MockProvider {
             info: ModelInfo {
                 name: Some("Mock Model".to_string()),
                 max_tokens: Some(4096),
-                context_window: Some(200_000),
+                context_window: self.context_window,
                 supports_images: Some(false),
                 supports_prompt_cache: false,
                 supports_reasoning: Some(false),

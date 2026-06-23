@@ -13,17 +13,25 @@ pub mod mock;
 pub mod openai;
 pub mod openrouter;
 
+pub use anthropic::AnthropicProvider;
+pub use deepseek::DeepSeekProvider;
+pub use gemini::GeminiProvider;
+pub use minimax::MinimaxProvider;
+pub use mock::MockProvider;
+pub use openai::OpenAiProvider;
+pub use openrouter::OpenRouterProvider;
+
 use reqwest::StatusCode;
+// Rust 1.93+ supports async traits natively; no #[async_trait] needed
 
 /// Maximum size for tool call arguments (128KB).
 /// Cap arguments to prevent a single tool call from exhausting memory while
-/// still allowing large but legitimate payloads.
-pub const MAX_TOOL_ARGUMENT_SIZE: usize = 131072;
-use reqwest::header::HeaderMap;
-use serde::{Deserialize, Serialize};
-use std::pin::Pin;
+    /// still allowing large but legitimate payloads.
+    pub const MAX_TOOL_ARGUMENT_SIZE: usize = 131072;
+    use reqwest::header::HeaderMap;
+    use serde::{Deserialize, Serialize};
 
-// ============================================================================
+    // ============================================================================
 // Content Block Types (ported from dirac/src/shared/messages/content.ts)
 // ============================================================================
 
@@ -555,6 +563,8 @@ pub struct ProviderModel {
     pub info: ModelInfo,
 }
 
+use std::pin::Pin;
+
 /// The API stream type — an async stream of chunks.
 pub type ApiStream = Pin<Box<dyn tokio_stream::Stream<Item = ApiStreamChunk> + Send>>;
 
@@ -842,13 +852,138 @@ impl From<anyhow::Error> for ProviderError {
 }
 
 /// Core trait that all model providers must implement.
-#[async_trait::async_trait]
-pub trait Provider: Send + Sync {
+#[allow(async_fn_in_trait)]
+pub trait Provider: Send {
     async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError>;
 
     fn get_model(&self) -> ProviderModel;
 
     fn name(&self) -> &str;
+}
+
+/// Concrete enum wrapping all provider types.
+/// Replaces `dyn Provider` to avoid `#[async_trait]` dependency.
+#[derive(Debug)]
+pub enum Providers {
+    OpenAi(OpenAiProvider),
+    Anthropic(AnthropicProvider),
+    DeepSeek(DeepSeekProvider),
+    Gemini(GeminiProvider),
+    Minimax(MinimaxProvider),
+    OpenRouter(OpenRouterProvider),
+    Mock(MockProvider),
+    RetryTest(RetryTestProvider),
+    #[cfg(test)]
+    RecordingChunk(RecordingChunkProvider),
+    #[cfg(test)]
+    TinyContext(TinyContextProvider),
+    #[cfg(test)]
+    Error(ErrorProvider),
+}
+
+#[derive(Debug)]
+pub struct RetryTestProvider {
+    pub attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub fail_until: usize,
+}
+
+impl Provider for RetryTestProvider {
+    async fn create_message(
+        &self,
+        _request: ProviderRequest,
+    ) -> Result<ApiStream, ProviderError> {
+        let attempt = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt < self.fail_until {
+            return Err(ProviderError::RateLimitError {
+                message: "rate limited".to_string(),
+                retry_delay_ms: None,
+            });
+        }
+
+        Ok(Box::pin(tokio_stream::iter(vec![ApiStreamChunk::Usage(
+            crate::providers::ApiStreamUsageChunk {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_write_tokens: None,
+                cache_read_tokens: None,
+                reasoning_tokens: None,
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: None,
+                id: None,
+            },
+        )])))
+    }
+
+    fn get_model(&self) -> ProviderModel {
+        ProviderModel {
+            id: "test".to_string(),
+            info: Default::default(),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "test"
+    }
+}
+
+impl Provider for Providers {
+    async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError> {
+        match self {
+            Providers::OpenAi(p) => p.create_message(request).await,
+            Providers::Anthropic(p) => p.create_message(request).await,
+            Providers::DeepSeek(p) => p.create_message(request).await,
+            Providers::Gemini(p) => p.create_message(request).await,
+            Providers::Minimax(p) => p.create_message(request).await,
+            Providers::OpenRouter(p) => p.create_message(request).await,
+            Providers::Mock(p) => p.create_message(request).await,
+            Providers::RetryTest(p) => p.create_message(request).await,
+            #[cfg(test)]
+            Providers::RecordingChunk(p) => p.create_message(request).await,
+            #[cfg(test)]
+            Providers::TinyContext(p) => p.create_message(request).await,
+            #[cfg(test)]
+            Providers::Error(p) => p.create_message(request).await,
+        }
+    }
+
+    fn get_model(&self) -> ProviderModel {
+        match self {
+            Providers::OpenAi(p) => p.get_model(),
+            Providers::Anthropic(p) => p.get_model(),
+            Providers::DeepSeek(p) => p.get_model(),
+            Providers::Gemini(p) => p.get_model(),
+            Providers::Minimax(p) => p.get_model(),
+            Providers::OpenRouter(p) => p.get_model(),
+            Providers::Mock(p) => p.get_model(),
+            Providers::RetryTest(p) => p.get_model(),
+            #[cfg(test)]
+            Providers::RecordingChunk(p) => p.get_model(),
+            #[cfg(test)]
+            Providers::TinyContext(p) => p.get_model(),
+            #[cfg(test)]
+            Providers::Error(p) => p.get_model(),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Providers::OpenAi(p) => p.name(),
+            Providers::Anthropic(p) => p.name(),
+            Providers::DeepSeek(p) => p.name(),
+            Providers::Gemini(p) => p.name(),
+            Providers::Minimax(p) => p.name(),
+            Providers::OpenRouter(p) => p.name(),
+            Providers::Mock(p) => p.name(),
+            Providers::RetryTest(p) => p.name(),
+            #[cfg(test)]
+            Providers::RecordingChunk(p) => p.name(),
+            #[cfg(test)]
+            Providers::TinyContext(p) => p.name(),
+            #[cfg(test)]
+            Providers::Error(p) => p.name(),
+        }
+    }
 }
 
 // ============================================================================
@@ -1190,5 +1325,123 @@ mod tests {
         let result = validate_tool_call_args("{", "test", "unit");
         let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
         assert!(parsed.is_object());
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub struct RecordingChunkProvider {
+    pub responses: Vec<Vec<ApiStreamChunk>>,
+    response_index: std::sync::Mutex<usize>,
+    pub requests: std::sync::Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+}
+
+#[cfg(test)]
+impl RecordingChunkProvider {
+    pub fn new(
+        responses: Vec<Vec<ApiStreamChunk>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+    ) -> Self {
+        Self {
+            responses,
+            response_index: std::sync::Mutex::new(0),
+            requests,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Provider for RecordingChunkProvider {
+    async fn create_message(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ApiStream, ProviderError> {
+        self.requests.lock().unwrap().push(request);
+        let response = {
+            let mut idx = self.response_index.lock().unwrap();
+            let response = self.responses.get(*idx).cloned().unwrap_or_default();
+            *idx += 1;
+            response
+        };
+        Ok(Box::pin(tokio_stream::iter(response)))
+    }
+
+    fn get_model(&self) -> ProviderModel {
+        ProviderModel {
+            id: "recording-model".to_string(),
+            info: ModelInfo {
+                name: Some("Recording Model".to_string()),
+                max_tokens: Some(4096),
+                context_window: Some(8192),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn name(&self) -> &str {
+        "recording"
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub struct TinyContextProvider;
+
+#[cfg(test)]
+impl Provider for TinyContextProvider {
+    async fn create_message(
+        &self,
+        _request: ProviderRequest,
+    ) -> Result<ApiStream, ProviderError> {
+        panic!("TinyContextProvider should not be called in truncation tests")
+    }
+
+    fn get_model(&self) -> ProviderModel {
+        ProviderModel {
+            id: "tiny-model".to_string(),
+            info: ModelInfo {
+                name: Some("Tiny Model".to_string()),
+                max_tokens: Some(128),
+                context_window: Some(256),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn name(&self) -> &str {
+        "tiny"
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub struct ErrorProvider;
+
+#[cfg(test)]
+impl Provider for ErrorProvider {
+    async fn create_message(
+        &self,
+        _request: ProviderRequest,
+    ) -> Result<ApiStream, ProviderError> {
+        Err(ProviderError::RateLimitError {
+            message: "forced error".to_string(),
+            retry_delay_ms: None,
+        })
+    }
+
+    fn get_model(&self) -> ProviderModel {
+        ProviderModel {
+            id: "error-model".to_string(),
+            info: ModelInfo {
+                name: Some("Error Model".to_string()),
+                max_tokens: Some(4096),
+                context_window: Some(8192),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn name(&self) -> &str {
+        "error"
     }
 }

@@ -13,6 +13,7 @@
 
 use crate::cli::output::OutputEvent;
 use crate::cli::tui::theme::{ERROR_FG, PROMPT_FG};
+use crate::providers::Providers;
 pub use crate::core::agent_types::{
     AgentConfig, AgentError, AgentMode, SnippedCodeBlock, TaskState, TurnResult,
 };
@@ -835,7 +836,7 @@ impl AgentLoop {
     }
 
     /// Get the underlying provider as a cloned Arc.
-    pub fn get_provider(&self) -> Arc<dyn Provider> {
+    pub fn get_provider(&self) -> Arc<Providers> {
         self.config.provider.lock().unwrap().clone()
     }
 
@@ -845,7 +846,7 @@ impl AgentLoop {
     }
 
     /// Set the active provider. Preserves conversation history.
-    pub fn set_provider(&mut self, new_provider: Arc<dyn Provider>) {
+    pub fn set_provider(&mut self, new_provider: Arc<Providers>) {
         *self.config.provider.lock().unwrap() = new_provider;
     }
 
@@ -4448,122 +4449,10 @@ mod tests {
     use super::*;
     use crate::core::tool_output::summarize_single_section;
     use crate::providers::{
-        ApiStream, ApiStreamTextChunk, ApiStreamToolCall, ApiStreamToolCallFunction,
-        ApiStreamToolCallsChunk, ModelInfo, ProviderError, ProviderModel,
+        ApiStreamTextChunk, ApiStreamToolCallFunction, ApiStreamToolCallsChunk,
     };
 
-    struct RecordingChunkProvider {
-        responses: Vec<Vec<ApiStreamChunk>>,
-        response_index: std::sync::Mutex<usize>,
-        requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
-    }
-
-    impl RecordingChunkProvider {
-        fn new(
-            responses: Vec<Vec<ApiStreamChunk>>,
-            requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
-        ) -> Self {
-            Self {
-                responses,
-                response_index: std::sync::Mutex::new(0),
-                requests,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for RecordingChunkProvider {
-        async fn create_message(
-            &self,
-            request: ProviderRequest,
-        ) -> Result<ApiStream, ProviderError> {
-            self.requests.lock().unwrap().push(request);
-            let response = {
-                let mut idx = self.response_index.lock().unwrap();
-                let response = self.responses.get(*idx).cloned().unwrap_or_default();
-                *idx += 1;
-                response
-            };
-            Ok(Box::pin(tokio_stream::iter(response)))
-        }
-
-        fn get_model(&self) -> crate::providers::ProviderModel {
-            crate::providers::ProviderModel {
-                id: "recording-model".to_string(),
-                info: crate::providers::ModelInfo {
-                    name: Some("Recording Model".to_string()),
-                    max_tokens: Some(4096),
-                    context_window: Some(8192),
-                    ..Default::default()
-                },
-            }
-        }
-
-        fn name(&self) -> &str {
-            "recording"
-        }
-    }
-
-    struct TinyContextProvider;
-
-    #[async_trait::async_trait]
-    impl Provider for TinyContextProvider {
-        async fn create_message(
-            &self,
-            _request: ProviderRequest,
-        ) -> Result<ApiStream, ProviderError> {
-            panic!("TinyContextProvider should not be called in truncation tests")
-        }
-
-        fn get_model(&self) -> ProviderModel {
-            ProviderModel {
-                id: "tiny-context".to_string(),
-                info: ModelInfo {
-                    name: Some("Tiny Context".to_string()),
-                    max_tokens: Some(1024),
-                    context_window: Some(1000),
-                    ..Default::default()
-                },
-            }
-        }
-
-        fn name(&self) -> &str {
-            "tiny-context"
-        }
-    }
-
-    struct ErrorProvider;
-
-    #[async_trait::async_trait]
-    impl Provider for ErrorProvider {
-        async fn create_message(
-            &self,
-            _request: ProviderRequest,
-        ) -> Result<ApiStream, ProviderError> {
-            Err(ProviderError::RateLimitError {
-                message: "rate limited".to_string(),
-                retry_delay_ms: None,
-            })
-        }
-
-        fn get_model(&self) -> ProviderModel {
-            ProviderModel {
-                id: "error-provider".to_string(),
-                info: ModelInfo {
-                    name: Some("Error Provider".to_string()),
-                    max_tokens: Some(4096),
-                    context_window: Some(8192),
-                    ..Default::default()
-                },
-            }
-        }
-
-        fn name(&self) -> &str {
-            "error-provider"
-        }
-    }
-
-    fn test_agent_config(provider: Arc<dyn Provider>, task_id: &str) -> AgentConfig {
+    fn test_agent_config(provider: Arc<Providers>, task_id: &str) -> AgentConfig {
         AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(provider)),
             mode: AgentMode::Act,
@@ -4705,10 +4594,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_failure_threshold_surfaces_recovery_message() {
-        let mut agent = AgentLoop::new(test_agent_config(
-            Arc::new(ErrorProvider),
-            "test-provider-failure-threshold",
-        ));
+        let provider = Arc::new(Providers::Error(crate::providers::ErrorProvider));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-provider-failure-threshold"));
         {
             let mut state = agent.state.lock().await;
             state.consecutive_provider_failures =
@@ -4734,10 +4621,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_failure_captures_retryable_failed_request() {
-        let mut agent = AgentLoop::new(test_agent_config(
-            Arc::new(ErrorProvider),
-            "test-provider-failure-captures-retry",
-        ));
+        let provider = Arc::new(Providers::Error(crate::providers::ErrorProvider));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-provider-failure-captures-retry"));
         let message = StorageMessage {
             id: None,
             role: MessageRole::User,
@@ -4787,7 +4672,7 @@ mod tests {
             "SENTINEL_NOT_CONSUMED\n".to_string(),
         ));
 
-        let provider = Arc::new(crate::providers::mock::MockProvider::new(all_responses));
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(all_responses)));
         let (tx, mut rx) = mpsc::channel(32);
         let mut config = test_agent_config(provider, "test-max-consecutive-mistakes");
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
@@ -4851,9 +4736,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_successful_turn_clears_stale_retryable_failed_request() {
-        let provider = Arc::new(crate::providers::mock::MockProvider::single_text_response(
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::single_text_response(
             "done",
-        ));
+        )));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-clear-stale-retry"));
         {
             let mut state = agent.state.lock().await;
@@ -4890,14 +4775,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_retryable_stream_error_before_output_retries_once() {
-        let provider = Arc::new(crate::providers::mock::MockProvider::new(vec![
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(vec![
             crate::providers::mock::MockResponse::Stream(vec![
                 crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
                     "OpenAI SSE stream error: error decoding response body (retryable)".to_string(),
                 )),
             ]),
             crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
-        ]));
+        ])));
         let (tx, mut rx) = mpsc::channel(32);
         let mut config = test_agent_config(provider, "test-stream-retry-before-output");
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
@@ -4928,7 +4813,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retryable_stream_error_after_output_does_not_retry() {
-        let provider = Arc::new(crate::providers::mock::MockProvider::new(vec![
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(vec![
             crate::providers::mock::MockResponse::Stream(vec![
                 crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Text(
                     ApiStreamTextChunk {
@@ -4942,7 +4827,7 @@ mod tests {
                 )),
             ]),
             crate::providers::mock::MockResponse::Text("should not be used\n".to_string()),
-        ]));
+        ])));
         let (tx, mut rx) = mpsc::channel(32);
         let mut config = test_agent_config(provider, "test-stream-retry-after-output");
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
@@ -5007,9 +4892,9 @@ mod tests {
             std::env::set_var("SNED_DATA_DIR", &data_dir);
         }
 
-        let provider = Arc::new(crate::providers::mock::MockProvider::single_text_response(
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::single_text_response(
             "should not run",
-        ));
+        )));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-run-pending-cancel"));
         {
             let mut state = agent.state.lock().await;
@@ -5043,8 +4928,8 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::single_text_response(&code),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::single_text_response(&code),
+            )))),
             mode: AgentMode::Act,
             task_id: "test-snipped-code".to_string(),
             enable_checkpoints: false,
@@ -5086,8 +4971,8 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::single_text_response(&code),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::single_text_response(&code),
+            )))),
             mode: AgentMode::Act,
             task_id: "test-one-shot-code".to_string(),
             enable_checkpoints: false,
@@ -5119,8 +5004,8 @@ mod tests {
     async fn test_one_shot_text_only_response_completes_without_tool_nudge() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::single_text_response("4"),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::single_text_response("4"),
+            )))),
             mode: AgentMode::Act,
             task_id: "test-one-shot-text-only".to_string(),
             enable_checkpoints: false,
@@ -5178,8 +5063,8 @@ mod tests {
     async fn test_later_text_only_response_gets_one_bounded_nudge() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::single_text_response_repeat("I checked it."),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::single_text_response_repeat("I checked it."),
+            )))),
             mode: AgentMode::Act,
             task_id: "test-text-only-nudge".to_string(),
             enable_checkpoints: false,
@@ -5316,7 +5201,7 @@ mod tests {
                 signature: None,
             })],
         ];
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-system-prompt-cache"))
             .with_system_prompt_context(SystemPromptContext {
                 cwd: Some("/tmp/cache-first".to_string()),
@@ -5409,7 +5294,8 @@ mod tests {
         use crate::core::context::context_window;
         use crate::providers::{MessageContent, MessageRole, ProviderRequest, StorageMessage};
 
-        let provider: Arc<dyn Provider> = Arc::new(TinyContextProvider);
+        let provider: Arc<Providers> =
+            Arc::new(Providers::TinyContext(crate::providers::TinyContextProvider));
         let agent = AgentLoop::new(test_agent_config(provider.clone(), "test-emergency-trunc"));
 
         {
@@ -5588,8 +5474,8 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: task_id.to_string(),
             enable_checkpoints: false,
@@ -5716,8 +5602,8 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: task_id.to_string(),
             enable_checkpoints: false,
@@ -5753,8 +5639,8 @@ mod tests {
         let task_storage_empty = TaskStorage::new("empty-task").unwrap();
         let agent_empty = AgentLoop::new(AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "empty-task".to_string(),
             enable_checkpoints: false,
@@ -5788,8 +5674,8 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5824,12 +5710,12 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::single_tool_call(
+                Providers::Mock(crate::providers::mock::MockProvider::single_tool_call(
                     "call_1",
                     "read_file",
                     serde_json::json!({"path": "/tmp/test_hook_file.txt"}),
                 ),
-            ))),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5930,8 +5816,8 @@ mod tests {
     async fn test_plan_mode_blocks_restricted_tools() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Plan,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -5972,8 +5858,8 @@ mod tests {
     async fn test_act_mode_allows_all_tools() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -6013,8 +5899,8 @@ mod tests {
     async fn test_plan_mode_disabled_allows_all_tools() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Plan,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -6056,12 +5942,12 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::single_tool_call(
+                Providers::Mock(crate::providers::mock::MockProvider::single_tool_call(
                     "call_1",
                     "read_file",
                     serde_json::json!({"path": "/tmp/test_approval_file.txt"}),
                 ),
-            ))),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -6133,12 +6019,12 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::single_tool_call(
+                Providers::Mock(crate::providers::mock::MockProvider::single_tool_call(
                     "call_1",
                     "execute_command",
                     serde_json::json!({"command": "echo hello"}),
                 ),
-            ))),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -6223,12 +6109,12 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::single_tool_call(
+                Providers::Mock(crate::providers::mock::MockProvider::single_tool_call(
                     "call_1",
                     "execute_command",
                     serde_json::json!({"commands": ["echo hello world"]}),
                 ),
-            ))),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -6293,8 +6179,8 @@ mod tests {
     async fn test_message_queue_enqueue_and_count() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -6332,8 +6218,8 @@ mod tests {
     async fn test_message_queue_clear() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -6370,8 +6256,8 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "test".to_string(),
             enable_checkpoints: false,
@@ -6500,7 +6386,7 @@ mod tests {
     async fn test_prepared_tool_call_parse_error_history_and_dispatch_result() {
         let raw_args = "{\"path\":\"unterminated".to_string();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(
             vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                 tool_call: ApiStreamToolCall {
                     call_id: Some("call_bad".to_string()),
@@ -6514,9 +6400,8 @@ mod tests {
                 id: None,
                 signature: None,
             })]],
-            requests,
-        ));
-
+             requests,
+        )));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-invalid-tool-call"));
         let result = agent.execute_turn().await;
         assert!(matches!(result, TurnResult::Continue));
@@ -6746,8 +6631,8 @@ mod tests {
     fn test_checkpoint_manager_wired() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "test-checkpoint-task".to_string(),
             enable_checkpoints: false,
@@ -6793,8 +6678,8 @@ mod tests {
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "test-mention-task".to_string(),
             enable_checkpoints: false,
@@ -6862,8 +6747,8 @@ mod tests {
     async fn test_ctrl_c_cancellation_wired() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::providers::mock::MockProvider::new(vec![]),
-            ))),
+                Providers::Mock(crate::providers::mock::MockProvider::new(vec![]),
+            )))),
             mode: AgentMode::Act,
             task_id: "test-cancel-task".to_string(),
             enable_checkpoints: false,
@@ -7467,7 +7352,7 @@ mod tests {
         ];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-cumulative-tokens"));
 
         // Execute turn 1
@@ -7581,7 +7466,7 @@ mod tests {
         ];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-context-fallback"));
 
         // Execute turn 1
@@ -7635,7 +7520,7 @@ mod tests {
         ];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(provider)),
@@ -7692,7 +7577,7 @@ mod tests {
         })]];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(provider)),
@@ -7760,7 +7645,7 @@ mod tests {
         })]];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(provider)),
@@ -7848,7 +7733,7 @@ mod tests {
         ];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(provider)),
@@ -7957,7 +7842,7 @@ mod tests {
         })]];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(provider)),
@@ -8030,7 +7915,7 @@ mod tests {
         })]];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(provider)),
@@ -8107,7 +7992,7 @@ mod tests {
         })]];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = Arc::new(RecordingChunkProvider::new(responses, requests.clone()));
+        let provider = Arc::new(Providers::RecordingChunk(crate::providers::RecordingChunkProvider::new(responses, requests.clone())));
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(provider)),
@@ -8619,8 +8504,8 @@ mod tests {
     #[tokio::test]
     async fn test_record_first_output_emit_time_atomic_fast_path() {
         use crate::providers::mock::{MockProvider, MockResponse};
-        let provider: Arc<dyn Provider> =
-            Arc::new(MockProvider::new(vec![MockResponse::Stream(vec![])]));
+        let provider: Arc<Providers> =
+            Arc::new(Providers::Mock(MockProvider::new(vec![MockResponse::Stream(vec![])])));
         let agent = AgentLoop::new(test_agent_config(provider, "test-atomic-fast-path"));
 
         // Set reasoning_active to true so the first call's
@@ -8670,8 +8555,8 @@ mod tests {
     #[tokio::test]
     async fn test_record_first_reasoning_chunk_time_atomic_fast_path() {
         use crate::providers::mock::{MockProvider, MockResponse};
-        let provider: Arc<dyn Provider> =
-            Arc::new(MockProvider::new(vec![MockResponse::Stream(vec![])]));
+        let provider: Arc<Providers> =
+            Arc::new(Providers::Mock(MockProvider::new(vec![MockResponse::Stream(vec![])])));
         let agent = AgentLoop::new(test_agent_config(provider, "test-reasoning-fast-path"));
 
         assert!(
