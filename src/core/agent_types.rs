@@ -3,7 +3,7 @@
 //! Extracted from agent_loop.rs to keep file sizes manageable.
 
 use crate::core::context::context_manager::ApiReqInfo;
-use crate::providers::Provider;
+use crate::providers::Providers;
 use crate::providers::StorageMessage;
 use lru::LruCache;
 use std::collections::HashSet;
@@ -237,17 +237,19 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             provider: Arc::new(Mutex::new(Arc::new(
-                crate::providers::openai::OpenAiProvider::new(
-                    crate::providers::openai::OpenAiConfig {
-                        api_key: String::new(),
-                        base_url: None,
-                        model_id: String::new(),
-                        model_info: None,
-                        reasoning_effort: None,
-                        custom_headers: None,
-                        provider_name: None, // Use default "OpenAI"
-                    }
-                ).expect("OpenAiProvider::new() should never fail with empty config; reqwest::Client build failure indicates system resource exhaustion")
+                crate::providers::Providers::OpenAi(
+                    crate::providers::openai::OpenAiProvider::new(
+                        crate::providers::openai::OpenAiConfig {
+                            api_key: String::new(),
+                            base_url: None,
+                            model_id: String::new(),
+                            model_info: None,
+                            reasoning_effort: None,
+                            custom_headers: None,
+                            provider_name: None, // Use default "OpenAI"
+                        }
+                    ).expect("OpenAiProvider::new() should never fail with empty config; reqwest::Client build failure indicates system resource exhaustion")
+                )
             ))),
             mode: AgentMode::Act,
             task_id: String::new(),
@@ -274,7 +276,7 @@ impl Default for AgentConfig {
 #[derive(Clone)]
 pub struct AgentConfig {
     /// The provider to use for API calls.
-    pub provider: Arc<Mutex<Arc<dyn Provider>>>,
+    pub provider: Arc<Mutex<Arc<Providers>>>,
     /// The mode (plan or act).
     pub mode: AgentMode,
     /// Task ID (also used as ULID for telemetry).

@@ -6,7 +6,7 @@
 use crate::cli::output::OutputEvent;
 use crate::core::agent_types::TaskState;
 use crate::core::context::context_window;
-use crate::providers::{ApiStream, Provider, ProviderError, ProviderRequest};
+use crate::providers::{ApiStream, Provider, ProviderError, ProviderRequest, Providers};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -87,7 +87,7 @@ fn env_var_nonzero_usize(name: &str, fallback: usize) -> usize {
 /// implementations so the agent loop can keep `TaskState` in sync with whether
 /// a retry actually occurred.
 pub async fn create_message_with_retry(
-    provider: Arc<dyn Provider>,
+    provider: Arc<Providers>,
     request: ProviderRequest,
     task_state: Arc<Mutex<TaskState>>,
     retry_config: RetryConfig,
@@ -241,12 +241,13 @@ fn exponential_backoff_delay(retry_attempt: usize, retry_config: RetryConfig) ->
 mod tests {
     use super::*;
     use crate::cli::output::{OutputEvent, OutputWriter};
-    use crate::providers::{ApiStreamChunk, ProviderModel};
-    use async_trait::async_trait;
+    use crate::providers::{
+        ApiStreamChunk, Providers, RetryTestProvider,
+    };
     use futures::StreamExt;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::AtomicUsize,
     };
     use std::sync::{LazyLock, Mutex as StdMutex};
 
@@ -296,52 +297,6 @@ mod tests {
                     std::env::remove_var(self.key);
                 }
             }
-        }
-    }
-
-    struct RetryTestProvider {
-        attempts: Arc<AtomicUsize>,
-        fail_until: usize,
-    }
-
-    #[async_trait]
-    impl Provider for RetryTestProvider {
-        async fn create_message(
-            &self,
-            _request: ProviderRequest,
-        ) -> Result<ApiStream, ProviderError> {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if attempt < self.fail_until {
-                return Err(ProviderError::RateLimitError {
-                    message: "rate limited".to_string(),
-                    retry_delay_ms: None,
-                });
-            }
-
-            Ok(Box::pin(tokio_stream::iter(vec![ApiStreamChunk::Usage(
-                crate::providers::ApiStreamUsageChunk {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_write_tokens: None,
-                    cache_read_tokens: None,
-                    reasoning_tokens: None,
-                    thoughts_token_count: None,
-                    total_cost: None,
-                    stop_reason: None,
-                    id: None,
-                },
-            )])))
-        }
-
-        fn get_model(&self) -> ProviderModel {
-            ProviderModel {
-                id: "test".to_string(),
-                info: Default::default(),
-            }
-        }
-
-        fn name(&self) -> &str {
-            "test"
         }
     }
 
@@ -490,10 +445,10 @@ mod tests {
 
     #[tokio::test]
     async fn retries_retryable_errors_and_sets_state_flag() {
-        let provider = Arc::new(RetryTestProvider {
+        let provider = Arc::new(Providers::RetryTest(RetryTestProvider {
             attempts: Arc::new(AtomicUsize::new(0)),
             fail_until: 2,
-        });
+        }));
         let state = Arc::new(Mutex::new(TaskState::default()));
         let request = ProviderRequest {
             system_prompt: "system".to_string(),
@@ -528,10 +483,10 @@ mod tests {
 
     #[tokio::test]
     async fn consecutive_failures_reset_on_success() {
-        let provider = Arc::new(RetryTestProvider {
+        let provider = Arc::new(Providers::RetryTest(RetryTestProvider {
             attempts: Arc::new(AtomicUsize::new(0)),
             fail_until: 1,
-        });
+        }));
         let state = Arc::new(Mutex::new(TaskState::default()));
         let request = ProviderRequest {
             system_prompt: "system".to_string(),
@@ -575,10 +530,10 @@ mod tests {
 
     #[tokio::test]
     async fn consecutive_failures_increment_on_retry_exhaustion() {
-        let provider = Arc::new(RetryTestProvider {
+        let provider = Arc::new(Providers::RetryTest(RetryTestProvider {
             attempts: Arc::new(AtomicUsize::new(0)),
             fail_until: usize::MAX,
-        });
+        }));
         let state = Arc::new(Mutex::new(TaskState::default()));
         let request = ProviderRequest {
             system_prompt: "system".to_string(),

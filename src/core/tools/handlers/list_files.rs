@@ -12,7 +12,8 @@ use crate::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
     resolve_sanitized_path,
 };
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use futures::future::join_all;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -446,16 +447,20 @@ impl ListFilesHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for ListFilesHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        self.execute_without_state(&ctx.workspace_root, params)
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            handler.execute_without_state(&ctx.workspace_root, params)
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

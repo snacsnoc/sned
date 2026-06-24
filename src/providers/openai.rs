@@ -9,7 +9,6 @@ use crate::providers::{
     ModelInfo, OpenAiCompatibleModelInfo, Provider, ProviderError, ProviderHttpError,
     ProviderModel, ProviderRequest,
 };
-use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -50,6 +49,7 @@ impl std::fmt::Debug for OpenAiConfig {
 }
 
 /// OpenAI-compatible provider (covers generic OpenAI, Azure, and custom base URL).
+#[derive(Debug)]
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     client: reqwest::Client,
@@ -934,7 +934,6 @@ pub async fn finish_openai_sse_to_chunks(
     }
 }
 
-#[async_trait]
 impl Provider for OpenAiProvider {
     async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url());

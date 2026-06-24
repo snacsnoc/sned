@@ -8,7 +8,8 @@ use crate::core::context::instructions::{
     SkillMetadata, SkillSource, discover_skills, get_available_skills,
 };
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
 /// List skills tool handler.
 #[derive(Debug, Clone, Default)]
@@ -67,49 +68,53 @@ impl ListSkillsHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for ListSkillsHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         _params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        // Discover skills outside the state lock to avoid holding lock across sync I/O
-        let workspace_root = ctx.workspace_root.as_path();
-        let skills = {
-            let state = ctx.state.lock().await;
-            if state.available_skills.is_empty() {
-                // Release lock before discovering skills
-                drop(state);
-                let project_skills = discover_skills(workspace_root);
-                get_available_skills(project_skills)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let _handler = self.clone();
+        let ctx = ctx.clone();
+        let _params = _params.clone();
+        Box::pin(async move {
+            // Discover skills outside the state lock to avoid holding lock across sync I/O
+            let workspace_root = ctx.workspace_root.as_path();
+            let skills = {
+                let state = ctx.state.lock().await;
+                if state.available_skills.is_empty() {
+                    // Release lock before discovering skills
+                    drop(state);
+                    let project_skills = discover_skills(workspace_root);
+                    get_available_skills(project_skills)
+                } else {
+                    state.available_skills.clone()
+                }
+            };
+
+            // Build response without holding any lock
+            let project_skills: Vec<&SkillMetadata> = skills
+                .iter()
+                .filter(|s| matches!(s.source, SkillSource::Project))
+                .collect();
+            let global_skills: Vec<&SkillMetadata> = skills
+                .iter()
+                .filter(|s| matches!(s.source, SkillSource::Global))
+                .collect();
+
+            let response = if skills.is_empty() {
+                "No skills are currently available.".to_string()
             } else {
-                state.available_skills.clone()
-            }
-        };
+                let mut response = "# AVAILABLE SKILLS\n\n".to_string();
+                for skill in project_skills.iter().chain(global_skills.iter()) {
+                    response.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+                }
+                response.push_str("\nUse the 'use_skill' tool to activate a skill.");
+                response
+            };
 
-        // Build response without holding any lock
-        let project_skills: Vec<&SkillMetadata> = skills
-            .iter()
-            .filter(|s| matches!(s.source, SkillSource::Project))
-            .collect();
-        let global_skills: Vec<&SkillMetadata> = skills
-            .iter()
-            .filter(|s| matches!(s.source, SkillSource::Global))
-            .collect();
-
-        let response = if skills.is_empty() {
-            "No skills are currently available.".to_string()
-        } else {
-            let mut response = "# AVAILABLE SKILLS\n\n".to_string();
-            for skill in project_skills.iter().chain(global_skills.iter()) {
-                response.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-            }
-            response.push_str("\nUse the 'use_skill' tool to activate a skill.");
-            response
-        };
-
-        Ok(serde_json::Value::String(response))
+            Ok(serde_json::Value::String(response))
+        })
     }
 
     fn description(&self, _params: &serde_json::Value) -> String {

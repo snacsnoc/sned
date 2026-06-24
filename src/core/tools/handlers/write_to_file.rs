@@ -6,8 +6,9 @@ use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
 };
-use async_trait::async_trait;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 #[derive(Debug, Clone, Default)]
 pub struct WriteToFileHandler;
@@ -154,96 +155,100 @@ impl WriteToFileHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for WriteToFileHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        let consecutive_mistakes = ctx.state.lock().await.consecutive_mistakes;
-        let path = params["path"].as_str().ok_or_else(|| {
-            ToolError::InvalidInput(error_guidance::missing_parameter(
-                "path",
-                consecutive_mistakes,
-            ))
-        })?;
-        let path = path.to_string();
-        let resolved_path = Self::resolve_path(ctx.workspace_root.as_path(), &path)?;
-        let mut resolved_params = params;
-        if let Some(obj) = resolved_params.as_object_mut() {
-            obj.insert(
-                "path".to_string(),
-                serde_json::Value::String(resolved_path.to_string_lossy().to_string()),
-            );
-        }
-
-        let content = resolved_params["content"]
-            .as_str()
-            .ok_or_else(|| {
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            let consecutive_mistakes = ctx.state.lock().await.consecutive_mistakes;
+            let path = params["path"].as_str().ok_or_else(|| {
                 ToolError::InvalidInput(error_guidance::missing_parameter(
-                    "content",
+                    "path",
                     consecutive_mistakes,
                 ))
-            })?
-            .to_string();
-        let lines_added = content.lines().count() as u32;
-
-        if content.is_empty() {
-            let mut state = ctx.state.lock().await;
-            state.consecutive_mistakes += 1;
-            tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
-                path = %path,
-                "write_to_file: empty content provided"
-            );
-            let message = Self::format_missing_content_error(&path, state.consecutive_mistakes);
-            return Err(ToolError::InvalidInput(message));
-        }
-
-        let result = self
-            .execute_with_workspace(resolved_params, ctx.workspace_root.as_path())
-            .await;
-        match result {
-            Ok(text) => {
-                let mut state = ctx.state.lock().await;
-                state.consecutive_mistakes = 0;
-                // Track newly created file to suppress "not read this session" warning on subsequent edits
-                state
-                    .file_context_tracker
-                    .track_file_context(
-                        &resolved_path.to_string_lossy(),
-                        crate::core::context::trackers::FileRecordSource::SnedEdited,
-                    )
-                    .await;
-                // Mark file as edited by Sned to suppress stale mtime detection
-                state
-                    .file_context_tracker
-                    .mark_file_as_edited_by_sned(&resolved_path);
-                // Record file change for session summary
-                let entry = state
-                    .session_file_changes
-                    .entry(resolved_path.to_string_lossy().to_string())
-                    .or_insert_with(|| crate::core::agent_types::FileChangeStats {
-                        lines_added: 0,
-                        lines_removed: 0,
-                        action: "created".to_string(),
-                    });
-                entry.lines_added = entry.lines_added.saturating_add(lines_added);
-                Ok(serde_json::Value::String(text))
+            })?;
+            let path = path.to_string();
+            let resolved_path = Self::resolve_path(ctx.workspace_root.as_path(), &path)?;
+            let mut resolved_params = params;
+            if let Some(obj) = resolved_params.as_object_mut() {
+                obj.insert(
+                    "path".to_string(),
+                    serde_json::Value::String(resolved_path.to_string_lossy().to_string()),
+                );
             }
-            Err(err) => {
+
+            let content = resolved_params["content"]
+                .as_str()
+                .ok_or_else(|| {
+                    ToolError::InvalidInput(error_guidance::missing_parameter(
+                        "content",
+                        consecutive_mistakes,
+                    ))
+                })?
+                .to_string();
+            let lines_added = content.lines().count() as u32;
+
+            if content.is_empty() {
                 let mut state = ctx.state.lock().await;
                 state.consecutive_mistakes += 1;
                 tracing::warn!(
                     consecutive_mistakes = state.consecutive_mistakes,
-                    path = %resolved_path.display(),
-                    error = %err,
-                    "write_to_file: write failed"
+                    path = %path,
+                    "write_to_file: empty content provided"
                 );
-                Err(err)
+                let message = Self::format_missing_content_error(&path, state.consecutive_mistakes);
+                return Err(ToolError::InvalidInput(message));
             }
-        }
+
+            let result = handler
+                .execute_with_workspace(resolved_params, ctx.workspace_root.as_path())
+                .await;
+            match result {
+                Ok(text) => {
+                    let mut state = ctx.state.lock().await;
+                    state.consecutive_mistakes = 0;
+                    // Track newly created file to suppress "not read this session" warning on subsequent edits
+                    state
+                        .file_context_tracker
+                        .track_file_context(
+                            &resolved_path.to_string_lossy(),
+                            crate::core::context::trackers::FileRecordSource::SnedEdited,
+                        )
+                        .await;
+                    // Mark file as edited by Sned to suppress stale mtime detection
+                    state
+                        .file_context_tracker
+                        .mark_file_as_edited_by_sned(&resolved_path);
+                    // Record file change for session summary
+                    let entry = state
+                        .session_file_changes
+                        .entry(resolved_path.to_string_lossy().to_string())
+                        .or_insert_with(|| crate::core::agent_types::FileChangeStats {
+                            lines_added: 0,
+                            lines_removed: 0,
+                            action: "created".to_string(),
+                        });
+                    entry.lines_added = entry.lines_added.saturating_add(lines_added);
+                    Ok(serde_json::Value::String(text))
+                }
+                Err(err) => {
+                    let mut state = ctx.state.lock().await;
+                    state.consecutive_mistakes += 1;
+                    tracing::warn!(
+                        consecutive_mistakes = state.consecutive_mistakes,
+                        path = %resolved_path.display(),
+                        error = %err,
+                        "write_to_file: write failed"
+                    );
+                    Err(err)
+                }
+            }
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

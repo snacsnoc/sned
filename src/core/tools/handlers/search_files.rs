@@ -3,7 +3,8 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use std::path::Path;
 
 use std::io;
@@ -296,16 +297,20 @@ async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyho
     })
 }
 
-#[async_trait]
 impl ToolHandler for SearchFilesHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        self.execute_without_state(&ctx.workspace_root, params)
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            handler.execute_without_state(&ctx.workspace_root, params)
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

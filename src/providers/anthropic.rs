@@ -7,7 +7,6 @@ use crate::providers::{
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, MessageRole,
     ModelInfo, Provider, ProviderError, ProviderHttpError, ProviderModel, ProviderRequest,
 };
-use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -40,6 +39,7 @@ impl std::fmt::Debug for AnthropicConfig {
 }
 
 /// Anthropic API provider.
+#[derive(Debug)]
 pub struct AnthropicProvider {
     config: AnthropicConfig,
     client: reqwest::Client,
@@ -571,7 +571,6 @@ enum AnthropicContentDelta {
     InputJsonDelta { partial_json: String },
 }
 
-#[async_trait]
 impl Provider for AnthropicProvider {
     async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         let url = format!("{}/messages", self.base_url());

@@ -31,6 +31,7 @@ impl std::fmt::Debug for DeepSeekConfig {
 }
 
 /// DeepSeek provider (OpenAI-compatible with custom base URL).
+#[derive(Debug)]
 pub struct DeepSeekProvider {
     inner: OpenAiProvider,
 }
@@ -52,7 +53,6 @@ impl DeepSeekProvider {
     }
 }
 
-#[async_trait::async_trait]
 impl Provider for DeepSeekProvider {
     fn name(&self) -> &str {
         "deepseek"

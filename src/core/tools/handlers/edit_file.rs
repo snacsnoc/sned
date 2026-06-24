@@ -21,10 +21,11 @@ use crate::core::tools::{
     ToolRequiredNextStep,
 };
 use crate::services::symbol_index::SymbolIndexService;
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::Mutex;
 
 /// Edit file tool handler.
@@ -1376,31 +1377,35 @@ impl EditFileHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for EditFileHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        let mut state = ctx.state.lock().await;
-        let result = self
-            .execute_with_workspace_root(
-                &mut state,
-                params,
-                ctx.workspace_root.as_path(),
-                &ctx.anchor_mgr,
-                Some(ctx.task_id.as_str()),
-                ctx.explicitly_approved,
-                ctx.json_output,
-                &ctx.output_writer,
-            )
-            .await;
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            let mut state = ctx.state.lock().await;
+            let result = handler
+                .execute_with_workspace_root(
+                    &mut state,
+                    params,
+                    ctx.workspace_root.as_path(),
+                    &ctx.anchor_mgr,
+                    Some(ctx.task_id.as_str()),
+                    ctx.explicitly_approved,
+                    ctx.json_output,
+                    &ctx.output_writer,
+                )
+                .await;
 
-        // Note: consecutive_mistakes tracking is handled centrally in agent_loop.rs.
-        // edit_file does not mutate the counter to avoid double-counting.
+            // Note: consecutive_mistakes tracking is handled centrally in agent_loop.rs.
+            // edit_file does not mutate the counter to avoid double-counting.
 
-        result.map(serde_json::Value::String)
+            result.map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

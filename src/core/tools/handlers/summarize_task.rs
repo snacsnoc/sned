@@ -5,8 +5,9 @@
 
 use crate::core::context::context_manager::{self, TruncationKeep};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
+use std::future::Future;
+use std::pin::Pin;
 use crate::providers::StorageMessage;
-use async_trait::async_trait;
 
 /// Summarize task tool handler.
 #[derive(Debug, Clone, Default)]
@@ -212,16 +213,19 @@ impl SummarizeTaskHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for SummarizeTaskHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        Self::execute(self, ctx, params)
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            SummarizeTaskHandler::execute(&SummarizeTaskHandler, &ctx, params)
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, _params: &serde_json::Value) -> String {

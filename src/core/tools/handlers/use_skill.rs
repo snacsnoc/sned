@@ -8,7 +8,8 @@ use crate::core::context::instructions::{
     SkillMetadata, discover_skills, get_available_skills, get_skill_content, list_supporting_files,
 };
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use std::path::Path;
 
 /// Use skill tool handler.
@@ -222,30 +223,34 @@ impl UseSkillHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for UseSkillHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        // Discover skills outside the state lock to avoid holding lock across sync I/O
-        let workspace_root = ctx.workspace_root.as_path();
-        let skills_to_use = {
-            let state = ctx.state.lock().await;
-            if state.available_skills.is_empty() {
-                // Release lock before discovering skills
-                drop(state);
-                Self::discover_available_skills(workspace_root)
-            } else {
-                state.available_skills.clone()
-            }
-        };
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            // Discover skills outside the state lock to avoid holding lock across sync I/O
+            let workspace_root = ctx.workspace_root.as_path();
+            let skills_to_use = {
+                let state = ctx.state.lock().await;
+                if state.available_skills.is_empty() {
+                    // Release lock before discovering skills
+                    drop(state);
+                    Self::discover_available_skills(workspace_root)
+                } else {
+                    state.available_skills.clone()
+                }
+            };
 
-        // Re-acquire lock only for state mutation
-        let mut state = ctx.state.lock().await;
-        let result = self.execute_with_skills(&mut state, params, workspace_root, skills_to_use)?;
-        Ok(serde_json::Value::String(result))
+            // Re-acquire lock only for state mutation
+            let mut state = ctx.state.lock().await;
+            let result = handler.execute_with_skills(&mut state, params, workspace_root, skills_to_use)?;
+            Ok(serde_json::Value::String(result))
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

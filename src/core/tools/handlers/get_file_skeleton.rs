@@ -1,4 +1,6 @@
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use std::future::Future;
+use std::pin::Pin;
 use crate::services::tree_sitter::get_file_skeleton;
 use crate::services::tree_sitter::load_required_language_parsers;
 use futures::future::join_all;
@@ -80,16 +82,20 @@ impl GetFileSkeletonHandler {
     }
 }
 
-#[async_trait::async_trait]
 impl ToolHandler for GetFileSkeletonHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        Self::run(self, ctx, params)
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self;
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            Self::run(handler, &ctx, params)
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

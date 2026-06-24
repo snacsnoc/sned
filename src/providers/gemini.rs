@@ -15,7 +15,6 @@ use crate::providers::{
     Provider, ProviderError, ProviderHttpError, ProviderModel, ProviderRequest, SseLineBuffer,
     ThinkingConfig, gemini_format,
 };
-use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -84,6 +83,7 @@ fn map_reasoning_effort_to_thinking_level(effort: &str) -> GeminiThinkingLevel {
 }
 
 /// Gemini provider.
+#[derive(Debug)]
 pub struct GeminiProvider {
     config: GeminiConfig,
     client: reqwest::Client,
@@ -708,7 +708,6 @@ async fn finish_gemini_sse_to_chunks(
     }
 }
 
-#[async_trait]
 impl Provider for GeminiProvider {
     async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         let url = self.stream_url();

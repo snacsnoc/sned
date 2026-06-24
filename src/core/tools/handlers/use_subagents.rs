@@ -6,7 +6,8 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -673,35 +674,39 @@ impl UseSubagentsHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for UseSubagentsHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        if !ctx.explicitly_approved {
-            let mut state = ctx.state.lock().await;
-            state.consecutive_mistakes += 1;
-            tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
-                "use_subagents: requires explicit user approval"
-            );
-            return Err(ToolError::ExecutionFailed(
-                "Subagent execution requires explicit user approval. Please approve the request."
-                    .to_string(),
-            ));
-        }
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            if !ctx.explicitly_approved {
+                let mut state = ctx.state.lock().await;
+                state.consecutive_mistakes += 1;
+                tracing::warn!(
+                    consecutive_mistakes = state.consecutive_mistakes,
+                    "use_subagents: requires explicit user approval"
+                );
+                return Err(ToolError::ExecutionFailed(
+                    "Subagent execution requires explicit user approval. Please approve the request."
+                        .to_string(),
+                ));
+            }
 
-        self.execute_with_workspace_root(
-            ctx.state.clone(),
-            params,
-            ctx.workspace_root.as_path(),
-            ctx.json_output,
-            &ctx.output_writer,
-        )
-        .await
-        .map(serde_json::Value::String)
+            handler.execute_with_workspace_root(
+                ctx.state.clone(),
+                params,
+                ctx.workspace_root.as_path(),
+                ctx.json_output,
+                &ctx.output_writer,
+            )
+            .await
+            .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

@@ -704,7 +704,7 @@ fn build_symbol_index_service(
 
 pub(crate) fn create_provider(
     task_opts: &TaskOptions,
-) -> anyhow::Result<Arc<dyn crate::providers::Provider>> {
+) -> anyhow::Result<Arc<crate::providers::Providers>> {
     use crate::providers::env_auth::get_provider_from_env;
 
     // Determine provider: --provider flag > auto-detection from env > custom base_url (with api_key from flag/env) > error
@@ -761,7 +761,7 @@ pub(crate) fn create_provider(
         });
     let user_agent = task_opts.user_agent.clone();
 
-    let provider: Arc<dyn crate::providers::Provider> = match provider_name {
+    let provider: Arc<crate::providers::Providers> = match provider_name {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .ok()
@@ -778,15 +778,17 @@ pub(crate) fn create_provider(
                 .or_else(|| state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string());
             let base_url = state.anthropic_base_url.filter(|u| !u.is_empty());
-            Arc::new(crate::providers::anthropic::AnthropicProvider::new(
-                crate::providers::anthropic::AnthropicConfig {
-                    api_key,
-                    base_url,
-                    model_id: default_model,
-                    model_info: Some(crate::providers::ModelInfo::default()),
-                    thinking_budget_tokens: thinking_budget,
-                },
-            )?)
+            Arc::new(crate::providers::Providers::Anthropic(
+                crate::providers::anthropic::AnthropicProvider::new(
+                    crate::providers::anthropic::AnthropicConfig {
+                        api_key,
+                        base_url,
+                        model_id: default_model,
+                        model_info: Some(crate::providers::ModelInfo::default()),
+                        thinking_budget_tokens: thinking_budget,
+                    },
+                )?,
+            ))
         }
         "minimax" => {
             // Use stored model ID default if not specified
@@ -805,15 +807,17 @@ pub(crate) fn create_provider(
             let api_key = std::env::var("MINIMAX_CN_API_KEY")
                 .or_else(|_| std::env::var("MINIMAX_API_KEY"))
                 .unwrap_or_default();
-            Arc::new(crate::providers::minimax::MinimaxProvider::new(
-                crate::providers::minimax::MinimaxConfig {
-                    api_key,
-                    api_line,
-                    model_id: default_model,
-                    model_info: None,
-                    thinking_budget_tokens: thinking_budget,
-                },
-            )?)
+            Arc::new(crate::providers::Providers::Minimax(
+                crate::providers::minimax::MinimaxProvider::new(
+                    crate::providers::minimax::MinimaxConfig {
+                        api_key,
+                        api_line,
+                        model_id: default_model,
+                        model_info: None,
+                        thinking_budget_tokens: thinking_budget,
+                    },
+                )?,
+            ))
         }
         "openai" | "openai-native" => {
             let api_key = task_opts
@@ -838,21 +842,23 @@ pub(crate) fn create_provider(
                     state.act_mode_api_model_id
                 })
                 .unwrap_or_else(|| "gpt-4o".to_string());
-            Arc::new(crate::providers::openai::OpenAiProvider::new(
-                crate::providers::openai::OpenAiConfig {
-                    model_id: default_model,
-                    api_key,
-                    base_url,
-                    model_info: None,
-                    reasoning_effort: task_opts.reasoning_effort.clone(),
-                    custom_headers: user_agent.map(|ua| {
-                        let mut headers = std::collections::HashMap::with_capacity(1);
-                        headers.insert("User-Agent".to_string(), ua);
-                        headers
-                    }),
-                    provider_name: None, // Use default "OpenAI"
-                },
-            )?)
+            Arc::new(crate::providers::Providers::OpenAi(
+                crate::providers::openai::OpenAiProvider::new(
+                    crate::providers::openai::OpenAiConfig {
+                        model_id: default_model,
+                        api_key,
+                        base_url,
+                        model_info: None,
+                        reasoning_effort: task_opts.reasoning_effort.clone(),
+                        custom_headers: user_agent.map(|ua| {
+                            let mut headers = std::collections::HashMap::with_capacity(1);
+                            headers.insert("User-Agent".to_string(), ua);
+                            headers
+                        }),
+                        provider_name: None, // Use default "OpenAI"
+                    },
+                )?,
+            ))
         }
         "gemini" => {
             let api_key = task_opts
@@ -871,17 +877,19 @@ pub(crate) fn create_provider(
                     state.act_mode_api_model_id
                 })
                 .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
-            Arc::new(crate::providers::gemini::GeminiProvider::new(
-                crate::providers::gemini::GeminiConfig {
-                    model_id: default_model,
-                    api_key,
-                    base_url,
-                    model_info: None,
-                    thinking_budget_tokens: thinking_budget,
-                    reasoning_effort: task_opts.reasoning_effort.clone(),
-                    search_enabled: false,
-                },
-            )?)
+            Arc::new(crate::providers::Providers::Gemini(
+                crate::providers::gemini::GeminiProvider::new(
+                    crate::providers::gemini::GeminiConfig {
+                        model_id: default_model,
+                        api_key,
+                        base_url,
+                        model_info: None,
+                        thinking_budget_tokens: thinking_budget,
+                        reasoning_effort: task_opts.reasoning_effort.clone(),
+                        search_enabled: false,
+                    },
+                )?,
+            ))
         }
         "deepseek" => {
             let api_key = task_opts
@@ -891,15 +899,17 @@ pub(crate) fn create_provider(
                 .unwrap_or_default();
             let model_id_str = model_id
                 .unwrap_or_else(|| "deepseek-chat".to_string());
-            Arc::new(crate::providers::deepseek::DeepSeekProvider::new(
-                crate::providers::deepseek::DeepSeekConfig {
-                    api_key,
-                    model_id: model_id_str.clone(),
-                    model_info: Some(crate::providers::deepseek::get_deepseek_model_info(
-                        &model_id_str,
-                    )),
-                },
-            )?)
+            Arc::new(crate::providers::Providers::DeepSeek(
+                crate::providers::deepseek::DeepSeekProvider::new(
+                    crate::providers::deepseek::DeepSeekConfig {
+                        api_key,
+                        model_id: model_id_str.clone(),
+                        model_info: Some(crate::providers::deepseek::get_deepseek_model_info(
+                            &model_id_str,
+                        )),
+                    },
+                )?,
+            ))
         }
         "openrouter" => {
             let api_key = task_opts
@@ -909,29 +919,35 @@ pub(crate) fn create_provider(
                 .unwrap_or_default();
             let model_id_str = model_id
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4.5".to_string());
-            Arc::new(crate::providers::openrouter::OpenRouterProvider::new(
-                crate::providers::openrouter::OpenRouterConfig {
-                    api_key,
-                    model_id: model_id_str.clone(),
-                    model_info: Some(crate::providers::openrouter::get_openrouter_model_info(
-                        &model_id_str,
-                    )),
-                    provider_sort: None,
-                    provider_name: None, // Use default "openrouter"
-                },
-            )?)
+            Arc::new(crate::providers::Providers::OpenRouter(
+                crate::providers::openrouter::OpenRouterProvider::new(
+                    crate::providers::openrouter::OpenRouterConfig {
+                        api_key,
+                        model_id: model_id_str.clone(),
+                        model_info: Some(crate::providers::openrouter::get_openrouter_model_info(
+                            &model_id_str,
+                        )),
+                        provider_sort: None,
+                        provider_name: None, // Use default "openrouter"
+                    },
+                )?,
+            ))
         }
         "mock" => {
             if std::env::var_os("SNED_MOCK_APPROVAL_SCROLL").is_some() {
-                Arc::new(crate::providers::mock::MockProvider::approval_scroll_scenario())
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::approval_scroll_scenario(),
+                ))
             } else if std::env::var_os("SNED_MOCK_BUSY_STREAM").is_some() {
-                Arc::new(crate::providers::mock::MockProvider::busy_stream_scenario())
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::busy_stream_scenario(),
+                ))
             } else {
-                Arc::new(
+                Arc::new(crate::providers::Providers::Mock(
                     crate::providers::mock::MockProvider::single_text_response_repeat(
                         "Mock provider response - task completed successfully",
                     ),
-                )
+                ))
             }
         }
         _ => {
@@ -1471,6 +1487,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::sync::Mutex;
+    use crate::providers::Provider;
     static PROVIDER_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]

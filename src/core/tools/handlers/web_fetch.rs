@@ -5,7 +5,8 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use futures::StreamExt;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use url::Url;
@@ -408,18 +409,19 @@ impl WebFetchHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for WebFetchHandler {
-    async fn execute(
+    fn execute(
         &self,
         _ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        // Don't acquire state lock - web_fetch doesn't use state and holding the lock
-        // across HTTP requests blocks Ctrl+C cancellation handler
-        Self::execute(self, &mut TaskState::default(), params)
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        Box::pin(async move {
+            // Don't acquire state lock - web_fetch doesn't use state and holding the lock
+            // across HTTP requests blocks Ctrl+C cancellation handler
+            Self::execute(self, &mut TaskState::default(), params)
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

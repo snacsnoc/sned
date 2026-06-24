@@ -38,6 +38,7 @@ impl std::fmt::Debug for OpenRouterConfig {
 }
 
 /// OpenRouter provider (OpenAI-compatible with custom headers and base URL).
+#[derive(Debug)]
 pub struct OpenRouterProvider {
     inner: OpenAiProvider,
 }
@@ -72,7 +73,6 @@ impl OpenRouterProvider {
     }
 }
 
-#[async_trait::async_trait]
 impl Provider for OpenRouterProvider {
     fn name(&self) -> &str {
         "openrouter"

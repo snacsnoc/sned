@@ -26,7 +26,6 @@ use crate::providers::{
     MessageContent, MessageRole, ModelInfo, Provider, ProviderError, ProviderHttpError,
     ProviderModel, ProviderRequest, StorageMessage, UserContentBlock,
 };
-use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -60,6 +59,7 @@ impl std::fmt::Debug for MinimaxConfig {
 }
 
 /// MiniMax API provider.
+#[derive(Debug)]
 pub struct MinimaxProvider {
     config: MinimaxConfig,
     client: reqwest::Client,
@@ -1263,7 +1263,6 @@ async fn process_minimax_sse_line(
     }
 }
 
-#[async_trait]
 impl Provider for MinimaxProvider {
     async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url());

@@ -2,6 +2,8 @@ use crate::core::agent_loop::TaskState;
 use crate::core::hash_utils::strip_hashes;
 use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use std::future::Future;
+use std::pin::Pin;
 use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::{SymbolRange, get_symbol_range, load_required_language_parsers};
 use std::collections::BTreeMap;
@@ -196,17 +198,21 @@ impl ReplaceSymbolHandler {
     }
 }
 
-#[async_trait::async_trait]
 impl ToolHandler for ReplaceSymbolHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        let mut state = ctx.state.lock().await;
-        self.execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self;
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            let mut state = ctx.state.lock().await;
+            handler.execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

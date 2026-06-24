@@ -8,7 +8,8 @@
 //! - Skip PlanState creation when needs_more_exploration is true
 
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Plan mode respond tool handler.
 #[derive(Debug, Clone, Default)]
@@ -100,16 +101,19 @@ impl PlanModeRespondHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for PlanModeRespondHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        Self::execute(self, ctx, params)
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            PlanModeRespondHandler::execute(&PlanModeRespondHandler, &ctx, params)
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, _params: &serde_json::Value) -> String {

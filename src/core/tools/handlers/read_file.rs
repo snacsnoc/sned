@@ -13,7 +13,8 @@ use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use futures::StreamExt;
 use tokio::io::AsyncBufReadExt;
 
@@ -658,39 +659,43 @@ impl ReadFileHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for ReadFileHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        let (paths, start_line, end_line) = Self::parse_params(&params)?;
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            let (paths, start_line, end_line) = Self::parse_params(&params)?;
 
-        let sanitized: Result<Vec<String>, ToolError> = paths
-            .iter()
-            .map(|p| {
-                crate::core::tools::resolve_sanitized_path(&ctx.workspace_root, p)
-                    .map(|pb| pb.to_string_lossy().to_string())
-            })
-            .collect();
-        let paths = sanitized?;
+            let sanitized: Result<Vec<String>, ToolError> = paths
+                .iter()
+                .map(|p| {
+                    crate::core::tools::resolve_sanitized_path(&ctx.workspace_root, p)
+                        .map(|pb| pb.to_string_lossy().to_string())
+                })
+                .collect();
+            let paths = sanitized?;
 
-        let results = self
-            .read_files(
-                paths.clone(),
-                start_line,
-                end_line,
-                &ctx.anchor_mgr,
-                Some(ctx.task_id.as_str()),
-                Some(&ctx.output_writer),
-            )
-            .await;
-        {
-            let mut state = ctx.state.lock().await;
-            Self::track_read_files(&mut state, &paths, &results);
-        }
-        Ok(serde_json::Value::String(Self::format_results(results)))
+            let results = handler
+                .read_files(
+                    paths.clone(),
+                    start_line,
+                    end_line,
+                    &ctx.anchor_mgr,
+                    Some(ctx.task_id.as_str()),
+                    Some(&ctx.output_writer),
+                )
+                .await;
+            {
+                let mut state = ctx.state.lock().await;
+                Self::track_read_files(&mut state, &paths, &results);
+            }
+            Ok(serde_json::Value::String(Self::format_results(results)))
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

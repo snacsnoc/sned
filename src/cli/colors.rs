@@ -189,23 +189,6 @@ pub fn print_raw(text: &str) {
     let _ = handle.flush();
 }
 
-/// Format a tool call header with icon and color.
-/// Includes 2-space indent for consistent visual hierarchy.
-pub fn tool_call_header(tool_name: &str) -> String {
-    if stderr_colors_disabled() {
-        format!("  ▶ {}", tool_name)
-    } else {
-        format!(
-            "  {}▶{} {}{}{}",
-            style::MAGENTA,
-            style::RESET,
-            style::BOLD,
-            tool_name,
-            style::RESET
-        )
-    }
-}
-
 /// Format a tool result success indicator.
 pub fn tool_success(tool_name: &str) -> String {
     if stdout_colors_disabled() {
@@ -290,29 +273,6 @@ pub fn file_path(path: &str) -> String {
     }
 }
 
-/// Format a line number for display.
-pub fn line_number(line: usize) -> String {
-    if stdout_colors_disabled() {
-        format!("L{}", line)
-    } else {
-        format!("{}L{}{}", style::DIM, line, style::RESET)
-    }
-}
-
-/// Print a horizontal rule separator to stderr.
-/// Uses stderr to avoid cursor races with TUI stdout rendering during agent execution.
-pub fn print_horizontal_rule() {
-    if stderr_colors_disabled() {
-        eprintln!("────────────────────────────────────────");
-    } else {
-        eprintln!(
-            "{}────────────────────────────────────────{}",
-            style::DIM,
-            style::RESET
-        );
-    }
-}
-
 /// Print a horizontal rule via the output writer.
 pub fn print_horizontal_rule_writer(writer: &crate::cli::output::OutputWriterArc) {
     use crate::cli::output::OutputEvent;
@@ -364,23 +324,6 @@ pub fn spinner_frame(index: usize) -> char {
     SPINNER_FRAMES[index % SPINNER_FRAMES.len()]
 }
 
-/// Format a spinner with message for progress indication.
-pub fn spinner_with_message(message: &str, frame: usize) -> String {
-    let spinner = spinner_frame(frame);
-    if stdout_colors_disabled() {
-        format!("{} {}", spinner, message)
-    } else {
-        format!(
-            "{}{}{} {}{}",
-            style::CYAN,
-            spinner,
-            style::RESET,
-            message,
-            style::RESET
-        )
-    }
-}
-
 /// Format a wait/loading message.
 pub fn waiting(message: &str) -> String {
     if stdout_colors_disabled() {
@@ -394,32 +337,6 @@ pub fn waiting(message: &str) -> String {
             style::DIM
         )
     }
-}
-
-/// Format a simple progress bar.
-pub fn progress_bar(current: usize, total: usize, width: usize) -> String {
-    let percent = current
-        .checked_mul(100)
-        .and_then(|v| v.checked_div(total))
-        .unwrap_or(0);
-    let filled = (width * percent) / 100;
-    let empty = width - filled;
-
-    let bar = if stdout_colors_disabled() {
-        format!("[{}{}]", "=".repeat(filled), " ".repeat(empty))
-    } else {
-        format!(
-            "{}[{}{}{}{}]{}",
-            style::DIM,
-            style::GREEN,
-            "=".repeat(filled),
-            style::DIM,
-            " ".repeat(empty),
-            style::RESET
-        )
-    };
-
-    format!("{} {:3}%", bar, percent)
 }
 
 /// Wrap a file path in OSC 8 hyperlink escape sequence.

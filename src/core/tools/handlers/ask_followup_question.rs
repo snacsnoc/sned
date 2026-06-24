@@ -4,7 +4,8 @@
 //! fighting the interactive input loop for stdin.
 
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Ask followup question tool handler.
 #[derive(Debug, Clone, Default)]
@@ -89,18 +90,21 @@ impl AskFollowupQuestionHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for AskFollowupQuestionHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        // Don't acquire state lock - ask_followup_question doesn't use state
-        // and holding the lock across user input delays Ctrl+C cancellation
-        Self::execute(self, ctx, params)
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            // Don't acquire state lock - ask_followup_question doesn't use state
+            // and holding the lock across user input delays Ctrl+C cancellation
+            AskFollowupQuestionHandler::execute(&AskFollowupQuestionHandler, &ctx, params)
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

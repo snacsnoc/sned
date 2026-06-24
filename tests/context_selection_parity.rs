@@ -482,43 +482,13 @@ fn new_context_mechanical_truncation_quarter_when_large() {
 // Context window info parity
 // ============================================================================
 
-use async_trait::async_trait;
 use sned::core::context::get_context_window_info;
-use sned::providers::{ModelInfo, Provider, ProviderError, ProviderModel, ProviderRequest};
-
-struct MockProvider {
-    context_window: Option<u64>,
-}
-
-#[async_trait]
-impl Provider for MockProvider {
-    fn name(&self) -> &str {
-        "test-provider"
-    }
-
-    async fn create_message(
-        &self,
-        _request: ProviderRequest,
-    ) -> Result<sned::providers::ApiStream, ProviderError> {
-        panic!("MockProvider::create_message should not be called in this test")
-    }
-
-    fn get_model(&self) -> ProviderModel {
-        ProviderModel {
-            id: "test-model".to_string(),
-            info: ModelInfo {
-                context_window: self.context_window,
-                ..Default::default()
-            },
-        }
-    }
-}
+use sned::providers::{mock::MockResponse, MockProvider, Providers};
 
 #[test]
 fn context_window_default_256k() {
-    let provider = MockProvider {
-        context_window: None,
-    };
+    let provider = MockProvider::new(vec![MockResponse::Text("test".to_string())]);
+    let provider = Providers::Mock(provider);
     let info = get_context_window_info(&provider);
     assert_eq!(info.context_window, 256_000);
     let expected = f64::max(256_000.0 - 40_000.0, 256_000.0 * 0.8) as u64;
@@ -527,9 +497,11 @@ fn context_window_default_256k() {
 
 #[test]
 fn context_window_large_respects_hard_limit() {
-    let provider = MockProvider {
-        context_window: Some(2_000_000),
-    };
+    let provider = MockProvider::new_with_context_window(
+        vec![MockResponse::Text("test".to_string())],
+        2_000_000,
+    );
+    let provider = Providers::Mock(provider);
     let info = get_context_window_info(&provider);
     assert_eq!(info.context_window, 2_000_000);
     assert_eq!(info.max_allowed_size, 1_000_000);
@@ -537,9 +509,11 @@ fn context_window_large_respects_hard_limit() {
 
 #[test]
 fn context_window_small_uses_80_percent() {
-    let provider = MockProvider {
-        context_window: Some(64_000),
-    };
+    let provider = MockProvider::new_with_context_window(
+        vec![MockResponse::Text("test".to_string())],
+        64_000,
+    );
+    let provider = Providers::Mock(provider);
     let info = get_context_window_info(&provider);
     assert_eq!(info.context_window, 64_000);
     let expected = f64::max(64_000.0 - 40_000.0, 64_000.0 * 0.8) as u64;

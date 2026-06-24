@@ -1,7 +1,7 @@
 //! Context window utilities.
 //!
 
-use crate::providers::{Provider, ProviderRequest};
+use crate::providers::{Provider, Providers, ProviderRequest};
 
 const HARD_LIMIT: u64 = 1_000_000;
 
@@ -110,7 +110,7 @@ pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
 /// Returns Ok(()) if valid, or Err with a descriptive message if it exceeds limits.
 pub fn validate_context_window(
     request: &ProviderRequest,
-    provider: &dyn Provider,
+    provider: &Providers,
 ) -> Result<(), String> {
     let model_info = provider.get_model().info;
     let context_window = model_info.context_window.unwrap_or(256_000);
@@ -140,7 +140,7 @@ pub struct ContextWindowInfo {
 /// Gets context window information for the given provider.
 ///
 /// Calculates the max allowed size as `min(HARD_LIMIT, max(context_window - 40_000, context_window * 0.8))`.
-pub fn get_context_window_info(provider: &dyn Provider) -> ContextWindowInfo {
+pub fn get_context_window_info(provider: &Providers) -> ContextWindowInfo {
     let context_window = provider.get_model().info.context_window.unwrap_or(256_000);
 
     let max_allowed_size = (HARD_LIMIT as f64)
@@ -184,42 +184,23 @@ pub fn calculate_context_usage_percentage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{ModelInfo, ProviderError, ProviderModel};
-    use async_trait::async_trait;
+    use crate::providers::mock::{MockProvider, MockResponse};
 
-    struct MockProvider {
-        context_window: Option<u64>,
-    }
-
-    #[async_trait]
-    impl Provider for MockProvider {
-        async fn create_message(
-            &self,
-            _request: crate::providers::ProviderRequest,
-        ) -> Result<crate::providers::ApiStream, ProviderError> {
-            panic!("MockProvider::create_message should not be called in this test")
-        }
-
-        fn get_model(&self) -> ProviderModel {
-            ProviderModel {
-                id: "test-model".to_string(),
-                info: ModelInfo {
-                    context_window: self.context_window,
-                    ..Default::default()
-                },
-            }
-        }
-
-        fn name(&self) -> &str {
-            "mock"
-        }
+    fn make_mock_provider(context_window: Option<u64>) -> crate::providers::Providers {
+        let mock = if let Some(cw) = context_window {
+            MockProvider::new_with_context_window(
+                vec![MockResponse::Text("test".to_string())],
+                cw,
+            )
+        } else {
+            MockProvider::new(vec![MockResponse::Text("test".to_string())])
+        };
+        crate::providers::Providers::Mock(mock)
     }
 
     #[test]
     fn test_default_context_window() {
-        let provider = MockProvider {
-            context_window: None,
-        };
+        let provider = make_mock_provider(None);
         let info = get_context_window_info(&provider);
         assert_eq!(info.context_window, 256_000);
         let expected = f64::max(256_000.0 - 40_000.0, 256_000.0 * 0.8) as u64;
@@ -228,9 +209,7 @@ mod tests {
 
     #[test]
     fn test_large_context_window() {
-        let provider = MockProvider {
-            context_window: Some(2_000_000),
-        };
+        let provider = make_mock_provider(Some(2_000_000));
         let info = get_context_window_info(&provider);
         assert_eq!(info.context_window, 2_000_000);
         assert_eq!(info.max_allowed_size, HARD_LIMIT);
@@ -238,9 +217,7 @@ mod tests {
 
     #[test]
     fn test_small_context_window() {
-        let provider = MockProvider {
-            context_window: Some(64_000),
-        };
+        let provider = make_mock_provider(Some(64_000));
         let info = get_context_window_info(&provider);
         assert_eq!(info.context_window, 64_000);
         let expected = f64::max(64_000.0 - 40_000.0, 64_000.0 * 0.8) as u64;

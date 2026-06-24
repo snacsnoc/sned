@@ -6,7 +6,8 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -636,17 +637,21 @@ impl DiagnosticsScanHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for DiagnosticsScanHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        let mut state = ctx.state.lock().await;
-        Self::execute(self, &mut state, &ctx.workspace_root, params)
-            .await
-            .map(serde_json::Value::String)
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            let mut state = ctx.state.lock().await;
+            Self::execute(&handler, &mut state, &ctx.workspace_root, params)
+                .await
+                .map(serde_json::Value::String)
+        })
     }
 
     fn description(&self, params: &serde_json::Value) -> String {

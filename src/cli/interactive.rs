@@ -8,6 +8,7 @@ use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::{ApprovalResult, is_approval_prompt_active, take_approval_sender};
+use crate::providers::Provider;
 use futures::FutureExt;
 use ratatui::crossterm::event::{
     EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,

@@ -8,7 +8,8 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Attempt completion tool handler.
 #[derive(Debug, Clone, Default)]
@@ -54,34 +55,38 @@ impl AttemptCompletionHandler {
     }
 }
 
-#[async_trait]
 impl ToolHandler for AttemptCompletionHandler {
-    async fn execute(
+    fn execute(
         &self,
         ctx: &ToolContext,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        let mut state = ctx.state.lock().await;
-        let result = Self::execute(self, &mut state, params)?;
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        let handler = self.clone();
+        let ctx = ctx.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            let mut state = ctx.state.lock().await;
+            let result = Self::execute(&handler, &mut state, params)?;
 
-        if ctx.json_output {
-            tracing::info!(
-                target: "json_output",
-                "{}",
-                serde_json::json!({
-                    "type": "completion",
-                    "result": result
-                })
-                .to_string()
-            );
-        } else {
-            use crate::cli::output::OutputEvent;
-            let completion_text = result.clone();
-            ctx.output_writer
-                .emit(OutputEvent::Completion(completion_text));
-        }
+            if ctx.json_output {
+                tracing::info!(
+                    target: "json_output",
+                    "{}",
+                    serde_json::json!({
+                        "type": "completion",
+                        "result": result
+                    })
+                    .to_string()
+                );
+            } else {
+                use crate::cli::output::OutputEvent;
+                let completion_text = result.clone();
+                ctx.output_writer
+                    .emit(OutputEvent::Completion(completion_text));
+            }
 
-        Ok(serde_json::Value::String(result))
+            Ok(serde_json::Value::String(result))
+        })
     }
 
     fn description(&self, _params: &serde_json::Value) -> String {

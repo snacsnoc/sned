@@ -681,33 +681,33 @@ pub fn new_task_schema() -> ToolSchema {
 use super::SnedTool;
 
 /// Returns the tool schema for a given SnedTool variant.
-#[allow(unreachable_patterns)]
-pub fn get_tool_schema(tool: SnedTool) -> Option<ToolSchema> {
+///
+/// All SnedTool variants are explicitly matched. The compiler will warn if a
+/// new variant is added without a corresponding schema function.
+pub fn get_tool_schema(tool: SnedTool) -> ToolSchema {
     match tool {
-        // All variants are explicitly matched
-        SnedTool::ReadFile => Some(read_file_schema()),
-        SnedTool::WriteToFile => Some(write_to_file_schema()),
-        SnedTool::ListFiles => Some(list_files_schema()),
-        SnedTool::SearchFiles => Some(search_files_schema()),
-        SnedTool::EditFile => Some(edit_file_schema()),
-        SnedTool::ExecuteCommand => Some(execute_command_schema()),
-        SnedTool::AskFollowupQuestion => Some(ask_followup_question_schema()),
-        SnedTool::AttemptCompletion => Some(attempt_completion_schema()),
-        SnedTool::PlanModeRespond => Some(plan_mode_respond_schema()),
-        SnedTool::GetFunction => Some(get_function_schema()),
-        SnedTool::GetFileSkeleton => Some(get_file_skeleton_schema()),
-        SnedTool::FindSymbolReferences => Some(find_symbol_references_schema()),
-        SnedTool::ReplaceSymbol => Some(replace_symbol_schema()),
-        SnedTool::RenameSymbol => Some(rename_symbol_schema()),
-        SnedTool::UseSubagents => Some(use_subagents_schema()),
-        SnedTool::UseSkill => Some(use_skill_schema()),
-        SnedTool::ListSkills => Some(list_skills_schema()),
-        SnedTool::DiagnosticsScan => Some(diagnostics_scan_schema()),
-        SnedTool::SummarizeTask => Some(summarize_task_schema()),
-        SnedTool::Condense => Some(condense_schema()),
-        SnedTool::WebFetch => Some(web_fetch_schema()),
-        SnedTool::NewTask => Some(new_task_schema()),
-        _ => None,
+        SnedTool::ReadFile => read_file_schema(),
+        SnedTool::WriteToFile => write_to_file_schema(),
+        SnedTool::ListFiles => list_files_schema(),
+        SnedTool::SearchFiles => search_files_schema(),
+        SnedTool::EditFile => edit_file_schema(),
+        SnedTool::ExecuteCommand => execute_command_schema(),
+        SnedTool::AskFollowupQuestion => ask_followup_question_schema(),
+        SnedTool::AttemptCompletion => attempt_completion_schema(),
+        SnedTool::PlanModeRespond => plan_mode_respond_schema(),
+        SnedTool::GetFunction => get_function_schema(),
+        SnedTool::GetFileSkeleton => get_file_skeleton_schema(),
+        SnedTool::FindSymbolReferences => find_symbol_references_schema(),
+        SnedTool::ReplaceSymbol => replace_symbol_schema(),
+        SnedTool::RenameSymbol => rename_symbol_schema(),
+        SnedTool::UseSubagents => use_subagents_schema(),
+        SnedTool::UseSkill => use_skill_schema(),
+        SnedTool::ListSkills => list_skills_schema(),
+        SnedTool::DiagnosticsScan => diagnostics_scan_schema(),
+        SnedTool::SummarizeTask => summarize_task_schema(),
+        SnedTool::Condense => condense_schema(),
+        SnedTool::WebFetch => web_fetch_schema(),
+        SnedTool::NewTask => new_task_schema(),
     }
 }
 
@@ -732,7 +732,7 @@ pub fn get_read_only_tool_definitions() -> Vec<ToolDefinition> {
 
     read_only_tools
         .iter()
-        .filter_map(|&t| get_tool_schema(t).map(|s| s.to_tool_definition()))
+        .map(|&t| get_tool_schema(t).to_tool_definition())
         .collect()
 }
 
@@ -849,7 +849,7 @@ pub fn get_tool_definitions_for_profile(profile: ToolProfile) -> Vec<ToolDefinit
     profile
         .tools()
         .iter()
-        .filter_map(|&t| get_tool_schema(t).map(|s| s.to_tool_definition()))
+        .map(|&t| get_tool_schema(t).to_tool_definition())
         .collect()
 }
 
@@ -1141,12 +1141,8 @@ mod tests {
             SnedTool::WebFetch,
         ];
 
-        for tool in &active {
-            assert!(
-                get_tool_schema(*tool).is_some(),
-                "Tool {:?} should have a schema",
-                tool
-            );
+        for _tool in &active {
+            // get_tool_schema always returns a schema for every SnedTool variant
         }
     }
 
