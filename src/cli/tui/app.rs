@@ -523,6 +523,7 @@ impl App {
             self.cached_visual_rows = self.cached_visual_rows.saturating_sub(removed_rows);
         }
         self.cached_visible_window = None;
+        self.cached_wrap_width = None;
 
         for _ in 0..visual_line_count {
             self.output_lines.pop_back();
@@ -642,6 +643,7 @@ impl App {
         }
             if prefixed_turn_indicator {
                 self.output_lines[model_entry_indices[0]] = rendered[0].clone();
+                self.output_line_kinds[model_entry_indices[0]] = BlockKind::Model;
             }
             self.needs_redraw = true;
             self.cached_wrap_width = None;
@@ -3871,6 +3873,62 @@ mod tests {
             !rendered.contains("awaiting approval"),
             "complete plan must not render approval prompt, got: {}",
             rendered
+        );
+    }
+
+    #[test]
+    fn test_turn_indicator_survives_can_skip_reinsert() {
+        // Regression test for the can_skip_reinsert bug where
+        // prefixed_turn_indicator = true but the modified rendered[0]
+        // was written to output_lines but NOT to output_line_kinds,
+        // violating the paired-buffer invariant.
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        // Set up the turn indicator
+        app.push_turn_indicator(Line::from(Span::styled(
+            "\u{2666}",
+            Style::default().fg(crate::cli::tui::theme::ACCENT),
+        )));
+
+        // Push a single plain text line that will trigger the can_skip_reinsert
+        // optimization (rendered line == streamed line, same content and style)
+        app.push_stream_line(Line::from("plain line"), StreamKind::Model);
+
+        assert_eq!(app.output_lines.len(), 1);
+        assert_eq!(app.output_line_kinds.len(), 1);
+
+        // This triggers the can_skip_reinsert path because the rendered markdown
+        // for "plain line" produces exactly one line with the same content
+        app.finalize_turn_stream("plain line");
+
+        // Verify the paired-buffer invariant
+        assert_eq!(
+            app.output_lines.len(),
+            app.output_line_kinds.len(),
+            "output_lines and output_line_kinds must stay in lockstep"
+        );
+
+        // Verify the turn indicator survived in the first line
+        let first_text: String = app
+            .output_lines
+            .front()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            first_text.contains("\u{2666}"),
+            "turn indicator must survive can_skip_reinsert: {:?}",
+            first_text
+        );
+
+        // Verify the kind is Model (not drifted to something else)
+        assert_eq!(
+            app.output_line_kinds.front().copied(),
+            Some(BlockKind::Model),
+            "output_line_kinds must be Model for the first line"
         );
     }
 }
