@@ -178,49 +178,6 @@ fn get_terminal_width() -> usize {
     }
 }
 
-/// Build a one-line summary of a reasoning chunk for the `Ɵ` indicator.
-///
-/// Returns `None` to suppress the indicator when the first non-empty line
-/// is too short to be informative (≤ 3 words). This avoids repeating a
-/// generic opener like "The" across turns when a model streams
-/// reasoning that doesn't carry real signal in its first line.
-///
-/// Truncation is by `char` count, not byte count, so multi-byte UTF-8
-/// (CJK, emoji) is never sliced mid-codepoint.
-///
-/// The TUI reserves 35 columns for the plan panel and 4 columns for
-/// margins. We subtract these from `term_width` so the reasoning indicator
-/// fits within the actual output viewport and doesn't get split by the
-/// TUI's pre-wrap logic.
-fn summarize_reasoning(reasoning: &str, term_width: usize) -> Option<String> {
-    const MIN_WORDS: usize = 3;
-    // "  Ɵ " prefix is 4 visible columns (2 spaces + glyph + space).
-    const PREFIX_COLS: usize = 4;
-    // "... " suffix reserves 4 columns when truncation kicks in.
-    const SUFFIX_COLS: usize = 4;
-    // The agent loop doesn't know the plan panel state, so it cannot
-    // reserve columns for it. The TUI's pre-wrap handles overflow.
-
-    let first_line = reasoning
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.trim())?;
-
-    if first_line.split_whitespace().count() < MIN_WORDS {
-        return None;
-    }
-
-    let max_chars = term_width.saturating_sub(PREFIX_COLS + SUFFIX_COLS);
-    let char_count = first_line.chars().count();
-
-    if char_count <= max_chars {
-        return Some(first_line.to_string());
-    }
-
-    let take = max_chars.saturating_sub(3);
-    let truncated: String = first_line.chars().take(take).collect();
-    Some(format!("{}...", truncated))
-}
 
 fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriterArc) {
     use crate::cli::output::OutputEvent;
@@ -1813,7 +1770,7 @@ impl AgentLoop {
                 state.snipped_code_blocks.len()
             };
             let mut snipped_blocks_this_turn: Vec<SnippedCodeBlock> = Vec::new();
-            let mut reasoning_preview_shown = false;
+
             let mut stream_errored = false;
             let mut retryable_stream_error_before_output: Option<String> = None;
             let mut in_thinking_tag = false;
@@ -2051,28 +2008,24 @@ impl AgentLoop {
                                 .to_string()
                             );
                         } else {
-                            // Show compact thinking indicator instead of raw reasoning dump.
-                            // Collects first non-empty line as a summary, displays with Ɵ symbol.
-                            if !reasoning_preview_shown {
-                                let term_width = crossterm::terminal::size()
-                                    .map(|(cols, _)| cols as usize)
-                                    .unwrap_or(80);
-
-                                if let Some(summary) =
-                                    summarize_reasoning(&reasoning_chunk.reasoning, term_width)
-                                {
-                                    let reasoning_line = Line::from(Span::styled(
-                                        format!("  Ɵ {}", summary),
-                                        Style::default()
-                                            .fg(crate::cli::tui::theme::ACCENT)
-                                            .add_modifier(Modifier::ITALIC),
-                                    ));
-                                    self.config
-                                        .output_writer
-                                        .emit(OutputEvent::ReasoningLine(reasoning_line));
-                                    reasoning_preview_shown = true;
-                                    emitted_output_this_attempt = true;
+                            // Stream all reasoning text as individual lines with Ɵ prefix.
+                            // Each line is emitted as OutputEvent::ReasoningLine so the TUI
+                            // can display it with BlockKind::Reasoning styling.
+                            for line in reasoning_chunk.reasoning.lines() {
+                                if line.trim().is_empty() {
+                                    continue;
                                 }
+                                let reasoning_line = Line::from(Span::styled(
+                                    format!("  Ɵ {}", line),
+                                    Style::default()
+                                        .fg(crate::cli::tui::theme::ACCENT)
+                                        .add_modifier(Modifier::ITALIC),
+                                ));
+                                self.config
+                                    .output_writer
+                                    .emit(OutputEvent::ReasoningLine(reasoning_line));
+
+                                emitted_output_this_attempt = true;
                             }
                         }
                         accumulated_reasoning.push_str(&reasoning_chunk.reasoning);
@@ -8419,80 +8372,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_summarize_reasoning_skips_short_openers() {
-        // Openers with fewer than 3 whitespace-delimited tokens carry no
-        // signal; the caller should suppress the Ɵ indicator entirely.
-        assert!(summarize_reasoning("The", 80).is_none());
-        assert!(summarize_reasoning("The user", 80).is_none());
-        // 3 words is the minimum to pass (not skip).
-        assert!(summarize_reasoning("The user wants", 80).is_some());
-        // Whitespace-only and empty inputs also suppress.
-        assert!(summarize_reasoning("", 80).is_none());
-        assert!(summarize_reasoning("   \n  \n", 80).is_none());
-        // CJK without spaces is a single "word" by split_whitespace;
-        // it will be suppressed. This is an accepted limitation —
-        // the indicator is most useful for Latin-script reasoning.
-        assert!(summarize_reasoning("考虑开始", 80).is_none());
-    }
-
-    #[test]
-    fn test_summarize_reasoning_returns_full_line_when_it_fits() {
-        // 3+ words and short enough to fit — return as-is.
-        // With term_width=80, max_chars = 80 - 4 - 4 = 72.
-        // The line below is 14 chars, which fits within 72.
-        let line = "The user wants";
-        assert_eq!(summarize_reasoning(line, 80).as_deref(), Some(line));
-    }
-
-    #[test]
-    fn test_summarize_reasoning_truncates_ascii_by_char_count() {
-        // Long line: must truncate and append "...", slicing on char
-        // boundaries (not byte boundaries).
-        let line = "The user wants me to ".to_string() + &"a".repeat(200);
-        let summary = summarize_reasoning(&line, 80).expect("should emit");
-        // Reserve is 80 - 4 prefix - 4 suffix = 72 chars; take is 72 - 3 = 69.
-        let expected_take = 80 - 4 - 4 - 3;
-        assert_eq!(
-            summary.chars().count(),
-            expected_take + 3,
-            "truncated length must be take + 3 for the '...' suffix"
-        );
-        assert!(summary.ends_with("..."));
-        // No mid-codepoint slicing: must be valid UTF-8 (the &str round-trip
-        // guarantees this, but the explicit assert documents the intent).
-        assert!(summary.is_char_boundary(summary.len()));
-    }
-
-    #[test]
-    fn test_summarize_reasoning_preserves_cjk_characters() {
-        // CJK without whitespace counts as a single word and is
-        // suppressed by the short-opener skip — that is a known
-        // limitation, documented in test_summarize_reasoning_skips_short_openers.
-        // Here we exercise the truncation path with whitespace-padded
-        // CJK so the word-count threshold is met. Three Latin tokens
-        // carry the word count; the CJK chars then verify that
-        // truncation is by char count, not byte count, so a 3-byte
-        // CJK char is never sliced mid-codepoint.
-        let line = "步骤 alpha beta ".to_string() + &"考虑".repeat(30);
-        let summary = summarize_reasoning(&line, 80).expect("should emit");
-        // Every char in the output must be a valid CJK char or one of
-        // the chars we explicitly put in the input (ASCII letters,
-        // spaces, the '.' truncation suffix). No mid-codepoint slicing.
-        for c in summary.chars() {
-            let ok = c == '.' || c == ' ' || c.is_ascii_alphabetic() || (c as u32) >= 0x4E00;
-            assert!(ok, "unexpected char in output: {c:?} (U+{:04X})", c as u32);
-        }
-        assert!(summary.is_char_boundary(summary.len()));
-    }
-
-    #[test]
-    fn test_summarize_reasoning_handles_tiny_term_width() {
-        // Pathological narrow terminal: term_width < prefix + suffix.
-        // Must not panic and must return at least the "..." suffix.
-        let summary = summarize_reasoning("The user wants me to read it", 4).expect("should emit");
-        assert!(summary.ends_with("..."));
-    }
 
     /// The `record_first_*_time` helpers use an atomic flag so that
     /// only the first chunk on a turn takes `state.lock().await`.
