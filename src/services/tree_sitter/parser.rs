@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 use tree_sitter::{Language, Query};
 
-use crate::services::tree_sitter::queries::*;
+use crate::services::tree_sitter::queries::{C_QUERY, CSHARP_QUERY, CPP_QUERY, GO_QUERY, JAVA_QUERY, JAVASCRIPT_QUERY, PHP_QUERY, PYTHON_QUERY, RUBY_QUERY, RUST_QUERY, SWIFT_QUERY, TYPESCRIPT_QUERY};
 
 /// Error type for language parser operations.
 #[derive(Debug, thiserror::Error)]
