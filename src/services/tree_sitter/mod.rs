@@ -32,10 +32,7 @@ pub fn parse_file(
 ) -> Result<Option<Vec<ParsedDefinition>>, LanguageParserError> {
     let ext = get_extension(file_path);
 
-    let entry = match language_parsers.get(&ext) {
-        Some(e) => e,
-        None => return Ok(None),
-    };
+    let Some(entry) = language_parsers.get(&ext) else { return Ok(None) };
 
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -119,12 +116,9 @@ pub fn get_file_skeleton(
     language_parsers: &LanguageParserMap,
     task_id: Option<&str>,
 ) -> Result<Option<String>, LanguageParserError> {
-    let definitions = match parse_file(absolute_path, file_content, language_parsers)? {
-        Some(d) => d,
-        None => return Ok(None),
-    };
+    let Some(definitions) = parse_file(absolute_path, file_content, language_parsers)? else { return Ok(None) };
 
-    let lines: Vec<String> = file_content.lines().map(|s| s.to_string()).collect();
+    let lines: Vec<String> = file_content.lines().map(std::string::ToString::to_string).collect();
     let anchors = anchor_mgr.reconcile(absolute_path, &lines, task_id);
 
     let mut formatted_output = String::new();
@@ -145,7 +139,7 @@ pub fn get_file_skeleton(
     }
 
     if !formatted_output.is_empty() {
-        Ok(Some(format!("|----\n{}|----\n", formatted_output)))
+        Ok(Some(format!("|----\n{formatted_output}|----\n")))
     } else {
         Ok(None)
     }
@@ -171,14 +165,11 @@ pub fn get_functions(
 ) -> Result<Option<GetFunctionsResult>, LanguageParserError> {
     let ext = get_extension(absolute_path);
 
-    let entry = match language_parsers.get(&ext) {
-        Some(e) => e,
-        None => {
-            return Ok(Some(GetFunctionsResult {
-                formatted_content: format!("Unsupported file type: {}", rel_path),
-                found_names: vec![],
-            }));
-        }
+    let Some(entry) = language_parsers.get(&ext) else {
+        return Ok(Some(GetFunctionsResult {
+            formatted_content: format!("Unsupported file type: {rel_path}"),
+            found_names: vec![],
+        }));
     };
 
     let mut parser = tree_sitter::Parser::new();
@@ -186,17 +177,14 @@ pub fn get_functions(
         .set_language(&entry.language)
         .map_err(|e| LanguageParserError::ParserCreation(e.to_string()))?;
 
-    let tree = match parser.parse(file_content, None) {
-        Some(t) => t,
-        None => {
-            return Ok(Some(GetFunctionsResult {
-                formatted_content: format!("Could not parse file: {}", rel_path),
-                found_names: vec![],
-            }));
-        }
+    let Some(tree) = parser.parse(file_content, None) else {
+        return Ok(Some(GetFunctionsResult {
+            formatted_content: format!("Could not parse file: {rel_path}"),
+            found_names: vec![],
+        }));
     };
 
-    let all_lines: Vec<String> = file_content.lines().map(|s| s.to_string()).collect();
+    let all_lines: Vec<String> = file_content.lines().map(std::string::ToString::to_string).collect();
     let all_anchors = anchor_mgr.reconcile(absolute_path, &all_lines, task_id);
 
     let root_node = tree.root_node();
@@ -279,7 +267,7 @@ pub fn get_functions(
                 {
                     seen_match_ids.insert(*parent_nid);
                     if let Some(parent_name) = match_to_name_text.get(parent_nid) {
-                        full_name = format!("{}.{}", parent_name, full_name);
+                        full_name = format!("{parent_name}.{full_name}");
                     }
                 }
             }
@@ -290,7 +278,7 @@ pub fn get_functions(
             for req_name in function_names {
                 let normalized_req_name = req_name.replace("::", ".");
                 if normalized_full_name == normalized_req_name
-                    || normalized_full_name.ends_with(&format!(".{}", normalized_req_name))
+                    || normalized_full_name.ends_with(&format!(".{normalized_req_name}"))
                 {
                     matched_req_names.push(req_name.clone());
                 }
@@ -329,7 +317,9 @@ pub fn get_functions(
                     .collect();
 
                 // Resolve symbol context (imports, class properties)
-                let context = if def_cap.node != name_cap.node {
+                let context = if def_cap.node == name_cap.node {
+                    String::new()
+                } else {
                     let context_options = symbol_context::SymbolContextOptions {
                         node: def_cap.node,
                         file_content,
@@ -343,8 +333,6 @@ pub fn get_functions(
                         }
                         _ => String::new(),
                     }
-                } else {
-                    String::new()
                 };
 
                 let func_hash = content_hash(def_text);
@@ -360,12 +348,7 @@ pub fn get_functions(
         }
     }
 
-    if !file_results.is_empty() {
-        Ok(Some(GetFunctionsResult {
-            formatted_content: file_results.join("\n\n---\n\n"),
-            found_names: found_names_in_file.into_iter().collect(),
-        }))
-    } else {
+    if file_results.is_empty() {
         let missing_note = format!(
             "\n\nNote: The following functions were not found in any of the provided files: {}",
             function_names.join(", ")
@@ -378,6 +361,11 @@ pub fn get_functions(
                 missing_note
             ),
             found_names: vec![],
+        }))
+    } else {
+        Ok(Some(GetFunctionsResult {
+            formatted_content: file_results.join("\n\n---\n\n"),
+            found_names: found_names_in_file.into_iter().collect(),
         }))
     }
 }
@@ -402,21 +390,14 @@ pub fn get_symbol_range(
 ) -> Result<Option<SymbolRange>, LanguageParserError> {
     let ext = get_extension(absolute_path);
 
-    let entry = match language_parsers.get(&ext) {
-        Some(e) => e,
-        None => return Ok(None),
-    };
+    let Some(entry) = language_parsers.get(&ext) else { return Ok(None) };
 
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&entry.language)
         .map_err(|e| LanguageParserError::ParserCreation(e.to_string()))?;
 
-    let tree = match parser.parse(file_content, None) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-
+    let Some(tree) = parser.parse(file_content, None) else { return Ok(None) };
     let root_node = tree.root_node();
 
     // Build mappings for nested name resolution (same as get_functions)
@@ -497,7 +478,7 @@ pub fn get_symbol_range(
                 {
                     seen_match_ids.insert(*parent_nid);
                     if let Some(parent_name) = match_to_name_text.get(parent_nid) {
-                        full_name = format!("{}.{}", parent_name, full_name);
+                        full_name = format!("{parent_name}.{full_name}");
                     }
                 }
             }
@@ -505,7 +486,7 @@ pub fn get_symbol_range(
             let normalized_full_name = full_name.replace("::", ".");
 
             if (normalized_full_name == normalized_requested_symbol
-                || normalized_full_name.ends_with(&format!(".{}", normalized_requested_symbol)))
+                || normalized_full_name.ends_with(&format!(".{normalized_requested_symbol}")))
                 && are_types_compatible(&def_type, symbol_type)
             {
                 let range = get_extended_range(def_cap.node);
@@ -544,6 +525,7 @@ pub struct ExtendedRange {
 
 /// Gets the extended range of a node, including wrapper types and preceding comments.
 ///
+#[must_use] 
 pub fn get_extended_range(target_node: tree_sitter::Node) -> ExtendedRange {
     let mut start_index = target_node.start_byte();
     let mut end_index = target_node.end_byte();

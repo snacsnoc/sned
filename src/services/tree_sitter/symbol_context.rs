@@ -23,13 +23,10 @@ pub fn resolve_symbol_context(
     options: SymbolContextOptions,
     language_entry: &LanguageParserEntry,
 ) -> Result<SymbolContextResult, LanguageParserError> {
-    let query_strings = match get_query_strings(options.ext) {
-        Some(qs) => qs,
-        None => {
-            return Ok(SymbolContextResult {
-                context: String::new(),
-            });
-        }
+    let Some(query_strings) = get_query_strings(options.ext) else {
+        return Ok(SymbolContextResult {
+            context: String::new(),
+        });
     };
 
     let query = Query::new(&language_entry.language, query_strings.context_query)
@@ -164,7 +161,7 @@ struct QueryStrings {
 fn get_query_strings(ext: &str) -> Option<QueryStrings> {
     match ext {
         "ts" | "tsx" | "js" | "jsx" => Some(QueryStrings {
-            context_query: r#"
+            context_query: r"
                 (import_declaration) @import
                 (class_declaration) @class
                 (class_heritage) @class.heritage
@@ -173,26 +170,26 @@ fn get_query_strings(ext: &str) -> Option<QueryStrings> {
                 (method_definition) @method
                 (identifier) @ref
                 (property_identifier) @ref
-            "#,
+            ",
         }),
         "py" => Some(QueryStrings {
-            context_query: r#"
+            context_query: r"
                 (import_from_statement) @import
                 (import_statement) @import
                 (class_definition) @class
                 (function_definition) @method
                 (assignment left: (attribute object: (identifier) @self attribute: (identifier) @property)) @property
                 (identifier) @ref
-            "#,
+            ",
         }),
         "java" => Some(QueryStrings {
-            context_query: r#"
+            context_query: r"
                 (import_declaration) @import
                 (class_declaration) @class
                 (field_declaration) @property
                 (method_declaration) @method
                 (identifier) @ref
-            "#,
+            ",
         }),
         _ => None,
     }

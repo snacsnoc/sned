@@ -12,6 +12,7 @@ use std::pin::Pin;
 pub struct AskFollowupQuestionHandler;
 
 impl AskFollowupQuestionHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -44,7 +45,7 @@ impl AskFollowupQuestionHandler {
                 Style::default().fg(ACCENT),
             ));
             ctx.output_writer.emit(OutputEvent::tool_output_line(
-                format!("(waiting up to {}s for your response)", timeout_secs),
+                format!("(waiting up to {timeout_secs}s for your response)"),
                 Style::default().add_modifier(Modifier::DIM),
             ));
             ctx.output_writer.flush();
@@ -68,11 +69,8 @@ impl AskFollowupQuestionHandler {
             crate::core::approval::clear_followup_sender(&task_id);
             crate::core::approval::set_followup_question_active(&task_id, false);
 
-            let response = match response_result {
-                Ok(Ok(r)) => r,
-                Ok(Err(_)) | Err(_) => {
-                    return Ok("User provided no response.".to_string());
-                }
+            let Ok(Ok(response)) = response_result else {
+                return Ok("User provided no response.".to_string());
             };
 
             let response = response.trim().to_string();
@@ -80,7 +78,7 @@ impl AskFollowupQuestionHandler {
             if response.is_empty() {
                 Ok("User provided no response.".to_string())
             } else {
-                Ok(format!("User response: {}", response))
+                Ok(format!("User response: {response}"))
             }
         } else {
             Err(ToolError::ExecutionFailed(
@@ -97,11 +95,10 @@ impl ToolHandler for AskFollowupQuestionHandler {
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             // Don't acquire state lock - ask_followup_question doesn't use state
             // and holding the lock across user input delays Ctrl+C cancellation
-            AskFollowupQuestionHandler::execute(&AskFollowupQuestionHandler, &ctx, params)
+            Self::execute(&Self, &ctx, params)
                 .await
                 .map(serde_json::Value::String)
         })

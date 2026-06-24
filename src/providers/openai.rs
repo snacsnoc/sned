@@ -100,11 +100,11 @@ impl OpenAiProvider {
 
     /// Get the base URL for the API endpoint.
     /// Normalizes URL by stripping trailing `/chat/completions` and slashes.
+    #[must_use] 
     pub fn base_url(&self) -> String {
         self.config
             .base_url
-            .as_ref()
-            .cloned()
+            .clone()
             .filter(|u| !u.is_empty())
             .map(|u| {
                 let mut u = u.trim().to_string();
@@ -121,7 +121,7 @@ impl OpenAiProvider {
     fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
         let model_id = &self.config.model_id;
         let is_reasoning_family = ["o1", "o3", "o4", "gpt-5"].iter().any(|prefix| {
-            model_id.starts_with(prefix) || model_id.contains(&format!("/{}", prefix))
+            model_id.starts_with(prefix) || model_id.contains(&format!("/{prefix}"))
         }) && !model_id.contains("chat");
 
         let mut messages = vec![];
@@ -174,7 +174,14 @@ impl OpenAiProvider {
                         part.get("type").and_then(|t| t.as_str()) != Some("tool_use")
                     });
 
-                if !tool_parts.is_empty() {
+                if tool_parts.is_empty() {
+                    let joined = join_assistant_text_parts(content);
+                    let Some(msg_obj) = msg.as_object_mut() else {
+                        tracing::warn!("Skipping non-object message in content conversion");
+                        continue;
+                    };
+                    msg_obj.insert("content".to_string(), json!(joined));
+                } else {
                     let tool_calls: Vec<serde_json::Value> = tool_parts
                         .iter()
                         .map(|tu| {
@@ -204,13 +211,6 @@ impl OpenAiProvider {
                             json!(join_assistant_text_parts(&text_parts)),
                         );
                     }
-                } else {
-                    let joined = join_assistant_text_parts(content);
-                    let Some(msg_obj) = msg.as_object_mut() else {
-                        tracing::warn!("Skipping non-object message in content conversion");
-                        continue;
-                    };
-                    msg_obj.insert("content".to_string(), json!(joined));
                 }
             }
         }
@@ -617,12 +617,9 @@ async fn process_openai_sse_line(
         .strip_prefix("data:")
         .map(|s| s.strip_prefix(" ").unwrap_or(s));
     if let Some(data) = data {
-        let chunk = match serde_json::from_str::<OpenAiStreamChunk>(data) {
-            Ok(c) => c,
-            Err(_) => {
-                tracing::warn!(line = %line, "OpenAI SSE: failed to parse chunk");
-                return;
-            }
+        let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk>(data) else {
+            tracing::warn!(line = %line, "OpenAI SSE: failed to parse chunk");
+            return;
         };
         if let Some(choice) = chunk.choices.into_iter().next() {
             let delta = choice.delta;
@@ -663,7 +660,7 @@ async fn process_openai_sse_line(
             {
                 try_send_chunk(
                     tx,
-                    ApiStreamChunk::Error(format!("OpenAI model refused: {}", refusal)),
+                    ApiStreamChunk::Error(format!("OpenAI model refused: {refusal}")),
                     "refusal",
                 );
             }
@@ -770,8 +767,7 @@ async fn process_openai_sse_line(
             let cached_tokens = usage
                 .prompt_tokens_details
                 .as_ref()
-                .map(|d| d.cached_tokens)
-                .unwrap_or(0);
+                .map_or(0, |d| d.cached_tokens);
             let cache_write_tokens = usage.prompt_cache_miss_tokens.unwrap_or(0);
             // OpenAI counts cached tokens in prompt_tokens, so subtract to get uncached input
             let uncached_input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
@@ -816,7 +812,7 @@ async fn process_openai_sse_line(
                     thoughts_token_count: None,
                     total_cost,
                     stop_reason: last_stop_reason.clone(),
-                    id: Some(chunk.id.clone()),
+                    id: Some(chunk.id),
                 }),
                 "usage",
             );
@@ -1088,9 +1084,7 @@ impl Provider for OpenAiProvider {
         let info = self
             .config
             .model_info
-            .as_ref()
-            .map(|m| m.base.clone())
-            .unwrap_or_else(|| get_openai_model_info(&self.config.model_id).base);
+            .as_ref().map_or_else(|| get_openai_model_info(&self.config.model_id).base, |m| m.base.clone());
 
         ProviderModel {
             id: self.config.model_id.clone(),
@@ -1098,13 +1092,14 @@ impl Provider for OpenAiProvider {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "openai"
     }
 }
 
 /// Get model info for known OpenAI models. Falls back to sane defaults
 /// matching TS `openAiModelInfoSaneDefaults` for unknown model IDs.
+#[must_use] 
 pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     // Default matching TS openAiModelInfoSaneDefaults
     let mut info = ModelInfo {

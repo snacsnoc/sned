@@ -51,6 +51,7 @@ pub const INDEX_DIR: &str = ".sned-symbol-index";
 pub const DB_FILENAME: &str = "data.db";
 
 impl SymbolIndexService {
+    #[must_use] 
     pub fn new(project_root: String) -> Self {
         Self {
             files: HashMap::with_capacity(1024),
@@ -102,13 +103,13 @@ impl SymbolIndexService {
                 .join(".git")
                 .join("info")
                 .join("exclude");
-            if git_exclude.parent().map(|p| p.exists()).unwrap_or(false)
+            if git_exclude.parent().is_some_and(std::path::Path::exists)
                 && let Ok(content) = std::fs::read_to_string(&git_exclude)
                 && !content.contains(INDEX_DIR)
             {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&git_exclude) {
-                    let _ = writeln!(f, "{}", INDEX_DIR);
+                    let _ = writeln!(f, "{INDEX_DIR}");
                 }
             }
         }
@@ -214,15 +215,12 @@ pub fn extract_symbols_for_indexing(
         .unwrap_or("")
         .to_lowercase();
 
-    let entry = match language_parsers.get(&ext) {
-        Some(e) => e,
-        None => return Ok(Vec::new()),
-    };
+    let Some(entry) = language_parsers.get(&ext) else { return Ok(Vec::new()) };
 
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&entry.language)
-        .map_err(|e| anyhow::anyhow!("Language error: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Language error: {e}"))?;
 
     let tree = parser
         .parse(content, None)

@@ -43,6 +43,7 @@ pub enum FileType {
 /// Short paths (≤ 2 components) are shown in full. Long paths are
 /// truncated from the front so the most distinguishing part stays
 /// visible (fzf-style).  E.g. `"a/b/c/d/e/file.rs"` → `"c/d/e/file.rs"`.
+#[must_use] 
 pub fn truncated_display_path(path: &str) -> String {
     let components: Vec<&str> = path.split('/').collect();
     if components.len() <= 2 {
@@ -106,6 +107,7 @@ fn is_excluded_dir(name: &str) -> bool {
     )
 }
 
+#[must_use] 
 pub fn check_ripgrep() -> bool {
     std::process::Command::new("which")
         .arg("rg")
@@ -134,9 +136,7 @@ fn dirs_to_results(dir_set: &std::collections::HashSet<String>) -> Vec<FileSearc
         .filter(|p| !p.is_empty())
         .map(|p| {
             let label = Path::new(p)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| p.clone());
+                .file_name().map_or_else(|| p.clone(), |n| n.to_string_lossy().to_string());
             FileSearchResult {
                 path: p.clone(),
                 file_type: FileType::Folder,
@@ -174,7 +174,7 @@ pub async fn list_workspace_files(
                 if name.starts_with('.') && !name.starts_with(".sned") {
                     return false;
                 }
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if e.file_type().is_some_and(|t| t.is_dir()) {
                     return !is_excluded_dir(&name);
                 }
                 // Filter out database files
@@ -191,7 +191,7 @@ pub async fn list_workspace_files(
                 break;
             }
 
-            let file_type = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let file_type = if entry.file_type().is_some_and(|t| t.is_dir()) {
                 FileType::Folder
             } else {
                 FileType::File
@@ -199,15 +199,11 @@ pub async fn list_workspace_files(
 
             let relative = entry
                 .path()
-                .strip_prefix(&workspace)
-                .map(|p: &std::path::Path| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| entry.path().to_string_lossy().to_string());
+                .strip_prefix(&workspace).map_or_else(|_| entry.path().to_string_lossy().to_string(), |p: &std::path::Path| p.to_string_lossy().to_string());
 
             if file_type == FileType::File {
                 let label = Path::new(&relative)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| relative.clone());
+                    .file_name().map_or_else(|| relative.clone(), |n| n.to_string_lossy().to_string());
                 files.push(FileSearchResult {
                     path: relative.clone(),
                     file_type: FileType::File,
@@ -308,10 +304,7 @@ pub async fn search_workspace_files(
     workspace_path: &str,
     limit: usize,
 ) -> Vec<FileSearchResult> {
-    let items = match list_workspace_files(workspace_path, 5000).await {
-        Ok(items) => items,
-        Err(_) => return Vec::new(),
-    };
+    let Ok(items) = list_workspace_files(workspace_path, 5000).await else { return Vec::new() };
 
     if query.trim().is_empty() {
         return items.into_iter().take(limit).collect();
@@ -335,23 +328,20 @@ pub async fn search_workspace_files(
         .collect()
 }
 
+#[must_use] 
 pub fn extract_mention_query(text: &str) -> MentionQuery {
-    let last_at = match text.rfind('@') {
-        Some(i) => i,
-        None => {
-            return MentionQuery {
-                in_mention_mode: false,
-                query: String::new(),
-                at_index: -1,
-            };
-        }
+    let Some(last_at) = text.rfind('@') else {
+        return MentionQuery {
+            in_mention_mode: false,
+            query: String::new(),
+            at_index: -1,
+        };
     };
 
     if last_at > 0 {
         let prev = text.as_bytes()[last_at - 1];
         if !char::from_u32(prev as u32)
-            .map(|c| c.is_whitespace())
-            .unwrap_or(false)
+            .is_some_and(char::is_whitespace)
         {
             return MentionQuery {
                 in_mention_mode: false,
@@ -384,6 +374,7 @@ pub struct MentionQuery {
     pub at_index: isize,
 }
 
+#[must_use] 
 pub fn insert_mention(
     text: &str,
     at_index: usize,
@@ -391,12 +382,12 @@ pub fn insert_mention(
     file_type: FileType,
 ) -> (String, usize) {
     let after_at = text[at_index..].find(' ');
-    let end = after_at.map(|i| at_index + i).unwrap_or(text.len());
+    let end = after_at.map_or(text.len(), |i| at_index + i);
 
     let mut normalized = if file_path.starts_with('/') {
         file_path.to_string()
     } else {
-        format!("/{}", file_path)
+        format!("/{file_path}")
     };
 
     if matches!(file_type, FileType::Folder) && !normalized.ends_with('/') {
@@ -404,9 +395,9 @@ pub fn insert_mention(
     }
 
     let mention = if normalized.contains(' ') {
-        format!("@\"{}\"", normalized)
+        format!("@\"{normalized}\"")
     } else {
-        format!("@{}", normalized)
+        format!("@{normalized}")
     };
 
     let cursor_pos = at_index + mention.len() + 1; // +1 for trailing space

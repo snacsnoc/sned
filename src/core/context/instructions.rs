@@ -47,7 +47,7 @@ fn check_injection_patterns(content: &str, source: &str) -> Vec<&'static str> {
 }
 
 /// Skill metadata
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
@@ -65,8 +65,8 @@ pub enum SkillSource {
 impl std::fmt::Display for SkillSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SkillSource::Project => write!(f, "project"),
-            SkillSource::Global => write!(f, "global"),
+            Self::Project => write!(f, "project"),
+            Self::Global => write!(f, "global"),
         }
     }
 }
@@ -91,6 +91,7 @@ pub struct SkillSupportingFiles {
 /// Scan directory for AGENTS.md files recursively.
 /// Only searches if a top-level AGENTS.md file exists.
 /// Uses ignore::WalkBuilder for .gitignore-aware filtering and skips common heavy directories.
+#[must_use] 
 pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
     let top_level = cwd.join("AGENTS.md");
     if !top_level.exists() {
@@ -124,7 +125,7 @@ pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Strin
     let top_level_str = top_level.to_string_lossy().to_string();
 
     // Check if top-level file is explicitly disabled
-    if let Some(false) = toggles.get(&top_level_str) {
+    if matches!(toggles.get(&top_level_str), Some(false)) {
         return None;
     }
 
@@ -138,7 +139,7 @@ pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Strin
         let file_str = file_path.to_string_lossy().to_string();
 
         // Skip if disabled
-        if let Some(false) = toggles.get(&file_str) {
+        if matches!(toggles.get(&file_str), Some(false)) {
             continue;
         }
 
@@ -166,7 +167,7 @@ pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Strin
 
     let combined = parts.join("\n\n");
     check_injection_patterns(&combined, "AGENTS.md");
-    Some(format!("# AGENTS.md Rules\n\n{}", combined))
+    Some(format!("# AGENTS.md Rules\n\n{combined}"))
 }
 
 /// Read local windsurf rules file
@@ -179,7 +180,7 @@ pub fn get_local_windsurf_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Str
     }
 
     // Check toggle
-    if let Some(false) = toggles.get(&path_str) {
+    if matches!(toggles.get(&path_str), Some(false)) {
         return None;
     }
 
@@ -190,7 +191,7 @@ pub fn get_local_windsurf_rules(cwd: &Path, toggles: &RuleToggles) -> Option<Str
                 None
             } else {
                 check_injection_patterns(content, ".windsurfrules");
-                Some(format!("# Windsurf Rules\n\n{}", content))
+                Some(format!("# Windsurf Rules\n\n{content}"))
             }
         }
         Err(e) => {
@@ -221,7 +222,7 @@ pub fn get_local_cursor_rules(cwd: &Path, toggles: &RuleToggles) -> Vec<Option<S
                 let content = content.trim();
                 if !content.is_empty() {
                     check_injection_patterns(content, ".cursorrules");
-                    results.push(Some(format!("# Cursor Rules\n\n{}", content)));
+                    results.push(Some(format!("# Cursor Rules\n\n{content}")));
                 } else {
                     results.push(None);
                 }
@@ -272,7 +273,7 @@ pub fn get_local_cursor_rules(cwd: &Path, toggles: &RuleToggles) -> Vec<Option<S
                 if !parts.is_empty() {
                     let combined = parts.join("\n\n");
                     check_injection_patterns(&combined, ".cursor/rules");
-                    results.push(Some(format!("# Cursor Rules Directory\n\n{}", combined)));
+                    results.push(Some(format!("# Cursor Rules Directory\n\n{combined}")));
                 }
             }
             Err(e) => {
@@ -294,15 +295,14 @@ fn read_directory_recursive(dir: &Path, extension: &str) -> Result<Vec<PathBuf>,
 
     for entry in walkdir::WalkDir::new(dir)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
     {
         if entry.file_type().is_file() {
             let path = entry.path();
             if extension.is_empty()
                 || path
                     .extension()
-                    .map(|e| e == &extension[1..])
-                    .unwrap_or(false)
+                    .is_some_and(|e| e == &extension[1..])
             {
                 results.push(path.to_path_buf());
             }
@@ -314,6 +314,7 @@ fn read_directory_recursive(dir: &Path, extension: &str) -> Result<Vec<PathBuf>,
 
 /// Synchronize rule toggles with current filesystem state.
 /// Adds defaults for new files, removes toggles for deleted files.
+#[must_use] 
 pub fn synchronize_rule_toggles(
     rules_path: &Path,
     current_toggles: &RuleToggles,
@@ -357,6 +358,7 @@ pub fn synchronize_rule_toggles(
 }
 
 /// Combine two rule toggle maps (toggles2 takes precedence)
+#[must_use] 
 pub fn combine_rule_toggles(toggles1: &RuleToggles, toggles2: &RuleToggles) -> RuleToggles {
     let mut combined = toggles1.clone();
     combined.extend(toggles2.iter().map(|(k, v)| (k.clone(), *v)));
@@ -364,6 +366,7 @@ pub fn combine_rule_toggles(toggles1: &RuleToggles, toggles2: &RuleToggles) -> R
 }
 
 /// Get skills directories to scan
+#[must_use] 
 pub fn get_skills_directories_for_scan(cwd: &Path) -> Vec<(PathBuf, SkillSource)> {
     let mut dirs = vec![
         (cwd.join(".agents/skills"), SkillSource::Project),
@@ -405,7 +408,7 @@ pub fn scan_skills_directory(dir_path: &Path, source: SkillSource) -> Vec<SkillM
         }
     };
 
-    for entry in entries.filter_map(|e| e.ok()) {
+    for entry in entries.filter_map(std::result::Result::ok) {
         let entry_path = entry.path();
 
         // Support subdirectories with SKILL.md inside
@@ -476,7 +479,7 @@ fn load_skill_metadata(
     let name = frontmatter.get("name")?.as_str()?;
     let description = frontmatter.get("description")?.as_str()?;
 
-    check_injection_patterns(description, &format!("skill:{}:description", skill_name));
+    check_injection_patterns(description, &format!("skill:{skill_name}:description"));
 
     // Name must match directory name
     if name != skill_name {
@@ -531,7 +534,7 @@ fn load_skill_from_md_file(
         let name = frontmatter.get("name")?.as_str()?;
         let description = frontmatter.get("description")?.as_str()?;
 
-        check_injection_patterns(description, &format!("skill:{}:description", skill_name));
+        check_injection_patterns(description, &format!("skill:{skill_name}:description"));
 
         // Name must match filename (without .md extension)
         if name != skill_name {
@@ -576,10 +579,7 @@ fn parse_yaml_frontmatter(content: &str) -> (serde_yml::Mapping, String, bool, O
     }
 
     let rest = &trimmed[3..];
-    let end_pos = match rest.find("---") {
-        Some(pos) => pos,
-        None => return (serde_yml::Mapping::new(), content.to_string(), false, None),
-    };
+    let Some(end_pos) = rest.find("---") else { return (serde_yml::Mapping::new(), content.to_string(), false, None) };
 
     let yaml_str = &rest[..end_pos];
     let body = rest[end_pos + 3..].to_string();
@@ -596,6 +596,7 @@ fn parse_yaml_frontmatter(content: &str) -> (serde_yml::Mapping, String, bool, O
 }
 
 /// Discover all skills from project and global directories
+#[must_use] 
 pub fn discover_skills(cwd: &Path) -> Vec<SkillMetadata> {
     let mut skills = Vec::new();
     let scan_dirs = get_skills_directories_for_scan(cwd);
@@ -609,6 +610,7 @@ pub fn discover_skills(cwd: &Path) -> Vec<SkillMetadata> {
 }
 
 /// Get available skills with override resolution (global > project)
+#[must_use] 
 pub fn get_available_skills(skills: Vec<SkillMetadata>) -> Vec<SkillMetadata> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
@@ -626,6 +628,7 @@ pub fn get_available_skills(skills: Vec<SkillMetadata>) -> Vec<SkillMetadata> {
 }
 
 /// List supporting files (docs and scripts) in a skill directory
+#[must_use] 
 pub fn list_supporting_files(skill_md_path: &Path) -> SkillSupportingFiles {
     let skill_dir = skill_md_path.parent().unwrap_or(Path::new("."));
     let docs_dir = skill_dir.join("docs");
@@ -637,7 +640,7 @@ pub fn list_supporting_files(skill_md_path: &Path) -> SkillSupportingFiles {
         && docs_dir.is_dir()
         && let Ok(entries) = fs::read_dir(&docs_dir)
     {
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries.filter_map(std::result::Result::ok) {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.ends_with(".md") || name_str.ends_with(".txt") {
@@ -650,7 +653,7 @@ pub fn list_supporting_files(skill_md_path: &Path) -> SkillSupportingFiles {
         && scripts_dir.is_dir()
         && let Ok(entries) = fs::read_dir(&scripts_dir)
     {
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries.filter_map(std::result::Result::ok) {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if !name_str.starts_with('.') {
@@ -663,21 +666,19 @@ pub fn list_supporting_files(skill_md_path: &Path) -> SkillSupportingFiles {
 }
 
 /// Get full skill content including instructions
+#[must_use] 
 pub fn get_skill_content(
     skill_name: &str,
     available_skills: &[SkillMetadata],
 ) -> Option<SkillContent> {
     let skill = available_skills.iter().find(|s| s.name == skill_name)?;
 
-    let file_content = match fs::read_to_string(&skill.path) {
-        Ok(content) => content,
-        Err(_) => return None,
-    };
+    let Ok(file_content) = fs::read_to_string(&skill.path) else { return None };
 
     let (_, body, _, _) = parse_yaml_frontmatter(&file_content);
     let instructions = body.trim().to_string();
 
-    check_injection_patterns(&instructions, &format!("skill:{}", skill_name));
+    check_injection_patterns(&instructions, &format!("skill:{skill_name}"));
 
     Some(SkillContent {
         name: skill.name.clone(),

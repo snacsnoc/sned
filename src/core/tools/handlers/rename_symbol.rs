@@ -16,6 +16,7 @@ pub struct RenameSymbolHandler {
 }
 
 impl RenameSymbolHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             symbol_index_service: None,
@@ -123,8 +124,7 @@ impl RenameSymbolHandler {
                         "rename_symbol: failed to read file"
                     );
                     return Err(ToolError::ExecutionFailed(format!(
-                        "Error reading file {}: {}",
-                        abs_path, e
+                        "Error reading file {abs_path}: {e}"
                     )));
                 }
             }
@@ -149,7 +149,7 @@ impl RenameSymbolHandler {
                 }
             }
 
-            if let Ok(mut index_service) = mutex.lock().map_err(|e| e.into_inner()) {
+            if let Ok(mut index_service) = mutex.lock().map_err(std::sync::PoisonError::into_inner) {
                 let project_root = index_service.get_project_root().to_string();
                 let root = std::path::Path::new(&project_root);
                 for (abs_path, symbols) in parsed_symbols {
@@ -162,8 +162,7 @@ impl RenameSymbolHandler {
                             .modified()
                             .ok()
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
+                            .map_or(0, |d| d.as_secs());
                         index_service.index_file(rel_str.to_string(), mtime, meta.len(), symbols);
                     }
                 }
@@ -173,11 +172,11 @@ impl RenameSymbolHandler {
         let language_parsers = load_required_language_parsers(
             &expanded_paths
                 .iter()
-                .map(|s| s.as_str())
+                .map(std::string::String::as_str)
                 .collect::<Vec<_>>(),
         )
         .map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to load language parsers: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
         })?;
 
         let mut locations_by_file: HashMap<String, FileData> =
@@ -189,7 +188,7 @@ impl RenameSymbolHandler {
                 .expect("file content should exist");
 
             let occurrences = if let Some(ref mutex) = self.symbol_index_service
-                && let Ok(index_service) = mutex.lock().map_err(|e| e.into_inner())
+                && let Ok(index_service) = mutex.lock().map_err(std::sync::PoisonError::into_inner)
             {
                 let project_root = index_service.get_project_root().to_string();
                 let defs = index_service.get_definitions(existing_symbol, None);
@@ -244,8 +243,7 @@ impl RenameSymbolHandler {
         if locations_by_file.is_empty() {
             state.consecutive_mistakes = 0;
             return Ok(format!(
-                "No occurrences of symbol '{}' found in the specified paths.",
-                existing_symbol,
+                "No occurrences of symbol '{existing_symbol}' found in the specified paths.",
             ));
         }
 
@@ -254,7 +252,7 @@ impl RenameSymbolHandler {
 
         for (abs_path, file_data) in locations_by_file {
             let mut current_lines: Vec<String> =
-                file_data.content.lines().map(|l| l.to_string()).collect();
+                file_data.content.lines().map(std::string::ToString::to_string).collect();
             let mut occurrences = file_data.occurrences;
             let mut replacement_count = 0;
 
@@ -283,7 +281,7 @@ impl RenameSymbolHandler {
                 }
                 let before: String = line.chars().take(occ.start_column).collect();
                 let after: String = line.chars().skip(occ.end_column).collect();
-                current_lines[occ.start_line] = format!("{}{}{}", before, new_symbol, after);
+                current_lines[occ.start_line] = format!("{before}{new_symbol}{after}");
                 replacement_count += 1;
             }
 
@@ -291,7 +289,7 @@ impl RenameSymbolHandler {
                 let final_content = current_lines.join("\n");
                 match crate::storage::disk::atomic_write_file_async(&abs_path, &final_content).await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         // Mark file as edited by Sned to suppress stale mtime detection
                         state
                             .file_context_tracker
@@ -305,8 +303,7 @@ impl RenameSymbolHandler {
                             "rename_symbol: failed to write file"
                         );
                         return Err(ToolError::ExecutionFailed(format!(
-                            "Failed to write file {}: {}",
-                            abs_path, e
+                            "Failed to write file {abs_path}: {e}"
                         )));
                     }
                 }
@@ -343,12 +340,13 @@ impl RenameSymbolHandler {
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
         let workspace_root = std::env::current_dir().map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to get current directory: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to get current directory: {e}"))
         })?;
         self.execute_with_workspace_root(state, params, &workspace_root)
             .await
     }
 
+    #[must_use] 
     pub fn description(&self, _params: &serde_json::Value) -> String {
         "[rename_symbol]".to_string()
     }
@@ -362,7 +360,6 @@ impl ToolHandler for RenameSymbolHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self;
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
             handler.execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
@@ -372,7 +369,7 @@ impl ToolHandler for RenameSymbolHandler {
     }
 
     fn description(&self, params: &serde_json::Value) -> String {
-        RenameSymbolHandler::description(self, params)
+        Self::description(self, params)
     }
 }
 
@@ -457,20 +454,14 @@ fn collect_symbol_occurrences(
         None => return Vec::new(),
     };
 
-    let entry = match language_parsers.get(&ext) {
-        Some(e) => e,
-        None => return Vec::new(),
-    };
+    let Some(entry) = language_parsers.get(&ext) else { return Vec::new() };
 
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&entry.language).is_err() {
         return Vec::new();
     }
 
-    let tree = match parser.parse(content, None) {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
+    let Some(tree) = parser.parse(content, None) else { return Vec::new() };
 
     let root_node = tree.root_node();
     let content_bytes = content.as_bytes();
@@ -532,7 +523,7 @@ fn collect_symbol_occurrences(
             {
                 seen_match_ids.insert(*parent_mid);
                 if let Some(parent_name) = match_to_name_text.get(parent_mid) {
-                    full_name = format!("{}.{}", parent_name, full_name);
+                    full_name = format!("{parent_name}.{full_name}");
                 }
             }
         }
@@ -541,9 +532,9 @@ fn collect_symbol_occurrences(
         let normalized_name = name_text.replace("::", ".");
 
         let matches = normalized_full == normalized_requested
-            || normalized_full.ends_with(&format!(".{}", normalized_requested))
+            || normalized_full.ends_with(&format!(".{normalized_requested}"))
             || normalized_name == normalized_requested
-            || normalized_name.ends_with(&format!(".{}", normalized_requested));
+            || normalized_name.ends_with(&format!(".{normalized_requested}"));
 
         if matches {
             let pos = cap.node.start_position();

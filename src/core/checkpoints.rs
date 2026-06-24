@@ -134,8 +134,7 @@ impl CheckpointTracker {
                 return self.get_head_commit();
             }
             return Err(CheckpointError::CommandFailed(format!(
-                "git commit failed: {}",
-                err_str
+                "git commit failed: {err_str}"
             )));
         }
 
@@ -155,8 +154,7 @@ impl CheckpointTracker {
 
         if let Err(e) = status_output {
             return Err(CheckpointError::CommandFailed(format!(
-                "git status failed: {}",
-                e
+                "git status failed: {e}"
             )));
         }
 
@@ -172,7 +170,7 @@ impl CheckpointTracker {
                 "--porcelain",
             ])
             .output()
-            .map_err(|e| CheckpointError::CommandFailed(format!("git status failed: {}", e)))?;
+            .map_err(|e| CheckpointError::CommandFailed(format!("git status failed: {e}")))?;
 
         if status_output.status.success() {
             let status_text = String::from_utf8_lossy(&status_output.stdout).to_string();
@@ -207,7 +205,7 @@ impl CheckpointTracker {
                 "HEAD",
             ])
             .output()
-            .map_err(|e| CheckpointError::CommandFailed(format!("git rev-parse failed: {}", e)))?;
+            .map_err(|e| CheckpointError::CommandFailed(format!("git rev-parse failed: {e}")))?;
 
         if !output.status.success() {
             return Ok(None);
@@ -235,7 +233,7 @@ impl CheckpointTracker {
                 "50",
             ])
             .output()
-            .map_err(|e| CheckpointError::CommandFailed(format!("git log failed: {}", e)))?;
+            .map_err(|e| CheckpointError::CommandFailed(format!("git log failed: {e}")))?;
 
         if !output.status.success() {
             return Err(CheckpointError::CommandFailed(
@@ -270,7 +268,7 @@ impl CheckpointTracker {
         rhs_hash: Option<&str>,
     ) -> Result<Vec<String>, CheckpointError> {
         let diff_range = match rhs_hash {
-            Some(rhs) => format!("{}..{}", lhs_hash, rhs),
+            Some(rhs) => format!("{lhs_hash}..{rhs}"),
             None => lhs_hash.to_string(),
         };
 
@@ -285,7 +283,7 @@ impl CheckpointTracker {
                 &diff_range,
             ])
             .output()
-            .map_err(|e| CheckpointError::CommandFailed(format!("git diff failed: {}", e)))?;
+            .map_err(|e| CheckpointError::CommandFailed(format!("git diff failed: {e}")))?;
 
         if !output.status.success() {
             return Err(CheckpointError::CommandFailed(format!(
@@ -296,7 +294,7 @@ impl CheckpointTracker {
 
         let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .filter(|s| !s.is_empty())
             .collect();
 
@@ -309,7 +307,7 @@ impl CheckpointTracker {
             .current_dir(git_dir)
             .args(args.iter().copied())
             .output()
-            .map_err(|e| CheckpointError::CommandFailed(format!("git command failed: {}", e)))?;
+            .map_err(|e| CheckpointError::CommandFailed(format!("git command failed: {e}")))?;
 
         if !output.status.success() {
             return Err(CheckpointError::CommandFailed(format!(
@@ -411,11 +409,7 @@ impl TaskCheckpointManager {
     /// Save a checkpoint of the current workspace state.
     /// Runs git commands in a blocking thread to avoid stalling the async runtime.
     pub async fn save_checkpoint(&mut self) -> Option<String> {
-        let tracker = match &self.tracker {
-            Some(t) => t,
-            None => return None,
-        };
-
+        let Some(tracker) = &self.tracker else { return None };
         let tracker_for_commit = tracker.clone();
         match tokio::task::spawn_blocking(move || tracker_for_commit.commit()).await {
             Ok(Ok(Some(hash))) => {
@@ -427,13 +421,13 @@ impl TaskCheckpointManager {
                 tracker.get_head_commit().ok().flatten()
             }
             Ok(Err(e)) => {
-                let msg = format!("Failed to save checkpoint: {}", e);
+                let msg = format!("Failed to save checkpoint: {e}");
                 warn!("[checkpoints] {}", msg);
                 self.error_message = Some(msg);
                 None
             }
             Err(e) => {
-                let msg = format!("Checkpoint task panicked: {}", e);
+                let msg = format!("Checkpoint task panicked: {e}");
                 warn!("[checkpoints] {}", msg);
                 self.error_message = Some(msg);
                 None
@@ -457,8 +451,7 @@ impl TaskCheckpointManager {
         match tokio::task::spawn_blocking(move || tracker.restore(&commit_hash)).await {
             Ok(result) => result,
             Err(e) => Err(CheckpointError::CommandFailed(format!(
-                "Checkpoint restore task panicked: {}",
-                e
+                "Checkpoint restore task panicked: {e}"
             ))),
         }
     }
@@ -480,7 +473,7 @@ impl TaskCheckpointManager {
         };
 
         let lhs_hash = lhs_hash.to_string();
-        let rhs_hash = rhs_hash.map(|s| s.to_string());
+        let rhs_hash = rhs_hash.map(std::string::ToString::to_string);
         match tokio::task::spawn_blocking(move || {
             tracker.get_changed_files(&lhs_hash, rhs_hash.as_deref())
         })
@@ -488,18 +481,19 @@ impl TaskCheckpointManager {
         {
             Ok(result) => result,
             Err(e) => Err(CheckpointError::CommandFailed(format!(
-                "Checkpoint get_changed_files task panicked: {}",
-                e
+                "Checkpoint get_changed_files task panicked: {e}"
             ))),
         }
     }
 
     /// Get the last checkpoint hash, if any.
+    #[must_use] 
     pub fn last_checkpoint(&self) -> Option<&String> {
         self.checkpoint_history.last()
     }
 
     /// Get the checkpoint error message, if any.
+    #[must_use] 
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
@@ -519,8 +513,7 @@ impl TaskCheckpointManager {
         match tokio::task::spawn_blocking(move || tracker.list_checkpoints()).await {
             Ok(result) => result,
             Err(e) => Err(CheckpointError::CommandFailed(format!(
-                "Checkpoint list_checkpoints task panicked: {}",
-                e
+                "Checkpoint list_checkpoints task panicked: {e}"
             ))),
         }
     }

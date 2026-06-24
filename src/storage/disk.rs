@@ -58,6 +58,7 @@ impl Drop for AtomicWriteGuard<'_> {
     }
 }
 
+#[must_use] 
 pub fn active_atomic_write_count() -> usize {
     active_atomic_write_count_on(&ATOMIC_WRITES)
 }
@@ -85,6 +86,7 @@ pub async fn wait_for_atomic_writes(timeout: Duration) -> bool {
 }
 
 /// Get the base Sned directory (~/.sned or SNED_DIR)
+#[must_use] 
 pub fn get_sned_dir() -> PathBuf {
     if let Ok(dir) = env::var("SNED_DIR") {
         PathBuf::from(dir)
@@ -96,6 +98,7 @@ pub fn get_sned_dir() -> PathBuf {
 }
 
 /// Get the Sned data directory (~/.sned/data or SNED_DATA_DIR)
+#[must_use] 
 pub fn get_data_dir() -> PathBuf {
     if let Ok(dir) = env::var("SNED_DATA_DIR") {
         PathBuf::from(dir)
@@ -105,16 +108,19 @@ pub fn get_data_dir() -> PathBuf {
 }
 
 /// Get the tasks directory (data/tasks)
+#[must_use] 
 pub fn get_tasks_dir() -> PathBuf {
     get_data_dir().join("tasks")
 }
 
 /// Get the state directory (data/state)
+#[must_use] 
 pub fn get_state_dir() -> PathBuf {
     get_data_dir().join("state")
 }
 
 /// Get the settings directory (data/settings)
+#[must_use] 
 pub fn get_settings_dir() -> PathBuf {
     get_data_dir().join("settings")
 }
@@ -161,7 +167,7 @@ pub fn atomic_write_file_bytes<P: AsRef<Path>>(file_path: P, data: &[u8]) -> io:
         .collect();
 
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp_name = format!("{}.tmp.{}.{}.json", file_name, now, rand_str);
+    let tmp_name = format!("{file_name}.tmp.{now}.{rand_str}.json");
     let tmp_path = parent.join(tmp_name);
 
     #[cfg(unix)]
@@ -245,7 +251,7 @@ pub async fn atomic_write_file_async<P: AsRef<Path>>(file_path: P, data: &str) -
         .collect();
 
     let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp_name = format!("{}.tmp.{}.{}.json", file_name, now, rand_str);
+    let tmp_name = format!("{file_name}.tmp.{now}.{rand_str}.json");
     let tmp_path = parent.join(tmp_name);
 
     #[cfg(unix)]
@@ -324,16 +330,10 @@ pub fn cleanup_orphaned_temp_files(dir: &Path, max_age: Duration) -> io::Result<
     };
 
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entry) = entry else { continue };
 
         let path = entry.path();
-        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(name) => name,
-            None => continue,
-        };
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
 
         // Match temp file pattern: *.tmp.*.json
         if !file_name.contains(".tmp.") || !file_name.ends_with(".json") {
@@ -341,15 +341,9 @@ pub fn cleanup_orphaned_temp_files(dir: &Path, max_age: Duration) -> io::Result<
         }
 
         // Check file age
-        let metadata = match fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let Ok(metadata) = fs::metadata(&path) else { continue };
 
-        let modified = match metadata.modified() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        let Ok(modified) = metadata.modified() else { continue };
 
         if now.duration_since(modified).unwrap_or(Duration::ZERO) > max_age
             && fs::remove_file(&path).is_ok()
@@ -382,8 +376,9 @@ impl GlobalFileNames {
     pub const TASK_METADATA: &'static str = "task_metadata.json";
     pub const ENDPOINTS_JSON: &'static str = "endpoints.json";
 
+    #[must_use] 
     pub fn remote_config(org_id: &str) -> String {
-        format!("remote_config_{}.json", org_id)
+        format!("remote_config_{org_id}.json")
     }
 }
 
