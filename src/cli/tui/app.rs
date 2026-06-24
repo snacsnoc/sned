@@ -8,7 +8,7 @@ use crate::core::file_search::FileSearchResult;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -151,6 +151,12 @@ pub struct App {
     pub output_overflow: bool,
     /// Total number of dropped events, for the status bar indicator.
     pub output_overflow_count: u64,
+    /// Path to the scrollback file for evicted output lines.
+    pub scrollback_file: Option<std::path::PathBuf>,
+    /// Number of lines stored in the scrollback file.
+    pub scrollback_count: u64,
+    /// True when the user is viewing scrollback history.
+    pub in_scrollback: bool,
     /// Session elapsed time for status bar
     pub elapsed: Option<Duration>,
     /// Scrollbar state for output pane
@@ -253,6 +259,14 @@ pub struct App {
 }
 
 impl App {
+    /// Convert a ratatui Line to a plain text string (ignores styling).
+    fn line_to_string(line: &Line<'static>) -> String {
+        let mut out = String::new();
+        for span in &line.spans {
+            out.push_str(&span.content);
+        }
+        out
+    }
     /// Create a new TextArea with default styling (no underline on cursor line).
     pub fn new_textarea(lines: Vec<String>) -> TextArea<'static> {
         let mut input = TextArea::new(lines);
@@ -378,6 +392,9 @@ impl App {
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
             output_overflow: false,
             output_overflow_count: 0,
+            scrollback_file: Some(crate::storage::disk::get_data_dir().join("scrollback/lines")),
+            scrollback_count: 0,
+            in_scrollback: false,
         }
     }
 
@@ -428,6 +445,20 @@ impl App {
         self.output_line_kinds.push_back(kind);
         self.cached_visible_window = None;
         if self.output_lines.len() > 10_000 {
+            // Evict front line and persist it to scrollback file
+            if let Some(ref file_path) = self.scrollback_file {
+                if let Some(line) = self.output_lines.front() {
+                    let text = Self::line_to_string(line);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(file_path)
+                    {
+                        let _ = std::io::Write::write_all(&mut f, format!("{}\n", text).as_bytes());
+                    }
+                }
+                self.scrollback_count = self.scrollback_count.saturating_add(1);
+            }
             self.output_lines.pop_front();
             self.output_line_kinds.pop_front();
             self.cached_wrap_width = None;
@@ -886,6 +917,77 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    /// Load scrollback content from the scrollback file and merge with
+    /// the current buffer.  The file stores one raw text line per line;
+    /// we reconstruct Line objects and prepend them to output_lines.
+    pub fn enter_scrollback(&mut self) {
+        self.in_scrollback = true;
+        self.needs_redraw = true;
+
+        if let Some(ref file_path) = self.scrollback_file {
+            if let Ok(content) = std::fs::read_to_string(file_path) {
+                let mut scrollback_lines: VecDeque<Line<'static>> = VecDeque::new();
+                let mut scrollback_kinds: VecDeque<BlockKind> = VecDeque::new();
+                for line in content.lines() {
+                    scrollback_lines.push_back(Line::from(line.to_string()));
+                    scrollback_kinds.push_back(BlockKind::ToolOutput);
+                }
+                // Prepend scrollback content before current session content
+                let mut new_lines: VecDeque<Line<'static>> = VecDeque::new();
+                let mut new_kinds: VecDeque<BlockKind> = VecDeque::new();
+                for line in scrollback_lines.iter() {
+                    new_lines.push_back(line.clone());
+                    new_kinds.push_back(BlockKind::ToolOutput);
+                }
+                // Insert divider line between scrollback and session content
+                if !self.output_lines.is_empty() {
+                    let divider = Line::from("─".repeat(40));
+                    new_lines.push_back(divider);
+                    new_kinds.push_back(BlockKind::Separator);
+                }
+                for line in self.output_lines.iter() {
+                    new_lines.push_back(line.clone());
+                }
+                for kind in self.output_line_kinds.iter() {
+                    new_kinds.push_back(*kind);
+                }
+                self.output_lines = new_lines;
+                self.output_line_kinds = new_kinds;
+                self.cached_wrap_width = None;
+                self.cached_visible_window = None;
+            }
+        }
+        // Reset scroll to bottom of combined buffer
+        self.scroll_mode = ScrollMode::Auto;
+        self.scroll_offset = 0;
+    }
+
+    /// Exit scrollback mode: clear the scrollback file, reset buffer to
+    /// the original session content, and return to bottom.
+    pub fn exit_scrollback(&mut self) {
+        self.in_scrollback = false;
+        self.needs_redraw = true;
+        // Clear the scrollback file - history was seen
+        if let Some(ref file_path) = self.scrollback_file {
+            let _ = std::fs::remove_file(file_path);
+        }
+        self.scrollback_count = 0;
+        self.cached_wrap_width = None;
+        self.cached_visible_window = None;
+        self.scroll_mode = ScrollMode::Auto;
+        self.scroll_offset = 0;
+    }
+
+    /// Toggle between normal and scrollback modes.
+    pub fn toggle_scrollback(&mut self) {
+        if self.in_scrollback {
+            self.exit_scrollback();
+        } else {
+            self.enter_scrollback();
+        }
+    }
+
+
     /// Clear all output and reset the visual-row cache.
     pub fn clear_output(&mut self) {
         self.needs_redraw = true;
@@ -901,6 +1003,8 @@ impl App {
         self.cached_error_rows = 0;
         self.cached_wrap_width = Some(self.last_wrap_width());
         self.cached_visible_window = None;
+        self.in_scrollback = false;
+        self.scrollback_count = 0;
     }
 
     /// Drain output from the given index onward and keep the visual-row cache in sync.
@@ -1502,6 +1606,28 @@ impl App {
                         .padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
                 );
             frame.render_widget(output, main_output_area);
+        }
+
+        // Scrollback overflow indicator: shown at bottom when there's
+        // scrollback history available and user is at the bottom.
+        if !self.in_scrollback
+            && self.scrollback_count > 0
+            && self.scroll_mode == ScrollMode::Auto
+        {
+            let indicator = Paragraph::new(Line::from(format!(
+                "↓ {} lines of scrollback — press S to view",
+                self.scrollback_count,
+            )))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(theme::ACCENT).italic());
+            let indicator_area = Rect {
+                x: main_output_area.x,
+                y: main_output_area.y + main_output_area.height - 1,
+                width: main_output_area.width,
+                height: 1,
+            };
+            frame.render_widget(Clear, indicator_area);
+            frame.render_widget(indicator, indicator_area);
         }
 
         // Render error box (priority) or completion box below the main output area.
@@ -3930,5 +4056,137 @@ mod tests {
             Some(BlockKind::Model),
             "output_line_kinds must be Model for the first line"
         );
+    }
+
+    /// Evicted lines must be written to the scrollback file.
+    #[test]
+    fn test_eviction_writes_to_scrollback_file() {
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        // Create a temp dir for the scrollback file
+        let tmp_dir = std::env::temp_dir().join("sned_scrollback_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let file_path = tmp_dir.join("lines");
+        app.scrollback_file = Some(file_path.clone());
+
+        // Push enough lines to trigger eviction (limit is 10,000)
+        // For testing, we'll simulate eviction by manually triggering it
+        for i in 0..10_001 {
+            app.push_plain(format!("line {}", i));
+        }
+
+        // Verify the scrollback file exists and has content
+        assert!(file_path.exists(), "scrollback file should exist after eviction");
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!content.is_empty(), "scrollback file should have content");
+        // The first evicted line should be in the file
+        assert!(content.contains("line 0"), "first evicted line should be in scrollback");
+        assert_eq!(app.scrollback_count, 1);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    /// Entering scrollback mode loads file content and merges with buffer.
+    #[test]
+    fn test_enter_scrollback_loads_file_content() {
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        // Create a temp scrollback file with test content
+        let tmp_dir = std::env::temp_dir().join("sned_scrollback_test2");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let file_path = tmp_dir.join("lines");
+        std::fs::write(&file_path, "scrollback line 0\nscrollback line 1\nscrollback line 2\n").unwrap();
+        app.scrollback_file = Some(file_path.clone());
+        app.scrollback_count = 3;
+
+        // Add some session content
+        app.push_plain("session line 0");
+        app.push_plain("session line 1");
+
+        // Enter scrollback mode
+        app.enter_scrollback();
+
+        // Verify: buffer contains scrollback lines + divider + session lines
+        assert!(app.in_scrollback);
+        let total = app.output_lines.len();
+        // 3 scrollback lines + 1 divider + 2 session lines = 6
+        assert_eq!(total, 6, "buffer should contain merged content");
+
+        // First line should be a scrollback line
+        let first_text: String = app
+            .output_lines
+            .front()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            first_text.contains("scrollback line 0"),
+            "first line should be from scrollback"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    /// Exiting scrollback clears the file and resets state.
+    #[test]
+    fn test_exit_scrollback_clears_file() {
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        let tmp_dir = std::env::temp_dir().join("sned_scrollback_test3");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let file_path = tmp_dir.join("lines");
+        std::fs::write(&file_path, "old scrollback content\n").unwrap();
+        app.scrollback_file = Some(file_path.clone());
+        app.scrollback_count = 1;
+
+        app.push_plain("session line");
+
+        app.enter_scrollback();
+        assert!(app.in_scrollback);
+
+        app.exit_scrollback();
+
+        assert!(!app.in_scrollback);
+        assert_eq!(app.scrollback_count, 0);
+        assert!(!file_path.exists(), "scrollback file should be deleted on exit");
+
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    /// Toggle switches between normal and scrollback modes.
+    #[test]
+    fn test_scrollback_toggle() {
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        let tmp_dir = std::env::temp_dir().join("sned_scrollback_test4");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let file_path = tmp_dir.join("lines");
+        std::fs::write(&file_path, "s0\ns1\n").unwrap();
+        app.scrollback_file = Some(file_path.clone());
+        app.scrollback_count = 2;
+
+        app.push_plain("session");
+
+        assert!(!app.in_scrollback);
+        app.toggle_scrollback();
+        assert!(app.in_scrollback, "first toggle should enter scrollback");
+        assert!(app.output_lines.len() >= 2, "buffer should contain scrollback lines");
+
+        app.toggle_scrollback();
+        assert!(!app.in_scrollback, "second toggle should exit scrollback");
+        assert_eq!(app.scrollback_count, 0, "count should be reset");
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
     }
 }

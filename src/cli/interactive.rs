@@ -1123,6 +1123,12 @@ async fn handle_key_event(
         return Ok(None);
     }
 
+    // S - toggle scrollback mode (view evicted output history)
+    if key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S') {
+        app.toggle_scrollback();
+        return Ok(None);
+    }
+
     // All other keys go to textarea
     use tui_textarea::Input;
     app.input.input(Input::from(key));
@@ -2909,6 +2915,10 @@ pub async fn run_interactive_shell_inner(
         .store(true, std::sync::atomic::Ordering::Release);
     let _guard = TerminalGuard;
     let mut app = App::new();
+    // Clear stale scrollback file from a previous session
+    if let Some(ref file_path) = app.scrollback_file {
+        let _ = std::fs::remove_file(file_path);
+    }
     if let Ok(cwd) = std::env::current_dir() {
         app.cwd = cwd.to_string_lossy().to_string();
     }
