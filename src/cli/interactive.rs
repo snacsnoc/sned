@@ -38,7 +38,7 @@ fn format_context_window(tokens: u64) -> String {
     } else if tokens >= 1_000 {
         format!("{}K context", tokens / 1_000)
     } else {
-        format!("{} context", tokens)
+        format!("{tokens} context")
     }
 }
 
@@ -101,7 +101,7 @@ fn build_user_message_content(
 
 fn strip_active_slash_command(text: &str) -> Option<String> {
     let query = crate::cli::slash_commands::extract_slash_query(text)?;
-    let start = text.rfind(&format!("/{}", query))?;
+    let start = text.rfind(&format!("/{query}"))?;
     Some(format!(
         "{}{}",
         &text[..start],
@@ -256,6 +256,7 @@ impl InteractiveSession {
     }
 
     /// Check if quiet mode is enabled (via --json flag which suppresses info output).
+    #[must_use] 
     pub fn is_quiet(&self) -> bool {
         self.task_opts.json
     }
@@ -289,13 +290,13 @@ impl InteractiveSession {
                             for block in blocks {
                                 if let AssistantContentBlock::Text(text) = block {
                                     let preview = text.text.chars().take(50).collect::<String>();
-                                    return Some(format!("Response: {}...", preview));
+                                    return Some(format!("Response: {preview}..."));
                                 }
                             }
                         }
                         MessageContent::Text(text) => {
                             let preview = text.chars().take(50).collect::<String>();
-                            return Some(format!("Response: {}...", preview));
+                            return Some(format!("Response: {preview}..."));
                         }
                         _ => {}
                     }
@@ -318,7 +319,7 @@ impl InteractiveSession {
             writer.emit(OutputEvent::RawAnsi(format!(
                 "{}\n",
                 crate::cli::colors::colorize(
-                    &format!("  📌 Last action: {}", action),
+                    &format!("  📌 Last action: {action}"),
                     crate::cli::colors::style::DIM
                 )
             )));
@@ -328,7 +329,7 @@ impl InteractiveSession {
             writer.emit(OutputEvent::RawAnsi(format!(
                 "{}\n",
                 crate::cli::colors::colorize(
-                    &format!("  📁 Files changed: {}", files_tracked),
+                    &format!("  📁 Files changed: {files_tracked}"),
                     crate::cli::colors::style::DIM
                 )
             )));
@@ -338,7 +339,7 @@ impl InteractiveSession {
     }
 
     pub async fn run(&self, prompt: Option<String>) -> anyhow::Result<()> {
-        tracing::debug!(target: "sned::session", "InteractiveSession::run() called, prompt={}", prompt.as_ref().map(|s| format!("{} chars", s.len())).unwrap_or("None".to_string()));
+        tracing::debug!(target: "sned::session", "InteractiveSession::run() called, prompt={}", prompt.as_ref().map_or("None".to_string(), |s| format!("{} chars", s.len())));
         let agent = self.agent_loop.clone();
         let state_manager = self.state_manager.clone();
 
@@ -400,7 +401,7 @@ impl InteractiveSession {
             loop_guard
                 .run(initial_messages, state_manager)
                 .await
-                .map_err(|e| anyhow::anyhow!("Agent error: {}", e))
+                .map_err(|e| anyhow::anyhow!("Agent error: {e}"))
         };
 
         // Always export on exit, even if the agent errored out.
@@ -587,9 +588,8 @@ fn approval_result_for_key(key: &KeyEvent) -> Option<ApprovalResult> {
             Some(ApprovalResult::Denied)
         }
         KeyCode::Char('y' | 'Y') => Some(ApprovalResult::Approved),
-        KeyCode::Char('n' | 'N') => Some(ApprovalResult::Denied),
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(ApprovalResult::Denied),
         KeyCode::Char('a' | 'A') => Some(ApprovalResult::Always),
-        KeyCode::Esc => Some(ApprovalResult::Denied),
         _ => None,
     }
 }
@@ -724,7 +724,7 @@ async fn run_agent_task(
     drop(agent_loop);
 
     if let Err(e) = result {
-        output_writer.emit(OutputEvent::warning(format!("Agent task failed: {}", e)));
+        output_writer.emit(OutputEvent::warning(format!("Agent task failed: {e}")));
         if retry_available {
             output_writer.emit(OutputEvent::warning(
                 "Retry available: type /retry to resend the last failed request verbatim.",
@@ -907,6 +907,7 @@ async fn handle_key_event(
             if let Some(sender) = take_followup_sender(task_id) {
                 let text = app.get_input_with_expanded_pastes();
                 app.push_user_message(&text, output_writer);
+                crate::core::approval::set_followup_question_active(task_id, false);
                 if sender.send(text).is_err() {
                     app.push_styled(
                         "Response discarded - prompt closed.",
@@ -1004,7 +1005,7 @@ async fn handle_key_event(
                 let mut state = sh.lock().await;
                 state.last_injected_plan_state_hash = None;
             }
-            app.push_plain(format!("Conversation cleared (confirmed via {}).", trigger));
+            app.push_plain(format!("Conversation cleared (confirmed via {trigger})."));
         } else {
             app.pending_clear = None;
             app.push_styled("Clear cancelled.", theme::dim_style());
@@ -1337,10 +1338,10 @@ async fn handle_cli_only_command(
                 Ok(new_provider) => {
                     let sess = session.lock().await;
                     sess.agent_loop_mut().await.set_provider(new_provider);
-                    app.push_plain(format!("Model switched to {}/{}", provider_name, model_id));
+                    app.push_plain(format!("Model switched to {provider_name}/{model_id}"));
                 }
                 Err(e) => {
-                    app.push_plain(format!("Failed to create provider: {}", e));
+                    app.push_plain(format!("Failed to create provider: {e}"));
                 }
             }
             return Ok(false);
@@ -1385,7 +1386,7 @@ async fn handle_cli_only_command(
                 if count == 0 {
                     app.push_plain("No messages queued.");
                 } else {
-                    app.push_plain(format!("{} message(s) queued:", count));
+                    app.push_plain(format!("{count} message(s) queued:"));
                     // Show queue preview (first few messages)
                     let messages = qh.peek_queued_messages(3).await;
                     for (i, msg) in messages.iter().enumerate() {
@@ -1425,7 +1426,7 @@ async fn handle_cli_only_command(
                 }
                 let count = sess.queue_handle().await.queued_message_count().await;
                 app.push_styled(
-                    format!("Retry queued to run next ({} in queue).", count),
+                    format!("Retry queued to run next ({count} in queue)."),
                     theme::dim_style(),
                 );
             } else {
@@ -1454,7 +1455,7 @@ async fn handle_cli_only_command(
             let checkpoints = match checkpoint_mgr.list_checkpoints().await {
                 Ok(cps) => cps,
                 Err(e) => {
-                    app.push_plain(format!("Failed to list checkpoints: {}", e));
+                    app.push_plain(format!("Failed to list checkpoints: {e}"));
                     return Ok(false);
                 }
             };
@@ -1465,7 +1466,7 @@ async fn handle_cli_only_command(
             }
 
             let most_recent = &checkpoints[0];
-            let current_hash = checkpoint_mgr.last_checkpoint().map(|h| h.as_str());
+            let current_hash = checkpoint_mgr.last_checkpoint().map(std::string::String::as_str);
             let changed_files = if let Some(current) = current_hash {
                 checkpoint_mgr
                     .get_changed_files(&most_recent.hash, Some(current))
@@ -1481,9 +1482,9 @@ async fn handle_cli_only_command(
                     Style::default().fg(theme::WARNING_FG),
                 );
                 for f in &changed_files {
-                    app.push_plain(format!("  - {}", f));
+                    app.push_plain(format!("  - {f}"));
                 }
-                app.push_plain("Continue? (y to cancel, Enter to confirm): ");
+                app.push_plain("Continue? (y/n): ");
 
                 let (sender, receiver) = std::sync::mpsc::channel();
                 crate::core::approval::set_followup_question_active(task_id, true);
@@ -1494,7 +1495,6 @@ async fn handle_cli_only_command(
                 })
                 .await;
 
-                crate::core::approval::clear_followup_sender(task_id);
                 crate::core::approval::set_followup_question_active(task_id, false);
 
                 let confirm = match response_result {
@@ -1511,7 +1511,7 @@ async fn handle_cli_only_command(
                     return Ok(false);
                 }
 
-                if confirm.trim().to_lowercase() == "y" {
+                if confirm.trim().to_lowercase() == "n" {
                     app.push_styled("Undo cancelled.", Style::default().fg(theme::WARNING_FG));
                     return Ok(false);
                 }
@@ -1527,20 +1527,19 @@ async fn handle_cli_only_command(
                     if !changed_files.is_empty() {
                         app.push_plain("\nReverted files:");
                         for f in &changed_files {
-                            app.push_plain(format!("  - {}", f));
+                            app.push_plain(format!("  - {f}"));
                         }
                     }
                     let removed = sess.agent_loop().await.remove_last_turn().await;
                     if removed > 0 {
                         app.push_plain(format!(
-                            "Removed {} message(s) from conversation history.",
-                            removed
+                            "Removed {removed} message(s) from conversation history."
                         ));
                     }
                 }
                 Err(e) => {
                     app.push_styled(
-                        format!("Undo failed: {}", e),
+                        format!("Undo failed: {e}"),
                         Style::default().fg(theme::ERROR_FG),
                     );
                 }
@@ -1563,7 +1562,7 @@ async fn handle_cli_only_command(
                         }
                         Err(e) => {
                             app.push_styled(
-                                format!("Failed to get diff: {}", e),
+                                format!("Failed to get diff: {e}"),
                                 Style::default().fg(theme::ERROR_FG),
                             );
                         }
@@ -1588,7 +1587,7 @@ async fn handle_cli_only_command(
                         }
                         Err(e) => {
                             app.push_styled(
-                                format!("Failed to get log: {}", e),
+                                format!("Failed to get log: {e}"),
                                 Style::default().fg(theme::ERROR_FG),
                             );
                         }
@@ -1634,7 +1633,6 @@ async fn handle_cli_only_command(
                                     })
                                     .await;
 
-                                    crate::core::approval::clear_followup_sender(task_id);
                                     crate::core::approval::set_followup_question_active(
                                         task_id, false,
                                     );
@@ -1663,7 +1661,7 @@ async fn handle_cli_only_command(
                                             }
                                             Err(e) => {
                                                 app.push_styled(
-                                                    format!("Commit failed: {}", e),
+                                                    format!("Commit failed: {e}"),
                                                     Style::default().fg(theme::ERROR_FG),
                                                 );
                                             }
@@ -1678,7 +1676,7 @@ async fn handle_cli_only_command(
                             }
                             Err(e) => {
                                 app.push_styled(
-                                    format!("Failed to get diff: {}", e),
+                                    format!("Failed to get diff: {e}"),
                                     Style::default().fg(theme::ERROR_FG),
                                 );
                             }
@@ -1709,7 +1707,7 @@ async fn handle_cli_only_command(
                     }
                 }
                 Err(e) => {
-                    app.push_plain(format!("Failed to list checkpoints: {}", e));
+                    app.push_plain(format!("Failed to list checkpoints: {e}"));
                 }
             }
         }
@@ -1722,7 +1720,7 @@ async fn handle_cli_only_command(
             let checkpoints = match checkpoint_mgr.list_checkpoints().await {
                 Ok(cps) => cps,
                 Err(e) => {
-                    app.push_plain(format!("Failed to list checkpoints: {}", e));
+                    app.push_plain(format!("Failed to list checkpoints: {e}"));
                     return Ok(false);
                 }
             };
@@ -1774,8 +1772,7 @@ async fn handle_cli_only_command(
             if let Some(checkpoint) = checkpoints.get(num - 1) {
                 let current_hash = checkpoint_mgr
                     .last_checkpoint()
-                    .map(|h| h.as_str())
-                    .unwrap_or("HEAD");
+                    .map_or("HEAD", std::string::String::as_str);
                 match checkpoint_mgr
                     .get_changed_files(&checkpoint.hash, Some(current_hash))
                     .await
@@ -1787,9 +1784,9 @@ async fn handle_cli_only_command(
                                 Style::default().fg(theme::WARNING_FG),
                             );
                             for file in &changed_files {
-                                app.push_plain(format!("  - {}", file));
+                                app.push_plain(format!("  - {file}"));
                             }
-                            app.push_plain("Continue? (y to cancel, Enter to confirm): ");
+                            app.push_plain("Continue? (y/n): ");
 
                             let (sender, receiver) = std::sync::mpsc::channel();
                             crate::core::approval::set_followup_question_active(task_id, true);
@@ -1800,7 +1797,6 @@ async fn handle_cli_only_command(
                             })
                             .await;
 
-                            crate::core::approval::clear_followup_sender(task_id);
                             crate::core::approval::set_followup_question_active(task_id, false);
 
                             let confirm = match response_result {
@@ -1817,7 +1813,7 @@ async fn handle_cli_only_command(
                                 return Ok(false);
                             }
 
-                            if confirm.trim().to_lowercase() == "y" {
+                            if confirm.trim().to_lowercase() == "n" {
                                 app.push_styled(
                                     "Restore cancelled.",
                                     Style::default().fg(theme::WARNING_FG),
@@ -1828,8 +1824,7 @@ async fn handle_cli_only_command(
                     }
                     Err(e) => {
                         app.push_plain(format!(
-                            "Warning: Could not determine changed files: {}",
-                            e
+                            "Warning: Could not determine changed files: {e}"
                         ));
                     }
                 }
@@ -1842,7 +1837,7 @@ async fn handle_cli_only_command(
                         ));
                     }
                     Err(e) => {
-                        app.push_plain(format!("Failed to restore checkpoint: {}", e));
+                        app.push_plain(format!("Failed to restore checkpoint: {e}"));
                     }
                 }
             }
@@ -1870,7 +1865,7 @@ async fn handle_cli_only_command(
                     }
                     app.push_plain("```");
                 } else {
-                    app.push_plain(format!("No snipped code block {}.", index));
+                    app.push_plain(format!("No snipped code block {index}."));
                 }
             } else {
                 app.push_plain("Usage: /expand N");
@@ -1937,7 +1932,7 @@ async fn handle_cli_only_command(
                                 app.push_plain("Step description cannot be empty.");
                             } else {
                                 plan.steps[step_num - 1].description = new_desc.trim().to_string();
-                                app.push_plain(format!("Step {} updated.", step_num));
+                                app.push_plain(format!("Step {step_num} updated."));
                             }
                         }
                         PlanSubcommand::Add(after_step, step_text) => {
@@ -1955,7 +1950,7 @@ async fn handle_cli_only_command(
                                                 plan.steps.len()
                                             ));
                                         }
-                                        Err(e) => app.push_plain(format!("Error: {}", e)),
+                                        Err(e) => app.push_plain(format!("Error: {e}")),
                                     }
                                 } else {
                                     let after_idx = after_step - 1;
@@ -1969,7 +1964,7 @@ async fn handle_cli_only_command(
                                                 plan.steps.len()
                                             ));
                                         }
-                                        Err(e) => app.push_plain(format!("Error: {}", e)),
+                                        Err(e) => app.push_plain(format!("Error: {e}")),
                                     }
                                 }
                         }
@@ -1989,7 +1984,7 @@ async fn handle_cli_only_command(
                                         step_num,
                                         plan.steps.len()
                                     )),
-                                    Err(e) => app.push_plain(format!("Error: {}", e)),
+                                    Err(e) => app.push_plain(format!("Error: {e}")),
                                 }
                             }
                         }
@@ -2012,8 +2007,7 @@ async fn handle_cli_only_command(
                                             };
                                             state.last_injected_plan_state_hash = None;
                                             app.push_plain(format!(
-                                                "Plan replaced ({} steps).",
-                                                plan_len
+                                                "Plan replaced ({plan_len} steps)."
                                             ));
                                         }
                                         Some(_) => app.push_plain("Plan must have at least 1 step."),
@@ -2142,12 +2136,11 @@ async fn handle_cli_only_command(
                             drop(state);
                             drop(sess);
                             app.push_plain(format!(
-                                "Plan resumed at step {}/{}: {}",
-                                step_num, step_total, step_desc
+                                "Plan resumed at step {step_num}/{step_total}: {step_desc}"
                             ));
                             // Spawn agent to resume plan execution
                             let prompt =
-                                format!("Execute step {}/{}: {}", step_num, step_total, step_desc);
+                                format!("Execute step {step_num}/{step_total}: {step_desc}");
                             spawn_agent_task(
                                 session,
                                 &prompt,
@@ -2217,15 +2210,14 @@ async fn handle_cli_only_command(
 fn serialize_conversation_export<T: serde::Serialize>(history: &T) -> Result<String, String> {
     serde_json::to_string_pretty(history)
         .map(|json| crate::cli::redact::redact_secrets(&json).into_owned())
-        .map_err(|e| format!("Failed to serialize conversation: {}", e))
+        .map_err(|e| format!("Failed to serialize conversation: {e}"))
 }
 
 fn write_conversation_export(export_path: &str, export_data: &str) -> Result<String, String> {
     crate::storage::disk::atomic_write_file(export_path, export_data)
-        .map_err(|e| format!("Failed to write export file: {}", e))?;
+        .map_err(|e| format!("Failed to write export file: {e}"))?;
     Ok(format!(
-        "Conversation exported to: {} (secrets redacted)",
-        export_path
+        "Conversation exported to: {export_path} (secrets redacted)"
     ))
 }
 
@@ -2342,7 +2334,7 @@ async fn run_main_loop(
                     self.first_output_emit_time,
                     self.first_render_time,
                 ) {
-                    eprintln!("{}", line);
+                    eprintln!("{line}");
                 }
             }
         }
@@ -2728,8 +2720,7 @@ async fn run_main_loop(
                                             // Message already echoed by handle_key_event
                                             app.push_styled(
                                                 format!(
-                                                    "Command queued ({} in queue): {}",
-                                                    count, text
+                                                    "Command queued ({count} in queue): {text}"
                                                 ),
                                                 theme::dim_style(),
                                             );
@@ -2751,7 +2742,7 @@ async fn run_main_loop(
                                     qh.enqueue_text_message(processed).await;
                                     let count = qh.queued_message_count().await;
                                     app.push_styled(
-                                        format!("Message queued ({} in queue)", count),
+                                        format!("Message queued ({count} in queue)"),
                                         theme::dim_style(),
                                     );
                                 } else {
@@ -2869,7 +2860,7 @@ async fn run_main_loop(
         {
             let new_elapsed = start.elapsed();
             let new_secs = new_elapsed.as_secs();
-            let old_secs = app.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
+            let old_secs = app.elapsed.map_or(u64::MAX, |e| e.as_secs());
             app.elapsed = Some(new_elapsed);
             if new_secs != old_secs {
                 app.needs_redraw = true;
@@ -3051,6 +3042,7 @@ pub async fn run_interactive_shell_inner(
     }
     Ok(())
 }
+#[must_use] 
 pub fn should_start_interactive_shell(
     has_prompt: bool,
     stdin_is_tty: bool,
@@ -3060,6 +3052,7 @@ pub fn should_start_interactive_shell(
     !has_prompt && stdin_is_tty && stdout_is_tty && !json
 }
 
+#[must_use] 
 pub fn render_interactive_prompt_prefix() -> String {
     crate::cli::colors::colorize(
         "❯ ",
