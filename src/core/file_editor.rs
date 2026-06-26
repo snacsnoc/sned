@@ -23,8 +23,9 @@ use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor, st
 /// Split file content into logical lines while preserving a trailing empty line
 /// when the file ends with `\n`. Anchor reconciliation and edit resolution must
 /// use identical line semantics.
+#[must_use] 
 pub fn split_content_lines(content: &str) -> Vec<String> {
-    content.split('\n').map(|s| s.to_string()).collect()
+    content.split('\n').map(std::string::ToString::to_string).collect()
 }
 
 // ============================================================================
@@ -46,12 +47,13 @@ pub enum FileEditorError {
 
 impl FileEditorError {
     /// Return an actionable display string with a suggestion for fixing the error.
+    #[must_use] 
     pub fn actionable_display(&self) -> String {
         match self {
             Self::AllEditsFailed { message } => {
                 let suggestion = "Check that the file content matches the anchors. \
                      Re-read the file to get fresh anchors before editing.";
-                format!("{}\n  Suggestion: {}", message, suggestion)
+                format!("{message}\n  Suggestion: {suggestion}")
             }
             _ => self.to_string(),
         }
@@ -151,7 +153,7 @@ impl AnchorStorage {
 
     fn get_dictionary(&mut self) -> &[String] {
         if self.dictionary.is_empty() {
-            self.dictionary = ANCHOR_DICTIONARY.iter().map(|s| s.to_string()).collect();
+            self.dictionary = ANCHOR_DICTIONARY.iter().map(std::string::ToString::to_string).collect();
         }
         &self.dictionary
     }
@@ -256,6 +258,7 @@ pub struct AnchorStateManager {
 }
 
 impl AnchorStateManager {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             storage: Arc::new(Mutex::new(AnchorStorage::load())),
@@ -290,7 +293,7 @@ impl AnchorStateManager {
 
             let w1 = &dictionary[idx1];
             let w2 = &dictionary[idx2];
-            let word = format!("{}{}", w1, w2);
+            let word = format!("{w1}{w2}");
 
             if !used_words_set.contains(&word) {
                 return word;
@@ -302,7 +305,7 @@ impl AnchorStateManager {
             if salt > 1000 {
                 let idx3 = ((mixed_hash >> 8) as usize) % dict_len;
                 let w3 = &dictionary[idx3];
-                let word3 = format!("{}{}{}", w1, w2, w3);
+                let word3 = format!("{w1}{w2}{w3}");
                 if !used_words_set.contains(&word3) {
                     return word3;
                 }
@@ -315,7 +318,7 @@ impl AnchorStateManager {
         }
 
         // Final fallback: generate a unique word with hash suffix
-        format!("Word{:08x}", line_hash)
+        format!("Word{line_hash:08x}")
     }
 
     fn get_task_state(&self, task_id: &str) -> IndexMap<String, TrackedDocument> {
@@ -374,6 +377,7 @@ impl AnchorStateManager {
 
     /// Reconciles the current file content with saved state using diff.
     ///
+    #[must_use] 
     pub fn reconcile(
         &self,
         absolute_path: &str,
@@ -385,7 +389,7 @@ impl AnchorStateManager {
         // Safeguard for massive files
         if current_lines.len() > MAX_TRACKED_LINES {
             return (1..=current_lines.len())
-                .map(|i| format!("L{}", i))
+                .map(|i| format!("L{i}"))
                 .collect();
         }
 
@@ -432,17 +436,6 @@ impl AnchorStateManager {
                 used_words_vec.push_back(word.clone());
                 used_words_set.insert(word.clone());
                 anchors.push(word);
-            }
-
-            // Cap used_words to prevent memory bloat
-            if used_words_vec.len() > MAX_USED_WORDS {
-                // Remove oldest-inserted entries (first half of VecDeque)
-                let to_remove_count = used_words_vec.len() / 2;
-                for _ in 0..to_remove_count {
-                    if let Some(word) = used_words_vec.pop_front() {
-                        used_words_set.remove(&word);
-                    }
-                }
             }
 
             let tracked = TrackedDocument {
@@ -502,6 +495,13 @@ impl AnchorStateManager {
             }
         }
 
+        // Evict oldest entries to prevent unbounded growth in repeated reconcile cycles
+        while new_used_words_vec.len() > MAX_USED_WORDS {
+            if let Some(oldest) = new_used_words_vec.pop_front() {
+                new_used_words_set.remove(&oldest);
+            }
+        }
+
         let tracked = TrackedDocument {
             hashes: current_hashes,
             anchors: new_anchors,
@@ -518,6 +518,7 @@ impl AnchorStateManager {
     }
 
     /// Returns true if the file is currently being tracked.
+    #[must_use] 
     pub fn is_tracking(&self, absolute_path: &str, task_id: Option<&str>) -> bool {
         let task_id = task_id.unwrap_or("default");
         let state = self.get_task_state(task_id);
@@ -525,6 +526,7 @@ impl AnchorStateManager {
     }
 
     /// Gets current anchors for a file if it's being tracked.
+    #[must_use] 
     pub fn get_anchors(&self, absolute_path: &str, task_id: Option<&str>) -> Option<Vec<String>> {
         let task_id = task_id.unwrap_or("default");
         let state = self.get_task_state(task_id);
@@ -627,14 +629,14 @@ pub struct Edit {
 }
 
 /// A file with multiple edits.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEdit {
     pub path: String,
     pub edits: Vec<Edit>,
 }
 
 /// A resolved edit with line indices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedEdit {
     pub line_idx: usize,
     pub end_idx: usize,
@@ -642,14 +644,14 @@ pub struct ResolvedEdit {
 }
 
 /// A failed edit with error message.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedEdit {
     pub edit: Edit,
     pub error: String,
 }
 
 /// An applied edit with metadata.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedEdit {
     pub start_idx: usize,
     pub end_idx: usize,
@@ -670,11 +672,13 @@ pub struct AppliedEdit {
 pub struct EditExecutor;
 
 impl EditExecutor {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
 
     /// Resolves edits to line indices.
+    #[must_use] 
     pub fn resolve_edits(
         &self,
         edits: &[Edit],
@@ -720,16 +724,16 @@ impl EditExecutor {
                 diagnostics.push("Range error: anchor must refer to a line that precedes or is the same as end_anchor.".to_string());
             }
 
-            if !diagnostics.is_empty() {
-                failed_edits.push(FailedEdit {
-                    edit: edit.clone(),
-                    error: diagnostics.join(" "),
-                });
-            } else {
+            if diagnostics.is_empty() {
                 resolved_edits.push(ResolvedEdit {
                     line_idx,
                     end_idx,
                     edit: edit.clone(),
+                });
+            } else {
+                failed_edits.push(FailedEdit {
+                    edit: edit.clone(),
+                    error: diagnostics.join(" "),
                 });
             }
         }
@@ -747,7 +751,7 @@ impl EditExecutor {
     ) -> (usize, Option<String>) {
         let anchor_raw = raw_anchor.trim();
         if anchor_raw.is_empty() {
-            return (usize::MAX, Some(format!("{} is missing.", anchor_type)));
+            return (usize::MAX, Some(format!("{anchor_type} is missing.")));
         }
 
         if anchor_raw.contains('\n') || anchor_raw.contains('\r') {
@@ -773,8 +777,7 @@ impl EditExecutor {
             return (
                 usize::MAX,
                 Some(format!(
-                    "{} is missing or incorrectly formatted. It must start with a single word followed by the delimiter (e.g., \"Apple{}\"). COPY THE EXACT ANCHOR STRING FROM read_file OUTPUT (e.g., \"Crawler§void draw_game_over() {{\"). Do NOT use raw source lines without the Word§ prefix.",
-                    anchor_type, ANCHOR_DELIMITER
+                    "{anchor_type} is missing or incorrectly formatted. It must start with a single word followed by the delimiter (e.g., \"Apple{ANCHOR_DELIMITER}\"). COPY THE EXACT ANCHOR STRING FROM read_file OUTPUT (e.g., \"Crawler§void draw_game_over() {{\"). Do NOT use raw source lines without the Word§ prefix."
                 )),
             );
         }
@@ -805,8 +808,7 @@ impl EditExecutor {
             return (
                 usize::MAX,
                 Some(format!(
-                    "{} \"{}\" not found in the file. Please ensure you are using the latest anchors from the most recent read_file output. COPY THE EXACT ANCHOR STRING FROM read_file OUTPUT (e.g., \"Crawler§void draw_game_over() {{\"). Do NOT modify the anchor text or omit the Word§ prefix.",
-                    anchor_type, anchor_name
+                    "{anchor_type} \"{anchor_name}\" not found in the file. Please ensure you are using the latest anchors from the most recent read_file output. COPY THE EXACT ANCHOR STRING FROM read_file OUTPUT (e.g., \"Crawler§void draw_game_over() {{\"). Do NOT modify the anchor text or omit the Word§ prefix."
                 )),
             );
         }
@@ -843,8 +845,7 @@ impl EditExecutor {
             return (
                 usize::MAX,
                 Some(format!(
-                    "{} \"{}\" exists, but the code line you provided does not match the file's content at any location with this anchor. Please use the latest anchors from the most recent read tool output.",
-                    anchor_type, anchor_name
+                    "{anchor_type} \"{anchor_name}\" exists, but the code line you provided does not match the file's content at any location with this anchor. Please use the latest anchors from the most recent read tool output."
                 )),
             );
         }
@@ -938,7 +939,7 @@ impl EditExecutor {
             let replacement_lines: Vec<String> = if clean_text.is_empty() {
                 Vec::new()
             } else {
-                clean_text.lines().map(|s| s.to_string()).collect()
+                clean_text.lines().map(std::string::ToString::to_string).collect()
             };
 
             let (removed_in_this_edit, splice_index) = if edit_type == "insert_after" {
@@ -1001,10 +1002,11 @@ impl EditExecutor {
     }
 
     /// Formats a failure message for an edit.
+    #[must_use] 
     pub fn format_failure_message(&self, edit: &Edit, error: Option<&str>) -> String {
         let diagnostic = error.map_or_else(
             || " This almost certainly is because the anchors used were incorrect or not in ascending order or the text supplied was incorrect. please check again edit again".to_string(),
-            |e| format!(" Diagnostics: {}", e),
+            |e| format!(" Diagnostics: {e}"),
         );
         format!(
             "Edit (anchor: \"{}\", end_anchor: \"{}\") failed.{}",
@@ -1027,6 +1029,7 @@ pub struct FileEditor {
 }
 
 impl FileEditor {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             executor: EditExecutor::new(),
@@ -1035,6 +1038,7 @@ impl FileEditor {
     }
 
     /// Reconciles anchors for a file and returns the anchor words.
+    #[must_use] 
     pub fn reconcile_anchors(
         &self,
         absolute_path: &str,
@@ -1082,7 +1086,7 @@ impl FileEditor {
         let final_content = final_lines.join("\n");
 
         // Reconcile anchors for the modified content
-        self.anchor_mgr
+        let _ = self.anchor_mgr
             .reconcile(absolute_path, &final_lines, task_id);
 
         Ok((final_content, applied_edits, failed_edits))
