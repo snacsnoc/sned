@@ -10,13 +10,12 @@
 //! - Handle errors gracefully
 
 use crate::core::agent_loop::TaskState;
-use crate::core::file_editor::AnchorStateManager;
+use crate::core::file_editor::{AnchorStateManager, split_content_lines};
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
 use std::pin::Pin;
 use futures::StreamExt;
-use tokio::io::AsyncBufReadExt;
 
 fn max_file_read_size() -> usize {
     use std::sync::OnceLock;
@@ -28,8 +27,7 @@ fn max_file_read_size() -> usize {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .map(|v| v.min(max_allowed))
-            .unwrap_or(default_size)
+            .map_or(default_size, |v| v.min(max_allowed))
     })
 }
 
@@ -54,6 +52,7 @@ struct FileReadResult {
 pub struct ReadFileHandler;
 
 impl ReadFileHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -141,7 +140,7 @@ impl ReadFileHandler {
         if !metadata.is_file() {
             let err = crate::cli::actionable_errors::file_not_found(
                 path,
-                &format!("{} is not a file", path),
+                &format!("{path} is not a file"),
             );
             return FileReadResult {
                 path: path.to_string(),
@@ -171,11 +170,10 @@ impl ReadFileHandler {
                         let size_kb = metadata.len() / 1024;
                         let max_kb = max_file_read_size() as u64 / 1024;
                         (
-                            content.clone(),
+                            content,
                             lines.clone(),
                             Some(format!(
-                                "[Note: File truncated to {}KB (file is {}KB). Use start_line and end_line parameters to read specific sections.]",
-                                max_kb, size_kb
+                                "[Note: File truncated to {max_kb}KB (file is {size_kb}KB). Use start_line and end_line parameters to read specific sections.]"
                             )),
                             Some(lines.clone()),
                             0,
@@ -247,9 +245,9 @@ impl ReadFileHandler {
         // Calculate file-level hash
         let hash = content_hash(&content_for_hash);
 
-        let mut content = format!("[File: {}, Hash: {}]\n{}", path, hash, anchored_content);
+        let mut content = format!("[File: {path}, Hash: {hash}]\n{anchored_content}");
         if let Some(note) = clamping_note {
-            content = format!("{}\n{}", note, content);
+            content = format!("{note}\n{content}");
         }
 
         FileReadResult {
@@ -313,8 +311,9 @@ impl ReadFileHandler {
             }
         };
 
-        // Use .lines() to strip \r from CRLF line endings, matching read_full_file behavior
-        let all_lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
+        // Use split_content_lines() to match edit_file.rs line semantics: split('\n')
+        // preserves \r from CRLF line endings, ensuring anchor consistency.
+        let all_lines: Vec<String> = split_content_lines(&content);
         let total_lines = all_lines.len();
 
         // Calculate the actual range (with clamping)
@@ -343,8 +342,7 @@ impl ReadFileHandler {
 
         let clamping_note = if clamped_start != original_start {
             Some(format!(
-                "[Note: start_line was clamped from {} to {} (file has {} lines)]",
-                original_start, clamped_start, total_lines
+                "[Note: start_line was clamped from {original_start} to {clamped_start} (file has {total_lines} lines)]"
             ))
         } else {
             None
@@ -362,34 +360,19 @@ impl ReadFileHandler {
     }
 
     /// Read the entire file using BufReader for reduced peak memory.
-    ///
-    /// Instead of `read_to_string` (which allocates the full file as one String,
-    /// then `.lines()` allocates again as Vec<String> — 2x peak memory), we use
-    /// `BufReader` to read line-by-line. Only the Vec<String> is retained, so
-    /// peak memory is ~1x file size instead of ~2x.
-    ///
-    /// For large files, emits progress events via `output_writer` every N lines.
+    /// Reads the full file content and splits it into lines using `split_content_lines()`.
+    /// Files at this point are known to be under 100KB (caller check), so reading at once is fine.
     async fn read_full_file(
         &self,
         path: &str,
-        output_writer: Option<&crate::cli::output::OutputWriterArc>,
+        _output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Result<(String, Vec<String>), FileReadResult> {
-        use tokio::io::BufReader;
-
-        let file = match tokio::fs::File::open(path).await {
-            Ok(f) => f,
+        // Read full file content for hash computation and line splitting.
+        // Files at this point are known to be under 100KB (caller check).
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(c) => c,
             Err(e) => {
-                let err_msg = if e.kind() == std::io::ErrorKind::InvalidData {
-                    format!(
-                        "File appears to be binary or contains invalid UTF-8. \
-                         Use a line range to read specific portions, or use a hex editor for binary files. \
-                         Original error: {}",
-                        e
-                    )
-                } else {
-                    format!("Error reading file: {}", e)
-                };
-                let err = crate::cli::actionable_errors::file_not_found(path, &err_msg);
+                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return Err(FileReadResult {
                     path: path.to_string(),
                     canonical_path: None,
@@ -401,53 +384,8 @@ impl ReadFileHandler {
             }
         };
 
-        let reader = BufReader::new(file);
-        let mut lines_stream = reader.lines();
-        let mut lines: Vec<String> = Vec::new();
-        let mut line_count: usize = 0;
-        let progress_interval: usize = 5000;
+        let lines = split_content_lines(&content);
 
-        while let Some(line) = lines_stream.next_line().await.map_err(|e| {
-            let err_msg = format!("Error reading file: {}", e);
-            let err = crate::cli::actionable_errors::file_not_found(path, &err_msg);
-            FileReadResult {
-                path: path.to_string(),
-                canonical_path: None,
-                content: String::new(),
-                hash: String::new(),
-                success: false,
-                error: Some(err.display()),
-            }
-        })? {
-            lines.push(line);
-            line_count += 1;
-
-            if let Some(writer) = output_writer
-                && line_count.is_multiple_of(progress_interval)
-            {
-                use crate::cli::tui::theme::INFO_FG;
-                use ratatui::style::{Modifier, Style};
-                writer.emit(crate::cli::output::OutputEvent::tool_output_line(
-                    format!("  Reading {}: {} lines...", path, line_count),
-                    Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
-                ));
-            }
-        }
-
-        if let Some(writer) = output_writer
-            && line_count >= progress_interval
-        {
-            use crate::cli::tui::theme::INFO_FG;
-            use ratatui::style::{Modifier, Style};
-            writer.emit(crate::cli::output::OutputEvent::tool_output_line(
-                format!("  Read {} lines from {}", line_count, path),
-                Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
-            ));
-        }
-
-        // Join lines for content_hash — this is the same as the old read_to_string
-        // result but built from the Vec we already own (no extra allocation).
-        let content = lines.join("\n");
         Ok((content, lines))
     }
 
@@ -515,7 +453,7 @@ impl ReadFileHandler {
             }
         };
 
-        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = split_content_lines(&content);
         Ok((content, lines))
     }
 
@@ -610,9 +548,8 @@ impl ReadFileHandler {
                     use ratatui::style::Style;
                     writer.emit(OutputEvent::tool_output_line(
                         format!(
-                            "⚠ {} has been read {} times consecutively with no edit. \
-                             If you have the anchors you need, call edit_file now.",
-                            path_str, count
+                            "⚠ {path_str} has been read {count} times consecutively with no edit. \
+                             If you have the anchors you need, call edit_file now."
                         ),
                         Style::default().fg(WARNING_FG),
                     ));
@@ -667,7 +604,6 @@ impl ToolHandler for ReadFileHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             let (paths, start_line, end_line) = Self::parse_params(&params)?;
 
@@ -710,7 +646,7 @@ impl ToolHandler for ReadFileHandler {
 mod tests {
     use super::*;
     use crate::core::agent_loop::TaskState;
-    use crate::core::file_editor::AnchorStateManager;
+use crate::core::file_editor::{AnchorStateManager, split_content_lines};
     use crate::core::tools::{ToolContext, ToolHandler};
     use std::io::Write;
     use std::sync::Arc;
@@ -1031,10 +967,8 @@ mod tests {
 
         assert!(result.is_ok());
         let rendered = drain_rendered_output(&mut rx);
-        assert_eq!(rendered.len(), 2);
-        assert!(rendered[0].contains("Reading"));
-        assert!(rendered[0].contains("5000 lines"));
-        assert!(rendered[1].contains("Read 5001 lines"));
+        // read_full_file no longer emits progress events (simplified for <100KB files)
+        assert_eq!(rendered.len(), 0);
     }
 
     #[tokio::test]
@@ -1154,7 +1088,7 @@ mod tests {
         assert!(
             result
                 .content
-                .contains("[Note: start_line was clamped from 999 to 1 (file has 10 lines)]")
+                .contains("[Note: start_line was clamped from 999 to 1 (file has 11 lines)]")
         );
     }
 
@@ -1232,12 +1166,12 @@ mod tests {
 
         assert!(result.success);
         assert!(result.content.contains("line 100"));
-        assert!(result.content.contains("line 50"));
-        assert!(!result.content.contains("line 49"));
+        assert!(result.content.contains("line 51"));
+        assert!(!result.content.contains("line 50"));
         assert!(
             result
                 .content
-                .contains("[Note: start_line was clamped from 200 to 50 (file has 100 lines)]")
+                .contains("[Note: start_line was clamped from 200 to 51 (file has 101 lines)]")
         );
     }
 
@@ -1288,12 +1222,12 @@ mod tests {
             .get_anchors(temp_file.path().to_str().unwrap(), Some(task_id))
             .expect("file should be tracked");
 
-        // The anchor state should have 100 entries (one per line in the full file),
+        // The anchor state should have 101 entries (one per split element, including trailing empty),
         // not 11 (the visible slice)
         assert_eq!(
             anchors.len(),
-            100,
-            "anchor state should have anchors for all 100 lines, not just the 11 visible lines"
+            101,
+            "anchor state should have anchors for all 101 split elements, not just the 11 visible lines"
         );
 
         // Verify that an anchor from outside the visible range (e.g., line 50) exists
