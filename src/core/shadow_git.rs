@@ -29,7 +29,7 @@ pub fn init_shadow_repo(workspace_root: &Path) -> Result<()> {
 
     // Create parent directories
     std::fs::create_dir_all(&shadow_git_path)
-        .with_context(|| format!("Failed to create shadow git dir: {:?}", shadow_git_path))?;
+        .with_context(|| format!("Failed to create shadow git dir: {shadow_git_path:?}"))?;
 
     // Initialize git repo
     let output = Command::new("git")
@@ -87,7 +87,7 @@ fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Re
     fs::create_dir_all(exclude_file_abs.parent().unwrap()).ok();
     let mut f = fs::File::create(&exclude_file_abs).context("Failed to create exclude file")?;
     for ignore in &default_ignores {
-        writeln!(f, "{}", ignore).ok();
+        writeln!(f, "{ignore}").ok();
     }
     drop(f);
 
@@ -124,7 +124,7 @@ fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Re
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("no files added") {
-            anyhow::bail!("git add failed: {}", stderr);
+            anyhow::bail!("git add failed: {stderr}");
         }
         // No files to add is OK for initial commit
     }
@@ -218,7 +218,7 @@ pub fn undo_last_turn(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>
     let added_files: Vec<String> = String::from_utf8_lossy(&added_files_output.stdout)
         .lines()
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     // Get files modified in the last turn
@@ -236,7 +236,7 @@ pub fn undo_last_turn(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>
     let modified_files: Vec<String> = String::from_utf8_lossy(&modified_files_output.stdout)
         .lines()
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     // Check for uncommitted changes outside the last turn's modified files
@@ -255,8 +255,15 @@ pub fn undo_last_turn(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>
             .lines()
             .filter(|s| !s.is_empty())
             .map(|s| {
-                // porcelain format: "XY filename" or "XY old_filename -> new_filename"
-                s.split_whitespace().nth(1).unwrap_or("").to_string()
+                // porcelain format: "XY filename" or "R1 old_name -> new_name"
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                let status = parts.first().unwrap_or(&"");
+                if status.starts_with('R') {
+                    // Renames: "R1 old_name -> new_name" — use the new name
+                    parts.last().map(|p| p.to_string()).unwrap_or_default()
+                } else {
+                    parts.get(1).map(|p| p.to_string()).unwrap_or_default()
+                }
             })
             .filter(|s| !s.is_empty())
             .collect();
@@ -303,7 +310,7 @@ pub fn undo_last_turn(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>
         let file_path = workspace_root.join(file);
         if file_path.exists() {
             std::fs::remove_file(&file_path)
-                .with_context(|| format!("Failed to remove added file: {}", file))?;
+                .with_context(|| format!("Failed to remove added file: {file}"))?;
         }
         // Remove empty parent directories to avoid accumulating orphan dirs
         if let Some(parent) = file_path.parent()
@@ -325,11 +332,11 @@ pub fn diff_turns(workspace_root: &Path, from: usize, to: usize) -> Result<Strin
         anyhow::bail!("Shadow git repo not initialized");
     }
 
-    let from_ref = format!("HEAD~{}", from);
+    let from_ref = format!("HEAD~{from}");
     let to_ref = if to == 0 {
         "HEAD".to_string()
     } else {
-        format!("HEAD~{}", to)
+        format!("HEAD~{to}")
     };
 
     let output = Command::new("git")
@@ -411,7 +418,7 @@ pub fn commit_to_real_git(workspace_root: &Path, message: &str) -> Result<Vec<St
     let changed_files: Vec<String> = String::from_utf8_lossy(&diff_output.stdout)
         .lines()
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     if changed_files.is_empty() {
@@ -455,6 +462,7 @@ pub fn commit_to_real_git(workspace_root: &Path, message: &str) -> Result<Vec<St
 }
 
 /// Check if shadow git is initialized.
+#[must_use] 
 pub fn is_initialized(workspace_root: &Path) -> bool {
     workspace_root.join(SHADOW_GIT_DIR).join("HEAD").exists()
 }
@@ -483,7 +491,7 @@ pub fn get_user_edits_since_last_turn(workspace_root: &Path) -> Result<Vec<Strin
     let modified_files: Vec<String> = String::from_utf8_lossy(&modified_files_output.stdout)
         .lines()
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     // Get files added in the last turn
@@ -502,7 +510,7 @@ pub fn get_user_edits_since_last_turn(workspace_root: &Path) -> Result<Vec<Strin
     let added_files: Vec<String> = String::from_utf8_lossy(&added_files_output.stdout)
         .lines()
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     // Check for user edits (files modified in working tree but not in last turn)
@@ -531,6 +539,7 @@ pub fn get_user_edits_since_last_turn(workspace_root: &Path) -> Result<Vec<Strin
 }
 
 /// Get the number of turns (commits) in the shadow repo.
+#[must_use] 
 pub fn turn_count(workspace_root: &Path) -> usize {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 

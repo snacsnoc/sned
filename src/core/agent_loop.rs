@@ -1917,11 +1917,6 @@ impl AgentLoop {
                                         code_block_full_buffer.push(code_line.clone());
                                         if code_block_lines > code_block_display_limit {
                                             code_block_snipped = true;
-                                            // Prevent CPU spinning on pause
-                                            tokio::time::sleep(std::time::Duration::from_millis(
-                                                500,
-                                            ))
-                                            .await;
                                             continue;
                                         }
 

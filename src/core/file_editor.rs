@@ -495,12 +495,12 @@ impl AnchorStateManager {
             }
         }
 
-        // Evict oldest entries to prevent unbounded growth in repeated reconcile cycles
-        while new_used_words_vec.len() > MAX_USED_WORDS {
-            if let Some(oldest) = new_used_words_vec.pop_front() {
-                new_used_words_set.remove(&oldest);
-            }
-        }
+        // Cap used_words_vec to MAX_USED_WORDS to prevent unbounded growth
+        // in repeated reconcile cycles where new_used_words_vec accumulates entries.
+        new_used_words_vec = new_used_words_vec
+            .into_iter()
+            .take(MAX_USED_WORDS)
+            .collect();
 
         let tracked = TrackedDocument {
             hashes: current_hashes,

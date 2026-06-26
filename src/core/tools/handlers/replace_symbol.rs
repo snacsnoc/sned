@@ -338,12 +338,18 @@ async fn process_batch(
                     index_service.get_definitions(&r.symbol, None)
                 };
                 let mut result = None;
+                let project_root = {
+                    let index_service = mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    index_service.get_project_root().to_string()
+                };
                 for loc in locations {
                     if let Some(loc_path) = &loc.path {
-                        let rel_path = std::path::Path::new(&batch.absolute_path);
-                        let abs_path_str = rel_path.to_str().unwrap_or("");
-                        if loc_path == abs_path_str
-                            || loc_path.starts_with(&format!("{}/", abs_path_str))
+                        let abs_loc_path = std::path::Path::new(&project_root)
+                            .join(loc_path)
+                            .to_string_lossy()
+                            .into_owned();
+                        if abs_loc_path == batch.absolute_path
+                            || abs_loc_path.starts_with(&format!("{}/", batch.absolute_path))
                         {
                             let start_index = calculate_byte_offset(
                                 &original_content,

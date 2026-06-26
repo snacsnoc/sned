@@ -107,7 +107,12 @@ impl RenameSymbolHandler {
             )));
         }
 
-        let expanded_paths = expand_paths(&paths, workspace_root).await?;
+        let expanded_paths: Vec<String> = expand_paths(&paths, workspace_root)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
 
         // Read file contents and parse symbols outside the lock to avoid blocking tokio workers
         let mut file_contents: HashMap<String, String> = HashMap::with_capacity(paths.len().max(1));

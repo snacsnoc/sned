@@ -146,20 +146,6 @@ impl CheckpointTracker {
     /// Fails if there are uncommitted changes in the working tree.
     pub fn restore(&self, commit_hash: &str) -> Result<(), CheckpointError> {
         // Check for uncommitted changes to prevent destructive reset
-        let status_output = Self::run_git_cmd_with_worktree(
-            &self.shadow_git_path,
-            &self.cwd,
-            &["status", "--porcelain"],
-        );
-
-        if let Err(e) = status_output {
-            return Err(CheckpointError::CommandFailed(format!(
-                "git status failed: {e}"
-            )));
-        }
-
-        // status_output returns Ok(()) on success, but we need the actual output
-        // Re-run to get the output for checking uncommitted changes
         let status_output = Command::new("git")
             .args([
                 "--git-dir",
