@@ -136,8 +136,7 @@ fn truncate_tool_result(result: &str) -> String {
     let remaining_lines = original_lines - truncated_lines;
 
     format!(
-        "{}\n\n[{} lines truncated, use read_file to see full content]",
-        truncated, remaining_lines
+        "{truncated}\n\n[{remaining_lines} lines truncated, use read_file to see full content]"
     )
 }
 
@@ -162,10 +161,7 @@ fn get_terminal_width() -> usize {
     let mut cache = TERM_WIDTH_CACHE.lock().unwrap();
     let now = Instant::now();
 
-    let needs_refresh = cache
-        .as_ref()
-        .map(|(_, last)| now.duration_since(*last) >= REFRESH_INTERVAL)
-        .unwrap_or(true);
+    let needs_refresh = cache.as_ref().is_none_or(|(_, last)| now.duration_since(*last) >= REFRESH_INTERVAL);
 
     if needs_refresh {
         let width = crossterm::terminal::size()
@@ -174,7 +170,7 @@ fn get_terminal_width() -> usize {
         *cache = Some((width, now));
         width
     } else {
-        cache.as_ref().map(|(w, _)| *w).unwrap_or(80)
+        cache.as_ref().map_or(80, |(w, _)| *w)
     }
 }
 
@@ -281,7 +277,7 @@ fn print_code_block(
     let highlighted = crate::cli::syntax_highlight::highlight_code(&code, lang);
     output_writer.emit(OutputEvent::RawAnsi(format!(
         "  {}\n",
-        highlighted.replace("\n", "\n  ")
+        highlighted.replace('\n', "\n  ")
     )));
 }
 
@@ -296,8 +292,7 @@ fn code_block_display_limit(interactive_mode: bool) -> usize {
 fn snipped_code_block_hint(index: Option<usize>) -> String {
     match index {
         Some(index) => format!(
-            "  ... [snipped - type /expand {} to show full block]",
-            index
+            "  ... [snipped - type /expand {index} to show full block]"
         ),
         None => "  ... [snipped]".to_string(),
     }
@@ -570,8 +565,7 @@ impl AgentLoop {
                     "failed to parse tool call arguments JSON"
                 );
                 Err(format!(
-                    "Tool '{}' arguments were invalid JSON and could not be parsed (id: {}). Please retry with valid JSON arguments.",
-                    tool_name, tool_id
+                    "Tool '{tool_name}' arguments were invalid JSON and could not be parsed (id: {tool_id}). Please retry with valid JSON arguments."
                 ))
             }
         }
@@ -597,7 +591,7 @@ impl AgentLoop {
                 .function
                 .id
                 .as_ref()
-                .is_none_or(|id| id.is_empty())
+                .is_none_or(std::string::String::is_empty)
             {
                 let generated = ulid::Ulid::new().to_string();
                 tool_call.function.id = Some(generated);
@@ -747,6 +741,7 @@ impl AgentLoop {
         }
     }
 
+    #[must_use] 
     pub fn new(config: AgentConfig) -> Self {
         let is_subagent = config.is_subagent_execution;
         let state = TaskState {
@@ -789,7 +784,7 @@ impl AgentLoop {
     /// Format: `msg_{counter}` (monotonically increasing per AgentLoop instance).
     fn next_message_id(counter: &std::sync::atomic::AtomicUsize) -> String {
         let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("msg_{}", n)
+        format!("msg_{n}")
     }
 
     /// Get the underlying provider as a cloned Arc.
@@ -1037,7 +1032,7 @@ impl AgentLoop {
                     error!("TaskStart hook join failed: {}", e);
                     crate::core::hooks::HookResult {
                         output: None,
-                        error: Some(format!("Hook execution failed: {}", e)),
+                        error: Some(format!("Hook execution failed: {e}")),
                         exit_code: -1,
                         execution_time_ms: 0,
                     }
@@ -1046,7 +1041,7 @@ impl AgentLoop {
                     error!("TaskStart hook timed out after {}ms", timeout_ms);
                     crate::core::hooks::HookResult {
                         output: None,
-                        error: Some(format!("Hook execution timed out after {}ms", timeout_ms)),
+                        error: Some(format!("Hook execution timed out after {timeout_ms}ms")),
                         exit_code: -1,
                         execution_time_ms: timeout_ms,
                     }
@@ -1062,8 +1057,7 @@ impl AgentLoop {
                         id: Some(Self::next_message_id(&self.message_counter)),
                         role: MessageRole::User,
                         content: MessageContent::Text(format!(
-                            "[Hook context from TaskStart]: {}",
-                            modification
+                            "[Hook context from TaskStart]: {modification}"
                         )),
                         model_info: None,
                         metrics: None,
@@ -1130,7 +1124,7 @@ impl AgentLoop {
                         crate::core::cancellation::CancellationHandler::new(self.state.clone());
                     if let Err(e) = cancellation_handler
                         .abort_task(
-                            self.deps.hook_manager.as_ref().map(|hm| hm.as_ref()),
+                            self.deps.hook_manager.as_ref().map(std::convert::AsRef::as_ref),
                             &state_manager,
                             &self.config.task_id,
                             Some(&self.anchor_mgr),
@@ -1199,7 +1193,7 @@ impl AgentLoop {
                             );
                             let mut msg = expanded_message;
                             if let MessageContent::Text(ref text) = msg.content {
-                                msg.content = MessageContent::Text(format!("{}{}", note, text));
+                                msg.content = MessageContent::Text(format!("{note}{text}"));
                             }
                             msg
                         } else {
@@ -1267,7 +1261,7 @@ impl AgentLoop {
                                     let mut msg = expanded_message;
                                     if let MessageContent::Text(ref text) = msg.content {
                                         msg.content =
-                                            MessageContent::Text(format!("{}{}", note, text));
+                                            MessageContent::Text(format!("{note}{text}"));
                                     }
                                     msg
                                 } else {
@@ -1300,8 +1294,7 @@ impl AgentLoop {
                                 id: Some(Self::next_message_id(&self.message_counter)),
                                 role: MessageRole::User,
                                 content: MessageContent::Text(format!(
-                                    "[Hook context from TaskComplete]: {}",
-                                    modification
+                                    "[Hook context from TaskComplete]: {modification}"
                                 )),
                                 model_info: None,
                                 metrics: None,
@@ -1521,9 +1514,7 @@ impl AgentLoop {
                 });
         let workspace_root = context
             .cwd
-            .clone()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| self.resolve_workspace_root());
+            .clone().map_or_else(|| self.resolve_workspace_root(), std::path::PathBuf::from);
         let tool_context = Arc::new(ToolContext::new(
             self.state.clone(),
             self.deps.approval_manager.clone(),
@@ -1550,7 +1541,7 @@ impl AgentLoop {
         if let Some(ref tracker) = self.model_tracker {
             let guard = self.config.provider.lock().unwrap();
             let provider_id = guard.name().to_string();
-            let model_id = guard.get_model().id.clone();
+            let model_id = guard.get_model().id;
             drop(guard);
             let mode = match self.config.mode {
                 crate::core::agent_types::AgentMode::Plan => "plan",
@@ -1615,7 +1606,7 @@ impl AgentLoop {
                     "Request still exceeds context limits after emergency truncation: {}",
                     msg
                 );
-                return TurnResult::Error(format!("Context window overflow: {}", msg));
+                return TurnResult::Error(format!("Context window overflow: {msg}"));
             }
         }
 
@@ -1625,7 +1616,7 @@ impl AgentLoop {
 
         tracing::debug!(
             message_count = request.messages.len(),
-            tool_count = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            tool_count = request.tools.as_ref().map_or(0, std::vec::Vec::len),
             "starting provider stream"
         );
 
@@ -1726,7 +1717,7 @@ impl AgentLoop {
                                                 }
                                                 break;
                                             }
-                                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                                                 if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
                                                     break 'stream;
                                                 }
@@ -1737,7 +1728,7 @@ impl AgentLoop {
                                 None => break 'stream,
                             }
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                             if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
                                 break 'stream;
                             }
@@ -2016,7 +2007,7 @@ impl AgentLoop {
                                     continue;
                                 }
                                 let reasoning_line = Line::from(Span::styled(
-                                    format!("  Ɵ {}", line),
+                                    format!("  Ɵ {line}"),
                                     Style::default()
                                         .fg(crate::cli::tui::theme::ACCENT)
                                         .add_modifier(Modifier::ITALIC),
@@ -2172,7 +2163,7 @@ impl AgentLoop {
                             let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
                             self.config
                                 .output_writer
-                                .emit(OutputEvent::tool_call(format!("▶ {}", tool_name)));
+                                .emit(OutputEvent::tool_call(format!("▶ {tool_name}")));
                             emitted_output_this_attempt = true;
                         }
                         if self.config.json_output {
@@ -2198,9 +2189,9 @@ impl AgentLoop {
                         // Allow partial tool call deltas with arguments even when name is missing.
                         // Provider may send name in a later chunk; merge logic assembles complete call.
                         let args_absent = tc.function.arguments.is_none()
-                            || tc.function.arguments.as_ref().is_some_and(|a| a.is_empty());
+                            || tc.function.arguments.as_ref().is_some_and(std::string::String::is_empty);
                         if (tc.function.name.is_none()
-                            || tc.function.name.as_ref().is_some_and(|n| n.is_empty()))
+                            || tc.function.name.as_ref().is_some_and(std::string::String::is_empty))
                             && args_absent
                         {
                             tracing::warn!(
@@ -2286,7 +2277,7 @@ impl AgentLoop {
                             // Emit to output_writer so TUI users see the error in the output pane
                             self.config
                                 .output_writer
-                                .emit(OutputEvent::plain(format!("Error: {}", err)));
+                                .emit(OutputEvent::plain(format!("Error: {err}")));
                             emitted_output_this_attempt = true;
                         }
                     }
@@ -2392,18 +2383,17 @@ impl AgentLoop {
                         format!(
                             " (partial response of {} text chars{} discarded)",
                             accumulated_text.len(),
-                            if !accumulated_reasoning.is_empty() {
-                                format!(" + {} reasoning chars", accumulated_reasoning.len())
-                            } else {
+                            if accumulated_reasoning.is_empty() {
                                 String::new()
+                            } else {
+                                format!(" + {} reasoning chars", accumulated_reasoning.len())
                             }
                         )
                     } else {
                         String::new()
                     };
                 return TurnResult::Error(format!(
-                    "Provider stream error{} - retry the request.",
-                    partial_note
+                    "Provider stream error{partial_note} - retry the request."
                 ));
             }
             break (
@@ -2488,7 +2478,7 @@ impl AgentLoop {
             // thinking extracted from delta.content (rare but possible).
             let merged_thinking = match (extracted_thinking, accumulated_reasoning.is_empty()) {
                 (Some(t), true) => Some(t),
-                (Some(t), false) => Some(format!("{}\n{}", t, accumulated_reasoning)),
+                (Some(t), false) => Some(format!("{t}\n{accumulated_reasoning}")),
                 (None, false) => Some(accumulated_reasoning.clone()),
                 (None, true) => None,
             };
@@ -2695,8 +2685,7 @@ impl AgentLoop {
                     if is_restricted {
                         ToolExecutionOutput::error(
                             format!(
-                                "Tool '{}' is not available in PLAN MODE. This tool is restricted to ACT MODE for file modifications. Only use tools available for PLAN MODE when in that mode.",
-                                tool_name
+                                "Tool '{tool_name}' is not available in PLAN MODE. This tool is restricted to ACT MODE for file modifications. Only use tools available for PLAN MODE when in that mode."
                             ),
                             None,
                         )
@@ -2720,8 +2709,7 @@ impl AgentLoop {
                         if previously_denied {
                             ToolExecutionOutput::error(
                                 format!(
-                                    "Tool '{}' was already denied for this exact request. Ask the user before retrying the same action.",
-                                    tool_name
+                                    "Tool '{tool_name}' was already denied for this exact request. Ask the user before retrying the same action."
                                 ),
                                 Some(ToolFailureMetadata {
                                     class: ToolFailureClass::ApprovalDenied,
@@ -2801,8 +2789,7 @@ impl AgentLoop {
                                         }
                                         Err(e) => Some(ToolExecutionOutput::error(
                                             format!(
-                                                "Approval error for tool '{}': {}",
-                                                tool_name, e
+                                                "Approval error for tool '{tool_name}': {e}"
                                             ),
                                             None,
                                         )),
@@ -2879,8 +2866,7 @@ impl AgentLoop {
                                             }
                                             Err(e) => Some(ToolExecutionOutput::error(
                                                 format!(
-                                                    "Approval error for tool '{}': {}",
-                                                    tool_name, e
+                                                    "Approval error for tool '{tool_name}': {e}"
                                                 ),
                                                 None,
                                             )),
@@ -2963,7 +2949,7 @@ impl AgentLoop {
                     } else {
                         tracing::warn!(tool = %tool_name, "tool handler not implemented");
                         ToolExecutionOutput::error(
-                            format!("Tool execution for '{}' not yet implemented", tool_name),
+                            format!("Tool execution for '{tool_name}' not yet implemented"),
                             None,
                         )
                     }
@@ -2976,8 +2962,7 @@ impl AgentLoop {
                         .join(", ");
                     ToolExecutionOutput::error(
                         format!(
-                            "Unknown tool: '{}'. Available tools: {}",
-                            tool_name, available
+                            "Unknown tool: '{tool_name}'. Available tools: {available}"
                         ),
                         None,
                     )
@@ -3135,7 +3120,7 @@ impl AgentLoop {
                         self.config
                             .output_writer
                             .emit(OutputEvent::tool_output_line(
-                                format!("  {} {}", status, stats),
+                                format!("  {status} {stats}"),
                                 Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
                             ));
                     } else if tool_name == "execute_command" {
@@ -3146,7 +3131,7 @@ impl AgentLoop {
                         self.config
                             .output_writer
                             .emit(OutputEvent::tool_output_line(
-                                format!("  {} {}", status, first_line),
+                                format!("  {status} {first_line}"),
                                 Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
                             ));
                     } else if !matches!(
@@ -3166,14 +3151,14 @@ impl AgentLoop {
                         self.config
                             .output_writer
                             .emit(OutputEvent::tool_output_line(
-                                format!("  {} {}", status, first),
+                                format!("  {status} {first}"),
                                 tool_style,
                             ));
                         for line in display_lines.take(2) {
                             self.config
                                 .output_writer
                                 .emit(OutputEvent::tool_output_line(
-                                    format!("    {}", line),
+                                    format!("    {line}"),
                                     Style::default().add_modifier(Modifier::DIM),
                                 ));
                         }
@@ -3375,7 +3360,7 @@ impl AgentLoop {
                                                 text.split("\n---\n").collect();
                                             sections.iter().any(|sec| {
                                                 path_from_read_file_header(sec)
-                                                    .map(|p| {
+                                                    .is_some_and(|p| {
                                                         let normalized_p =
                                                             normalize_path_for_matching(p);
                                                         edited_paths.iter().any(|ep| {
@@ -3383,7 +3368,6 @@ impl AgentLoop {
                                                                 == normalized_p
                                                         })
                                                     })
-                                                    .unwrap_or(false)
                                             })
                                         } else {
                                             false
@@ -3627,19 +3611,16 @@ impl AgentLoop {
     async fn inject_plan_state_into_history(&self) {
         let plan_state_entry = {
             let mut state = self.state.lock().await;
-            match state.plan_state.as_ref() {
-                Some(plan_state) => {
-                    let text = plan_state.format_state();
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    std::hash::Hash::hash(&text, &mut hasher);
-                    let hash = hasher.finish();
-                    let should_inject = state.last_injected_plan_state_hash != Some(hash);
-                    Some((text, hash, should_inject))
-                }
-                None => {
-                    state.last_injected_plan_state_hash = None;
-                    None
-                }
+            if let Some(plan_state) = state.plan_state.as_ref() {
+                let text = plan_state.format_state();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&text, &mut hasher);
+                let hash = hasher.finish();
+                let should_inject = state.last_injected_plan_state_hash != Some(hash);
+                Some((text, hash, should_inject))
+            } else {
+                state.last_injected_plan_state_hash = None;
+                None
             }
         };
 
@@ -3799,8 +3780,7 @@ impl AgentLoop {
         let listed = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
         let suffix = if paths.len() > 3 { ", ..." } else { "" };
         Some(format!(
-            "[system] Before using edit_file again, call read_file on the stale path(s): {}{}.",
-            listed, suffix
+            "[system] Before using edit_file again, call read_file on the stale path(s): {listed}{suffix}."
         ))
     }
 
@@ -3849,7 +3829,7 @@ impl AgentLoop {
             if let Some(output) = pre_result.output {
                 if output.cancel == Some(true) {
                     return ToolExecutionOutput::error(
-                        format!("Tool '{}' was cancelled by PreToolUse hook.", tool_name),
+                        format!("Tool '{tool_name}' was cancelled by PreToolUse hook."),
                         None,
                     );
                 }
@@ -3861,8 +3841,7 @@ impl AgentLoop {
                         id: Some(Self::next_message_id(&message_counter)),
                         role: MessageRole::User,
                         content: MessageContent::Text(format!(
-                            "[Hook context from PreToolUse]: {}",
-                            modification
+                            "[Hook context from PreToolUse]: {modification}"
                         )),
                         model_info: None,
                         metrics: None,
@@ -3904,8 +3883,7 @@ impl AgentLoop {
                             id: Some(Self::next_message_id(&message_counter)),
                             role: MessageRole::User,
                             content: MessageContent::Text(format!(
-                                "[Hook context from PostToolUse]: {}",
-                                modification
+                                "[Hook context from PostToolUse]: {modification}"
                             )),
                             model_info: None,
                             metrics: None,
@@ -3916,7 +3894,7 @@ impl AgentLoop {
                 }
                 ToolExecutionOutput::success(res_text)
             }
-            Err(e) => ToolExecutionOutput::error(format!("Error: {}", e), e.metadata().cloned()),
+            Err(e) => ToolExecutionOutput::error(format!("Error: {e}"), e.metadata().cloned()),
         }
     }
 
@@ -4027,8 +4005,7 @@ impl AgentLoop {
         // Preserve system prompt if it exists (first message with role=assistant)
         let has_system_prompt = history
             .first()
-            .map(|m| matches!(m.role, MessageRole::Assistant))
-            .unwrap_or(false);
+            .is_some_and(|m| matches!(m.role, MessageRole::Assistant));
 
         if has_system_prompt {
             // Keep system prompt + most recent messages
@@ -4068,10 +4045,11 @@ impl AgentLoop {
 
             request.messages = history.clone();
 
-            match context_window::validate_context_window(
+            let value = context_window::validate_context_window(
                 request,
                 self.config.provider.lock().unwrap().as_ref(),
-            ) {
+            );
+            match value {
                 Ok(()) => break Ok(()),
                 Err(msg) => {
                     tracing::warn!(
@@ -4209,8 +4187,7 @@ impl AgentLoop {
         // Remove user message if present
         if history
             .last()
-            .map(|m| m.role == MessageRole::User)
-            .unwrap_or(false)
+            .is_some_and(|m| m.role == MessageRole::User)
         {
             history.pop();
             removed = 2;

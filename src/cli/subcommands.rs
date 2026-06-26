@@ -27,8 +27,7 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
         history.retain(|item| {
             item.workspace_root_path
                 .as_ref()
-                .map(|w| cwd.starts_with(w))
-                .unwrap_or(false)
+                .is_some_and(|w| cwd.starts_with(w))
         });
     }
 
@@ -90,16 +89,13 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
 
     // Header
     println!(
-        " Task History{} (page {} of {}, {} total)",
-        filter_summary, page, total_pages, total
+        " Task History{filter_summary} (page {page} of {total_pages}, {total} total)"
     );
     println!("{}", "─".repeat(separator_width));
 
     for item in items {
         let ts = item.ts;
-        let dt = DateTime::from_timestamp(ts, 0)
-            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| ts.to_string());
+        let dt = DateTime::from_timestamp(ts, 0).map_or_else(|| ts.to_string(), |d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string());
 
         let preview = if item.task.len() > 50 {
             let end = item.task.floor_char_boundary(47);
@@ -128,8 +124,7 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
 
     println!("{}", "─".repeat(separator_width));
     println!(
-        " Showing {} tasks per page. Use -n <limit> and -p <page> to navigate.",
-        limit
+        " Showing {limit} tasks per page. Use -n <limit> and -p <page> to navigate."
     );
     if !filter_parts.is_empty() {
         println!(
@@ -162,16 +157,16 @@ pub fn run_config(opts: ConfigOptions) -> anyhow::Result<()> {
         match state_manager.set_global_state_string_field(key, value.clone()) {
             Ok(()) => {
                 state_manager.persist()?;
-                println!("Updated configuration: {}={}", key, value);
+                println!("Updated configuration: {key}={value}");
             }
             Err(e) => {
-                return Err(anyhow::anyhow!("{}", e));
+                return Err(anyhow::anyhow!("{e}"));
             }
         }
         return Ok(());
     }
 
-    if let Some(ConfigAction::List) = opts.action {
+    if matches!(opts.action, Some(ConfigAction::List)) {
         let state_manager = crate::storage::state_manager::StateManager::new()?;
         state_manager.initialize()?;
 
@@ -208,24 +203,22 @@ pub fn run_config(opts: ConfigOptions) -> anyhow::Result<()> {
         ];
 
         for (mode, provider) in providers {
-            let key_name = format!("{}_API_KEY", provider.to_uppercase().replace("-", "_"));
+            let key_name = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
             let has_key = std::env::var(&key_name).is_ok()
                 || std::env::var(format!(
                     "SNED_{}_API_KEY",
-                    provider.to_uppercase().replace("-", "_")
+                    provider.to_uppercase().replace('-', "_")
                 ))
                 .is_ok();
 
-            if !has_key {
-                issues.push(format!(
-                    "  ⚠️  {} mode provider '{}' may need API key ({} not set)",
-                    mode, provider, key_name
-                ));
-            } else {
+            if has_key {
                 println!(
-                    "  ✓  {} mode provider '{}' has API key configured",
-                    mode, provider
+                    "  ✓  {mode} mode provider '{provider}' has API key configured"
                 );
+            } else {
+                issues.push(format!(
+                    "  ⚠️  {mode} mode provider '{provider}' may need API key ({key_name} not set)"
+                ));
             }
         }
 
@@ -234,7 +227,7 @@ pub fn run_config(opts: ConfigOptions) -> anyhow::Result<()> {
         } else {
             println!("\nConfiguration issues found:");
             for issue in issues {
-                println!("{}", issue);
+                println!("{issue}");
             }
         }
     } else {
@@ -263,22 +256,20 @@ pub fn run_migration(source_dir: &str, dry_run: bool) -> anyhow::Result<()> {
         .ok()
         .or_else(|| dirs::config_dir().map(|p| p.join("sned").to_string_lossy().into_owned()))
         .unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".config/sned").to_string_lossy().into_owned())
-                .unwrap_or_else(|| ".config/sned".to_string())
+            dirs::home_dir().map_or_else(|| ".config/sned".to_string(), |h| h.join(".config/sned").to_string_lossy().into_owned())
         });
 
     let destination_path = PathBuf::from(&destination_dir);
 
     println!("Migration Plan");
     println!("==============");
-    println!("Source:      {}", source_dir);
+    println!("Source:      {source_dir}");
     println!("Destination: {}", destination_path.display());
     println!();
 
     let source_path = PathBuf::from(source_dir);
     if !source_path.exists() {
-        anyhow::bail!("Source directory does not exist: {}", source_dir);
+        anyhow::bail!("Source directory does not exist: {source_dir}");
     }
 
     if !destination_path.exists() {
@@ -288,7 +279,7 @@ pub fn run_migration(source_dir: &str, dry_run: bool) -> anyhow::Result<()> {
 
     if dry_run {
         let report = plan_dry_run_migration(&source_path, &destination_path)
-            .map_err(|e| anyhow::anyhow!("Failed to plan migration: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to plan migration: {e}"))?;
 
         print_dry_run_report(&report);
     } else {
@@ -303,14 +294,14 @@ pub fn run_migration(source_dir: &str, dry_run: bool) -> anyhow::Result<()> {
                 println!("\n✓ Migration completed successfully");
             }
             Err(e) => {
-                println!("\n✗ Migration failed: {}", e);
+                println!("\n✗ Migration failed: {e}");
                 println!("\nAttempting rollback...");
                 if let Err(rb_err) = engine.rollback() {
-                    println!("✗ Rollback failed: {}", rb_err);
+                    println!("✗ Rollback failed: {rb_err}");
                 } else {
                     println!("✓ Rollback completed");
                 }
-                anyhow::bail!("Migration failed: {}", e);
+                anyhow::bail!("Migration failed: {e}");
             }
         }
     }
@@ -545,32 +536,29 @@ pub(crate) fn print_execution_report(report: &crate::storage::migration::Migrati
     let total_copied = report
         .endpoints
         .as_ref()
-        .map(|e| e.copied_keys.len())
-        .unwrap_or(0)
+        .map_or(0, |e| e.copied_keys.len())
         + report
             .global_settings
             .as_ref()
-            .map(|g| g.copied_keys.len())
-            .unwrap_or(0)
+            .map_or(0, |g| g.copied_keys.len())
         + report
             .secrets
             .as_ref()
-            .map(|s| s.copied_keys.len())
-            .unwrap_or(0)
+            .map_or(0, |s| s.copied_keys.len())
         + report
             .task_history
             .as_ref()
-            .map(|t| t.copied_ids.len())
-            .unwrap_or(0)
+            .map_or(0, |t| t.copied_ids.len())
         + report
             .tasks
             .iter()
             .map(|t| t.copied_files.len())
             .sum::<usize>();
 
-    println!("Total: {} files/keys copied", total_copied);
+    println!("Total: {total_copied} files/keys copied");
 }
 
+#[must_use] 
 pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -> String {
     let mut lines = vec![
         String::from("Current Sned Configuration"),
@@ -671,7 +659,7 @@ pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -
 
     lines.push("## Recent Announcements".to_string());
     if let Some(ref v) = state.last_shown_announcement_id {
-        lines.push(format!("  Last Shown: {}", v));
+        lines.push(format!("  Last Shown: {v}"));
     } else {
         lines.push("  Last Shown: none".to_string());
     }
@@ -696,7 +684,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
         Some(p) => p.clone(),
         None => match get_provider_from_env() {
             Some(p) => {
-                println!("Auto-detected provider from environment: {}", p);
+                println!("Auto-detected provider from environment: {p}");
                 p.to_string()
             }
             None => {
@@ -714,7 +702,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
     let api_key = match &opts.apikey {
         Some(k) => k.clone(),
         None => {
-            print!("Enter API key for {}: ", provider);
+            print!("Enter API key for {provider}: ");
             io::stdout().flush()?;
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
@@ -746,19 +734,19 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
         "vercel-ai-gateway" => "vercelAiGatewayApiKey",
         "openai-compatible" => "openAiCompatibleCustomApiKey",
         _ => {
-            crate::cli::colors::eprint_error(&format!("Unknown provider '{}'", provider));
+            crate::cli::colors::eprint_error(&format!("Unknown provider '{provider}'"));
             return Ok(());
         }
     };
 
     state_manager.set_secret(secret_key, api_key);
-    println!("Stored API key for {}", provider);
+    println!("Stored API key for {provider}");
 
     // Persist model ID if provided (applies to both act and plan modes)
     if let Some(model_id) = &opts.modelid {
         state_manager.set_global_state_string_field("act_mode_api_model_id", model_id.clone())?;
         state_manager.set_global_state_string_field("plan_mode_api_model_id", model_id.clone())?;
-        println!("Stored model ID: {}", model_id);
+        println!("Stored model ID: {model_id}");
     }
 
     // Persist base URL if provided (provider-specific)
@@ -769,13 +757,10 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
             "openrouter" => "open_router_base_url",
             "gemini" => "gemini_base_url",
             "lite_llm" => "lite_llm_base_url",
-            _ => {
-                // For other providers, use open_ai_base_url as fallback
-                "open_ai_base_url"
-            }
+            _ => "open_ai_base_url",
         };
         state_manager.set_global_state_string_field(base_url_key, base_url.clone())?;
-        println!("Stored base URL for {}: {}", provider, base_url);
+        println!("Stored base URL for {provider}: {base_url}");
     }
 
     // Persist Azure API version if provided (stored for Azure OpenAI provider)
@@ -783,7 +768,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
         // Azure API version is typically used with Azure OpenAI
         // Store it as a setting that can be referenced later
         state_manager.set_global_state_string_field("azure_api_version", azure_version.clone())?;
-        println!("Stored Azure API version: {}", azure_version);
+        println!("Stored Azure API version: {azure_version}");
     }
 
     if opts.verbose {
@@ -833,14 +818,14 @@ pub fn run_doctor() -> anyhow::Result<i32> {
                 } else {
                     "****".to_string()
                 };
-                println!("  [OK] {} ({})", provider, masked);
+                println!("  [OK] {provider} ({masked})");
             }
             Ok(_) => {
-                println!("  [WARN] {} ({} is set but empty)", provider, env_var);
+                println!("  [WARN] {provider} ({env_var} is set but empty)");
                 has_warn = true;
             }
             Err(_) => {
-                println!("  [WARN] {} ({} not set)", provider, env_var);
+                println!("  [WARN] {provider} ({env_var} not set)");
                 has_warn = true;
             }
         }
@@ -915,11 +900,10 @@ pub fn run_doctor() -> anyhow::Result<i32> {
             for subdir in subdirs {
                 let subpath = sned_dir.join(subdir);
                 if subpath.exists() {
-                    println!("  [OK] {} directory exists", subdir);
+                    println!("  [OK] {subdir} directory exists");
                 } else {
                     println!(
-                        "  [WARN] {} directory missing (will be created on first use)",
-                        subdir
+                        "  [WARN] {subdir} directory missing (will be created on first use)"
                     );
                     has_warn = true;
                 }

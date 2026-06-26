@@ -52,7 +52,7 @@ where
                     _field: &tracing::field::Field,
                     value: &dyn std::fmt::Debug,
                 ) {
-                    let raw = format!("{:?}", value);
+                    let raw = format!("{value:?}");
                     self.0 = match serde_json::from_str::<serde_json::Value>(&raw) {
                         Ok(parsed) => match parsed {
                             serde_json::Value::String(inner) => inner,
@@ -95,7 +95,7 @@ fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
         TracingMode::Human { verbose } => {
             let log_level = if verbose || debug { "debug" } else { "warn" };
             let env_filter = EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(format!("sned={}", log_level)));
+                .unwrap_or_else(|_| EnvFilter::new(format!("sned={log_level}")));
 
             use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
@@ -496,6 +496,7 @@ pub struct Cli {
 }
 
 /// Parse and return the CLI structure.
+#[must_use] 
 pub fn parse() -> Cli {
     Cli::parse()
 }
@@ -531,9 +532,7 @@ pub fn apply_config_override(cli: &Cli) {
 }
 
 fn cli_log_file_path_from(data_dir: &Path, log_dir: Option<&Path>) -> PathBuf {
-    log_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| data_dir.join("logs"))
+    log_dir.map_or_else(|| data_dir.join("logs"), Path::to_path_buf)
         .join("sned.1.log")
 }
 
@@ -665,7 +664,7 @@ fn hash_cwd(cwd: &str) -> String {
 fn build_symbol_index_service(
     cwd_str: String,
     mode: SymbolIndexMode,
-) -> anyhow::Result<crate::services::symbol_index::SymbolIndexService> {
+) -> crate::services::symbol_index::SymbolIndexService {
     // Derive a unique /tmp path for the symbol index DB so the workspace
     // directory stays clean. Each cwd maps to a unique /tmp path via a hash
     // of the absolute path.
@@ -673,11 +672,11 @@ fn build_symbol_index_service(
     let service = crate::services::symbol_index::SymbolIndexService::new(cwd_str.clone())
         .with_index_root(index_root.clone());
     match mode {
-        SymbolIndexMode::Off => Ok(service.disabled()),
-        SymbolIndexMode::Memory => Ok(service),
+        SymbolIndexMode::Off => service.disabled(),
+        SymbolIndexMode::Memory => service,
         SymbolIndexMode::Persisted => {
             match service.with_persistence() {
-                Ok(svc) => Ok(svc),
+                Ok(svc) => svc,
                 Err(e) => {
                     tracing::warn!(
                         "Symbol index DB corruption detected, falling back to memory mode: {}",
@@ -693,9 +692,9 @@ fn build_symbol_index_service(
                         let _ = std::fs::remove_file(&db_path);
                     }
                     // Return in-memory service (service was moved into with_persistence, so create new one)
-                    Ok(crate::services::symbol_index::SymbolIndexService::new(
+                    crate::services::symbol_index::SymbolIndexService::new(
                         cwd_str,
-                    ))
+                    )
                 }
             }
         }
@@ -952,8 +951,7 @@ pub(crate) fn create_provider(
         }
         _ => {
             return Err(crate::error::CliError::config(format!(
-                "Unsupported provider: {}",
-                provider_name
+                "Unsupported provider: {provider_name}"
             ))
             .into());
         }
@@ -1169,9 +1167,8 @@ async fn build_task_components(
             .map(|h| h.id)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "No previous task found for workspace '{}'. \
-                     Start a new task without --continue, or use --taskId to specify one.",
-                    cwd
+                    "No previous task found for workspace '{cwd}'. \
+                     Start a new task without --continue, or use --taskId to specify one."
                 )
             })?
     } else {
@@ -1181,12 +1178,12 @@ async fn build_task_components(
     if task_opts.json {
         println!(
             "{}",
-            serde_json::json!({ "type": "task_started", "taskId": task_id.clone() })
+            serde_json::json!({ "type": "task_started", "taskId": task_id })
         );
     }
 
     let config = AgentConfig {
-        provider: Arc::new(std::sync::Mutex::new(provider.clone())),
+        provider: Arc::new(std::sync::Mutex::new(provider)),
         mode,
         task_id: task_id.clone(),
         enable_checkpoints: state_manager
@@ -1256,7 +1253,7 @@ async fn build_task_components(
         };
 
     let system_prompt_context = SystemPromptContext {
-        cwd: cwd.clone(),
+        cwd,
         active_shell_path: shell_path,
         active_shell_type: shell_type,
         active_shell_is_posix: true,
@@ -1283,7 +1280,7 @@ async fn build_task_components(
     let symbol_index_service = Arc::new(std::sync::Mutex::new(build_symbol_index_service(
         cwd_str.clone(),
         symbol_index_mode,
-    )?));
+    )));
 
     let context_loader = crate::core::context::ContextLoader::new(cwd_str.clone())
         .with_symbol_index_service(Arc::clone(&symbol_index_service));
@@ -1302,7 +1299,7 @@ async fn build_task_components(
     let hook_manager = setup_hook_manager(&task_opts, &state_manager);
 
     let checkpoint_mgr = crate::core::checkpoints::TaskCheckpointManager::new(
-        task_id.clone(),
+        task_id,
         config.enable_checkpoints,
         &cwd_str,
     );
@@ -1363,7 +1360,7 @@ fn combine_prompt_with_stdin(
 ) -> Option<String> {
     match (prompt, stdin_input) {
         (Some(prompt), Some(stdin_input)) if !stdin_input.is_empty() => {
-            Some(format!("{}\n\n{}", stdin_input, prompt))
+            Some(format!("{stdin_input}\n\n{prompt}"))
         }
         (Some(prompt), _) => Some(prompt),
         (None, Some(stdin_input)) if !stdin_input.is_empty() => Some(stdin_input),
@@ -1405,8 +1402,8 @@ pub fn run() -> anyhow::Result<()> {
             let commit = env!("GIT_COMMIT_HASH");
             let profile = env!("BUILD_PROFILE");
             println!("sned {}", env!("CARGO_PKG_VERSION"));
-            println!("commit: {}", commit);
-            println!("build: {}", profile);
+            println!("commit: {commit}");
+            println!("build: {profile}");
             Ok(())
         }
         Some(Command::Dev { subcmd }) => match subcmd {
@@ -1421,7 +1418,7 @@ pub fn run() -> anyhow::Result<()> {
         Some(Command::Doctor) => match run_doctor() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
-                eprintln!("doctor failed: {}", e);
+                eprintln!("doctor failed: {e}");
                 std::process::exit(crate::exit_codes::EXIT_ERROR)
             }
         },
@@ -2067,15 +2064,10 @@ mod tests {
         }
 
         let service = build_symbol_index_service(temp_dir.to_string(), SymbolIndexMode::Persisted);
-        assert!(
-            service.is_ok(),
-            "Service should fallback to memory mode on corrupted DB"
-        );
 
         // Verify service is functional (not disabled)
-        let svc = service.unwrap();
         assert!(
-            !svc.is_disabled(),
+            !service.is_disabled(),
             "Service should be functional after fallback"
         );
 

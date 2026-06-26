@@ -775,7 +775,8 @@ async fn cancel_agent(
         state.running_command_pids.clear();
     }
 
-    if let Some(task) = agent_task.lock().await.take() {
+    let task_opt = agent_task.lock().await.take();
+    if let Some(task) = task_opt {
         task.abort();
     }
 
@@ -1547,9 +1548,7 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Diff => {
             if let Ok(workspace_root) = std::env::current_dir() {
-                if !crate::core::shadow_git::is_initialized(&workspace_root) {
-                    app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
-                } else {
+                if crate::core::shadow_git::is_initialized(&workspace_root) {
                     match crate::core::shadow_git::diff_turns(&workspace_root, 1, 0) {
                         Ok(diff) => {
                             if diff.is_empty() {
@@ -1567,14 +1566,14 @@ async fn handle_cli_only_command(
                             );
                         }
                     }
+                } else {
+                    app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
                 }
             }
         }
         CliOnlyCommand::Log => {
             if let Ok(workspace_root) = std::env::current_dir() {
-                if !crate::core::shadow_git::is_initialized(&workspace_root) {
-                    app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
-                } else {
+                if crate::core::shadow_git::is_initialized(&workspace_root) {
                     match crate::core::shadow_git::log(&workspace_root, Some(10)) {
                         Ok(log) => {
                             if log.is_empty() {
@@ -1592,6 +1591,8 @@ async fn handle_cli_only_command(
                             );
                         }
                     }
+                } else {
+                    app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
                 }
             }
         }
@@ -1605,9 +1606,7 @@ async fn handle_cli_only_command(
 
             if let Some(msg) = commit_msg {
                 if let Ok(workspace_root) = std::env::current_dir() {
-                    if !crate::core::shadow_git::is_initialized(&workspace_root) {
-                        app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
-                    } else {
+                    if crate::core::shadow_git::is_initialized(&workspace_root) {
                         match crate::core::shadow_git::diff_turns(&workspace_root, 1, 0) {
                             Ok(diff) => {
                                 if diff.is_empty() {
@@ -1681,10 +1680,12 @@ async fn handle_cli_only_command(
                                 );
                             }
                         }
+                    } else {
+                        app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
                     }
+                } else {
+                    app.push_plain("Usage: /commit <message>");
                 }
-            } else {
-                app.push_plain("Usage: /commit <message>");
             }
         }
         CliOnlyCommand::CheckpointList => {
@@ -2829,7 +2830,8 @@ async fn run_main_loop(
             } else {
                 false
             };
-            if let Some(start) = agent_start_time.lock().await.take() {
+            let start_opt = agent_start_time.lock().await.take();
+            if let Some(start) = start_opt {
                 let elapsed = start.elapsed();
                 app.elapsed = Some(elapsed);
                 app.push_styled(

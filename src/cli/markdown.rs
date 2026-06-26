@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span};
 /// Block-level markdown (tables, code blocks, lists, headings) is broken
 /// into multiple `Line`s. Inline formatting (bold, italic, inline code)
 /// is applied as `Span` styling.
+#[must_use] 
 pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
     render_markdown(Some(prefix), text)
 }
@@ -24,6 +25,7 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
 /// The first line is prefixed with `prefix` (e.g. "✗ Error") styled in red.
 /// The error text is rendered as plain styled lines (no markdown parsing).
 /// Lines that exceed the terminal width are word-wrapped.
+#[must_use] 
 pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
     let wrap_width = crate::cli::text_utils::get_terminal_width();
     let prefix_width = unicode_width::UnicodeWidthStr::width(prefix) + 2;
@@ -52,7 +54,7 @@ pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
                 first = false;
                 out.push(Line::from(vec![
                     Span::styled(
-                        format!("{}: ", prefix),
+                        format!("{prefix}: "),
                         Style::default()
                             .fg(ratatui::style::Color::Red)
                             .add_modifier(Modifier::BOLD),
@@ -85,11 +87,12 @@ pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
 /// banner). If `prefix` is `None`, no banner is applied — the lines
 /// render as plain styled markdown, suitable for re-rendering streamed
 /// agent output after a turn completes.
+#[must_use] 
 pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
         let banner = prefix.unwrap_or("");
         return vec![Line::from(Span::styled(
-            format!("{}{}", banner, text),
+            format!("{banner}{text}"),
             Style::default(),
         ))];
     }
@@ -190,7 +193,6 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                     *is_first_line = false;
                     in_code_block = true;
                 }
-                Tag::List(_) => {}
                 Tag::Item => {
                     // Flush any accumulated spans from the previous item.
                     // Guard against flushing empty spans to avoid spurious
@@ -218,16 +220,9 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                 Tag::Table(_) => {
                     in_table = true;
                 }
-                Tag::TableHead => {}
-                Tag::TableRow => {}
-                Tag::TableCell => {}
                 Tag::BlockQuote => {
                     pending_list_prefix = Some("│ ".to_string());
                 }
-                Tag::Link { .. } => {}
-                Tag::Image { .. } => {}
-                Tag::MetadataBlock(_) => {}
-                Tag::HtmlBlock => {}
                 _ => {}
             },
             Event::End(tag_end) => match tag_end {
@@ -259,20 +254,12 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                 TagEnd::CodeBlock => {
                     in_code_block = false;
                 }
-                TagEnd::Item => {
+                TagEnd::Item | TagEnd::BlockQuote => {
                     pending_list_prefix = None;
                 }
-                TagEnd::List(_) => {}
                 TagEnd::Table => {
                     in_table = false;
                 }
-                TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell => {}
-                TagEnd::BlockQuote => {
-                    pending_list_prefix = None;
-                }
-                TagEnd::Link | TagEnd::Image => {}
-                TagEnd::MetadataBlock(_) => {}
-                TagEnd::HtmlBlock => {}
                 _ => {}
             },
             Event::Text(t) => {
@@ -295,7 +282,7 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                             // Continue building current line
                         }
                         let style = Style::default().add_modifier(Modifier::DIM);
-                        current_spans.push(Span::styled(format!("    {}", line), style));
+                        current_spans.push(Span::styled(format!("    {line}"), style));
                     }
                 } else if in_table {
                     // Strip pipe characters and alignment row markers.
