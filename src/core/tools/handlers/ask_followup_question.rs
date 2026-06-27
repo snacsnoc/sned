@@ -40,9 +40,19 @@ impl AskFollowupQuestionHandler {
                     .fg(WARNING_FG)
                     .add_modifier(Modifier::BOLD),
             ));
+
+            // Render the question text as markdown so the TUI displays
+            // formatted content instead of raw `**bold**` / `| tables |` text.
+            let rendered = crate::cli::markdown::render_markdown(None, question);
+            for line in rendered {
+                ctx.output_writer.emit(OutputEvent::ToolOutputLine(line));
+            }
+
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 "Your answer: ",
-                Style::default().fg(ACCENT),
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ));
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("(waiting up to {timeout_secs}s for your response)"),

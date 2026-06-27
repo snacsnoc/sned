@@ -663,16 +663,15 @@ impl App {
             if let Some(first) = rendered.first_mut()
                 && self.turn_indicator.take().is_some()
             {
-                // Prepend "♦ " to the first span of the first line.
-                    let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
-                    new_spans.push(Span::styled(
-                        "\u{2666} ",
-                        Style::default().fg(crate::cli::tui::theme::ACCENT),
-                    ));
-                    new_spans.extend(first.spans.iter().cloned());
-                    first.spans = new_spans;
+                let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
+                new_spans.push(Span::styled(
+                    "\u{2666} ",
+                    Style::default().fg(crate::cli::tui::theme::ACCENT),
+                ));
+                new_spans.extend(first.spans.iter().cloned());
+                first.spans = new_spans;
                 prefixed_turn_indicator = true;
-        }
+            }
             if prefixed_turn_indicator {
                 self.output_lines[model_entry_indices[0]] = rendered[0].clone();
                 self.output_line_kinds[model_entry_indices[0]] = BlockKind::Model;

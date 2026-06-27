@@ -605,8 +605,6 @@ impl ApprovalManager {
     pub fn should_prompt_with_path(&self, tool: SnedTool, action_path: Option<&str>) -> bool {
         let category = tool.category();
         let is_local = action_path.is_some_and(|p| self.is_path_local(p));
-
-        // In yolo mode we fully suppress approval prompts.
         if self.yolo_mode {
             return false;
         }

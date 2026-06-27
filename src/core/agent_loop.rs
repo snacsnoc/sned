@@ -2809,63 +2809,85 @@ impl AgentLoop {
                                     }) || script
                                         .is_some_and(|s| checker.is_safe(s).is_err());
                                     if any_unsafe {
-                                        // Auto-approved but unsafe — override auto-approval and prompt the user
-                                        drop(mgr);
-                                        user_prompted = true;
-                                        match crate::core::approval::prompt_for_approval_async(
-                                            &tool_name,
-                                            &tool_params,
-                                            self.config.output_writer.clone(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(crate::core::approval::ApprovalResult::Denied) => {
-                                                let mut state = self.state.lock().await;
-                                                state.record_denied_tool_action(
-                                                    crate::core::agent_types::DeniedToolAction {
-                                                        tool_name: tool_name.clone(),
-                                                        action_paths: action_paths.clone(),
-                                                        params_fingerprint: params_fingerprint
-                                                            .clone(),
-                                                    },
-                                                );
-                                                Some(ToolExecutionOutput::error(
-                                                    crate::core::approval::format_denial_message(
-                                                        &tool_name,
-                                                    ),
-                                                    Some(ToolFailureMetadata {
-                                                        class: ToolFailureClass::ApprovalDenied,
-                                                        affected_paths: action_paths.clone(),
-                                                        required_next_step: Some(
-                                                            ToolRequiredNextStep::AskUser,
-                                                        ),
-                                                    }),
-                                                ))
-                                            }
-                                            Ok(crate::core::approval::ApprovalResult::Always) => {
-                                                // User approved unsafe command — future
-                                                // auto-approves skip safety for this tool.
-                                                if let Some(ref am) = self.deps.approval_manager {
-                                                    let mut mgr = am.lock().await;
-                                                    // For execute_command, pass command fingerprint for per-command approval (F-02 fix)
-                                                    let cmd_fp = if tool_name == "execute_command" {
-                                                        Some(params_fingerprint.as_str())
-                                                    } else {
-                                                        None
-                                                    };
-                                                    mgr.auto_approve(tool, cmd_fp);
-                                                }
-                                                None
-                                            }
-                                            Ok(crate::core::approval::ApprovalResult::Approved) => {
-                                                None
-                                            }
-                                            Err(e) => Some(ToolExecutionOutput::error(
-                                                format!(
-                                                    "Approval error for tool '{tool_name}': {e}"
+                                        // In non-interactive mode, deny unsafe commands directly
+                                        // (no TUI available to prompt the user).
+                                        if !self.config.interactive_mode {
+                                            let mut state = self.state.lock().await;
+                                            state.record_denied_tool_action(
+                                                crate::core::agent_types::DeniedToolAction {
+                                                    tool_name: tool_name.clone(),
+                                                    action_paths: action_paths.clone(),
+                                                    params_fingerprint: params_fingerprint
+                                                        .clone(),
+                                                },
+                                            );
+                                            Some(ToolExecutionOutput::error(
+                                                crate::core::approval::format_denial_message(
+                                                    &tool_name,
                                                 ),
-                                                None,
-                                            )),
+                                                Some(ToolFailureMetadata {
+                                                    class: ToolFailureClass::ApprovalDenied,
+                                                    affected_paths: action_paths.clone(),
+                                                    required_next_step: Some(
+                                                        ToolRequiredNextStep::AskUser,
+                                                    ),
+                                                }),
+                                            ))
+                                        } else {
+                                            drop(mgr);
+                                            user_prompted = true;
+                                            match crate::core::approval::prompt_for_approval_async(
+                                                &tool_name,
+                                                &tool_params,
+                                                self.config.output_writer.clone(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(crate::core::approval::ApprovalResult::Denied) => {
+                                                    let mut state = self.state.lock().await;
+                                                    state.record_denied_tool_action(
+                                                        crate::core::agent_types::DeniedToolAction {
+                                                            tool_name: tool_name.clone(),
+                                                            action_paths: action_paths.clone(),
+                                                            params_fingerprint: params_fingerprint
+                                                                .clone(),
+                                                        },
+                                                    );
+                                                    Some(ToolExecutionOutput::error(
+                                                        crate::core::approval::format_denial_message(
+                                                            &tool_name,
+                                                        ),
+                                                        Some(ToolFailureMetadata {
+                                                            class: ToolFailureClass::ApprovalDenied,
+                                                            affected_paths: action_paths.clone(),
+                                                            required_next_step: Some(
+                                                                ToolRequiredNextStep::AskUser,
+                                                            ),
+                                                        }),
+                                                    ))
+                                                }
+                                                Ok(crate::core::approval::ApprovalResult::Always) => {
+                                                    if let Some(ref am) = self.deps.approval_manager {
+                                                        let mut mgr = am.lock().await;
+                                                        let cmd_fp = if tool_name == "execute_command" {
+                                                            Some(params_fingerprint.as_str())
+                                                        } else {
+                                                            None
+                                                        };
+                                                        mgr.auto_approve(tool, cmd_fp);
+                                                    }
+                                                    None
+                                                }
+                                                Ok(crate::core::approval::ApprovalResult::Approved) => {
+                                                    None
+                                                }
+                                                Err(e) => Some(ToolExecutionOutput::error(
+                                                    format!(
+                                                        "Approval error for tool '{tool_name}': {e}"
+                                                    ),
+                                                    None,
+                                                )),
+                                            }
                                         }
                                     } else {
                                         None // Safe command, auto-approve proceeds
