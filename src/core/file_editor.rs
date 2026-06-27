@@ -1755,12 +1755,12 @@ mod tests {
         let lines = vec!["fn test() {}".to_string()];
 
         // Insert tasks in order: A, B, C
-        anchor_mgr.reconcile("/tmp/task_a.rs", &lines, Some(task_a));
-        anchor_mgr.reconcile("/tmp/task_b.rs", &lines, Some(task_b));
-        anchor_mgr.reconcile("/tmp/task_c.rs", &lines, Some(task_c));
+        let _ = anchor_mgr.reconcile("/tmp/task_a.rs", &lines, Some(task_a));
+        let _ = anchor_mgr.reconcile("/tmp/task_b.rs", &lines, Some(task_b));
+        let _ = anchor_mgr.reconcile("/tmp/task_c.rs", &lines, Some(task_c));
 
         // Access task A again (should move it to back of LRU queue)
-        anchor_mgr.reconcile("/tmp/task_a.rs", &lines, Some(task_a));
+        let _ = anchor_mgr.reconcile("/tmp/task_a.rs", &lines, Some(task_a));
 
         // Verify all tasks are tracked
         assert!(anchor_mgr.is_tracking("/tmp/task_a.rs", Some(task_a)));

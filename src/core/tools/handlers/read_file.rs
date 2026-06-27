@@ -645,8 +645,8 @@ impl ToolHandler for ReadFileHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::agent_loop::TaskState;
-use crate::core::file_editor::{AnchorStateManager, split_content_lines};
+use crate::core::agent_loop::TaskState;
+    use crate::core::file_editor::AnchorStateManager;
     use crate::core::tools::{ToolContext, ToolHandler};
     use std::io::Write;
     use std::sync::Arc;
