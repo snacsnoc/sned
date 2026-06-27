@@ -1510,6 +1510,7 @@ impl AgentLoop {
                     }),
                     active_shell_is_posix: true,
                     enable_parallel_tool_calling: true,
+                    model_id: self.resolve_active_model_id(),
                     ..Default::default()
                 });
         let workspace_root = context
@@ -3671,6 +3672,14 @@ impl AgentLoop {
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
+    /// Lock the provider, read its configured model id. Returns None if
+    /// the provider mutex cannot be locked or the model id is empty.
+    fn resolve_active_model_id(&self) -> Option<String> {
+        let guard = self.config.provider.lock().ok()?;
+        let id = guard.get_model().id.clone();
+        if id.is_empty() { None } else { Some(id) }
     }
 
     /// Check if a tool is restricted in plan mode.

@@ -1254,6 +1254,7 @@ async fn build_task_components(
 
     let system_prompt_context = SystemPromptContext {
         cwd,
+        model_id: task_opts.model.clone(),
         active_shell_path: shell_path,
         active_shell_type: shell_type,
         active_shell_is_posix: true,

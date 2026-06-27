@@ -12,7 +12,9 @@ pub mod context_loader;
 pub mod context_manager;
 pub mod context_window;
 pub mod instructions;
+pub mod model_detect;
 pub mod system_prompt;
+pub mod tool_examples;
 pub mod trackers;
 
 pub use context_loader::ContextLoader;
@@ -28,5 +30,7 @@ pub use instructions::{
     get_local_agents_rules, get_local_cursor_rules, get_local_windsurf_rules, get_skill_content,
     list_supporting_files, scan_skills_directory, synchronize_rule_toggles,
 };
+pub use model_detect::is_qwen_model;
 pub use system_prompt::{PromptBuilder, SystemPromptContext};
+pub use tool_examples::tool_examples_for_model;
 pub use trackers::FileContextTracker;

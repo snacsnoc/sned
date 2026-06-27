@@ -28,6 +28,9 @@ pub struct SystemPromptContext {
     pub enable_parallel_tool_calling: bool,
     pub user_instructions: Option<String>,
     pub sned_rules: Option<String>,
+    /// Active model identifier (e.g. "qwen3-coder", "gpt-4o", "qwen/qwen3-coder").
+    /// Used for model-specific prompt routing. None = generic behavior.
+    pub model_id: Option<String>,
     pub active_shell_type: Option<String>,
     pub active_shell_path: Option<String>,
     pub active_shell_is_posix: bool,
@@ -55,20 +58,69 @@ pub struct PromptBuilder {
 }
 
 impl PromptBuilder {
+    #[must_use] 
     pub fn new(context: SystemPromptContext) -> Self {
         Self { context }
     }
 
     /// Builds the system prompt.
+    #[must_use] 
     pub fn build(&self) -> String {
         let prompt = self.render_template();
+        let prompt = self.apply_env_override(prompt);
         self.post_process(prompt)
+    }
+
+    /// If `SNED_SYSTEM_MD` points to a readable, non-empty file, prepend
+    /// its contents ahead of the generated prompt with a separator.
+    /// If unset, unreadable, or empty, the prompt is returned unchanged.
+    /// No replace mode in this patch.
+    fn apply_env_override(&self, prompt: String) -> String {
+        let Ok(path) = std::env::var("SNED_SYSTEM_MD") else {
+            return prompt;
+        };
+        if path.is_empty() {
+            return prompt;
+        }
+        let Ok(custom) = std::fs::read_to_string(&path) else {
+            return prompt;
+        };
+        if custom.trim().is_empty() {
+            return prompt;
+        }
+        format!("{custom}\n\n---\n\n{prompt}")
+    }
+
+    fn model_specific_section(&self) -> String {
+        match self.context.model_id.as_deref() {
+            Some(m) if super::model_detect::is_qwen_model(m) => Self::qwen_section(),
+            _ => String::new(),
+        }
+    }
+
+    fn qwen_section() -> String {
+        "\
+QWEN MODEL GUIDANCE
+- Call a tool explicitly when the task advances by inspecting, editing, running, or searching; do not describe plans in prose instead of acting.
+- Tool arguments must be valid JSON that matches the tool's schema; double-check field names and required keys before submitting.
+- Execute in small, verifiable steps: re-read a file with read_file before edit_file so the anchor matches the current line exactly.
+- When a tool returns an error, read the error text, fix the failing argument, and call the same tool again. Do not guess a corrected result.
+"
+        .to_string()
     }
 
     fn render_template(&self) -> String {
         let skills_section = self.format_skills_section();
 
+        let model_section = self.model_specific_section();
+
         let mut prompt = "You are Sned, a terminal-first coding agent.\n\n".to_string();
+
+        if !model_section.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&model_section);
+            prompt.push('\n');
+        }
 
         prompt.push_str(
             "PRIME DIRECTIVES\n\
@@ -137,8 +189,15 @@ impl PromptBuilder {
             );
 
             for instructions in custom_instructions {
-                prompt.push_str(&format!("\n{}\n", instructions));
+                prompt.push_str(&format!("\n{instructions}\n"));
             }
+        }
+
+        if let Some(examples) =
+            super::tool_examples::tool_examples_for_model(self.context.model_id.as_deref())
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(examples);
         }
 
         prompt
@@ -477,5 +536,186 @@ mod tests {
         let prompt = PromptBuilder::new(context).build();
         assert!(prompt.contains("Use tools sequentially"));
         assert!(!prompt.contains("Batch independent tool calls"));
+    }
+
+    #[test]
+    fn test_qwen_model_id_injects_qwen_section() {
+        let context = SystemPromptContext {
+            model_id: Some("qwen3-coder".to_string()),
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        assert!(prompt.contains("QWEN MODEL GUIDANCE"));
+        assert!(prompt.contains("Call a tool explicitly"));
+    }
+
+    #[test]
+    fn test_qwen_model_id_injects_tool_examples() {
+        let context = SystemPromptContext {
+            model_id: Some("qwen3-coder".to_string()),
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        assert!(prompt.contains("EXAMPLE TOOL CALLS (Qwen)"));
+        assert!(prompt.contains("tool=read_file"));
+    }
+
+    #[test]
+    fn test_qwen_routed_model_id_injects() {
+        let context = SystemPromptContext {
+            model_id: Some("qwen/qwen3-coder".to_string()),
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        assert!(prompt.contains("QWEN MODEL GUIDANCE"));
+        assert!(prompt.contains("EXAMPLE TOOL CALLS (Qwen)"));
+    }
+
+    #[test]
+    fn test_non_qwen_model_id_no_section() {
+        let context = SystemPromptContext {
+            model_id: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        assert!(!prompt.contains("QWEN MODEL GUIDANCE"));
+        assert!(!prompt.contains("EXAMPLE TOOL CALLS"));
+    }
+
+    #[test]
+    fn test_model_id_none_no_section_no_examples() {
+        let context = SystemPromptContext::default();
+        let prompt = PromptBuilder::new(context).build();
+        assert!(!prompt.contains("QWEN MODEL GUIDANCE"));
+        assert!(!prompt.contains("EXAMPLE TOOL CALLS"));
+    }
+
+    #[test]
+    fn test_non_qwen_prompt_byte_identical_to_pre_patch() {
+        // Critical invariant: non-Qwen prompts must be byte-identical
+        // whether model_id is None or Some(non-Qwen).
+        let ctx_none = SystemPromptContext {
+            cwd: Some("/tmp/test".to_string()),
+            ide: "vscode".to_string(),
+            enable_parallel_tool_calling: true,
+            ..Default::default()
+        };
+        let ctx_gpt = SystemPromptContext {
+            cwd: Some("/tmp/test".to_string()),
+            ide: "vscode".to_string(),
+            enable_parallel_tool_calling: true,
+            model_id: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+        let prompt_none = PromptBuilder::new(ctx_none).build();
+        let prompt_gpt = PromptBuilder::new(ctx_gpt).build();
+        assert_eq!(prompt_none, prompt_gpt);
+    }
+
+    /// Process-global mutex to serialize env var tests. `cargo test` runs
+    /// tests in parallel by default, and process-global env vars are
+    /// shared across threads. Without this guard, one test reading
+    /// `SNED_SYSTEM_MD` can observe another test's value mid-flight.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Helper for env var tests: set env var for the duration of the
+    /// test, restore on drop. Holds `ENV_TEST_LOCK` while alive so
+    /// tests that read/write `SNED_SYSTEM_MD` cannot interleave.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var(key).ok();
+            // SAFETY: env var mutation is serialized via ENV_TEST_LOCK.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: env var mutation is serialized via ENV_TEST_LOCK.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sned_system_md_prepends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("custom.md");
+        std::fs::write(&path, "CUSTOM_HEADER").expect("write");
+        let _g = EnvGuard::set("SNED_SYSTEM_MD", path.to_str().unwrap());
+
+        let context = SystemPromptContext::default();
+        let prompt = PromptBuilder::new(context).build();
+
+        assert!(prompt.starts_with("CUSTOM_HEADER"));
+        assert!(prompt.contains("\n\n---\n\n"));
+        // Generated prompt must appear after the separator.
+        assert!(prompt.contains("You are Sned"));
+        let sep_idx = prompt.find("---").expect("separator present");
+        let sned_idx = prompt.find("You are Sned").expect("sned prompt present");
+        assert!(sned_idx > sep_idx);
+    }
+
+    #[test]
+    fn test_sned_system_md_unset_no_change() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: env var mutation is serialized via ENV_TEST_LOCK.
+        unsafe {
+            std::env::remove_var("SNED_SYSTEM_MD");
+        }
+        let ctx_unset = SystemPromptContext::default();
+        let prompt_unset = PromptBuilder::new(ctx_unset).build();
+        // Compare against a fresh builder (also with env unset).
+        let prompt_again = PromptBuilder::new(SystemPromptContext::default()).build();
+        assert_eq!(prompt_unset, prompt_again);
+    }
+
+    #[test]
+    fn test_sned_system_md_missing_file_no_change() {
+        let _g = EnvGuard::set("SNED_SYSTEM_MD", "/nonexistent/path/to/file.md");
+        let ctx = SystemPromptContext::default();
+        let prompt_with_missing = PromptBuilder::new(ctx).build();
+        drop(_g);
+        let _lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: env var mutation is serialized via ENV_TEST_LOCK.
+        unsafe {
+            std::env::remove_var("SNED_SYSTEM_MD");
+        }
+        let prompt_baseline = PromptBuilder::new(SystemPromptContext::default()).build();
+        assert_eq!(prompt_with_missing, prompt_baseline);
+    }
+
+    #[test]
+    fn test_sned_system_md_empty_file_no_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.md");
+        std::fs::write(&path, "").expect("write");
+        let _g = EnvGuard::set("SNED_SYSTEM_MD", path.to_str().unwrap());
+        let ctx = SystemPromptContext::default();
+        let prompt_with_empty = PromptBuilder::new(ctx).build();
+        drop(_g);
+        let _lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: env var mutation is serialized via ENV_TEST_LOCK.
+        unsafe {
+            std::env::remove_var("SNED_SYSTEM_MD");
+        }
+        let prompt_baseline = PromptBuilder::new(SystemPromptContext::default()).build();
+        assert_eq!(prompt_with_empty, prompt_baseline);
     }
 }
