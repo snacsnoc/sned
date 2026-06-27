@@ -1125,13 +1125,13 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    // Uppercase 'S' - toggle scrollback mode (view evicted output history).
-    // Only uppercase 'S' triggers it (matches the in-app hint "press S to view")
-    // and only when the input is empty, so typing 's' in a sentence like
-    // "the quick brown fox jumps" is never swallowed by the hotkey.
-    if key.code == KeyCode::Char('S')
-        && app.input.lines().join("\n").is_empty()
-    {
+    // Shift+S - toggle scrollback mode (view evicted output history).
+    // Matches the Shift+Up/Down scroll pattern (lines 1017-1027). Shift+S
+    // cannot be produced by normal letter typing (plain 's' or CapsLock+s
+    // have no SHIFT modifier), so no empty-input guard is needed — the
+    // user can press Shift+S with text in the buffer. The in-app hint
+    // in src/cli/tui/app.rs:1615 mirrors this: "press Shift+S to view".
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::SHIFT) {
         app.toggle_scrollback();
         return Ok(None);
     }
@@ -4108,9 +4108,9 @@ mod tests {
         Ok(())
     }
 
-    /// Uppercase 'S' with empty input must toggle scrollback mode (the
-    /// intended behavior of the original hotkey). Use a temp directory for
-    /// the scrollback file so the test does not pollute the user's data dir.
+    /// Shift+s must toggle scrollback mode (the intended behavior of the
+    /// hotkey). Use a temp directory for the scrollback file so the test
+    /// does not pollute the user's data dir.
     #[tokio::test]
     async fn test_handle_key_event_uppercase_s_toggles_scrollback_with_empty_input(
     ) -> anyhow::Result<()> {
@@ -4130,7 +4130,7 @@ mod tests {
         app.input = App::new_textarea(Vec::new());
 
         let action = handle_key_event(
-            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::SHIFT),
             &mut app,
             &output_writer,
             &state_handle,
@@ -4141,7 +4141,7 @@ mod tests {
         assert!(action.is_none());
         assert!(
             app.in_scrollback,
-            "uppercase 'S' with empty input must toggle scrollback mode"
+            "Shift+s must toggle scrollback mode"
         );
 
         // Cleanup
@@ -4149,10 +4149,59 @@ mod tests {
         Ok(())
     }
 
-    /// Uppercase 'S' must NOT toggle scrollback when the input has text,
-    /// so users can still type "S" mid-sentence (e.g. "Save the file").
+    /// Shift+s must toggle scrollback even when the input has text. This
+    /// is the key advantage of using an explicit SHIFT-modifier check over
+    /// an is_empty() guard — the user can press Shift+S mid-typing without
+    /// first clearing the input.
     #[tokio::test]
-    async fn test_handle_key_event_uppercase_s_types_into_non_empty_textarea(
+    async fn test_handle_key_event_shift_s_toggles_scrollback_with_non_empty_input(
+    ) -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let tmp_dir = std::env::temp_dir().join("sned_scrollback_hotkey_test2");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let scrollback_file = tmp_dir.join("lines");
+        let _ = std::fs::remove_file(&scrollback_file);
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.scrollback_file = Some(scrollback_file.clone());
+        app.scrollback_count = 0;
+        app.input = App::new_textarea(vec!["draft message in progress".to_string()]);
+        app.input.move_cursor(tui_textarea::CursorMove::End);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::SHIFT),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(
+            app.in_scrollback,
+            "Shift+s must toggle scrollback mode even with text in the input"
+        );
+        // The input buffer is untouched — the user can resume typing after
+        // exiting scrollback.
+        assert_eq!(app.input.lines().join("\n"), "draft message in progress");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&scrollback_file);
+        Ok(())
+    }
+
+    /// Char('S') with no modifiers (e.g. from a US layout keyboard with
+    /// no SHIFT held) must reach the textarea as a typed character. This
+    /// is the case for the rare input source that produces uppercase S
+    /// without the SHIFT modifier — for example, accessibility software,
+    /// IME composition, or programmatic key injection.
+    #[tokio::test]
+    async fn test_handle_key_event_uppercase_s_no_modifier_types_into_textarea(
     ) -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -4175,12 +4224,53 @@ mod tests {
         assert!(action.is_none());
         assert!(
             !app.in_scrollback,
-            "uppercase 'S' must NOT toggle scrollback when input is non-empty"
+            "Char('S') without SHIFT modifier must NOT toggle scrollback"
         );
         assert_eq!(
             app.input.lines().join("\n"),
             "save the fileS",
-            "uppercase 'S' must reach the textarea as a typed character"
+            "Char('S') without SHIFT modifier must reach the textarea"
+        );
+
+        Ok(())
+    }
+
+    /// CapsLock+s (uppercase S with no SHIFT modifier) must reach the
+    /// textarea, not trigger scrollback. This is the strongest evidence
+    /// that the SHIFT-modifier check is more robust than the is_empty()
+    /// guard from the previous fix — CapsLock produces uppercase letters
+    /// without the SHIFT modifier bit, so the old is_empty() check would
+    /// have accidentally blocked typing with CapsLock enabled while text
+    /// was in the input.
+    #[tokio::test]
+    async fn test_handle_key_event_capslock_s_reaches_textarea() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.input = App::new_textarea(vec!["fox jump".to_string()]);
+        app.input.move_cursor(tui_textarea::CursorMove::End);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(
+            !app.in_scrollback,
+            "CapsLock+s (uppercase 'S' with no SHIFT modifier) must NOT toggle scrollback"
+        );
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "fox jumpS",
+            "CapsLock+s must reach the textarea as a typed character"
         );
 
         Ok(())

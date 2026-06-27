@@ -1612,7 +1612,7 @@ impl App {
             && self.scroll_mode == ScrollMode::Auto
         {
             let indicator = Paragraph::new(Line::from(format!(
-                "↓ {} lines of scrollback — press S to view",
+                "↓ {} lines of scrollback — press Shift+S to view",
                 self.scrollback_count,
             )))
                 .wrap(Wrap { trim: false })
