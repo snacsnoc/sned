@@ -1125,7 +1125,7 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    // Shift+S - toggle scrollback mode (view evicted output history).
+    // Uppercase 'S' - toggle scrollback mode (view evicted output history).
     // Only uppercase 'S' triggers it (matches the in-app hint "press S to view")
     // and only when the input is empty, so typing 's' in a sentence like
     // "the quick brown fox jumps" is never swallowed by the hotkey.
