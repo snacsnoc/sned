@@ -1125,8 +1125,13 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    // S - toggle scrollback mode (view evicted output history)
-    if key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S') {
+    // Shift+S - toggle scrollback mode (view evicted output history).
+    // Only uppercase 'S' triggers it (matches the in-app hint "press S to view")
+    // and only when the input is empty, so typing 's' in a sentence like
+    // "the quick brown fox jumps" is never swallowed by the hotkey.
+    if key.code == KeyCode::Char('S')
+        && app.input.lines().join("\n").is_empty()
+    {
         app.toggle_scrollback();
         return Ok(None);
     }
@@ -4015,6 +4020,168 @@ mod tests {
         assert!(action.is_none());
         assert_eq!(app.input.lines(), ["hello", ""]);
         assert_eq!(app.input.cursor(), (1, 0));
+
+        Ok(())
+    }
+
+    /// Regression test for the "s key swallowed by scrollback hotkey" bug.
+    ///
+    /// Before the fix, `handle_key_event` intercepted every `KeyCode::Char('s')`
+    /// keystroke unconditionally and called `toggle_scrollback()`, which made it
+    /// impossible to type the letter `s` into the input textarea. Typing
+    /// "the quick brown fox jumps over the lazy dog" would jump into scrollback
+    /// mode as soon as the user pressed `s`.
+    ///
+    /// The fix restricts the hotkey to uppercase `S` *and* requires the input
+    /// to be empty. Both invariants are exercised below.
+    #[tokio::test]
+    async fn test_handle_key_event_lowercase_s_reaches_textarea_when_input_non_empty(
+    ) -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        // Pre-populate the textarea with the bug-report reproducer: text that
+        // ends in "fox jump" with the cursor positioned so the next typed
+        // character would be "s" (completing "fox jumps").
+        app.input = App::new_textarea(vec!["the quick brown fox jump".to_string()]);
+        app.input.move_cursor(tui_textarea::CursorMove::End);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(
+            !app.in_scrollback,
+            "lowercase 's' must NOT toggle scrollback when input is non-empty"
+        );
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "the quick brown fox jumps",
+            "lowercase 's' must reach the textarea as a typed character"
+        );
+
+        Ok(())
+    }
+
+    /// Companion to the lowercase test: lowercase 's' with empty input must
+    /// also reach the textarea (i.e. type the letter into the empty buffer)
+    /// rather than toggling scrollback. This guards against a regression where
+    /// someone tries to "fix" the bug by always letting 's' through even when
+    /// scrollback would make sense.
+    #[tokio::test]
+    async fn test_handle_key_event_lowercase_s_types_into_empty_textarea(
+    ) -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        // Empty textarea (no lines).
+        assert!(app.input.lines().join("\n").is_empty());
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(
+            !app.in_scrollback,
+            "lowercase 's' must NOT toggle scrollback even with empty input"
+        );
+        assert_eq!(app.input.lines().join("\n"), "s");
+
+        Ok(())
+    }
+
+    /// Uppercase 'S' with empty input must toggle scrollback mode (the
+    /// intended behavior of the original hotkey). Use a temp directory for
+    /// the scrollback file so the test does not pollute the user's data dir.
+    #[tokio::test]
+    async fn test_handle_key_event_uppercase_s_toggles_scrollback_with_empty_input(
+    ) -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let tmp_dir = std::env::temp_dir().join("sned_scrollback_hotkey_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let scrollback_file = tmp_dir.join("lines");
+        let _ = std::fs::remove_file(&scrollback_file);
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.scrollback_file = Some(scrollback_file.clone());
+        app.scrollback_count = 0;
+        app.input = App::new_textarea(Vec::new());
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(
+            app.in_scrollback,
+            "uppercase 'S' with empty input must toggle scrollback mode"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&scrollback_file);
+        Ok(())
+    }
+
+    /// Uppercase 'S' must NOT toggle scrollback when the input has text,
+    /// so users can still type "S" mid-sentence (e.g. "Save the file").
+    #[tokio::test]
+    async fn test_handle_key_event_uppercase_s_types_into_non_empty_textarea(
+    ) -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.input = App::new_textarea(vec!["save the file".to_string()]);
+        app.input.move_cursor(tui_textarea::CursorMove::End);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(
+            !app.in_scrollback,
+            "uppercase 'S' must NOT toggle scrollback when input is non-empty"
+        );
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "save the fileS",
+            "uppercase 'S' must reach the textarea as a typed character"
+        );
 
         Ok(())
     }

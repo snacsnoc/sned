@@ -1592,7 +1592,7 @@ mod tests {
         anchor_mgr.reset(Some(task_id));
 
         let lines = vec!["def hello():".to_string()];
-        anchor_mgr.reconcile("/tmp/reset.py", &lines, Some(task_id));
+        let _ = anchor_mgr.reconcile("/tmp/reset.py", &lines, Some(task_id));
 
         assert!(anchor_mgr.is_tracking("/tmp/reset.py", Some(task_id)));
 
