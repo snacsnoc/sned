@@ -301,8 +301,8 @@ pub async fn setup_ctrl_c_handler(state: Arc<Mutex<TaskState>>) {
 
     #[cfg(unix)]
     {
-        let state = state.clone();
-        let last_signal = last_signal.clone();
+        let state = state;
+        let last_signal = last_signal;
         tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
 

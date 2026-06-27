@@ -68,6 +68,7 @@ pub struct CommandSafetyChecker {
 }
 
 impl CommandSafetyChecker {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             yolo_mode: false,
@@ -98,11 +99,13 @@ impl CommandSafetyChecker {
             .unwrap_or_default()
     }
 
+    #[must_use] 
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.yolo_mode = yolo;
         self
     }
 
+    #[must_use] 
     pub fn with_user_safe_commands(mut self, commands: Vec<String>) -> Self {
         self.user_safe_commands = commands;
         self
@@ -113,13 +116,13 @@ impl CommandSafetyChecker {
         let base = command
             .split_whitespace()
             .next()
-            .map(|s| s.to_lowercase())
+            .map(str::to_lowercase)
             .unwrap_or_default();
         self.user_safe_commands.iter().any(|c| {
             c == &base
                 || c == base.trim_start_matches('/')
-                || c == &format!("/bin/{}", base)
-                || c == &format!("/usr/bin/{}", base)
+                || c == &format!("/bin/{base}")
+                || c == &format!("/usr/bin/{base}")
         })
     }
 
@@ -240,7 +243,7 @@ impl CommandSafetyChecker {
         let normalized = command.trim();
         let segments = split_command_segments(normalized);
 
-        for segment in segments.iter() {
+        for segment in &segments {
             let trimmed = segment.trim();
             if trimmed.is_empty() {
                 continue;
@@ -256,8 +259,7 @@ impl CommandSafetyChecker {
             // Hardcoded deny list: these commands are never allowed regardless of SNED_SAFE_COMMANDS
             if HARD_CODED_DENY_LIST.contains(&base_command.as_str()) {
                 return Err(CommandUnsafe::new(&format!(
-                    "command '{}' is permanently denied for safety",
-                    base_command
+                    "command '{base_command}' is permanently denied for safety"
                 )));
             }
 
@@ -268,8 +270,7 @@ impl CommandSafetyChecker {
                 let subcommand = parts[1].to_lowercase();
                 if !SAFE_GIT_SUBCOMMANDS.contains(&subcommand.as_str()) {
                     return Err(CommandUnsafe::new(&format!(
-                        "git subcommand '{}' is not allowed",
-                        subcommand
+                        "git subcommand '{subcommand}' is not allowed"
                     )));
                 }
                 if subcommand == "branch" || subcommand == "remote" {
@@ -277,19 +278,17 @@ impl CommandSafetyChecker {
                     for part in parts.iter().skip(2) {
                         if !allowed_flags.contains(part) {
                             return Err(CommandUnsafe::new(&format!(
-                                "git flag '{}' is not allowed",
-                                part
+                                "git flag '{part}' is not allowed"
                             )));
                         }
                     }
                 }
             } else if base_command == "find" {
                 for part in parts.iter().skip(1) {
-                    for flag in DANGEROUS_FIND_FLAGS.iter() {
+                    for flag in DANGEROUS_FIND_FLAGS {
                         if part.to_lowercase().starts_with(flag) {
                             return Err(CommandUnsafe::new(&format!(
-                                "find flag '{}' is not allowed",
-                                part
+                                "find flag '{part}' is not allowed"
                             )));
                         }
                     }
@@ -305,8 +304,7 @@ impl CommandSafetyChecker {
                 && !self.is_user_safe(&base_command)
             {
                 return Err(CommandUnsafe::new(&format!(
-                    "command '{}' is not in safe list",
-                    base_command
+                    "command '{base_command}' is not in safe list"
                 )));
             }
         }
@@ -363,6 +361,7 @@ pub struct CommandUnsafe {
 }
 
 impl CommandUnsafe {
+    #[must_use] 
     pub fn new(reason: &str) -> Self {
         Self {
             reason: reason.to_string(),
@@ -406,30 +405,31 @@ impl PathPattern {
     /// - anything else → `PathPattern::Exact`
     pub fn parse(pattern: &str) -> Result<Self, PathPatternError> {
         match pattern {
-            "external:*" => Ok(PathPattern::External),
-            "workspace:*" => Ok(PathPattern::Workspace),
+            "external:*" => Ok(Self::External),
+            "workspace:*" => Ok(Self::Workspace),
             s if s.starts_with("regex:") => {
                 let re_str = &s[6..];
                 let re = Regex::new(re_str).map_err(|e| PathPatternError::new(&e.to_string()))?;
-                Ok(PathPattern::Regex(re))
+                Ok(Self::Regex(re))
             }
-            s => Ok(PathPattern::Exact(s.to_string())),
+            s => Ok(Self::Exact(s.to_string())),
         }
     }
 
     /// Check if a path matches this pattern.
     ///
     /// `workspace_root` is required for `External` and `Workspace` patterns.
+    #[must_use] 
     pub fn matches(&self, path: &str, workspace_root: Option<&str>) -> bool {
         match self {
-            PathPattern::External => {
+            Self::External => {
                 workspace_root.is_none_or(|root| !Path::new(path).starts_with(root))
             }
-            PathPattern::Workspace => {
+            Self::Workspace => {
                 workspace_root.is_some_and(|root| Path::new(path).starts_with(root))
             }
-            PathPattern::Exact(s) => path == s,
-            PathPattern::Regex(re) => re.is_match(path),
+            Self::Exact(s) => path == s,
+            Self::Regex(re) => re.is_match(path),
         }
     }
 }
@@ -440,6 +440,7 @@ pub struct PathPatternError {
 }
 
 impl PathPatternError {
+    #[must_use] 
     pub fn new(reason: &str) -> Self {
         Self {
             reason: reason.to_string(),
@@ -496,6 +497,7 @@ pub struct ApprovalManager {
 
 impl ApprovalManager {
     /// Create a new approval manager, loading SNED_AUTO_APPROVE from the environment.
+    #[must_use] 
     pub fn new() -> Self {
         let env_auto_approve = std::env::var("SNED_AUTO_APPROVE")
             .ok()
@@ -513,48 +515,56 @@ impl ApprovalManager {
     }
 
     /// Enable yolo mode (skip all approval prompts).
+    #[must_use] 
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.yolo_mode = yolo;
         self
     }
 
     /// Enable auto-approve-all (skip prompts but keep interactive mode).
+    #[must_use] 
     pub fn with_auto_approve_all(mut self, auto_approve_all: bool) -> Self {
         self.auto_approve_all = auto_approve_all;
         self
     }
 
     /// Set the workspace root for local vs external path resolution.
+    #[must_use] 
     pub fn with_workspace_root(mut self, root: String) -> Self {
         self.workspace_root = Some(root);
         self
     }
 
     /// Set per-action auto-approval settings.
+    #[must_use] 
     pub fn with_auto_approval_settings(mut self, settings: AutoApprovalSettings) -> Self {
         self.auto_approval_settings = settings;
         self
     }
 
     /// Set per-path auto-approval patterns.
+    #[must_use] 
     pub fn with_auto_approve_patterns(mut self, patterns: Vec<PathPattern>) -> Self {
         self.auto_approve_patterns = patterns;
         self
     }
 
     /// Set user-safe commands (overrides SNED_SAFE_COMMANDS env var).
+    #[must_use] 
     pub fn with_user_safe_commands(mut self, commands: Vec<String>) -> Self {
         self.user_safe_commands = commands;
         self
     }
 
     /// Set env auto-approve tool names (from SNED_AUTO_APPROVE env var).
+    #[must_use] 
     pub fn with_env_auto_approve(mut self, tools: HashSet<String>) -> Self {
         self.env_auto_approve = tools;
         self
     }
 
     /// Get the user-safe commands list.
+    #[must_use] 
     pub fn get_user_safe_commands(&self) -> &Vec<String> {
         &self.user_safe_commands
     }
@@ -564,6 +574,7 @@ impl ApprovalManager {
     /// Read-only tools and tools already in the session auto-approve list
     /// do not require a prompt. Yolo mode and auto-approve-all also skip prompts.
     /// For execute_command, command_fingerprint should be provided for per-command approval (F-02 fix).
+    #[must_use] 
     pub fn should_prompt(&self, tool: SnedTool, command_fingerprint: Option<&str>) -> bool {
         let category = tool.category();
         if matches!(category, ToolCategory::ReadOnly | ToolCategory::ReadFiles) {
@@ -590,6 +601,7 @@ impl ApprovalManager {
     /// - `auto-approve-all` skips non-external prompts.
     /// - Per-action settings from `AutoApprovalSettings` are applied for
     ///   local vs external paths.
+    #[must_use] 
     pub fn should_prompt_with_path(&self, tool: SnedTool, action_path: Option<&str>) -> bool {
         let category = tool.category();
         let is_local = action_path.is_some_and(|p| self.is_path_local(p));
@@ -804,6 +816,7 @@ impl ApprovalManager {
 
     /// Check if a tool is in the session auto-approve list.
     /// For execute_command, also check the command fingerprint.
+    #[must_use] 
     pub fn is_auto_approved(&self, tool_name: &str, command_fingerprint: Option<&str>) -> bool {
         if tool_name == "execute_command"
             && let Some(fp) = command_fingerprint
@@ -820,11 +833,13 @@ impl ApprovalManager {
     }
 
     /// Check if yolo mode is enabled.
+    #[must_use] 
     pub fn is_yolo_mode(&self) -> bool {
         self.yolo_mode
     }
 
     /// Check if auto-approve-all is enabled.
+    #[must_use] 
     pub fn is_auto_approve_all(&self) -> bool {
         self.auto_approve_all
     }
@@ -844,11 +859,11 @@ pub enum ApprovalResult {
 /// Format the standard denial message for a tool.
 ///
 /// Centralizes the wording so agent_loop and tool handlers stay in sync.
+#[must_use] 
 pub fn format_denial_message(tool_name: &str) -> String {
     format!(
-        "Tool '{}' was denied by user. Ask the user what approach they would prefer. \
-         Do not attempt to bypass this denial with alternative tools.",
-        tool_name
+        "Tool '{tool_name}' was denied by user. Ask the user what approach they would prefer. \
+         Do not attempt to bypass this denial with alternative tools."
     )
 }
 
@@ -897,13 +912,13 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
         "write_to_file" => {
             let mut output = String::new();
             if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
-                output.push_str(&format!(" {}", path));
+                output.push_str(&format!(" {path}"));
             }
             if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
                 let lines: Vec<&str> = content.lines().collect();
                 let total = lines.len();
                 let preview_lines = std::cmp::min(20, total);
-                output.push_str(&format!("\n    [{} lines total]\n", total));
+                output.push_str(&format!("\n    [{total} lines total]\n"));
                 for (i, line) in lines.iter().take(preview_lines).enumerate() {
                     output.push_str(&format!("    {:4} │ {}\n", i + 1, line));
                 }
@@ -926,7 +941,7 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
                 }
                 let mut summary: Vec<String> = file_counts
                     .iter()
-                    .map(|(f, c)| format!("{} ({})", f, c))
+                    .map(|(f, c)| format!("{f} ({c})"))
                     .collect();
                 summary.sort();
                 output.push_str(&format!(
@@ -942,13 +957,13 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
         "read_file" => {
             let mut output = String::new();
             if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
-                output.push_str(&format!(" {}", path));
+                output.push_str(&format!(" {path}"));
             }
             if let (Some(start), Some(end)) = (
-                obj.get("line_start").and_then(|v| v.as_u64()),
-                obj.get("line_end").and_then(|v| v.as_u64()),
+                obj.get("line_start").and_then(serde_json::Value::as_u64),
+                obj.get("line_end").and_then(serde_json::Value::as_u64),
             ) {
-                output.push_str(&format!(" [lines {}-{}]", start, end));
+                output.push_str(&format!(" [lines {start}-{end}]"));
             }
             output
         }
@@ -958,10 +973,10 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
                 obj.get("old_name").and_then(|v| v.as_str()),
                 obj.get("new_name").and_then(|v| v.as_str()),
             ) {
-                output.push_str(&format!("\n    {} → {}", old, new));
+                output.push_str(&format!("\n    {old} → {new}"));
             }
             if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
-                output.push_str(&format!(" in {}", path));
+                output.push_str(&format!(" in {path}"));
             }
             output
         }
@@ -972,7 +987,7 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
                     "\n{}",
                     pretty
                         .lines()
-                        .map(|l| format!("    {}", l))
+                        .map(|l| format!("    {l}"))
                         .collect::<Vec<_>>()
                         .join("\n")
                 ),
@@ -1064,7 +1079,7 @@ pub fn prompt_for_approval(
 
     use crate::cli::output::OutputEvent;
     let receiver = begin_approval_prompt();
-    output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
+    output_writer.emit(OutputEvent::RawAnsi(format!("{prompt}\n")));
 
     // Channel-based: the TUI loop reads the key event and sends the result
     // through the channel. Timeout prevents hanging forever if user walks
@@ -1225,7 +1240,7 @@ pub async fn prompt_for_approval_async(
         prompt_for_approval(&tool_name, &params_owned, &output_writer)
     })
     .await
-    .map_err(|e| io::Error::other(format!("spawn_blocking failed: {}", e)))?
+    .map_err(|e| io::Error::other(format!("spawn_blocking failed: {e}")))?
 }
 
 /// Prompt the user for combined approval of multiple file edits.
@@ -1245,7 +1260,7 @@ pub async fn prompt_for_combined_approval(
     let file_names = if file_count == 1 {
         "1 file".to_string()
     } else {
-        format!("{} files", file_count)
+        format!("{file_count} files")
     };
 
     let prompt = build_combined_approval_prompt(
@@ -1260,7 +1275,7 @@ pub async fn prompt_for_combined_approval(
 
     use crate::cli::output::OutputEvent;
     let receiver = begin_approval_prompt();
-    output_writer.emit(OutputEvent::RawAnsi(format!("{}\n", prompt)));
+    output_writer.emit(OutputEvent::RawAnsi(format!("{prompt}\n")));
 
     // Wrap blocking channel recv in spawn_blocking to avoid blocking the tokio runtime
     tokio::task::spawn_blocking(move || {
@@ -1279,7 +1294,7 @@ pub async fn prompt_for_combined_approval(
         Ok(result)
     })
     .await
-    .map_err(|e| io::Error::other(format!("spawn_blocking failed: {}", e)))?
+    .map_err(|e| io::Error::other(format!("spawn_blocking failed: {e}")))?
 }
 
 fn build_tool_approval_prompt(
@@ -1292,7 +1307,7 @@ fn build_tool_approval_prompt(
 ) -> String {
     let mut prompt = String::new();
     prompt.push('\n');
-    let _ = write!(&mut prompt, "{} Tool: {}", icon, tool_name);
+    let _ = write!(&mut prompt, "{icon} Tool: {tool_name}");
     if !params_str.is_empty() {
         // params_str already starts with newline from format_tool_parameters
         prompt.push_str(params_str);
@@ -1300,8 +1315,7 @@ fn build_tool_approval_prompt(
     prompt.push('\n');
     let _ = write!(
         &mut prompt,
-        "Execute this tool? ({}/{}/{} — 'a' auto-approves this tool for the session): ",
-        yes_label, no_label, always_label
+        "Execute this tool? ({yes_label}/{no_label}/{always_label} — 'a' auto-approves this tool for the session): "
     );
     prompt
 }
@@ -1319,8 +1333,7 @@ fn build_combined_approval_prompt(
     prompt.push('\n');
     let _ = writeln!(
         &mut prompt,
-        "{} Sned wants to edit {} with {} anchored edit(s)",
-        icon, file_names, edit_count
+        "{icon} Sned wants to edit {file_names} with {edit_count} anchored edit(s)"
     );
     if !diff_preview.is_empty() {
         prompt.push('\n');
@@ -1329,8 +1342,7 @@ fn build_combined_approval_prompt(
     prompt.push('\n');
     let _ = write!(
         &mut prompt,
-        "Approve these edits? ({}/{}/{}): ",
-        yes_label, no_label, always_label
+        "Approve these edits? ({yes_label}/{no_label}/{always_label}): "
     );
     prompt
 }

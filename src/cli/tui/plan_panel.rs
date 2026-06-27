@@ -58,7 +58,7 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
     };
 
     lines.push(Line::from(Span::styled(
-        format!("Status: {}", status),
+        format!("Status: {status}"),
         Style::default().fg(theme::ACCENT),
     )));
 
@@ -85,8 +85,7 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
     let bar_str: String = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
     lines.push(Line::from(Span::styled(
         format!(
-            "[{}] {:.0}% ({}/{})",
-            bar_str, progress_pct, done_count, total
+            "[{bar_str}] {progress_pct:.0}% ({done_count}/{total})"
         ),
         theme::dim_style(),
     )));

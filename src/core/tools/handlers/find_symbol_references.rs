@@ -59,8 +59,7 @@ impl FindSymbolReferencesHandler {
                 Ok(content) => content,
                 Err(e) => {
                     any_error = Some(ToolError::ExecutionFailed(format!(
-                        "Error reading file {}: {}",
-                        path, e
+                        "Error reading file {path}: {e}"
                     )));
                     break;
                 }
@@ -68,15 +67,15 @@ impl FindSymbolReferencesHandler {
 
             let parsers =
                 load_required_language_parsers(&[abs_path_str.as_ref()]).map_err(|e| {
-                    ToolError::ExecutionFailed(format!("Failed to load language parsers: {}", e))
+                    ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
                 })?;
 
             let hits = collect_hits_for_file(path, &symbols, find_type, &content, &parsers)
                 .map_err(|e| {
-                    ToolError::ExecutionFailed(format!("Error finding references: {}", e))
+                    ToolError::ExecutionFailed(format!("Error finding references: {e}"))
                 })?;
 
-            let lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
+            let lines: Vec<String> = content.lines().map(std::string::ToString::to_string).collect();
             file_data.insert(path.clone(), FileData { lines, hits });
         }
 
@@ -92,7 +91,7 @@ impl FindSymbolReferencesHandler {
             let kind = if find_type == "both" {
                 "references or definitions".to_string()
             } else {
-                format!("{}s", find_type)
+                format!("{find_type}s")
             };
             return Ok(format!(
                 "No {} found for symbols: {}.",
@@ -147,7 +146,6 @@ impl ToolHandler for FindSymbolReferencesHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self;
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             Self::run(handler, &ctx, params)
                 .await
@@ -183,7 +181,7 @@ fn collect_hits_for_file(
 
     let entry = language_parsers
         .get(&ext)
-        .ok_or_else(|| format!("Unsupported file extension: {}", ext))?;
+        .ok_or_else(|| format!("Unsupported file extension: {ext}"))?;
 
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -289,7 +287,7 @@ fn resolve_full_name(
         if let Some(parent_node) = node_to_match.get(&current_node.id())
             && let Some(parent_name) = capture_text_by_node.get(&parent_node.id())
         {
-            full_name = format!("{}.{}", parent_name, full_name);
+            full_name = format!("{parent_name}.{full_name}");
         }
     }
 
@@ -297,7 +295,7 @@ fn resolve_full_name(
 }
 
 fn symbol_matches(full_name: &str, requested: &str) -> bool {
-    full_name == requested || full_name.ends_with(&format!(".{}", requested))
+    full_name == requested || full_name.ends_with(&format!(".{requested}"))
 }
 
 #[cfg(test)]

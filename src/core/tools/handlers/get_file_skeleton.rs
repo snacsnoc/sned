@@ -36,7 +36,7 @@ impl GetFileSkeletonHandler {
                     .collect::<Vec<_>>(),
             )
             .map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to load language parsers: {}", e))
+                ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
             })?,
         );
 
@@ -45,7 +45,7 @@ impl GetFileSkeletonHandler {
             .iter()
             .zip(abs_paths.iter())
             .map(|(rel_path, abs_path)| {
-                let rel_path = rel_path.to_string();
+                let rel_path = rel_path.clone();
                 let abs_path = abs_path.clone();
                 let anchor_mgr = anchor_mgr.clone();
                 let language_parsers = Arc::clone(&language_parsers);
@@ -61,14 +61,13 @@ impl GetFileSkeletonHandler {
                         ) {
                             Ok(Some(skeleton)) => {
                                 format!(
-                                    "--- {} ---\nStable Anchors are provided with each line.\n{}",
-                                    rel_path, skeleton
+                                    "--- {rel_path} ---\nStable Anchors are provided with each line.\n{skeleton}"
                                 )
                             }
-                            Ok(None) => format!("No definitions found in {}", rel_path),
-                            Err(e) => format!("Error parsing {}: {}", rel_path, e),
+                            Ok(None) => format!("No definitions found in {rel_path}"),
+                            Err(e) => format!("Error parsing {rel_path}: {e}"),
                         },
-                        Err(e) => format!("Error reading file {}: {}", rel_path, e),
+                        Err(e) => format!("Error reading file {rel_path}: {e}"),
                     }
                 }
             });
@@ -90,7 +89,6 @@ impl ToolHandler for GetFileSkeletonHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self;
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             Self::run(handler, &ctx, params)
                 .await
@@ -99,7 +97,7 @@ impl ToolHandler for GetFileSkeletonHandler {
     }
 
     fn description(&self, params: &serde_json::Value) -> String {
-        GetFileSkeletonHandler::description(self, params)
+        Self::description(self, params)
     }
 }
 

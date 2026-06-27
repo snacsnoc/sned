@@ -140,7 +140,7 @@ impl SearchFilesHandler {
                 let err = crate::cli::actionable_errors::invalid_regex(regex, &stderr);
                 return Err(anyhow::anyhow!("{}", err.display()));
             }
-            return Err(anyhow::anyhow!("grep failed: {}", stderr));
+            return Err(anyhow::anyhow!("grep failed: {stderr}"));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -212,6 +212,7 @@ impl SearchFilesHandler {
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
     }
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -266,29 +267,26 @@ async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyho
     drop(child.stdout.take());
     drop(child.stderr.take());
 
-    let status = match timeout(timeout_duration, child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
-            let _ = child.kill().await;
-            // Drop reader task handles instead of awaiting them — they will
-            // complete in the background once the killed process's pipes close.
-            drop(stdout_task);
-            drop(stderr_task);
-            let _ = child.wait().await;
-            let err = crate::cli::actionable_errors::command_timeout(
-                "search_files",
-                timeout_duration.as_secs(),
-            );
-            return Err(anyhow::anyhow!("{}", err.display()));
-        }
+    let status = if let Ok(status) = timeout(timeout_duration, child.wait()).await { status? } else {
+        let _ = child.kill().await;
+        // Drop reader task handles instead of awaiting them — they will
+        // complete in the background once the killed process's pipes close.
+        drop(stdout_task);
+        drop(stderr_task);
+        let _ = child.wait().await;
+        let err = crate::cli::actionable_errors::command_timeout(
+            "search_files",
+            timeout_duration.as_secs(),
+        );
+        return Err(anyhow::anyhow!("{}", err.display()));
     };
 
     let stdout = stdout_task
         .await
-        .map_err(|error| anyhow::anyhow!("search stdout task failed: {}", error))??;
+        .map_err(|error| anyhow::anyhow!("search stdout task failed: {error}"))??;
     let stderr = stderr_task
         .await
-        .map_err(|error| anyhow::anyhow!("search stderr task failed: {}", error))??;
+        .map_err(|error| anyhow::anyhow!("search stderr task failed: {error}"))??;
 
     Ok(Output {
         status,
@@ -305,7 +303,6 @@ impl ToolHandler for SearchFilesHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             handler.execute_without_state(&ctx.workspace_root, params)
                 .await
@@ -315,7 +312,7 @@ impl ToolHandler for SearchFilesHandler {
 
     fn description(&self, params: &serde_json::Value) -> String {
         let regex = params["regex"].as_str().unwrap_or("unknown regex");
-        format!("Searching for / {} /", regex)
+        format!("Searching for / {regex} /")
     }
 }
 

@@ -16,10 +16,10 @@ pub enum PlanStepStatus {
 impl fmt::Display for PlanStepStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PlanStepStatus::Pending => write!(f, "pending"),
-            PlanStepStatus::Running => write!(f, "running"),
-            PlanStepStatus::Done => write!(f, "done"),
-            PlanStepStatus::Failed => write!(f, "failed"),
+            Self::Pending => write!(f, "pending"),
+            Self::Running => write!(f, "running"),
+            Self::Done => write!(f, "done"),
+            Self::Failed => write!(f, "failed"),
         }
     }
 }
@@ -33,6 +33,7 @@ pub struct PlanStep {
 }
 
 impl PlanStep {
+    #[must_use] 
     pub fn status_icon(&self) -> &'static str {
         match self.status {
             PlanStepStatus::Pending => "○",
@@ -62,6 +63,7 @@ pub struct PlanState {
 
 impl PlanState {
     /// Create a new plan from step descriptions.
+    #[must_use] 
     pub fn create_plan(step_descriptions: Vec<String>) -> Self {
         let steps = step_descriptions
             .into_iter()
@@ -199,6 +201,7 @@ impl PlanState {
     }
 
     /// Get the current step.
+    #[must_use] 
     pub fn current_step(&self) -> Option<&PlanStep> {
         self.steps.get(self.current_step_index)
     }
@@ -281,6 +284,7 @@ impl PlanState {
     }
 
     /// Check if all steps are done.
+    #[must_use] 
     pub fn is_complete(&self) -> bool {
         !self.steps.is_empty() && self.steps.iter().all(|s| s.status == PlanStepStatus::Done)
     }
@@ -298,6 +302,7 @@ impl PlanState {
     /// - `1. First step`
     /// - `1) First step`
     /// - `Step 1: First step`
+    #[must_use] 
     pub fn parse_plan(text: &str) -> Option<Vec<String>> {
         let mut steps = Vec::new();
 
@@ -323,6 +328,7 @@ impl PlanState {
     }
 
     /// Format the plan state for model context injection.
+    #[must_use] 
     pub fn format_state(&self) -> String {
         let mut out = String::new();
 
@@ -343,7 +349,7 @@ impl PlanState {
         };
 
         out.push_str("Plan state:\n");
-        out.push_str(&format!("mode: {}\n", mode_label));
+        out.push_str(&format!("mode: {mode_label}\n"));
         out.push_str(&format!("approved: {}\n", self.approved));
         out.push_str(&format!("paused: {}\n", self.paused));
         out.push_str(&format!("complete: {}\n", self.complete));
@@ -375,6 +381,7 @@ impl PlanState {
     }
 
     /// Format the plan for display in the TUI panel.
+    #[must_use] 
     pub fn format_display(&self) -> String {
         let mut out = String::new();
 
@@ -402,6 +409,7 @@ impl PlanState {
     }
 
     /// Get the status summary string for the status bar.
+    #[must_use] 
     pub fn status_summary(&self) -> String {
         let total = self.steps.len();
         let current = self.current_step_index + 1;
@@ -414,13 +422,13 @@ impl PlanState {
         let approved = self.approved;
 
         if complete {
-            format!("Plan: complete {}/{}", total, total)
+            format!("Plan: complete {total}/{total}")
         } else if paused {
-            format!("Plan: paused at {}/{}", current, total)
+            format!("Plan: paused at {current}/{total}")
         } else if has_failed {
-            format!("Plan: failed at {}/{}", current, total)
+            format!("Plan: failed at {current}/{total}")
         } else if approved {
-            format!("Plan: {}/{} running", current, total)
+            format!("Plan: {current}/{total} running")
         } else {
             "Plan: awaiting approval".to_string()
         }

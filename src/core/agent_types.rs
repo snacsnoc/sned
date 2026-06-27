@@ -334,7 +334,7 @@ impl TaskState {
         let replaced_size = self
             .file_content_cache
             .peek(&path)
-            .map_or(0, |existing| existing.len());
+            .map_or(0, std::string::String::len);
         let mut total_size = self.file_content_cache_size().saturating_sub(replaced_size);
 
         while total_size + content_size > MAX_FILE_CONTENT_CACHE_SIZE {
@@ -365,6 +365,7 @@ impl TaskState {
         }
     }
 
+    #[must_use] 
     pub fn is_denied_tool_action(
         &self,
         tool_name: &str,

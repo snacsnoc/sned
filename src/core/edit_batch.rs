@@ -76,6 +76,7 @@ pub enum DiffMode {
 }
 
 impl BatchProcessor {
+    #[must_use] 
     pub fn new(diff_mode: DiffMode) -> Self {
         Self {
             executor: EditExecutor::new(),
@@ -157,7 +158,7 @@ impl BatchProcessor {
 
         // Validate all edits first
         for edit in edits {
-            self.validate_edit(edit)?
+            self.validate_edit(edit)?;
         }
 
         let (resolved_edits, failed_edits) =
@@ -215,11 +216,11 @@ impl BatchProcessor {
 
         batch.final_lines = final_lines.clone();
         batch.final_content = final_lines.join("\n");
-        batch.applied_edits = applied_edits.clone();
+        batch.applied_edits = applied_edits;
 
         // Generate diff
         let diff = self.generate_diff(display_path, batch);
-        batch.diff = diff.clone();
+        batch.diff = diff;
 
         BatchResult {
             success: true,
@@ -233,6 +234,7 @@ impl BatchProcessor {
     }
 
     /// Generates diff for a batch.
+    #[must_use] 
     pub fn generate_diff(&self, display_path: &str, prepared: &PreparedEdits) -> String {
         let mut diff = String::new();
         if !crate::cli::colors::stdout_colors_disabled() {
@@ -244,7 +246,7 @@ impl BatchProcessor {
                 crate::cli::colors::style::RESET
             ));
         } else {
-            diff.push_str(&format!("Update File: {}\n\n", display_path));
+            diff.push_str(&format!("Update File: {display_path}\n\n"));
         }
 
         for applied in &prepared.applied_edits {
@@ -267,7 +269,7 @@ impl BatchProcessor {
             } else {
                 search_lines =
                     prepared.lines[applied.original_start_idx..=applied.original_end_idx].to_vec();
-                replace_lines = applied.edit.text.lines().map(|s| s.to_string()).collect();
+                replace_lines = applied.edit.text.lines().map(std::string::ToString::to_string).collect();
             }
 
             let colored = !crate::cli::colors::stdout_colors_disabled();
@@ -309,6 +311,7 @@ impl BatchProcessor {
 
     /// Formats the final result for a batch.
     ///
+    #[must_use] 
     pub fn format_result(
         &self,
         prepared: &PreparedEdits,
@@ -384,15 +387,15 @@ impl BatchProcessor {
             );
         }
 
-        let line_changes = format!(" (+{}, -{} lines)", total_added, total_removed);
+        let line_changes = format!(" (+{total_added}, -{total_removed} lines)");
         let summary = format!(
             "Applied {} edit(s) successfully{}. NOTE the UPDATED anchors below.{}",
             prepared.resolved_edits.len(),
             line_changes,
-            if !prepared.failed_edits.is_empty() {
-                format!(" {} edit(s) failed.", prepared.failed_edits.len())
-            } else {
+            if prepared.failed_edits.is_empty() {
                 String::new()
+            } else {
+                format!(" {} edit(s) failed.", prepared.failed_edits.len())
             }
         );
 
@@ -416,8 +419,7 @@ impl BatchProcessor {
             && !edits.is_empty()
         {
             results.push(format!(
-                "The user made the following updates to your content:\n\n{}",
-                edits
+                "The user made the following updates to your content:\n\n{edits}"
             ));
         }
 
@@ -425,8 +427,7 @@ impl BatchProcessor {
             && !auto_fmt.is_empty()
         {
             results.push(format!(
-                    "The user's editor also applied the following auto-formatting to your content:\n\n{}",
-                    auto_fmt
+                    "The user's editor also applied the following auto-formatting to your content:\n\n{auto_fmt}"
                 ));
             results.push(
                     "(Note: Pay close attention to changes such as single quotes being converted to double quotes, semicolons being removed or added, long lines being broken into multiple lines, adjusting indentation style, adding/removing trailing commas, etc. This will help you ensure future edit_file operations to this file are accurate.)".to_string()

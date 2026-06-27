@@ -37,6 +37,7 @@ pub struct MockToolCall {
 }
 
 impl MockProvider {
+    #[must_use] 
     pub fn new(responses: Vec<MockResponse>) -> Self {
         Self {
             responses,
@@ -46,6 +47,7 @@ impl MockProvider {
         }
     }
 
+    #[must_use] 
     pub fn new_with_repeat(responses: Vec<MockResponse>) -> Self {
         Self {
             responses,
@@ -55,6 +57,7 @@ impl MockProvider {
         }
     }
 
+    #[must_use] 
     pub fn new_with_context_window(responses: Vec<MockResponse>, context_window: u64) -> Self {
         Self {
             responses,
@@ -64,14 +67,17 @@ impl MockProvider {
         }
     }
 
+    #[must_use] 
     pub fn single_text_response(text: &str) -> Self {
         Self::new(vec![MockResponse::Text(text.to_string())])
     }
 
+    #[must_use] 
     pub fn single_text_response_repeat(text: &str) -> Self {
         Self::new_with_repeat(vec![MockResponse::Text(text.to_string())])
     }
 
+    #[must_use] 
     pub fn single_tool_call(call_id: &str, name: &str, arguments: serde_json::Value) -> Self {
         Self::new(vec![MockResponse::ToolCalls(vec![MockToolCall {
             call_id: call_id.to_string(),
@@ -80,20 +86,19 @@ impl MockProvider {
         }])])
     }
 
+    #[must_use] 
     pub fn approval_scroll_scenario() -> Self {
         let mut first_text = String::new();
         for i in 1..=30 {
             first_text.push_str(&format!(
-                "approval scroll line {:02}: this output fills the viewport\n",
-                i
+                "approval scroll line {i:02}: this output fills the viewport\n"
             ));
         }
 
         let mut second_text = String::new();
         for i in 31..=60 {
             second_text.push_str(&format!(
-                "approval scroll line {:02}: keep scrolling through output\n",
-                i
+                "approval scroll line {i:02}: keep scrolling through output\n"
             ));
         }
 
@@ -155,6 +160,7 @@ impl MockProvider {
         ])
     }
 
+    #[must_use] 
     pub fn busy_stream_scenario() -> Self {
         let mut events = Vec::new();
         events.push(MockStreamEvent::Chunk(ApiStreamChunk::Text(
@@ -169,8 +175,7 @@ impl MockProvider {
             events.push(MockStreamEvent::Chunk(ApiStreamChunk::Text(
                 ApiStreamTextChunk {
                     text: format!(
-                        "busy stream chunk {:03}: keeping the TUI output channel active\n",
-                        i
+                        "busy stream chunk {i:03}: keeping the TUI output channel active\n"
                     ),
                     id: None,
                     signature: None,
@@ -309,7 +314,7 @@ impl Provider for MockProvider {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "mock"
     }
 }

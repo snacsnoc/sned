@@ -31,15 +31,16 @@ pub enum HookName {
 }
 
 impl HookName {
+    #[must_use] 
     pub fn as_str(&self) -> &'static str {
         match self {
-            HookName::PreToolUse => "PreToolUse",
-            HookName::PostToolUse => "PostToolUse",
-            HookName::TaskStart => "TaskStart",
-            HookName::TaskResume => "TaskResume",
-            HookName::TaskCancel => "TaskCancel",
-            HookName::TaskComplete => "TaskComplete",
-            HookName::PreCompact => "PreCompact",
+            Self::PreToolUse => "PreToolUse",
+            Self::PostToolUse => "PostToolUse",
+            Self::TaskStart => "TaskStart",
+            Self::TaskResume => "TaskResume",
+            Self::TaskCancel => "TaskCancel",
+            Self::TaskComplete => "TaskComplete",
+            Self::PreCompact => "PreCompact",
         }
     }
 }
@@ -225,12 +226,14 @@ impl HookManager {
     }
 
     /// Get the global hooks directory if set.
+    #[must_use] 
     pub fn get_global_hooks_dir(&self) -> Option<&PathBuf> {
         self.global_hooks_dir.as_ref()
     }
 
     /// Discover all hooks for a given hook name across all directories.
     /// Priority: runtime > workspace (> requires opt-in) > global
+    #[must_use] 
     pub fn discover_hooks(&self, hook_name: HookName) -> Vec<PathBuf> {
         let mut hooks = Vec::new();
         let hook_file = hook_name.as_str();
@@ -299,6 +302,7 @@ impl HookManager {
     /// Execute a hook with the given input data.
     /// Returns the combined output from all hook scripts.
     /// Fail-open: if a hook fails, it returns empty modifications and logs the error.
+    #[must_use] 
     pub fn execute_hook(
         &self,
         hook_name: HookName,
@@ -333,7 +337,7 @@ impl HookManager {
                         let existing = combined_output.context_modification.unwrap_or_default();
                         if !existing.is_empty() {
                             combined_output.context_modification =
-                                Some(format!("{}\n{}", existing, modification));
+                                Some(format!("{existing}\n{modification}"));
                         } else {
                             combined_output.context_modification = Some(modification);
                         }
@@ -379,7 +383,7 @@ impl HookManager {
     ) -> Result<HookOutput, String> {
         // Serialize input to JSON
         let input_json = serde_json::to_string(input)
-            .map_err(|e| format!("Failed to serialize hook input: {}", e))?;
+            .map_err(|e| format!("Failed to serialize hook input: {e}"))?;
 
         // Determine shell to use - use /bin/sh for portability and security
         // rather than user's login shell which could execute malicious rc files
@@ -421,7 +425,7 @@ impl HookManager {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("Failed to spawn hook process: {}", e))?;
+            .map_err(|e| format!("Failed to spawn hook process: {e}"))?;
 
         // Write input to stdin BEFORE registering PID for cancellation
         // This prevents timeout/cancel from firing while stdin is being written
@@ -443,15 +447,13 @@ impl HookManager {
             }
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("Failed to write hook input to stdin: {}", e));
+            return Err(format!("Failed to write hook input to stdin: {e}"));
         }
         drop(stdin);
 
         // Track active execution AFTER stdin is written
         let hook_name = hook_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .file_name().map_or_else(|| "unknown".to_string(), |n| n.to_string_lossy().to_string());
         {
             let mut exec = self.active_execution.lock();
             *exec = Some(HookExecution {
@@ -526,9 +528,9 @@ impl HookManager {
                     *pid = None;
                 }
                 // Still collect output
-                let stdout = HookManager::join_thread_with_timeout(stdout_handle, "stdout");
-                let stderr = HookManager::join_thread_with_timeout(stderr_handle, "stderr");
-                return Err(format!("{}\nStdout: {}\nStderr: {}", e, stdout, stderr));
+                let stdout = Self::join_thread_with_timeout(stdout_handle, "stdout");
+                let stderr = Self::join_thread_with_timeout(stderr_handle, "stderr");
+                return Err(format!("{e}\nStdout: {stdout}\nStderr: {stderr}"));
             }
         };
 
@@ -545,8 +547,8 @@ impl HookManager {
         let exit_code = result.code().unwrap_or(-1);
 
         // Collect output
-        let stdout = HookManager::join_thread_with_timeout(stdout_handle, "stdout");
-        let stderr = HookManager::join_thread_with_timeout(stderr_handle, "stderr");
+        let stdout = Self::join_thread_with_timeout(stdout_handle, "stdout");
+        let stderr = Self::join_thread_with_timeout(stderr_handle, "stderr");
 
         // Check for cancellation (Unix SIGINT convention: 128 + 2 = 130)
         if exit_code == 130 {
@@ -565,8 +567,7 @@ impl HookManager {
 
         let output: HookOutput = serde_json::from_str(&stdout).map_err(|e| {
             format!(
-                "Failed to parse hook output as JSON: {}\nStdout: {}\nStderr: {}",
-                e, stdout, stderr
+                "Failed to parse hook output as JSON: {e}\nStdout: {stdout}\nStderr: {stderr}"
             )
         })?;
 
@@ -599,14 +600,13 @@ impl HookManager {
                 Ok(Ok(status)) => {
                     if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst)
                         || cancel_token
-                            .map(|token| token.is_cancelled())
-                            .unwrap_or(false)
+                            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
                     {
                         return Err("Hook execution cancelled".to_string());
                     }
                     return Ok(status);
                 }
-                Ok(Err(e)) => return Err(format!("Failed to wait for hook: {}", e)),
+                Ok(Err(e)) => return Err(format!("Failed to wait for hook: {e}")),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     return Err("Hook wait thread disconnected".to_string());
                 }
@@ -631,8 +631,7 @@ impl HookManager {
                                 nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
-                                Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)) | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }
@@ -650,8 +649,7 @@ impl HookManager {
 
             if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst)
                 || cancel_token
-                    .map(|token| token.is_cancelled())
-                    .unwrap_or(false)
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
                 if pid > 0 {
                     #[cfg(unix)]
@@ -667,8 +665,7 @@ impl HookManager {
                                 nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
-                                Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)) | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }
@@ -701,7 +698,7 @@ impl HookManager {
                 } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
                     s.to_string()
                 } else {
-                    format!("unknown panic in {} reader thread", stream_name)
+                    format!("unknown panic in {stream_name} reader thread")
                 };
                 tracing::error!(
                     stream = %stream_name,
@@ -758,8 +755,7 @@ impl HookManager {
             for pattern in &injection_patterns {
                 if lower.contains(pattern) {
                     return Err(format!(
-                        "contextModification contains prohibited instruction pattern: '{}'",
-                        pattern
+                        "contextModification contains prohibited instruction pattern: '{pattern}'"
                     ));
                 }
             }
@@ -769,6 +765,7 @@ impl HookManager {
     }
 
     /// Execute PreToolUse hook
+    #[must_use] 
     pub fn pre_tool_use(&self, task_id: &str, tool: &str, input: &serde_json::Value) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -784,6 +781,7 @@ impl HookManager {
     }
 
     /// Execute PostToolUse hook
+    #[must_use] 
     pub fn post_tool_use(
         &self,
         task_id: &str,
@@ -806,6 +804,7 @@ impl HookManager {
     }
 
     /// Execute TaskStart hook
+    #[must_use] 
     pub fn task_start(&self, task_id: &str, task: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -820,6 +819,7 @@ impl HookManager {
     }
 
     /// Execute TaskComplete hook
+    #[must_use] 
     pub fn task_complete(&self, task_id: &str, task: &str, completion: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -835,6 +835,7 @@ impl HookManager {
     }
 
     /// Execute TaskCancel hook
+    #[must_use] 
     pub fn task_cancel(&self, task_id: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -849,6 +850,7 @@ impl HookManager {
     }
 
     /// Execute TaskResume hook
+    #[must_use] 
     pub fn task_resume(&self, task_id: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -863,6 +865,7 @@ impl HookManager {
     }
 
     /// Execute PreCompact hook
+    #[must_use] 
     pub fn pre_compact(&self, task_id: &str, conversation_history_path: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -895,11 +898,13 @@ pub enum HookError {
 
 // Inherent methods (formerly HookManager trait methods - collapsed to eliminate unnecessary abstraction)
 impl HookManager {
+    #[must_use] 
     pub fn should_run_task_cancel_hook(&self) -> bool {
         let hooks = self.discover_hooks(HookName::TaskCancel);
         !hooks.is_empty()
     }
 
+    #[must_use] 
     pub fn get_active_hook_execution(&self) -> Option<HookExecution> {
         let guard = self.active_execution.lock();
         guard.clone()
@@ -919,7 +924,7 @@ impl HookManager {
                 use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
                 kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM).map_err(|e| {
-                    HookError::Other(format!("Failed to kill process group: {}", e))
+                    HookError::Other(format!("Failed to kill process group: {e}"))
                 })?;
                 let kill_start = std::time::Instant::now();
                 while kill_start.elapsed() < std::time::Duration::from_millis(500) {
@@ -927,8 +932,7 @@ impl HookManager {
                         Pid::from_raw(-(pid as i32)),
                         Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                     ) {
-                        Ok(nix::sys::wait::WaitStatus::Exited(_, _))
-                        | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                        Ok(nix::sys::wait::WaitStatus::Exited(_, _) | nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                         _ => std::thread::sleep(std::time::Duration::from_millis(50)),
                     }
                 }

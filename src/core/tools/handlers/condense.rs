@@ -14,6 +14,7 @@ use crate::providers::{MessageRole, StorageMessage};
 pub struct CondenseHandler;
 
 impl CondenseHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -68,8 +69,7 @@ impl CondenseHandler {
         // Augment summary with hook modification if present
         let final_summary = if let Some(modification) = hook_context_modification {
             format!(
-                "{}\n\n[Context Modification from PreCompact Hook]\n{}",
-                context, modification
+                "{context}\n\n[Context Modification from PreCompact Hook]\n{modification}"
             )
         } else {
             context.to_string()
@@ -86,7 +86,7 @@ impl CondenseHandler {
                 Style::default().fg(WARNING_FG),
             ));
             ctx.output_writer.emit(OutputEvent::tool_output_line(
-                format!("{}\n", final_summary),
+                format!("{final_summary}\n"),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             ctx.output_writer.emit(OutputEvent::tool_output_line(
@@ -94,7 +94,7 @@ impl CondenseHandler {
                 Style::default().fg(ACCENT),
             ));
             ctx.output_writer.emit(OutputEvent::tool_output_line(
-                format!("(waiting up to {}s for your response)", timeout_secs),
+                format!("(waiting up to {timeout_secs}s for your response)"),
                 Style::default().add_modifier(Modifier::DIM),
             ));
             ctx.output_writer.flush();
@@ -125,8 +125,7 @@ impl CondenseHandler {
             if !user_response.is_empty() {
                 tracing::info!("User provided feedback on condensation instead of accepting");
                 return Ok(format!(
-                    "User provided feedback on the condensed conversation summary:\n<feedback>\n{}\n</feedback>",
-                    user_response
+                    "User provided feedback on the condensed conversation summary:\n<feedback>\n{user_response}\n</feedback>"
                 ));
             }
             // Empty response = user accepted, proceed with compaction
@@ -146,8 +145,7 @@ impl CondenseHandler {
                 if let Some(history_array) = params.get("history").and_then(|h| h.as_array()) {
                     let range_end = state
                         .conversation_history_deleted_range
-                        .map(|r| r.1 + 1)
-                        .unwrap_or(0);
+                        .map_or(0, |r| r.1 + 1);
                     history_array.len().saturating_sub(range_end)
                 } else {
                     0
@@ -155,9 +153,8 @@ impl CondenseHandler {
 
             if active_messages <= 2 {
                 return Err(ToolError::InvalidInput(format!(
-                    "Not enough new messages to re-compact ({} new message(s) since last compaction). \
-                         Continue the conversation or start a new task before compacting again.",
-                    active_messages
+                    "Not enough new messages to re-compact ({active_messages} new message(s) since last compaction). \
+                         Continue the conversation or start a new task before compacting again."
                 )));
             }
             // Enough new messages — proceed with re-compaction (will overwrite below)
@@ -170,8 +167,7 @@ impl CondenseHandler {
         let messages_compacted = params
             .get("history")
             .and_then(|h| h.as_array())
-            .map(|arr| arr.len())
-            .unwrap_or(0);
+            .map_or(0, std::vec::Vec::len);
 
         // Create and store compacted summary (overwrites previous summary on re-compaction)
         let summary = CompactedSummary::new(final_summary.clone(), messages_compacted);
@@ -203,8 +199,7 @@ impl CondenseHandler {
                 // messages (so the assistant's summary message isn't lost).
                 let keep = if history
                     .last()
-                    .map(|m| m.role == MessageRole::Assistant)
-                    .unwrap_or(false)
+                    .is_some_and(|m| m.role == MessageRole::Assistant)
                 {
                     TruncationKeep::LastTwo
                 } else {
@@ -223,13 +218,11 @@ impl CondenseHandler {
 
         if is_recompaction {
             Ok(format!(
-                "Conversation re-compacted. Continuing from updated summary:\n\n{}",
-                final_summary
+                "Conversation re-compacted. Continuing from updated summary:\n\n{final_summary}"
             ))
         } else {
             Ok(format!(
-                "Conversation condensed. Continuing from summary:\n\n{}",
-                final_summary
+                "Conversation condensed. Continuing from summary:\n\n{final_summary}"
             ))
         }
     }
@@ -242,9 +235,8 @@ impl ToolHandler for CondenseHandler {
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
-            CondenseHandler::execute(&CondenseHandler, &ctx, params)
+            Self::execute(&Self, &ctx, params)
                 .await
                 .map(serde_json::Value::String)
         })

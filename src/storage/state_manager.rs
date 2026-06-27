@@ -367,281 +367,281 @@ pub enum GlobalStateKey {
 
 impl GlobalStateKey {
     /// Get the string value for this key from GlobalState (for CLI config display).
+    #[must_use] 
     pub fn get_string_value(&self, state: &GlobalState) -> Option<String> {
         match self {
-            GlobalStateKey::Mode => Some(state.mode.clone()),
-            GlobalStateKey::ActModeApiProvider => Some(state.act_mode_api_provider.clone()),
-            GlobalStateKey::PlanModeApiProvider => Some(state.plan_mode_api_provider.clone()),
-            GlobalStateKey::ActModeApiModelId => state.act_mode_api_model_id.clone(),
-            GlobalStateKey::PlanModeApiModelId => state.plan_mode_api_model_id.clone(),
-            GlobalStateKey::AzureApiVersion => state.azure_api_version.clone(),
-            GlobalStateKey::PreferredLanguage => Some(state.preferred_language.clone()),
-            GlobalStateKey::TelemetrySetting => Some(state.telemetry_setting.clone()),
-            GlobalStateKey::DefaultTerminalProfile => Some(state.default_terminal_profile.clone()),
-            GlobalStateKey::CustomPrompt => state.custom_prompt.clone(),
-            GlobalStateKey::WorktreeAutoOpenPath => state.worktree_auto_open_path.clone(),
-            GlobalStateKey::LastShownAnnouncementId => state.last_shown_announcement_id.clone(),
-            GlobalStateKey::WritePromptMetadataDirectory => {
+            Self::Mode => Some(state.mode.clone()),
+            Self::ActModeApiProvider => Some(state.act_mode_api_provider.clone()),
+            Self::PlanModeApiProvider => Some(state.plan_mode_api_provider.clone()),
+            Self::ActModeApiModelId => state.act_mode_api_model_id.clone(),
+            Self::PlanModeApiModelId => state.plan_mode_api_model_id.clone(),
+            Self::AzureApiVersion => state.azure_api_version.clone(),
+            Self::PreferredLanguage => Some(state.preferred_language.clone()),
+            Self::TelemetrySetting => Some(state.telemetry_setting.clone()),
+            Self::DefaultTerminalProfile => Some(state.default_terminal_profile.clone()),
+            Self::CustomPrompt => state.custom_prompt.clone(),
+            Self::WorktreeAutoOpenPath => state.worktree_auto_open_path.clone(),
+            Self::LastShownAnnouncementId => state.last_shown_announcement_id.clone(),
+            Self::WritePromptMetadataDirectory => {
                 state.write_prompt_metadata_directory.clone()
             }
-            GlobalStateKey::LiteLlmBaseUrl => state.lite_llm_base_url.clone(),
-            GlobalStateKey::AnthropicBaseUrl => state.anthropic_base_url.clone(),
-            GlobalStateKey::OpenAiBaseUrl => state.open_ai_base_url.clone(),
-            GlobalStateKey::OpenRouterBaseUrl => state.open_router_base_url.clone(),
-            GlobalStateKey::GeminiBaseUrl => state.gemini_base_url.clone(),
-            GlobalStateKey::AwsRegion => state.aws_region.clone(),
-            GlobalStateKey::OpenTelemetryMetricsExporter => {
+            Self::LiteLlmBaseUrl => state.lite_llm_base_url.clone(),
+            Self::AnthropicBaseUrl => state.anthropic_base_url.clone(),
+            Self::OpenAiBaseUrl => state.open_ai_base_url.clone(),
+            Self::OpenRouterBaseUrl => state.open_router_base_url.clone(),
+            Self::GeminiBaseUrl => state.gemini_base_url.clone(),
+            Self::AwsRegion => state.aws_region.clone(),
+            Self::OpenTelemetryMetricsExporter => {
                 state.open_telemetry_metrics_exporter.clone()
             }
-            GlobalStateKey::OpenTelemetryLogsExporter => state.open_telemetry_logs_exporter.clone(),
-            GlobalStateKey::OpenTelemetryOtlpProtocol => {
+            Self::OpenTelemetryLogsExporter => state.open_telemetry_logs_exporter.clone(),
+            Self::OpenTelemetryOtlpProtocol => {
                 Some(state.open_telemetry_otlp_protocol.clone())
             }
-            GlobalStateKey::OpenTelemetryOtlpEndpoint => {
+            Self::OpenTelemetryOtlpEndpoint => {
                 Some(state.open_telemetry_otlp_endpoint.clone())
             }
-            GlobalStateKey::OpenTelemetryOtlpMetricsProtocol => {
+            Self::OpenTelemetryOtlpMetricsProtocol => {
                 state.open_telemetry_otlp_metrics_protocol.clone()
             }
-            GlobalStateKey::OpenTelemetryOtlpMetricsEndpoint => {
+            Self::OpenTelemetryOtlpMetricsEndpoint => {
                 state.open_telemetry_otlp_metrics_endpoint.clone()
             }
-            GlobalStateKey::OpenTelemetryOtlpLogsProtocol => {
+            Self::OpenTelemetryOtlpLogsProtocol => {
                 state.open_telemetry_otlp_logs_protocol.clone()
             }
-            GlobalStateKey::OpenTelemetryOtlpLogsEndpoint => {
+            Self::OpenTelemetryOtlpLogsEndpoint => {
                 state.open_telemetry_otlp_logs_endpoint.clone()
             }
-            GlobalStateKey::ShellIntegrationTimeout => {
+            Self::ShellIntegrationTimeout => {
                 Some(state.shell_integration_timeout.to_string())
             }
-            GlobalStateKey::TerminalOutputLineLimit => {
+            Self::TerminalOutputLineLimit => {
                 Some(state.terminal_output_line_limit.to_string())
             }
-            GlobalStateKey::MaxConsecutiveMistakes => {
+            Self::MaxConsecutiveMistakes => {
                 Some(state.max_consecutive_mistakes.to_string())
             }
-            GlobalStateKey::OpenTelemetryMetricExportInterval => {
+            Self::OpenTelemetryMetricExportInterval => {
                 Some(state.open_telemetry_metric_export_interval.to_string())
             }
-            GlobalStateKey::OpenTelemetryLogBatchSize => {
+            Self::OpenTelemetryLogBatchSize => {
                 Some(state.open_telemetry_log_batch_size.to_string())
             }
-            GlobalStateKey::OpenTelemetryLogBatchTimeout => {
+            Self::OpenTelemetryLogBatchTimeout => {
                 Some(state.open_telemetry_log_batch_timeout.to_string())
             }
-            GlobalStateKey::OpenTelemetryLogMaxQueueSize => {
+            Self::OpenTelemetryLogMaxQueueSize => {
                 Some(state.open_telemetry_log_max_queue_size.to_string())
             }
-            GlobalStateKey::RequestTimeoutMs => state.request_timeout_ms.map(|v| v.to_string()),
-            GlobalStateKey::EnableCheckpoints => Some(state.enable_checkpoints_setting.to_string()),
-            GlobalStateKey::PlanActSeparateModelsSetting => {
+            Self::RequestTimeoutMs => state.request_timeout_ms.map(|v| v.to_string()),
+            Self::EnableCheckpoints => Some(state.enable_checkpoints_setting.to_string()),
+            Self::PlanActSeparateModelsSetting => {
                 Some(state.plan_act_separate_models_setting.to_string())
             }
-            GlobalStateKey::StrictPlanModeEnabled => {
+            Self::StrictPlanModeEnabled => {
                 Some(state.strict_plan_mode_enabled.to_string())
             }
-            GlobalStateKey::HooksEnabled => Some(state.hooks_enabled.to_string()),
-            GlobalStateKey::UseAutoCondense => Some(state.use_auto_condense.to_string()),
-            GlobalStateKey::ShowTokenUsage => Some(state.show_token_usage.to_string()),
-            GlobalStateKey::SubagentsEnabled => Some(state.subagents_enabled.to_string()),
-            GlobalStateKey::SnedWebToolsEnabled => Some(state.sned_web_tools_enabled.to_string()),
-            GlobalStateKey::WorktreesEnabled => Some(state.worktrees_enabled.to_string()),
-            GlobalStateKey::BackgroundEditEnabled => {
+            Self::HooksEnabled => Some(state.hooks_enabled.to_string()),
+            Self::UseAutoCondense => Some(state.use_auto_condense.to_string()),
+            Self::ShowTokenUsage => Some(state.show_token_usage.to_string()),
+            Self::SubagentsEnabled => Some(state.subagents_enabled.to_string()),
+            Self::SnedWebToolsEnabled => Some(state.sned_web_tools_enabled.to_string()),
+            Self::WorktreesEnabled => Some(state.worktrees_enabled.to_string()),
+            Self::BackgroundEditEnabled => {
                 Some(state.background_edit_enabled.to_string())
             }
-            GlobalStateKey::OptOutOfRemoteConfig => {
+            Self::OptOutOfRemoteConfig => {
                 Some(state.opt_out_of_remote_config.to_string())
             }
-            GlobalStateKey::DoubleCheckCompletionEnabled => {
+            Self::DoubleCheckCompletionEnabled => {
                 Some(state.double_check_completion_enabled.to_string())
             }
-            GlobalStateKey::OpenTelemetryEnabled => Some(state.open_telemetry_enabled.to_string()),
-            GlobalStateKey::OpenTelemetryOtlpInsecure => {
+            Self::OpenTelemetryEnabled => Some(state.open_telemetry_enabled.to_string()),
+            Self::OpenTelemetryOtlpInsecure => {
                 Some(state.open_telemetry_otlp_insecure.to_string())
             }
-            GlobalStateKey::WritePromptMetadataEnabled => {
+            Self::WritePromptMetadataEnabled => {
                 Some(state.write_prompt_metadata_enabled.to_string())
             }
-            GlobalStateKey::EnableParallelToolCalling => {
+            Self::EnableParallelToolCalling => {
                 Some(state.enable_parallel_tool_calling.to_string())
             }
-            GlobalStateKey::SnedVersion => state.sned_version.clone(),
-            GlobalStateKey::TaskHistory => None,
-            GlobalStateKey::FavoritedModelIds => None,
-            GlobalStateKey::TerminalReuseEnabled => Some(state.terminal_reuse_enabled.to_string()),
-            GlobalStateKey::IsNewUser => Some(state.is_new_user.to_string()),
-            GlobalStateKey::GlobalSnedRulesToggles => None,
+            Self::SnedVersion => state.sned_version.clone(),
+            Self::TaskHistory | Self::FavoritedModelIds | Self::GlobalSnedRulesToggles => None,
+            Self::TerminalReuseEnabled => Some(state.terminal_reuse_enabled.to_string()),
+            Self::IsNewUser => Some(state.is_new_user.to_string()),
         }
     }
 
     /// Get the JSON value for this key from GlobalState.
+    #[must_use] 
     pub fn get_json_value(&self, state: &GlobalState) -> Option<serde_json::Value> {
         match self {
-            GlobalStateKey::SnedVersion => serde_json::to_value(&state.sned_version).ok(),
-            GlobalStateKey::TaskHistory => serde_json::to_value(&state.task_history).ok(),
-            GlobalStateKey::FavoritedModelIds => {
+            Self::SnedVersion => serde_json::to_value(&state.sned_version).ok(),
+            Self::TaskHistory => serde_json::to_value(&state.task_history).ok(),
+            Self::FavoritedModelIds => {
                 serde_json::to_value(&state.favorited_model_ids).ok()
             }
-            GlobalStateKey::TerminalReuseEnabled => {
+            Self::TerminalReuseEnabled => {
                 serde_json::to_value(state.terminal_reuse_enabled).ok()
             }
-            GlobalStateKey::IsNewUser => serde_json::to_value(state.is_new_user).ok(),
-            GlobalStateKey::Mode => serde_json::to_value(&state.mode).ok(),
-            GlobalStateKey::SubagentsEnabled => serde_json::to_value(state.subagents_enabled).ok(),
-            GlobalStateKey::GlobalSnedRulesToggles => {
+            Self::IsNewUser => serde_json::to_value(state.is_new_user).ok(),
+            Self::Mode => serde_json::to_value(&state.mode).ok(),
+            Self::SubagentsEnabled => serde_json::to_value(state.subagents_enabled).ok(),
+            Self::GlobalSnedRulesToggles => {
                 serde_json::to_value(&state.global_sned_rules_toggles).ok()
             }
-            GlobalStateKey::EnableCheckpoints => {
+            Self::EnableCheckpoints => {
                 serde_json::to_value(state.enable_checkpoints_setting).ok()
             }
-            GlobalStateKey::ActModeApiProvider => {
+            Self::ActModeApiProvider => {
                 serde_json::to_value(&state.act_mode_api_provider).ok()
             }
-            GlobalStateKey::PlanModeApiProvider => {
+            Self::PlanModeApiProvider => {
                 serde_json::to_value(&state.plan_mode_api_provider).ok()
             }
-            GlobalStateKey::ActModeApiModelId => {
+            Self::ActModeApiModelId => {
                 serde_json::to_value(&state.act_mode_api_model_id).ok()
             }
-            GlobalStateKey::PlanModeApiModelId => {
+            Self::PlanModeApiModelId => {
                 serde_json::to_value(&state.plan_mode_api_model_id).ok()
             }
-            GlobalStateKey::AzureApiVersion => serde_json::to_value(&state.azure_api_version).ok(),
-            GlobalStateKey::PreferredLanguage => {
+            Self::AzureApiVersion => serde_json::to_value(&state.azure_api_version).ok(),
+            Self::PreferredLanguage => {
                 serde_json::to_value(&state.preferred_language).ok()
             }
-            GlobalStateKey::TelemetrySetting => serde_json::to_value(&state.telemetry_setting).ok(),
-            GlobalStateKey::DefaultTerminalProfile => {
+            Self::TelemetrySetting => serde_json::to_value(&state.telemetry_setting).ok(),
+            Self::DefaultTerminalProfile => {
                 serde_json::to_value(&state.default_terminal_profile).ok()
             }
-            GlobalStateKey::CustomPrompt => state
+            Self::CustomPrompt => state
                 .custom_prompt
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::WorktreeAutoOpenPath => state
+            Self::WorktreeAutoOpenPath => state
                 .worktree_auto_open_path
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::LastShownAnnouncementId => state
+            Self::LastShownAnnouncementId => state
                 .last_shown_announcement_id
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::WritePromptMetadataDirectory => state
+            Self::WritePromptMetadataDirectory => state
                 .write_prompt_metadata_directory
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::LiteLlmBaseUrl => state
+            Self::LiteLlmBaseUrl => state
                 .lite_llm_base_url
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::AnthropicBaseUrl => state
+            Self::AnthropicBaseUrl => state
                 .anthropic_base_url
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::OpenAiBaseUrl => state
+            Self::OpenAiBaseUrl => state
                 .open_ai_base_url
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::OpenRouterBaseUrl => state
+            Self::OpenRouterBaseUrl => state
                 .open_router_base_url
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::GeminiBaseUrl => state
+            Self::GeminiBaseUrl => state
                 .gemini_base_url
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::AwsRegion => state
+            Self::AwsRegion => state
                 .aws_region
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::OpenTelemetryMetricsExporter => state
+            Self::OpenTelemetryMetricsExporter => state
                 .open_telemetry_metrics_exporter
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::OpenTelemetryLogsExporter => state
+            Self::OpenTelemetryLogsExporter => state
                 .open_telemetry_logs_exporter
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::OpenTelemetryOtlpProtocol => {
+            Self::OpenTelemetryOtlpProtocol => {
                 serde_json::to_value(&state.open_telemetry_otlp_protocol).ok()
             }
-            GlobalStateKey::OpenTelemetryOtlpEndpoint => {
+            Self::OpenTelemetryOtlpEndpoint => {
                 serde_json::to_value(&state.open_telemetry_otlp_endpoint).ok()
             }
-            GlobalStateKey::OpenTelemetryOtlpMetricsProtocol => state
+            Self::OpenTelemetryOtlpMetricsProtocol => state
                 .open_telemetry_otlp_metrics_protocol
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::OpenTelemetryOtlpMetricsEndpoint => state
+            Self::OpenTelemetryOtlpMetricsEndpoint => state
                 .open_telemetry_otlp_metrics_endpoint
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::OpenTelemetryOtlpLogsProtocol => state
+            Self::OpenTelemetryOtlpLogsProtocol => state
                 .open_telemetry_otlp_logs_protocol
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::OpenTelemetryOtlpLogsEndpoint => state
+            Self::OpenTelemetryOtlpLogsEndpoint => state
                 .open_telemetry_otlp_logs_endpoint
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::ShellIntegrationTimeout => {
+            Self::ShellIntegrationTimeout => {
                 serde_json::to_value(state.shell_integration_timeout).ok()
             }
-            GlobalStateKey::TerminalOutputLineLimit => {
+            Self::TerminalOutputLineLimit => {
                 serde_json::to_value(state.terminal_output_line_limit).ok()
             }
-            GlobalStateKey::MaxConsecutiveMistakes => {
+            Self::MaxConsecutiveMistakes => {
                 serde_json::to_value(state.max_consecutive_mistakes).ok()
             }
-            GlobalStateKey::OpenTelemetryMetricExportInterval => {
+            Self::OpenTelemetryMetricExportInterval => {
                 serde_json::to_value(state.open_telemetry_metric_export_interval).ok()
             }
-            GlobalStateKey::OpenTelemetryLogBatchSize => {
+            Self::OpenTelemetryLogBatchSize => {
                 serde_json::to_value(state.open_telemetry_log_batch_size).ok()
             }
-            GlobalStateKey::OpenTelemetryLogBatchTimeout => {
+            Self::OpenTelemetryLogBatchTimeout => {
                 serde_json::to_value(state.open_telemetry_log_batch_timeout).ok()
             }
-            GlobalStateKey::OpenTelemetryLogMaxQueueSize => {
+            Self::OpenTelemetryLogMaxQueueSize => {
                 serde_json::to_value(state.open_telemetry_log_max_queue_size).ok()
             }
-            GlobalStateKey::RequestTimeoutMs => state
+            Self::RequestTimeoutMs => state
                 .request_timeout_ms
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            GlobalStateKey::PlanActSeparateModelsSetting => {
+            Self::PlanActSeparateModelsSetting => {
                 serde_json::to_value(state.plan_act_separate_models_setting).ok()
             }
-            GlobalStateKey::StrictPlanModeEnabled => {
+            Self::StrictPlanModeEnabled => {
                 serde_json::to_value(state.strict_plan_mode_enabled).ok()
             }
-            GlobalStateKey::HooksEnabled => serde_json::to_value(state.hooks_enabled).ok(),
-            GlobalStateKey::UseAutoCondense => serde_json::to_value(state.use_auto_condense).ok(),
-            GlobalStateKey::ShowTokenUsage => serde_json::to_value(state.show_token_usage).ok(),
-            GlobalStateKey::SnedWebToolsEnabled => {
+            Self::HooksEnabled => serde_json::to_value(state.hooks_enabled).ok(),
+            Self::UseAutoCondense => serde_json::to_value(state.use_auto_condense).ok(),
+            Self::ShowTokenUsage => serde_json::to_value(state.show_token_usage).ok(),
+            Self::SnedWebToolsEnabled => {
                 serde_json::to_value(state.sned_web_tools_enabled).ok()
             }
-            GlobalStateKey::WorktreesEnabled => serde_json::to_value(state.worktrees_enabled).ok(),
-            GlobalStateKey::BackgroundEditEnabled => {
+            Self::WorktreesEnabled => serde_json::to_value(state.worktrees_enabled).ok(),
+            Self::BackgroundEditEnabled => {
                 serde_json::to_value(state.background_edit_enabled).ok()
             }
-            GlobalStateKey::OptOutOfRemoteConfig => {
+            Self::OptOutOfRemoteConfig => {
                 serde_json::to_value(state.opt_out_of_remote_config).ok()
             }
-            GlobalStateKey::DoubleCheckCompletionEnabled => {
+            Self::DoubleCheckCompletionEnabled => {
                 serde_json::to_value(state.double_check_completion_enabled).ok()
             }
-            GlobalStateKey::OpenTelemetryEnabled => {
+            Self::OpenTelemetryEnabled => {
                 serde_json::to_value(state.open_telemetry_enabled).ok()
             }
-            GlobalStateKey::OpenTelemetryOtlpInsecure => {
+            Self::OpenTelemetryOtlpInsecure => {
                 serde_json::to_value(state.open_telemetry_otlp_insecure).ok()
             }
-            GlobalStateKey::WritePromptMetadataEnabled => {
+            Self::WritePromptMetadataEnabled => {
                 serde_json::to_value(state.write_prompt_metadata_enabled).ok()
             }
-            GlobalStateKey::EnableParallelToolCalling => {
+            Self::EnableParallelToolCalling => {
                 serde_json::to_value(state.enable_parallel_tool_calling).ok()
             }
         }
@@ -650,241 +650,241 @@ impl GlobalStateKey {
     /// Set a JSON value on GlobalState for this key.
     pub fn set_json_value(&self, state: &mut GlobalState, value: serde_json::Value) {
         match self {
-            GlobalStateKey::SnedVersion => state.sned_version = serde_json::from_value(value).ok(),
-            GlobalStateKey::TaskHistory => {
+            Self::SnedVersion => state.sned_version = serde_json::from_value(value).ok(),
+            Self::TaskHistory => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.task_history = v;
                 }
             }
-            GlobalStateKey::FavoritedModelIds => {
+            Self::FavoritedModelIds => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.favorited_model_ids = v;
                 }
             }
-            GlobalStateKey::TerminalReuseEnabled => {
+            Self::TerminalReuseEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.terminal_reuse_enabled = v;
                 }
             }
-            GlobalStateKey::IsNewUser => {
+            Self::IsNewUser => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.is_new_user = v;
                 }
             }
-            GlobalStateKey::Mode => {
+            Self::Mode => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.mode = v;
                 }
             }
-            GlobalStateKey::SubagentsEnabled => {
+            Self::SubagentsEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.subagents_enabled = v;
                 }
             }
-            GlobalStateKey::GlobalSnedRulesToggles => {
+            Self::GlobalSnedRulesToggles => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.global_sned_rules_toggles = v;
                 }
             }
-            GlobalStateKey::EnableCheckpoints => {
+            Self::EnableCheckpoints => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.enable_checkpoints_setting = v;
                 }
             }
-            GlobalStateKey::ActModeApiProvider => {
+            Self::ActModeApiProvider => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.act_mode_api_provider = v;
                 }
             }
-            GlobalStateKey::PlanModeApiProvider => {
+            Self::PlanModeApiProvider => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.plan_mode_api_provider = v;
                 }
             }
-            GlobalStateKey::ActModeApiModelId => {
-                state.act_mode_api_model_id = serde_json::from_value(value).ok()
+            Self::ActModeApiModelId => {
+                state.act_mode_api_model_id = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::PlanModeApiModelId => {
-                state.plan_mode_api_model_id = serde_json::from_value(value).ok()
+            Self::PlanModeApiModelId => {
+                state.plan_mode_api_model_id = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::AzureApiVersion => {
-                state.azure_api_version = serde_json::from_value(value).ok()
+            Self::AzureApiVersion => {
+                state.azure_api_version = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::PreferredLanguage => {
+            Self::PreferredLanguage => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.preferred_language = v;
                 }
             }
-            GlobalStateKey::TelemetrySetting => {
+            Self::TelemetrySetting => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.telemetry_setting = v;
                 }
             }
-            GlobalStateKey::DefaultTerminalProfile => {
+            Self::DefaultTerminalProfile => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.default_terminal_profile = v;
                 }
             }
-            GlobalStateKey::CustomPrompt => {
-                state.custom_prompt = serde_json::from_value(value).ok()
+            Self::CustomPrompt => {
+                state.custom_prompt = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::WorktreeAutoOpenPath => {
-                state.worktree_auto_open_path = serde_json::from_value(value).ok()
+            Self::WorktreeAutoOpenPath => {
+                state.worktree_auto_open_path = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::LastShownAnnouncementId => {
-                state.last_shown_announcement_id = serde_json::from_value(value).ok()
+            Self::LastShownAnnouncementId => {
+                state.last_shown_announcement_id = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::WritePromptMetadataDirectory => {
-                state.write_prompt_metadata_directory = serde_json::from_value(value).ok()
+            Self::WritePromptMetadataDirectory => {
+                state.write_prompt_metadata_directory = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::LiteLlmBaseUrl => {
-                state.lite_llm_base_url = serde_json::from_value(value).ok()
+            Self::LiteLlmBaseUrl => {
+                state.lite_llm_base_url = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::AnthropicBaseUrl => {
-                state.anthropic_base_url = serde_json::from_value(value).ok()
+            Self::AnthropicBaseUrl => {
+                state.anthropic_base_url = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::OpenAiBaseUrl => {
-                state.open_ai_base_url = serde_json::from_value(value).ok()
+            Self::OpenAiBaseUrl => {
+                state.open_ai_base_url = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::OpenRouterBaseUrl => {
-                state.open_router_base_url = serde_json::from_value(value).ok()
+            Self::OpenRouterBaseUrl => {
+                state.open_router_base_url = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::GeminiBaseUrl => {
-                state.gemini_base_url = serde_json::from_value(value).ok()
+            Self::GeminiBaseUrl => {
+                state.gemini_base_url = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::AwsRegion => state.aws_region = serde_json::from_value(value).ok(),
-            GlobalStateKey::OpenTelemetryMetricsExporter => {
-                state.open_telemetry_metrics_exporter = serde_json::from_value(value).ok()
+            Self::AwsRegion => state.aws_region = serde_json::from_value(value).ok(),
+            Self::OpenTelemetryMetricsExporter => {
+                state.open_telemetry_metrics_exporter = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::OpenTelemetryLogsExporter => {
-                state.open_telemetry_logs_exporter = serde_json::from_value(value).ok()
+            Self::OpenTelemetryLogsExporter => {
+                state.open_telemetry_logs_exporter = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::OpenTelemetryOtlpProtocol => {
+            Self::OpenTelemetryOtlpProtocol => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.open_telemetry_otlp_protocol = v;
                 }
             }
-            GlobalStateKey::OpenTelemetryOtlpEndpoint => {
+            Self::OpenTelemetryOtlpEndpoint => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.open_telemetry_otlp_endpoint = v;
                 }
             }
-            GlobalStateKey::OpenTelemetryOtlpMetricsProtocol => {
-                state.open_telemetry_otlp_metrics_protocol = serde_json::from_value(value).ok()
+            Self::OpenTelemetryOtlpMetricsProtocol => {
+                state.open_telemetry_otlp_metrics_protocol = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::OpenTelemetryOtlpMetricsEndpoint => {
-                state.open_telemetry_otlp_metrics_endpoint = serde_json::from_value(value).ok()
+            Self::OpenTelemetryOtlpMetricsEndpoint => {
+                state.open_telemetry_otlp_metrics_endpoint = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::OpenTelemetryOtlpLogsProtocol => {
-                state.open_telemetry_otlp_logs_protocol = serde_json::from_value(value).ok()
+            Self::OpenTelemetryOtlpLogsProtocol => {
+                state.open_telemetry_otlp_logs_protocol = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::OpenTelemetryOtlpLogsEndpoint => {
-                state.open_telemetry_otlp_logs_endpoint = serde_json::from_value(value).ok()
+            Self::OpenTelemetryOtlpLogsEndpoint => {
+                state.open_telemetry_otlp_logs_endpoint = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::ShellIntegrationTimeout => {
+            Self::ShellIntegrationTimeout => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.shell_integration_timeout = v;
                 }
             }
-            GlobalStateKey::TerminalOutputLineLimit => {
+            Self::TerminalOutputLineLimit => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.terminal_output_line_limit = v;
                 }
             }
-            GlobalStateKey::MaxConsecutiveMistakes => {
+            Self::MaxConsecutiveMistakes => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.max_consecutive_mistakes = v;
                 }
             }
-            GlobalStateKey::OpenTelemetryMetricExportInterval => {
+            Self::OpenTelemetryMetricExportInterval => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.open_telemetry_metric_export_interval = v;
                 }
             }
-            GlobalStateKey::OpenTelemetryLogBatchSize => {
+            Self::OpenTelemetryLogBatchSize => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.open_telemetry_log_batch_size = v;
                 }
             }
-            GlobalStateKey::OpenTelemetryLogBatchTimeout => {
+            Self::OpenTelemetryLogBatchTimeout => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.open_telemetry_log_batch_timeout = v;
                 }
             }
-            GlobalStateKey::OpenTelemetryLogMaxQueueSize => {
+            Self::OpenTelemetryLogMaxQueueSize => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.open_telemetry_log_max_queue_size = v;
                 }
             }
-            GlobalStateKey::RequestTimeoutMs => {
-                state.request_timeout_ms = serde_json::from_value(value).ok()
+            Self::RequestTimeoutMs => {
+                state.request_timeout_ms = serde_json::from_value(value).ok();
             }
-            GlobalStateKey::PlanActSeparateModelsSetting => {
+            Self::PlanActSeparateModelsSetting => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.plan_act_separate_models_setting = v;
                 }
             }
-            GlobalStateKey::StrictPlanModeEnabled => {
+            Self::StrictPlanModeEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.strict_plan_mode_enabled = v;
                 }
             }
-            GlobalStateKey::HooksEnabled => {
+            Self::HooksEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.hooks_enabled = v;
                 }
             }
-            GlobalStateKey::UseAutoCondense => {
+            Self::UseAutoCondense => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.use_auto_condense = v;
                 }
             }
-            GlobalStateKey::ShowTokenUsage => {
+            Self::ShowTokenUsage => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.show_token_usage = v;
                 }
             }
-            GlobalStateKey::SnedWebToolsEnabled => {
+            Self::SnedWebToolsEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.sned_web_tools_enabled = v;
                 }
             }
-            GlobalStateKey::WorktreesEnabled => {
+            Self::WorktreesEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.worktrees_enabled = v;
                 }
             }
-            GlobalStateKey::BackgroundEditEnabled => {
+            Self::BackgroundEditEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.background_edit_enabled = v;
                 }
             }
-            GlobalStateKey::OptOutOfRemoteConfig => {
+            Self::OptOutOfRemoteConfig => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.opt_out_of_remote_config = v;
                 }
             }
-            GlobalStateKey::DoubleCheckCompletionEnabled => {
+            Self::DoubleCheckCompletionEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.double_check_completion_enabled = v;
                 }
             }
-            GlobalStateKey::OpenTelemetryEnabled => {
+            Self::OpenTelemetryEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.open_telemetry_enabled = v;
                 }
             }
-            GlobalStateKey::OpenTelemetryOtlpInsecure => {
+            Self::OpenTelemetryOtlpInsecure => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.open_telemetry_otlp_insecure = v;
                 }
             }
-            GlobalStateKey::WritePromptMetadataEnabled => {
+            Self::WritePromptMetadataEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.write_prompt_metadata_enabled = v;
                 }
             }
-            GlobalStateKey::EnableParallelToolCalling => {
+            Self::EnableParallelToolCalling => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.enable_parallel_tool_calling = v;
                 }
@@ -899,186 +899,186 @@ impl std::str::FromStr for GlobalStateKey {
         // Support both camelCase (original) and snake_case (VALID_CONFIG_KEYS) names
         match s {
             // snedVersion
-            "snedVersion" | "sned_version" => Ok(GlobalStateKey::SnedVersion),
+            "snedVersion" | "sned_version" => Ok(Self::SnedVersion),
             // taskHistory
-            "taskHistory" | "task_history" => Ok(GlobalStateKey::TaskHistory),
+            "taskHistory" | "task_history" => Ok(Self::TaskHistory),
             // favoritedModelIds
-            "favoritedModelIds" | "favorited_model_ids" => Ok(GlobalStateKey::FavoritedModelIds),
+            "favoritedModelIds" | "favorited_model_ids" => Ok(Self::FavoritedModelIds),
             // terminalReuseEnabled
             "terminalReuseEnabled" | "terminal_reuse_enabled" => {
-                Ok(GlobalStateKey::TerminalReuseEnabled)
+                Ok(Self::TerminalReuseEnabled)
             }
             // isNewUser
-            "isNewUser" | "is_new_user" => Ok(GlobalStateKey::IsNewUser),
+            "isNewUser" | "is_new_user" => Ok(Self::IsNewUser),
             // mode
-            "mode" => Ok(GlobalStateKey::Mode),
+            "mode" => Ok(Self::Mode),
             // subagentsEnabled
-            "subagentsEnabled" | "subagents_enabled" => Ok(GlobalStateKey::SubagentsEnabled),
+            "subagentsEnabled" | "subagents_enabled" => Ok(Self::SubagentsEnabled),
             // globalSnedRulesToggles
             "globalSnedRulesToggles" | "global_sned_rules_toggles" => {
-                Ok(GlobalStateKey::GlobalSnedRulesToggles)
+                Ok(Self::GlobalSnedRulesToggles)
             }
             // enableCheckpoints
-            "enableCheckpoints" | "enable_checkpoints" => Ok(GlobalStateKey::EnableCheckpoints),
+            "enableCheckpoints" | "enable_checkpoints" => Ok(Self::EnableCheckpoints),
             // actModeApiProvider
             "actModeApiProvider" | "act_mode_api_provider" => {
-                Ok(GlobalStateKey::ActModeApiProvider)
+                Ok(Self::ActModeApiProvider)
             }
             // planModeApiProvider
             "planModeApiProvider" | "plan_mode_api_provider" => {
-                Ok(GlobalStateKey::PlanModeApiProvider)
+                Ok(Self::PlanModeApiProvider)
             }
             // actModeApiModelId
-            "actModeApiModelId" | "act_mode_api_model_id" => Ok(GlobalStateKey::ActModeApiModelId),
+            "actModeApiModelId" | "act_mode_api_model_id" => Ok(Self::ActModeApiModelId),
             // planModeApiModelId
             "planModeApiModelId" | "plan_mode_api_model_id" => {
-                Ok(GlobalStateKey::PlanModeApiModelId)
+                Ok(Self::PlanModeApiModelId)
             }
             // azureApiVersion
-            "azureApiVersion" | "azure_api_version" => Ok(GlobalStateKey::AzureApiVersion),
+            "azureApiVersion" | "azure_api_version" => Ok(Self::AzureApiVersion),
             // preferredLanguage
-            "preferredLanguage" | "preferred_language" => Ok(GlobalStateKey::PreferredLanguage),
+            "preferredLanguage" | "preferred_language" => Ok(Self::PreferredLanguage),
             // telemetrySetting
-            "telemetrySetting" | "telemetry_setting" => Ok(GlobalStateKey::TelemetrySetting),
+            "telemetrySetting" | "telemetry_setting" => Ok(Self::TelemetrySetting),
             // defaultTerminalProfile
             "defaultTerminalProfile" | "default_terminal_profile" => {
-                Ok(GlobalStateKey::DefaultTerminalProfile)
+                Ok(Self::DefaultTerminalProfile)
             }
             // customPrompt
-            "customPrompt" | "custom_prompt" => Ok(GlobalStateKey::CustomPrompt),
+            "customPrompt" | "custom_prompt" => Ok(Self::CustomPrompt),
             // worktreeAutoOpenPath
             "worktreeAutoOpenPath" | "worktree_auto_open_path" => {
-                Ok(GlobalStateKey::WorktreeAutoOpenPath)
+                Ok(Self::WorktreeAutoOpenPath)
             }
             // lastShownAnnouncementId
             "lastShownAnnouncementId" | "last_shown_announcement_id" => {
-                Ok(GlobalStateKey::LastShownAnnouncementId)
+                Ok(Self::LastShownAnnouncementId)
             }
             // writePromptMetadataDirectory
             "writePromptMetadataDirectory" | "write_prompt_metadata_directory" => {
-                Ok(GlobalStateKey::WritePromptMetadataDirectory)
+                Ok(Self::WritePromptMetadataDirectory)
             }
             // liteLlmBaseUrl
-            "liteLlmBaseUrl" | "lite_llm_base_url" => Ok(GlobalStateKey::LiteLlmBaseUrl),
+            "liteLlmBaseUrl" | "lite_llm_base_url" => Ok(Self::LiteLlmBaseUrl),
             // anthropicBaseUrl
-            "anthropicBaseUrl" | "anthropic_base_url" => Ok(GlobalStateKey::AnthropicBaseUrl),
+            "anthropicBaseUrl" | "anthropic_base_url" => Ok(Self::AnthropicBaseUrl),
             // openAiBaseUrl
-            "openAiBaseUrl" | "open_ai_base_url" => Ok(GlobalStateKey::OpenAiBaseUrl),
+            "openAiBaseUrl" | "open_ai_base_url" => Ok(Self::OpenAiBaseUrl),
             // openRouterBaseUrl
-            "openRouterBaseUrl" | "open_router_base_url" => Ok(GlobalStateKey::OpenRouterBaseUrl),
+            "openRouterBaseUrl" | "open_router_base_url" => Ok(Self::OpenRouterBaseUrl),
             // geminiBaseUrl
-            "geminiBaseUrl" | "gemini_base_url" => Ok(GlobalStateKey::GeminiBaseUrl),
+            "geminiBaseUrl" | "gemini_base_url" => Ok(Self::GeminiBaseUrl),
             // awsRegion
-            "awsRegion" | "aws_region" => Ok(GlobalStateKey::AwsRegion),
+            "awsRegion" | "aws_region" => Ok(Self::AwsRegion),
             // openTelemetryMetricsExporter
             "openTelemetryMetricsExporter" | "open_telemetry_metrics_exporter" => {
-                Ok(GlobalStateKey::OpenTelemetryMetricsExporter)
+                Ok(Self::OpenTelemetryMetricsExporter)
             }
             // openTelemetryLogsExporter
             "openTelemetryLogsExporter" | "open_telemetry_logs_exporter" => {
-                Ok(GlobalStateKey::OpenTelemetryLogsExporter)
+                Ok(Self::OpenTelemetryLogsExporter)
             }
             // openTelemetryOtlpProtocol
             "openTelemetryOtlpProtocol" | "open_telemetry_otlp_protocol" => {
-                Ok(GlobalStateKey::OpenTelemetryOtlpProtocol)
+                Ok(Self::OpenTelemetryOtlpProtocol)
             }
             // openTelemetryOtlpEndpoint
             "openTelemetryOtlpEndpoint" | "open_telemetry_otlp_endpoint" => {
-                Ok(GlobalStateKey::OpenTelemetryOtlpEndpoint)
+                Ok(Self::OpenTelemetryOtlpEndpoint)
             }
             // openTelemetryOtlpMetricsProtocol
             "openTelemetryOtlpMetricsProtocol" | "open_telemetry_otlp_metrics_protocol" => {
-                Ok(GlobalStateKey::OpenTelemetryOtlpMetricsProtocol)
+                Ok(Self::OpenTelemetryOtlpMetricsProtocol)
             }
             // openTelemetryOtlpMetricsEndpoint
             "openTelemetryOtlpMetricsEndpoint" | "open_telemetry_otlp_metrics_endpoint" => {
-                Ok(GlobalStateKey::OpenTelemetryOtlpMetricsEndpoint)
+                Ok(Self::OpenTelemetryOtlpMetricsEndpoint)
             }
             // openTelemetryOtlpLogsProtocol
             "openTelemetryOtlpLogsProtocol" | "open_telemetry_otlp_logs_protocol" => {
-                Ok(GlobalStateKey::OpenTelemetryOtlpLogsProtocol)
+                Ok(Self::OpenTelemetryOtlpLogsProtocol)
             }
             // openTelemetryOtlpLogsEndpoint
             "openTelemetryOtlpLogsEndpoint" | "open_telemetry_otlp_logs_endpoint" => {
-                Ok(GlobalStateKey::OpenTelemetryOtlpLogsEndpoint)
+                Ok(Self::OpenTelemetryOtlpLogsEndpoint)
             }
             // shellIntegrationTimeout
             "shellIntegrationTimeout" | "shell_integration_timeout" => {
-                Ok(GlobalStateKey::ShellIntegrationTimeout)
+                Ok(Self::ShellIntegrationTimeout)
             }
             // terminalOutputLineLimit
             "terminalOutputLineLimit" | "terminal_output_line_limit" => {
-                Ok(GlobalStateKey::TerminalOutputLineLimit)
+                Ok(Self::TerminalOutputLineLimit)
             }
             // maxConsecutiveMistakes
             "maxConsecutiveMistakes" | "max_consecutive_mistakes" => {
-                Ok(GlobalStateKey::MaxConsecutiveMistakes)
+                Ok(Self::MaxConsecutiveMistakes)
             }
             // openTelemetryMetricExportInterval
             "openTelemetryMetricExportInterval" | "open_telemetry_metric_export_interval" => {
-                Ok(GlobalStateKey::OpenTelemetryMetricExportInterval)
+                Ok(Self::OpenTelemetryMetricExportInterval)
             }
             // openTelemetryLogBatchSize
             "openTelemetryLogBatchSize" | "open_telemetry_log_batch_size" => {
-                Ok(GlobalStateKey::OpenTelemetryLogBatchSize)
+                Ok(Self::OpenTelemetryLogBatchSize)
             }
             // openTelemetryLogBatchTimeout
             "openTelemetryLogBatchTimeout" | "open_telemetry_log_batch_timeout" => {
-                Ok(GlobalStateKey::OpenTelemetryLogBatchTimeout)
+                Ok(Self::OpenTelemetryLogBatchTimeout)
             }
             // openTelemetryLogMaxQueueSize
             "openTelemetryLogMaxQueueSize" | "open_telemetry_log_max_queue_size" => {
-                Ok(GlobalStateKey::OpenTelemetryLogMaxQueueSize)
+                Ok(Self::OpenTelemetryLogMaxQueueSize)
             }
             // requestTimeoutMs
-            "requestTimeoutMs" | "request_timeout_ms" => Ok(GlobalStateKey::RequestTimeoutMs),
+            "requestTimeoutMs" | "request_timeout_ms" => Ok(Self::RequestTimeoutMs),
             // planActSeparateModelsSetting
             "planActSeparateModelsSetting" | "plan_act_separate_models_setting" => {
-                Ok(GlobalStateKey::PlanActSeparateModelsSetting)
+                Ok(Self::PlanActSeparateModelsSetting)
             }
             // strictPlanModeEnabled
             "strictPlanModeEnabled" | "strict_plan_mode_enabled" => {
-                Ok(GlobalStateKey::StrictPlanModeEnabled)
+                Ok(Self::StrictPlanModeEnabled)
             }
             // hooksEnabled
-            "hooksEnabled" | "hooks_enabled" => Ok(GlobalStateKey::HooksEnabled),
+            "hooksEnabled" | "hooks_enabled" => Ok(Self::HooksEnabled),
             // useAutoCondense
-            "useAutoCondense" | "use_auto_condense" => Ok(GlobalStateKey::UseAutoCondense),
+            "useAutoCondense" | "use_auto_condense" => Ok(Self::UseAutoCondense),
             // showTokenUsage
-            "showTokenUsage" | "show_token_usage" => Ok(GlobalStateKey::ShowTokenUsage),
+            "showTokenUsage" | "show_token_usage" => Ok(Self::ShowTokenUsage),
             // snedWebToolsEnabled
             "snedWebToolsEnabled" | "sned_web_tools_enabled" => {
-                Ok(GlobalStateKey::SnedWebToolsEnabled)
+                Ok(Self::SnedWebToolsEnabled)
             }
             // worktreesEnabled
-            "worktreesEnabled" | "worktrees_enabled" => Ok(GlobalStateKey::WorktreesEnabled),
+            "worktreesEnabled" | "worktrees_enabled" => Ok(Self::WorktreesEnabled),
             // backgroundEditEnabled
             "backgroundEditEnabled" | "background_edit_enabled" => {
-                Ok(GlobalStateKey::BackgroundEditEnabled)
+                Ok(Self::BackgroundEditEnabled)
             }
             // optOutOfRemoteConfig
             "optOutOfRemoteConfig" | "opt_out_of_remote_config" => {
-                Ok(GlobalStateKey::OptOutOfRemoteConfig)
+                Ok(Self::OptOutOfRemoteConfig)
             }
             // doubleCheckCompletionEnabled
             "doubleCheckCompletionEnabled" | "double_check_completion_enabled" => {
-                Ok(GlobalStateKey::DoubleCheckCompletionEnabled)
+                Ok(Self::DoubleCheckCompletionEnabled)
             }
             // openTelemetryEnabled
             "openTelemetryEnabled" | "open_telemetry_enabled" => {
-                Ok(GlobalStateKey::OpenTelemetryEnabled)
+                Ok(Self::OpenTelemetryEnabled)
             }
             // openTelemetryOtlpInsecure
             "openTelemetryOtlpInsecure" | "open_telemetry_otlp_insecure" => {
-                Ok(GlobalStateKey::OpenTelemetryOtlpInsecure)
+                Ok(Self::OpenTelemetryOtlpInsecure)
             }
             // writePromptMetadataEnabled
             "writePromptMetadataEnabled" | "write_prompt_metadata_enabled" => {
-                Ok(GlobalStateKey::WritePromptMetadataEnabled)
+                Ok(Self::WritePromptMetadataEnabled)
             }
             // enableParallelToolCalling
             "enableParallelToolCalling" | "enable_parallel_tool_calling" => {
-                Ok(GlobalStateKey::EnableParallelToolCalling)
+                Ok(Self::EnableParallelToolCalling)
             }
             _ => Err(()),
         }
@@ -1479,17 +1479,16 @@ impl StateManager {
                 return Err(ConfigFieldError::InvalidValue(
                     key.to_string(),
                     "number".to_string(),
-                    value.clone(),
+                    value,
                 ));
             }
             "boolean" if !matches!(value.to_lowercase().as_str(), "true" | "false" | "1" | "0") => {
                 return Err(ConfigFieldError::InvalidValue(
                     key.to_string(),
                     "boolean".to_string(),
-                    value.clone(),
+                    value,
                 ));
             }
-            "number" | "boolean" => {}
             _ => {} // String fields accept any value
         }
 

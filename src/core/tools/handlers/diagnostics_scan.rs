@@ -38,6 +38,7 @@ static PROJECT_TYPE_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), ProjectType
     LazyLock::new(|| Mutex::new(HashMap::with_capacity(16)));
 
 impl DiagnosticsScanHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -89,7 +90,7 @@ impl DiagnosticsScanHandler {
         }
 
         // Check for Python by extension
-        if file_path.extension().map(|e| e == "py").unwrap_or(false) {
+        if file_path.extension().is_some_and(|e| e == "py") {
             return ProjectType::Python;
         }
 
@@ -162,39 +163,36 @@ impl DiagnosticsScanHandler {
                     .output()
                     .await;
 
-                match lint_output {
-                    Ok(output) => {
+                if let Ok(output) = lint_output {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stdout.is_empty() {
+                        result.push_str(&stdout);
+                    }
+                    if !stderr.is_empty() {
+                        if !result.is_empty() {
+                            result.push('\n');
+                        }
+                        result.push_str(&stderr);
+                    }
+                } else {
+                    // Fall back to eslint on the specific file
+                    let eslint_output = Command::new("npx")
+                        .args([
+                            "eslint",
+                            "--format=compact",
+                            file_path.to_string_lossy().as_ref(),
+                        ])
+                        .current_dir(&js_dir)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .await;
+
+                    if let Ok(output) = eslint_output {
                         let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
                         if !stdout.is_empty() {
                             result.push_str(&stdout);
-                        }
-                        if !stderr.is_empty() {
-                            if !result.is_empty() {
-                                result.push('\n');
-                            }
-                            result.push_str(&stderr);
-                        }
-                    }
-                    Err(_) => {
-                        // Fall back to eslint on the specific file
-                        let eslint_output = Command::new("npx")
-                            .args([
-                                "eslint",
-                                "--format=compact",
-                                file_path.to_string_lossy().as_ref(),
-                            ])
-                            .current_dir(&js_dir)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .output()
-                            .await;
-
-                        if let Ok(output) = eslint_output {
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            if !stdout.is_empty() {
-                                result.push_str(&stdout);
-                            }
                         }
                     }
                 }
@@ -281,6 +279,7 @@ impl DiagnosticsScanHandler {
     }
 
     /// Find the nearest ancestor directory containing the named file.
+    #[must_use] 
     pub fn find_ancestor_with_file(start: &Path, file_name: &str) -> Option<PathBuf> {
         let mut current = Some(start);
         while let Some(path) = current {
@@ -294,6 +293,7 @@ impl DiagnosticsScanHandler {
 
     /// Parse diagnostic output to extract file/line/error info.
     /// This is a best-effort parser for common compiler/linter formats.
+    #[must_use] 
     pub fn parse_diagnostics(output: &str, display_path: &str) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -392,8 +392,7 @@ impl DiagnosticsScanHandler {
         let message = caps.get(4)?.as_str().to_string();
 
         let severity = match severity_str.to_lowercase().as_str() {
-            "warning" => Severity::Warning,
-            "info" => Severity::Warning,
+            "warning" | "info" => Severity::Warning,
             _ => Severity::Error,
         };
 
@@ -422,6 +421,7 @@ impl DiagnosticsScanHandler {
     }
 
     /// Format diagnostics with file context (matching TypeScript output style).
+    #[must_use] 
     pub fn format_diagnostics(
         display_path: &str,
         diagnostics: &[Diagnostic],
@@ -429,8 +429,7 @@ impl DiagnosticsScanHandler {
     ) -> String {
         if diagnostics.is_empty() {
             return format!(
-                "- file: {}\n  status: No diagnostics issues found.",
-                display_path
+                "- file: {display_path}\n  status: No diagnostics issues found."
             );
         }
 
@@ -439,7 +438,7 @@ impl DiagnosticsScanHandler {
         let problems = &diagnostics[..diagnostics.len().min(max_errors)];
         let truncated_count = diagnostics.len().saturating_sub(max_errors);
 
-        let mut result = format!("- file: {}\n  diagnostics: |\n", display_path);
+        let mut result = format!("- file: {display_path}\n  diagnostics: |\n");
 
         for diag in problems {
             if let Some(line_num) = diag.line {
@@ -464,7 +463,7 @@ impl DiagnosticsScanHandler {
                                 line_text, label, current_line_num, diag.message
                             ));
                         } else {
-                            result.push_str(&format!("    {}\n", line_text));
+                            result.push_str(&format!("    {line_text}\n"));
                         }
                     }
                 } else {
@@ -487,7 +486,7 @@ impl DiagnosticsScanHandler {
         }
 
         if truncated_count > 0 {
-            result.push_str(&format!("\n    ... and {} more errors.", truncated_count));
+            result.push_str(&format!("\n    ... and {truncated_count} more errors."));
         }
 
         result
@@ -549,7 +548,7 @@ impl DiagnosticsScanHandler {
                 match crate::core::tools::resolve_sanitized_path(workspace_root, rel_path) {
                     Ok(path) => path,
                     Err(e) => {
-                        error_results.push(format!("- file: {}\n  error: {}", rel_path, e));
+                        error_results.push(format!("- file: {rel_path}\n  error: {e}"));
                         continue;
                     }
                 };
@@ -558,7 +557,7 @@ impl DiagnosticsScanHandler {
             let file_content = match tokio::fs::read_to_string(&abs_path).await {
                 Ok(content) => Some(content),
                 Err(e) => {
-                    error_results.push(format!("- file: {}\n  error: {}", rel_path, e));
+                    error_results.push(format!("- file: {rel_path}\n  error: {e}"));
                     continue;
                 }
             };
@@ -577,12 +576,12 @@ impl DiagnosticsScanHandler {
             )
             .or_else(|| {
                 Self::find_ancestor_with_file(&abs_path, "package.json")
-                    .or_else(|| abs_path.parent().map(|p| p.to_path_buf()))
+                    .or_else(|| abs_path.parent().map(std::path::Path::to_path_buf))
             })
             .unwrap_or_else(|| {
                 abs_path
                     .parent()
-                    .map(|p| p.to_path_buf())
+                    .map(std::path::Path::to_path_buf)
                     .unwrap_or_else(|| PathBuf::from("."))
             });
 
@@ -623,11 +622,12 @@ impl DiagnosticsScanHandler {
         Ok(final_result)
     }
 
+    #[must_use] 
     pub fn description(&self, params: &serde_json::Value) -> String {
         if let Some(paths) = params.get("paths").and_then(|p| p.as_array()) {
             let paths_text: Vec<String> = paths
                 .iter()
-                .filter_map(|p| p.as_str().map(|s| format!("'{}'", s)))
+                .filter_map(|p| p.as_str().map(|s| format!("'{s}'")))
                 .collect();
             if !paths_text.is_empty() {
                 return format!("[diagnostics_scan for {}]", paths_text.join(", "));
@@ -645,7 +645,6 @@ impl ToolHandler for DiagnosticsScanHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
             Self::execute(&handler, &mut state, &ctx.workspace_root, params)
@@ -655,7 +654,7 @@ impl ToolHandler for DiagnosticsScanHandler {
     }
 
     fn description(&self, params: &serde_json::Value) -> String {
-        DiagnosticsScanHandler::description(self, params)
+        Self::description(self, params)
     }
 }
 

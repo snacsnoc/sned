@@ -89,8 +89,7 @@ impl AnthropicProvider {
     fn base_url(&self) -> String {
         self.config
             .base_url
-            .as_ref()
-            .cloned()
+            .clone()
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string())
     }
@@ -133,8 +132,7 @@ impl AnthropicProvider {
         let native_tools_on = request
             .tools
             .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|t| !t.is_empty());
         let supports_cache = model_info.supports_prompt_cache;
 
         let max_tokens = request
@@ -626,7 +624,7 @@ impl Provider for AnthropicProvider {
                         .await;
                     }
                     Err(e) => {
-                        let error_msg = format!("Anthropic SSE stream error: {}", e);
+                        let error_msg = format!("Anthropic SSE stream error: {e}");
                         let is_retryable = e.to_string().contains("timeout")
                             || e.to_string().contains("connection")
                             || e.to_string().contains("incomplete")
@@ -668,7 +666,7 @@ impl Provider for AnthropicProvider {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "anthropic"
     }
 }
@@ -872,9 +870,8 @@ async fn process_anthropic_event(
                 "usage_delta",
             );
         }
-        AnthropicStreamEvent::MessageStop => {}
-        AnthropicStreamEvent::Ping => {
-            // Ping events are keepalive, no action needed
+        AnthropicStreamEvent::MessageStop | AnthropicStreamEvent::Ping => {
+            // Both are terminal/keepalive events, no action needed
         }
         AnthropicStreamEvent::Error { error } => {
             try_send_chunk(
@@ -932,7 +929,7 @@ async fn process_anthropic_event(
                             function: ApiStreamToolCallFunction {
                                 id: Some(id),
                                 name: Some(name),
-                                arguments: Some("".to_string()),
+                                arguments: Some(String::new()),
                             },
                             signature: None,
                         },
@@ -985,7 +982,7 @@ async fn process_anthropic_event(
                 try_send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
-                        reasoning: "".to_string(),
+                        reasoning: String::new(),
                         details: None,
                         signature: Some(signature),
                         redacted_data: None,

@@ -268,6 +268,7 @@ impl App {
         out
     }
     /// Create a new TextArea with default styling (no underline on cursor line).
+    #[must_use] 
     pub fn new_textarea(lines: Vec<String>) -> TextArea<'static> {
         let mut input = TextArea::new(lines);
         input.set_placeholder_text("❯ ");
@@ -326,6 +327,7 @@ impl App {
     }
 
     /// Create a new App instance.
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             output_lines: VecDeque::new(),
@@ -454,7 +456,7 @@ impl App {
                         .append(true)
                         .open(file_path)
                     {
-                        let _ = std::io::Write::write_all(&mut f, format!("{}\n", text).as_bytes());
+                        let _ = std::io::Write::write_all(&mut f, format!("{text}\n").as_bytes());
                     }
                 }
                 self.scrollback_count = self.scrollback_count.saturating_add(1);
@@ -616,7 +618,7 @@ impl App {
             // This avoids a visual flash on the first turn.
             if model_indices.is_empty() && had_streamed_line && !markdown_text.trim().is_empty() {
                 let prefixed_markdown = if self.turn_indicator.take().is_some() {
-                    format!("\u{2666} {}", markdown_text)
+                    format!("\u{2666} {markdown_text}")
                 } else {
                     markdown_text.to_string()
                 };
@@ -650,8 +652,7 @@ impl App {
                 |(rendered_line, popped_idx)| {
                     self.output_lines
                         .get(*popped_idx)
-                        .map(|popped| rendered_line == popped)
-                        .unwrap_or(false)
+                        .is_some_and(|popped| rendered_line == popped)
                 },
             );
 
@@ -728,7 +729,7 @@ impl App {
         // same line as the start of the response instead of dropping it
         // or forcing it onto its own line.
         let prefixed_markdown = if self.turn_indicator.take().is_some() {
-            format!("\u{2666} {}", markdown_text)
+            format!("\u{2666} {markdown_text}")
         } else {
             markdown_text.to_string()
         };
@@ -897,12 +898,12 @@ impl App {
         for (i, line) in lines.iter().enumerate() {
             let content = if is_multiline {
                 if i == 0 {
-                    format!("│ ❯ {}", line)
+                    format!("│ ❯ {line}")
                 } else {
-                    format!("│   {}", line)
+                    format!("│   {line}")
                 }
             } else {
-                format!("❯ {}", line)
+                format!("❯ {line}")
             };
             writer.emit(OutputEvent::UserPromptLine(Line::from(Span::styled(
                 content, style,
@@ -924,38 +925,37 @@ impl App {
         self.in_scrollback = true;
         self.needs_redraw = true;
 
-        if let Some(ref file_path) = self.scrollback_file {
-            if let Ok(content) = std::fs::read_to_string(file_path) {
-                let mut scrollback_lines: VecDeque<Line<'static>> = VecDeque::new();
-                let mut scrollback_kinds: VecDeque<BlockKind> = VecDeque::new();
-                for line in content.lines() {
-                    scrollback_lines.push_back(Line::from(line.to_string()));
-                    scrollback_kinds.push_back(BlockKind::ToolOutput);
-                }
-                // Prepend scrollback content before current session content
-                let mut new_lines: VecDeque<Line<'static>> = VecDeque::new();
-                let mut new_kinds: VecDeque<BlockKind> = VecDeque::new();
-                for line in scrollback_lines.iter() {
-                    new_lines.push_back(line.clone());
-                    new_kinds.push_back(BlockKind::ToolOutput);
-                }
-                // Insert divider line between scrollback and session content
-                if !self.output_lines.is_empty() {
-                    let divider = Line::from("─".repeat(40));
-                    new_lines.push_back(divider);
-                    new_kinds.push_back(BlockKind::Separator);
-                }
-                for line in self.output_lines.iter() {
-                    new_lines.push_back(line.clone());
-                }
-                for kind in self.output_line_kinds.iter() {
-                    new_kinds.push_back(*kind);
-                }
-                self.output_lines = new_lines;
-                self.output_line_kinds = new_kinds;
-                self.cached_wrap_width = None;
-                self.cached_visible_window = None;
+        if let Some(ref file_path) = self.scrollback_file
+            && let Ok(content) = std::fs::read_to_string(file_path) {
+            let mut scrollback_lines: VecDeque<Line<'static>> = VecDeque::new();
+            let mut scrollback_kinds: VecDeque<BlockKind> = VecDeque::new();
+            for line in content.lines() {
+                scrollback_lines.push_back(Line::from(line.to_string()));
+                scrollback_kinds.push_back(BlockKind::ToolOutput);
             }
+            // Prepend scrollback content before current session content
+            let mut new_lines: VecDeque<Line<'static>> = VecDeque::new();
+            let mut new_kinds: VecDeque<BlockKind> = VecDeque::new();
+            for line in &scrollback_lines {
+                new_lines.push_back(line.clone());
+                new_kinds.push_back(BlockKind::ToolOutput);
+            }
+            // Insert divider line between scrollback and session content
+            if !self.output_lines.is_empty() {
+                let divider = Line::from("─".repeat(40));
+                new_lines.push_back(divider);
+                new_kinds.push_back(BlockKind::Separator);
+            }
+            for line in &self.output_lines {
+                new_lines.push_back(line.clone());
+            }
+            for kind in &self.output_line_kinds {
+                new_kinds.push_back(*kind);
+            }
+            self.output_lines = new_lines;
+            self.output_line_kinds = new_kinds;
+            self.cached_wrap_width = None;
+            self.cached_visible_window = None;
         }
         // Reset scroll to bottom of combined buffer
         self.scroll_mode = ScrollMode::Auto;
@@ -1060,7 +1060,7 @@ impl App {
     ) -> bool {
         match plan {
             Some(plan) => {
-                let plan_ptr = plan as *const _ as usize;
+                let plan_ptr = std::ptr::from_ref(plan) as usize;
                 if self.plan_state_cache_ptr == Some(plan_ptr)
                     && self.plan_state_cache_version == plan.version
                     && self.plan_state_cache.is_some()
@@ -1347,8 +1347,8 @@ impl App {
         if prev == BlockKind::Separator || next == BlockKind::Separator {
             return false;
         }
-        match (prev, next) {
-            (BlockKind::CommandHeader, BlockKind::CommandOutput) => false,
+        matches!(
+            (prev, next),
             (
                 BlockKind::Model,
                 BlockKind::ToolHeader
@@ -1357,8 +1357,7 @@ impl App {
                 | BlockKind::CommandOutput
                 | BlockKind::Reasoning
                 | BlockKind::UserPrompt,
-            ) => true,
-            (
+            ) | (_, BlockKind::UserPrompt) | (
                 BlockKind::ToolOutput
                 | BlockKind::CommandOutput
                 | BlockKind::ToolHeader
@@ -1366,10 +1365,8 @@ impl App {
                 | BlockKind::Reasoning
                 | BlockKind::UserPrompt,
                 BlockKind::Model,
-            ) => true,
-            (_, BlockKind::UserPrompt) => true,
-            _ => false,
-        }
+            )
+        )
     }
 
     fn total_visual_rows(&mut self, wrap_width: usize) -> usize {
@@ -1476,7 +1473,7 @@ impl App {
             );
             self.status_left_fingerprint = current_fingerprint;
         }
-        let elapsed_secs = self.elapsed.map(|e| e.as_secs()).unwrap_or(u64::MAX);
+        let elapsed_secs = self.elapsed.map_or(u64::MAX, |e| e.as_secs());
         let context_key = (
             elapsed_secs,
             self.context_pct,
@@ -1499,15 +1496,15 @@ impl App {
                 (Some(ovf), Some(ctx), Some(elapsed)) => {
                     format!("{}{}⏱ {} ", ovf, ctx, format_duration(elapsed))
                 }
-                (Some(ovf), Some(ctx), None) => format!("{}{} ", ovf, ctx),
+                (Some(ovf), Some(ctx), None) => format!("{ovf}{ctx} "),
                 (Some(ovf), None, Some(elapsed)) => {
                     format!("{}⏱ {} ", ovf, format_duration(elapsed))
                 }
-                (Some(ovf), None, None) => format!("{} ", ovf),
+                (Some(ovf), None, None) => format!("{ovf} "),
                 (None, Some(ctx), Some(elapsed)) => {
                     format!("{}⏱ {} ", ctx, format_duration(elapsed))
                 }
-                (None, Some(ctx), None) => format!("{} ", ctx),
+                (None, Some(ctx), None) => format!("{ctx} "),
                 (None, None, Some(elapsed)) => format!("⏱ {} ", format_duration(elapsed)),
                 (None, None, None) => String::new(),
             };
@@ -1883,10 +1880,7 @@ impl App {
         }
 
         let now = Instant::now();
-        let should_advance = self
-            .last_spinner_tick
-            .map(|last| now.duration_since(last) >= SPINNER_INTERVAL)
-            .unwrap_or(true);
+        let should_advance = self.last_spinner_tick.is_none_or(|last| now.duration_since(last) >= SPINNER_INTERVAL);
 
         if should_advance {
             self.spinner_index = (self.spinner_index + 1) % 10;
@@ -1903,18 +1897,19 @@ impl App {
 }
 
 /// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m").
+#[must_use] 
 pub fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
     if total_secs >= 3600 {
         let hours = total_secs / 3600;
         let mins = (total_secs % 3600) / 60;
-        format!("{}h {}m", hours, mins)
+        format!("{hours}h {mins}m")
     } else if total_secs >= 60 {
         let mins = total_secs / 60;
         let secs = total_secs % 60;
-        format!("{}m {}s", mins, secs)
+        format!("{mins}m {secs}s")
     } else {
-        format!("{}s", total_secs)
+        format!("{total_secs}s")
     }
 }
 

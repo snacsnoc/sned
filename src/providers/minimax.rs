@@ -126,8 +126,7 @@ impl MinimaxProvider {
         let native_tools_on = request
             .tools
             .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|t| !t.is_empty());
 
         let mut messages: Vec<serde_json::Value> = request
             .messages
@@ -626,7 +625,7 @@ fn convert_assistant_blocks_to_openai(
         msg["content"] = json!(text_content);
     } else {
         msg["content"] = json!(if text_content.is_empty() {
-            "".to_string()
+            String::new()
         } else {
             text_content
         });
@@ -803,7 +802,7 @@ fn extract_and_emit_xml_tool_calls(
         let remaining = xml_buffer[block_end..].to_string();
         *xml_buffer = remaining;
 
-        let call_id = format!("minimax-{}", event_id);
+        let call_id = format!("minimax-{event_id}");
         let (tool_name, tool_params) = parse_minimax_xml_tool_call(&block).unwrap_or_else(|| {
             (
                 "xml_tool_call".to_string(),
@@ -1228,8 +1227,7 @@ async fn process_minimax_sse_line(
             let cached_tokens = usage
                 .prompt_tokens_details
                 .as_ref()
-                .map(|d| d.cached_tokens)
-                .unwrap_or(0);
+                .map_or(0, |d| d.cached_tokens);
             let input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
             try_send_chunk(
                 tx,
@@ -1339,7 +1337,7 @@ impl Provider for MinimaxProvider {
                         }
                     }
                     Err(e) => {
-                        let error_msg = format!("MiniMax SSE stream error: {}", e);
+                        let error_msg = format!("MiniMax SSE stream error: {e}");
                         let is_retryable = e.to_string().contains("timeout")
                             || e.to_string().contains("connection")
                             || e.to_string().contains("incomplete")
@@ -1389,7 +1387,7 @@ impl Provider for MinimaxProvider {
 
                 // Flush any accumulated native tool calls that were never emitted
                 // (some providers send finish_reason:"stop" instead of "tool_calls")
-                for (idx, (id, name, args)) in accumulated_tool_calls.iter() {
+                for (idx, (id, name, args)) in &accumulated_tool_calls {
                     if !id.is_empty()
                         && !name.is_empty()
                         && !completed_tool_call_indices.contains(idx)
@@ -1433,7 +1431,7 @@ impl Provider for MinimaxProvider {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "minimax"
     }
 }

@@ -109,6 +109,7 @@ pub struct ContextLoader {
 }
 
 impl ContextLoader {
+    #[must_use] 
     pub fn new(cwd: String) -> Self {
         Self {
             cwd,
@@ -146,14 +147,15 @@ impl ContextLoader {
 
         // CPU cores
         let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(1);
         details.push_str(&format!("\n# CPU Cores\n{cores}\n"));
 
-        format!("<environment_details>\n{}</environment_details>", details)
+        format!("<environment_details>\n{details}</environment_details>")
     }
 
     /// Extract file/directory paths and symbols from text.
+    #[must_use] 
     pub fn extract_context(text: &str) -> Vec<String> {
         let mut mentions = Vec::new();
         let mention_regex = regex::Regex::new(r"@([A-Za-z0-9_./\-]+)").unwrap();
@@ -203,7 +205,7 @@ impl ContextLoader {
         let without_mentions = MENTION_REGEX.replace_all(&without_urls, " ");
         let scrubbed_text =
             SLASH_COMMAND_REGEX.replace_all(&without_mentions, |caps: &regex::Captures<'_>| {
-                format!("{} ", caps.get(1).map(|m| m.as_str()).unwrap_or(""))
+                format!("{} ", caps.get(1).map_or("", |m| m.as_str()))
             });
 
         let mut seen = HashSet::new();
@@ -247,7 +249,7 @@ impl ContextLoader {
         let (project_root, all_definitions, all_references) = {
             let service = symbol_index_service
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let root = service.get_project_root();
             let project_root = if root.is_empty() {
                 self.cwd.clone()
@@ -266,7 +268,7 @@ impl ContextLoader {
             let mut references = HashMap::with_capacity(symbols.len());
             for symbol in &symbols {
                 let remaining_limit = MAX_AUTO_SYMBOL_TOTAL_LINES
-                    .saturating_sub(definitions.get(symbol).map(|d| d.len()).unwrap_or(0));
+                    .saturating_sub(definitions.get(symbol).map_or(0, std::vec::Vec::len));
                 let refs = service.get_references(symbol, Some(remaining_limit));
                 references.insert(symbol.clone(), refs);
             }
@@ -311,14 +313,13 @@ impl ContextLoader {
                 // Check if we already have this exact location
                 let existing = file_locations
                     .get(loc_path_str)
-                    .map(|locs| {
+                    .is_some_and(|locs| {
                         locs.iter().any(|(s, l)| {
                             l.path.as_deref() == Some(loc_path_str.as_str())
                                 && l.start_line == loc.start_line
                                 && s == symbol
                         })
-                    })
-                    .unwrap_or(false);
+                    });
 
                 if !existing {
                     file_locations
@@ -390,7 +391,7 @@ impl ContextLoader {
                         kind,
                         line_content,
                     ),
-                    format!("{}:{}", loc_path_str, line_num),
+                    format!("{loc_path_str}:{line_num}"),
                 ));
             }
         }
@@ -427,23 +428,20 @@ impl ContextLoader {
             let num_locations = data.all_locations.len();
             let mut symbol_lines = Vec::new();
             symbol_lines.push(format!(
-                "Note: The following context was automatically included because the symbol \"{}\" was mentioned in user's message.",
-                symbol,
+                "Note: The following context was automatically included because the symbol \"{symbol}\" was mentioned in user's message.",
             ));
             if num_locations <= MAX_AUTO_SYMBOL_TOTAL_LINES {
                 symbol_lines.push(format!(
-                    "All {} symbols found in the codebase are listed below.",
-                    num_locations,
+                    "All {num_locations} symbols found in the codebase are listed below.",
                 ));
             } else {
                 symbol_lines.push(format!(
-                    "{} out of {} symbols listed below (definitions first).",
-                    total_lines_added, num_locations,
+                    "{total_lines_added} out of {num_locations} symbols listed below (definitions first).",
                 ));
             }
 
             symbol_lines.push("symbol_context:".to_string());
-            symbol_lines.push(format!("  {}:", symbol));
+            symbol_lines.push(format!("  {symbol}:"));
             symbol_lines.extend(data.added_lines.iter().cloned());
 
             symbol_definitions.push(symbol_lines.join("\n"));

@@ -27,7 +27,7 @@ use reqwest::StatusCode;
 /// Maximum size for tool call arguments (128KB).
 /// Cap arguments to prevent a single tool call from exhausting memory while
     /// still allowing large but legitimate payloads.
-    pub const MAX_TOOL_ARGUMENT_SIZE: usize = 131072;
+    pub const MAX_TOOL_ARGUMENT_SIZE: usize = 131_072;
     use reqwest::header::HeaderMap;
     use serde::{Deserialize, Serialize};
 
@@ -56,7 +56,7 @@ pub struct SharedContentFields {
 }
 
 /// A text content block.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextContentBlock {
     pub text: String,
     #[serde(flatten)]
@@ -66,7 +66,7 @@ pub struct TextContentBlock {
 }
 
 /// Source of an image.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ImageSource {
     #[serde(rename = "base64")]
@@ -80,7 +80,7 @@ pub enum ImageSource {
 }
 
 /// Source of a document.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum DocumentSource {
     #[serde(rename = "base64")]
@@ -122,7 +122,7 @@ pub struct ImageContentBlock {
 }
 
 /// A tool use block (assistant-side).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolUseBlock {
     pub id: String,
     pub name: String,
@@ -143,7 +143,7 @@ pub struct ToolResultBlock {
 }
 
 /// A thinking block (assistant-side).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThinkingBlock {
     pub thinking: String,
     pub signature: String,
@@ -153,7 +153,7 @@ pub struct ThinkingBlock {
 }
 
 /// A redacted thinking block.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedactedThinkingBlock {
     pub data: String,
     #[serde(flatten)]
@@ -205,7 +205,7 @@ pub enum AssistantContentBlock {
 // ============================================================================
 
 /// Role of a message participant.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,
@@ -223,7 +223,7 @@ pub struct MessageMetrics {
 }
 
 /// Model info attached to a message (internal use only, stripped before sending to providers).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageModelInfo {
     pub provider: String,
     pub model_id: String,
@@ -267,7 +267,7 @@ pub enum ApiStreamChunk {
 }
 
 /// Text chunk.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiStreamTextChunk {
     pub text: String,
     pub id: Option<String>,
@@ -275,7 +275,7 @@ pub struct ApiStreamTextChunk {
 }
 
 /// Reasoning/thinking chunk.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiStreamReasoningChunk {
     pub reasoning: String,
     pub details: Option<serde_json::Value>,
@@ -301,7 +301,7 @@ pub struct ApiStreamToolCall {
 }
 
 /// Function details of a tool call.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiStreamToolCallFunction {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -395,7 +395,7 @@ pub struct OpenAiCompatibleModelInfo {
 // ============================================================================
 
 /// Tool choice options for provider requests.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoice {
     /// Model decides whether to call tools (default)
@@ -538,7 +538,7 @@ pub struct ToolDefinition {
 }
 
 /// Function definition within a tool.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FunctionDefinition {
     pub name: String,
     pub description: String,
@@ -611,18 +611,17 @@ impl SseLineBuffer {
         self.pending.extend_from_slice(chunk);
 
         if self.pending.len() >= self.max_line_length {
-            if let Some(last_newline) = self.pending.iter().rposition(|&b| b == b'\n') {
-                let lines = self.take_complete_lines(last_newline + 1);
-                if self.pending.len() >= self.max_line_length {
-                    self.pending.clear();
-                    self.limit_exceeded = true;
-                }
-                return lines;
-            } else {
+        if let Some(last_newline) = self.pending.iter().rposition(|&b| b == b'\n') {
+            let lines = self.take_complete_lines(last_newline + 1);
+            if self.pending.len() >= self.max_line_length {
                 self.pending.clear();
                 self.limit_exceeded = true;
-                return Vec::new();
             }
+            return lines;
+        }
+        self.pending.clear();
+        self.limit_exceeded = true;
+        return Vec::new();
         }
 
         self.pending
@@ -683,6 +682,7 @@ impl Default for SseLineBuffer {
 }
 
 /// Validate and optionally repair tool call arguments JSON.
+///
 /// Returns `Some(valid_json)` on success, or `None` when the JSON is
 /// unrepairable — the caller should skip the tool call rather than
 /// executing it with empty/semantically-wrong arguments.
@@ -817,17 +817,17 @@ impl From<ProviderHttpError> for ProviderError {
     fn from(e: ProviderHttpError) -> Self {
         if e.status.is_client_error() {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
-                ProviderError::AuthenticationError(e.to_string())
+                Self::AuthenticationError(e.to_string())
             } else if e.status == StatusCode::TOO_MANY_REQUESTS {
-                ProviderError::RateLimitError {
+                Self::RateLimitError {
                     message: e.to_string(),
                     retry_delay_ms: e.retry_delay_ms,
                 }
             } else {
-                ProviderError::InvalidRequest(e.to_string())
+                Self::InvalidRequest(e.to_string())
             }
         } else {
-            ProviderError::ApiError(e.to_string())
+            Self::ApiError(e.to_string())
         }
     }
 }
@@ -835,9 +835,9 @@ impl From<ProviderHttpError> for ProviderError {
 impl From<reqwest::Error> for ProviderError {
     fn from(e: reqwest::Error) -> Self {
         if e.is_timeout() || e.is_connect() || e.is_body() {
-            ProviderError::NetworkError(e.to_string())
+            Self::NetworkError(e.to_string())
         } else {
-            ProviderError::UnexpectedError(e.to_string())
+            Self::UnexpectedError(e.to_string())
         }
     }
 }
@@ -845,8 +845,8 @@ impl From<reqwest::Error> for ProviderError {
 impl From<anyhow::Error> for ProviderError {
     fn from(e: anyhow::Error) -> Self {
         match e.downcast::<ProviderHttpError>() {
-            Ok(http_err) => ProviderError::from(http_err),
-            Err(err) => ProviderError::UnexpectedError(err.to_string()),
+            Ok(http_err) => Self::from(http_err),
+            Err(err) => Self::UnexpectedError(err.to_string()),
         }
     }
 }
@@ -922,7 +922,7 @@ impl Provider for RetryTestProvider {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "test"
     }
 }
@@ -930,14 +930,14 @@ impl Provider for RetryTestProvider {
 impl Provider for Providers {
     async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         match self {
-            Providers::OpenAi(p) => p.create_message(request).await,
-            Providers::Anthropic(p) => p.create_message(request).await,
-            Providers::DeepSeek(p) => p.create_message(request).await,
-            Providers::Gemini(p) => p.create_message(request).await,
-            Providers::Minimax(p) => p.create_message(request).await,
-            Providers::OpenRouter(p) => p.create_message(request).await,
-            Providers::Mock(p) => p.create_message(request).await,
-            Providers::RetryTest(p) => p.create_message(request).await,
+            Self::OpenAi(p) => p.create_message(request).await,
+            Self::Anthropic(p) => p.create_message(request).await,
+            Self::DeepSeek(p) => p.create_message(request).await,
+            Self::Gemini(p) => p.create_message(request).await,
+            Self::Minimax(p) => p.create_message(request).await,
+            Self::OpenRouter(p) => p.create_message(request).await,
+            Self::Mock(p) => p.create_message(request).await,
+            Self::RetryTest(p) => p.create_message(request).await,
             #[cfg(test)]
             Providers::RecordingChunk(p) => p.create_message(request).await,
             #[cfg(test)]
@@ -949,14 +949,14 @@ impl Provider for Providers {
 
     fn get_model(&self) -> ProviderModel {
         match self {
-            Providers::OpenAi(p) => p.get_model(),
-            Providers::Anthropic(p) => p.get_model(),
-            Providers::DeepSeek(p) => p.get_model(),
-            Providers::Gemini(p) => p.get_model(),
-            Providers::Minimax(p) => p.get_model(),
-            Providers::OpenRouter(p) => p.get_model(),
-            Providers::Mock(p) => p.get_model(),
-            Providers::RetryTest(p) => p.get_model(),
+            Self::OpenAi(p) => p.get_model(),
+            Self::Anthropic(p) => p.get_model(),
+            Self::DeepSeek(p) => p.get_model(),
+            Self::Gemini(p) => p.get_model(),
+            Self::Minimax(p) => p.get_model(),
+            Self::OpenRouter(p) => p.get_model(),
+            Self::Mock(p) => p.get_model(),
+            Self::RetryTest(p) => p.get_model(),
             #[cfg(test)]
             Providers::RecordingChunk(p) => p.get_model(),
             #[cfg(test)]
@@ -968,14 +968,14 @@ impl Provider for Providers {
 
     fn name(&self) -> &str {
         match self {
-            Providers::OpenAi(p) => p.name(),
-            Providers::Anthropic(p) => p.name(),
-            Providers::DeepSeek(p) => p.name(),
-            Providers::Gemini(p) => p.name(),
-            Providers::Minimax(p) => p.name(),
-            Providers::OpenRouter(p) => p.name(),
-            Providers::Mock(p) => p.name(),
-            Providers::RetryTest(p) => p.name(),
+            Self::OpenAi(p) => p.name(),
+            Self::Anthropic(p) => p.name(),
+            Self::DeepSeek(p) => p.name(),
+            Self::Gemini(p) => p.name(),
+            Self::Minimax(p) => p.name(),
+            Self::OpenRouter(p) => p.name(),
+            Self::Mock(p) => p.name(),
+            Self::RetryTest(p) => p.name(),
             #[cfg(test)]
             Providers::RecordingChunk(p) => p.name(),
             #[cfg(test)]

@@ -128,8 +128,7 @@ pub async fn create_message_with_retry(
                         )
                     } else {
                         format!(
-                            "⚠ Provider failed after {max_retries} retries. Request {consecutive_failures}/{} failed consecutively. Retry or use /model <provider/model> to switch.",
-                            DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES
+                            "⚠ Provider failed after {max_retries} retries. Request {consecutive_failures}/{DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES} failed consecutively. Retry or use /model <provider/model> to switch."
                         )
                     };
                     if let Some(writer) = output_writer {
@@ -170,7 +169,7 @@ pub async fn create_message_with_retry(
                                 "cancelled by user during retry delay".to_string(),
                             ));
                         }
-                        tokio::time::sleep(poll_interval.min(remaining - elapsed)).await;
+                        tokio::time::sleep(poll_interval.min(remaining.checked_sub(elapsed).unwrap())).await;
                         elapsed += poll_interval;
                     }
                 } else {

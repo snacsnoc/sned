@@ -16,6 +16,7 @@ use std::pin::Pin;
 pub struct ListSkillsHandler;
 
 impl ListSkillsHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -62,7 +63,7 @@ impl ListSkillsHandler {
         _params: serde_json::Value,
     ) -> Result<String, ToolError> {
         let workspace_root = std::env::current_dir().map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to get current directory: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to get current directory: {e}"))
         })?;
         Self::build_response(state, &workspace_root, _params)
     }
@@ -76,7 +77,6 @@ impl ToolHandler for ListSkillsHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let _handler = self.clone();
         let ctx = ctx.clone();
-        let _params = _params.clone();
         Box::pin(async move {
             // Discover skills outside the state lock to avoid holding lock across sync I/O
             let workspace_root = ctx.workspace_root.as_path();

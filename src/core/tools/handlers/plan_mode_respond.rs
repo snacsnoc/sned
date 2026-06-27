@@ -16,6 +16,7 @@ use std::pin::Pin;
 pub struct PlanModeRespondHandler;
 
 impl PlanModeRespondHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -35,7 +36,7 @@ impl PlanModeRespondHandler {
         // Check for needs_more_exploration escape hatch
         let needs_more = params
             .get("needs_more_exploration")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         // Reset consecutive mistakes
@@ -90,14 +91,14 @@ impl PlanModeRespondHandler {
             use crate::cli::tui::theme::ACCENT;
             use ratatui::style::{Modifier, Style};
             ctx.output_writer.emit(OutputEvent::tool_output_line(
-                format!("\n📋 Plan Generated\n{}\n", response),
+                format!("\n📋 Plan Generated\n{response}\n"),
                 Style::default()
                     .fg(ACCENT)
                     .add_modifier(Modifier::BOLD),
             ));
         }
 
-        Ok(format!("<user_message>\n{}\n</user_message>", response))
+        Ok(format!("<user_message>\n{response}\n</user_message>"))
     }
 }
 
@@ -108,9 +109,8 @@ impl ToolHandler for PlanModeRespondHandler {
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
-            PlanModeRespondHandler::execute(&PlanModeRespondHandler, &ctx, params)
+            Self::execute(&Self, &ctx, params)
                 .await
                 .map(serde_json::Value::String)
         })

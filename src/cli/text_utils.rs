@@ -6,6 +6,7 @@ use std::io::{self, IsTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Get the current terminal width, or a sensible default.
+#[must_use] 
 pub fn get_terminal_width() -> usize {
     crossterm::terminal::size()
         .map(|(cols, _)| cols as usize)
@@ -13,6 +14,7 @@ pub fn get_terminal_width() -> usize {
 }
 
 /// Check if stderr is a TTY.
+#[must_use] 
 pub fn stderr_is_tty() -> bool {
     io::stderr().is_terminal()
 }
@@ -24,6 +26,7 @@ pub fn stderr_is_tty() -> bool {
 /// │ Content line 1                             │
 /// │ Content line 2                             │
 /// ╰────────────────────────────────────────────╯
+#[must_use] 
 pub fn draw_completion_box(title: &str, content: &str, width: usize) -> String {
     draw_box(title, content, width, "✓")
 }
@@ -35,6 +38,7 @@ pub fn draw_completion_box(title: &str, content: &str, width: usize) -> String {
 /// │ Error message line 1                       │
 /// │ Error message line 2                       │
 /// ╰────────────────────────────────────────────╯
+#[must_use] 
 pub fn draw_error_box(title: &str, content: &str, width: usize) -> String {
     draw_box(title, content, width, "✗")
 }
@@ -62,7 +66,7 @@ fn draw_box(title: &str, content: &str, width: usize, symbol: &str) -> String {
     // Below ~10 cols the borders and padding can no longer coexist,
     // so emit a plain fallback instead of a malformed box.
     if width < 10 {
-        return format!("{} {}\n{}\n", symbol, title, content);
+        return format!("{symbol} {title}\n{content}\n");
     }
 
     let inner_width = width.saturating_sub(4);
@@ -124,6 +128,7 @@ fn draw_box(title: &str, content: &str, width: usize, symbol: &str) -> String {
 /// - Preserves code blocks (text between ``` markers)
 /// - Indents continuation lines with the specified indent
 /// - Returns wrapped text with newlines
+#[must_use] 
 pub fn wrap_text(text: &str, width: usize, indent: &str) -> String {
     if width == 0 {
         return text.to_string();

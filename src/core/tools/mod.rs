@@ -56,98 +56,102 @@ pub enum ToolCategory {
 }
 
 impl ToolCategory {
+    #[must_use] 
     pub const fn is_read_only(self) -> bool {
-        matches!(self, ToolCategory::ReadOnly)
+        matches!(self, Self::ReadOnly)
     }
 }
 
 impl SnedTool {
     /// Returns the string name of the tool.
+    #[must_use] 
     pub fn name(&self) -> &'static str {
         match self {
-            SnedTool::AskFollowupQuestion => "ask_followup_question",
-            SnedTool::AttemptCompletion => "attempt_completion",
-            SnedTool::ExecuteCommand => "execute_command",
-            SnedTool::ReadFile => "read_file",
-            SnedTool::WriteToFile => "write_to_file",
-            SnedTool::SearchFiles => "search_files",
-            SnedTool::ListFiles => "list_files",
-            SnedTool::WebFetch => "web_fetch",
-            SnedTool::NewTask => "new_task",
-            SnedTool::PlanModeRespond => "plan_mode_respond",
-            SnedTool::Condense => "condense",
-            SnedTool::SummarizeTask => "summarize_task",
-            SnedTool::UseSkill => "use_skill",
-            SnedTool::ListSkills => "list_skills",
-            SnedTool::UseSubagents => "use_subagents",
-            SnedTool::GetFunction => "get_function",
-            SnedTool::GetFileSkeleton => "get_file_skeleton",
-            SnedTool::FindSymbolReferences => "find_symbol_references",
-            SnedTool::EditFile => "edit_file",
-            SnedTool::DiagnosticsScan => "diagnostics_scan",
-            SnedTool::ReplaceSymbol => "replace_symbol",
-            SnedTool::RenameSymbol => "rename_symbol",
+            Self::AskFollowupQuestion => "ask_followup_question",
+            Self::AttemptCompletion => "attempt_completion",
+            Self::ExecuteCommand => "execute_command",
+            Self::ReadFile => "read_file",
+            Self::WriteToFile => "write_to_file",
+            Self::SearchFiles => "search_files",
+            Self::ListFiles => "list_files",
+            Self::WebFetch => "web_fetch",
+            Self::NewTask => "new_task",
+            Self::PlanModeRespond => "plan_mode_respond",
+            Self::Condense => "condense",
+            Self::SummarizeTask => "summarize_task",
+            Self::UseSkill => "use_skill",
+            Self::ListSkills => "list_skills",
+            Self::UseSubagents => "use_subagents",
+            Self::GetFunction => "get_function",
+            Self::GetFileSkeleton => "get_file_skeleton",
+            Self::FindSymbolReferences => "find_symbol_references",
+            Self::EditFile => "edit_file",
+            Self::DiagnosticsScan => "diagnostics_scan",
+            Self::ReplaceSymbol => "replace_symbol",
+            Self::RenameSymbol => "rename_symbol",
         }
     }
 
     /// Returns the approval category for this tool.
+    #[must_use] 
     pub const fn category(self) -> ToolCategory {
         match self {
-            SnedTool::ReadFile
-            | SnedTool::GetFunction
-            | SnedTool::GetFileSkeleton
-            | SnedTool::FindSymbolReferences
-            | SnedTool::DiagnosticsScan
-            | SnedTool::ListFiles
-            | SnedTool::SearchFiles
-            | SnedTool::UseSkill => ToolCategory::ReadFiles,
+            Self::ReadFile
+            | Self::GetFunction
+            | Self::GetFileSkeleton
+            | Self::FindSymbolReferences
+            | Self::DiagnosticsScan
+            | Self::ListFiles
+            | Self::SearchFiles
+            | Self::UseSkill => ToolCategory::ReadFiles,
 
-            SnedTool::UseSubagents => ToolCategory::Other,
+            Self::UseSubagents => ToolCategory::Other,
 
-            SnedTool::WriteToFile
-            | SnedTool::EditFile
-            | SnedTool::ReplaceSymbol
-            | SnedTool::RenameSymbol => ToolCategory::EditFiles,
+            Self::WriteToFile
+            | Self::EditFile
+            | Self::ReplaceSymbol
+            | Self::RenameSymbol => ToolCategory::EditFiles,
 
-            SnedTool::ExecuteCommand => ToolCategory::ExecuteCommand,
-            SnedTool::WebFetch => ToolCategory::WebFetch,
+            Self::ExecuteCommand => ToolCategory::ExecuteCommand,
+            Self::WebFetch => ToolCategory::WebFetch,
 
-            SnedTool::ListSkills
-            | SnedTool::AttemptCompletion
-            | SnedTool::PlanModeRespond
-            | SnedTool::AskFollowupQuestion
-            | SnedTool::Condense
-            | SnedTool::SummarizeTask => ToolCategory::ReadOnly,
+            Self::ListSkills
+            | Self::AttemptCompletion
+            | Self::PlanModeRespond
+            | Self::AskFollowupQuestion
+            | Self::Condense
+            | Self::SummarizeTask => ToolCategory::ReadOnly,
 
             _ => ToolCategory::Other,
         }
     }
 
     /// Parses a tool name string into a SnedTool.
-    pub fn from_name(name: &str) -> Option<SnedTool> {
+    #[must_use] 
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
-            "ask_followup_question" => Some(SnedTool::AskFollowupQuestion),
-            "attempt_completion" => Some(SnedTool::AttemptCompletion),
-            "execute_command" => Some(SnedTool::ExecuteCommand),
-            "read_file" => Some(SnedTool::ReadFile),
-            "write_to_file" => Some(SnedTool::WriteToFile),
-            "search_files" => Some(SnedTool::SearchFiles),
-            "list_files" => Some(SnedTool::ListFiles),
-            "web_fetch" => Some(SnedTool::WebFetch),
-            "new_task" => Some(SnedTool::NewTask),
-            "plan_mode_respond" => Some(SnedTool::PlanModeRespond),
-            "condense" => Some(SnedTool::Condense),
-            "summarize_task" => Some(SnedTool::SummarizeTask),
-            "use_skill" => Some(SnedTool::UseSkill),
-            "list_skills" => Some(SnedTool::ListSkills),
-            "use_subagents" => Some(SnedTool::UseSubagents),
-            "get_function" => Some(SnedTool::GetFunction),
-            "get_file_skeleton" => Some(SnedTool::GetFileSkeleton),
-            "find_symbol_references" => Some(SnedTool::FindSymbolReferences),
-            "edit_file" => Some(SnedTool::EditFile),
-            "diagnostics_scan" => Some(SnedTool::DiagnosticsScan),
-            "replace_symbol" => Some(SnedTool::ReplaceSymbol),
-            "rename_symbol" => Some(SnedTool::RenameSymbol),
+            "ask_followup_question" => Some(Self::AskFollowupQuestion),
+            "attempt_completion" => Some(Self::AttemptCompletion),
+            "execute_command" => Some(Self::ExecuteCommand),
+            "read_file" => Some(Self::ReadFile),
+            "write_to_file" => Some(Self::WriteToFile),
+            "search_files" => Some(Self::SearchFiles),
+            "list_files" => Some(Self::ListFiles),
+            "web_fetch" => Some(Self::WebFetch),
+            "new_task" => Some(Self::NewTask),
+            "plan_mode_respond" => Some(Self::PlanModeRespond),
+            "condense" => Some(Self::Condense),
+            "summarize_task" => Some(Self::SummarizeTask),
+            "use_skill" => Some(Self::UseSkill),
+            "list_skills" => Some(Self::ListSkills),
+            "use_subagents" => Some(Self::UseSubagents),
+            "get_function" => Some(Self::GetFunction),
+            "get_file_skeleton" => Some(Self::GetFileSkeleton),
+            "find_symbol_references" => Some(Self::FindSymbolReferences),
+            "edit_file" => Some(Self::EditFile),
+            "diagnostics_scan" => Some(Self::DiagnosticsScan),
+            "replace_symbol" => Some(Self::ReplaceSymbol),
+            "rename_symbol" => Some(Self::RenameSymbol),
             _ => None,
         }
     }
@@ -165,6 +169,7 @@ impl Default for ToolRegistry {
 }
 
 impl ToolRegistry {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             handlers: HashMap::with_capacity(16),
@@ -177,11 +182,13 @@ impl ToolRegistry {
     }
 
     /// Get a handler for a tool.
+    #[must_use] 
     pub fn get_handler(&self, tool: &SnedTool) -> Option<Arc<dyn ToolHandler + Send + Sync>> {
         self.handlers.get(tool).cloned()
     }
 
     /// Check if a handler is registered.
+    #[must_use] 
     pub fn has_handler(&self, tool: &SnedTool) -> bool {
         self.handlers.contains_key(tool)
     }
@@ -422,6 +429,7 @@ pub enum ToolError {
 }
 
 impl ToolError {
+    #[must_use] 
     pub fn metadata(&self) -> Option<&ToolFailureMetadata> {
         match self {
             Self::InvalidInputWithMetadata(_, metadata)
@@ -433,6 +441,7 @@ impl ToolError {
 
 /// Convert a tool result value into plain text for conversation history.
 /// Uses compact JSON to minimize token usage in conversation history.
+#[must_use] 
 pub fn tool_result_to_text(value: serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text,

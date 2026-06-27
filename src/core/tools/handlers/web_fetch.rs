@@ -113,7 +113,7 @@ impl WebFetchHandler {
     /// - User info in URL (user:pass@host)
     fn validate_url(url_str: &str) -> Result<Url, ToolError> {
         let url = Url::parse(url_str)
-            .map_err(|e| ToolError::InvalidInput(format!("Invalid URL format: {}", e)))?;
+            .map_err(|e| ToolError::InvalidInput(format!("Invalid URL format: {e}")))?;
 
         if url.scheme() != "http" && url.scheme() != "https" {
             return Err(ToolError::InvalidInput(format!(
@@ -162,8 +162,7 @@ impl WebFetchHandler {
                 // is_private covers 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
                 if ipv4.is_private() || ipv4.is_loopback() || ipv4.is_link_local() {
                     return Err(ToolError::InvalidInput(format!(
-                        "Access to private IP address {} is not allowed",
-                        ip
+                        "Access to private IP address {ip} is not allowed"
                     )));
                 }
                 // CGNAT/shared address space 100.64.0.0/10 (covers 100.64-100.127)
@@ -189,27 +188,23 @@ impl WebFetchHandler {
             IpAddr::V6(ipv6) => {
                 if ipv6.is_unspecified() {
                     return Err(ToolError::InvalidInput(format!(
-                        "Access to unspecified address {} is not allowed",
-                        ip
+                        "Access to unspecified address {ip} is not allowed"
                     )));
                 }
                 if ipv6.is_loopback() {
                     return Err(ToolError::InvalidInput(format!(
-                        "Access to loopback address {} is not allowed",
-                        ip
+                        "Access to loopback address {ip} is not allowed"
                     )));
                 }
                 if ipv6.is_unicast_link_local() {
                     return Err(ToolError::InvalidInput(format!(
-                        "Access to link-local address {} is not allowed",
-                        ip
+                        "Access to link-local address {ip} is not allowed"
                     )));
                 }
                 // fc00::/7 — unique local addresses (IPv6 equivalent of private IPv4)
                 if ipv6.is_unique_local() {
                     return Err(ToolError::InvalidInput(format!(
-                        "Access to unique local address {} is not allowed",
-                        ip
+                        "Access to unique local address {ip} is not allowed"
                     )));
                 }
                 // IPv4-mapped IPv6 (::ffff:x.x.x.x) — kernel routes to the embedded IPv4
@@ -247,14 +242,13 @@ impl WebFetchHandler {
         let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
             .map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to resolve hostname '{}': {}", host, e))
+                ToolError::ExecutionFailed(format!("Failed to resolve hostname '{host}': {e}"))
             })?
             .collect();
 
         if addrs.is_empty() {
             return Err(ToolError::ExecutionFailed(format!(
-                "DNS resolution for '{}' returned no addresses",
-                host
+                "DNS resolution for '{host}' returned no addresses"
             )));
         }
 
@@ -294,7 +288,7 @@ impl WebFetchHandler {
         builder = builder.resolve(&host, pinned_addr);
 
         let client = builder.build().map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to create HTTP client: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to create HTTP client: {e}"))
         })?;
 
         // Manual redirect loop with DNS validation at each hop
@@ -307,7 +301,7 @@ impl WebFetchHandler {
                 .get(current_url.clone())
                 .send()
                 .await
-                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to fetch URL: {}", e)))?;
+                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to fetch URL: {e}")))?;
 
             let status = response.status();
             if status.is_redirection() {
@@ -330,8 +324,7 @@ impl WebFetchHandler {
                     .or_else(|_| current_url.join(location))
                     .map_err(|e| {
                         ToolError::ExecutionFailed(format!(
-                            "Invalid redirect URL '{}': {}",
-                            location, e
+                            "Invalid redirect URL '{location}': {e}"
                         ))
                     })?;
 
@@ -354,7 +347,7 @@ impl WebFetchHandler {
                     .redirect(reqwest::redirect::Policy::none())
                     .resolve(&redirect_host, redirect_addr)
                     .build()
-                    .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create HTTP client: {}", e)))?;
+                    .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create HTTP client: {e}")))?;
 
                 current_url = validated_redirect;
                 redirect_count += 1;
@@ -363,8 +356,7 @@ impl WebFetchHandler {
 
             if !status.is_success() {
                 return Err(ToolError::ExecutionFailed(format!(
-                    "HTTP error {} when fetching {}",
-                    status, url
+                    "HTTP error {status} when fetching {url}"
                 )));
             }
 
@@ -372,7 +364,7 @@ impl WebFetchHandler {
             let (bytes, truncated, content_length) = read_response_capped(response, max_size)
                 .await
                 .map_err(|e| {
-                    ToolError::ExecutionFailed(format!("Failed to read response body: {}", e))
+                    ToolError::ExecutionFailed(format!("Failed to read response body: {e}"))
                 })?;
 
             let html = String::from_utf8_lossy(&bytes).to_string();
@@ -380,17 +372,15 @@ impl WebFetchHandler {
 
             return if truncated {
                 let full_size_note = match content_length {
-                    Some(len) => format!(", full size was {} bytes", len),
+                    Some(len) => format!(", full size was {len} bytes"),
                     None => ", Content-Length not declared".to_string(),
                 };
                 Ok(format!(
-                    "Successfully fetched {} (response truncated at {} bytes{}). Content:\n\n{}",
-                    url, max_size, full_size_note, text
+                    "Successfully fetched {url} (response truncated at {max_size} bytes{full_size_note}). Content:\n\n{text}"
                 ))
             } else {
                 Ok(format!(
-                    "Successfully fetched {}. Content:\n\n{}",
-                    url, text
+                    "Successfully fetched {url}. Content:\n\n{text}"
                 ))
             };
         }
@@ -429,7 +419,7 @@ impl ToolHandler for WebFetchHandler {
             .get("url")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        format!("[web_fetch for '{}'", url)
+        format!("[web_fetch for '{url}'")
     }
 }
 

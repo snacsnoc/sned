@@ -14,6 +14,7 @@ use crate::providers::StorageMessage;
 pub struct SummarizeTaskHandler;
 
 impl SummarizeTaskHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -135,8 +136,7 @@ impl SummarizeTaskHandler {
                     }
 
                     file_contents.push_str(&format!(
-                        "\n\n<file_content path=\"{}\">\n{}\n</file_content>",
-                        rel_path, content
+                        "\n\n<file_content path=\"{rel_path}\">\n{content}\n</file_content>"
                     ));
                     loaded_file_paths.push(rel_path.clone());
                     total_chars += content.len();
@@ -186,26 +186,23 @@ impl SummarizeTaskHandler {
 
         // Build the result with file contents and hook modification.
         let mut result = format!(
-            "Task summarized. The following summary will be used to continue the conversation:\n\n{}",
-            context
+            "Task summarized. The following summary will be used to continue the conversation:\n\n{context}"
         );
 
         if !loaded_file_paths.is_empty() {
             let file_mention_string = loaded_file_paths
                 .iter()
-                .map(|p| format!("'{}'", p))
+                .map(|p| format!("'{p}'"))
                 .collect::<Vec<_>>()
                 .join(", ");
             result.push_str(&format!(
-                "\n\nThe following files were automatically read based on the files listed in the Required Files section: {} (see below for file content). These are the latest versions of these files - you should reference them directly and not re-read them:{}",
-                file_mention_string, file_contents
+                "\n\nThe following files were automatically read based on the files listed in the Required Files section: {file_mention_string} (see below for file content). These are the latest versions of these files - you should reference them directly and not re-read them:{file_contents}"
             ));
         }
 
         if let Some(modification) = hook_context_modification {
             result.push_str(&format!(
-                "\n\n[Context Modification from PreCompact Hook]\n{}",
-                modification
+                "\n\n[Context Modification from PreCompact Hook]\n{modification}"
             ));
         }
 
@@ -220,9 +217,8 @@ impl ToolHandler for SummarizeTaskHandler {
         params: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
-            SummarizeTaskHandler::execute(&SummarizeTaskHandler, &ctx, params)
+            Self::execute(&Self, &ctx, params)
                 .await
                 .map(serde_json::Value::String)
         })

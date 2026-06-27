@@ -17,16 +17,18 @@ pub enum SlashCommand {
 }
 
 impl SlashCommand {
-    pub fn parse(s: &str) -> Option<SlashCommand> {
+    #[must_use] 
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "newtask" => Some(SlashCommand::NewTask),
-            "compact" => Some(SlashCommand::Smol),
-            "newrule" => Some(SlashCommand::NewRule),
-            "explain-changes" => Some(SlashCommand::ExplainChanges),
+            "newtask" => Some(Self::NewTask),
+            "compact" => Some(Self::Smol),
+            "newrule" => Some(Self::NewRule),
+            "explain-changes" => Some(Self::ExplainChanges),
             _ => None,
         }
     }
 
+    #[must_use] 
     pub fn parse_with_skills_and_workflows(
         command_name: &str,
         available_skills: &[SkillMetadata],
@@ -34,13 +36,13 @@ impl SlashCommand {
         global_workflow_toggles: &HashMap<String, bool>,
         remote_workflow_toggles: &HashMap<String, bool>,
         cwd: &Path,
-    ) -> Option<SlashCommand> {
-        if let Some(slash_cmd) = SlashCommand::parse(command_name) {
+    ) -> Option<Self> {
+        if let Some(slash_cmd) = Self::parse(command_name) {
             return Some(slash_cmd);
         }
 
         if let Some(skill) = available_skills.iter().find(|s| s.name == command_name) {
-            return Some(SlashCommand::SkillCommand {
+            return Some(Self::SkillCommand {
                 name: skill.name.clone(),
             });
         }
@@ -52,7 +54,7 @@ impl SlashCommand {
             cwd,
         );
         if let Some(workflow) = workflows.iter().find(|w| w.file_name == command_name) {
-            return Some(SlashCommand::WorkflowCommand {
+            return Some(Self::WorkflowCommand {
                 name: workflow.file_name.clone(),
             });
         }
@@ -60,39 +62,44 @@ impl SlashCommand {
         None
     }
 
+    #[must_use] 
     pub fn is_skill_command(&self) -> bool {
-        matches!(self, SlashCommand::SkillCommand { .. })
+        matches!(self, Self::SkillCommand { .. })
     }
 
+    #[must_use] 
     pub fn is_workflow_command(&self) -> bool {
-        matches!(self, SlashCommand::WorkflowCommand { .. })
+        matches!(self, Self::WorkflowCommand { .. })
     }
 
+    #[must_use] 
     pub fn is_compact(&self) -> bool {
-        matches!(self, SlashCommand::Smol)
+        matches!(self, Self::Smol)
     }
 
+    #[must_use] 
     pub fn instruction_block(&self) -> &'static str {
         match self {
-            SlashCommand::NewTask => NEW_TASK_INSTRUCTION,
-            SlashCommand::Smol => CONDENSE_INSTRUCTION,
-            SlashCommand::NewRule => NEW_RULE_INSTRUCTION,
-            SlashCommand::ExplainChanges => EXPLAIN_CHANGES_INSTRUCTION,
-            SlashCommand::SkillCommand { .. } => "",
-            SlashCommand::WorkflowCommand { .. } => "",
+            Self::NewTask => NEW_TASK_INSTRUCTION,
+            Self::Smol => CONDENSE_INSTRUCTION,
+            Self::NewRule => NEW_RULE_INSTRUCTION,
+            Self::ExplainChanges => EXPLAIN_CHANGES_INSTRUCTION,
+            Self::SkillCommand { .. } | Self::WorkflowCommand { .. } => "",
         }
     }
 
+    #[must_use] 
     pub fn skill_name(&self) -> Option<&str> {
         match self {
-            SlashCommand::SkillCommand { name } => Some(name),
+            Self::SkillCommand { name } => Some(name),
             _ => None,
         }
     }
 
+    #[must_use] 
     pub fn workflow_name(&self) -> Option<&str> {
         match self {
-            SlashCommand::WorkflowCommand { name } => Some(name),
+            Self::WorkflowCommand { name } => Some(name),
             _ => None,
         }
     }
@@ -133,7 +140,7 @@ fn build_workflows_list(
         && local_dir.is_dir()
         && let Ok(entries) = std::fs::read_dir(&local_dir)
     {
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries.filter_map(std::result::Result::ok) {
             let path = entry.path();
             if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                 let file_name = path
@@ -165,7 +172,7 @@ fn build_workflows_list(
     if let Some(global_dir) = global_dir
         && let Ok(entries) = std::fs::read_dir(&global_dir)
     {
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries.filter_map(std::result::Result::ok) {
             let path = entry.path();
             if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                 let file_name = path
@@ -194,6 +201,7 @@ fn build_workflows_list(
     workflows
 }
 
+#[must_use] 
 pub fn get_workflow_content(
     workflow_name: &str,
     local_workflow_toggles: &HashMap<String, bool>,
@@ -221,6 +229,7 @@ pub fn get_workflow_content(
         .map(|c| c.trim().to_string())
 }
 
+#[must_use] 
 pub fn get_skill_content_for_command(
     skill_name: &str,
     available_skills: &[SkillMetadata],
@@ -330,153 +339,162 @@ pub fn parse_plan_subcommand(args: &str) -> Option<PlanSubcommand> {
 }
 
 impl CliOnlyCommand {
-    pub fn parse(s: &str) -> Option<CliOnlyCommand> {
+    #[must_use] 
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "exit" => Some(CliOnlyCommand::Exit),
-            "q" => Some(CliOnlyCommand::Quit),
-            "quit" => Some(CliOnlyCommand::Quit),
-            "clear" => Some(CliOnlyCommand::Clear),
-            "history" => Some(CliOnlyCommand::History),
-            "skills" => Some(CliOnlyCommand::Skills),
-            "help" => Some(CliOnlyCommand::Help),
-            "settings" => Some(CliOnlyCommand::Settings),
-            "models" => Some(CliOnlyCommand::Models),
-            "resetcompact" | "clearcompact" => Some(CliOnlyCommand::ResetCompact),
-            "stats" => Some(CliOnlyCommand::Stats),
-            "undo" => Some(CliOnlyCommand::Undo),
-            "diff" => Some(CliOnlyCommand::Diff),
-            "log" => Some(CliOnlyCommand::Log),
-            "commit" => Some(CliOnlyCommand::Commit),
-            "checkpoint-list" | "checkpoint list" => Some(CliOnlyCommand::CheckpointList),
-            "checkpoint-restore" | "checkpoint restore" => Some(CliOnlyCommand::CheckpointRestore),
-            "checkpoint-undo" | "checkpoint undo" => Some(CliOnlyCommand::CheckpointUndo),
-            "expand" => Some(CliOnlyCommand::Expand),
-            "changes" => Some(CliOnlyCommand::Changes),
-            "queue" => Some(CliOnlyCommand::Queue),
-            "retry" => Some(CliOnlyCommand::Retry),
-            "model" => Some(CliOnlyCommand::ModelSwitch(String::new())),
-            "plan" => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
-            "plan approve" => Some(CliOnlyCommand::PlanApprove),
-            "plan pause" => Some(CliOnlyCommand::PlanPause),
-            "plan resume" => Some(CliOnlyCommand::PlanResume),
-            "plan abort" => Some(CliOnlyCommand::PlanAbort),
-            "plan complete" => Some(CliOnlyCommand::PlanComplete),
-            "plan fail" => Some(CliOnlyCommand::PlanFail),
+            "exit" => Some(Self::Exit),
+            "q" | "quit" => Some(Self::Quit),
+            "clear" => Some(Self::Clear),
+            "history" => Some(Self::History),
+            "skills" => Some(Self::Skills),
+            "help" => Some(Self::Help),
+            "settings" => Some(Self::Settings),
+            "models" => Some(Self::Models),
+            "resetcompact" | "clearcompact" => Some(Self::ResetCompact),
+            "stats" => Some(Self::Stats),
+            "undo" => Some(Self::Undo),
+            "diff" => Some(Self::Diff),
+            "log" => Some(Self::Log),
+            "commit" => Some(Self::Commit),
+            "checkpoint-list" | "checkpoint list" => Some(Self::CheckpointList),
+            "checkpoint-restore" | "checkpoint restore" => Some(Self::CheckpointRestore),
+            "checkpoint-undo" | "checkpoint undo" => Some(Self::CheckpointUndo),
+            "expand" => Some(Self::Expand),
+            "changes" => Some(Self::Changes),
+            "queue" => Some(Self::Queue),
+            "retry" => Some(Self::Retry),
+            "model" => Some(Self::ModelSwitch(String::new())),
+            "plan" => Some(Self::Plan(PlanSubcommand::Status)),
+            "plan approve" => Some(Self::PlanApprove),
+            "plan pause" => Some(Self::PlanPause),
+            "plan resume" => Some(Self::PlanResume),
+            "plan abort" => Some(Self::PlanAbort),
+            "plan complete" => Some(Self::PlanComplete),
+            "plan fail" => Some(Self::PlanFail),
             _ => None,
         }
     }
 
     /// Parse plan subcommands with arguments.
     /// Called when the command is "plan" and there's additional text.
-    pub fn parse_plan_with_args(args: &str) -> Option<CliOnlyCommand> {
+    #[must_use] 
+    pub fn parse_plan_with_args(args: &str) -> Option<Self> {
         let args_trimmed = args.trim();
         let subcmd = parse_plan_subcommand(args_trimmed);
         match subcmd {
-            Some(PlanSubcommand::Status) => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
+            Some(PlanSubcommand::Status) => Some(Self::Plan(PlanSubcommand::Status)),
             Some(PlanSubcommand::Edit(step, desc)) => {
-                Some(CliOnlyCommand::Plan(PlanSubcommand::Edit(step, desc)))
+                Some(Self::Plan(PlanSubcommand::Edit(step, desc)))
             }
             Some(PlanSubcommand::Add(after, desc)) => {
-                Some(CliOnlyCommand::Plan(PlanSubcommand::Add(after, desc)))
+                Some(Self::Plan(PlanSubcommand::Add(after, desc)))
             }
             Some(PlanSubcommand::Remove(step)) => {
-                Some(CliOnlyCommand::Plan(PlanSubcommand::Remove(step)))
+                Some(Self::Plan(PlanSubcommand::Remove(step)))
             }
             Some(PlanSubcommand::Replace(text)) => {
-                Some(CliOnlyCommand::Plan(PlanSubcommand::Replace(text)))
+                Some(Self::Plan(PlanSubcommand::Replace(text)))
             }
-            Some(PlanSubcommand::Approve) => Some(CliOnlyCommand::PlanApprove),
-            Some(PlanSubcommand::Pause) => Some(CliOnlyCommand::PlanPause),
-            Some(PlanSubcommand::Resume) => Some(CliOnlyCommand::PlanResume),
-            Some(PlanSubcommand::Abort) => Some(CliOnlyCommand::PlanAbort),
-            Some(PlanSubcommand::Complete) => Some(CliOnlyCommand::PlanComplete),
-            Some(PlanSubcommand::Fail) => Some(CliOnlyCommand::PlanFail),
-            None if args_trimmed.is_empty() => Some(CliOnlyCommand::Plan(PlanSubcommand::Status)),
-            None => Some(CliOnlyCommand::PlanPrompt(args_trimmed.to_string())),
+            Some(PlanSubcommand::Approve) => Some(Self::PlanApprove),
+            Some(PlanSubcommand::Pause) => Some(Self::PlanPause),
+            Some(PlanSubcommand::Resume) => Some(Self::PlanResume),
+            Some(PlanSubcommand::Abort) => Some(Self::PlanAbort),
+            Some(PlanSubcommand::Complete) => Some(Self::PlanComplete),
+            Some(PlanSubcommand::Fail) => Some(Self::PlanFail),
+            None if args_trimmed.is_empty() => Some(Self::Plan(PlanSubcommand::Status)),
+            None => Some(Self::PlanPrompt(args_trimmed.to_string())),
         }
     }
 
-    pub fn parse_with_arg(cmd: &str, arg: &str) -> Option<CliOnlyCommand> {
+    #[must_use] 
+    pub fn parse_with_arg(cmd: &str, arg: &str) -> Option<Self> {
         match cmd.to_lowercase().as_str() {
-            "help" if !arg.is_empty() => Some(CliOnlyCommand::HelpOption(arg.to_lowercase())),
-            "model" => Some(CliOnlyCommand::ModelSwitch(arg.to_string())),
+            "help" if !arg.is_empty() => Some(Self::HelpOption(arg.to_lowercase())),
+            "model" => Some(Self::ModelSwitch(arg.to_string())),
             _ => Self::parse(cmd),
         }
     }
 
+    #[must_use] 
     pub fn is_shutdown(&self) -> bool {
-        matches!(self, CliOnlyCommand::Exit | CliOnlyCommand::Quit)
+        matches!(self, Self::Exit | Self::Quit)
     }
 
+    #[must_use] 
     pub fn is_clear(&self) -> bool {
-        matches!(self, CliOnlyCommand::Clear)
+        matches!(self, Self::Clear)
     }
 
+    #[must_use] 
     pub fn is_reset_compact(&self) -> bool {
-        matches!(self, CliOnlyCommand::ResetCompact)
+        matches!(self, Self::ResetCompact)
     }
 
     /// Returns true if this command can execute locally without the agent.
+    #[must_use] 
     pub fn is_local_command(&self) -> bool {
         matches!(
             self,
-            CliOnlyCommand::Exit
-                | CliOnlyCommand::Quit
-                | CliOnlyCommand::Clear
-                | CliOnlyCommand::History
-                | CliOnlyCommand::Skills
-                | CliOnlyCommand::Help
-                | CliOnlyCommand::HelpOption(_)
-                | CliOnlyCommand::Settings
-                | CliOnlyCommand::Models
-                | CliOnlyCommand::ResetCompact
-                | CliOnlyCommand::Stats
-                | CliOnlyCommand::Expand
-                | CliOnlyCommand::Changes
-                | CliOnlyCommand::Queue
-                | CliOnlyCommand::Retry
-                | CliOnlyCommand::Plan(_)
-                | CliOnlyCommand::PlanPrompt(_)
-                | CliOnlyCommand::PlanApprove
-                | CliOnlyCommand::PlanPause
-                | CliOnlyCommand::PlanResume
-                | CliOnlyCommand::PlanAbort
-                | CliOnlyCommand::PlanComplete
-                | CliOnlyCommand::PlanFail
-                | CliOnlyCommand::ModelSwitch(_)
+            Self::Exit
+                | Self::Quit
+                | Self::Clear
+                | Self::History
+                | Self::Skills
+                | Self::Help
+                | Self::HelpOption(_)
+                | Self::Settings
+                | Self::Models
+                | Self::ResetCompact
+                | Self::Stats
+                | Self::Expand
+                | Self::Changes
+                | Self::Queue
+                | Self::Retry
+                | Self::Plan(_)
+                | Self::PlanPrompt(_)
+                | Self::PlanApprove
+                | Self::PlanPause
+                | Self::PlanResume
+                | Self::PlanAbort
+                | Self::PlanComplete
+                | Self::PlanFail
+                | Self::ModelSwitch(_)
         )
     }
 
     /// Returns true if this command requires the agent to be idle.
+    #[must_use] 
     pub fn requires_agent_idle(&self) -> bool {
         matches!(
             self,
-            CliOnlyCommand::Undo
-                | CliOnlyCommand::Diff
-                | CliOnlyCommand::Log
-                | CliOnlyCommand::Commit
-                | CliOnlyCommand::CheckpointList
-                | CliOnlyCommand::CheckpointRestore
-                | CliOnlyCommand::CheckpointUndo
+            Self::Undo
+                | Self::Diff
+                | Self::Log
+                | Self::Commit
+                | Self::CheckpointList
+                | Self::CheckpointRestore
+                | Self::CheckpointUndo
         )
     }
 
     /// Returns true if this is a plan command.
+    #[must_use] 
     pub fn is_plan_command(&self) -> bool {
         matches!(
             self,
-            CliOnlyCommand::Plan(_)
-                | CliOnlyCommand::PlanPrompt(_)
-                | CliOnlyCommand::PlanApprove
-                | CliOnlyCommand::PlanPause
-                | CliOnlyCommand::PlanResume
-                | CliOnlyCommand::PlanAbort
-                | CliOnlyCommand::PlanComplete
-                | CliOnlyCommand::PlanFail
+            Self::Plan(_)
+                | Self::PlanPrompt(_)
+                | Self::PlanApprove
+                | Self::PlanPause
+                | Self::PlanResume
+                | Self::PlanAbort
+                | Self::PlanComplete
+                | Self::PlanFail
         )
     }
 }
 
+#[must_use] 
 pub fn parse_slash_command(text: &str) -> SlashCommandParseResult {
     let regex = Regex::new(SLASH_COMMAND_REGEX).unwrap();
     let caps = regex.captures(text);
@@ -491,7 +509,7 @@ pub fn parse_slash_command(text: &str) -> SlashCommandParseResult {
         let after_command = text.get(end..).unwrap_or("");
         let following_char = after_command.chars().next();
 
-        let is_valid = following_char.map(|c| c.is_whitespace()).unwrap_or(true);
+        let is_valid = following_char.is_none_or(char::is_whitespace);
 
         if !is_valid {
             return SlashCommandParseResult {
@@ -521,6 +539,7 @@ pub fn parse_slash_command(text: &str) -> SlashCommandParseResult {
     }
 }
 
+#[must_use] 
 pub fn process_slash_command(text: &str) -> String {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command
@@ -535,6 +554,7 @@ pub fn process_slash_command(text: &str) -> String {
     text.to_string()
 }
 
+#[must_use] 
 pub fn process_slash_command_with_context(
     text: &str,
     available_skills: &[SkillMetadata],
@@ -559,8 +579,7 @@ pub fn process_slash_command_with_context(
                 && let Some(content) = get_skill_content_for_command(skill_name, available_skills)
             {
                 let instruction = format!(
-                    "<explicit_instructions type=\"skill\" name=\"{}\">\n{}\n</explicit_instructions>",
-                    skill_name, content
+                    "<explicit_instructions type=\"skill\" name=\"{skill_name}\">\n{content}\n</explicit_instructions>"
                 );
 
                 let text_after = &result.processed_text;
@@ -568,12 +587,11 @@ pub fn process_slash_command_with_context(
 
                 if is_empty {
                     let activation_note = format!(
-                        "\n(Note: The user has explicitly activated the \"{}\" skill via a slash command. This skill is now active. Please acknowledge its activation, summarize how you can help based on its instructions, and ask the user for the specific target or task they want you to perform, or propose a first step if appropriate.)\n",
-                        skill_name
+                        "\n(Note: The user has explicitly activated the \"{skill_name}\" skill via a slash command. This skill is now active. Please acknowledge its activation, summarize how you can help based on its instructions, and ask the user for the specific target or task they want you to perform, or propose a first step if appropriate.)\n"
                     );
-                    return format!("{}{}{}", instruction, activation_note, text_after);
+                    return format!("{instruction}{activation_note}{text_after}");
                 }
-                return format!("{}\n{}", instruction, text_after);
+                return format!("{instruction}\n{text_after}");
             }
         } else if slash_cmd.is_workflow_command() {
             if let Some(workflow_name) = slash_cmd.workflow_name()
@@ -586,8 +604,7 @@ pub fn process_slash_command_with_context(
                 )
             {
                 let instruction = format!(
-                    "<explicit_instructions type=\"{}\">\n{}\n</explicit_instructions>",
-                    workflow_name, content
+                    "<explicit_instructions type=\"{workflow_name}\">\n{content}\n</explicit_instructions>"
                 );
                 return format!("{}\n{}", instruction, result.processed_text);
             }
@@ -604,6 +621,7 @@ pub fn process_slash_command_with_context(
     text.to_string()
 }
 
+#[must_use] 
 pub fn is_compact_command(text: &str) -> bool {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command
@@ -614,6 +632,7 @@ pub fn is_compact_command(text: &str) -> bool {
     false
 }
 
+#[must_use] 
 pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command {
@@ -644,6 +663,7 @@ pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
     None
 }
 
+#[must_use] 
 pub fn parse_expand_index(text: &str) -> Option<usize> {
     let result = parse_slash_command(text);
     let cmd = result.command?;
@@ -659,6 +679,7 @@ pub fn parse_expand_index(text: &str) -> Option<usize> {
         .filter(|index| *index > 0)
 }
 
+#[must_use] 
 pub fn parse_checkpoint_restore(text: &str) -> Option<usize> {
     let result = parse_slash_command(text);
     let cmd = result.command?;
@@ -737,6 +758,7 @@ pub struct SlashCommandEntry {
 ///
 /// Combines built-in agent commands, local CLI commands, skills, and workflows
 /// into a single list for the autocomplete picker.
+#[must_use] 
 pub fn build_slash_command_entries(
     available_skills: &[SkillMetadata],
     local_workflow_toggles: &HashMap<String, bool>,
@@ -889,6 +911,7 @@ pub fn build_slash_command_entries(
 }
 
 /// Build workflow entries from a pre-loaded workflow list.
+#[must_use] 
 pub fn build_workflow_entries(workflows: &[(String, String)]) -> Vec<SlashCommandEntry> {
     workflows
         .iter()
@@ -906,6 +929,7 @@ pub fn build_workflow_entries(workflows: &[(String, String)]) -> Vec<SlashComman
 ///
 /// Returns `Some(query)` if the user is currently typing a slash command
 /// (text contains `/` at the start of a word), `None` otherwise.
+#[must_use] 
 pub fn extract_slash_query(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut last_slash_pos = None;
@@ -927,6 +951,7 @@ pub fn extract_slash_query(text: &str) -> Option<String> {
 /// The returned text keeps any prefix before the slash and any suffix after
 /// the typed query, but the current `/query` token is replaced with the
 /// completed command name including its leading slash.
+#[must_use] 
 pub fn apply_slash_completion(text: &str, command_name: &str) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
     let mut last_slash_pos = None;
@@ -957,6 +982,7 @@ pub fn apply_slash_completion(text: &str, command_name: &str) -> Option<(String,
 /// 2. Prefix match on name
 /// 3. Prefix match on alias
 /// 4. Substring match on name or description
+#[must_use] 
 pub fn filter_slash_commands(entries: &[SlashCommandEntry], query: &str) -> Vec<SlashCommandEntry> {
     if query.is_empty() {
         return entries.to_vec();
@@ -1010,6 +1036,7 @@ pub fn filter_slash_commands(entries: &[SlashCommandEntry], query: &str) -> Vec<
 
     substring.into_iter().take(10).collect()
 }
+#[must_use] 
 pub fn format_help_text() -> String {
     use crate::cli::colors::style;
 
@@ -1415,6 +1442,7 @@ pub fn format_help_text() -> String {
     s
 }
 
+#[must_use] 
 pub fn format_help_for_command(cmd: &str) -> String {
     use crate::cli::colors::style;
 
@@ -1429,7 +1457,7 @@ pub fn format_help_for_command(cmd: &str) -> String {
 
     let help_text = match cmd_lower.as_str() {
         "newtask" => {
-            r#"Creates a new task while preserving context from the current conversation.
+            r"Creates a new task while preserving context from the current conversation.
 
 Use when:
   - Starting a new subtask within a larger project
@@ -1437,79 +1465,79 @@ Use when:
   - Creating a focused task with inherited context
 
 Example:
-  /newtask - Create a new task with current context"#
+  /newtask - Create a new task with current context"
         }
 
         "compact" => {
-            r#"Condenses the current conversation history to reduce token usage.
+            r"Condenses the current conversation history to reduce token usage.
 
 Use when:
   - Approaching context window limits
   - After completing a major task phase
   - Before starting a new topic in the same session
 
-Note: Can only be used once per session. After that, use /resetcompact."#
+Note: Can only be used once per session. After that, use /resetcompact."
         }
 
         "newrule" => {
-            r#"Creates a new Sned rule based on your conversation context.
+            r"Creates a new Sned rule based on your conversation context.
 
 Use when:
   - You want to codify a pattern from your current work
   - Creating project-specific conventions
-  - Documenting recurring workflows"#
+  - Documenting recurring workflows"
         }
 
         "explain-changes" => {
-            r#"Explains the changes you have made to the codebase.
+            r"Explains the changes you have made to the codebase.
 
 Use when:
   - You want a summary of your modifications
   - Preparing commit messages
-  - Reviewing your own work"#
+  - Reviewing your own work"
         }
 
         "exit" | "q" | "quit" => {
-            r#"Exits the Sned CLI.
+            r"Exits the Sned CLI.
 
 Aliases: /exit, /q, /quit
 
 Use when:
   - Finished with your session
-  - Want to return to the shell"#
+  - Want to return to the shell"
         }
 
         "clear" => {
-            r#"Clears the current conversation history.
+            r"Clears the current conversation history.
 
 Use when:
   - Starting fresh without context
   - Privacy concerns require clearing history
   - Resetting a confused session
 
-Warning: This action cannot be undone."#
+Warning: This action cannot be undone."
         }
 
         "history" => {
-            r#"Shows recent tasks from your history.
+            r"Shows recent tasks from your history.
 
 Use when:
   - Looking for a previous task
   - Reviewing past work sessions
-  - Finding task IDs for reference"#
+  - Finding task IDs for reference"
         }
 
         "skills" => {
-            r#"Lists available skills that can be invoked via slash commands.
+            r"Lists available skills that can be invoked via slash commands.
 
 Use when:
   - Discovering available skills
   - Checking skill names and descriptions
-  - Learning about project-specific automations"#
+  - Learning about project-specific automations"
         }
 
         "help" => {
-            r#"Shows this help message or detailed help for a specific command.
+            r"Shows this help message or detailed help for a specific command.
 
 Usage:
   /help - Show all commands
@@ -1517,49 +1545,49 @@ Usage:
 
 Examples:
   /help newtask - Get detailed help for /newtask
-  /help checkpoint - Get help for checkpoint commands"#
+  /help checkpoint - Get help for checkpoint commands"
         }
 
         "settings" => {
-            r#"Shows current Sned settings including provider, model, and mode.
+            r"Shows current Sned settings including provider, model, and mode.
 
 Use when:
   - Verifying current configuration
   - Checking which model is active
-  - Confirming auto-approve status"#
+  - Confirming auto-approve status"
         }
 
         "models" => {
-            r#"Lists available models across providers.
+            r"Lists available models across providers.
 
 Use when:
   - Choosing a model for your task
   - Checking model availability
-  - Comparing model options"#
+  - Comparing model options"
         }
 
         "stats" => {
-            r#"Shows token usage and session cost statistics.
+            r"Shows token usage and session cost statistics.
 
 Use when:
   - Monitoring API costs
   - Tracking token consumption
-  - Optimizing prompt efficiency"#
+  - Optimizing prompt efficiency"
         }
 
         "resetcompact" => {
-            r#"Clears the compacted summary, allowing /compact to be used again.
+            r"Clears the compacted summary, allowing /compact to be used again.
 
 Alias: /clearcompact
 
 Use when:
   - Need to compact again after first use
   - Compacted summary is outdated
-  - Starting a new major phase"#
+  - Starting a new major phase"
         }
 
         "undo" => {
-            r#"Undoes the last turn by reverting file changes.
+            r"Undoes the last turn by reverting file changes.
 
 Requires: --track-changes flag
 
@@ -1568,29 +1596,29 @@ Use when:
   - Want to retry with a different prompt
   - Reverting experimental modifications
 
-Note: Requires checkpoint tracking to be enabled."#
+Note: Requires checkpoint tracking to be enabled."
         }
 
         "diff" => {
-            r#"Shows changes from the last turn.
+            r"Shows changes from the last turn.
 
 Requires: --track-changes flag
 
 Use when:
   - Reviewing what changed
   - Preparing to commit changes
-  - Understanding modifications"#
+  - Understanding modifications"
         }
 
         "log" => {
-            r#"Shows turn history.
+            r"Shows turn history.
 
 Requires: --track-changes flag
 
 Use when:
   - Reviewing session timeline
   - Finding specific turns
-  - Auditing actions"#
+  - Auditing actions"
         }
 
         "commit" => {
@@ -1611,7 +1639,7 @@ Example:
         }
 
         "expand" => {
-            r#"Shows a previously snipped code block.
+            r"Shows a previously snipped code block.
 
 Usage:
   /expand N - Show code block number N
@@ -1619,11 +1647,11 @@ Usage:
 Use when:
   - Need to review truncated output
   - Agent snipped long code blocks
-  - Checking specific sections of output"#
+  - Checking specific sections of output"
         }
 
         "checkpoint" | "checkpoint-list" | "checkpoint list" => {
-            r#"Lists available checkpoints with timestamps.
+            r"Lists available checkpoints with timestamps.
 
 Requires: --track-changes flag
 
@@ -1632,11 +1660,11 @@ Aliases: /checkpoint-list, /checkpoint list
 Use when:
   - Finding restore points
   - Reviewing checkpoint history
-  - Identifying specific turns to restore"#
+  - Identifying specific turns to restore"
         }
 
         "checkpoint-restore" | "checkpoint restore" => {
-            r#"Restores files to a specific checkpoint state.
+            r"Restores files to a specific checkpoint state.
 
 Requires: --track-changes flag
 
@@ -1650,11 +1678,11 @@ Use when:
   - Undoing multiple turns at once
   - Experimenting with different approaches
 
-Warning: Reverts all files to checkpoint state."#
+Warning: Reverts all files to checkpoint state."
         }
 
         "checkpoint-undo" | "checkpoint undo" => {
-            r#"Undoes last turn using checkpoint (reverts files + trims history).
+            r"Undoes last turn using checkpoint (reverts files + trims history).
 
 Requires: --track-changes flag
 
@@ -1663,132 +1691,132 @@ Aliases: /checkpoint-undo, /checkpoint undo
 Use when:
   - Complete undo of last action
   - Both file and history rollback needed
-  - More thorough than /undo alone"#
+  - More thorough than /undo alone"
         }
 
         "queue" => {
-            r#"Shows pending queued messages waiting for the agent to become idle.
+            r"Shows pending queued messages waiting for the agent to become idle.
 
 Use when:
   - Agent is busy and you've queued commands
   - Want to review what's waiting to execute
   - Checking queue order and count
 
-Note: Local commands (/help, /stats, etc.) execute immediately even when the agent is busy."#
+Note: Local commands (/help, /stats, etc.) execute immediately even when the agent is busy."
         }
 
         "retry" => {
-            r#"Retries the most recent safe failed request verbatim.
+            r"Retries the most recent safe failed request verbatim.
 
 Use when:
   - A provider request or stream failed before tool execution
   - Sned says the request is retryable
   - You want to resend the exact failed request without retyping it
 
-Note: If the agent is busy, /retry is queued to run next."#
+Note: If the agent is busy, /retry is queued to run next."
         }
 
         "plan" => {
-            r#"Shows the current plan workflow state and steps.
+            r"Shows the current plan workflow state and steps.
 
 Use when:
   - Checking plan progress
   - Viewing current step status
   - Reviewing planned actions
 
-Note: Plan state is stored in memory and not persisted to disk."#
+Note: Plan state is stored in memory and not persisted to disk."
         }
 
         "plan approve" => {
-            r#"Approves the current plan and begins step execution.
+            r"Approves the current plan and begins step execution.
 
 Use when:
   - You've reviewed the plan and want to start execution
   - All steps look correct
   - Ready to let the agent begin working
 
-Note: Plan steps are executed sequentially with batch approval."#
+Note: Plan steps are executed sequentially with batch approval."
         }
 
         "plan pause" => {
-            r#"Pauses execution of the current plan.
+            r"Pauses execution of the current plan.
 
 Use when:
   - Need to review progress before continuing
   - Want to edit remaining steps
-  - Need to take a break from plan execution"#
+  - Need to take a break from plan execution"
         }
 
         "plan resume" => {
-            r#"Resumes execution of a paused plan.
+            r"Resumes execution of a paused plan.
 
 Use when:
   - Ready to continue plan execution
-  - After editing steps while paused"#
+  - After editing steps while paused"
         }
 
         "plan abort" => {
-            r#"Aborts the current plan and clears plan state.
+            r"Aborts the current plan and clears plan state.
 
 Use when:
   - Plan is no longer needed
   - Want to start over with a new plan
   - Plan has failed and you want to reset
 
-Note: Already-applied filesystem changes are kept."#
+Note: Already-applied filesystem changes are kept."
         }
 
         "plan edit" => {
-            r#"Edits a specific step in the plan.
+            r"Edits a specific step in the plan.
 
 Usage:
   /plan edit <step> <description>
 
 Use when:
   - Need to correct a step before approval
-  - Want to refine a step while paused"#
+  - Want to refine a step while paused"
         }
 
         "plan add" => {
-            r#"Adds a new step after a specified step.
+            r"Adds a new step after a specified step.
 
 Usage:
   /plan add <after_step> <description>
 
 Use when:
   - Need to insert a missing step
-  - Want to break down a complex step"#
+  - Want to break down a complex step"
         }
 
         "plan remove" => {
-            r#"Removes a step from the plan.
+            r"Removes a step from the plan.
 
 Usage:
   /plan remove <step>
 
 Use when:
   - A step is redundant
-  - Want to simplify the plan"#
+  - Want to simplify the plan"
         }
 
         _ => &format!(
-            "Unknown command: /{}\n\nUse /help to see all available commands.",
-            cmd
+            "Unknown command: /{cmd}\n\nUse /help to see all available commands."
         ),
     };
 
-    format!("{}\n\n{}", banner, help_text)
+    format!("{banner}\n\n{help_text}")
 }
 
+#[must_use] 
 pub fn format_settings_text(provider: &str, model: &str, mode: &str, auto_approve: bool) -> String {
     format!(
-        r#"Current Sned Settings:
+        r"Current Sned Settings:
 
 Provider:     {}
 Model:        {}
 Mode:         {}
 Auto-approve: {}
-"#,
+",
         provider,
         model,
         mode,
@@ -1806,6 +1834,7 @@ pub struct ModelPickerEntry {
 }
 
 /// Build the list of available model picker entries.
+#[must_use] 
 pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
     vec![
         ModelPickerEntry {
@@ -1884,6 +1913,7 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
 }
 
 /// Format available models text for /models command.
+#[must_use] 
 pub fn format_models_text() -> String {
     let entries = build_model_picker_entries();
     let mut s = String::new();
@@ -1912,7 +1942,7 @@ fn to_title_case(s: &str) -> String {
                 None => String::new(),
                 Some(first) => {
                     let mut result = first.to_uppercase().collect::<String>();
-                    result.extend(c.flat_map(|ch| ch.to_lowercase()));
+                    result.extend(c.flat_map(char::to_lowercase));
                     result
                 }
             }
@@ -1920,6 +1950,7 @@ fn to_title_case(s: &str) -> String {
     }
 }
 
+#[must_use] 
 pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String {
     if let Some(ref api_req_info) = state.last_api_req_info {
         let tokens_in = api_req_info.tokens_in.unwrap_or(0);
@@ -1932,19 +1963,19 @@ pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String 
         let context_window = api_req_info.context_window.unwrap_or(0);
 
         let cache_str = if cache_writes > 0 || cache_reads > 0 {
-            format!(" ({}w/{}r)", cache_writes, cache_reads)
+            format!(" ({cache_writes}w/{cache_reads}r)")
         } else {
             String::new()
         };
 
         let reasoning_str = if reasoning > 0 {
-            format!(" | {} reasoning", reasoning)
+            format!(" | {reasoning} reasoning")
         } else {
             String::new()
         };
 
         let cost_str = if cost > 0.0 {
-            format!(" | ${:.4}", cost)
+            format!(" | ${cost:.4}")
         } else {
             String::new()
         };
@@ -1966,6 +1997,7 @@ pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String 
 }
 
 /// Format session file changes for /changes command.
+#[must_use] 
 pub fn format_changes_text(state: &crate::core::agent_types::TaskState) -> String {
     use crate::core::context::trackers::FileRecordSource;
 
@@ -2000,14 +2032,14 @@ pub fn format_changes_text(state: &crate::core::agent_types::TaskState) -> Strin
     if !created.is_empty() {
         lines.push("Created:".to_string());
         for path in &created {
-            lines.push(format!("  + {}", path));
+            lines.push(format!("  + {path}"));
         }
     }
 
     if !edited.is_empty() {
         lines.push("Edited:".to_string());
         for path in &edited {
-            lines.push(format!("  ~ {}", path));
+            lines.push(format!("  ~ {path}"));
         }
     }
 

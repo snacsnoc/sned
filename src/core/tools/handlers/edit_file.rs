@@ -38,6 +38,7 @@ pub struct EditFileHandler {
 }
 
 impl EditFileHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             approval_manager: None,
@@ -66,26 +67,23 @@ impl EditFileHandler {
     }
 
     fn file_entry_path(file: &serde_json::Value) -> Result<&str, String> {
-        match file.get("path") {
-            Some(path) => path.as_str().ok_or_else(|| {
-                "edit_file requires 'path' to be a string in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
-                    .to_string()
-            }),
-            None => {
-                // Lenient fallback: models commonly put "path" inside the first
-                // edit object instead of at the file-entry level. Extract it
-                // if present so the edit succeeds without a wasted round-trip.
-                if let Some(edits) = file.get("edits").and_then(|e| e.as_array())
-                    && let Some(first_edit) = edits.first()
-                    && let Some(path) = first_edit.get("path").and_then(|p| p.as_str())
-                {
-                    return Ok(path);
-                }
-                Err(
-                    "edit_file requires a 'path' key in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
-                        .to_string(),
-                )
+        if let Some(path) = file.get("path") { path.as_str().ok_or_else(|| {
+            "edit_file requires 'path' to be a string in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
+                .to_string()
+        }) } else {
+            // Lenient fallback: models commonly put "path" inside the first
+            // edit object instead of at the file-entry level. Extract it
+            // if present so the edit succeeds without a wasted round-trip.
+            if let Some(edits) = file.get("edits").and_then(|e| e.as_array())
+                && let Some(first_edit) = edits.first()
+                && let Some(path) = first_edit.get("path").and_then(|p| p.as_str())
+            {
+                return Ok(path);
             }
+            Err(
+                "edit_file requires a 'path' key in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
+                    .to_string(),
+            )
         }
     }
 
@@ -93,8 +91,7 @@ impl EditFileHandler {
         let anchor = raw.trim();
         if anchor.is_empty() {
             return Err(format!(
-                "File '{}': '{}' is empty. Copy the exact 'Word§line content' string from read_file output.",
-                path, field_name
+                "File '{path}': '{field_name}' is empty. Copy the exact 'Word§line content' string from read_file output."
             ));
         }
 
@@ -117,8 +114,7 @@ impl EditFileHandler {
                     first_line.to_string()
                 };
                 return Err(format!(
-                    "File '{}': '{}' is a multi-line anchor that starts with an incomplete line ('{}' ends with the '{}' delimiter but has no content after it). Anchors must be a single complete physical line from the read_file output (format: 'Word§line content'). If you want to replace a range of lines, use 'anchor' for the first line and 'end_anchor' for the last line.",
-                    path, field_name, preview, ANCHOR_DELIMITER
+                    "File '{path}': '{field_name}' is a multi-line anchor that starts with an incomplete line ('{preview}' ends with the '{ANCHOR_DELIMITER}' delimiter but has no content after it). Anchors must be a single complete physical line from the read_file output (format: 'Word§line content'). If you want to replace a range of lines, use 'anchor' for the first line and 'end_anchor' for the last line."
                 ));
             }
             // First line is complete (has content after §). Use it.
@@ -238,9 +234,8 @@ impl EditFileHandler {
                     if has_anchor || has_edit_type || has_text {
                         ToolError::InvalidInput(format!(
                             "The 'anchor', 'edit_type', and 'text' fields must be inside an 'edits' array, not at the file-entry level.\n\n\
-                             Correct: {{ \"path\": \"{}\", \"edits\": [{{ \"anchor\": \"...\", \"text\": \"...\" }}] }}\n\
-                             Wrong:   {{ \"path\": \"{}\", \"anchor\": \"...\", \"text\": \"...\" }}",
-                            path, path
+                             Correct: {{ \"path\": \"{path}\", \"edits\": [{{ \"anchor\": \"...\", \"text\": \"...\" }}] }}\n\
+                             Wrong:   {{ \"path\": \"{path}\", \"anchor\": \"...\", \"text\": \"...\" }}"
                         ))
                     } else {
                         ToolError::InvalidInput(format!(
@@ -321,8 +316,7 @@ impl EditFileHandler {
         match edit_type {
             "replace" | "insert_before" | "insert_after" => Ok(()),
             _ => Err(ToolError::InvalidInput(format!(
-                "Unknown edit_type '{}'. Valid values are: replace, insert_before, insert_after",
-                edit_type
+                "Unknown edit_type '{edit_type}'. Valid values are: replace, insert_before, insert_after"
             ))),
         }
     }
@@ -344,7 +338,7 @@ impl EditFileHandler {
             let path = match Self::file_entry_path(file) {
                 Ok(path) => path,
                 Err(message) => {
-                    path_errors.push(format!("  - {}", message));
+                    path_errors.push(format!("  - {message}"));
                     continue;
                 }
             };
@@ -352,18 +346,17 @@ impl EditFileHandler {
                 affected_paths.push(resolved);
             }
 
-            let edits = file
+            let edits: &[serde_json::Value] = file
                 .get("edits")
                 .and_then(|e| e.as_array())
-                .map(|a| a.as_slice())
-                .unwrap_or(&[]);
+                .map_or(&[], std::vec::Vec::as_slice);
 
             for edit in edits {
-                let anchor_raw = edit.get("anchor").and_then(|a| a.as_str()).unwrap_or("");
+                let anchor_raw = edit.get("anchor").and_then(|a: &serde_json::Value| a.as_str()).unwrap_or("");
                 let anchor = match Self::normalized_anchor("anchor", path, anchor_raw) {
                     Ok(anchor) => anchor,
                     Err(message) => {
-                        invalid_anchors.push(format!("  - {}", message));
+                        invalid_anchors.push(format!("  - {message}"));
                         continue;
                     }
                 };
@@ -375,7 +368,7 @@ impl EditFileHandler {
                         if anchor.chars().count() > 50 {
                             format!("{}...", anchor.chars().take(50).collect::<String>())
                         } else {
-                            anchor.to_string()
+                            anchor.clone()
                         },
                         ANCHOR_DELIMITER
                     ));
@@ -388,19 +381,19 @@ impl EditFileHandler {
                             if anchor.chars().count() > 50 {
                                 format!("{}...", anchor.chars().take(50).collect::<String>())
                             } else {
-                                anchor.to_string()
+                                anchor.clone()
                             },
                             ANCHOR_DELIMITER
                         ));
                     }
                 }
 
-                if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a| a.as_str()) {
+                if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a: &serde_json::Value| a.as_str()) {
                     let end_anchor =
                         match Self::normalized_anchor("end_anchor", path, end_anchor_raw) {
                             Ok(anchor) => anchor,
                             Err(message) => {
-                                invalid_anchors.push(format!("  - {}", message));
+                                invalid_anchors.push(format!("  - {message}"));
                                 continue;
                             }
                         };
@@ -411,7 +404,7 @@ impl EditFileHandler {
                             if end_anchor.chars().count() > 50 {
                                 format!("{}...", end_anchor.chars().take(50).collect::<String>())
                             } else {
-                                end_anchor.to_string()
+                                end_anchor.clone()
                             },
                             ANCHOR_DELIMITER
                         ));
@@ -426,7 +419,7 @@ impl EditFileHandler {
                                 if end_anchor.chars().count() > 50 {
                                     format!("{}...", end_anchor.chars().take(50).collect::<String>())
                                 } else {
-                                    end_anchor.to_string()
+                                    end_anchor.clone()
                                 },
                                 ANCHOR_DELIMITER
                             ));
@@ -486,8 +479,7 @@ impl EditFileHandler {
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
         ToolError::ExecutionFailedWithMetadata(
             format!(
-                "You must re-read {} before retrying edit_file. A successful edit (or a prior failed attempt) changed the file, so the hash anchors from your previous read_file are stale. Call read_file on this path to get fresh anchors, then retry the edit with the new anchors.",
-                display_path
+                "You must re-read {display_path} before retrying edit_file. A successful edit (or a prior failed attempt) changed the file, so the hash anchors from your previous read_file are stale. Call read_file on this path to get fresh anchors, then retry the edit with the new anchors."
             ),
             ToolFailureMetadata {
                 class: ToolFailureClass::AnchorInvalid,
@@ -500,8 +492,7 @@ impl EditFileHandler {
     fn external_modification_error(display_path: &str, absolute_path: &str) -> ToolError {
         ToolError::ExecutionFailedWithMetadata(
             format!(
-                "File {} was modified externally during edit operation. Aborting write to prevent data loss. Re-read the file and retry.",
-                display_path
+                "File {display_path} was modified externally during edit operation. Aborting write to prevent data loss. Re-read the file and retry."
             ),
             ToolFailureMetadata {
                 class: ToolFailureClass::AnchorInvalid,
@@ -544,8 +535,7 @@ impl EditFileHandler {
             return if let Some(value) = files_value {
                 if value
                     .as_array()
-                    .map(|a| a.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(std::vec::Vec::is_empty)
                 {
                     Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
                 } else if value.as_str().is_some() {
@@ -553,12 +543,11 @@ impl EditFileHandler {
                         Ok(parsed) if parsed.is_empty() => Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string()),
                         Ok(_) => unreachable!("files vec is empty but parse succeeded with non-empty"),
                         Err(e) => Ok(format!(
-                            "Failed to parse 'files' parameter as a JSON array string. The 'files' parameter must be a JSON array of {{path, edits}} objects, e.g. [{{\"path\":\"file.rs\",\"edits\":[...]}}]. Parse error: {}",
-                            e
+                            "Failed to parse 'files' parameter as a JSON array string. The 'files' parameter must be a JSON array of {{path, edits}} objects, e.g. [{{\"path\":\"file.rs\",\"edits\":[...]}}]. Parse error: {e}"
                         )),
                     }
                 } else {
-                    Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}].", value))
+                    Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {value}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}]."))
                 }
             } else {
                 Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
@@ -572,7 +561,7 @@ impl EditFileHandler {
 
         let silent = params
             .get("silent")
-            .and_then(|s| s.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         // Group edits by resolved absolute path
@@ -720,7 +709,7 @@ impl EditFileHandler {
             // "anchor not found" and force a re-read.
             if let Some(ref old) = pre_reconcile_anchors {
                 let new_set: std::collections::HashSet<&str> =
-                    anchors.iter().map(|s| s.as_str()).collect();
+                    anchors.iter().map(std::string::String::as_str).collect();
                 let mut stale_anchors: Vec<String> = Vec::new();
                 for edit in &batch.edits {
                     let anchor_raw = edit.anchor.lines().next().unwrap_or("").trim();
@@ -739,7 +728,7 @@ impl EditFileHandler {
                     );
                     msg.push_str("Stale anchors:\n");
                     for a in &stale_anchors {
-                        msg.push_str(&format!("  - {}\n", a));
+                        msg.push_str(&format!("  - {a}\n"));
                     }
                     all_results.push(format!(
                         "Error preparing edits for {}: {}",
@@ -823,7 +812,7 @@ impl EditFileHandler {
                         // Proceed with edits
                     }
                     Err(e) => {
-                        return Err(ToolError::ExecutionFailed(format!("Approval error: {}", e)));
+                        return Err(ToolError::ExecutionFailed(format!("Approval error: {e}")));
                     }
                 }
             }
@@ -847,8 +836,7 @@ impl EditFileHandler {
             )
             .unwrap_or_else(|| {
                 path.parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or(PathBuf::from("."))
+                    .map_or(PathBuf::from("."), std::path::Path::to_path_buf)
             });
             files_by_project
                 .entry((project_root, project_type))
@@ -964,12 +952,12 @@ impl EditFileHandler {
             let final_lines: Vec<String> = result
                 .final_content
                 .as_ref()
-                .map(|c| c.split('\n').map(|s| s.to_string()).collect())
+                .map(|c| c.split('\n').map(std::string::ToString::to_string).collect())
                 .unwrap_or_default();
 
             let final_hashes = compute_hashes(&final_lines)
                 .iter()
-                .map(|h| format!("{:08x}", h))
+                .map(|h| format!("{h:08x}"))
                 .collect::<Vec<_>>();
 
             file_results.push(FileResult {
@@ -1013,7 +1001,7 @@ impl EditFileHandler {
                                 && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
                             {
                                 rollback_errors
-                                    .push(format!("Failed to rollback {}: {}", path, re));
+                                    .push(format!("Failed to rollback {path}: {re}"));
                             }
                         }
                         if !rollback_errors.is_empty() {
@@ -1085,20 +1073,20 @@ impl EditFileHandler {
                                         crate::storage::disk::atomic_write_file(path, orig)
                                 {
                                     rollback_errors
-                                        .push(format!("Failed to rollback {}: {}", path, re));
+                                        .push(format!("Failed to rollback {path}: {re}"));
                                 }
                             }
-                            if !rollback_errors.is_empty() {
+                            if rollback_errors.is_empty() {
+                                all_results.push(format!(
+                                    "Error writing file {}: {}",
+                                    item.display_path, e
+                                ));
+                            } else {
                                 all_results.push(format!(
                                     "Error writing file {}: {}. Rollback incomplete: {}",
                                     item.display_path,
                                     e,
                                     rollback_errors.join(", ")
-                                ));
-                            } else {
-                                all_results.push(format!(
-                                    "Error writing file {}: {}",
-                                    item.display_path, e
                                 ));
                             }
                         }
@@ -1153,20 +1141,20 @@ impl EditFileHandler {
                                         crate::storage::disk::atomic_write_file(path, orig)
                                 {
                                     rollback_errors
-                                        .push(format!("Failed to rollback {}: {}", path, re));
+                                        .push(format!("Failed to rollback {path}: {re}"));
                                 }
                             }
-                            if !rollback_errors.is_empty() {
+                            if rollback_errors.is_empty() {
+                                all_results.push(format!(
+                                    "Error writing file {}: {}",
+                                    item.display_path, e
+                                ));
+                            } else {
                                 all_results.push(format!(
                                     "Error writing file {}: {}. Rollback incomplete: {}",
                                     item.display_path,
                                     e,
                                     rollback_errors.join(", ")
-                                ));
-                            } else {
-                                all_results.push(format!(
-                                    "Error writing file {}: {}",
-                                    item.display_path, e
                                 ));
                             }
                         }
@@ -1194,9 +1182,7 @@ impl EditFileHandler {
                 .iter()
                 .map(|item| {
                     std::path::Path::new(&item.absolute_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| item.absolute_path.clone())
+                        .file_name().map_or_else(|| item.absolute_path.clone(), |n| n.to_string_lossy().to_string())
                 })
                 .collect();
             output_writer.emit(OutputEvent::tool_output_line(
@@ -1235,8 +1221,7 @@ impl EditFileHandler {
                 )
                 .unwrap_or_else(|| {
                     path.parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or(PathBuf::from("."))
+                        .map_or(PathBuf::from("."), std::path::Path::to_path_buf)
                 });
                 files_by_project
                     .entry((project_root, project_type))
@@ -1308,14 +1293,14 @@ impl EditFileHandler {
                     .cloned()
                     .collect();
 
-                let new_problems_message = if !new_problems.is_empty() {
+                let new_problems_message = if new_problems.is_empty() {
+                    String::new()
+                } else {
                     DiagnosticsScanHandler::format_diagnostics(
                         &file_result.batch_display_path,
                         &new_problems,
                         None,
                     )
-                } else {
-                    String::new()
                 };
 
                 Some(DiagnosticsResult {
@@ -1365,6 +1350,7 @@ impl EditFileHandler {
         ))
     }
 
+    #[must_use] 
     pub fn description(&self, params: &serde_json::Value) -> String {
         let path = params
             .get("files")
@@ -1373,7 +1359,7 @@ impl EditFileHandler {
             .and_then(|f| f.get("path"))
             .and_then(|p| p.as_str())
             .unwrap_or("?");
-        format!("[edit_file for '{}']", path)
+        format!("[edit_file for '{path}']")
     }
 }
 
@@ -1385,7 +1371,6 @@ impl ToolHandler for EditFileHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
             let result = handler
@@ -1409,7 +1394,7 @@ impl ToolHandler for EditFileHandler {
     }
 
     fn description(&self, params: &serde_json::Value) -> String {
-        EditFileHandler::description(self, params)
+        Self::description(self, params)
     }
 }
 

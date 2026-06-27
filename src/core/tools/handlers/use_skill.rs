@@ -17,6 +17,7 @@ use std::path::Path;
 pub struct UseSkillHandler;
 
 impl UseSkillHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -96,25 +97,23 @@ impl UseSkillHandler {
 
         if !supporting.docs.is_empty() || !supporting.scripts.is_empty() {
             activation_message.push_str(&format!(
-                "\nYou may access supporting files in the skill directory: {}/\n",
-                skill_dir
+                "\nYou may access supporting files in the skill directory: {skill_dir}/\n"
             ));
             if !supporting.docs.is_empty() {
                 activation_message.push_str("\nDocumentation available:\n");
                 for doc in &supporting.docs {
-                    activation_message.push_str(&format!("- {}/docs/{}\n", skill_dir, doc));
+                    activation_message.push_str(&format!("- {skill_dir}/docs/{doc}\n"));
                 }
             }
             if !supporting.scripts.is_empty() {
                 activation_message.push_str("\nScripts available (run via execute_command):\n");
                 for script in &supporting.scripts {
-                    activation_message.push_str(&format!("- {}/scripts/{}\n", skill_dir, script));
+                    activation_message.push_str(&format!("- {skill_dir}/scripts/{script}\n"));
                 }
             }
         } else {
             activation_message.push_str(&format!(
-                "\nYou may access other files in the skill directory at: {}",
-                skill_dir
+                "\nYou may access other files in the skill directory at: {skill_dir}"
             ));
         }
 
@@ -127,7 +126,7 @@ impl UseSkillHandler {
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
         let workspace_root = std::env::current_dir().map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to get current directory: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to get current directory: {e}"))
         })?;
         self.execute_with_workspace_root(state, params, &workspace_root)
     }
@@ -197,25 +196,23 @@ impl UseSkillHandler {
 
         if !supporting.docs.is_empty() || !supporting.scripts.is_empty() {
             activation_message.push_str(&format!(
-                "\nYou may access supporting files in the skill directory: {}/\n",
-                skill_dir
+                "\nYou may access supporting files in the skill directory: {skill_dir}/\n"
             ));
             if !supporting.docs.is_empty() {
                 activation_message.push_str("\nDocumentation available:\n");
                 for doc in &supporting.docs {
-                    activation_message.push_str(&format!("- {}/docs/{}\n", skill_dir, doc));
+                    activation_message.push_str(&format!("- {skill_dir}/docs/{doc}\n"));
                 }
             }
             if !supporting.scripts.is_empty() {
                 activation_message.push_str("\nScripts available (run via execute_command):\n");
                 for script in &supporting.scripts {
-                    activation_message.push_str(&format!("- {}/scripts/{}\n", skill_dir, script));
+                    activation_message.push_str(&format!("- {skill_dir}/scripts/{script}\n"));
                 }
             }
         } else {
             activation_message.push_str(&format!(
-                "\nYou may access other files in the skill directory at: {}",
-                skill_dir
+                "\nYou may access other files in the skill directory at: {skill_dir}"
             ));
         }
 
@@ -231,7 +228,6 @@ impl ToolHandler for UseSkillHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             // Discover skills outside the state lock to avoid holding lock across sync I/O
             let workspace_root = ctx.workspace_root.as_path();
@@ -255,7 +251,7 @@ impl ToolHandler for UseSkillHandler {
 
     fn description(&self, params: &serde_json::Value) -> String {
         if let Some(skill_name) = params.get("skill_name").and_then(|s| s.as_str()) {
-            format!("[use_skill for \"{}\"]", skill_name)
+            format!("[use_skill for \"{skill_name}\"]")
         } else {
             "[use_skill]".to_string()
         }

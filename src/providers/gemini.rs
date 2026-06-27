@@ -75,7 +75,6 @@ impl GeminiThinkingLevel {
 fn map_reasoning_effort_to_thinking_level(effort: &str) -> GeminiThinkingLevel {
     match effort.to_lowercase().as_str() {
         "minimal" => GeminiThinkingLevel::Minimal,
-        "low" => GeminiThinkingLevel::Low,
         "medium" => GeminiThinkingLevel::Medium,
         "high" | "xhigh" => GeminiThinkingLevel::High,
         _ => GeminiThinkingLevel::Low,
@@ -114,8 +113,7 @@ impl GeminiProvider {
     fn base_url(&self) -> String {
         self.config
             .base_url
-            .as_ref()
-            .cloned()
+            .clone()
             .filter(|u| !u.is_empty())
             .map(|u| {
                 let u = u.trim().trim_end_matches('/');
@@ -409,8 +407,7 @@ async fn process_gemini_sse_line(
 
     let data = line
         .strip_prefix("data:")
-        .map(|s| s.strip_prefix(' ').unwrap_or(s))
-        .unwrap_or(line);
+        .map_or(line, |s| s.strip_prefix(' ').unwrap_or(s));
 
     let chunk = match serde_json::from_str::<GeminiStreamChunk>(data) {
         Ok(c) => c,
@@ -485,12 +482,10 @@ async fn process_gemini_sse_line(
                         // complete args in one chunk rather than streaming deltas,
                         // but the size limit still applies.
                         let args_str = match fc.args.as_ref() {
-                            Some(serde_json::Value::Object(_))
-                            | Some(serde_json::Value::Array(_)) => {
+                            Some(serde_json::Value::Object(_) | serde_json::Value::Array(_)) => {
                                 fc.args.as_ref().unwrap().to_string()
                             }
-                            Some(_) => "{}".to_string(),
-                            None => "{}".to_string(),
+                            Some(_) | None => "{}".to_string(),
                         };
                         let args_str = if args_str.len() <= crate::providers::MAX_TOOL_ARGUMENT_SIZE
                         {
@@ -649,10 +644,10 @@ async fn finish_gemini_sse_to_chunks(
     // recitation content. Those states are explicit terminal responses.
     if !matches!(
         last_stop_reason.as_deref(),
-        Some("RECITATION") | Some("BLOCKED")
+        Some("RECITATION" | "BLOCKED")
     ) {
         // Flush accumulated tool calls on stream end.
-        for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
+        for (call_id, (id, name, args, signature)) in accumulated_tool_calls {
             if !completed_tool_call_ids.contains(call_id)
                 && let Some(validated_args) =
                     crate::providers::validate_tool_call_args(args, "Gemini", "at stream end")
@@ -777,7 +772,7 @@ impl Provider for GeminiProvider {
                         }
                     }
                     Err(e) => {
-                        let error_msg = format!("Gemini SSE stream error: {}", e);
+                        let error_msg = format!("Gemini SSE stream error: {e}");
                         let is_retryable = e.to_string().contains("timeout")
                             || e.to_string().contains("connection")
                             || e.to_string().contains("incomplete")
@@ -818,8 +813,7 @@ impl Provider for GeminiProvider {
         let info = self
             .config
             .model_info
-            .as_ref()
-            .cloned()
+            .clone()
             .unwrap_or_else(|| get_gemini_model_info(&self.config.model_id));
 
         ProviderModel {
@@ -828,7 +822,7 @@ impl Provider for GeminiProvider {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "gemini"
     }
 }

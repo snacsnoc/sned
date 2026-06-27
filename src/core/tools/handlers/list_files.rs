@@ -46,6 +46,7 @@ struct ListFilesResult {
 pub struct ListFilesHandler;
 
 impl ListFilesHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -68,8 +69,7 @@ impl ListFilesHandler {
                 hit_limit: false,
                 success: false,
                 error: Some(format!(
-                    "Error listing files in {}: path does not exist",
-                    path
+                    "Error listing files in {path}: path does not exist"
                 )),
                 warning: None,
             };
@@ -119,8 +119,7 @@ impl ListFilesHandler {
                     hit_limit: false,
                     success: false,
                     error: Some(format!(
-                        "{}\n  Suggestion: Check permissions, or try list_files on the parent directory.",
-                        e
+                        "{e}\n  Suggestion: Check permissions, or try list_files on the parent directory."
                     )),
                     warning: None,
                 };
@@ -166,7 +165,7 @@ impl ListFilesHandler {
 
             // Skip hidden files/directories in top-level listing
             if let Some(name) = path.file_name()
-                && name.to_string_lossy().starts_with(".")
+                && name.to_string_lossy().starts_with('.')
             {
                 continue;
             }
@@ -252,7 +251,7 @@ impl ListFilesHandler {
                         Err(e) => {
                             // Only record the first error; keep walking to collect what we can
                             if walk_error.is_none() {
-                                walk_error = Some(format!("Error reading directory entry: {}", e));
+                                walk_error = Some(format!("Error reading directory entry: {e}"));
                                 root_failed = file_paths.is_empty() && dir_entries.is_empty();
                             }
                             continue;
@@ -268,7 +267,7 @@ impl ListFilesHandler {
 
                     // Skip hidden files/directories
                     if let Some(name) = path.file_name()
-                        && name.to_string_lossy().starts_with(".")
+                        && name.to_string_lossy().starts_with('.')
                         && entry.file_type().is_dir()
                     {
                         walker.skip_current_dir();
@@ -376,24 +375,21 @@ impl ListFilesHandler {
         for file in files {
             let prefix = if file.is_directory { "📁 " } else { "📄 " };
             let line_info = if let Some(count) = file.line_count {
-                format!(" ({} lines)", count)
+                format!(" ({count} lines)")
             } else {
                 String::new()
             };
 
             // Get just the filename for display
             let name = Path::new(&file.path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| file.path.clone());
+                .file_name().map_or_else(|| file.path.clone(), |n| n.to_string_lossy().to_string());
 
-            lines.push(format!("{}{}{}", prefix, name, line_info));
+            lines.push(format!("{prefix}{name}{line_info}"));
         }
 
         if hit_limit {
             lines.push(format!(
-                "\n(Listing limited to {} files. Use recursive listing or refine your search.)",
-                MAX_FILES_LIMIT
+                "\n(Listing limited to {MAX_FILES_LIMIT} files. Use recursive listing or refine your search.)"
             ));
         }
 
@@ -455,7 +451,6 @@ impl ToolHandler for ListFilesHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             handler.execute_without_state(&ctx.workspace_root, params)
                 .await
@@ -465,7 +460,7 @@ impl ToolHandler for ListFilesHandler {
 
     fn description(&self, params: &serde_json::Value) -> String {
         let path = params["path"].as_str().unwrap_or(".");
-        format!("Listing files in {}", path)
+        format!("Listing files in {path}")
     }
 }
 

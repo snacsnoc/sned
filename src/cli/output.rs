@@ -60,16 +60,16 @@ pub enum OutputEvent {
 
 impl OutputEvent {
     pub fn plain(text: impl Into<String>) -> Self {
-        OutputEvent::Line(Line::from(text.into()))
+        Self::Line(Line::from(text.into()))
     }
 
     pub fn styled(text: impl Into<String>, style: ratatui::style::Style) -> Self {
-        OutputEvent::Line(Line::from(Span::styled(text.into(), style)))
+        Self::Line(Line::from(Span::styled(text.into(), style)))
     }
 
     pub fn dim_yellow(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
+        Self::Line(Line::from(Span::styled(
             text.into(),
             Style::default()
                 .fg(theme::WARNING_FG)
@@ -79,12 +79,12 @@ impl OutputEvent {
 
     pub fn dim(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(text.into(), theme::dim_style())))
+        Self::Line(Line::from(Span::styled(text.into(), theme::dim_style())))
     }
 
     pub fn cyan(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
+        Self::Line(Line::from(Span::styled(
             text.into(),
             Style::default().fg(theme::ACCENT),
         )))
@@ -92,7 +92,7 @@ impl OutputEvent {
 
     pub fn magenta(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
+        Self::Line(Line::from(Span::styled(
             text.into(),
             Style::default().fg(theme::TOOL_CALL_FG),
         )))
@@ -100,7 +100,7 @@ impl OutputEvent {
 
     pub fn error_or_success(text: impl Into<String>, is_error: bool) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
+        Self::Line(Line::from(Span::styled(
             text.into(),
             Style::default().fg(if is_error {
                 theme::ERROR_FG
@@ -112,12 +112,12 @@ impl OutputEvent {
 
     pub fn bold(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(text.into(), theme::bold_style())))
+        Self::Line(Line::from(Span::styled(text.into(), theme::bold_style())))
     }
 
     pub fn yellow(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
+        Self::Line(Line::from(Span::styled(
             text.into(),
             Style::default().fg(theme::WARNING_FG),
         )))
@@ -125,28 +125,28 @@ impl OutputEvent {
 
     pub fn error(text: impl fmt::Display) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
-            format!("[sned] ERROR: {}", text),
+        Self::Line(Line::from(Span::styled(
+            format!("[sned] ERROR: {text}"),
             Style::default().fg(theme::ERROR_FG),
         )))
     }
 
     pub fn error_box(text: impl fmt::Display) -> Self {
-        OutputEvent::ErrorBox(text.to_string())
+        Self::ErrorBox(text.to_string())
     }
 
     pub fn warning(text: impl fmt::Display) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
-            format!("[sned] Warning: {}", text),
+        Self::Line(Line::from(Span::styled(
+            format!("[sned] Warning: {text}"),
             Style::default().fg(theme::WARNING_FG),
         )))
     }
 
     pub fn info(text: impl fmt::Display) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
-            format!("[sned] {}", text),
+        Self::Line(Line::from(Span::styled(
+            format!("[sned] {text}"),
             Style::default()
                 .fg(theme::INFO_FG)
                 .add_modifier(Modifier::DIM),
@@ -155,7 +155,7 @@ impl OutputEvent {
 
     pub fn tool_call(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::ToolHeaderLine(Line::from(Span::styled(
+        Self::ToolHeaderLine(Line::from(Span::styled(
             text.into(),
             Style::default().fg(theme::TOOL_CALL_FG),
         )))
@@ -163,7 +163,7 @@ impl OutputEvent {
 
     pub fn model_output(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::Line(Line::from(Span::styled(
+        Self::Line(Line::from(Span::styled(
             text.into(),
             Style::default().fg(theme::ACCENT),
         )))
@@ -174,7 +174,7 @@ impl OutputEvent {
     /// when re-rendering the turn as markdown.
     pub fn turn_indicator(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
-        OutputEvent::TurnIndicator(Line::from(Span::styled(
+        Self::TurnIndicator(Line::from(Span::styled(
             text.into(),
             Style::default().fg(theme::ACCENT),
         )))
@@ -195,35 +195,35 @@ impl OutputEvent {
             // No foreground set — use DarkGray for subtle appearance.
             ratatui::style::Style::default().fg(crate::cli::tui::theme::STATUS_FG)
         };
-        OutputEvent::ToolOutputLine(Line::from(Span::styled(text.into(), final_style)))
+        Self::ToolOutputLine(Line::from(Span::styled(text.into(), final_style)))
     }
 
     /// Emit a command-execution header line (e.g. "Running: <cmd>").
     /// Tagged separately so render-time grouping can keep the header
     /// visually anchored to its stdout/stderr block.
     pub fn command_header_line(text: impl Into<String>) -> Self {
-        OutputEvent::CommandHeaderLine(Line::from(text.into()))
+        Self::CommandHeaderLine(Line::from(text.into()))
     }
 
     /// Emit a command stdout / stderr / tail line.  Tagged as a
     /// `CommandOutput` block so consecutive output lines are grouped
     /// without blank separators between them.
     pub fn command_output_line(text: impl Into<String>) -> Self {
-        OutputEvent::CommandOutputLine(Line::from(text.into()))
+        Self::CommandOutputLine(Line::from(text.into()))
     }
 
     /// Emit a reasoning-summary line (e.g. "Ɵ ...").  Tagged
     /// separately so render-time grouping can recognise the start of a
     /// reasoning block without confusing it with model prose.
     pub fn reasoning_line(text: impl Into<String>) -> Self {
-        OutputEvent::ReasoningLine(Line::from(text.into()))
+        Self::ReasoningLine(Line::from(text.into()))
     }
 
     /// Emit a user-prompt line (e.g. "❯ ..." or "│ ❯ ...").  Routed
     /// to the TUI buffer with `BlockKind::UserPrompt` so render-time
     /// grouping gives it a visual boundary above.
     pub fn user_prompt_line(text: impl Into<String>) -> Self {
-        OutputEvent::UserPromptLine(Line::from(text.into()))
+        Self::UserPromptLine(Line::from(text.into()))
     }
 }
 
@@ -262,27 +262,21 @@ pub struct StderrOutputWriter;
 impl OutputWriter for StderrOutputWriter {
     fn emit(&self, event: OutputEvent) {
         match event {
-            OutputEvent::Line(line) => {
-                eprintln!("{}", line);
-            }
-            OutputEvent::ModelUpdateLine(line) => {
-                eprintln!("{}", line);
-            }
-            OutputEvent::ToolOutputLine(line) => {
-                eprintln!("{}", line);
+            OutputEvent::Line(line) | OutputEvent::ModelUpdateLine(line) | OutputEvent::ToolOutputLine(line) | OutputEvent::ToolHeaderLine(line) | OutputEvent::CommandHeaderLine(line) | OutputEvent::CommandOutputLine(line) | OutputEvent::ReasoningLine(line) | OutputEvent::UserPromptLine(line) => {
+                eprintln!("{line}");
             }
             OutputEvent::RawAnsi(s) => {
-                eprint!("{}", s);
+                eprint!("{s}");
             }
             OutputEvent::Completion(result) => {
-                eprintln!("\n[sned] Task Completed: {}", result);
+                eprintln!("\n[sned] Task Completed: {result}");
             }
             OutputEvent::ErrorBox(msg) => {
                 if !msg.trim().is_empty() {
                     let width = crate::cli::text_utils::get_terminal_width();
                     let box_str = crate::cli::text_utils::draw_error_box("✗ Error", &msg, width);
                     if crate::cli::colors::stderr_colors_disabled() {
-                        eprint!("{}", box_str);
+                        eprint!("{box_str}");
                     } else {
                         for line in box_str.lines() {
                             eprintln!(
@@ -295,23 +289,7 @@ impl OutputWriter for StderrOutputWriter {
                     }
                 }
             }
-            OutputEvent::TurnEnd { .. } => {}
-            OutputEvent::TurnIndicator(_) => {}
-            OutputEvent::ToolHeaderLine(line) => {
-                eprintln!("{}", line);
-            }
-            OutputEvent::CommandHeaderLine(line) => {
-                eprintln!("{}", line);
-            }
-            OutputEvent::CommandOutputLine(line) => {
-                eprintln!("{}", line);
-            }
-            OutputEvent::ReasoningLine(line) => {
-                eprintln!("{}", line);
-            }
-            OutputEvent::UserPromptLine(line) => {
-                eprintln!("{}", line);
-            }
+            OutputEvent::TurnEnd { .. } | OutputEvent::TurnIndicator(_) => {}
         }
     }
 
@@ -337,6 +315,7 @@ pub struct ChannelOutputWriter {
 
 impl ChannelOutputWriter {
     /// Create a new ChannelOutputWriter with a bounded channel.
+    #[must_use] 
     pub fn new(tx: mpsc::Sender<OutputEvent>) -> Self {
         Self {
             tx,
@@ -395,6 +374,7 @@ pub type OutputWriterArc = Arc<dyn OutputWriter>;
 /// Returns whether diagnostic timing output is enabled.
 ///
 /// Set `SNED_TIMING=1` to enable phase timing logs.
+#[must_use] 
 pub fn timing_enabled() -> bool {
     matches!(
         std::env::var("SNED_TIMING").ok().as_deref(),
@@ -403,6 +383,7 @@ pub fn timing_enabled() -> bool {
 }
 
 /// Format phase timing diagnostics into printable lines.
+#[must_use] 
 pub fn format_timing_phases(
     session_start: Instant,
     request_sent: Option<Instant>,

@@ -135,6 +135,7 @@ fn build_tool_use_id_to_name(
 /// - `tool_use` blocks → `{ functionCall: { id, name, args }, thoughtSignature }`
 /// - `tool_result` blocks → `{ functionResponse: { id, name, response } }`
 /// - Signatures carry forward across parts within a message
+#[must_use] 
 pub fn convert_to_gemini_contents(messages: &[StorageMessage]) -> Vec<GeminiContent> {
     let tool_use_id_to_name = build_tool_use_id_to_name(messages);
 
@@ -261,7 +262,7 @@ fn convert_content_to_gemini_parts(
                                 // Gemini doesn't support URL-based documents directly
                                 // Convert to text placeholder
                                 parts.push(GeminiPart {
-                                    text: Some(format!("[Document: {}]", url)),
+                                    text: Some(format!("[Document: {url}]")),
                                     thought: None,
                                     thought_signature: doc.shared.signature.clone(),
                                     function_call: None,

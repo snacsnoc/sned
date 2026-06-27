@@ -16,6 +16,7 @@ use std::pin::Pin;
 pub struct AttemptCompletionHandler;
 
 impl AttemptCompletionHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -63,7 +64,6 @@ impl ToolHandler for AttemptCompletionHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
             let result = Self::execute(&handler, &mut state, params)?;

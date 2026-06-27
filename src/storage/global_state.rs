@@ -281,14 +281,13 @@ pub struct BrowserSettings {
 
 /// Load global state from the default path (~/.sned/data/settings/global_settings.json)
 /// Uses integrity validation (SHA256 checksum) when available.
+#[must_use] 
 pub fn load_global_state() -> GlobalState {
     load_global_state_with_integrity()
 }
 
 fn get_sned_home_path() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".sned"))
-        .unwrap_or_else(|| PathBuf::from(".sned"))
+    dirs::home_dir().map_or_else(|| PathBuf::from(".sned"), |h| h.join(".sned"))
 }
 
 /// Compute SHA256 checksum of data for integrity validation
@@ -376,7 +375,7 @@ pub fn save_global_state_with_integrity(state: &GlobalState) -> std::io::Result<
     let json_data = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
 
     let checksum = compute_checksum(&json_data);
-    let contents = format!("sha256:{}\n{}", checksum, json_data);
+    let contents = format!("sha256:{checksum}\n{json_data}");
 
     // Use atomic write for safety
     crate::storage::disk::atomic_write_file(&path, &contents)?;

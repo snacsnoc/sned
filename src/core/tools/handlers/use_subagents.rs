@@ -58,6 +58,7 @@ impl Default for SubagentResult {
 pub struct UseSubagentsHandler;
 
 impl UseSubagentsHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -65,7 +66,7 @@ impl UseSubagentsHandler {
     fn parse_prompts(params: &serde_json::Value) -> Vec<String> {
         let mut prompts = Vec::new();
         for i in 1..=MAX_SUBAGENT_PROMPTS {
-            let key = format!("prompt_{}", i);
+            let key = format!("prompt_{i}");
             if let Some(p) = params.get(&key).and_then(|v| v.as_str()) {
                 let trimmed = p.trim();
                 if !trimmed.is_empty() {
@@ -79,21 +80,20 @@ impl UseSubagentsHandler {
     fn parse_timeout(params: &serde_json::Value) -> u64 {
         params
             .get("timeout")
-            .and_then(|v| v.as_i64())
-            .map(|t| {
+            .and_then(serde_json::Value::as_i64)
+            .map_or(DEFAULT_TIMEOUT_SECS, |t| {
                 if t > 0 {
                     t as u64
                 } else {
                     DEFAULT_TIMEOUT_SECS
                 }
             })
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
     }
 
     fn parse_max_turns(params: &serde_json::Value) -> Option<u32> {
         params
             .get("max_turns")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .map(|t| if t > 0 { t as u32 } else { 1 })
     }
 
@@ -101,8 +101,7 @@ impl UseSubagentsHandler {
         params
             .get("include_history")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_lowercase() == "true")
-            .unwrap_or(false)
+            .is_some_and(|s| s.to_lowercase() == "true")
     }
 
     async fn collect_stream_output<R>(
@@ -118,7 +117,7 @@ impl UseSubagentsHandler {
         let mut lines = BufReader::new(reader).lines();
         let mut collected = String::new();
         let stream_prefix = if is_stderr {
-            format!("{} stderr", prefix)
+            format!("{prefix} stderr")
         } else {
             prefix
         };
@@ -131,7 +130,7 @@ impl UseSubagentsHandler {
             collected.push_str(&line);
 
             if emit_progress && let Some(ref writer) = output_writer {
-                let formatted = format!("{} {}", stream_prefix, line);
+                let formatted = format!("{stream_prefix} {line}");
                 if is_stderr {
                     writer.emit(crate::cli::output::OutputEvent::dim_yellow(formatted));
                 } else {
@@ -195,7 +194,7 @@ impl UseSubagentsHandler {
                 }
                 return SubagentResult {
                     status: "failed".to_string(),
-                    error: Some(format!("spawn failed: {}", e)),
+                    error: Some(format!("spawn failed: {e}")),
                     ..Default::default()
                 };
             }
@@ -299,7 +298,7 @@ impl UseSubagentsHandler {
                 }
                 SubagentResult {
                     status: "failed".to_string(),
-                    error: Some(format!("wait failed: {}", e)),
+                    error: Some(format!("wait failed: {e}")),
                     ..Default::default()
                 }
             }
@@ -332,7 +331,7 @@ impl UseSubagentsHandler {
                 }
                 SubagentResult {
                     status: "failed".to_string(),
-                    error: Some(format!("Subagent timed out after {} seconds", timeout_secs)),
+                    error: Some(format!("Subagent timed out after {timeout_secs} seconds")),
                     ..Default::default()
                 }
             }
@@ -423,7 +422,7 @@ impl UseSubagentsHandler {
 
         let mut prompt_count_in_json = 0;
         for i in 1..=(MAX_SUBAGENT_PROMPTS + 1) {
-            let key = format!("prompt_{}", i);
+            let key = format!("prompt_{i}");
             if params.get(&key).is_some() {
                 prompt_count_in_json += 1;
             }
@@ -438,8 +437,7 @@ impl UseSubagentsHandler {
                 "use_subagents: too many prompts in JSON"
             );
             return Err(ToolError::InvalidInput(format!(
-                "Too many subagent prompts provided ({}). Maximum is {}.",
-                prompt_count_in_json, MAX_SUBAGENT_PROMPTS
+                "Too many subagent prompts provided ({prompt_count_in_json}). Maximum is {MAX_SUBAGENT_PROMPTS}."
             )));
         }
 
@@ -459,7 +457,7 @@ impl UseSubagentsHandler {
             ));
         }
 
-        if let Some(0) = max_turns {
+        if max_turns == Some(0) {
             let mut state = state.lock().await;
             state.consecutive_mistakes += 1;
             tracing::warn!(
@@ -525,7 +523,7 @@ impl UseSubagentsHandler {
                         results.len(),
                         SubagentResult {
                             status: "failed".to_string(),
-                            error: Some(format!("Join error: {}", e)),
+                            error: Some(format!("Join error: {e}")),
                             ..Default::default()
                         },
                     ));
@@ -546,10 +544,10 @@ impl UseSubagentsHandler {
 
         let mut summary_lines = vec![format!("Subagent results:")];
         if timeout_secs != DEFAULT_TIMEOUT_SECS {
-            summary_lines.push(format!("Timeout: {}s", timeout_secs));
+            summary_lines.push(format!("Timeout: {timeout_secs}s"));
         }
         if let Some(turns) = max_turns {
-            summary_lines.push(format!("Max turns: {}", turns));
+            summary_lines.push(format!("Max turns: {turns}"));
         }
         summary_lines.push(format!("Total: {}", results.len()));
         summary_lines.push(String::new());
@@ -566,9 +564,9 @@ impl UseSubagentsHandler {
                         } else {
                             res.clone()
                         };
-                        summary_lines.push(format!("{} SUCCEEDED\n{}", label, excerpt));
+                        summary_lines.push(format!("{label} SUCCEEDED\n{excerpt}"));
                     } else {
-                        summary_lines.push(format!("{} SUCCEEDED (no output)", label));
+                        summary_lines.push(format!("{label} SUCCEEDED (no output)"));
                     }
                     total_tool_calls = total_tool_calls.saturating_add(result.tool_calls);
                     total_cache_writes =
@@ -593,7 +591,7 @@ impl UseSubagentsHandler {
                     } else {
                         err.to_string()
                     };
-                    summary_lines.push(format!("{} FAILED\n{}", label, excerpt));
+                    summary_lines.push(format!("{label} FAILED\n{excerpt}"));
                 }
                 _ => {
                     failures += 1;
@@ -604,8 +602,7 @@ impl UseSubagentsHandler {
 
         summary_lines.push(String::new());
         summary_lines.push(format!(
-            "Summary: {} succeeded, {} failed",
-            successes, failures
+            "Summary: {successes} succeeded, {failures} failed"
         ));
 
         if total_tool_calls > 0
@@ -614,13 +611,12 @@ impl UseSubagentsHandler {
             || max_context_tokens > 0
         {
             summary_lines.push(String::new());
-            summary_lines.push(format!("Tool calls: {}", total_tool_calls));
-            summary_lines.push(format!("Cache writes: {}", total_cache_writes));
-            summary_lines.push(format!("Cache reads: {}", total_cache_reads));
+            summary_lines.push(format!("Tool calls: {total_tool_calls}"));
+            summary_lines.push(format!("Cache writes: {total_cache_writes}"));
+            summary_lines.push(format!("Cache reads: {total_cache_reads}"));
             if max_context_tokens > 0 && max_context_window > 0 {
                 summary_lines.push(format!(
-                    "Max context: {} / {} ({:.1}%)",
-                    max_context_tokens, max_context_window, max_context_pct
+                    "Max context: {max_context_tokens} / {max_context_window} ({max_context_pct:.1}%)"
                 ));
             }
         }
@@ -682,7 +678,6 @@ impl ToolHandler for UseSubagentsHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             if !ctx.explicitly_approved {
                 let mut state = ctx.state.lock().await;
@@ -718,7 +713,7 @@ impl ToolHandler for UseSubagentsHandler {
             if count == 1 {
                 "[use_subagents: 1 prompt]".to_string()
             } else {
-                format!("[use_subagents: {} prompts]", count)
+                format!("[use_subagents: {count} prompts]")
             }
         }
     }

@@ -5,6 +5,7 @@ use std::pin::Pin;
 pub struct NewTaskHandler;
 
 impl NewTaskHandler {
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -30,8 +31,7 @@ impl NewTaskHandler {
         state.consecutive_mistakes = 0;
 
         Ok(format!(
-            "User requested to create a new task with context: {}\n\nTo create a new task, please restart Sned with the --continue flag and provide this context summary.",
-            context
+            "User requested to create a new task with context: {context}\n\nTo create a new task, please restart Sned with the --continue flag and provide this context summary."
         ))
     }
 }
@@ -50,7 +50,6 @@ impl ToolHandler for NewTaskHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self;
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
             Self::execute(handler, &mut state, params)

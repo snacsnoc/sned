@@ -8,6 +8,7 @@ pub enum ThinkOpenKind {
     TagOrUnicode,
 }
 
+#[must_use] 
 pub fn classify_think_start(line: &str) -> Option<ThinkOpenKind> {
     let trimmed = line.trim();
     if trimmed == "```think" {
@@ -19,6 +20,7 @@ pub fn classify_think_start(line: &str) -> Option<ThinkOpenKind> {
     }
 }
 
+#[must_use] 
 pub fn is_think_end(line: &str, open_kind: ThinkOpenKind) -> bool {
     let trimmed = line.trim();
     // These end markers are unambiguous — always valid regardless of how thinking started
@@ -46,6 +48,7 @@ pub struct TruncatedJson {
 }
 
 /// Safely truncate a JSON string to fit within MAX_TOOL_ARGUMENT_SIZE bytes.
+///
 /// Ensures UTF-8 boundaries and JSON validity (closes open strings/objects).
 /// Returns both the result and whether repair logic was needed.
 ///
@@ -55,6 +58,7 @@ pub struct TruncatedJson {
 /// semantic correctness (no lying data) at the cost of losing partial values.
 /// The graceful fallback in `parse_tool_arguments` wraps unparseable JSON in
 /// `{"_raw_arguments": "..."}` so no data is lost, just degraded.
+#[must_use] 
 pub fn truncate_json_arguments(args: &str, max_size: usize) -> TruncatedJson {
     if args.len() <= max_size {
         return TruncatedJson {
@@ -150,13 +154,12 @@ pub fn truncate_json_arguments(args: &str, max_size: usize) -> TruncatedJson {
                 value: result,
                 was_repaired: true,
             };
-        } else {
-            // No quotes found, return empty object
-            return TruncatedJson {
-                value: "{}".to_string(),
-                was_repaired: true,
-            };
         }
+        // No quotes found, return empty object
+        return TruncatedJson {
+            value: "{}".to_string(),
+            was_repaired: true,
+        };
     }
 
     // Count open braces/brackets and close them if needed
@@ -240,8 +243,7 @@ fn strip_common_indent(lines: &[&str]) -> Vec<String> {
             .max_by(|(indent_a, count_a), (indent_b, count_b)| {
                 count_a.cmp(count_b).then(indent_a.cmp(indent_b))
             })
-            .map(|(indent, count)| (*indent, *count))
-            .unwrap_or((0, 0));
+            .map_or((0, 0), |(indent, count)| (*indent, *count));
 
         let non_empty_count: usize = indent_counts.values().sum();
         let dominant_block_count = lines
@@ -276,6 +278,7 @@ fn strip_common_indent(lines: &[&str]) -> Vec<String> {
         .collect()
 }
 
+#[must_use] 
 pub fn split_model_output(text: &str) -> (Option<String>, Option<String>) {
     let mut thinking: Option<String> = None;
     let mut response: Option<String> = None;
@@ -359,6 +362,7 @@ pub fn split_model_output(text: &str) -> (Option<String>, Option<String>) {
 /// - `⏳` — "waiting" / in-progress
 /// - `⠋` — spinner character
 /// - `[sned]` — internal status messages
+#[must_use] 
 pub fn strip_tool_call_lines(input: &str) -> String {
     input
         .lines()

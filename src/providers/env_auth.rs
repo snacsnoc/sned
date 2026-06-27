@@ -7,6 +7,7 @@
 /// Get the best provider based on available environment variables.
 ///
 /// Source: `dirac/src/shared/storage/env-config.ts` — `getProviderFromEnv()`
+#[must_use] 
 pub fn get_provider_from_env() -> Option<&'static str> {
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
         return Some("anthropic");

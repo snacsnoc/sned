@@ -19,6 +19,7 @@ static COMMIT_HASH_REGEX: LazyLock<Regex> =
 
 /// Regex for matching mentions in text.
 /// Matches: @/path/to/file, @folder/, @git-changes, @commit-hash
+#[must_use] 
 pub fn get_mention_regex() -> &'static Regex {
     &MENTION_REGEX
 }
@@ -41,18 +42,18 @@ impl Mention {
             .unwrap_or(mention);
 
         if mention == "git-changes" {
-            return Some(Mention::GitChanges);
+            return Some(Self::GitChanges);
         }
 
         if COMMIT_HASH_REGEX.is_match(mention) {
-            return Some(Mention::Commit(mention.to_string()));
+            return Some(Self::Commit(mention.to_string()));
         }
 
         if mention.starts_with('/') {
             if mention.ends_with('/') {
-                return Some(Mention::Folder(mention.to_string()));
+                return Some(Self::Folder(mention.to_string()));
             }
-            return Some(Mention::File(mention.to_string()));
+            return Some(Self::File(mention.to_string()));
         }
 
         None
@@ -63,18 +64,19 @@ impl Mention {
     }
 
     /// Get a description for the mention.
+    #[must_use] 
     pub fn description(&self) -> String {
         match self {
-            Mention::File(path) => format!(
+            Self::File(path) => format!(
                 "'{}' (see below for file content)",
                 Self::display_path(path)
             ),
-            Mention::Folder(path) => format!(
+            Self::Folder(path) => format!(
                 "'{}' (see below for folder content)",
                 Self::display_path(path)
             ),
-            Mention::GitChanges => "Working directory changes (see below for details)".to_string(),
-            Mention::Commit(hash) => format!("Git commit '{}' (see below for commit info)", hash),
+            Self::GitChanges => "Working directory changes (see below for details)".to_string(),
+            Self::Commit(hash) => format!("Git commit '{hash}' (see below for commit info)"),
         }
     }
 }
@@ -123,11 +125,11 @@ async fn expand_mention(mention: &Mention, workspace_root: &Path) -> Result<Stri
 async fn expand_file_mention(path: &str, workspace_root: &Path) -> Result<String, String> {
     let clean_path = path.trim_start_matches('/');
     let full_path = crate::core::tools::resolve_sanitized_path(workspace_root, clean_path)
-        .map_err(|e| format!("Invalid path {}: {}", path, e))?;
+        .map_err(|e| format!("Invalid path {path}: {e}"))?;
 
     let metadata = tokio::fs::metadata(&full_path)
         .await
-        .map_err(|e| format!("Failed to stat file {}: {}", path, e))?;
+        .map_err(|e| format!("Failed to stat file {path}: {e}"))?;
 
     if metadata.len() > MAX_FILE_READ_SIZE {
         return Err(format!(
@@ -140,17 +142,16 @@ async fn expand_file_mention(path: &str, workspace_root: &Path) -> Result<String
 
     match tokio::fs::read_to_string(&full_path).await {
         Ok(content) => Ok(format!(
-            "<file_mention path=\"{}\">\n{}\n</file_mention>",
-            clean_path, content
+            "<file_mention path=\"{clean_path}\">\n{content}\n</file_mention>"
         )),
-        Err(e) => Err(format!("Failed to read file {}: {}", path, e)),
+        Err(e) => Err(format!("Failed to read file {path}: {e}")),
     }
 }
 
 async fn expand_folder_mention(path: &str, workspace_root: &Path) -> Result<String, String> {
     let clean_path = path.trim_start_matches('/');
     let full_path = crate::core::tools::resolve_sanitized_path(workspace_root, clean_path)
-        .map_err(|e| format!("Invalid path {}: {}", path, e))?;
+        .map_err(|e| format!("Invalid path {path}: {e}"))?;
 
     match tokio::fs::read_dir(&full_path).await {
         Ok(mut entries) => {
@@ -158,7 +159,7 @@ async fn expand_folder_mention(path: &str, workspace_root: &Path) -> Result<Stri
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-                    lines.push(format!("{}/", name));
+                    lines.push(format!("{name}/"));
                 } else {
                     lines.push(name);
                 }
@@ -170,7 +171,7 @@ async fn expand_folder_mention(path: &str, workspace_root: &Path) -> Result<Stri
                 lines.join("\n")
             ))
         }
-        Err(e) => Err(format!("Failed to read directory {}: {}", path, e)),
+        Err(e) => Err(format!("Failed to read directory {path}: {e}")),
     }
 }
 
@@ -180,7 +181,7 @@ async fn expand_git_changes_mention(workspace_root: &Path) -> Result<String, Str
         .current_dir(workspace_root)
         .output()
         .await
-        .map_err(|e| format!("Failed to run git status: {}", e))?;
+        .map_err(|e| format!("Failed to run git status: {e}"))?;
 
     if !output.status.success() {
         return Err("Not a git repository".to_string());
@@ -194,13 +195,12 @@ async fn expand_git_changes_mention(workspace_root: &Path) -> Result<String, Str
         .current_dir(workspace_root)
         .output()
         .await
-        .map_err(|e| format!("Failed to run git diff: {}", e))?;
+        .map_err(|e| format!("Failed to run git diff: {e}"))?;
 
     let diff_stats = String::from_utf8_lossy(&diff_output.stdout);
 
     Ok(format!(
-        "**git-changes**:\n\nStatus:\n{}\nDiff stats:\n{}",
-        status, diff_stats
+        "**git-changes**:\n\nStatus:\n{status}\nDiff stats:\n{diff_stats}"
     ))
 }
 
@@ -210,15 +210,15 @@ async fn expand_commit_mention(hash: &str, workspace_root: &Path) -> Result<Stri
         .current_dir(workspace_root)
         .output()
         .await
-        .map_err(|e| format!("Failed to run git show: {}", e))?;
+        .map_err(|e| format!("Failed to run git show: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!("Invalid commit hash: {}", hash));
+        return Err(format!("Invalid commit hash: {hash}"));
     }
 
     let info = String::from_utf8_lossy(&output.stdout);
 
-    Ok(format!("**commit**:\n\n{}", info))
+    Ok(format!("**commit**:\n\n{info}"))
 }
 
 #[cfg(test)]

@@ -30,17 +30,19 @@ static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Generates a 32-bit FNV-1a hash for the given content string.
 ///
+#[must_use] 
 pub fn content_hash(content: &str) -> String {
     let mut h: u32 = 2_166_136_261; // FNV-1a offset basis
     for byte in content.bytes() {
         h ^= byte as u32;
         h = h.wrapping_mul(16_777_619); // FNV-1a prime
     }
-    format!("{:08x}", h)
+    format!("{h:08x}")
 }
 
 /// Computes 64-bit FNV-1a hashes for all lines.
 ///
+#[must_use] 
 pub fn compute_hashes(lines: &[String]) -> Vec<u64> {
     lines
         .iter()
@@ -57,12 +59,14 @@ pub fn compute_hashes(lines: &[String]) -> Vec<u64> {
 
 /// Formats a line with its anchor prefix.
 ///
+#[must_use] 
 pub fn format_line_with_hash(content: &str, anchor: &str) -> String {
-    format!("{}{}{}", anchor, ANCHOR_DELIMITER, content)
+    format!("{anchor}{ANCHOR_DELIMITER}{content}")
 }
 
 /// Splits a raw anchor string into anchor word and content.
 ///
+#[must_use] 
 pub fn split_anchor(raw_anchor: &str) -> (String, String) {
     match raw_anchor.find(ANCHOR_DELIMITER) {
         Some(idx) => (
@@ -98,6 +102,7 @@ pub fn strip_hashes(content: &str) -> String {
 
 /// Extracts the ID from a line reference.
 ///
+#[must_use] 
 pub fn extract_id(reference: &str) -> String {
     if reference.is_empty() {
         return String::new();

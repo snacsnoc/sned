@@ -18,9 +18,8 @@ impl TokenStyle {
         match self {
             Self::Keyword => format!("{}{}", style::BOLD, style::CYAN),
             Self::String => style::GREEN.to_string(),
-            Self::Number => style::YELLOW.to_string(),
+            Self::Number | Self::Type => style::YELLOW.to_string(),
             Self::Comment => format!("{}{}", style::DIM, style::GRAY),
-            Self::Type => style::YELLOW.to_string(),
             Self::Function => format!("{}{}", style::BOLD, style::WHITE),
         }
     }
@@ -37,6 +36,7 @@ struct HighlightSpan {
 ///
 /// Unsupported languages, disabled grammar features, parse failures, and `NO_COLOR` all fall back
 /// to returning the original code unchanged.
+#[must_use] 
 pub fn highlight_code(code: &str, lang: &str) -> String {
     if std::env::var_os("NO_COLOR").is_some() || code.is_empty() {
         return code.to_string();
@@ -108,6 +108,7 @@ fn normalize_lang(lang: &str) -> String {
         .replace(['_', ' '], "-")
 }
 
+#[allow(clippy::suspicious_operation_groupings)]
 fn collect_spans(node: Node<'_>, source: &[u8], spans: &mut Vec<HighlightSpan>) {
     if let Some(style) = classify_node(node) {
         spans.push(HighlightSpan {
@@ -279,8 +280,7 @@ fn render_lexical_highlights(code: &str) -> String {
         if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
             let end = code[start..]
                 .find('\n')
-                .map(|offset| start + offset)
-                .unwrap_or(code.len());
+                .map_or(code.len(), |offset| start + offset);
             push_styled(&mut out, &code[start..end], TokenStyle::Comment);
             if end < code.len() {
                 out.push('\n');
@@ -298,8 +298,7 @@ fn render_lexical_highlights(code: &str) -> String {
         if ch == '#' {
             let end = code[start..]
                 .find('\n')
-                .map(|offset| start + offset)
-                .unwrap_or(code.len());
+                .map_or(code.len(), |offset| start + offset);
             push_styled(&mut out, &code[start..end], TokenStyle::Comment);
             if end < code.len() {
                 out.push('\n');

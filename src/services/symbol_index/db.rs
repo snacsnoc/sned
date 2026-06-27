@@ -153,11 +153,11 @@ impl SymbolIndexDatabase {
         let mut param_idx = 2;
 
         if symbol_type.is_some() {
-            sql.push_str(&format!(" AND type = ?{}", param_idx));
+            sql.push_str(&format!(" AND type = ?{param_idx}"));
             param_idx += 1;
         }
         if limit.is_some() {
-            sql.push_str(&format!(" LIMIT ?{}", param_idx));
+            sql.push_str(&format!(" LIMIT ?{param_idx}"));
         }
 
         let mut stmt = match self.conn.prepare(&sql) {

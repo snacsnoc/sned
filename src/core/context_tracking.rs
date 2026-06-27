@@ -12,6 +12,7 @@ pub struct ModelContextTracker {
 }
 
 impl ModelContextTracker {
+    #[must_use] 
     pub fn new(task_id: &str) -> Self {
         Self {
             task_id: task_id.to_string(),
@@ -56,6 +57,7 @@ pub struct EnvironmentContextTracker {
 }
 
 impl EnvironmentContextTracker {
+    #[must_use] 
     pub fn new(task_id: &str) -> Self {
         Self {
             task_id: task_id.to_string(),

@@ -31,7 +31,7 @@ pub(crate) fn load_command_history() -> Vec<String> {
         Ok(content) => {
             let mut lines: Vec<String> = content
                 .lines()
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .filter(|s| !s.is_empty())
                 .collect();
 
@@ -81,6 +81,7 @@ pub struct FileHistory {
 
 impl FileHistory {
     /// Load command history from disk.
+    #[must_use] 
     pub fn load() -> Self {
         Self {
             entries: load_command_history(),
@@ -111,7 +112,7 @@ impl FileHistory {
         }
         self.index += 1;
         let idx = (self.entries.len() as isize - 1 - self.index) as usize;
-        self.entries.get(idx).map(|s| s.as_str())
+        self.entries.get(idx).map(std::string::String::as_str)
     }
 
     /// Navigate forward in history (Down arrow).
@@ -123,7 +124,7 @@ impl FileHistory {
         if self.index > 0 {
             self.index -= 1;
             let idx = (self.entries.len() as isize - 1 - self.index) as usize;
-            self.entries.get(idx).map(|s| s.as_str())
+            self.entries.get(idx).map(std::string::String::as_str)
         } else {
             self.index = -1;
             None
@@ -136,6 +137,7 @@ impl FileHistory {
     }
 
     /// Whether the user is currently navigating history (index >= 0).
+    #[must_use] 
     pub fn is_navigating(&self) -> bool {
         self.index >= 0
     }
@@ -147,6 +149,7 @@ impl FileHistory {
     }
 
     /// Get a reference to the underlying entries (for `/history` command).
+    #[must_use] 
     pub fn entries(&self) -> &[String] {
         &self.entries
     }

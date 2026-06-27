@@ -16,22 +16,18 @@ pub struct WriteToFileHandler;
 impl WriteToFileHandler {
     fn format_missing_content_error(path: &str, consecutive_failures: u32) -> String {
         let base = format!(
-            "Failed to write '{}': the 'content' parameter was empty. This usually means the model ran out of output budget or tried to emit the file in one oversized response.",
-            path
+            "Failed to write '{path}': the 'content' parameter was empty. This usually means the model ran out of output budget or tried to emit the file in one oversized response."
         );
 
         match consecutive_failures {
             0 | 1 => format!(
-                "{} Try writing a smaller skeleton first, then use edit_file for the remaining sections.",
-                base
+                "{base} Try writing a smaller skeleton first, then use edit_file for the remaining sections."
             ),
             2 => format!(
-                "{} This is the second failed attempt. Switch strategies: write a minimal skeleton first, then fill sections incrementally with edit_file.",
-                base
+                "{base} This is the second failed attempt. Switch strategies: write a minimal skeleton first, then fill sections incrementally with edit_file."
             ),
             _ => format!(
-                "{} This has failed {} times in a row. Stop retrying write_to_file for this file and create a skeleton or split the file into smaller pieces before continuing.",
-                base, consecutive_failures
+                "{base} This has failed {consecutive_failures} times in a row. Stop retrying write_to_file for this file and create a skeleton or split the file into smaller pieces before continuing."
             ),
         }
     }
@@ -105,7 +101,7 @@ impl WriteToFileHandler {
         // Write the file atomically using async I/O (avoids spawn_blocking overhead)
         crate::storage::disk::atomic_write_file_async(&final_canonical, content).await?;
 
-        Ok(format!("Successfully wrote to {}", path))
+        Ok(format!("Successfully wrote to {path}"))
     }
 
     async fn execute_with_workspace(
@@ -141,8 +137,7 @@ impl WriteToFileHandler {
                             )
                         }
                         _ => ToolError::ExecutionFailed(format!(
-                            "Failed to write '{}': {}",
-                            path, io_err
+                            "Failed to write '{path}': {io_err}"
                         )),
                     }
                 } else {
@@ -150,6 +145,7 @@ impl WriteToFileHandler {
                 }
             })
     }
+    #[must_use] 
     pub fn new() -> Self {
         Self
     }
@@ -163,7 +159,6 @@ impl ToolHandler for WriteToFileHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             let consecutive_mistakes = ctx.state.lock().await.consecutive_mistakes;
             let path = params["path"].as_str().ok_or_else(|| {
@@ -253,7 +248,7 @@ impl ToolHandler for WriteToFileHandler {
 
     fn description(&self, params: &serde_json::Value) -> String {
         let path = params["path"].as_str().unwrap_or("unknown file");
-        format!("Writing to {}", path)
+        format!("Writing to {path}")
     }
 }
 

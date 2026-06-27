@@ -12,10 +12,12 @@ fn env_colors_disabled() -> bool {
 // Re-evaluate on every call so tests that mutate NO_COLOR mid-process take
 // effect immediately. The cost is one std::env::var + one is_terminal() per
 // call, which is negligible for human-scale output.
+#[must_use] 
 pub fn stdout_colors_disabled() -> bool {
     env_colors_disabled() || !std::io::stdout().is_terminal()
 }
 
+#[must_use] 
 pub fn stderr_colors_disabled() -> bool {
     env_colors_disabled() || !std::io::stderr().is_terminal()
 }
@@ -54,6 +56,7 @@ pub mod style {
 }
 
 /// Wrap text with ANSI codes for stdout, respecting NO_COLOR and TTY status.
+#[must_use] 
 pub fn colorize(text: &str, code: &str) -> String {
     if stdout_colors_disabled() {
         text.to_string()
@@ -63,6 +66,7 @@ pub fn colorize(text: &str, code: &str) -> String {
 }
 
 /// Wrap text with ANSI codes for stderr, respecting NO_COLOR and TTY status.
+#[must_use] 
 pub fn colorize_stderr(text: &str, code: &str) -> String {
     if stderr_colors_disabled() {
         text.to_string()
@@ -72,14 +76,16 @@ pub fn colorize_stderr(text: &str, code: &str) -> String {
 }
 
 /// Format a tool name with color for prompts (stdout).
+#[must_use] 
 pub fn tool_name(name: &str) -> String {
     colorize(name, style::BOLD)
 }
 
 /// Format an error message consistently (for stderr output).
+#[must_use] 
 pub fn error(text: &str) -> String {
     if stderr_colors_disabled() {
-        format!("[sned] ERROR: {}", text)
+        format!("[sned] ERROR: {text}")
     } else {
         format!(
             "{}[sned]{} {}ERROR:{} {}",
@@ -93,9 +99,10 @@ pub fn error(text: &str) -> String {
 }
 
 /// Format a warning message consistently (for stderr output).
+#[must_use] 
 pub fn warning(text: &str) -> String {
     if stderr_colors_disabled() {
-        format!("[sned] Warning: {}", text)
+        format!("[sned] Warning: {text}")
     } else {
         format!(
             "{}[sned]{} {}Warning:{} {}",
@@ -109,24 +116,27 @@ pub fn warning(text: &str) -> String {
 }
 
 /// Format an info/status message consistently (for stderr output).
+#[must_use] 
 pub fn info(text: &str) -> String {
     if stderr_colors_disabled() {
-        format!("[sned] {}", text)
+        format!("[sned] {text}")
     } else {
         format!("{}[sned]{} {}", style::DIM, style::RESET, text)
     }
 }
 
 /// Format success message (for stdout output).
+#[must_use] 
 pub fn success(text: &str) -> String {
     if stdout_colors_disabled() {
-        format!("✓ {}", text)
+        format!("✓ {text}")
     } else {
         format!("{}✓{} {}", style::GREEN, style::RESET, text)
     }
 }
 
 /// Format the interactive prompt (stdout).
+#[must_use] 
 pub fn prompt(text: &str) -> String {
     colorize(text, style::GREEN)
 }
@@ -190,9 +200,10 @@ pub fn print_raw(text: &str) {
 }
 
 /// Format a tool result success indicator.
+#[must_use] 
 pub fn tool_success(tool_name: &str) -> String {
     if stdout_colors_disabled() {
-        format!("✓ {}", tool_name)
+        format!("✓ {tool_name}")
     } else {
         format!(
             "{}✓{} {}{}{}",
@@ -206,9 +217,10 @@ pub fn tool_success(tool_name: &str) -> String {
 }
 
 /// Format a tool result failure indicator.
+#[must_use] 
 pub fn tool_failure(tool_name: &str) -> String {
     if stdout_colors_disabled() {
-        format!("✗ {}", tool_name)
+        format!("✗ {tool_name}")
     } else {
         format!(
             "{}✗{} {}{}{}",
@@ -222,9 +234,10 @@ pub fn tool_failure(tool_name: &str) -> String {
 }
 
 /// Format a section header (for grouping related output).
+#[must_use] 
 pub fn section_header(text: &str) -> String {
     if stdout_colors_disabled() {
-        format!("═══ {}", text)
+        format!("═══ {text}")
     } else {
         format!(
             "{}═══{} {}{}{}",
@@ -238,33 +251,37 @@ pub fn section_header(text: &str) -> String {
 }
 
 /// Format a diff addition line.
+#[must_use] 
 pub fn diff_addition(text: &str) -> String {
     if stdout_colors_disabled() {
-        format!("+ {}", text)
+        format!("+ {text}")
     } else {
         format!("{}+ {}{}", style::GREEN, text, style::RESET)
     }
 }
 
 /// Format a diff removal line.
+#[must_use] 
 pub fn diff_removal(text: &str) -> String {
     if stdout_colors_disabled() {
-        format!("- {}", text)
+        format!("- {text}")
     } else {
         format!("{}- {}{}", style::RED, text, style::RESET)
     }
 }
 
 /// Format a diff context line.
+#[must_use] 
 pub fn diff_context(text: &str) -> String {
     if stdout_colors_disabled() {
-        format!("  {}", text)
+        format!("  {text}")
     } else {
         format!("{}  {}{}", style::DIM, text, style::RESET)
     }
 }
 
 /// Format a file path for display.
+#[must_use] 
 pub fn file_path(path: &str) -> String {
     if stdout_colors_disabled() {
         path.to_string()
@@ -290,6 +307,7 @@ pub fn print_horizontal_rule_writer(writer: &crate::cli::output::OutputWriterArc
 }
 
 /// Format reasoning/thinking text with dim styling.
+#[must_use] 
 pub fn reasoning(text: &str) -> String {
     if stdout_colors_disabled() {
         text.to_string()
@@ -299,18 +317,20 @@ pub fn reasoning(text: &str) -> String {
 }
 
 /// Format a status badge (e.g., [PLAN], [ACT]) for stdout.
+#[must_use] 
 pub fn badge(text: &str) -> String {
     if stdout_colors_disabled() {
-        format!("[{}]", text)
+        format!("[{text}]")
     } else {
         format!("{}[{}{}]{}", style::DIM, style::BOLD, text, style::RESET)
     }
 }
 
 /// Format a status badge (e.g., [PLAN], [ACT]) for stderr output.
+#[must_use] 
 pub fn badge_stderr(text: &str) -> String {
     if stderr_colors_disabled() {
-        format!("[{}]", text)
+        format!("[{text}]")
     } else {
         format!("{}[{}{}]{}", style::DIM, style::BOLD, text, style::RESET)
     }
@@ -320,14 +340,16 @@ pub fn badge_stderr(text: &str) -> String {
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Get the current spinner frame based on an index.
+#[must_use] 
 pub fn spinner_frame(index: usize) -> char {
     SPINNER_FRAMES[index % SPINNER_FRAMES.len()]
 }
 
 /// Format a wait/loading message.
+#[must_use] 
 pub fn waiting(message: &str) -> String {
     if stdout_colors_disabled() {
-        format!("⏳ {}", message)
+        format!("⏳ {message}")
     } else {
         format!(
             "{}⏳{} {}{}",
@@ -340,9 +362,11 @@ pub fn waiting(message: &str) -> String {
 }
 
 /// Wrap a file path in OSC 8 hyperlink escape sequence.
+///
 /// Terminals that support OSC 8 will render it as a clickable link.
 /// Unsupported terminals will display the path as plain text.
 /// Respects NO_COLOR and TTY detection.
+#[must_use] 
 pub fn hyperlink_path(path: &str) -> String {
     if stderr_colors_disabled() {
         return path.to_string();
@@ -352,16 +376,12 @@ pub fn hyperlink_path(path: &str) -> String {
         path.to_string()
     } else if let Some(rest) = path.strip_prefix('~') {
         let rest = rest.strip_prefix('/').unwrap_or(rest);
-        dirs::home_dir()
-            .map(|h| h.join(rest).to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string())
+        dirs::home_dir().map_or_else(|| path.to_string(), |h| h.join(rest).to_string_lossy().into_owned())
     } else {
-        std::env::current_dir()
-            .map(|d| d.join(path).to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string())
+        std::env::current_dir().map_or_else(|_| path.to_string(), |d| d.join(path).to_string_lossy().into_owned())
     };
 
-    format!("\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\", abs_path, path)
+    format!("\x1b]8;;file://{abs_path}\x1b\\{path}\x1b]8;;\x1b\\")
 }
 
 #[cfg(test)]

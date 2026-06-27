@@ -25,6 +25,7 @@ impl ActionableError {
         }
     }
 
+    #[must_use] 
     pub fn display(&self) -> String {
         match &self.suggestion {
             Some(s) => format!("{}\n  Suggestion: {}", self.message, s),
@@ -40,6 +41,7 @@ impl std::fmt::Display for ActionableError {
 }
 
 /// Add an actionable suggestion to a file-not-found error.
+#[must_use] 
 pub fn file_not_found(path: &str, original_error: &str) -> ActionableError {
     let suggestion = if path.contains("..") {
         "Path contains '..' — check that the relative path is correct from the workspace root."
@@ -50,17 +52,17 @@ pub fn file_not_found(path: &str, original_error: &str) -> ActionableError {
         "Check the file path for typos, or use list_files to see available files.".to_string()
     };
     ActionableError::with_suggestion(
-        format!("Error reading file: {}", original_error),
+        format!("Error reading file: {original_error}"),
         suggestion,
     )
 }
 
 /// Add an actionable suggestion to a file-too-large error.
+#[must_use] 
 pub fn file_too_large(size_kb: u64, max_kb: u64) -> ActionableError {
     ActionableError::with_suggestion(
         format!(
-            "The file size is {}KB, which exceeds the {}KB limit for full file reads.",
-            size_kb, max_kb
+            "The file size is {size_kb}KB, which exceeds the {max_kb}KB limit for full file reads."
         ),
         "Use start_line and end_line parameters to read only the relevant section, \
          or use search_files to find specific content within the file.",
@@ -68,14 +70,16 @@ pub fn file_too_large(size_kb: u64, max_kb: u64) -> ActionableError {
 }
 
 /// Add an actionable suggestion to a permission-denied error.
+#[must_use] 
 pub fn permission_denied(path: &str, operation: &str) -> ActionableError {
     ActionableError::with_suggestion(
-        format!("Permission denied: cannot {} '{}'", operation, path),
+        format!("Permission denied: cannot {operation} '{path}'"),
         "Check file permissions with `ls -la`. You may need to adjust ownership or use a different location.",
     )
 }
 
 /// Add an actionable suggestion to a command-timeout error.
+#[must_use] 
 pub fn command_timeout(cmd: &str, timeout_secs: u64) -> ActionableError {
     let suggestion = if timeout_secs <= 30 {
         "This is a short-running command timeout (30s). If the command needs more time, \
@@ -84,24 +88,22 @@ pub fn command_timeout(cmd: &str, timeout_secs: u64) -> ActionableError {
             .to_string()
     } else {
         format!(
-            "The command exceeded the {}s timeout. Consider: \
+            "The command exceeded the {timeout_secs}s timeout. Consider: \
              (1) breaking the task into smaller steps, \
              (2) checking for infinite loops or hangs, \
-             (3) running the command manually to diagnose the issue.",
-            timeout_secs
+             (3) running the command manually to diagnose the issue."
         )
     };
     ActionableError::with_suggestion(
-        format!("Command timed out after {}s: {}", timeout_secs, cmd),
+        format!("Command timed out after {timeout_secs}s: {cmd}"),
         suggestion,
     )
 }
 
 /// Add an actionable suggestion to a command-exit-code error.
+#[must_use] 
 pub fn command_exit_code(cmd: &str, exit_code: Option<i32>) -> ActionableError {
-    let code = exit_code
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let code = exit_code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
     let suggestion = match exit_code {
         Some(126) => "Exit code 126 means 'Permission denied' — the command exists but is not executable. Try `chmod +x` on the script.".to_string(),
         Some(127) => "Exit code 127 means 'Command not found' — check the command name and ensure it is installed and on your PATH.".to_string(),
@@ -127,26 +129,27 @@ pub fn command_exit_code(cmd: &str, exit_code: Option<i32>) -> ActionableError {
         _ => "Check the command output above for error details. You can also run the command manually to debug.".to_string(),
     };
     ActionableError::with_suggestion(
-        format!("Command failed with exit code {}: {}", code, cmd),
+        format!("Command failed with exit code {code}: {cmd}"),
         suggestion,
     )
 }
 
 /// Add an actionable suggestion to a directory-not-found error.
+#[must_use] 
 pub fn directory_not_found(path: &str) -> ActionableError {
     ActionableError::with_suggestion(
         format!(
-            "Working directory does not exist or is not a directory: {}",
-            path
+            "Working directory does not exist or is not a directory: {path}"
         ),
         "Check the path for typos. Use list_files to see available directories.",
     )
 }
 
 /// Add an actionable suggestion to a search-no-results case.
+#[must_use] 
 pub fn search_no_results(pattern: &str) -> ActionableError {
     ActionableError::with_suggestion(
-        format!("No matches found for pattern: {}", pattern),
+        format!("No matches found for pattern: {pattern}"),
         "Try: (1) simplifying the regex, (2) removing file pattern filters, \
          (3) checking for case sensitivity (regex is case-sensitive by default — \
          try prepending (?i) for case-insensitive search).",
@@ -154,6 +157,7 @@ pub fn search_no_results(pattern: &str) -> ActionableError {
 }
 
 /// Add an actionable suggestion to a provider API error.
+#[must_use] 
 pub fn provider_error(error_text: &str) -> ActionableError {
     let lower = error_text.to_lowercase();
     let suggestion = if lower.contains("401")
@@ -191,37 +195,41 @@ pub fn provider_error(error_text: &str) -> ActionableError {
     } else {
         "Check your provider configuration with `sned config --validate`.".to_string()
     };
-    ActionableError::with_suggestion(format!("Provider error: {}", error_text), suggestion)
+    ActionableError::with_suggestion(format!("Provider error: {error_text}"), suggestion)
 }
 
 /// Add an actionable suggestion to an edit anchor mismatch error.
+#[must_use] 
 pub fn edit_anchor_mismatch(path: &str, anchor: &str) -> ActionableError {
     ActionableError::with_suggestion(
-        format!("Anchor not found in {}: {}", path, anchor),
+        format!("Anchor not found in {path}: {anchor}"),
         "The file may have changed since it was last read. Re-read the file \
          to get updated anchors, then retry the edit with the correct line content.",
     )
 }
 
 /// Add an actionable suggestion for an unsupported language error.
+#[must_use] 
 pub fn unsupported_language(language: &str) -> ActionableError {
     ActionableError::with_suggestion(
-        format!("Unsupported language: {}", language),
+        format!("Unsupported language: {language}"),
         "Supported languages: python, python3, node, javascript, bash, sh, zsh. \
          For other languages, use execute_command with the appropriate interpreter.",
     )
 }
 
 /// Add an actionable suggestion for a regex compilation error.
+#[must_use] 
 pub fn invalid_regex(pattern: &str, error: &str) -> ActionableError {
     ActionableError::with_suggestion(
-        format!("Invalid regex pattern '{}': {}", pattern, error),
+        format!("Invalid regex pattern '{pattern}': {error}"),
         "Common fixes: escape special characters with \\ (e.g., \\., \\*, \\[, \\( ), \
          or use simpler patterns. Test your regex at regex101.com.",
     )
 }
 
 /// Add an actionable suggestion for a git operation error.
+#[must_use] 
 pub fn git_operation_failed(operation: &str, error: &str) -> ActionableError {
     let lower = error.to_lowercase();
     let suggestion = if lower.contains("not a git repository") || lower.contains("git repository") {
@@ -249,10 +257,11 @@ pub fn git_operation_failed(operation: &str, error: &str) -> ActionableError {
          properly configured and you have the necessary permissions."
             .to_string()
     };
-    ActionableError::with_suggestion(format!("Git {} failed: {}", operation, error), suggestion)
+    ActionableError::with_suggestion(format!("Git {operation} failed: {error}"), suggestion)
 }
 
 /// Add an actionable suggestion for a checkpoint operation error.
+#[must_use] 
 pub fn checkpoint_operation_failed(operation: &str, error: &str) -> ActionableError {
     let lower = error.to_lowercase();
     let suggestion = if lower.contains("not found") || lower.contains("does not exist") {
@@ -272,7 +281,7 @@ pub fn checkpoint_operation_failed(operation: &str, error: &str) -> ActionableEr
             .to_string()
     };
     ActionableError::with_suggestion(
-        format!("Checkpoint {} failed: {}", operation, error),
+        format!("Checkpoint {operation} failed: {error}"),
         suggestion,
     )
 }

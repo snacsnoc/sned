@@ -7,6 +7,7 @@ const HARD_LIMIT: u64 = 1_000_000;
 
 /// Estimate token count for a provider request.
 /// Uses rough heuristic: ~4 chars per token for English text.
+#[must_use] 
 pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
     let system_tokens = request.system_prompt.len() as f64 / 4.0;
 
@@ -89,7 +90,7 @@ pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
     let tool_def_tokens: f64 = request
         .tools
         .as_ref()
-        .map(|tools| {
+        .map_or(0.0, |tools| {
             tools
                 .iter()
                 .map(|t| {
@@ -100,8 +101,7 @@ pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
                             .unwrap_or(10.0)
                 })
                 .sum()
-        })
-        .unwrap_or(0.0);
+        });
 
     (system_tokens + message_tokens + tool_def_tokens) as u64
 }
@@ -120,8 +120,7 @@ pub fn validate_context_window(
 
     if estimated_tokens > max_allowed {
         return Err(format!(
-            "Request size ({}) exceeds provider context limit ({} / {} max_allowed)",
-            estimated_tokens, context_window, max_allowed
+            "Request size ({estimated_tokens}) exceeds provider context limit ({context_window} / {max_allowed} max_allowed)"
         ));
     }
 
@@ -162,6 +161,7 @@ pub fn get_context_window_info(provider: &Providers) -> ContextWindowInfo {
 /// - Gemini: `input_tokens = prompt_tokens - cached_content_token_count`
 ///
 /// Returns percentage (0.0-100.0) of context window consumed.
+#[must_use] 
 pub fn calculate_context_usage_percentage(
     tokens_in: u32,
     tokens_out: u32,

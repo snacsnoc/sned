@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use vte::{Params, Perform};
 
 /// Convert a string with ANSI escape sequences to ratatui lines.
+#[must_use] 
 pub fn ansi_to_ratatui_lines(text: &str) -> Vec<Line<'static>> {
     let mut performer = RatatuiPerformer::with_capacity(text.len());
     let mut parser = vte::Parser::new();
@@ -76,31 +77,24 @@ impl Perform for RatatuiPerformer {
             // SGR — Select Graphic Rendition
             // Flush accumulated text before changing style
             self.flush_current_text();
-            for param in params.iter() {
+            for param in params {
                 match param {
                     [0] => self.current_style = Style::default(),
                     [1] => self.current_style = self.current_style.add_modifier(Modifier::BOLD),
                     [2] => self.current_style = self.current_style.add_modifier(Modifier::DIM),
                     [3] => self.current_style = self.current_style.add_modifier(Modifier::ITALIC),
                     [4] => {
-                        self.current_style = self.current_style.add_modifier(Modifier::UNDERLINED)
+                        self.current_style = self.current_style.add_modifier(Modifier::UNDERLINED);
                     }
                     [30] => self.current_style = self.current_style.fg(Color::Black),
-                    [31] => self.current_style = self.current_style.fg(Color::Red),
-                    [32] => self.current_style = self.current_style.fg(Color::Green),
-                    [33] => self.current_style = self.current_style.fg(Color::Yellow),
-                    [34] => self.current_style = self.current_style.fg(Color::Blue),
-                    [35] => self.current_style = self.current_style.fg(Color::Magenta),
-                    [36] => self.current_style = self.current_style.fg(Color::Cyan),
-                    [37] => self.current_style = self.current_style.fg(Color::White),
+                    [31] | [91] => self.current_style = self.current_style.fg(Color::Red),
+                    [32] | [92] => self.current_style = self.current_style.fg(Color::Green),
+                    [33] | [93] => self.current_style = self.current_style.fg(Color::Yellow),
+                    [34] | [94] => self.current_style = self.current_style.fg(Color::Blue),
+                    [35] | [95] => self.current_style = self.current_style.fg(Color::Magenta),
+                    [36] | [96] => self.current_style = self.current_style.fg(Color::Cyan),
+                    [37] | [97] => self.current_style = self.current_style.fg(Color::White),
                     [90] => self.current_style = self.current_style.fg(Color::DarkGray),
-                    [91] => self.current_style = self.current_style.fg(Color::Red),
-                    [92] => self.current_style = self.current_style.fg(Color::Green),
-                    [93] => self.current_style = self.current_style.fg(Color::Yellow),
-                    [94] => self.current_style = self.current_style.fg(Color::Blue),
-                    [95] => self.current_style = self.current_style.fg(Color::Magenta),
-                    [96] => self.current_style = self.current_style.fg(Color::Cyan),
-                    [97] => self.current_style = self.current_style.fg(Color::White),
                     // Background colors: 40-47
                     [40] => self.current_style = self.current_style.bg(Color::Black),
                     [41] => self.current_style = self.current_style.bg(Color::Red),
@@ -121,7 +115,7 @@ impl Perform for RatatuiPerformer {
                     [107] => self.current_style = self.current_style.bg(Color::Indexed(15)), // Bright white
                     // Blinking
                     [5] => {
-                        self.current_style = self.current_style.add_modifier(Modifier::SLOW_BLINK)
+                        self.current_style = self.current_style.add_modifier(Modifier::SLOW_BLINK);
                     }
                     // Reverse video
                     [7] => self.current_style = self.current_style.add_modifier(Modifier::REVERSED),
@@ -131,21 +125,21 @@ impl Perform for RatatuiPerformer {
                         self.current_style = self.current_style.remove_modifier(Modifier::DIM);
                     }
                     [23] => {
-                        self.current_style = self.current_style.remove_modifier(Modifier::ITALIC)
+                        self.current_style = self.current_style.remove_modifier(Modifier::ITALIC);
                     }
                     [24] => {
                         self.current_style =
-                            self.current_style.remove_modifier(Modifier::UNDERLINED)
+                            self.current_style.remove_modifier(Modifier::UNDERLINED);
                     }
                     // 256-color: [38, 5, N] → Color::Indexed(N)
                     [38, 5, n] => {
-                        self.current_style = self.current_style.fg(Color::Indexed(*n as u8))
+                        self.current_style = self.current_style.fg(Color::Indexed(*n as u8));
                     }
                     // Truecolor: [38, 2, R, G, B] → Color::Rgb(R, G, B)
                     [38, 2, r, g, b] => {
                         self.current_style = self
                             .current_style
-                            .fg(Color::Rgb(*r as u8, *g as u8, *b as u8))
+                            .fg(Color::Rgb(*r as u8, *g as u8, *b as u8));
                     }
                     _ => {}
                 }

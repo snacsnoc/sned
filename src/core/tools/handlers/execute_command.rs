@@ -186,7 +186,7 @@ impl ExecuteCommandHandler {
             // Skip safety checks for explicitly user-approved commands
             if !explicitly_approved && let Err(e) = self.safety_checker.is_safe(&cmd_str) {
                 tracing::warn!(command = %cmd_str, reason = %e, "command rejected by safety checker");
-                return Err(anyhow::anyhow!("{}", e));
+                return Err(anyhow::anyhow!("{e}"));
             }
             tracing::debug!(command = %cmd_str, cwd = ?cwd, "executing command");
 
@@ -194,7 +194,7 @@ impl ExecuteCommandHandler {
                 use crate::cli::tui::theme::INFO_FG;
                 use ratatui::style::{Modifier, Style};
                 let header = Line::from(Span::styled(
-                    format!("Running: {}", cmd_str),
+                    format!("Running: {cmd_str}"),
                     Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
                 ));
                 output_writer.emit(OutputEvent::CommandHeaderLine(header));
@@ -349,13 +349,12 @@ impl ExecuteCommandHandler {
                         }
                     }
                     // Periodic cancellation check to allow Ctrl+C to interrupt long-running commands
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                         // Check cancellation flag using try_lock (synchronous)
                         let is_cancelled = task_state
                             .as_ref()
                             .and_then(|s| s.try_lock().ok())
-                            .map(|state| state.is_cancelled_atomic.load(std::sync::atomic::Ordering::Acquire))
-                            .unwrap_or(false);
+                            .is_some_and(|state| state.is_cancelled_atomic.load(std::sync::atomic::Ordering::Acquire));
                         if is_cancelled {
                             // Kill the process group on cancellation
                             #[cfg(unix)]
@@ -457,7 +456,7 @@ impl ExecuteCommandHandler {
                                     stderr: stderr_collected.into_bytes(),
                                 }
                             }
-                            Ok(Err(e)) => return Err(anyhow::anyhow!("Command failed: {}", e)),
+                            Ok(Err(e)) => return Err(anyhow::anyhow!("Command failed: {e}")),
                             Err(_) => {
                                 // Kill the entire process group to ensure grandchildren are terminated
                                 #[cfg(unix)]
@@ -507,7 +506,7 @@ impl ExecuteCommandHandler {
                     format!("--- last {} of {} lines ---", tail_buffer.len(), total),
                     Style::default().add_modifier(Modifier::DIM),
                 ))));
-                for line in tail_buffer.iter() {
+                for line in &tail_buffer {
                     output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                         line.clone(),
                         Style::default().add_modifier(Modifier::DIM),
@@ -580,7 +579,7 @@ impl ExecuteCommandHandler {
             let sample: Vec<&str> = all_filtered_names
                 .iter()
                 .take(5)
-                .map(|s| s.as_str())
+                .map(std::string::String::as_str)
                 .collect();
             let note = if all_filtered_names.len() > 5 {
                 format!(
@@ -661,7 +660,7 @@ impl ExecuteCommandHandler {
             };
             if let Err(e) = check {
                 tracing::warn!(script = %script, reason = %e, "script rejected by safety checker");
-                return Err(anyhow::anyhow!("{}", e));
+                return Err(anyhow::anyhow!("{e}"));
             }
         }
 
@@ -719,12 +718,12 @@ impl ExecuteCommandHandler {
             Ok(Ok(status)) => {
                 let stdout = stdout_task
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to join stdout reader: {}", e))?
-                    .map_err(|e| anyhow::anyhow!("Failed to read stdout: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to join stdout reader: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("Failed to read stdout: {e}"))?;
                 let stderr = stderr_task
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to join stderr reader: {}", e))?
-                    .map_err(|e| anyhow::anyhow!("Failed to read stderr: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to join stderr reader: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("Failed to read stderr: {e}"))?;
 
                 std::process::Output {
                     status,
@@ -732,7 +731,7 @@ impl ExecuteCommandHandler {
                     stderr,
                 }
             }
-            Ok(Err(e)) => return Err(anyhow::anyhow!("Script failed to execute: {}", e)),
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Script failed to execute: {e}")),
             Err(_) => {
                 // Kill the entire process group to ensure grandchildren are terminated
                 #[cfg(unix)]
@@ -753,13 +752,13 @@ impl ExecuteCommandHandler {
                 let stdout = stdout_task
                     .await
                     .ok()
-                    .and_then(|r| r.ok())
+                    .and_then(std::result::Result::ok)
                     .map(|buf| String::from_utf8_lossy(&buf).to_string())
                     .unwrap_or_default();
                 let stderr = stderr_task
                     .await
                     .ok()
-                    .and_then(|r| r.ok())
+                    .and_then(std::result::Result::ok)
                     .map(|buf| String::from_utf8_lossy(&buf).to_string())
                     .unwrap_or_default();
                 let err = crate::cli::actionable_errors::command_timeout(
@@ -789,14 +788,14 @@ impl ExecuteCommandHandler {
 
         if !output.status.success() {
             let err = crate::cli::actionable_errors::command_exit_code(
-                &format!("{} script", language),
+                &format!("{language} script"),
                 output.status.code(),
             );
             combined.push_str(&format!("\n{}", err.display()));
         }
 
         if !filtered_names.is_empty() {
-            let sample: Vec<&str> = filtered_names.iter().take(5).map(|s| s.as_str()).collect();
+            let sample: Vec<&str> = filtered_names.iter().take(5).map(std::string::String::as_str).collect();
             let note = if filtered_names.len() > 5 {
                 format!(
                     "\n[Sandbox: {} env vars filtered (e.g. {}). Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
@@ -884,7 +883,7 @@ impl ExecuteCommandHandler {
         let allow_set: HashMap<&str, bool> = BASE_ALLOWLIST
             .iter()
             .copied()
-            .chain(extra.iter().map(|s| s.as_str()))
+            .chain(extra.iter().map(std::string::String::as_str))
             .map(|k| (k, true))
             .collect();
 
@@ -906,12 +905,14 @@ impl ExecuteCommandHandler {
         (env, filtered)
     }
 
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             safety_checker: CommandSafetyChecker::new(),
         }
     }
 
+    #[must_use] 
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.safety_checker = self.safety_checker.with_yolo(yolo);
         self
@@ -988,7 +989,6 @@ impl ToolHandler for ExecuteCommandHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self.clone();
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             handler.execute_without_state(
                 Some(ctx.workspace_root.as_path()),
@@ -1008,7 +1008,7 @@ impl ToolHandler for ExecuteCommandHandler {
         if let Some(cmds) = params["commands"].as_array() {
             format!("Executing {} commands", cmds.len())
         } else if let Some(lang) = params["language"].as_str() {
-            format!("Executing {} script", lang)
+            format!("Executing {lang} script")
         } else {
             "Executing command".to_string()
         }

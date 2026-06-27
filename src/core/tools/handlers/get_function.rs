@@ -22,7 +22,7 @@ impl GetFunctionHandler {
             names_arr
                 .iter()
                 .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -45,7 +45,7 @@ impl GetFunctionHandler {
         let abs_path_str = abs_path.to_string_lossy();
         let language_parsers =
             load_required_language_parsers(&[abs_path_str.as_ref()]).map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to load language parsers: {}", e))
+                ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
             })?;
 
         match tokio::fs::read_to_string(&abs_path).await {
@@ -60,16 +60,14 @@ impl GetFunctionHandler {
                     None,
                 ) {
                     Ok(Some(result)) => Ok(result.formatted_content),
-                    Ok(None) => Ok(format!("No functions found in {}", path)),
+                    Ok(None) => Ok(format!("No functions found in {path}")),
                     Err(e) => Err(ToolError::ExecutionFailed(format!(
-                        "Error getting functions: {}",
-                        e
+                        "Error getting functions: {e}"
                     ))),
                 }
             }
             Err(e) => Err(ToolError::ExecutionFailed(format!(
-                "Error reading file {}: {}",
-                path, e
+                "Error reading file {path}: {e}"
             ))),
         }
     }
@@ -83,7 +81,6 @@ impl ToolHandler for GetFunctionHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self;
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             Self::run(handler, &ctx, params)
                 .await
