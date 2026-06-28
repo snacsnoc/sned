@@ -24,14 +24,7 @@ Cargo.lock
 /dist/
 /out/
 
-# Node.js
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-package-lock.json
 
-# IDE
 .vscode/
 .idea/
 *.swp
@@ -40,15 +33,10 @@ package-lock.json
 .DS_Store
 ._*
 
-# Test outputs
 *.log
-
-# Temporary files
 *.tmp
 *.temp
 .cache/
-
-# Sned generated files
 .sned-symbol-index/
 .sned/
 
@@ -56,17 +44,10 @@ opencode.json
 .qwen/
 
 .agents/
-BUILD_SPEC.md
-llm-openai-docs/
-
-vendor/
-
-
 dhat-heap.json
-
 *.bak
 
 .snedrules/hooks/
 
 .internal/
-.opencode/plans/
+.opencode/
