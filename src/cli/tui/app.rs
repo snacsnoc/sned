@@ -4183,4 +4183,115 @@ mod tests {
         let _ = std::fs::remove_file(&file_path);
         let _ = std::fs::remove_dir(&tmp_dir);
     }
+
+    /// Closes the "tests ≠ reality" gap for autoscroll.
+    ///
+    /// Existing scroll tests (e.g. `test_scroll_lines_switches_to_manual_mode`)
+    /// assert on `app.scroll_mode` and `app.scroll_offset` directly. They pass
+    /// even if the render path uses a stale or wrong offset. This test
+    /// asserts on the actual rendered framebuffer produced by
+    /// `TestBackend` — if `scroll_mode == Auto` but the rendered viewport
+    /// doesn't show the bottom of the buffer, this test fails.
+    #[test]
+    fn test_force_bottom_renders_visible_bottom_of_buffer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let content_height = 5;
+        let mut app = make_scrolling_app(20, content_height);
+
+        // Sanity: state says we should be at the bottom (20 - 5 = 15).
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert_eq!(
+            app.resolved_scroll_y_for(app.output_lines.len(), content_height),
+            15
+        );
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The last 5 lines (15..20) must be visible in the rendered buffer.
+        for index in 15..20 {
+            assert!(
+                rendered.contains(&format!("line {index}")),
+                "line {index} should be visible at the bottom of the rendered viewport"
+            );
+        }
+
+        // Earlier lines must NOT be visible — would indicate we are scrolled
+        // to the top instead of Auto-following the tail.
+        assert!(
+            !rendered.contains("line 0 "),
+            "line 0 should be off-screen when 20 lines are buffered with height 5"
+        );
+        assert!(
+            !rendered.contains("line 5 "),
+            "line 5 should be off-screen at the bottom of a 20-line buffer"
+        );
+    }
+
+    /// Companion test for Manual scroll mode: when the user scrolls up,
+    /// the EARLIER lines must become visible and the LATEST lines must be
+    /// off-screen. Catches the case where `scroll_mode == Manual` is set
+    /// correctly but the viewport still renders the tail.
+    #[test]
+    fn test_manual_scroll_renders_visible_top_of_buffer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let content_height = 5;
+        let mut app = make_scrolling_app(20, content_height);
+
+        // Scroll up by 5 lines → enter Manual mode at offset 10.
+        app.scroll_lines(-5);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 10);
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Lines 10..15 must be visible.
+        for index in 10..15 {
+            assert!(
+                rendered.contains(&format!("line {index}")),
+                "line {index} should be visible at scroll offset 10"
+            );
+        }
+
+        // Line 19 (the very last) must NOT be visible — confirms we scrolled UP.
+        assert!(
+            !rendered.contains("line 19"),
+            "line 19 should be off-screen when scrolled up by 5"
+        );
+
+        // Line 0 should still NOT be visible (we are at offset 10, not 0).
+        assert!(
+            !rendered.contains("line 0 "),
+            "line 0 should be off-screen at offset 10"
+        );
+    }
 }
