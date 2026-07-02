@@ -21,6 +21,15 @@ use unicode_width::UnicodeWidthStr;
 
 const INPUT_MAX_VISIBLE_LINES: usize = 6;
 const BLOCKING_PROMPT_INPUT_VISIBLE_LINES: usize = 1;
+const SCROLLBACK_FLUSH_LINE_BATCH: usize = 128;
+
+/// Async @-mention search result delivered back to the interactive loop.
+#[derive(Debug, Clone)]
+pub struct MentionSearchUpdate {
+    pub generation: u64,
+    pub query: String,
+    pub results: Vec<FileSearchResult>,
+}
 
 /// Distinguishes model-streamed prose from tool-result or system lines
 /// in the TUI output buffer.  Only `Model` lines are tracked by
@@ -156,6 +165,10 @@ pub struct App {
     pub scrollback_file: Option<std::path::PathBuf>,
     /// Number of lines stored in the scrollback file.
     pub scrollback_count: u64,
+    /// Buffered evicted scrollback lines waiting to be appended to disk.
+    pub scrollback_pending: String,
+    /// Number of buffered lines waiting in `scrollback_pending`.
+    pub scrollback_pending_lines: usize,
     /// True when the user is viewing scrollback history.
     pub in_scrollback: bool,
     /// Session elapsed time for status bar
@@ -186,6 +199,11 @@ pub struct App {
     pub mention_search_query: String,
     /// Deadline for debounced mention search.
     pub mention_search_deadline: Instant,
+    /// Monotonic generation for the latest mention query; stale async
+    /// search results are discarded when their generation no longer matches.
+    pub mention_search_generation: u64,
+    /// Result channel for async mention searches.
+    pub mention_search_tx: Option<tokio::sync::mpsc::UnboundedSender<MentionSearchUpdate>>,
     /// Cached status bar left segment (provider / model | task | mode).
     /// Rebuilt only when the underlying fields change.
     pub cached_status_left: String,
@@ -397,7 +415,11 @@ impl App {
             output_overflow_count: 0,
             scrollback_file: Some(crate::storage::disk::get_data_dir().join("scrollback/lines")),
             scrollback_count: 0,
+            scrollback_pending: String::new(),
+            scrollback_pending_lines: 0,
             in_scrollback: false,
+            mention_search_generation: 0,
+            mention_search_tx: None,
         }
     }
 
@@ -448,18 +470,12 @@ impl App {
         self.output_line_kinds.push_back(kind);
         self.cached_visible_window = None;
         if self.output_lines.len() > 10_000 {
-            // Evict front line and persist it to scrollback file
-            if let Some(ref file_path) = self.scrollback_file {
-                if let Some(line) = self.output_lines.front() {
-                    let text = Self::line_to_string(line);
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(file_path)
-                    {
-                        let _ = std::io::Write::write_all(&mut f, format!("{text}\n").as_bytes());
-                    }
-                }
+            // Evict front line and buffer it for batched scrollback append.
+            if let Some(line) = self.output_lines.front() {
+                let text = Self::line_to_string(line);
+                self.scrollback_pending.push_str(&text);
+                self.scrollback_pending.push('\n');
+                self.scrollback_pending_lines = self.scrollback_pending_lines.saturating_add(1);
                 self.scrollback_count = self.scrollback_count.saturating_add(1);
             }
             self.output_lines.pop_front();
@@ -918,12 +934,41 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    pub fn flush_scrollback_pending(&mut self) -> std::io::Result<()> {
+        if self.scrollback_pending.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(ref file_path) = self.scrollback_file {
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(file_path)?;
+            std::io::Write::write_all(&mut file, self.scrollback_pending.as_bytes())?;
+        }
+
+        self.scrollback_pending.clear();
+        self.scrollback_pending_lines = 0;
+        Ok(())
+    }
+
+    pub fn flush_scrollback_pending_if_needed(&mut self) -> std::io::Result<()> {
+        if self.scrollback_pending_lines >= SCROLLBACK_FLUSH_LINE_BATCH {
+            self.flush_scrollback_pending()?;
+        }
+        Ok(())
+    }
+
     /// Load scrollback content from the scrollback file and merge with
     /// the current buffer.  The file stores one raw text line per line;
     /// we reconstruct Line objects and prepend them to output_lines.
     pub fn enter_scrollback(&mut self) {
         self.in_scrollback = true;
         self.needs_redraw = true;
+        let _ = self.flush_scrollback_pending();
 
         if let Some(ref file_path) = self.scrollback_file
             && let Ok(content) = std::fs::read_to_string(file_path)
@@ -973,6 +1018,8 @@ impl App {
             let _ = std::fs::remove_file(file_path);
         }
         self.scrollback_count = 0;
+        self.scrollback_pending.clear();
+        self.scrollback_pending_lines = 0;
         self.cached_wrap_width = None;
         self.cached_visible_window = None;
         self.scroll_mode = ScrollMode::Auto;
@@ -1005,6 +1052,8 @@ impl App {
         self.cached_visible_window = None;
         self.in_scrollback = false;
         self.scrollback_count = 0;
+        self.scrollback_pending.clear();
+        self.scrollback_pending_lines = 0;
     }
 
     /// Drain output from the given index onward and keep the visual-row cache in sync.
@@ -4118,9 +4167,10 @@ mod tests {
         );
     }
 
-    /// Evicted lines must be written to the scrollback file.
+    /// Evicted lines must be buffered in memory and only written when the
+    /// batched scrollback flush runs.
     #[test]
-    fn test_eviction_writes_to_scrollback_file() {
+    fn test_eviction_buffers_scrollback_until_flush() {
         let mut app = App::new();
         app.set_content_width(80);
 
@@ -4136,19 +4186,27 @@ mod tests {
             app.push_plain(format!("line {}", i));
         }
 
-        // Verify the scrollback file exists and has content
+        assert_eq!(app.scrollback_count, 1);
+        assert_eq!(app.scrollback_pending_lines, 1);
+        assert!(
+            !file_path.exists(),
+            "scrollback file should not be touched from the append hot path"
+        );
+
+        app.flush_scrollback_pending().unwrap();
+
         assert!(
             file_path.exists(),
-            "scrollback file should exist after eviction"
+            "flush should materialize the scrollback file"
         );
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert!(!content.is_empty(), "scrollback file should have content");
-        // The first evicted line should be in the file
         assert!(
             content.contains("line 0"),
             "first evicted line should be in scrollback"
         );
-        assert_eq!(app.scrollback_count, 1);
+        assert!(app.scrollback_pending.is_empty());
+        assert_eq!(app.scrollback_pending_lines, 0);
 
         // Cleanup
         let _ = std::fs::remove_file(&file_path);
