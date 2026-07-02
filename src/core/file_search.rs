@@ -480,11 +480,11 @@ mod tests {
 
     #[test]
     fn test_fuzzy_score_prefix_bonus() {
-        let score1 = fuzzy_score("age", "AGENTS.md").unwrap();
-        let score2 = fuzzy_score("age", "src/agents.rs").unwrap();
+        let score1 = fuzzy_score("read", "README.md").unwrap();
+        let score2 = fuzzy_score("read", "src/reader.rs").unwrap();
         assert!(
             score1 > score2,
-            "AGENTS.md (prefix match) should score higher than src/agents.rs, got {} vs {}",
+            "README.md (prefix match) should score higher than src/reader.rs, got {} vs {}",
             score1,
             score2
         );
@@ -834,9 +834,9 @@ mod tests {
     #[test]
     fn test_search_workspace_files_root_file_no_duplication() {
         // Root-level files where label == path should not get inflated scores from duplication.
-        // "agents" matching "AGENTS.md" (no duplication) vs "AGENTS.md AGENTS.md" (self-duplicated).
-        let score1 = fuzzy_score_normalized("agents".as_bytes(), "AGENTS.md");
-        let score2 = fuzzy_score_normalized("agents".as_bytes(), "AGENTS.md AGENTS.md");
+        // "readme" matching "README.md" (no duplication) vs "README.md README.md" (self-duplicated).
+        let score1 = fuzzy_score_normalized("readme".as_bytes(), "README.md");
+        let score2 = fuzzy_score_normalized("readme".as_bytes(), "README.md README.md");
         assert!(
             score1.is_some() && score2.is_some(),
             "both should match"

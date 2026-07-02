@@ -3425,8 +3425,8 @@ mod tests {
         let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
 
-        let model_text = "Read and understood both AGENTS.md and README.md.";
-        let tool_output_text = "  ✓ Read and understood both AGENTS.md and README.md.";
+        let model_text = "Read and understood the project documentation.";
+        let tool_output_text = "  ✓ Read and understood the project documentation.";
 
         let (tx, mut rx) = mpsc::channel(8);
         // Stream model text — ends up as BlockKind::Model in output_lines.

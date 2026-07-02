@@ -1332,7 +1332,6 @@ async fn run_task_inner(
 fn run_interactive_shell(task_opts: TaskOptions, root_opts: RootOnlyOptions) -> anyhow::Result<()> {
     // ARCHITECTURAL GUARD: Interactive shell MUST use run_interactive_shell_inner
     // which has the TUI loop. Never call session.run(None) directly here.
-    // See: AGENTS.md §Interactive Shell Architecture
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_interactive_shell_inner(task_opts, root_opts))
 }
