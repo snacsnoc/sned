@@ -262,7 +262,14 @@ pub struct StderrOutputWriter;
 impl OutputWriter for StderrOutputWriter {
     fn emit(&self, event: OutputEvent) {
         match event {
-            OutputEvent::Line(line) | OutputEvent::ModelUpdateLine(line) | OutputEvent::ToolOutputLine(line) | OutputEvent::ToolHeaderLine(line) | OutputEvent::CommandHeaderLine(line) | OutputEvent::CommandOutputLine(line) | OutputEvent::ReasoningLine(line) | OutputEvent::UserPromptLine(line) => {
+            OutputEvent::Line(line)
+            | OutputEvent::ModelUpdateLine(line)
+            | OutputEvent::ToolOutputLine(line)
+            | OutputEvent::ToolHeaderLine(line)
+            | OutputEvent::CommandHeaderLine(line)
+            | OutputEvent::CommandOutputLine(line)
+            | OutputEvent::ReasoningLine(line)
+            | OutputEvent::UserPromptLine(line) => {
                 eprintln!("{line}");
             }
             OutputEvent::RawAnsi(s) => {
@@ -309,29 +316,47 @@ impl OutputWriter for StderrOutputWriter {
 /// on each frame tick.
 pub struct ChannelOutputWriter {
     tx: mpsc::Sender<OutputEvent>,
+    priority_tx: mpsc::UnboundedSender<OutputEvent>,
+    priority_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
     dropped_count: std::sync::atomic::AtomicU64,
     overflow_signaled: std::sync::atomic::AtomicBool,
 }
 
 impl ChannelOutputWriter {
     /// Create a new ChannelOutputWriter with a bounded channel.
-    #[must_use] 
+    #[must_use]
     pub fn new(tx: mpsc::Sender<OutputEvent>) -> Self {
+        let (priority_tx, priority_rx) = mpsc::unbounded_channel();
         Self {
             tx,
+            priority_tx,
+            priority_rx: std::sync::Mutex::new(Some(priority_rx)),
             dropped_count: std::sync::atomic::AtomicU64::new(0),
             overflow_signaled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[must_use]
+    pub fn take_priority_rx(&self) -> Option<mpsc::UnboundedReceiver<OutputEvent>> {
+        self.priority_rx
+            .lock()
+            .expect("priority rx mutex poisoned")
+            .take()
     }
 }
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
         let is_lossy_update = matches!(event, OutputEvent::ModelUpdateLine(_));
-        if self.tx.try_send(event).is_err() {
+        if let Err(err) = self.tx.try_send(event) {
             if is_lossy_update {
                 return;
             }
+
+            if self.priority_tx.send(err.into_inner()).is_ok() {
+                return;
+            }
+
             let count = self
                 .dropped_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -374,7 +399,7 @@ pub type OutputWriterArc = Arc<dyn OutputWriter>;
 /// Returns whether diagnostic timing output is enabled.
 ///
 /// Set `SNED_TIMING=1` to enable phase timing logs.
-#[must_use] 
+#[must_use]
 pub fn timing_enabled() -> bool {
     matches!(
         std::env::var("SNED_TIMING").ok().as_deref(),
@@ -383,7 +408,7 @@ pub fn timing_enabled() -> bool {
 }
 
 /// Format phase timing diagnostics into printable lines.
-#[must_use] 
+#[must_use]
 pub fn format_timing_phases(
     session_start: Instant,
     request_sent: Option<Instant>,
@@ -508,72 +533,52 @@ mod tests {
         assert_eq!(lines[7], "[timing] first_output_to_first_render_us=16000");
     }
 
-    /// Regression test for the silent channel-overflow bug. The user
-    /// reported that the approval prompt was not visible in the TUI
-    /// viewport; the root cause was `try_send` silently dropping events
-    /// when the 8192-capacity mpsc channel flooded during tool-result
-    /// bursts. This test fills the channel past capacity, drops an
-    /// approval-prompt RawAnsi event, and asserts that:
-    /// 1. The dropped event does NOT land in the receiver.
-    /// 2. The overflow signal is set.
-    /// 3. `dropped_count()` reflects the lost event.
-    ///
-    /// The TUI main loop uses these signals to surface a user-visible
-    /// warning in the status bar (src/cli/tui/app.rs output_overflow
-    /// field) so the user knows output (including approval prompts) may
-    /// be missing.
+    /// Critical non-lossy events must survive a saturated main output
+    /// queue by spilling into the reliable priority lane instead of
+    /// being dropped.
     #[test]
-    fn test_channel_overflow_signals_dropped_approval_prompt() {
+    fn test_channel_overflow_preserves_approval_prompt_via_priority_lane() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        // Tiny channel capacity (1) so we can force overflow without
-        // emitting thousands of events. The approval prompt is the
-        // event that MUST be dropped to reproduce the user's bug.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
         let writer = ChannelOutputWriter::new(tx);
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
 
-        // Fill the channel: 1 event slots into the buffer, the rest
-        // queue in the sender's pending queue up to capacity.
         writer.emit(OutputEvent::plain("line 1"));
         writer.emit(OutputEvent::plain("line 2"));
         writer.emit(OutputEvent::plain("line 3"));
 
-        // The approval prompt — the critical event — must be dropped
-        // when the channel is full and the receiver is not draining.
         let approval_prompt = OutputEvent::RawAnsi(
             "\n\x1b[33m🔧 Tool:\x1b[0m \x1b[1mexecute_command\x1b[0m\n\
              Execute this tool? (y/n/always): "
                 .to_string(),
         );
-        writer.emit(approval_prompt);
+        writer.emit(approval_prompt.clone());
 
-        // Drain whatever made it through (line 1, possibly line 2/3 if
-        // the sender's queue absorbed them, but NOT the prompt).
-        while rx.try_recv().is_ok() {}
+        let primary_events: Vec<OutputEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let priority_events: Vec<OutputEvent> =
+            std::iter::from_fn(|| priority_rx.try_recv().ok()).collect();
 
-        // The approval prompt must not have been delivered.
-        // (We can't directly assert "not received" because the sender's
-        // bounded queue may have absorbed the prior events; the
-        // critical assertion is that the overflow signal fired and
-        // dropped_count > 0.)
-
-        // Overflow signal must be set so the TUI can surface it.
         assert!(
-            writer.take_overflow_signal(),
-            "take_overflow_signal must return true when events were dropped"
+            primary_events
+                .iter()
+                .chain(priority_events.iter())
+                .any(|event| matches!(event, OutputEvent::RawAnsi(text) if text == match &approval_prompt {
+                    OutputEvent::RawAnsi(text) => text,
+                    _ => unreachable!(),
+                })),
+            "approval prompt must survive overflow via either output lane"
         );
-
-        // dropped_count must reflect the lost event.
-        assert!(
-            writer.dropped_count() > 0,
-            "dropped_count must be > 0 after channel overflow, got: {}",
-            writer.dropped_count()
-        );
-
-        // Second call must return false (signal is edge-triggered).
         assert!(
             !writer.take_overflow_signal(),
-            "take_overflow_signal must be edge-triggered (false after consume)"
+            "priority fallback should preserve the prompt without signaling a drop"
+        );
+        assert_eq!(
+            writer.dropped_count(),
+            0,
+            "priority fallback should avoid durable drops"
         );
     }
 
@@ -596,6 +601,32 @@ mod tests {
             writer.dropped_count(),
             0,
             "lossy model updates should not count as dropped durable output"
+        );
+    }
+
+    #[test]
+    fn test_channel_overflow_still_signals_when_all_receivers_are_gone() {
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        drop(rx);
+        drop(priority_rx);
+
+        writer.emit(OutputEvent::plain("dropped"));
+
+        assert!(
+            writer.take_overflow_signal(),
+            "closed receivers should still surface durable-output loss"
+        );
+        assert_eq!(
+            writer.dropped_count(),
+            1,
+            "closed receivers should count as one dropped durable event"
         );
     }
 }
