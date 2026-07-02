@@ -20,6 +20,7 @@ use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
 const INPUT_MAX_VISIBLE_LINES: usize = 6;
+const BLOCKING_PROMPT_INPUT_VISIBLE_LINES: usize = 1;
 
 /// Distinguishes model-streamed prose from tool-result or system lines
 /// in the TUI output buffer.  Only `Model` lines are tracked by
@@ -268,7 +269,7 @@ impl App {
         out
     }
     /// Create a new TextArea with default styling (no underline on cursor line).
-    #[must_use] 
+    #[must_use]
     pub fn new_textarea(lines: Vec<String>) -> TextArea<'static> {
         let mut input = TextArea::new(lines);
         input.set_placeholder_text("❯ ");
@@ -327,7 +328,7 @@ impl App {
     }
 
     /// Create a new App instance.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             output_lines: VecDeque::new(),
@@ -925,7 +926,8 @@ impl App {
         self.needs_redraw = true;
 
         if let Some(ref file_path) = self.scrollback_file
-            && let Ok(content) = std::fs::read_to_string(file_path) {
+            && let Ok(content) = std::fs::read_to_string(file_path)
+        {
             let mut scrollback_lines: VecDeque<Line<'static>> = VecDeque::new();
             let mut scrollback_kinds: VecDeque<BlockKind> = VecDeque::new();
             for line in content.lines() {
@@ -985,7 +987,6 @@ impl App {
             self.enter_scrollback();
         }
     }
-
 
     /// Clear all output and reset the visual-row cache.
     pub fn clear_output(&mut self) {
@@ -1351,20 +1352,21 @@ impl App {
             (
                 BlockKind::Model,
                 BlockKind::ToolHeader
-                | BlockKind::CommandHeader
-                | BlockKind::ToolOutput
-                | BlockKind::CommandOutput
-                | BlockKind::Reasoning
-                | BlockKind::UserPrompt,
-            ) | (_, BlockKind::UserPrompt) | (
-                BlockKind::ToolOutput
-                | BlockKind::CommandOutput
-                | BlockKind::ToolHeader
-                | BlockKind::CommandHeader
-                | BlockKind::Reasoning
-                | BlockKind::UserPrompt,
-                BlockKind::Model,
-            )
+                    | BlockKind::CommandHeader
+                    | BlockKind::ToolOutput
+                    | BlockKind::CommandOutput
+                    | BlockKind::Reasoning
+                    | BlockKind::UserPrompt,
+            ) | (_, BlockKind::UserPrompt)
+                | (
+                    BlockKind::ToolOutput
+                        | BlockKind::CommandOutput
+                        | BlockKind::ToolHeader
+                        | BlockKind::CommandHeader
+                        | BlockKind::Reasoning
+                        | BlockKind::UserPrompt,
+                    BlockKind::Model,
+                )
         )
     }
 
@@ -1390,7 +1392,7 @@ impl App {
             let [output_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(1),
-                Constraint::Length(self.input_height()),
+                Constraint::Length(self.render_input_height()),
             ])
             .areas(main_area);
 
@@ -1414,7 +1416,7 @@ impl App {
             let [output_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(1),
-                Constraint::Length(self.input_height()),
+                Constraint::Length(self.render_input_height()),
             ])
             .areas(frame.area());
 
@@ -1440,8 +1442,11 @@ impl App {
     }
 
     fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
-        let input_title = if self.agent_busy && !crate::core::approval::is_approval_prompt_active()
-        {
+        let input_title = if crate::core::approval::is_approval_prompt_active() {
+            " Approval pending (y/n/a) ".to_string()
+        } else if crate::core::approval::is_any_followup_question_active() {
+            " Follow-up reply ".to_string()
+        } else if self.agent_busy {
             if self.reasoning_active {
                 format!(" {} Reasoning... ", self.spinner_char())
             } else {
@@ -1450,12 +1455,27 @@ impl App {
         } else {
             " Input ".to_string()
         };
-        self.input
-            .set_block(theme::input_block(input_title, self.agent_busy));
+        self.input.set_block(theme::input_block(
+            input_title,
+            self.agent_busy || self.has_blocking_prompt(),
+        ));
 
         self.update_placeholder();
 
         frame.render_widget(&self.input, input_area);
+    }
+
+    fn has_blocking_prompt(&self) -> bool {
+        crate::core::approval::is_approval_prompt_active()
+            || crate::core::approval::is_any_followup_question_active()
+    }
+
+    fn render_input_height(&self) -> u16 {
+        if self.has_blocking_prompt() {
+            (BLOCKING_PROMPT_INPUT_VISIBLE_LINES as u16) + 2
+        } else {
+            self.input_height()
+        }
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect) {
@@ -1606,16 +1626,14 @@ impl App {
 
         // Scrollback overflow indicator: shown at bottom when there's
         // scrollback history available and user is at the bottom.
-        if !self.in_scrollback
-            && self.scrollback_count > 0
-            && self.scroll_mode == ScrollMode::Auto
+        if !self.in_scrollback && self.scrollback_count > 0 && self.scroll_mode == ScrollMode::Auto
         {
             let indicator = Paragraph::new(Line::from(format!(
                 "↓ {} lines of scrollback — press Shift+S to view",
                 self.scrollback_count,
             )))
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(theme::ACCENT).italic());
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(theme::ACCENT).italic());
             let indicator_area = Rect {
                 x: main_output_area.x,
                 y: main_output_area.y + main_output_area.height - 1,
@@ -1879,7 +1897,9 @@ impl App {
         }
 
         let now = Instant::now();
-        let should_advance = self.last_spinner_tick.is_none_or(|last| now.duration_since(last) >= SPINNER_INTERVAL);
+        let should_advance = self
+            .last_spinner_tick
+            .is_none_or(|last| now.duration_since(last) >= SPINNER_INTERVAL);
 
         if should_advance {
             self.spinner_index = (self.spinner_index + 1) % 10;
@@ -1896,7 +1916,7 @@ impl App {
 }
 
 /// Format a duration as a human-readable string (e.g., "2m 30s", "45s", "1h 15m").
-#[must_use] 
+#[must_use]
 pub fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
     if total_secs >= 3600 {
@@ -2243,6 +2263,52 @@ mod tests {
 
         assert!(rendered.contains("Your answer:"));
         assert!(rendered.contains("What kind of colour improvement"));
+    }
+
+    #[test]
+    fn test_render_approval_prompt_stays_visible_with_tall_input() {
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        struct ApprovalPromptCleanup;
+
+        impl Drop for ApprovalPromptCleanup {
+            fn drop(&mut self) {
+                crate::core::approval::set_approval_prompt_active(false);
+                crate::core::approval::clear_approval_prompt_scroll();
+            }
+        }
+
+        let _cleanup = ApprovalPromptCleanup;
+        crate::core::approval::set_approval_prompt_active(true);
+        crate::core::approval::set_approval_prompt_scroll();
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.pin_approval_bottom();
+        app.set_input_text("1\n2\n3\n4\n5\n6\n7\n8");
+        app.push_plain("A long wrapped tool explanation line that takes multiple rows.");
+        app.push_plain("Another wrapped line that used to crowd the prompt below the input box.");
+        app.push_plain("🔧 Tool: edit_file");
+        app.push_plain("Execute this tool? (y/n/always):");
+
+        assert_eq!(app.render_input_height(), 3);
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Approval pending"));
+        assert!(rendered.contains("Execute this tool?"));
+        assert!(rendered.contains("edit_file"));
     }
 
     #[test]
@@ -4071,11 +4137,17 @@ mod tests {
         }
 
         // Verify the scrollback file exists and has content
-        assert!(file_path.exists(), "scrollback file should exist after eviction");
+        assert!(
+            file_path.exists(),
+            "scrollback file should exist after eviction"
+        );
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert!(!content.is_empty(), "scrollback file should have content");
         // The first evicted line should be in the file
-        assert!(content.contains("line 0"), "first evicted line should be in scrollback");
+        assert!(
+            content.contains("line 0"),
+            "first evicted line should be in scrollback"
+        );
         assert_eq!(app.scrollback_count, 1);
 
         // Cleanup
@@ -4093,7 +4165,11 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join("sned_scrollback_test2");
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let file_path = tmp_dir.join("lines");
-        std::fs::write(&file_path, "scrollback line 0\nscrollback line 1\nscrollback line 2\n").unwrap();
+        std::fs::write(
+            &file_path,
+            "scrollback line 0\nscrollback line 1\nscrollback line 2\n",
+        )
+        .unwrap();
         app.scrollback_file = Some(file_path.clone());
         app.scrollback_count = 3;
 
@@ -4151,7 +4227,10 @@ mod tests {
 
         assert!(!app.in_scrollback);
         assert_eq!(app.scrollback_count, 0);
-        assert!(!file_path.exists(), "scrollback file should be deleted on exit");
+        assert!(
+            !file_path.exists(),
+            "scrollback file should be deleted on exit"
+        );
 
         let _ = std::fs::remove_dir(&tmp_dir);
     }
@@ -4174,7 +4253,10 @@ mod tests {
         assert!(!app.in_scrollback);
         app.toggle_scrollback();
         assert!(app.in_scrollback, "first toggle should enter scrollback");
-        assert!(app.output_lines.len() >= 2, "buffer should contain scrollback lines");
+        assert!(
+            app.output_lines.len() >= 2,
+            "buffer should contain scrollback lines"
+        );
 
         app.toggle_scrollback();
         assert!(!app.in_scrollback, "second toggle should exit scrollback");
@@ -4194,8 +4276,8 @@ mod tests {
     /// doesn't show the bottom of the buffer, this test fails.
     #[test]
     fn test_force_bottom_renders_visible_bottom_of_buffer() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let content_height = 5;
         let mut app = make_scrolling_app(20, content_height);
@@ -4248,8 +4330,8 @@ mod tests {
     /// correctly but the viewport still renders the tail.
     #[test]
     fn test_manual_scroll_renders_visible_top_of_buffer() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let content_height = 5;
         let mut app = make_scrolling_app(20, content_height);

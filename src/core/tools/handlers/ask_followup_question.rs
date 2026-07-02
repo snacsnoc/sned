@@ -12,7 +12,7 @@ use std::pin::Pin;
 pub struct AskFollowupQuestionHandler;
 
 impl AskFollowupQuestionHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -34,11 +34,17 @@ impl AskFollowupQuestionHandler {
             use ratatui::style::{Modifier, Style};
             let timeout_secs = crate::core::approval::followup_timeout().as_secs();
             use crate::cli::tui::theme::{ACCENT, WARNING_FG};
+            let task_id = ctx.task_id.clone();
+
+            // Arm the prompt state before emitting any lines so a drain that
+            // lands mid-emit still pins the viewport to the blocking question.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            crate::core::approval::set_followup_question_active(&task_id, true);
+            crate::core::approval::set_followup_sender(&task_id, sender);
+
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("\n{} {}\n", "[Sned Question]", question),
-                Style::default()
-                    .fg(WARNING_FG)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(WARNING_FG).add_modifier(Modifier::BOLD),
             ));
 
             // Render the question text as markdown so the TUI displays
@@ -50,23 +56,13 @@ impl AskFollowupQuestionHandler {
 
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 "Your answer: ",
-                Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ));
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("(waiting up to {timeout_secs}s for your response)"),
                 Style::default().add_modifier(Modifier::DIM),
             ));
             ctx.output_writer.flush();
-
-            // Capture task_id for use after spawn_blocking
-            let task_id = ctx.task_id.clone();
-
-            // Use channel-based input to avoid fighting the interactive loop
-            let (sender, receiver) = std::sync::mpsc::channel();
-            crate::core::approval::set_followup_question_active(&task_id, true);
-            crate::core::approval::set_followup_sender(&task_id, sender);
 
             // Use recv_timeout to avoid blocking the TUI event loop indefinitely.
             // Same pattern as /undo, /commit, /checkpoint-restore followup prompts.
