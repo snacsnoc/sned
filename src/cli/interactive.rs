@@ -256,7 +256,7 @@ impl InteractiveSession {
     }
 
     /// Check if quiet mode is enabled (via --json flag which suppresses info output).
-    #[must_use] 
+    #[must_use]
     pub fn is_quiet(&self) -> bool {
         self.task_opts.json
     }
@@ -429,97 +429,169 @@ fn is_shutdown_submit(text: &str) -> bool {
     crate::cli::slash_commands::get_cli_only_command(text).is_some_and(|cmd| cmd.is_shutdown())
 }
 
-/// Drain output channel into app buffer.
-fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
-    let mut saw_output = false;
-    let mut pending_model_update: Option<ratatui::text::Line<'static>> = None;
+fn invalidate_mention_search(app: &mut App) {
+    app.mention_search_generation = app.mention_search_generation.wrapping_add(1);
+}
 
+fn clear_mention_search(app: &mut App, clear_results: bool) {
+    invalidate_mention_search(app);
+    app.mention_search_active = false;
+    app.mention_search_query.clear();
+    app.mention_search_deadline = Instant::now();
+    if clear_results {
+        app.picker_active = false;
+        app.picker_results.clear();
+        app.picker_index = 0;
+    }
+}
+
+fn spawn_mention_search(app: &mut App, query: String) {
+    let Some(tx) = app.mention_search_tx.clone() else {
+        return;
+    };
+    let generation = app.mention_search_generation;
+    let cwd = app.cwd.clone();
+    tokio::spawn(async move {
+        #[cfg(test)]
+        wait_for_mention_search_test_blocker().await;
+        let results = crate::core::file_search::search_workspace_files(&query, &cwd, 10).await;
+        let _ = tx.send(crate::cli::tui::app::MentionSearchUpdate {
+            generation,
+            query,
+            results,
+        });
+    });
+}
+
+fn schedule_immediate_mention_search(app: &mut App, query: String) {
+    app.mention_search_deadline = Instant::now() + Duration::from_secs(3600);
+    spawn_mention_search(app, query);
+}
+
+#[cfg(test)]
+fn mention_search_test_blocker() -> &'static std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> {
+    static BLOCKER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>> =
+        std::sync::OnceLock::new();
+    BLOCKER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_mention_search_test_blocker(blocker: Option<Arc<tokio::sync::Notify>>) {
+    *mention_search_test_blocker()
+        .lock()
+        .expect("mention search blocker mutex poisoned") = blocker;
+}
+
+#[cfg(test)]
+async fn wait_for_mention_search_test_blocker() {
+    let blocker = mention_search_test_blocker()
+        .lock()
+        .expect("mention search blocker mutex poisoned")
+        .clone();
+    if let Some(blocker) = blocker {
+        blocker.notified().await;
+    }
+}
+
+fn apply_output_event(
+    app: &mut App,
+    event: OutputEvent,
+    pending_model_update: &mut Option<ratatui::text::Line<'static>>,
+) {
     let flush_model_update = |app: &mut App, pending: &mut Option<ratatui::text::Line<'static>>| {
         if let Some(line) = pending.take() {
             app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
         }
     };
 
-    while let Ok(event) = rx.try_recv() {
-        saw_output = true;
-        match event {
-            OutputEvent::Line(line) => {
-                flush_model_update(app, &mut pending_model_update);
-                app.push_stream_line(line, crate::cli::tui::StreamKind::Model);
-            }
-            OutputEvent::ModelUpdateLine(line) => {
-                pending_model_update = Some(line);
-            }
-            OutputEvent::ToolOutputLine(line) => {
-                flush_model_update(app, &mut pending_model_update);
-                app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
-            }
-            OutputEvent::ToolHeaderLine(line) => {
-                flush_model_update(app, &mut pending_model_update);
-                app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
-            }
-            OutputEvent::CommandHeaderLine(line) => {
-                flush_model_update(app, &mut pending_model_update);
-                app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandHeader);
-            }
-            OutputEvent::CommandOutputLine(line) => {
-                flush_model_update(app, &mut pending_model_update);
-                app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
-            }
-            OutputEvent::ReasoningLine(line) => {
-                flush_model_update(app, &mut pending_model_update);
-                app.push_output_with_kind(line, crate::cli::tui::BlockKind::Reasoning);
-            }
-            OutputEvent::UserPromptLine(line) => {
-                flush_model_update(app, &mut pending_model_update);
-                app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
-            }
-            OutputEvent::RawAnsi(s) => {
-                flush_model_update(app, &mut pending_model_update);
-                // Raw ANSI events (code blocks) are already styled. We
-                // do NOT record them in turn_stream_line_indices, so
-                // turn-end replacement only re-renders the plain
-                // streamed text and leaves ANSI code blocks untouched.
-                let lines = ansi_to_ratatui_lines(&s);
-                for line in lines {
-                    app.push_output(line);
-                }
-            }
-            OutputEvent::Completion(_) => {
-                flush_model_update(app, &mut pending_model_update);
-                // Completion box is a thin status indicator — the result text
-                // is already visible as ToolOutputLine in the main output, so
-                // we never duplicate it here.
-                app.clear_completion_lines();
-                for line in
-                    crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed")
-                {
-                    app.push_completion_line(line);
-                }
-            }
-            OutputEvent::ErrorBox(msg) => {
-                flush_model_update(app, &mut pending_model_update);
-                if !msg.trim().is_empty() {
-                    app.clear_error_lines();
-                    for line in crate::cli::markdown::render_error_markdown("✗ Error", &msg) {
-                        app.push_error_line(line);
-                    }
-                }
-            }
-            OutputEvent::TurnEnd { accumulated_text } => {
-                flush_model_update(app, &mut pending_model_update);
-                app.finalize_turn_stream(&accumulated_text);
-            }
-            OutputEvent::TurnIndicator(line) => {
-                flush_model_update(app, &mut pending_model_update);
-                // Store the indicator separately from streamed lines so
-                // finalize_turn_stream can re-insert it at the top of
-                // the markdown block instead of stripping it.
-                app.push_turn_indicator(line);
+    match event {
+        OutputEvent::Line(line) => {
+            flush_model_update(app, pending_model_update);
+            app.push_stream_line(line, crate::cli::tui::StreamKind::Model);
+        }
+        OutputEvent::ModelUpdateLine(line) => {
+            *pending_model_update = Some(line);
+        }
+        OutputEvent::ToolOutputLine(line) => {
+            flush_model_update(app, pending_model_update);
+            app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
+        }
+        OutputEvent::ToolHeaderLine(line) => {
+            flush_model_update(app, pending_model_update);
+            app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
+        }
+        OutputEvent::CommandHeaderLine(line) => {
+            flush_model_update(app, pending_model_update);
+            app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandHeader);
+        }
+        OutputEvent::CommandOutputLine(line) => {
+            flush_model_update(app, pending_model_update);
+            app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
+        }
+        OutputEvent::ReasoningLine(line) => {
+            flush_model_update(app, pending_model_update);
+            app.push_output_with_kind(line, crate::cli::tui::BlockKind::Reasoning);
+        }
+        OutputEvent::UserPromptLine(line) => {
+            flush_model_update(app, pending_model_update);
+            app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
+        }
+        OutputEvent::RawAnsi(s) => {
+            flush_model_update(app, pending_model_update);
+            let lines = ansi_to_ratatui_lines(&s);
+            for line in lines {
+                app.push_output(line);
             }
         }
+        OutputEvent::Completion(_) => {
+            flush_model_update(app, pending_model_update);
+            app.clear_completion_lines();
+            for line in crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed")
+            {
+                app.push_completion_line(line);
+            }
+        }
+        OutputEvent::ErrorBox(msg) => {
+            flush_model_update(app, pending_model_update);
+            if !msg.trim().is_empty() {
+                app.clear_error_lines();
+                for line in crate::cli::markdown::render_error_markdown("✗ Error", &msg) {
+                    app.push_error_line(line);
+                }
+            }
+        }
+        OutputEvent::TurnEnd { accumulated_text } => {
+            flush_model_update(app, pending_model_update);
+            app.finalize_turn_stream(&accumulated_text);
+        }
+        OutputEvent::TurnIndicator(line) => {
+            flush_model_update(app, pending_model_update);
+            app.push_turn_indicator(line);
+        }
     }
-    flush_model_update(app, &mut pending_model_update);
+}
+
+/// Drain output channels into the app buffer, giving reliable priority
+/// events a chance to bypass a saturated main queue.
+fn drain_output_queues(
+    priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    rx: &mut mpsc::Receiver<OutputEvent>,
+    app: &mut App,
+) {
+    let mut saw_output = false;
+    let mut pending_model_update: Option<ratatui::text::Line<'static>> = None;
+
+    while let Ok(event) = priority_rx.try_recv() {
+        saw_output = true;
+        apply_output_event(app, event, &mut pending_model_update);
+    }
+    while let Ok(event) = rx.try_recv() {
+        saw_output = true;
+        apply_output_event(app, event, &mut pending_model_update);
+    }
+    if let Some(line) = pending_model_update.take() {
+        app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
+    }
     if crate::core::approval::take_approval_prompt_scroll()
         || crate::core::approval::take_followup_prompt_scroll()
     {
@@ -537,6 +609,19 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     if saw_output {
         app.clamp_to_content();
     }
+    if let Err(err) = app.flush_scrollback_pending_if_needed() {
+        tracing::warn!("Failed to flush scrollback batch: {err}");
+    }
+}
+
+/// Drain the main output channel into the app buffer.
+///
+/// Tests and non-priority codepaths can use this wrapper; the interactive
+/// loop uses `drain_output_queues` so critical fallback events are preserved.
+#[cfg(test)]
+fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
+    let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+    drain_output_queues(&mut priority_rx, rx, app);
 }
 
 fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
@@ -557,9 +642,10 @@ fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> a
 fn drain_and_render_user_submit(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
+    priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     output_rx: &mut mpsc::Receiver<OutputEvent>,
 ) -> anyhow::Result<()> {
-    drain_output(output_rx, app);
+    drain_output_queues(priority_output_rx, output_rx, app);
     app.force_bottom();
     sync_scroll_viewport(terminal, app)?;
     terminal.draw(|f| app.render(f))?;
@@ -579,7 +665,17 @@ fn record_submit_history(app: &mut App, text: &str) {
 /// `ChannelOutputWriter` without standing up a full `ratatui::DefaultTerminal`.
 #[cfg(test)]
 pub(crate) fn drain_output_for_test(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
-    drain_output(rx, app);
+    let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+    drain_output_queues(&mut priority_rx, rx, app);
+}
+
+#[cfg(test)]
+pub(crate) fn drain_output_for_test_with_priority(
+    priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    rx: &mut mpsc::Receiver<OutputEvent>,
+    app: &mut App,
+) {
+    drain_output_queues(priority_rx, rx, app);
 }
 
 fn approval_result_for_key(key: &KeyEvent) -> Option<ApprovalResult> {
@@ -860,17 +956,11 @@ async fn handle_key_event(
                 result.file_type,
             );
             app.set_input_text_and_cursor(&new_text, cursor_pos);
-            app.picker_active = false;
-            app.picker_results.clear();
-            app.mention_search_active = false;
-            app.mention_search_query.clear();
+            clear_mention_search(app, true);
             return Ok(None);
         }
         // Picker active but mention mode lost — dismiss picker and fall through
-        app.picker_active = false;
-        app.picker_results.clear();
-        app.mention_search_active = false;
-        app.mention_search_query.clear();
+        clear_mention_search(app, true);
         // Fall through to normal Enter/Tab handling
     }
 
@@ -1084,10 +1174,7 @@ async fn handle_key_event(
 
     // Escape key - dismiss picker or clear input mode
     if key.code == KeyCode::Esc && app.picker_active {
-        app.picker_active = false;
-        app.picker_results.clear();
-        app.mention_search_active = false;
-        app.mention_search_query.clear();
+        clear_mention_search(app, true);
         return Ok(None);
     }
 
@@ -1146,28 +1233,24 @@ async fn handle_key_event(
     if mq.in_mention_mode && !app.cwd.is_empty() {
         let query = mq.query;
         if !app.mention_search_active {
-            // First entry into mention mode — search immediately
+            // First entry into mention mode — activate picker immediately
+            // and run the search in the background.
             app.mention_search_active = true;
-            app.mention_search_query = query.clone();
-            let results =
-                crate::core::file_search::search_workspace_files(&query, &app.cwd, 10).await;
             app.picker_active = true;
-            app.picker_results = results;
-            app.picker_index = 0;
-            // Push deadline far forward so the main loop doesn't re-search immediately
-            app.mention_search_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(3600);
+            app.mention_search_query = query.clone();
+            invalidate_mention_search(app);
+            schedule_immediate_mention_search(app, query);
         } else if query != app.mention_search_query {
             // Query changed — reset debounce timer, keep stale results visible
+            // while any older background search results are discarded.
             app.mention_search_query = query;
+            app.picker_active = true;
+            invalidate_mention_search(app);
             app.mention_search_deadline =
                 std::time::Instant::now() + std::time::Duration::from_millis(150);
         }
     } else {
-        app.picker_active = false;
-        app.picker_results.clear();
-        app.mention_search_active = false;
-        app.mention_search_query.clear();
+        clear_mention_search(app, true);
     }
 
     // Check for slash command mode activation / update
@@ -1472,7 +1555,9 @@ async fn handle_cli_only_command(
             }
 
             let most_recent = &checkpoints[0];
-            let current_hash = checkpoint_mgr.last_checkpoint().map(std::string::String::as_str);
+            let current_hash = checkpoint_mgr
+                .last_checkpoint()
+                .map(std::string::String::as_str);
             let changed_files = if let Some(current) = current_hash {
                 checkpoint_mgr
                     .get_changed_files(&most_recent.hash, Some(current))
@@ -1829,9 +1914,7 @@ async fn handle_cli_only_command(
                         }
                     }
                     Err(e) => {
-                        app.push_plain(format!(
-                            "Warning: Could not determine changed files: {e}"
-                        ));
+                        app.push_plain(format!("Warning: Could not determine changed files: {e}"));
                     }
                 }
 
@@ -1946,33 +2029,31 @@ async fn handle_cli_only_command(
                                 app.push_plain("Cannot add steps while plan is running. Use /plan pause first.");
                             } else if step_text.trim().is_empty() {
                                 app.push_plain("Usage: /plan add <after_step> <description>");
-            } else if after_step == 0 {
-                                    match plan
-                                        .insert_step_at_beginning(step_text.trim().to_string())
-                                    {
-                                        Ok(()) => {
-                                            app.push_plain(format!(
-                                                "Step added at the beginning. ({} steps total).",
-                                                plan.steps.len()
-                                            ));
-                                        }
-                                        Err(e) => app.push_plain(format!("Error: {e}")),
+                            } else if after_step == 0 {
+                                match plan.insert_step_at_beginning(step_text.trim().to_string()) {
+                                    Ok(()) => {
+                                        app.push_plain(format!(
+                                            "Step added at the beginning. ({} steps total).",
+                                            plan.steps.len()
+                                        ));
                                     }
-                                } else {
-                                    let after_idx = after_step - 1;
-                                    match plan
-                                        .insert_step_after(after_idx, step_text.trim().to_string())
-                                    {
-                                        Ok(()) => {
-                                            app.push_plain(format!(
-                                                "Step added after step {}. ({} steps total).",
-                                                after_step,
-                                                plan.steps.len()
-                                            ));
-                                        }
-                                        Err(e) => app.push_plain(format!("Error: {e}")),
-                                    }
+                                    Err(e) => app.push_plain(format!("Error: {e}")),
                                 }
+                            } else {
+                                let after_idx = after_step - 1;
+                                match plan
+                                    .insert_step_after(after_idx, step_text.trim().to_string())
+                                {
+                                    Ok(()) => {
+                                        app.push_plain(format!(
+                                            "Step added after step {}. ({} steps total).",
+                                            after_step,
+                                            plan.steps.len()
+                                        ));
+                                    }
+                                    Err(e) => app.push_plain(format!("Error: {e}")),
+                                }
+                            }
                         }
                         PlanSubcommand::Remove(step_num) => {
                             if plan.approved && !plan.paused {
@@ -2277,6 +2358,8 @@ async fn export_agent_conversation(
 async fn run_main_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
+    priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    mention_search_rx: &mut mpsc::UnboundedReceiver<crate::cli::tui::app::MentionSearchUpdate>,
     output_rx: &mut mpsc::Receiver<OutputEvent>,
     output_writer: OutputWriterArc,
     session: Arc<Mutex<InteractiveSession>>,
@@ -2371,7 +2454,7 @@ async fn run_main_loop(
         // 1. Drain channel into app
         {
             let t = std::time::Instant::now();
-            drain_output(output_rx, app);
+            drain_output_queues(priority_output_rx, output_rx, app);
             // Surface channel overflow to the user. The writer silently
             // drops events on a full channel (src/cli/output.rs:198-213);
             // if the dropped event was the approval prompt, the user
@@ -2385,6 +2468,18 @@ async fn run_main_loop(
             let us = t.elapsed().as_micros() as u64;
             timing.drain_total_us += us;
             timing.drain_count += 1;
+        }
+
+        while let Ok(update) = mention_search_rx.try_recv() {
+            if app.mention_search_active
+                && update.generation == app.mention_search_generation
+                && update.query == app.mention_search_query
+            {
+                app.picker_active = true;
+                app.picker_results = update.results;
+                app.picker_index = 0;
+                app.needs_redraw = true;
+            }
         }
 
         // Track output lines peak
@@ -2544,10 +2639,7 @@ async fn run_main_loop(
                         if is_double_tap {
                             // Force exit on second Ctrl+C
                             if app.picker_active {
-                                app.picker_active = false;
-                                app.picker_results.clear();
-                                app.mention_search_active = false;
-                                app.mention_search_query.clear();
+                                clear_mention_search(app, true);
                             }
                             // Always export on exit, even if the agent errored out.
                             if let Some(ref export_path) = task_opts.export {
@@ -2560,6 +2652,7 @@ async fn run_main_loop(
                                     true,
                                 );
                             }
+                            let _ = app.flush_scrollback_pending();
                             return Ok(());
                         }
 
@@ -2571,10 +2664,7 @@ async fn run_main_loop(
 
                         // Dismiss picker if active
                         if app.picker_active {
-                            app.picker_active = false;
-                            app.picker_results.clear();
-                            app.mention_search_active = false;
-                            app.mention_search_query.clear();
+                            clear_mention_search(app, true);
                             continue;
                         }
 
@@ -2611,7 +2701,12 @@ async fn run_main_loop(
                             Action::Submit(text) => {
                                 // Make the echoed submit visible before any
                                 // command bookkeeping or agent startup work.
-                                drain_and_render_user_submit(terminal, app, output_rx)?;
+                                drain_and_render_user_submit(
+                                    terminal,
+                                    app,
+                                    priority_output_rx,
+                                    output_rx,
+                                )?;
 
                                 // Save to command history without rereading the
                                 // history file on the hot path.
@@ -2701,6 +2796,7 @@ async fn run_main_loop(
                                                     true,
                                                 );
                                             }
+                                            let _ = app.flush_scrollback_pending();
                                             return Ok(());
                                         }
                                         continue;
@@ -2809,15 +2905,7 @@ async fn run_main_loop(
             && std::time::Instant::now() >= app.mention_search_deadline
         {
             let query = app.mention_search_query.clone();
-            let cwd = app.cwd.clone();
-            let results = crate::core::file_search::search_workspace_files(&query, &cwd, 10).await;
-            app.picker_active = true;
-            app.picker_results = results;
-            app.picker_index = 0;
-            app.needs_redraw = true;
-            // Push deadline far forward so we don't re-search until query changes
-            app.mention_search_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(3600);
+            schedule_immediate_mention_search(app, query);
         }
 
         // 4. Check agent completion (non-blocking)
@@ -2913,6 +3001,8 @@ pub async fn run_interactive_shell_inner(
         .store(true, std::sync::atomic::Ordering::Release);
     let _guard = TerminalGuard;
     let mut app = App::new();
+    let (mention_search_tx, mut mention_search_rx) = mpsc::unbounded_channel();
+    app.mention_search_tx = Some(mention_search_tx);
     // Clear stale scrollback file from a previous session
     if let Some(ref file_path) = app.scrollback_file {
         let _ = std::fs::remove_file(file_path);
@@ -2924,7 +3014,11 @@ pub async fn run_interactive_shell_inner(
     // 2. Create output channel (bounded to prevent memory exhaustion during
     // output floods while absorbing larger streaming bursts before overflow).
     let (output_tx, mut output_rx) = mpsc::channel(output_channel_capacity());
-    let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(output_tx));
+    let channel_output_writer = ChannelOutputWriter::new(output_tx);
+    let mut priority_output_rx = channel_output_writer
+        .take_priority_rx()
+        .expect("priority output receiver must be available before sharing writer");
+    let output_writer: OutputWriterArc = Arc::new(channel_output_writer);
 
     // 3. Build session
     let session = Arc::new(Mutex::new(
@@ -3023,9 +3117,11 @@ pub async fn run_interactive_shell_inner(
 
     // 6. Main loop
     let auto_approve = task_opts.yolo || task_opts.auto_approve_all;
-    run_main_loop(
+    let run_result = run_main_loop(
         &mut terminal,
         &mut app,
+        &mut priority_output_rx,
+        &mut mention_search_rx,
         &mut output_rx,
         output_writer,
         session,
@@ -3039,7 +3135,9 @@ pub async fn run_interactive_shell_inner(
         &task_opts,
         auto_approve,
     )
-    .await?;
+    .await;
+    let _ = app.flush_scrollback_pending();
+    run_result?;
     // In JSON mode stdout is reserved for structured events, so route
     // the session ID to stderr to keep stdout parseable as JSONL.
     if task_opts.json {
@@ -3049,7 +3147,7 @@ pub async fn run_interactive_shell_inner(
     }
     Ok(())
 }
-#[must_use] 
+#[must_use]
 pub fn should_start_interactive_shell(
     has_prompt: bool,
     stdin_is_tty: bool,
@@ -3059,7 +3157,7 @@ pub fn should_start_interactive_shell(
     !has_prompt && stdin_is_tty && stdout_is_tty && !json
 }
 
-#[must_use] 
+#[must_use]
 pub fn render_interactive_prompt_prefix() -> String {
     crate::cli::colors::colorize(
         "❯ ",
@@ -3200,6 +3298,39 @@ mod tests {
 
         let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
         assert_eq!(rendered, vec!["final partial"]);
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_priority_lane_preserves_critical_prompt_under_stress() {
+        use crate::cli::output::{OutputEvent, OutputWriter};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        writer.emit(OutputEvent::plain("line 1"));
+        writer.emit(OutputEvent::RawAnsi(
+            "\nExecute this tool? (y/n/always): ".to_string(),
+        ));
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Execute this tool? (y/n/always):")),
+            "critical prompt must survive a saturated main queue: {rendered:?}"
+        );
 
         reset_prompt_state();
     }
@@ -4024,6 +4155,64 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_handle_key_event_mention_search_returns_before_background_search_finishes()
+    -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "sned-mention-search-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(tmp_dir.join("src"))?;
+        std::fs::write(tmp_dir.join("src/main.rs"), "fn main() {}")?;
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let (mention_tx, mut mention_rx) = mpsc::unbounded_channel();
+        app.cwd = tmp_dir.to_string_lossy().into_owned();
+        app.mention_search_tx = Some(mention_tx);
+
+        let blocker = Arc::new(tokio::sync::Notify::new());
+        set_mention_search_test_blocker(Some(blocker.clone()));
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('@'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.picker_active, "picker should activate immediately");
+        assert!(
+            app.mention_search_active,
+            "mention mode should stay active while the search runs in the background"
+        );
+        assert!(
+            mention_rx.try_recv().is_err(),
+            "blocked background search should not have completed before handle_key_event returns"
+        );
+
+        blocker.notify_waiters();
+        set_mention_search_test_blocker(None);
+
+        let update = tokio::time::timeout(Duration::from_secs(5), mention_rx.recv())
+            .await?
+            .expect("mention search should eventually produce a result");
+        assert_eq!(update.generation, app.mention_search_generation);
+        assert_eq!(update.query, "");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
     /// Regression test for the "s key swallowed by scrollback hotkey" bug.
     ///
     /// Before the fix, `handle_key_event` intercepted every `KeyCode::Char('s')`
@@ -4035,8 +4224,8 @@ mod tests {
     /// The fix restricts the hotkey to uppercase `S` *and* requires the input
     /// to be empty. Both invariants are exercised below.
     #[tokio::test]
-    async fn test_handle_key_event_lowercase_s_reaches_textarea_when_input_non_empty(
-    ) -> anyhow::Result<()> {
+    async fn test_handle_key_event_lowercase_s_reaches_textarea_when_input_non_empty()
+    -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (tx, _rx) = mpsc::channel(4);
@@ -4078,8 +4267,7 @@ mod tests {
     /// someone tries to "fix" the bug by always letting 's' through even when
     /// scrollback would make sense.
     #[tokio::test]
-    async fn test_handle_key_event_lowercase_s_types_into_empty_textarea(
-    ) -> anyhow::Result<()> {
+    async fn test_handle_key_event_lowercase_s_types_into_empty_textarea() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (tx, _rx) = mpsc::channel(4);
@@ -4112,8 +4300,8 @@ mod tests {
     /// hotkey). Use a temp directory for the scrollback file so the test
     /// does not pollute the user's data dir.
     #[tokio::test]
-    async fn test_handle_key_event_uppercase_s_toggles_scrollback_with_empty_input(
-    ) -> anyhow::Result<()> {
+    async fn test_handle_key_event_uppercase_s_toggles_scrollback_with_empty_input()
+    -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let tmp_dir = std::env::temp_dir().join("sned_scrollback_hotkey_test");
@@ -4139,10 +4327,7 @@ mod tests {
         .await?;
 
         assert!(action.is_none());
-        assert!(
-            app.in_scrollback,
-            "Shift+s must toggle scrollback mode"
-        );
+        assert!(app.in_scrollback, "Shift+s must toggle scrollback mode");
 
         // Cleanup
         let _ = std::fs::remove_file(&scrollback_file);
@@ -4154,8 +4339,8 @@ mod tests {
     /// an is_empty() guard — the user can press Shift+S mid-typing without
     /// first clearing the input.
     #[tokio::test]
-    async fn test_handle_key_event_shift_s_toggles_scrollback_with_non_empty_input(
-    ) -> anyhow::Result<()> {
+    async fn test_handle_key_event_shift_s_toggles_scrollback_with_non_empty_input()
+    -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let tmp_dir = std::env::temp_dir().join("sned_scrollback_hotkey_test2");
@@ -4201,8 +4386,8 @@ mod tests {
     /// without the SHIFT modifier — for example, accessibility software,
     /// IME composition, or programmatic key injection.
     #[tokio::test]
-    async fn test_handle_key_event_uppercase_s_no_modifier_types_into_textarea(
-    ) -> anyhow::Result<()> {
+    async fn test_handle_key_event_uppercase_s_no_modifier_types_into_textarea()
+    -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (tx, _rx) = mpsc::channel(4);
