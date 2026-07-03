@@ -200,7 +200,7 @@ fn wrap_line(line: &str, width: usize, indent: &str, output: &mut String) {
     // wrap iteration.
     let mut segment_start = 0;
     let mut segment_width = 0usize;
-    let mut last_space: Option<(usize, usize)> = None;
+    let mut last_break: Option<(usize, usize)> = None;
 
     fn push_segment(output: &mut String, indent: &str, segment: &str) {
         let segment = segment.trim_end();
@@ -218,20 +218,23 @@ fn wrap_line(line: &str, width: usize, indent: &str, output: &mut String) {
         let next_byte = byte_idx + ch.len_utf8();
         segment_width += ch_width;
 
-        if ch == ' ' {
-            last_space = Some((next_byte, segment_width));
+        // Accept spaces and URL/path separators as break points so long
+        // URLs and file paths wrap at meaningful boundaries instead of
+        // garbling mid-sequence.
+        if ch == ' ' || ch == '/' || ch == '?' || ch == '#' {
+            last_break = Some((next_byte, segment_width));
         }
 
         if segment_width <= available_width {
             continue;
         }
 
-        if let Some((space_byte, space_width)) = last_space.take()
-            && space_byte > segment_start
+        if let Some((break_byte, break_width)) = last_break.take()
+            && break_byte > segment_start
         {
-            push_segment(output, indent, &trimmed[segment_start..space_byte]);
-            segment_start = space_byte;
-            segment_width = segment_width.saturating_sub(space_width);
+            push_segment(output, indent, &trimmed[segment_start..break_byte]);
+            segment_start = break_byte;
+            segment_width = segment_width.saturating_sub(break_width);
             continue;
         }
 
@@ -239,7 +242,7 @@ fn wrap_line(line: &str, width: usize, indent: &str, output: &mut String) {
             push_segment(output, indent, &trimmed[segment_start..byte_idx]);
             segment_start = byte_idx;
             segment_width = ch_width;
-            last_space = if ch == ' ' {
+            last_break = if ch == ' ' || ch == '/' || ch == '?' || ch == '#' {
                 Some((next_byte, ch_width))
             } else {
                 None
@@ -252,7 +255,7 @@ fn wrap_line(line: &str, width: usize, indent: &str, output: &mut String) {
         push_segment(output, indent, &trimmed[segment_start..next_byte]);
         segment_start = next_byte;
         segment_width = 0;
-        last_space = None;
+        last_break = None;
     }
 
     if segment_start < trimmed.len() {
