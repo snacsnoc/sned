@@ -280,8 +280,9 @@ pub struct App {
 }
 
 impl App {
-    /// Convert a ratatui Line to a plain text string (ignores styling).
-    fn line_to_string(line: &Line<'static>) -> String {
+    /// Extract plain text for dedup comparison. Styling artifacts from markdown
+    /// re-render would corrupt the match against the raw completion result.
+    pub(crate) fn line_to_string(line: &Line<'static>) -> String {
         let mut out = String::new();
         for span in &line.spans {
             out.push_str(&span.content);

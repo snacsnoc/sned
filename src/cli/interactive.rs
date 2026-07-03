@@ -6,6 +6,7 @@
 use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
+use crate::cli::tui::BlockKind;
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::{ApprovalResult, is_approval_prompt_active, take_approval_sender};
 use crate::providers::Provider;
@@ -543,11 +544,48 @@ fn apply_output_event(
                 app.push_output(line);
             }
         }
-        OutputEvent::Completion(_) => {
+        OutputEvent::Completion(result) => {
             flush_model_update(app, pending_model_update);
             app.clear_completion_lines();
-            for line in crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed")
-            {
+            // Concatenate consecutive Model lines because wrapped responses and
+            // markdown-re-rendered content split the original text across multiple
+            // visual lines. Comparing individual lines would always fail to match.
+            let mut model_text = String::new();
+            let mut in_model_sequence = false;
+            for (line, kind) in app.output_lines.iter().zip(app.output_line_kinds.iter()) {
+                if *kind == BlockKind::Model {
+                    if !in_model_sequence {
+                        in_model_sequence = true;
+                        model_text.clear();
+                    }
+                    if !model_text.is_empty() {
+                        model_text.push('\n');
+                    }
+                    model_text.push_str(&App::line_to_string(line));
+                } else {
+                    if in_model_sequence {
+                        if model_text == result {
+                            for line in crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed") {
+                                app.push_completion_line(line);
+                            }
+                            return;
+                        }
+                        in_model_sequence = false;
+                        model_text.clear();
+                    }
+                }
+            }
+            // Model lines may end at the last entry without a non-Model line to
+            // trigger the comparison, so we must check the trailing sequence here.
+            if in_model_sequence && model_text == result {
+                for line in crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed") {
+                    app.push_completion_line(line);
+                }
+                return;
+            }
+            // The completion text contains information not already visible in the
+            // output area, so we must render it to avoid losing the result.
+            for line in crate::cli::markdown::render_completion_markdown("🚀 Task Completed: ", &result) {
                 app.push_completion_line(line);
             }
         }
