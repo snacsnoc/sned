@@ -4,9 +4,9 @@
 //! file picker, input queuing, and agent lifecycle.
 
 use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
+use crate::cli::tui::BlockKind;
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
-use crate::cli::tui::BlockKind;
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::{ApprovalResult, is_approval_prompt_active, take_approval_sender};
 use crate::providers::Provider;
@@ -564,8 +564,11 @@ fn apply_output_event(
                     model_text.push_str(&App::line_to_string(line));
                 } else {
                     if in_model_sequence {
-                        if model_text == result {
-                            for line in crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed") {
+                        if model_text.trim() == result.trim() {
+                            for line in crate::cli::markdown::render_completion_markdown(
+                                "🚀 ",
+                                "Task Completed",
+                            ) {
                                 app.push_completion_line(line);
                             }
                             return;
@@ -577,15 +580,19 @@ fn apply_output_event(
             }
             // Model lines may end at the last entry without a non-Model line to
             // trigger the comparison, so we must check the trailing sequence here.
-            if in_model_sequence && model_text == result {
-                for line in crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed") {
+            if in_model_sequence && model_text.trim() == result.trim() {
+                for line in
+                    crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed")
+                {
                     app.push_completion_line(line);
                 }
                 return;
             }
             // The completion text contains information not already visible in the
             // output area, so we must render it to avoid losing the result.
-            for line in crate::cli::markdown::render_completion_markdown("🚀 Task Completed: ", &result) {
+            for line in
+                crate::cli::markdown::render_completion_markdown("🚀 Task Completed: ", &result)
+            {
                 app.push_completion_line(line);
             }
         }
@@ -619,11 +626,16 @@ fn drain_output_queues(
     let mut saw_output = false;
     let mut pending_model_update: Option<ratatui::text::Line<'static>> = None;
 
-    while let Ok(event) = priority_rx.try_recv() {
+    while let Ok(event) = rx.try_recv() {
         saw_output = true;
         apply_output_event(app, event, &mut pending_model_update);
     }
-    while let Ok(event) = rx.try_recv() {
+    // Priority-lane events are emitted only when the bounded queue rejected
+    // them, so they are newer than the still-buffered main-queue backlog.
+    // Draining them last preserves the user-visible chronology and keeps a
+    // blocking approval prompt anchored at the bottom instead of burying it
+    // above older output that happened to drain later.
+    while let Ok(event) = priority_rx.try_recv() {
         saw_output = true;
         apply_output_event(app, event, &mut pending_model_update);
     }
@@ -3382,6 +3394,63 @@ mod tests {
             "critical prompt must survive a saturated main queue: {rendered:?}"
         );
 
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_priority_lane_keeps_approval_prompt_last_for_visibility() {
+        use crate::cli::output::{OutputEvent, OutputWriter};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        crate::core::approval::set_approval_prompt_active(true);
+        crate::core::approval::set_approval_prompt_scroll();
+
+        let (tx, mut rx) = mpsc::channel(20);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        for index in 0..20 {
+            writer.emit(OutputEvent::plain(format!("backlog line {index:02}")));
+        }
+        writer.emit(OutputEvent::RawAnsi(
+            "\nExecute this tool? (y/n/always): \n".to_string(),
+        ));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        for index in 0..50 {
+            app.push_plain(format!("old line {index:02}"));
+        }
+
+        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+        let output_bottom_rows: Vec<&String> = rows.iter().rev().take(15).collect();
+
+        assert!(
+            output_bottom_rows
+                .iter()
+                .any(|row| row.contains("Execute this tool?")),
+            "priority-lane approval prompt must remain visible after older backlog drains: {output_bottom_rows:?}"
+        );
+
+        crate::core::approval::set_approval_prompt_active(false);
+        crate::core::approval::clear_approval_prompt_scroll();
         reset_prompt_state();
     }
 
