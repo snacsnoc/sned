@@ -161,6 +161,8 @@ pub struct App {
     pub output_overflow: bool,
     /// Total number of dropped events, for the status bar indicator.
     pub output_overflow_count: u64,
+    /// Number of messages queued for the agent.
+    pub queued_message_count: usize,
     /// Path to the scrollback file for evicted output lines.
     pub scrollback_file: Option<std::path::PathBuf>,
     /// Number of lines stored in the scrollback file.
@@ -214,7 +216,7 @@ pub struct App {
     /// Seconds value the cached right segment was built for.
     /// Last known context usage percentage from the API.
     pub context_pct: Option<f64>,
-    pub cached_status_right_secs: (u64, Option<f64>, bool, u64),
+    pub cached_status_right_secs: (u64, Option<f64>, bool, u64, usize),
     /// Cached spacer string for the status bar.
     pub cached_spacer: String,
     /// Length the cached spacer was built for.
@@ -389,7 +391,7 @@ impl App {
             cached_status_left: String::new(),
             status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
             cached_status_right: String::new(),
-            cached_status_right_secs: (u64::MAX, None, false, 0),
+            cached_status_right_secs: (u64::MAX, None, false, 0, 0),
             context_pct: None,
             cached_spacer: String::new(),
             cached_spacer_len: 0,
@@ -413,6 +415,7 @@ impl App {
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
             output_overflow: false,
             output_overflow_count: 0,
+            queued_message_count: 0,
             scrollback_file: Some(crate::storage::disk::get_data_dir().join("scrollback/lines")),
             scrollback_count: 0,
             scrollback_pending: String::new(),
@@ -1547,6 +1550,7 @@ impl App {
             self.context_pct,
             self.output_overflow,
             self.output_overflow_count,
+            self.queued_message_count,
         );
         if context_key != self.cached_status_right_secs {
             let context_str = self
@@ -1560,21 +1564,42 @@ impl App {
             } else {
                 None
             };
-            self.cached_status_right = match (overflow_str, context_str, self.elapsed) {
-                (Some(ovf), Some(ctx), Some(elapsed)) => {
+            let queued_str = if self.queued_message_count > 0 {
+                Some(format!("📨 {} queued · ", self.queued_message_count))
+            } else {
+                None
+            };
+            self.cached_status_right = match (overflow_str, context_str, queued_str, self.elapsed) {
+                (Some(ovf), Some(ctx), Some(q), Some(elapsed)) => {
+                    format!("{}{}{}⏱ {} ", ovf, ctx, q, format_duration(elapsed))
+                }
+                (Some(ovf), Some(ctx), Some(q), None) => format!("{ovf}{ctx}{q} "),
+                (Some(ovf), None, Some(q), Some(elapsed)) => {
+                    format!("{}{}⏱ {} ", ovf, q, format_duration(elapsed))
+                }
+                (Some(ovf), None, Some(q), None) => format!("{ovf}{q} "),
+                (None, Some(ctx), Some(q), Some(elapsed)) => {
+                    format!("{}{}⏱ {} ", ctx, q, format_duration(elapsed))
+                }
+                (None, Some(ctx), Some(q), None) => format!("{ctx}{q} "),
+                (None, None, Some(q), Some(elapsed)) => {
+                    format!("{}⏱ {} ", q, format_duration(elapsed))
+                }
+                (None, None, Some(q), None) => format!("{q} "),
+                (Some(ovf), Some(ctx), None, Some(elapsed)) => {
                     format!("{}{}⏱ {} ", ovf, ctx, format_duration(elapsed))
                 }
-                (Some(ovf), Some(ctx), None) => format!("{ovf}{ctx} "),
-                (Some(ovf), None, Some(elapsed)) => {
+                (Some(ovf), Some(ctx), None, None) => format!("{ovf}{ctx} "),
+                (Some(ovf), None, None, Some(elapsed)) => {
                     format!("{}⏱ {} ", ovf, format_duration(elapsed))
                 }
-                (Some(ovf), None, None) => format!("{ovf} "),
-                (None, Some(ctx), Some(elapsed)) => {
+                (Some(ovf), None, None, None) => format!("{ovf} "),
+                (None, Some(ctx), None, Some(elapsed)) => {
                     format!("{}⏱ {} ", ctx, format_duration(elapsed))
                 }
-                (None, Some(ctx), None) => format!("{ctx} "),
-                (None, None, Some(elapsed)) => format!("⏱ {} ", format_duration(elapsed)),
-                (None, None, None) => String::new(),
+                (None, Some(ctx), None, None) => format!("{ctx} "),
+                (None, None, None, Some(elapsed)) => format!("⏱ {} ", format_duration(elapsed)),
+                (None, None, None, None) => String::new(),
             };
             self.cached_status_right_secs = context_key;
         }

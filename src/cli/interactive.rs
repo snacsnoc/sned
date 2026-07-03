@@ -2465,6 +2465,18 @@ async fn run_main_loop(
                 app.output_overflow_count = output_writer.dropped_count();
                 app.needs_redraw = true;
             }
+            // Poll queue count from AgentLoop so the TUI can show it in the status bar.
+            {
+                if let Ok(qh) = queue_handle.try_lock()
+                    && let Some(handle) = qh.as_ref()
+                    && let Some(new_count) = handle.try_queued_message_count()
+                {
+                    if new_count != app.queued_message_count {
+                        app.queued_message_count = new_count;
+                        app.needs_redraw = true;
+                    }
+                }
+            }
             let us = t.elapsed().as_micros() as u64;
             timing.drain_total_us += us;
             timing.drain_count += 1;

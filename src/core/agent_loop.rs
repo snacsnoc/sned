@@ -477,6 +477,11 @@ impl MessageQueueHandle {
         self.queue.lock().await.len()
     }
 
+    /// Synchronous queue length (for use in the TUI main loop).
+    pub fn try_queued_message_count(&self) -> Option<usize> {
+        self.queue.try_lock().ok().map(|q| q.len())
+    }
+
     pub async fn has_queued_messages(&self) -> bool {
         !self.queue.lock().await.is_empty()
     }
@@ -1170,11 +1175,21 @@ impl AgentLoop {
                     if !self.config.json_output {
                         if queue_remaining > 0 {
                             info!(
-                                "\n[sned] Processing queued message ({} more queued)\n",
+                                "[sned] Processing queued message ({} more queued)",
                                 queue_remaining
                             );
+                            self.config.output_writer.emit(OutputEvent::info(
+                                format!("Processing queued message ({} more queued)", queue_remaining),
+                            ));
                         } else {
-                            info!("\n[sned] Processing queued message\n");
+                            info!("[sned] Processing queued message");
+                            self.config.output_writer.emit(OutputEvent::info(
+                                "Processing queued message",
+                            ));
+                        }
+                        // Re-display the queued message as a user prompt in the TUI output.
+                        if let MessageContent::Text(ref text) = queued_message.content {
+                            self.config.output_writer.emit(OutputEvent::user_prompt_line(text));
                         }
                     }
                     let expanded_message = self.expand_message_mentions(queued_message).await;
@@ -1214,7 +1229,10 @@ impl AgentLoop {
                 TurnResult::Continue => {
                     self.current_turn_retry_candidate = None;
                     if dequeued_message_for_notification && !self.config.json_output {
-                        info!("\n[sned] Queued message sent to provider\n");
+                        info!("[sned] Queued message sent to provider");
+                        self.config.output_writer.emit(OutputEvent::info(
+                            "Queued message sent to provider",
+                        ));
                     }
                     dequeued_message_for_notification = false;
                     continue;
@@ -1222,7 +1240,10 @@ impl AgentLoop {
                 TurnResult::Complete => {
                     self.current_turn_retry_candidate = None;
                     if dequeued_message_for_notification && !self.config.json_output {
-                        info!("\n[sned] Queued message sent to provider\n");
+                        info!("[sned] Queued message sent to provider");
+                        self.config.output_writer.emit(OutputEvent::info(
+                            "Queued message sent to provider",
+                        ));
                     }
                     dequeued_message_for_notification = false;
 
@@ -1236,11 +1257,21 @@ impl AgentLoop {
                             if !self.config.json_output {
                                 if queue_remaining > 0 {
                                     info!(
-                                        "\n[sned] Processing queued message ({} more queued)\n",
-                                        queue_remaining
+                                        "[sned] Processing queued message ({} more queued)",
+                                        queue_remaining,
                                     );
+                                    self.config.output_writer.emit(OutputEvent::info(
+                                        format!("Processing queued message ({} more queued)", queue_remaining),
+                                    ));
                                 } else {
-                                    info!("\n[sned] Processing queued message\n");
+                                    info!("[sned] Processing queued message");
+                                    self.config.output_writer.emit(OutputEvent::info(
+                                        "Processing queued message",
+                                    ));
+                                }
+                                // Re-display the queued message as a user prompt in the TUI output.
+                                if let MessageContent::Text(ref text) = queued_message.content {
+                                    self.config.output_writer.emit(OutputEvent::user_prompt_line(text));
                                 }
                             }
                             let expanded_message =
