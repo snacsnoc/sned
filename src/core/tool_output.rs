@@ -284,12 +284,9 @@ pub fn format_heat_map(edit_files: &[(String, i32, i32)]) -> String {
         String::new()
     };
 
-    format!(
-        "🔥 {} files: {}{}",
-        sorted.len(),
-        files_str.join("  "),
-        more_str
-    )
+    let file_count_word = if sorted.len() == 1 { "file" } else { "files" };
+    let count_prefix = format!("🔥 {} {}: ", sorted.len(), file_count_word);
+    format!("{}{}{}", count_prefix, files_str.join("  "), more_str)
 }
 
 /// Strip the hash anchor prefix (Word§) from a single line.
