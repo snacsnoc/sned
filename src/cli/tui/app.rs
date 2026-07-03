@@ -741,26 +741,26 @@ impl App {
         // emitted immediately when the model streamed them.
         let insert_at = *model_entry_indices.iter().min().unwrap();
 
-        // The turn indicator ("\u{2666}") was prepended inline to the
-        // first streamed model line by `print_model_line_with_prefix_if_pending`.
-        // That line was recorded in `turn_stream_entries` and is
-        // about to be popped, so prepend the same prefix to the markdown
-        // text before re-rendering. This keeps the indicator on the
-        // same line as the start of the response instead of dropping it
-        // or forcing it onto its own line.
-        let prefixed_markdown = if self.turn_indicator.take().is_some() {
-            format!("\u{2666} {markdown_text}")
-        } else {
-            markdown_text.to_string()
-        };
-        // Collect rendered lines, then insert in reverse at the same
-        // position. Each insert is O(1) amortized (tail-shift only),
-        // avoiding the O(n²) cost of inserting each line at a growing
-        // index in a VecDeque.  `output_line_kinds` is kept in lockstep
-        // so render-time grouping still sees BlockKind::Model for the
-        // re-rendered markdown.
-        let rendered: Vec<Line<'static>> =
-            crate::cli::markdown::render_markdown(None, &prefixed_markdown);
+        // Render the markdown text first, then prepend the turn indicator
+        // as a styled span to the first rendered line. Prepending the
+        // indicator to the markdown string would make `render_markdown`
+        // parse "♦ " as paragraph text, breaking the visual hierarchy.
+        // Prepending as a span keeps the indicator on the same line as
+        // the start of the response.
+        let have_indicator = self.turn_indicator.take().is_some();
+        let mut rendered: Vec<Line<'static>> =
+            crate::cli::markdown::render_markdown(None, markdown_text);
+        if have_indicator
+            && let Some(first) = rendered.first_mut()
+        {
+            let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
+            new_spans.push(Span::styled(
+                "\u{2666} ",
+                Style::default().fg(crate::cli::tui::theme::ACCENT),
+            ));
+            new_spans.extend(first.spans.iter().cloned());
+            first.spans = new_spans;
+        }
         for line in rendered.into_iter().rev() {
             self.output_lines.insert(insert_at, line);
             self.output_line_kinds.insert(insert_at, BlockKind::Model);
@@ -1400,6 +1400,9 @@ impl App {
         if prev == BlockKind::Separator || next == BlockKind::Separator {
             return false;
         }
+        // Insert separators between model text and tool/command blocks
+        // to visually group related output. Also separate tool headers
+        // from their output, and command headers from their output.
         matches!(
             (prev, next),
             (
@@ -1419,7 +1422,8 @@ impl App {
                         | BlockKind::Reasoning
                         | BlockKind::UserPrompt,
                     BlockKind::Model,
-                )
+                ) | (BlockKind::ToolHeader, BlockKind::ToolOutput)
+                    | (BlockKind::CommandHeader, BlockKind::CommandOutput)
         )
     }
 
