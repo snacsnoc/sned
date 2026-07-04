@@ -746,6 +746,7 @@ mod tests {
                 OutputEvent::CommandOutputLine(line) => line.to_string(),
                 OutputEvent::ReasoningLine(line) => line.to_string(),
                 OutputEvent::UserPromptLine(line) => line.to_string(),
+                OutputEvent::ApprovalDropped => String::new(),
             };
             self.events.lock().unwrap().push(text);
         }

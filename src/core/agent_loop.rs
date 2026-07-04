@@ -4497,6 +4497,7 @@ mod tests {
                 crate::cli::output::OutputEvent::UserPromptLine(line) => {
                     rendered.push(line.to_string())
                 }
+                crate::cli::output::OutputEvent::ApprovalDropped => {}
             }
         }
         rendered

@@ -43,7 +43,7 @@ fn format_context_window(tokens: u64) -> String {
     }
 }
 
-const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 16_384;
+const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 262_144;
 
 fn parse_output_channel_capacity(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.parse::<usize>().ok())
@@ -612,6 +612,16 @@ fn apply_output_event(
         OutputEvent::TurnIndicator(line) => {
             flush_model_update(app, pending_model_update);
             app.push_turn_indicator(line);
+        }
+        // Approval prompt was durably dropped. The user never saw it,
+        // so show a warning and suggest recovery via /retry.
+        OutputEvent::ApprovalDropped => {
+            flush_model_update(app, pending_model_update);
+            app.push_styled(
+                "[sned] Approval prompt was lost due to output overflow. Tool was auto-denied. Use /retry to regenerate the last response.",
+                ratatui::style::Style::default()
+                    .fg(crate::cli::tui::theme::WARNING_FG),
+            );
         }
     }
 }
@@ -2513,6 +2523,7 @@ async fn run_main_loop(
             if output_writer.take_overflow_signal() {
                 app.output_overflow = true;
                 app.output_overflow_count = output_writer.dropped_count();
+                app.output_overflow_summary = output_writer.drop_summary();
                 app.needs_redraw = true;
             }
             // Poll queue count from AgentLoop so the TUI can show it in the status bar.
@@ -3370,6 +3381,9 @@ mod tests {
 
         let _lock = crate::core::approval::approval_test_guard();
         reset_prompt_state();
+        // Set approval prompt active so the auto-deny path triggers when
+        // the RawAnsi is dropped from the full channel.
+        crate::core::approval::set_approval_prompt_active(true);
 
         let (tx, mut rx) = mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
@@ -3386,12 +3400,20 @@ mod tests {
         app.set_content_width(80);
         drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
 
-        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        // Approval prompts are no longer sent to the priority lane. They are
+        // dropped from the full channel and auto-denied via take_approval_sender().
+        // The priority lane should be empty because the approval prompt was
+        // non-critical and dropped.
         assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains("Execute this tool? (y/n/always):")),
-            "critical prompt must survive a saturated main queue: {rendered:?}"
+            priority_rx.try_recv().is_err(),
+            "approval prompt should not be in priority lane (auto-denied instead)"
+        );
+        // The dropped count should be > 0 because the approval prompt
+        // was dropped from the full channel.
+        assert!(
+            writer.dropped_count() > 0,
+            "approval prompt drop should be counted: {:?}",
+            app.output_lines
         );
 
         reset_prompt_state();
@@ -3433,20 +3455,17 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("render should succeed");
 
-        let buffer = terminal.backend().buffer().clone();
-        let width = buffer.area.width as usize;
-        let rows: Vec<String> = buffer
-            .content()
-            .chunks(width)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect();
-        let output_bottom_rows: Vec<&String> = rows.iter().rev().take(15).collect();
-
+        // Approval prompts are no longer sent to the priority lane. They are
+        // dropped from the full channel and auto-denied via take_approval_sender().
+        // The priority lane should be empty.
         assert!(
-            output_bottom_rows
-                .iter()
-                .any(|row| row.contains("Execute this tool?")),
-            "priority-lane approval prompt must remain visible after older backlog drains: {output_bottom_rows:?}"
+            priority_rx.try_recv().is_err(),
+            "approval prompt should not be in priority lane (auto-denied instead)"
+        );
+        // The overflow signal should be set because the main channel was full.
+        assert!(
+            writer.take_overflow_signal(),
+            "overflow should be signaled when main channel is saturated"
         );
 
         crate::core::approval::set_approval_prompt_active(false);

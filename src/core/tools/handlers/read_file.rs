@@ -688,6 +688,7 @@ use crate::core::agent_loop::TaskState;
                 crate::cli::output::OutputEvent::UserPromptLine(line) => {
                     rendered.push(line.to_string())
                 }
+                crate::cli::output::OutputEvent::ApprovalDropped => {}
             }
         }
         rendered

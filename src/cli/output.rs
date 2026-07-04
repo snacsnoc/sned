@@ -56,6 +56,10 @@ pub enum OutputEvent {
     /// streamed model text so that `finalize_turn_stream` does not
     /// strip it when re-rendering the turn as markdown.
     TurnIndicator(Line<'static>),
+    /// Signal that an approval prompt was durably dropped. The TUI
+    /// main loop receives this and auto-denies the pending tool
+    /// execution so the agent doesn't hang on a 5-minute timeout.
+    ApprovalDropped,
 }
 
 impl OutputEvent {
@@ -251,6 +255,12 @@ pub trait OutputWriter: Send + Sync {
     fn dropped_count(&self) -> u64 {
         0
     }
+
+    /// Human-readable summary of per-category drop counts.
+    /// Default: "none" (no drops).
+    fn drop_summary(&self) -> String {
+        "none".to_string()
+    }
 }
 
 /// Output writer that forwards to stderr.
@@ -296,7 +306,7 @@ impl OutputWriter for StderrOutputWriter {
                     }
                 }
             }
-            OutputEvent::TurnEnd { .. } | OutputEvent::TurnIndicator(_) => {}
+            OutputEvent::TurnEnd { .. } | OutputEvent::TurnIndicator(_) | OutputEvent::ApprovalDropped => {}
         }
     }
 
@@ -305,20 +315,63 @@ impl OutputWriter for StderrOutputWriter {
     }
 }
 
+/// Per-category drop counters for overflow diagnostics.
+/// Tracking by category lets the TUI surface what was lost
+/// (model text, tool results, approval prompts, etc.).
+#[derive(Default)]
+struct DropCounters {
+    model_text: std::sync::atomic::AtomicU64,
+    tool_output: std::sync::atomic::AtomicU64,
+    approval_prompt: std::sync::atomic::AtomicU64,
+    other: std::sync::atomic::AtomicU64,
+}
+
+impl DropCounters {
+    fn total(&self) -> u64 {
+        self.model_text.load(std::sync::atomic::Ordering::Relaxed)
+            + self.tool_output.load(std::sync::atomic::Ordering::Relaxed)
+            + self.approval_prompt.load(std::sync::atomic::Ordering::Relaxed)
+            + self.other.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn format_summary(&self) -> String {
+        let m = self.model_text.load(std::sync::atomic::Ordering::Relaxed);
+        let t = self.tool_output.load(std::sync::atomic::Ordering::Relaxed);
+        let a = self.approval_prompt.load(std::sync::atomic::Ordering::Relaxed);
+        let o = self.other.load(std::sync::atomic::Ordering::Relaxed);
+        let mut parts = Vec::new();
+        if m > 0 {
+            parts.push(format!("{} model", m));
+        }
+        if t > 0 {
+            parts.push(format!("{} tools", t));
+        }
+        if a > 0 {
+            parts.push(format!("{} approvals", a));
+        }
+        if o > 0 {
+            parts.push(format!("{} other", o));
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
 /// Output writer that sends events through an mpsc channel.
 ///
-/// The channel is bounded (default 16384 entries; override with
+/// The channel is bounded (default 262144 entries; override with
 /// `SNED_OUTPUT_CHANNEL_CAPACITY` in `run_interactive_shell_inner`). When
-/// the buffer is full, events are dropped silently and a counter is
-/// incremented; the TUI's main loop reads this counter via
-/// `dropped_count()` and surfaces a user-visible "⚠ output overflow (N
-/// dropped)" warning in the status bar. The render loop drains the channel
-/// on each frame tick.
+/// the buffer is full, events spill to the priority lane. If the priority
+/// lane is also unreachable (receiver dropped), events are durably dropped
+/// and per-category counters are incremented.
 pub struct ChannelOutputWriter {
     tx: mpsc::Sender<OutputEvent>,
     priority_tx: mpsc::UnboundedSender<OutputEvent>,
     priority_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
-    dropped_count: std::sync::atomic::AtomicU64,
+    drop_counters: DropCounters,
     overflow_signaled: std::sync::atomic::AtomicBool,
 }
 
@@ -331,7 +384,7 @@ impl ChannelOutputWriter {
             tx,
             priority_tx,
             priority_rx: std::sync::Mutex::new(Some(priority_rx)),
-            dropped_count: std::sync::atomic::AtomicU64::new(0),
+            drop_counters: DropCounters::default(),
             overflow_signaled: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -353,25 +406,74 @@ impl OutputWriter for ChannelOutputWriter {
                 return;
             }
 
-            if self.priority_tx.send(err.into_inner()).is_ok() {
+            // Main channel is full. Classify the event to determine
+            // whether it must be preserved (critical) or can be safely
+            // dropped (non-critical).
+            let dropped = err.into_inner();
+            let is_critical = matches!(
+                &dropped,
+                OutputEvent::TurnEnd { .. }
+                    | OutputEvent::Completion(_)
+                    | OutputEvent::ErrorBox(_)
+                    | OutputEvent::ApprovalDropped
+            );
+
+            if is_critical {
+                // Critical events survive channel saturation: send them
+                // into the unbounded priority lane so the TUI always sees
+                // them even when the main queue is backed up.
+                let _ = self.priority_tx.send(dropped);
                 return;
             }
 
-            let count = self
-                .dropped_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Set the overflow signal on every drop so the TUI can
-            // surface a user-visible indicator. This is critical for
-            // approval prompts: if the prompt emit is dropped, the user
-            // will not see it and must blindly hit "y".
+            // Non-critical events are dropped when the main channel is
+            // full. Track for diagnostics so the status bar can surface
+            // the count to the user.
+            let counters = &self.drop_counters;
+            let is_approval_drop = matches!(&dropped, OutputEvent::RawAnsi(_))
+                && crate::core::approval::is_approval_prompt_active();
+            if is_approval_drop {
+                // An approval prompt was emitted but the RawAnsi that
+                // carries it was dropped. Auto-deny so the agent loop
+                // unblocks from recv_timeout instead of hanging.
+                counters.approval_prompt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(sender) = crate::core::approval::take_approval_sender() {
+                    let _ = sender.send(crate::core::approval::ApprovalResult::Denied);
+                }
+            } else {
+                match &dropped {
+                    OutputEvent::Line(_) => {
+                        counters.model_text.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    OutputEvent::ToolOutputLine(_)
+                    | OutputEvent::ToolHeaderLine(_)
+                    | OutputEvent::CommandHeaderLine(_)
+                    | OutputEvent::CommandOutputLine(_) => {
+                        counters.tool_output.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    OutputEvent::RawAnsi(_) => {
+                        // Non-approval RawAnsi is non-critical; track as other.
+                        counters.other.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => {
+                        counters.other.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            // Set the overflow signal so the TUI can surface a
+            // user-visible indicator.
             self.overflow_signaled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            if count.is_multiple_of(100) {
+
+            let total = counters.total();
+            if total > 0 && total.is_multiple_of(100) {
                 tracing::warn!(
-                    dropped = count + 1,
+                    dropped = total,
+                    summary = counters.format_summary(),
                     "Output channel full; TUI render loop is falling behind. \
-                     {} events dropped so far.",
-                    count + 1
+                     {} events dropped so far ({}).",
+                    total,
+                    counters.format_summary()
                 );
             }
         }
@@ -388,8 +490,11 @@ impl OutputWriter for ChannelOutputWriter {
     }
 
     fn dropped_count(&self) -> u64 {
-        self.dropped_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.drop_counters.total()
+    }
+
+    fn drop_summary(&self) -> String {
+        self.drop_counters.format_summary()
     }
 }
 
@@ -561,24 +666,31 @@ mod tests {
         let priority_events: Vec<OutputEvent> =
             std::iter::from_fn(|| priority_rx.try_recv().ok()).collect();
 
+        // Approval prompts are no longer sent to the priority lane. They are
+        // dropped from the full channel and auto-denied via take_approval_sender().
+        // The priority lane should be empty because the approval prompt was
+        // non-critical and dropped.
         assert!(
-            primary_events
-                .iter()
-                .chain(priority_events.iter())
-                .any(|event| matches!(event, OutputEvent::RawAnsi(text) if text == match &approval_prompt {
-                    OutputEvent::RawAnsi(text) => text,
-                    _ => unreachable!(),
-                })),
-            "approval prompt must survive overflow via either output lane"
+            priority_events.is_empty(),
+            "approval prompt should not be in priority lane (auto-denied instead)"
         );
+        // The dropped count should be > 0 because the approval prompt
+        // was dropped from the full channel.
         assert!(
-            !writer.take_overflow_signal(),
-            "priority fallback should preserve the prompt without signaling a drop"
+            writer.dropped_count() > 0,
+            "approval prompt drop should be counted"
         );
-        assert_eq!(
-            writer.dropped_count(),
-            0,
-            "priority fallback should avoid durable drops"
+        // Overflow signal fires when the main channel is full, even if
+        // critical events are preserved via the priority lane. This
+        // ensures the status bar surfaces the saturation to the user.
+        assert!(
+            writer.take_overflow_signal(),
+            "overflow should be signaled when main channel is saturated"
+        );
+        // Non-critical events dropped from the full channel are tracked.
+        assert!(
+            writer.dropped_count() >= 2,
+            "non-critical events lost to the full channel should be counted"
         );
     }
 

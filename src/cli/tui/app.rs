@@ -161,6 +161,8 @@ pub struct App {
     pub output_overflow: bool,
     /// Total number of dropped events, for the status bar indicator.
     pub output_overflow_count: u64,
+    /// Per-category drop summary string (e.g. "5 model, 3 tools, 1 approval").
+    pub output_overflow_summary: String,
     /// Number of messages queued for the agent.
     pub queued_message_count: usize,
     /// Path to the scrollback file for evicted output lines.
@@ -416,6 +418,7 @@ impl App {
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
             output_overflow: false,
             output_overflow_count: 0,
+            output_overflow_summary: String::new(),
             queued_message_count: 0,
             scrollback_file: Some(crate::storage::disk::get_data_dir().join("scrollback/lines")),
             scrollback_count: 0,
@@ -1563,8 +1566,13 @@ impl App {
                 .map(|pct| format!("Context: {:.0}% left · ", 100.0 - pct));
             let overflow_str = if self.output_overflow {
                 Some(format!(
-                    "⚠ output overflow ({} dropped) · ",
-                    self.output_overflow_count
+                    "⚠ output overflow ({} dropped{}) · ",
+                    self.output_overflow_count,
+                    if self.output_overflow_summary.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", self.output_overflow_summary)
+                    }
                 ))
             } else {
                 None
