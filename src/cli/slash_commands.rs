@@ -9,7 +9,7 @@ const SLASH_COMMAND_REGEX: &str = r"(^|\s)\/([a-zA-Z0-9_.:@-]+)";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     NewTask,
-    Smol,
+    Compact,
     NewRule,
     ExplainChanges,
     SkillCommand { name: String },
@@ -21,7 +21,7 @@ impl SlashCommand {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "newtask" => Some(Self::NewTask),
-            "compact" => Some(Self::Smol),
+            "compact" => Some(Self::Compact),
             "newrule" => Some(Self::NewRule),
             "explain-changes" => Some(Self::ExplainChanges),
             _ => None,
@@ -74,14 +74,14 @@ impl SlashCommand {
 
     #[must_use] 
     pub fn is_compact(&self) -> bool {
-        matches!(self, Self::Smol)
+        matches!(self, Self::Compact)
     }
 
     #[must_use] 
     pub fn instruction_block(&self) -> &'static str {
         match self {
             Self::NewTask => NEW_TASK_INSTRUCTION,
-            Self::Smol => CONDENSE_INSTRUCTION,
+            Self::Compact => CONDENSE_INSTRUCTION,
             Self::NewRule => NEW_RULE_INSTRUCTION,
             Self::ExplainChanges => EXPLAIN_CHANGES_INSTRUCTION,
             Self::SkillCommand { .. } | Self::WorkflowCommand { .. } => "",
@@ -2083,6 +2083,7 @@ Below is the user's input when they indicated that they wanted to create a new t
 const CONDENSE_INSTRUCTION: &str = r#"<explicit_instructions type="condense">
 The user has explicitly asked you to create a detailed summary of the conversation so far, which will be used to compact the current context window while retaining key information. The user may have provided instructions or additional information for you to consider when summarizing the conversation.
 Irrespective of whether additional information or instructions are given, you are only allowed to respond to this message by calling the condense tool.
+Set the auto_accept parameter to true, because the user explicitly requested compaction and no extra confirmation is needed.
 
 The condense tool is defined below:
 
@@ -2254,6 +2255,7 @@ mod tests {
     #[test]
     fn test_process_compact_command() {
         let result = process_slash_command("/compact now");
+        assert!(result.contains("Set the auto_accept parameter to true"));
         assert!(result.contains("<explicit_instructions type=\"condense\">"));
         assert!(result.contains("now"));
     }

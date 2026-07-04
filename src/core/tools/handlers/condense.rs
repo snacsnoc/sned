@@ -36,6 +36,10 @@ impl CondenseHandler {
             .ok_or_else(|| {
                 ToolError::InvalidInput("Missing required parameter: context".to_string())
             })?;
+        let auto_accept = params
+            .get("auto_accept")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Validate summary is non-empty
         if context.trim().is_empty() {
@@ -76,7 +80,7 @@ impl CondenseHandler {
         };
 
         // INTERACTIVE APPROVAL: Show summary and wait for user response
-        if !ctx.json_output {
+        if !ctx.json_output && !auto_accept {
             use crate::cli::output::OutputEvent;
             use ratatui::style::{Modifier, Style};
             let timeout_secs = crate::core::approval::followup_timeout().as_secs();
@@ -129,8 +133,7 @@ impl CondenseHandler {
                 ));
             }
             // Empty response = user accepted, proceed with compaction
-        } else {
-            // JSON mode: cannot read stdin, auto-accept
+        } else if ctx.json_output {
             tracing::warn!("Condense tool auto-accepted in JSON mode (cannot read stdin)");
         }
 
@@ -784,6 +787,45 @@ mod tests {
         assert!(text.contains("Test summary"));
 
         // Verify compaction happened
+        let state_guard = state.lock().await;
+        assert!(state_guard.compacted_summary.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_condense_auto_accept_skips_prompt() {
+        use crate::core::tools::ToolContext;
+        use std::sync::Arc;
+
+        let handler = CondenseHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = handler
+            .execute(
+                &ctx,
+                serde_json::json!({
+                    "context": "Test summary",
+                    "auto_accept": true,
+                }),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let text = result.unwrap();
+        assert!(text.contains("Conversation condensed"));
+        assert!(text.contains("Test summary"));
+
         let state_guard = state.lock().await;
         assert!(state_guard.compacted_summary.is_some());
     }
