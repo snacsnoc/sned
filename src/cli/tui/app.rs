@@ -1187,6 +1187,26 @@ impl App {
         }
     }
 
+    fn resolved_output_scroll_y_for(
+        &self,
+        wrap_width: usize,
+        total_rows: usize,
+        content_height: usize,
+    ) -> u16 {
+        if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
+            return self.resolved_scroll_y_for(total_rows, content_height);
+        }
+
+        let max_offset = Self::max_scroll_offset_for(total_rows, content_height);
+        let Some(prompt_tail_row) = self.last_user_prompt_tail_row(wrap_width) else {
+            return max_offset;
+        };
+
+        prompt_tail_row
+            .saturating_sub(content_height)
+            .min(max_offset as usize) as u16
+    }
+
     fn enter_manual_mode(&mut self, total_rows: usize) -> bool {
         match self.scroll_mode {
             ScrollMode::ApprovalPinned => false,
@@ -1202,6 +1222,21 @@ impl App {
 
     fn max_scroll_offset_for(total_lines: usize, content_height: usize) -> u16 {
         total_lines.saturating_sub(content_height) as u16
+    }
+
+    fn last_user_prompt_tail_row(&self, wrap_width: usize) -> Option<usize> {
+        let mut tail_row = None;
+        let mut rendered_rows = 0usize;
+
+        self.for_each_output_row(|line, kind| {
+            rendered_rows =
+                rendered_rows.saturating_add(Self::output_row_visual_rows(line, wrap_width));
+            if kind == BlockKind::UserPrompt {
+                tail_row = Some(rendered_rows);
+            }
+        });
+
+        tail_row
     }
 
     fn last_wrap_width(&self) -> usize {
@@ -1688,7 +1723,7 @@ impl App {
         let output_rows = total_rows
             .saturating_sub(self.cached_completion_rows)
             .saturating_sub(self.cached_error_rows);
-        let scroll_y = self.resolved_scroll_y_for(output_rows, content_height);
+        let scroll_y = self.resolved_output_scroll_y_for(wrap_width, output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y as usize, content_height);
 
@@ -2028,8 +2063,9 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
 
     fn make_scrolling_app(total_lines: usize, content_height: usize) -> App {
         let mut app = App::new();
@@ -2039,6 +2075,24 @@ mod tests {
             app.push_plain(format!("line {}", index));
         }
         app
+    }
+
+    fn rendered_rows(buffer: &Buffer) -> Vec<String> {
+        let width = buffer.area.width as usize;
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn rendered_output_rows(app: &App, buffer: &Buffer) -> Vec<String> {
+        let output_height = buffer
+            .area
+            .height
+            .saturating_sub(1)
+            .saturating_sub(app.render_input_height()) as usize;
+        rendered_rows(buffer).into_iter().take(output_height).collect()
     }
 
     #[test]
@@ -2385,17 +2439,63 @@ mod tests {
             .expect("render should succeed");
 
         let buffer = terminal.backend().buffer();
-        let width = buffer.area.width as usize;
-        let rendered = buffer
-            .content()
-            .chunks(width)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rendered = rendered_rows(buffer).join("\n");
+        let output_rows = rendered_output_rows(&app, buffer).join("\n");
 
         assert!(rendered.contains("Approval pending"));
-        assert!(rendered.contains("Execute this tool?"));
-        assert!(rendered.contains("edit_file"));
+        assert!(output_rows.contains("Execute this tool?"));
+        assert!(output_rows.contains("edit_file"));
+    }
+
+    #[test]
+    fn test_render_approval_pin_tracks_prompt_tail_not_transcript_tail() {
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        struct ApprovalPromptCleanup;
+
+        impl Drop for ApprovalPromptCleanup {
+            fn drop(&mut self) {
+                crate::core::approval::set_approval_prompt_active(false);
+                crate::core::approval::clear_approval_prompt_scroll();
+            }
+        }
+
+        let _cleanup = ApprovalPromptCleanup;
+        crate::core::approval::set_approval_prompt_active(true);
+        crate::core::approval::set_approval_prompt_scroll();
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.pin_approval_bottom();
+
+        for index in 0..8 {
+            app.push_plain(format!("old line {index}"));
+        }
+        app.push_output_with_kind(Line::from("🔧 Tool: edit_file"), BlockKind::UserPrompt);
+        app.push_output_with_kind(
+            Line::from("Execute this tool? (y/n/always):"),
+            BlockKind::UserPrompt,
+        );
+        for index in 0..6 {
+            app.push_plain(format!("late tool output {index}"));
+        }
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer();
+        let output_rows = rendered_output_rows(&app, buffer);
+        let rendered = output_rows.join("\n");
+
+        assert!(
+            rendered.contains("Execute this tool?"),
+            "approval-pinned viewport must keep the prompt tail visible even if later output exists: {output_rows:?}"
+        );
+        assert!(
+            !rendered.contains("late tool output 5"),
+            "approval pin should anchor to the prompt block instead of newer transcript tail rows: {output_rows:?}"
+        );
     }
 
     #[test]

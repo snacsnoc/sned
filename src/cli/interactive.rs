@@ -540,8 +540,15 @@ fn apply_output_event(
         OutputEvent::RawAnsi(s) => {
             flush_model_update(app, pending_model_update);
             let lines = ansi_to_ratatui_lines(&s);
+            let kind = if crate::core::approval::is_approval_prompt_active()
+                || crate::core::approval::is_any_followup_question_active()
+            {
+                crate::cli::tui::BlockKind::UserPrompt
+            } else {
+                crate::cli::tui::BlockKind::ToolOutput
+            };
             for line in lines {
-                app.push_output(line);
+                app.push_output_with_kind(line, kind);
             }
         }
         OutputEvent::Completion(result) => {

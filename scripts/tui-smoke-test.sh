@@ -6,10 +6,10 @@
 # verifies the ratatui banner renders, sends /exit, and checks clean shutdown.
 #
 # Usage:
-#   ./user-scripts/tui-smoke-test.sh
-#   ./user-scripts/tui-smoke-test.sh --verbose
-#   ./user-scripts/tui-smoke-test.sh --test tui-startup-exit
-#   ./user-scripts/tui-smoke-test.sh --list
+#   ./scripts/tui-smoke-test.sh
+#   ./scripts/tui-smoke-test.sh --verbose
+#   ./scripts/tui-smoke-test.sh --test tui-startup-exit
+#   ./scripts/tui-smoke-test.sh --list
 
 set -euo pipefail
 
@@ -193,7 +193,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -288,7 +288,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -393,7 +393,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -504,7 +504,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -679,7 +679,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -787,7 +787,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -975,7 +975,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -1104,7 +1104,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -1207,7 +1207,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -1355,7 +1355,7 @@ env.update({
 })
 
 cmd = [
-    os.path.join(repo, "user-scripts", "sned-pty-helper"),
+    os.path.join(repo, "scripts", "sned-pty-helper"),
     "24",
     "80",
     sned_bin,
@@ -1474,7 +1474,7 @@ run_one() {
         FAIL_COUNT=$((FAIL_COUNT + 1))
         printf "         -> FAIL\n"
         printf "         Likely source: %s\n" "$(test_source "$name")"
-        printf "         Verbose re-run: ./user-scripts/tui-smoke-test.sh --verbose --test %s\n" "$name"
+        printf "         Verbose re-run: ./scripts/tui-smoke-test.sh --verbose --test %s\n" "$name"
         if [ "$VERBOSE" -eq 1 ]; then
             printf '%s\n' "$result"
         fi
