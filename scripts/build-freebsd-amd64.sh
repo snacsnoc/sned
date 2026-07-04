@@ -1,6 +1,4 @@
 #!/bin/bash
-# Build and package the FreeBSD amd64 release tarball.
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

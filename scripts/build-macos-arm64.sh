@@ -3,4 +3,4 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-exec "${SCRIPT_DIR}/build-release-package.sh" x86_64-unknown-linux-gnu linux-amd64 "$@"
+exec "${SCRIPT_DIR}/build-release-package.sh" aarch64-apple-darwin macos-arm64 "$@"

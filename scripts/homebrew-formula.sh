@@ -6,17 +6,18 @@
 #
 # Arguments:
 #   version - Release version (default: reads from Cargo.toml)
-#   sha256  - SHA256 of the universal binary (default: computed)
+#   sha256  - SHA256 of the macOS arm64 tarball (default: computed)
 #
 # Outputs:
 #   - Prints the formula to stdout
-#   - Saves to target/universal/sned.rb
+#   - Saves to target/dist/macos-arm64/sned.rb
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-UNIVERSAL_BINARY="${PROJECT_ROOT}/target/universal/sned"
+VERSION_FROM_MANIFEST=$(grep "^version" "${PROJECT_ROOT}/Cargo.toml" | head -1 | cut -d'"' -f2)
+MACOS_ARM64_TARBALL="${PROJECT_ROOT}/target/dist/macos-arm64/sned-${VERSION_FROM_MANIFEST}-macos-arm64.tar.gz"
 
 # Get version from Cargo.toml if not provided
 if [[ -n "${1:-}" ]]; then
@@ -29,31 +30,31 @@ fi
 if [[ -n "${2:-}" ]]; then
     SHA256="$2"
 else
-    if [[ -f "${UNIVERSAL_BINARY}" ]]; then
-        SHA256=$(shasum -a 256 "${UNIVERSAL_BINARY}" | cut -d' ' -f1)
+    if [[ -f "${MACOS_ARM64_TARBALL}" ]]; then
+        SHA256=$(shasum -a 256 "${MACOS_ARM64_TARBALL}" | cut -d' ' -f1)
     else
-        echo "❌ Error: Universal binary not found at ${UNIVERSAL_BINARY}"
-        echo "   Run ./scripts/build-universal-macos.sh first"
+        echo "Error: macOS arm64 tarball not found at ${MACOS_ARM64_TARBALL}"
+        echo "Run ./scripts/build-macos-arm64.sh first"
         exit 1
     fi
 fi
 
-FORMULA_PATH="${PROJECT_ROOT}/target/universal/sned.rb"
+FORMULA_PATH="${PROJECT_ROOT}/target/dist/macos-arm64/sned.rb"
 
-echo "🍺 Generating Homebrew formula..."
-echo "   Version: ${VERSION}"
-echo "   SHA256: ${SHA256}"
+echo "Generating Homebrew formula..."
+echo "Version: ${VERSION}"
+echo "SHA256: ${SHA256}"
 
 cat > "${FORMULA_PATH}" <<EOF
 class Sned < Formula
   desc "Rust CLI for code editing"
   homepage "https://github.com/snacsnoc/sned"
   version "${VERSION}"
-  url "https://github.com/snacsnoc/sned/releases/download/v#{version}/sned-#{version}-macos-universal.tar.gz"
+  url "https://github.com/snacsnoc/sned/releases/download/v#{version}/sned-#{version}-macos-arm64.tar.gz"
   sha256 "${SHA256}"
   license any_of: ["GPL-3.0-only", "Apache-2.0"]
 
-  depends_on arch: [:x86_64, :arm64]
+  depends_on arch: :arm64
   depends_on macos: ">= :catalina"
 
   def install
@@ -68,17 +69,5 @@ end
 EOF
 
 echo ""
-echo "✅ Formula generated!"
-echo "   Location: ${FORMULA_PATH}"
-echo ""
-echo "To test locally:"
-echo "   brew install --formula ${FORMULA_PATH}"
-echo ""
-echo "To publish to a tap:"
-echo "   1. Create a GitHub repo: sned-run/homebrew-tap"
-echo "   2. Add formula to Formula/sned.rb"
-echo "   3. Push to the tap repo"
-echo ""
-echo "Users can then install with:"
-echo "   brew tap sned-run/tap"
-echo "   brew install sned"
+echo "Formula generated:"
+echo "Location: ${FORMULA_PATH}"

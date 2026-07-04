@@ -9,7 +9,8 @@ Helper scripts for profiling, memory analysis, TUI testing, build, signing, and 
 | Profile memory | `./scripts/profile-memory.sh --workload all` |
 | Analyze a dhat heap dump | `./scripts/analyze-dhat-heap.sh dhat-heap.json` |
 | Test the TUI | `./scripts/tui-smoke-test.sh` |
-| Build a universal macOS binary | `./scripts/build-universal-macos.sh` |
+| Build and package macOS arm64 | `./scripts/build-macos-arm64.sh` |
+| Build and package macOS x86_64 | `./scripts/build-macos-x86_64.sh` |
 | Build and package Linux amd64 | `./scripts/build-linux-amd64.sh` |
 | Build and package FreeBSD amd64 | `./scripts/build-freebsd-amd64.sh` |
 | Sign a macOS binary | `./scripts/sign-macos.sh` |
@@ -105,15 +106,19 @@ Dependencies: `python3`, `gcc`/`clang` (only for the rebuild).
 
 ## macOS release
 
-### `build-universal-macos.sh`
-
-Builds a universal (arm64 + x86_64) release binary.
-
 ### `build-release-package.sh`
 
-Shared helper used by the Linux and FreeBSD packaging wrappers. Builds a
+Shared helper used by the macOS, Linux, and FreeBSD packaging wrappers. Builds a
 single target triple and writes a tar.gz release artifact under
 `target/dist/<suffix>/`.
+
+### `build-macos-arm64.sh`
+
+Builds `aarch64-apple-darwin` and packages `sned-<version>-macos-arm64.tar.gz`.
+
+### `build-macos-x86_64.sh`
+
+Builds `x86_64-apple-darwin` and packages `sned-<version>-macos-x86_64.tar.gz`.
 
 ### `build-linux-amd64.sh`
 

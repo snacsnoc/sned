@@ -1,16 +1,4 @@
 #!/bin/bash
-# Build and package a release binary for a single target triple.
-#
-# Usage:
-#   ./scripts/build-release-package.sh <target-triple> <artifact-suffix> [--debug|--release]
-#
-# Examples:
-#   ./scripts/build-release-package.sh x86_64-unknown-linux-gnu linux-amd64
-#   ./scripts/build-release-package.sh x86_64-unknown-freebsd freebsd-amd64
-#
-# Output:
-#   target/dist/<artifact-suffix>/sned-<version>-<artifact-suffix>.tar.gz
-#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,11 +51,25 @@ if [[ -z "${VERSION}" ]]; then
 fi
 
 HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-TARGET_OS="${TARGET_TRIPLE#*-unknown-}"
-TARGET_OS="${TARGET_OS%%-*}"
+
+case "${TARGET_TRIPLE}" in
+    *-unknown-linux-gnu)
+        TARGET_OS="linux"
+        ;;
+    *-unknown-freebsd)
+        TARGET_OS="freebsd"
+        ;;
+    *-apple-darwin)
+        TARGET_OS="darwin"
+        ;;
+    *)
+        printf '%s\n' "unsupported target triple: ${TARGET_TRIPLE}" >&2
+        exit 1
+        ;;
+esac
 
 case "${TARGET_OS}" in
-    linux|freebsd)
+    linux|freebsd|darwin)
         ;;
     *)
         printf '%s\n' "unsupported target OS in triple: ${TARGET_TRIPLE}" >&2

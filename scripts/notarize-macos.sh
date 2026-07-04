@@ -1,105 +1,86 @@
 #!/bin/bash
-# Notarize the sned binary and staple the ticket.
-#
-# Usage:
-#   ./scripts/notarize-macos.sh [bundle-id]
-#
-# Arguments:
-#   bundle-id - Bundle identifier for notarization (default: run.sned.cli)
-#
-# Prerequisites:
-#   - macOS with Xcode Command Line Tools
-#   - Apple Developer account with App Store Connect API key
-#   - Binary already signed (run sign-macos.sh first)
-#   - Environment variables set:
-#     - APPLE_ID: Your Apple ID email
-#     - APPLE_APP_SPECIFIC_PASSWORD: App-specific password for notarization
-#     - APPLE_TEAM_ID: Apple Developer Team ID
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-UNIVERSAL_BINARY="${PROJECT_ROOT}/target/universal/sned"
-ZIP_PATH="${PROJECT_ROOT}/target/universal/sned.zip"
+TARGET_ARCH="${1:-arm64}"
+case "${TARGET_ARCH}" in
+    arm64)
+        BINARY_SUFFIX="macos-arm64"
+        ;;
+    x86_64)
+        BINARY_SUFFIX="macos-x86_64"
+        ;;
+    *)
+        echo "Usage: ./scripts/notarize-macos.sh [arm64|x86_64] [bundle-id]"
+        exit 1
+        ;;
+esac
 
-BUNDLE_ID="${1:-run.sned.cli}"
+VERSION=$(grep "^version" "${PROJECT_ROOT}/Cargo.toml" | head -1 | cut -d'"' -f2)
+PACKAGE_DIR="${PROJECT_ROOT}/target/dist/${BINARY_SUFFIX}/sned-${VERSION}-${BINARY_SUFFIX}"
+BINARY_PATH="${PACKAGE_DIR}/sned"
+ZIP_PATH="${PROJECT_ROOT}/target/dist/${BINARY_SUFFIX}/sned.zip"
+LOG_PATH="${PROJECT_ROOT}/target/dist/${BINARY_SUFFIX}/notarization-log.json"
+BUNDLE_ID="${2:-run.sned.cli}"
 
-echo "📦 Notarizing sned..."
-echo "   Bundle ID: ${BUNDLE_ID}"
-echo "   Binary: ${UNIVERSAL_BINARY}"
+echo "Notarizing sned..."
+echo "Bundle ID: ${BUNDLE_ID}"
+echo "Binary: ${BINARY_PATH}"
 
-# Check prerequisites
-if [[ ! -f "${UNIVERSAL_BINARY}" ]]; then
-    echo "❌ Error: Universal binary not found at ${UNIVERSAL_BINARY}"
+if [[ ! -f "${BINARY_PATH}" ]]; then
+    echo "Error: binary not found at ${BINARY_PATH}"
     exit 1
 fi
 
 if [[ -z "${APPLE_ID:-}" ]]; then
-    echo "❌ Error: APPLE_ID environment variable not set"
-    echo "   Set it to your Apple ID email address"
+    echo "Error: APPLE_ID environment variable not set"
     exit 1
 fi
 
 if [[ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
-    echo "❌ Error: APPLE_APP_SPECIFIC_PASSWORD environment variable not set"
-    echo "   Generate an app-specific password at appleid.apple.com"
+    echo "Error: APPLE_APP_SPECIFIC_PASSWORD environment variable not set"
     exit 1
 fi
 
 if [[ -z "${APPLE_TEAM_ID:-}" ]]; then
-    echo "❌ Error: APPLE_TEAM_ID environment variable not set"
-    echo "   Find it in Apple Developer Portal"
+    echo "Error: APPLE_TEAM_ID environment variable not set"
     exit 1
 fi
 
-# Create a ZIP for notarization
-echo "🗜️  Creating ZIP for notarization..."
-ditto -c -k --keepParent "${UNIVERSAL_BINARY}" "${ZIP_PATH}"
+echo "Creating ZIP for notarization..."
+ditto -c -k --keepParent "${BINARY_PATH}" "${ZIP_PATH}"
 
-# Submit for notarization
-echo "📤 Submitting for notarization..."
+echo "Submitting for notarization..."
 xcrun notarytool submit "${ZIP_PATH}" \
     --apple-id "${APPLE_ID}" \
     --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
     --team-id "${APPLE_TEAM_ID}" \
     --wait \
     --output-format json \
-    | tee "${PROJECT_ROOT}/target/universal/notarization-log.json"
+    | tee "${LOG_PATH}"
 
-# Extract submission ID
-SUBMISSION_ID=$(cat "${PROJECT_ROOT}/target/universal/notarization-log.json" | grep -o '"id": "[^"]*"' | head -1 | cut -d'"' -f4)
+SUBMISSION_ID=$(grep -o '"id": "[^"]*"' "${LOG_PATH}" | head -1 | cut -d'"' -f4)
 
 echo ""
-echo "📋 Notarization submitted with ID: ${SUBMISSION_ID}"
+echo "Notarization submitted with ID: ${SUBMISSION_ID}"
 
-# Check status
-STATUS=$(cat "${PROJECT_ROOT}/target/universal/notarization-log.json" | grep -o '"status": "[^"]*"' | head -1 | cut -d'"' -f4)
+STATUS=$(grep -o '"status": "[^"]*"' "${LOG_PATH}" | head -1 | cut -d'"' -f4)
 
 if [[ "${STATUS}" == "Accepted" ]]; then
-    echo "✅ Notarization accepted!"
-    
-    # Staple the ticket
-    echo "📎 Stapling notarization ticket..."
-    xcrun stapler staple "${UNIVERSAL_BINARY}"
-    
-    # Verify staple
-    echo "🔍 Verifying staple..."
-    xcrun stapler validate "${UNIVERSAL_BINARY}"
-    
+    echo "Notarization accepted!"
+    echo "Stapling notarization ticket..."
+    xcrun stapler staple "${BINARY_PATH}"
+    echo "Verifying staple..."
+    xcrun stapler validate "${BINARY_PATH}"
+
     echo ""
-    echo "🎉 Binary notarized and stapled successfully!"
-    echo "   Location: ${UNIVERSAL_BINARY}"
-    
-    # Clean up
+    echo "Binary notarized and stapled successfully:"
+    echo "Location: ${BINARY_PATH}"
     rm "${ZIP_PATH}"
-    
-    echo ""
-    echo "Next steps:"
-    echo "   1. Create Homebrew formula: ./scripts/homebrew-formula.sh"
-    echo "   2. Test installation on a clean macOS machine"
 else
-    echo "❌ Notarization failed with status: ${STATUS}"
-    echo "   Check log: ${PROJECT_ROOT}/target/universal/notarization-log.json"
+    echo "Notarization failed with status: ${STATUS}"
+    echo "Check log: ${LOG_PATH}"
     exit 1
 fi

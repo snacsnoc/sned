@@ -1,39 +1,39 @@
 #!/bin/bash
-# Sign the sned universal binary with Hardened Runtime.
-#
-# Usage:
-#   ./scripts/sign-macos.sh [identity]
-#
-# Arguments:
-#   identity - Apple Developer ID Application identity (default: "Developer ID Application: Sned")
-#
-# Prerequisites:
-#   - macOS with Xcode Command Line Tools
-#   - Apple Developer ID certificate installed in Keychain
-#   - Binary already built (run build-universal-macos.sh first)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-UNIVERSAL_BINARY="${PROJECT_ROOT}/target/universal/sned"
+TARGET_ARCH="${1:-arm64}"
+case "${TARGET_ARCH}" in
+    arm64)
+        BINARY_SUFFIX="macos-arm64"
+        ;;
+    x86_64)
+        BINARY_SUFFIX="macos-x86_64"
+        ;;
+    *)
+        echo "Usage: ./scripts/sign-macos.sh [arm64|x86_64] [identity]"
+        exit 1
+        ;;
+esac
+
+VERSION=$(grep "^version" "${PROJECT_ROOT}/Cargo.toml" | head -1 | cut -d'"' -f2)
+PACKAGE_DIR="${PROJECT_ROOT}/target/dist/${BINARY_SUFFIX}/sned-${VERSION}-${BINARY_SUFFIX}"
+BINARY_PATH="${PACKAGE_DIR}/sned"
 ENTITLEMENTS_FILE="${SCRIPT_DIR}/sned.entitlements"
+IDENTITY="${2:-Developer ID Application: Sned}"
 
-# Default signing identity
-IDENTITY="${1:-Developer ID Application: Sned}"
+echo "Signing sned with Hardened Runtime..."
+echo "Identity: ${IDENTITY}"
+echo "Binary: ${BINARY_PATH}"
 
-echo "🔏 Signing sned with Hardened Runtime..."
-echo "   Identity: ${IDENTITY}"
-echo "   Binary: ${UNIVERSAL_BINARY}"
-
-# Check if binary exists
-if [[ ! -f "${UNIVERSAL_BINARY}" ]]; then
-    echo "❌ Error: Universal binary not found at ${UNIVERSAL_BINARY}"
-    echo "   Run ./scripts/build-universal-macos.sh first"
+if [[ ! -f "${BINARY_PATH}" ]]; then
+    echo "Error: binary not found at ${BINARY_PATH}"
+    echo "Run ./scripts/build-${BINARY_SUFFIX}.sh first"
     exit 1
 fi
 
-# Create entitlements file for Hardened Runtime
 cat > "${ENTITLEMENTS_FILE}" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -58,28 +58,21 @@ cat > "${ENTITLEMENTS_FILE}" <<'EOF'
 </plist>
 EOF
 
-# Sign the binary
-echo "📜 Signing with codesign..."
+echo "Signing with codesign..."
 codesign \
     --sign "${IDENTITY}" \
     --force \
     --options runtime \
     --entitlements "${ENTITLEMENTS_FILE}" \
     --timestamp \
-    "${UNIVERSAL_BINARY}"
+    "${BINARY_PATH}"
 
-# Verify signature
-echo "✅ Verifying signature..."
-codesign --verify --verbose "${UNIVERSAL_BINARY}"
-codesign --display --verbose=4 "${UNIVERSAL_BINARY}"
+echo "Verifying signature..."
+codesign --verify --verbose "${BINARY_PATH}"
+codesign --display --verbose=4 "${BINARY_PATH}"
 
-# Clean up entitlements file
 rm "${ENTITLEMENTS_FILE}"
 
 echo ""
-echo "🎉 Binary signed successfully!"
-echo "   Location: ${UNIVERSAL_BINARY}"
-echo ""
-echo "Next steps:"
-echo "   1. Notarize: ./scripts/notarize-macos.sh"
-echo "   2. Create Homebrew formula: ./scripts/homebrew-formula.sh"
+echo "Binary signed successfully:"
+echo "Location: ${BINARY_PATH}"
