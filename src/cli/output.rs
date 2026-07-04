@@ -645,7 +645,7 @@ mod tests {
     fn test_channel_overflow_preserves_approval_prompt_via_priority_lane() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
         let writer = ChannelOutputWriter::new(tx);
         let mut priority_rx = writer
             .take_priority_rx()
@@ -662,7 +662,6 @@ mod tests {
         );
         writer.emit(approval_prompt.clone());
 
-        let primary_events: Vec<OutputEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let priority_events: Vec<OutputEvent> =
             std::iter::from_fn(|| priority_rx.try_recv().ok()).collect();
 
