@@ -5,16 +5,16 @@
 
 use crate::core::context::context_manager::{self, TruncationKeep};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
+use crate::providers::StorageMessage;
 use std::future::Future;
 use std::pin::Pin;
-use crate::providers::StorageMessage;
 
 /// Summarize task tool handler.
 #[derive(Debug, Clone, Default)]
 pub struct SummarizeTaskHandler;
 
 impl SummarizeTaskHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }

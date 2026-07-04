@@ -5,16 +5,16 @@
 
 use crate::core::context::context_manager::{self, CompactedSummary, TruncationKeep};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
+use crate::providers::{MessageRole, StorageMessage};
 use std::future::Future;
 use std::pin::Pin;
-use crate::providers::{MessageRole, StorageMessage};
 
 /// Condense tool handler.
 #[derive(Debug, Clone, Default)]
 pub struct CondenseHandler;
 
 impl CondenseHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -72,9 +72,7 @@ impl CondenseHandler {
 
         // Augment summary with hook modification if present
         let final_summary = if let Some(modification) = hook_context_modification {
-            format!(
-                "{context}\n\n[Context Modification from PreCompact Hook]\n{modification}"
-            )
+            format!("{context}\n\n[Context Modification from PreCompact Hook]\n{modification}")
         } else {
             context.to_string()
         };

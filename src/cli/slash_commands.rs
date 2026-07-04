@@ -96,7 +96,7 @@ impl SlashCommand {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn workflow_name(&self) -> Option<&str> {
         match self {
             Self::WorkflowCommand { name } => Some(name),
@@ -1442,7 +1442,7 @@ pub fn format_help_text() -> String {
     s
 }
 
-#[must_use] 
+#[must_use]
 pub fn format_help_for_command(cmd: &str) -> String {
     use crate::cli::colors::style;
 
@@ -2255,8 +2255,8 @@ mod tests {
     #[test]
     fn test_process_compact_command() {
         let result = process_slash_command("/compact now");
-        assert!(result.contains("Set the auto_accept parameter to true"));
         assert!(result.contains("<explicit_instructions type=\"condense\">"));
+        assert!(result.contains("Set the auto_accept parameter to true"));
         assert!(result.contains("now"));
     }
 

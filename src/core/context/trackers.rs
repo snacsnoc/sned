@@ -152,7 +152,7 @@ impl FileWatcher {
 
     /// Check if a path has been modified externally and clear its flag.
     /// Uses canonical path comparison to handle symlinks (e.g., /var vs /private/var on macOS).
-    #[must_use] 
+    #[must_use]
     pub fn take_modified(&self, path: &Path) -> bool {
         if !self.watch_targets.contains_key(path) {
             return false;
@@ -206,7 +206,7 @@ impl FileWatcher {
     }
 
     /// Get all externally modified paths and clear them.
-    #[must_use] 
+    #[must_use]
     pub fn drain_modified(&self) -> HashSet<PathBuf> {
         if let Ok(mut set) = self.externally_modified.lock() {
             std::mem::take(&mut *set)
@@ -217,7 +217,10 @@ impl FileWatcher {
 
     /// Stop watching all paths and cleanup the watcher.
     pub fn stop_watching_all(&mut self) {
-        let mut watcher = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut watcher = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for path in &self.watched_paths {
             let _ = watcher.unwatch(path);
         }
@@ -269,7 +272,7 @@ impl Default for FileContextTracker {
 }
 
 impl FileContextTracker {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -281,18 +284,18 @@ impl FileContextTracker {
     }
 
     /// Get the current task ID, if any.
-    #[must_use] 
+    #[must_use]
     pub fn task_id(&self) -> Option<&str> {
         self.task_id.as_deref()
     }
 
     /// Get a reference to the in-memory files_in_context metadata.
-    #[must_use] 
+    #[must_use]
     pub fn files_in_context(&self) -> &[FileMetadataEntry] {
         &self.files_in_context
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn was_read_this_session(&self, path: &str) -> bool {
         self.files_in_context
             .iter()
@@ -419,7 +422,7 @@ impl FileContextTracker {
     /// Detect files that were edited by Sned or users after a specific timestamp.
     ///
     /// Used when restoring checkpoints to warn about potential file content mismatches.
-    #[must_use] 
+    #[must_use]
     pub fn detect_files_edited_after_message(&self, message_ts: u64) -> Vec<String> {
         let mut edited_files = Vec::new();
 
@@ -519,14 +522,14 @@ impl FileContextTracker {
     }
 
     /// Determines if a file was recently modified by the user (legacy).
-    #[must_use] 
+    #[must_use]
     pub fn is_recently_modified(&self, file_path: &str) -> bool {
         self.recently_modified_files
             .contains(&file_path.to_string())
     }
 
     /// Get the list of tracked files (for debugging/testing)
-    #[must_use] 
+    #[must_use]
     pub fn tracked_files(&self) -> &HashMap<PathBuf, SystemTime> {
         &self.tracked_files
     }

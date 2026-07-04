@@ -3,7 +3,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-
 /// Secret keys matching TypeScript SECRETS_KEYS from state-keys.ts
 pub const SECRET_KEYS: &[&str] = &[
     "apiKey",
@@ -46,7 +45,7 @@ pub const SECRET_KEYS: &[&str] = &[
 ];
 
 /// Environment variable to secret key mapping (from ENV_VAR_TO_SECRET_KEY in env-config.ts)
-#[must_use] 
+#[must_use]
 pub fn env_var_to_secret_key() -> HashMap<&'static str, &'static str> {
     let mut map = HashMap::with_capacity(16);
     map.insert("ANTHROPIC_API_KEY", "apiKey");
@@ -160,7 +159,7 @@ impl SecretsStore {
     }
 
     /// Get a specific secret
-    #[must_use] 
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<String> {
         // Try keyring first, but fall back to file if keyring returns empty
         let keyring_value = if let Ok(entry) = keyring::Entry::new(&self.service_name, key) {

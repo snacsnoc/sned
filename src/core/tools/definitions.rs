@@ -18,7 +18,7 @@ pub struct ToolParameter {
 
 impl ToolParameter {
     /// Convert to a JSON schema property.
-    #[must_use] 
+    #[must_use]
     pub fn to_schema_property(&self) -> serde_json::Value {
         let mut prop = serde_json::json!({
             "type": self.param_type,
@@ -51,7 +51,7 @@ pub struct ToolSchema {
 
 impl ToolSchema {
     /// Convert to a provider-native ToolDefinition (OpenAI format).
-    #[must_use] 
+    #[must_use]
     pub fn to_tool_definition(&self) -> ToolDefinition {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
@@ -91,7 +91,7 @@ impl ToolSchema {
 // Tool Schemas (ported from TypeScript source)
 // ============================================================================
 
-#[must_use] 
+#[must_use]
 pub fn read_file_schema() -> ToolSchema {
     ToolSchema {
         name: "read_file",
@@ -125,7 +125,7 @@ pub fn read_file_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn write_to_file_schema() -> ToolSchema {
     ToolSchema {
         name: "write_to_file",
@@ -151,7 +151,7 @@ pub fn write_to_file_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn list_files_schema() -> ToolSchema {
     ToolSchema {
         name: "list_files",
@@ -177,7 +177,7 @@ pub fn list_files_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn search_files_schema() -> ToolSchema {
     ToolSchema {
         name: "search_files",
@@ -211,7 +211,7 @@ pub fn search_files_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
@@ -263,7 +263,7 @@ pub fn edit_file_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn execute_command_schema() -> ToolSchema {
     ToolSchema {
         name: "execute_command",
@@ -305,7 +305,7 @@ pub fn execute_command_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn ask_followup_question_schema() -> ToolSchema {
     ToolSchema {
         name: "ask_followup_question",
@@ -321,7 +321,7 @@ pub fn ask_followup_question_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn attempt_completion_schema() -> ToolSchema {
     ToolSchema {
         name: "attempt_completion",
@@ -347,7 +347,7 @@ pub fn attempt_completion_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn plan_mode_respond_schema() -> ToolSchema {
     ToolSchema {
         name: "plan_mode_respond",
@@ -373,7 +373,7 @@ pub fn plan_mode_respond_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn get_function_schema() -> ToolSchema {
     ToolSchema {
         name: "get_function",
@@ -399,7 +399,7 @@ pub fn get_function_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn get_file_skeleton_schema() -> ToolSchema {
     ToolSchema {
         name: "get_file_skeleton",
@@ -415,7 +415,7 @@ pub fn get_file_skeleton_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn find_symbol_references_schema() -> ToolSchema {
     ToolSchema {
         name: "find_symbol_references",
@@ -441,7 +441,7 @@ pub fn find_symbol_references_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn replace_symbol_schema() -> ToolSchema {
     ToolSchema {
         name: "replace_symbol",
@@ -475,7 +475,7 @@ pub fn replace_symbol_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn rename_symbol_schema() -> ToolSchema {
     ToolSchema {
         name: "rename_symbol",
@@ -509,7 +509,7 @@ pub fn rename_symbol_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn use_subagents_schema() -> ToolSchema {
     ToolSchema {
         name: "use_subagents",
@@ -583,7 +583,7 @@ pub fn use_subagents_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn use_skill_schema() -> ToolSchema {
     ToolSchema {
         name: "use_skill",
@@ -599,7 +599,7 @@ pub fn use_skill_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn list_skills_schema() -> ToolSchema {
     ToolSchema {
         name: "list_skills",
@@ -608,7 +608,7 @@ pub fn list_skills_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn diagnostics_scan_schema() -> ToolSchema {
     ToolSchema {
         name: "diagnostics_scan",
@@ -624,7 +624,7 @@ pub fn diagnostics_scan_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn summarize_task_schema() -> ToolSchema {
     ToolSchema {
         name: "summarize_task",
@@ -650,7 +650,7 @@ pub fn summarize_task_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn condense_schema() -> ToolSchema {
     ToolSchema {
         name: "condense",
@@ -676,7 +676,7 @@ pub fn condense_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn web_fetch_schema() -> ToolSchema {
     ToolSchema {
         name: "web_fetch",
@@ -692,7 +692,7 @@ pub fn web_fetch_schema() -> ToolSchema {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn new_task_schema() -> ToolSchema {
     ToolSchema {
         name: "new_task",
@@ -718,7 +718,7 @@ use super::SnedTool;
 ///
 /// All SnedTool variants are explicitly matched. The compiler will warn if a
 /// new variant is added without a corresponding schema function.
-#[must_use] 
+#[must_use]
 pub fn get_tool_schema(tool: SnedTool) -> ToolSchema {
     match tool {
         SnedTool::ReadFile => read_file_schema(),
@@ -747,13 +747,13 @@ pub fn get_tool_schema(tool: SnedTool) -> ToolSchema {
 }
 
 /// Returns ToolDefinitions for all active (kept) tools.
-#[must_use] 
+#[must_use]
 pub fn get_active_tool_definitions() -> Vec<ToolDefinition> {
     get_tool_definitions_for_profile(ToolProfile::Full)
 }
 
 /// Returns ToolDefinitions for read-only tools only.
-#[must_use] 
+#[must_use]
 pub fn get_read_only_tool_definitions() -> Vec<ToolDefinition> {
     let read_only_tools = [
         SnedTool::ReadFile,
@@ -794,7 +794,7 @@ pub enum ToolProfile {
 impl ToolProfile {
     /// Returns the next larger profile for recovery when a reduced tier
     /// causes the model to produce a text-only non-completion response.
-    #[must_use] 
+    #[must_use]
     pub fn escalate(self) -> Option<Self> {
         match self {
             Self::DirectAnswer => Some(Self::AnswerOnly),
@@ -804,13 +804,11 @@ impl ToolProfile {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn tools(self) -> &'static [SnedTool] {
         match self {
             Self::DirectAnswer => &[],
-            Self::AnswerOnly => {
-                &[SnedTool::AttemptCompletion, SnedTool::AskFollowupQuestion]
-            }
+            Self::AnswerOnly => &[SnedTool::AttemptCompletion, SnedTool::AskFollowupQuestion],
             Self::WriteOnly => &[
                 SnedTool::WriteToFile,
                 SnedTool::AttemptCompletion,
@@ -879,7 +877,7 @@ impl ToolProfile {
 }
 
 /// Returns ToolDefinitions for a given tool profile.
-#[must_use] 
+#[must_use]
 pub fn get_tool_definitions_for_profile(profile: ToolProfile) -> Vec<ToolDefinition> {
     profile
         .tools()
@@ -897,7 +895,7 @@ pub fn get_tool_definitions_for_profile(profile: ToolProfile) -> Vec<ToolDefinit
 /// - Validate: tasks requesting validation (run tests, lint, check)
 /// - Symbol: rename/reference/symbol tasks
 /// - Full: anything complex, multi-step, or ambiguous
-#[must_use] 
+#[must_use]
 pub fn select_tool_profile(prompt: &str, mode: &str) -> ToolProfile {
     let lower = prompt.to_lowercase();
 

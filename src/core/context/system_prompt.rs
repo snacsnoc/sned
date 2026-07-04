@@ -58,13 +58,13 @@ pub struct PromptBuilder {
 }
 
 impl PromptBuilder {
-    #[must_use] 
+    #[must_use]
     pub fn new(context: SystemPromptContext) -> Self {
         Self { context }
     }
 
     /// Builds the system prompt.
-    #[must_use] 
+    #[must_use]
     pub fn build(&self) -> String {
         let prompt = self.render_template();
         let prompt = self.apply_env_override(prompt);

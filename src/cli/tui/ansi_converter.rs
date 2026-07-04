@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use vte::{Params, Perform};
 
 /// Convert a string with ANSI escape sequences to ratatui lines.
-#[must_use] 
+#[must_use]
 pub fn ansi_to_ratatui_lines(text: &str) -> Vec<Line<'static>> {
     let mut performer = RatatuiPerformer::with_capacity(text.len());
     let mut parser = vte::Parser::new();

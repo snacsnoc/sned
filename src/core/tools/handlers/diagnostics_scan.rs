@@ -6,11 +6,11 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use std::future::Future;
-use std::pin::Pin;
 use regex::Regex;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{LazyLock, Mutex};
 use tokio::process::Command;
@@ -38,7 +38,7 @@ static PROJECT_TYPE_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), ProjectType
     LazyLock::new(|| Mutex::new(HashMap::with_capacity(16)));
 
 impl DiagnosticsScanHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -279,7 +279,7 @@ impl DiagnosticsScanHandler {
     }
 
     /// Find the nearest ancestor directory containing the named file.
-    #[must_use] 
+    #[must_use]
     pub fn find_ancestor_with_file(start: &Path, file_name: &str) -> Option<PathBuf> {
         let mut current = Some(start);
         while let Some(path) = current {
@@ -293,7 +293,7 @@ impl DiagnosticsScanHandler {
 
     /// Parse diagnostic output to extract file/line/error info.
     /// This is a best-effort parser for common compiler/linter formats.
-    #[must_use] 
+    #[must_use]
     pub fn parse_diagnostics(output: &str, display_path: &str) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -421,16 +421,14 @@ impl DiagnosticsScanHandler {
     }
 
     /// Format diagnostics with file context (matching TypeScript output style).
-    #[must_use] 
+    #[must_use]
     pub fn format_diagnostics(
         display_path: &str,
         diagnostics: &[Diagnostic],
         file_content: Option<&str>,
     ) -> String {
         if diagnostics.is_empty() {
-            return format!(
-                "- file: {display_path}\n  status: No diagnostics issues found."
-            );
+            return format!("- file: {display_path}\n  status: No diagnostics issues found.");
         }
 
         let max_errors = 20;
@@ -622,7 +620,7 @@ impl DiagnosticsScanHandler {
         Ok(final_result)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn description(&self, params: &serde_json::Value) -> String {
         if let Some(paths) = params.get("paths").and_then(|p| p.as_array()) {
             let paths_text: Vec<String> = paths

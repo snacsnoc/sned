@@ -92,7 +92,7 @@ impl Provider for OpenRouterProvider {
 
 /// Get model info for common OpenRouter models.
 /// OpenRouter supports 100+ models from multiple providers.
-#[must_use] 
+#[must_use]
 pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     // Default base info
     let mut info = ModelInfo {

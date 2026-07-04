@@ -31,7 +31,7 @@ pub enum HookName {
 }
 
 impl HookName {
-    #[must_use] 
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::PreToolUse => "PreToolUse",
@@ -226,14 +226,14 @@ impl HookManager {
     }
 
     /// Get the global hooks directory if set.
-    #[must_use] 
+    #[must_use]
     pub fn get_global_hooks_dir(&self) -> Option<&PathBuf> {
         self.global_hooks_dir.as_ref()
     }
 
     /// Discover all hooks for a given hook name across all directories.
     /// Priority: runtime > workspace (> requires opt-in) > global
-    #[must_use] 
+    #[must_use]
     pub fn discover_hooks(&self, hook_name: HookName) -> Vec<PathBuf> {
         let mut hooks = Vec::new();
         let hook_file = hook_name.as_str();
@@ -302,7 +302,7 @@ impl HookManager {
     /// Execute a hook with the given input data.
     /// Returns the combined output from all hook scripts.
     /// Fail-open: if a hook fails, it returns empty modifications and logs the error.
-    #[must_use] 
+    #[must_use]
     pub fn execute_hook(
         &self,
         hook_name: HookName,
@@ -452,8 +452,10 @@ impl HookManager {
         drop(stdin);
 
         // Track active execution AFTER stdin is written
-        let hook_name = hook_path
-            .file_name().map_or_else(|| "unknown".to_string(), |n| n.to_string_lossy().to_string());
+        let hook_name = hook_path.file_name().map_or_else(
+            || "unknown".to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
         {
             let mut exec = self.active_execution.lock();
             *exec = Some(HookExecution {
@@ -566,9 +568,7 @@ impl HookManager {
         }
 
         let output: HookOutput = serde_json::from_str(&stdout).map_err(|e| {
-            format!(
-                "Failed to parse hook output as JSON: {e}\nStdout: {stdout}\nStderr: {stderr}"
-            )
+            format!("Failed to parse hook output as JSON: {e}\nStdout: {stdout}\nStderr: {stderr}")
         })?;
 
         // Validate output
@@ -631,7 +631,8 @@ impl HookManager {
                                 nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)) | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                                Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+                                | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }
@@ -648,8 +649,7 @@ impl HookManager {
             }
 
             if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst)
-                || cancel_token
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                || cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
                 if pid > 0 {
                     #[cfg(unix)]
@@ -665,7 +665,8 @@ impl HookManager {
                                 nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)) | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                                Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+                                | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }
@@ -765,7 +766,7 @@ impl HookManager {
     }
 
     /// Execute PreToolUse hook
-    #[must_use] 
+    #[must_use]
     pub fn pre_tool_use(&self, task_id: &str, tool: &str, input: &serde_json::Value) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -781,7 +782,7 @@ impl HookManager {
     }
 
     /// Execute PostToolUse hook
-    #[must_use] 
+    #[must_use]
     pub fn post_tool_use(
         &self,
         task_id: &str,
@@ -804,7 +805,7 @@ impl HookManager {
     }
 
     /// Execute TaskStart hook
-    #[must_use] 
+    #[must_use]
     pub fn task_start(&self, task_id: &str, task: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -819,7 +820,7 @@ impl HookManager {
     }
 
     /// Execute TaskComplete hook
-    #[must_use] 
+    #[must_use]
     pub fn task_complete(&self, task_id: &str, task: &str, completion: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -835,7 +836,7 @@ impl HookManager {
     }
 
     /// Execute TaskCancel hook
-    #[must_use] 
+    #[must_use]
     pub fn task_cancel(&self, task_id: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -850,7 +851,7 @@ impl HookManager {
     }
 
     /// Execute TaskResume hook
-    #[must_use] 
+    #[must_use]
     pub fn task_resume(&self, task_id: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -865,7 +866,7 @@ impl HookManager {
     }
 
     /// Execute PreCompact hook
-    #[must_use] 
+    #[must_use]
     pub fn pre_compact(&self, task_id: &str, conversation_history_path: &str) -> HookResult {
         let hook_input = HookInput {
             task_id: task_id.to_string(),
@@ -898,13 +899,13 @@ pub enum HookError {
 
 // Inherent methods (formerly HookManager trait methods - collapsed to eliminate unnecessary abstraction)
 impl HookManager {
-    #[must_use] 
+    #[must_use]
     pub fn should_run_task_cancel_hook(&self) -> bool {
         let hooks = self.discover_hooks(HookName::TaskCancel);
         !hooks.is_empty()
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn get_active_hook_execution(&self) -> Option<HookExecution> {
         let guard = self.active_execution.lock();
         guard.clone()
@@ -923,16 +924,18 @@ impl HookManager {
             {
                 use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
-                kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM).map_err(|e| {
-                    HookError::Other(format!("Failed to kill process group: {e}"))
-                })?;
+                kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM)
+                    .map_err(|e| HookError::Other(format!("Failed to kill process group: {e}")))?;
                 let kill_start = std::time::Instant::now();
                 while kill_start.elapsed() < std::time::Duration::from_millis(500) {
                     match nix::sys::wait::waitpid(
                         Pid::from_raw(-(pid as i32)),
                         Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                     ) {
-                        Ok(nix::sys::wait::WaitStatus::Exited(_, _) | nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                        Ok(
+                            nix::sys::wait::WaitStatus::Exited(_, _)
+                            | nix::sys::wait::WaitStatus::Signaled(_, _, _),
+                        ) => break,
                         _ => std::thread::sleep(std::time::Duration::from_millis(50)),
                     }
                 }

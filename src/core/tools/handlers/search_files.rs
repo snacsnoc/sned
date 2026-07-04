@@ -4,8 +4,8 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
 use std::future::Future;
-use std::pin::Pin;
 use std::path::Path;
+use std::pin::Pin;
 
 use std::io;
 use std::process::Output;
@@ -212,7 +212,7 @@ impl SearchFilesHandler {
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
     }
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -267,7 +267,9 @@ async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyho
     drop(child.stdout.take());
     drop(child.stderr.take());
 
-    let status = if let Ok(status) = timeout(timeout_duration, child.wait()).await { status? } else {
+    let status = if let Ok(status) = timeout(timeout_duration, child.wait()).await {
+        status?
+    } else {
         let _ = child.kill().await;
         // Drop reader task handles instead of awaiting them — they will
         // complete in the background once the killed process's pipes close.
@@ -304,7 +306,8 @@ impl ToolHandler for SearchFilesHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            handler.execute_without_state(&ctx.workspace_root, params)
+            handler
+                .execute_without_state(&ctx.workspace_root, params)
                 .await
                 .map(serde_json::Value::String)
         })

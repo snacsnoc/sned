@@ -135,7 +135,7 @@ fn build_tool_use_id_to_name(
 /// - `tool_use` blocks → `{ functionCall: { id, name, args }, thoughtSignature }`
 /// - `tool_result` blocks → `{ functionResponse: { id, name, response } }`
 /// - Signatures carry forward across parts within a message
-#[must_use] 
+#[must_use]
 pub fn convert_to_gemini_contents(messages: &[StorageMessage]) -> Vec<GeminiContent> {
     let tool_use_id_to_name = build_tool_use_id_to_name(messages);
 

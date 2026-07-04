@@ -68,7 +68,7 @@ pub struct CommandSafetyChecker {
 }
 
 impl CommandSafetyChecker {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             yolo_mode: false,
@@ -99,13 +99,13 @@ impl CommandSafetyChecker {
             .unwrap_or_default()
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.yolo_mode = yolo;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn with_user_safe_commands(mut self, commands: Vec<String>) -> Self {
         self.user_safe_commands = commands;
         self
@@ -361,7 +361,7 @@ pub struct CommandUnsafe {
 }
 
 impl CommandUnsafe {
-    #[must_use] 
+    #[must_use]
     pub fn new(reason: &str) -> Self {
         Self {
             reason: reason.to_string(),
@@ -419,15 +419,11 @@ impl PathPattern {
     /// Check if a path matches this pattern.
     ///
     /// `workspace_root` is required for `External` and `Workspace` patterns.
-    #[must_use] 
+    #[must_use]
     pub fn matches(&self, path: &str, workspace_root: Option<&str>) -> bool {
         match self {
-            Self::External => {
-                workspace_root.is_none_or(|root| !Path::new(path).starts_with(root))
-            }
-            Self::Workspace => {
-                workspace_root.is_some_and(|root| Path::new(path).starts_with(root))
-            }
+            Self::External => workspace_root.is_none_or(|root| !Path::new(path).starts_with(root)),
+            Self::Workspace => workspace_root.is_some_and(|root| Path::new(path).starts_with(root)),
             Self::Exact(s) => path == s,
             Self::Regex(re) => re.is_match(path),
         }
@@ -440,7 +436,7 @@ pub struct PathPatternError {
 }
 
 impl PathPatternError {
-    #[must_use] 
+    #[must_use]
     pub fn new(reason: &str) -> Self {
         Self {
             reason: reason.to_string(),
@@ -497,7 +493,7 @@ pub struct ApprovalManager {
 
 impl ApprovalManager {
     /// Create a new approval manager, loading SNED_AUTO_APPROVE from the environment.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         let env_auto_approve = std::env::var("SNED_AUTO_APPROVE")
             .ok()
@@ -515,56 +511,56 @@ impl ApprovalManager {
     }
 
     /// Enable yolo mode (skip all approval prompts).
-    #[must_use] 
+    #[must_use]
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.yolo_mode = yolo;
         self
     }
 
     /// Enable auto-approve-all (skip prompts but keep interactive mode).
-    #[must_use] 
+    #[must_use]
     pub fn with_auto_approve_all(mut self, auto_approve_all: bool) -> Self {
         self.auto_approve_all = auto_approve_all;
         self
     }
 
     /// Set the workspace root for local vs external path resolution.
-    #[must_use] 
+    #[must_use]
     pub fn with_workspace_root(mut self, root: String) -> Self {
         self.workspace_root = Some(root);
         self
     }
 
     /// Set per-action auto-approval settings.
-    #[must_use] 
+    #[must_use]
     pub fn with_auto_approval_settings(mut self, settings: AutoApprovalSettings) -> Self {
         self.auto_approval_settings = settings;
         self
     }
 
     /// Set per-path auto-approval patterns.
-    #[must_use] 
+    #[must_use]
     pub fn with_auto_approve_patterns(mut self, patterns: Vec<PathPattern>) -> Self {
         self.auto_approve_patterns = patterns;
         self
     }
 
     /// Set user-safe commands (overrides SNED_SAFE_COMMANDS env var).
-    #[must_use] 
+    #[must_use]
     pub fn with_user_safe_commands(mut self, commands: Vec<String>) -> Self {
         self.user_safe_commands = commands;
         self
     }
 
     /// Set env auto-approve tool names (from SNED_AUTO_APPROVE env var).
-    #[must_use] 
+    #[must_use]
     pub fn with_env_auto_approve(mut self, tools: HashSet<String>) -> Self {
         self.env_auto_approve = tools;
         self
     }
 
     /// Get the user-safe commands list.
-    #[must_use] 
+    #[must_use]
     pub fn get_user_safe_commands(&self) -> &Vec<String> {
         &self.user_safe_commands
     }
@@ -574,7 +570,7 @@ impl ApprovalManager {
     /// Read-only tools and tools already in the session auto-approve list
     /// do not require a prompt. Yolo mode and auto-approve-all also skip prompts.
     /// For execute_command, command_fingerprint should be provided for per-command approval (F-02 fix).
-    #[must_use] 
+    #[must_use]
     pub fn should_prompt(&self, tool: SnedTool, command_fingerprint: Option<&str>) -> bool {
         let category = tool.category();
         if matches!(category, ToolCategory::ReadOnly | ToolCategory::ReadFiles) {
@@ -601,7 +597,7 @@ impl ApprovalManager {
     /// - `auto-approve-all` skips non-external prompts.
     /// - Per-action settings from `AutoApprovalSettings` are applied for
     ///   local vs external paths.
-    #[must_use] 
+    #[must_use]
     pub fn should_prompt_with_path(&self, tool: SnedTool, action_path: Option<&str>) -> bool {
         let category = tool.category();
         let is_local = action_path.is_some_and(|p| self.is_path_local(p));
@@ -814,7 +810,7 @@ impl ApprovalManager {
 
     /// Check if a tool is in the session auto-approve list.
     /// For execute_command, also check the command fingerprint.
-    #[must_use] 
+    #[must_use]
     pub fn is_auto_approved(&self, tool_name: &str, command_fingerprint: Option<&str>) -> bool {
         if tool_name == "execute_command"
             && let Some(fp) = command_fingerprint
@@ -831,13 +827,13 @@ impl ApprovalManager {
     }
 
     /// Check if yolo mode is enabled.
-    #[must_use] 
+    #[must_use]
     pub fn is_yolo_mode(&self) -> bool {
         self.yolo_mode
     }
 
     /// Check if auto-approve-all is enabled.
-    #[must_use] 
+    #[must_use]
     pub fn is_auto_approve_all(&self) -> bool {
         self.auto_approve_all
     }
@@ -857,7 +853,7 @@ pub enum ApprovalResult {
 /// Format the standard denial message for a tool.
 ///
 /// Centralizes the wording so agent_loop and tool handlers stay in sync.
-#[must_use] 
+#[must_use]
 pub fn format_denial_message(tool_name: &str) -> String {
     format!(
         "Tool '{tool_name}' was denied by user. Ask the user what approach they would prefer. \
@@ -1348,8 +1344,8 @@ fn build_combined_approval_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex as StdMutex};
     use crate::test_support::env_lock;
+    use std::sync::{LazyLock, Mutex as StdMutex};
 
     static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 

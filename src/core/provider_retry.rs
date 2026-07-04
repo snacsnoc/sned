@@ -169,7 +169,10 @@ pub async fn create_message_with_retry(
                                 "cancelled by user during retry delay".to_string(),
                             ));
                         }
-                        tokio::time::sleep(poll_interval.min(remaining.checked_sub(elapsed).unwrap())).await;
+                        tokio::time::sleep(
+                            poll_interval.min(remaining.checked_sub(elapsed).unwrap()),
+                        )
+                        .await;
                         elapsed += poll_interval;
                     }
                 } else {
@@ -240,14 +243,9 @@ fn exponential_backoff_delay(retry_attempt: usize, retry_config: RetryConfig) ->
 mod tests {
     use super::*;
     use crate::cli::output::{OutputEvent, OutputWriter};
-    use crate::providers::{
-        ApiStreamChunk, Providers, RetryTestProvider,
-    };
+    use crate::providers::{ApiStreamChunk, Providers, RetryTestProvider};
     use futures::StreamExt;
-    use std::sync::{
-        Arc,
-        atomic::AtomicUsize,
-    };
+    use std::sync::{Arc, atomic::AtomicUsize};
     use std::sync::{LazyLock, Mutex as StdMutex};
 
     static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));

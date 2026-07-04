@@ -129,7 +129,7 @@ pub const LOCK_TEXT_SYMBOL: &str = "\u{1F512}";
 
 /// Resolves a relative path against a workspace root.
 ///
-#[must_use] 
+#[must_use]
 pub fn resolve_workspace_path(cwd: &str, relative_path: &str) -> PathBuf {
     let cwd_path = Path::new(cwd);
     cwd_path.join(relative_path)
@@ -151,7 +151,7 @@ pub struct SnedIgnoreController {
 }
 
 impl SnedIgnoreController {
-    #[must_use] 
+    #[must_use]
     pub fn new(cwd: &str) -> Self {
         let mut builder = ignore::gitignore::GitignoreBuilder::new(cwd);
 
@@ -277,7 +277,7 @@ impl SnedIgnoreController {
 
     /// Check if a file should be accessible.
     ///
-    #[must_use] 
+    #[must_use]
     pub fn validate_access(&self, file_path: &str) -> bool {
         if self.yolo_mode {
             return true;
@@ -301,7 +301,7 @@ impl SnedIgnoreController {
 
     /// Check if a terminal command should be allowed.
     ///
-    #[must_use] 
+    #[must_use]
     pub fn validate_command(&self, command: &str) -> Option<String> {
         if self.yolo_mode {
             return None;
@@ -353,7 +353,7 @@ impl SnedIgnoreController {
 
     /// Filter an array of paths, removing ignored ones.
     ///
-    #[must_use] 
+    #[must_use]
     pub fn filter_paths(&self, paths: &[String]) -> Vec<String> {
         paths
             .iter()
@@ -368,7 +368,7 @@ impl SnedIgnoreController {
 // ============================================================================
 
 /// Checks if a path is within the workspace.
-#[must_use] 
+#[must_use]
 pub fn is_within_workspace(workspace_root: &str, path: &str) -> bool {
     let root = Path::new(workspace_root);
     let target = Path::new(path);
@@ -376,7 +376,7 @@ pub fn is_within_workspace(workspace_root: &str, path: &str) -> bool {
 }
 
 /// Checks if a file is a binary file based on extension.
-#[must_use] 
+#[must_use]
 pub fn is_binary_file(path: &str) -> bool {
     let binary_extensions = [
         ".exe", ".dll", ".so", ".dylib", ".bin", ".dat", ".db", ".sqlite", ".sqlite3", ".pdb",
@@ -392,7 +392,7 @@ pub fn is_binary_file(path: &str) -> bool {
 }
 
 /// Checks if a file is too large to process.
-#[must_use] 
+#[must_use]
 pub fn is_large_file(size_bytes: u64, max_size: u64) -> bool {
     size_bytes > max_size
 }

@@ -36,7 +36,7 @@ struct HighlightSpan {
 ///
 /// Unsupported languages, disabled grammar features, parse failures, and `NO_COLOR` all fall back
 /// to returning the original code unchanged.
-#[must_use] 
+#[must_use]
 pub fn highlight_code(code: &str, lang: &str) -> String {
     if std::env::var_os("NO_COLOR").is_some() || code.is_empty() {
         return code.to_string();

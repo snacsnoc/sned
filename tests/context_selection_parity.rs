@@ -483,7 +483,7 @@ fn new_context_mechanical_truncation_quarter_when_large() {
 // ============================================================================
 
 use sned::core::context::get_context_window_info;
-use sned::providers::{mock::MockResponse, MockProvider, Providers};
+use sned::providers::{MockProvider, Providers, mock::MockResponse};
 
 #[test]
 fn context_window_default_256k() {
@@ -509,10 +509,8 @@ fn context_window_large_respects_hard_limit() {
 
 #[test]
 fn context_window_small_uses_80_percent() {
-    let provider = MockProvider::new_with_context_window(
-        vec![MockResponse::Text("test".to_string())],
-        64_000,
-    );
+    let provider =
+        MockProvider::new_with_context_window(vec![MockResponse::Text("test".to_string())], 64_000);
     let provider = Providers::Mock(provider);
     let info = get_context_window_info(&provider);
     assert_eq!(info.context_window, 64_000);

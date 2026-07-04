@@ -5,11 +5,11 @@ use crate::cli::output::OutputEvent;
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_string_array};
-use std::future::Future;
-use std::pin::Pin;
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -795,7 +795,11 @@ impl ExecuteCommandHandler {
         }
 
         if !filtered_names.is_empty() {
-            let sample: Vec<&str> = filtered_names.iter().take(5).map(std::string::String::as_str).collect();
+            let sample: Vec<&str> = filtered_names
+                .iter()
+                .take(5)
+                .map(std::string::String::as_str)
+                .collect();
             let note = if filtered_names.len() > 5 {
                 format!(
                     "\n[Sandbox: {} env vars filtered (e.g. {}). Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
@@ -905,14 +909,14 @@ impl ExecuteCommandHandler {
         (env, filtered)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             safety_checker: CommandSafetyChecker::new(),
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.safety_checker = self.safety_checker.with_yolo(yolo);
         self
@@ -990,17 +994,18 @@ impl ToolHandler for ExecuteCommandHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            handler.execute_without_state(
-                Some(ctx.workspace_root.as_path()),
-                params,
-                Some(&ctx.task_id),
-                ctx.explicitly_approved,
-                Some(ctx.state.clone()),
-                ctx.json_output,
-                &ctx.output_writer,
-            )
-            .await
-            .map(serde_json::Value::String)
+            handler
+                .execute_without_state(
+                    Some(ctx.workspace_root.as_path()),
+                    params,
+                    Some(&ctx.task_id),
+                    ctx.explicitly_approved,
+                    Some(ctx.state.clone()),
+                    ctx.json_output,
+                    &ctx.output_writer,
+                )
+                .await
+                .map(serde_json::Value::String)
         })
     }
 

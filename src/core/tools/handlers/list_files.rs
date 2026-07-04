@@ -12,9 +12,9 @@ use crate::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
     resolve_sanitized_path,
 };
+use futures::future::join_all;
 use std::future::Future;
 use std::pin::Pin;
-use futures::future::join_all;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use std::path::Path;
@@ -46,7 +46,7 @@ struct ListFilesResult {
 pub struct ListFilesHandler;
 
 impl ListFilesHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -382,7 +382,8 @@ impl ListFilesHandler {
 
             // Get just the filename for display
             let name = Path::new(&file.path)
-                .file_name().map_or_else(|| file.path.clone(), |n| n.to_string_lossy().to_string());
+                .file_name()
+                .map_or_else(|| file.path.clone(), |n| n.to_string_lossy().to_string());
 
             lines.push(format!("{prefix}{name}{line_info}"));
         }
@@ -452,7 +453,8 @@ impl ToolHandler for ListFilesHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            handler.execute_without_state(&ctx.workspace_root, params)
+            handler
+                .execute_without_state(&ctx.workspace_root, params)
                 .await
                 .map(serde_json::Value::String)
         })

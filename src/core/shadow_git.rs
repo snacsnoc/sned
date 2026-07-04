@@ -462,7 +462,7 @@ pub fn commit_to_real_git(workspace_root: &Path, message: &str) -> Result<Vec<St
 }
 
 /// Check if shadow git is initialized.
-#[must_use] 
+#[must_use]
 pub fn is_initialized(workspace_root: &Path) -> bool {
     workspace_root.join(SHADOW_GIT_DIR).join("HEAD").exists()
 }
@@ -539,7 +539,7 @@ pub fn get_user_edits_since_last_turn(workspace_root: &Path) -> Result<Vec<Strin
 }
 
 /// Get the number of turns (commits) in the shadow repo.
-#[must_use] 
+#[must_use]
 pub fn turn_count(workspace_root: &Path) -> usize {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 

@@ -123,10 +123,7 @@ impl MinimaxProvider {
     fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
         let model_id = self.canonical_model_id();
         let model_info = self.get_model_info();
-        let native_tools_on = request
-            .tools
-            .as_ref()
-            .is_some_and(|t| !t.is_empty());
+        let native_tools_on = request.tools.as_ref().is_some_and(|t| !t.is_empty());
 
         let mut messages: Vec<serde_json::Value> = request
             .messages

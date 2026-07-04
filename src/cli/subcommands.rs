@@ -88,14 +88,15 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
     };
 
     // Header
-    println!(
-        " Task History{filter_summary} (page {page} of {total_pages}, {total} total)"
-    );
+    println!(" Task History{filter_summary} (page {page} of {total_pages}, {total} total)");
     println!("{}", "─".repeat(separator_width));
 
     for item in items {
         let ts = item.ts;
-        let dt = DateTime::from_timestamp(ts, 0).map_or_else(|| ts.to_string(), |d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string());
+        let dt = DateTime::from_timestamp(ts, 0).map_or_else(
+            || ts.to_string(),
+            |d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string(),
+        );
 
         let preview = if item.task.len() > 50 {
             let end = item.task.floor_char_boundary(47);
@@ -123,9 +124,7 @@ pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
     }
 
     println!("{}", "─".repeat(separator_width));
-    println!(
-        " Showing {limit} tasks per page. Use -n <limit> and -p <page> to navigate."
-    );
+    println!(" Showing {limit} tasks per page. Use -n <limit> and -p <page> to navigate.");
     if !filter_parts.is_empty() {
         println!(
             " Active filters: {}. Use --help to see filter options.",
@@ -212,9 +211,7 @@ pub fn run_config(opts: ConfigOptions) -> anyhow::Result<()> {
                 .is_ok();
 
             if has_key {
-                println!(
-                    "  ✓  {mode} mode provider '{provider}' has API key configured"
-                );
+                println!("  ✓  {mode} mode provider '{provider}' has API key configured");
             } else {
                 issues.push(format!(
                     "  ⚠️  {mode} mode provider '{provider}' may need API key ({key_name} not set)"
@@ -256,7 +253,10 @@ pub fn run_migration(source_dir: &str, dry_run: bool) -> anyhow::Result<()> {
         .ok()
         .or_else(|| dirs::config_dir().map(|p| p.join("sned").to_string_lossy().into_owned()))
         .unwrap_or_else(|| {
-            dirs::home_dir().map_or_else(|| ".config/sned".to_string(), |h| h.join(".config/sned").to_string_lossy().into_owned())
+            dirs::home_dir().map_or_else(
+                || ".config/sned".to_string(),
+                |h| h.join(".config/sned").to_string_lossy().into_owned(),
+            )
         });
 
     let destination_path = PathBuf::from(&destination_dir);
@@ -533,18 +533,12 @@ pub(crate) fn print_execution_report(report: &crate::storage::migration::Migrati
         println!();
     }
 
-    let total_copied = report
-        .endpoints
-        .as_ref()
-        .map_or(0, |e| e.copied_keys.len())
+    let total_copied = report.endpoints.as_ref().map_or(0, |e| e.copied_keys.len())
         + report
             .global_settings
             .as_ref()
             .map_or(0, |g| g.copied_keys.len())
-        + report
-            .secrets
-            .as_ref()
-            .map_or(0, |s| s.copied_keys.len())
+        + report.secrets.as_ref().map_or(0, |s| s.copied_keys.len())
         + report
             .task_history
             .as_ref()
@@ -558,7 +552,7 @@ pub(crate) fn print_execution_report(report: &crate::storage::migration::Migrati
     println!("Total: {total_copied} files/keys copied");
 }
 
-#[must_use] 
+#[must_use]
 pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -> String {
     let mut lines = vec![
         String::from("Current Sned Configuration"),
@@ -902,9 +896,7 @@ pub fn run_doctor() -> anyhow::Result<i32> {
                 if subpath.exists() {
                     println!("  [OK] {subdir} directory exists");
                 } else {
-                    println!(
-                        "  [WARN] {subdir} directory missing (will be created on first use)"
-                    );
+                    println!("  [WARN] {subdir} directory missing (will be created on first use)");
                     has_warn = true;
                 }
             }

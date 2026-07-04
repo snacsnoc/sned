@@ -32,7 +32,9 @@ pub fn parse_file(
 ) -> Result<Option<Vec<ParsedDefinition>>, LanguageParserError> {
     let ext = get_extension(file_path);
 
-    let Some(entry) = language_parsers.get(&ext) else { return Ok(None) };
+    let Some(entry) = language_parsers.get(&ext) else {
+        return Ok(None);
+    };
 
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -116,9 +118,14 @@ pub fn get_file_skeleton(
     language_parsers: &LanguageParserMap,
     task_id: Option<&str>,
 ) -> Result<Option<String>, LanguageParserError> {
-    let Some(definitions) = parse_file(absolute_path, file_content, language_parsers)? else { return Ok(None) };
+    let Some(definitions) = parse_file(absolute_path, file_content, language_parsers)? else {
+        return Ok(None);
+    };
 
-    let lines: Vec<String> = file_content.lines().map(std::string::ToString::to_string).collect();
+    let lines: Vec<String> = file_content
+        .lines()
+        .map(std::string::ToString::to_string)
+        .collect();
     let anchors = anchor_mgr.reconcile(absolute_path, &lines, task_id);
 
     let mut formatted_output = String::new();
@@ -184,7 +191,10 @@ pub fn get_functions(
         }));
     };
 
-    let all_lines: Vec<String> = file_content.lines().map(std::string::ToString::to_string).collect();
+    let all_lines: Vec<String> = file_content
+        .lines()
+        .map(std::string::ToString::to_string)
+        .collect();
     let all_anchors = anchor_mgr.reconcile(absolute_path, &all_lines, task_id);
 
     let root_node = tree.root_node();
@@ -390,14 +400,18 @@ pub fn get_symbol_range(
 ) -> Result<Option<SymbolRange>, LanguageParserError> {
     let ext = get_extension(absolute_path);
 
-    let Some(entry) = language_parsers.get(&ext) else { return Ok(None) };
+    let Some(entry) = language_parsers.get(&ext) else {
+        return Ok(None);
+    };
 
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&entry.language)
         .map_err(|e| LanguageParserError::ParserCreation(e.to_string()))?;
 
-    let Some(tree) = parser.parse(file_content, None) else { return Ok(None) };
+    let Some(tree) = parser.parse(file_content, None) else {
+        return Ok(None);
+    };
     let root_node = tree.root_node();
 
     // Build mappings for nested name resolution (same as get_functions)
@@ -525,7 +539,7 @@ pub struct ExtendedRange {
 
 /// Gets the extended range of a node, including wrapper types and preceding comments.
 ///
-#[must_use] 
+#[must_use]
 pub fn get_extended_range(target_node: tree_sitter::Node) -> ExtendedRange {
     let mut start_index = target_node.start_byte();
     let mut end_index = target_node.end_byte();

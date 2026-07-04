@@ -33,7 +33,7 @@ pub struct PlanStep {
 }
 
 impl PlanStep {
-    #[must_use] 
+    #[must_use]
     pub fn status_icon(&self) -> &'static str {
         match self.status {
             PlanStepStatus::Pending => "○",
@@ -63,7 +63,7 @@ pub struct PlanState {
 
 impl PlanState {
     /// Create a new plan from step descriptions.
-    #[must_use] 
+    #[must_use]
     pub fn create_plan(step_descriptions: Vec<String>) -> Self {
         let steps = step_descriptions
             .into_iter()
@@ -201,7 +201,7 @@ impl PlanState {
     }
 
     /// Get the current step.
-    #[must_use] 
+    #[must_use]
     pub fn current_step(&self) -> Option<&PlanStep> {
         self.steps.get(self.current_step_index)
     }
@@ -284,7 +284,7 @@ impl PlanState {
     }
 
     /// Check if all steps are done.
-    #[must_use] 
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         !self.steps.is_empty() && self.steps.iter().all(|s| s.status == PlanStepStatus::Done)
     }
@@ -302,7 +302,7 @@ impl PlanState {
     /// - `1. First step`
     /// - `1) First step`
     /// - `Step 1: First step`
-    #[must_use] 
+    #[must_use]
     pub fn parse_plan(text: &str) -> Option<Vec<String>> {
         let mut steps = Vec::new();
 
@@ -328,7 +328,7 @@ impl PlanState {
     }
 
     /// Format the plan state for model context injection.
-    #[must_use] 
+    #[must_use]
     pub fn format_state(&self) -> String {
         let mut out = String::new();
 
@@ -381,7 +381,7 @@ impl PlanState {
     }
 
     /// Format the plan for display in the TUI panel.
-    #[must_use] 
+    #[must_use]
     pub fn format_display(&self) -> String {
         let mut out = String::new();
 
@@ -409,7 +409,7 @@ impl PlanState {
     }
 
     /// Get the status summary string for the status bar.
-    #[must_use] 
+    #[must_use]
     pub fn status_summary(&self) -> String {
         let total = self.steps.len();
         let current = self.current_step_index + 1;

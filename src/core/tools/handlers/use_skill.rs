@@ -9,15 +9,15 @@ use crate::core::context::instructions::{
 };
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
-use std::pin::Pin;
 use std::path::Path;
+use std::pin::Pin;
 
 /// Use skill tool handler.
 #[derive(Debug, Clone, Default)]
 pub struct UseSkillHandler;
 
 impl UseSkillHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -244,7 +244,8 @@ impl ToolHandler for UseSkillHandler {
 
             // Re-acquire lock only for state mutation
             let mut state = ctx.state.lock().await;
-            let result = handler.execute_with_skills(&mut state, params, workspace_root, skills_to_use)?;
+            let result =
+                handler.execute_with_skills(&mut state, params, workspace_root, skills_to_use)?;
             Ok(serde_json::Value::String(result))
         })
     }
@@ -292,11 +293,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = handler
-            .execute(
-                &mut state,
-                serde_json::json!({"skill_name": "missing-skill"}),
-            );
+        let result = handler.execute(
+            &mut state,
+            serde_json::json!({"skill_name": "missing-skill"}),
+        );
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("Error: Skill \"missing-skill\" not found"));
@@ -335,8 +335,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handler
-            .execute(&mut state, serde_json::json!({"skill_name": "test-skill"}));
+        let result = handler.execute(&mut state, serde_json::json!({"skill_name": "test-skill"}));
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("Skill \"test-skill\" is now active"));
@@ -371,11 +370,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handler
-            .execute(
-                &mut state,
-                serde_json::json!({"skill_name": "minimal-skill"}),
-            );
+        let result = handler.execute(
+            &mut state,
+            serde_json::json!({"skill_name": "minimal-skill"}),
+        );
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("Minimal instructions."));
@@ -423,8 +421,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handler
-            .execute(&mut state, serde_json::json!({"skill_name": "test-skill"}));
+        let result = handler.execute(&mut state, serde_json::json!({"skill_name": "test-skill"}));
         assert!(result.is_ok());
         let text = result.unwrap();
 

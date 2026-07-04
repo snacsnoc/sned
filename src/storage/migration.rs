@@ -31,7 +31,8 @@ fn create_backup_path(original: &Path) -> PathBuf {
         .as_secs();
 
     let mut backup_name = original
-        .file_name().map_or_else(|| "backup".to_string(), |s| s.to_string_lossy().to_string());
+        .file_name()
+        .map_or_else(|| "backup".to_string(), |s| s.to_string_lossy().to_string());
 
     backup_name.push_str(&format!(".{timestamp}.bak"));
 
@@ -70,7 +71,7 @@ pub struct JsonObjectMigration {
 }
 
 impl JsonObjectMigration {
-    #[must_use] 
+    #[must_use]
     pub fn is_in_sync(&self) -> bool {
         self.copied_keys.is_empty() && self.conflicting_keys.is_empty()
     }
@@ -87,7 +88,7 @@ pub struct TaskHistoryMigration {
 }
 
 impl TaskHistoryMigration {
-    #[must_use] 
+    #[must_use]
     pub fn is_in_sync(&self) -> bool {
         self.copied_ids.is_empty() && self.conflicting_ids.is_empty()
     }
@@ -104,7 +105,7 @@ pub struct TaskDirectoryMigration {
 }
 
 impl TaskDirectoryMigration {
-    #[must_use] 
+    #[must_use]
     pub fn is_in_sync(&self) -> bool {
         self.copied_files.is_empty() && self.conflicting_files.is_empty()
     }
@@ -122,7 +123,7 @@ pub struct DryRunMigrationReport {
 }
 
 impl DryRunMigrationReport {
-    #[must_use] 
+    #[must_use]
     pub fn has_changes(&self) -> bool {
         self.endpoints
             .as_ref()
@@ -142,7 +143,7 @@ impl DryRunMigrationReport {
             || self.tasks.iter().any(|report| !report.is_in_sync())
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn total_copied_files(&self) -> usize {
         let mut total = 0;
 
@@ -263,7 +264,7 @@ pub struct MigrationExecutionReport {
 }
 
 impl MigrationExecutionReport {
-    #[must_use] 
+    #[must_use]
     pub fn has_changes(&self) -> bool {
         self.endpoints
             .as_ref()
@@ -909,7 +910,8 @@ impl MigrationEngine {
         for entry in WalkDir::new(&source_rules_dir) {
             let entry = entry.map_err(|source| MigrationError::Io {
                 path: source
-                    .path().map_or_else(|| source_rules_dir.clone(), Path::to_path_buf),
+                    .path()
+                    .map_or_else(|| source_rules_dir.clone(), Path::to_path_buf),
                 source: io::Error::other(source),
             })?;
             if entry.file_type().is_file() {
@@ -1251,7 +1253,8 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, MigrationError> {
     for entry in WalkDir::new(root) {
         let entry = entry.map_err(|source| MigrationError::Io {
             path: source
-                .path().map_or_else(|| root.to_path_buf(), Path::to_path_buf),
+                .path()
+                .map_or_else(|| root.to_path_buf(), Path::to_path_buf),
             source: io::Error::other(source),
         })?;
         if entry.file_type().is_file() {

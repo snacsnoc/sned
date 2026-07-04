@@ -100,7 +100,7 @@ impl OpenAiProvider {
 
     /// Get the base URL for the API endpoint.
     /// Normalizes URL by stripping trailing `/chat/completions` and slashes.
-    #[must_use] 
+    #[must_use]
     pub fn base_url(&self) -> String {
         self.config
             .base_url
@@ -120,9 +120,10 @@ impl OpenAiProvider {
 
     fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
         let model_id = &self.config.model_id;
-        let is_reasoning_family = ["o1", "o3", "o4", "gpt-5"].iter().any(|prefix| {
-            model_id.starts_with(prefix) || model_id.contains(&format!("/{prefix}"))
-        }) && !model_id.contains("chat");
+        let is_reasoning_family = ["o1", "o3", "o4", "gpt-5"]
+            .iter()
+            .any(|prefix| model_id.starts_with(prefix) || model_id.contains(&format!("/{prefix}")))
+            && !model_id.contains("chat");
 
         let mut messages = vec![];
 
@@ -1081,10 +1082,10 @@ impl Provider for OpenAiProvider {
     }
 
     fn get_model(&self) -> ProviderModel {
-        let info = self
-            .config
-            .model_info
-            .as_ref().map_or_else(|| get_openai_model_info(&self.config.model_id).base, |m| m.base.clone());
+        let info = self.config.model_info.as_ref().map_or_else(
+            || get_openai_model_info(&self.config.model_id).base,
+            |m| m.base.clone(),
+        );
 
         ProviderModel {
             id: self.config.model_id.clone(),
@@ -1099,7 +1100,7 @@ impl Provider for OpenAiProvider {
 
 /// Get model info for known OpenAI models. Falls back to sane defaults
 /// matching TS `openAiModelInfoSaneDefaults` for unknown model IDs.
-#[must_use] 
+#[must_use]
 pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     // Default matching TS openAiModelInfoSaneDefaults
     let mut info = ModelInfo {

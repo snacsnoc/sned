@@ -71,7 +71,7 @@ impl Provider for DeepSeekProvider {
 }
 
 /// Get model info for known DeepSeek models.
-#[must_use] 
+#[must_use]
 pub fn get_deepseek_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     // Default matching TS deepseekModelInfo
     let mut info = ModelInfo {

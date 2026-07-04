@@ -7,8 +7,8 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
-use std::pin::Pin;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -58,7 +58,7 @@ impl Default for SubagentResult {
 pub struct UseSubagentsHandler;
 
 impl UseSubagentsHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -601,9 +601,7 @@ impl UseSubagentsHandler {
         }
 
         summary_lines.push(String::new());
-        summary_lines.push(format!(
-            "Summary: {successes} succeeded, {failures} failed"
-        ));
+        summary_lines.push(format!("Summary: {successes} succeeded, {failures} failed"));
 
         if total_tool_calls > 0
             || total_cache_writes > 0
@@ -692,15 +690,16 @@ impl ToolHandler for UseSubagentsHandler {
                 ));
             }
 
-            handler.execute_with_workspace_root(
-                ctx.state.clone(),
-                params,
-                ctx.workspace_root.as_path(),
-                ctx.json_output,
-                &ctx.output_writer,
-            )
-            .await
-            .map(serde_json::Value::String)
+            handler
+                .execute_with_workspace_root(
+                    ctx.state.clone(),
+                    params,
+                    ctx.workspace_root.as_path(),
+                    ctx.json_output,
+                    &ctx.output_writer,
+                )
+                .await
+                .map(serde_json::Value::String)
         })
     }
 

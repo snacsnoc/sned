@@ -94,31 +94,31 @@ pub fn overlay_block(title: impl Into<String>) -> Block<'static> {
 }
 
 /// Style for status bar text.
-#[must_use] 
+#[must_use]
 pub fn status_style() -> Style {
     Style::default().fg(STATUS_FG)
 }
 
 /// Style for dim text (hints, metadata).
-#[must_use] 
+#[must_use]
 pub fn dim_style() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
 /// Style for bold text (headers, emphasis).
-#[must_use] 
+#[must_use]
 pub fn bold_style() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
 }
 
 /// Style for the spinner character.
-#[must_use] 
+#[must_use]
 pub fn spinner_style() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
 /// Style for selected file picker row.
-#[must_use] 
+#[must_use]
 pub fn picker_selected_style() -> Style {
     Style::default()
         .bg(PICKER_SELECTED_BG)
@@ -127,13 +127,13 @@ pub fn picker_selected_style() -> Style {
 }
 
 /// Style for scrollbar track.
-#[must_use] 
+#[must_use]
 pub fn scrollbar_style() -> Style {
     Style::default().fg(STATUS_FG)
 }
 
 /// Style for scrollbar thumb (the movable part).
-#[must_use] 
+#[must_use]
 pub fn scrollbar_thumb_style() -> Style {
     Style::default().fg(BORDER_FG)
 }

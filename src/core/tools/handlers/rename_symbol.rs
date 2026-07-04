@@ -1,12 +1,12 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
-use std::future::Future;
-use std::pin::Pin;
 use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::load_required_language_parsers;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use streaming_iterator::StreamingIterator;
 use tokio::fs;
@@ -16,7 +16,7 @@ pub struct RenameSymbolHandler {
 }
 
 impl RenameSymbolHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             symbol_index_service: None,
@@ -154,7 +154,8 @@ impl RenameSymbolHandler {
                 }
             }
 
-            if let Ok(mut index_service) = mutex.lock().map_err(std::sync::PoisonError::into_inner) {
+            if let Ok(mut index_service) = mutex.lock().map_err(std::sync::PoisonError::into_inner)
+            {
                 let project_root = index_service.get_project_root().to_string();
                 let root = std::path::Path::new(&project_root);
                 for (abs_path, symbols) in parsed_symbols {
@@ -180,9 +181,7 @@ impl RenameSymbolHandler {
                 .map(std::string::String::as_str)
                 .collect::<Vec<_>>(),
         )
-        .map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
-        })?;
+        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}")))?;
 
         let mut locations_by_file: HashMap<String, FileData> =
             HashMap::with_capacity(paths.len().max(1));
@@ -256,8 +255,11 @@ impl RenameSymbolHandler {
         let mut total_replacements = 0;
 
         for (abs_path, file_data) in locations_by_file {
-            let mut current_lines: Vec<String> =
-                file_data.content.lines().map(std::string::ToString::to_string).collect();
+            let mut current_lines: Vec<String> = file_data
+                .content
+                .lines()
+                .map(std::string::ToString::to_string)
+                .collect();
             let mut occurrences = file_data.occurrences;
             let mut replacement_count = 0;
 
@@ -351,7 +353,7 @@ impl RenameSymbolHandler {
             .await
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn description(&self, _params: &serde_json::Value) -> String {
         "[rename_symbol]".to_string()
     }
@@ -367,7 +369,8 @@ impl ToolHandler for RenameSymbolHandler {
         let ctx = ctx.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
-            handler.execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
+            handler
+                .execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
                 .await
                 .map(serde_json::Value::String)
         })
@@ -459,14 +462,18 @@ fn collect_symbol_occurrences(
         None => return Vec::new(),
     };
 
-    let Some(entry) = language_parsers.get(&ext) else { return Vec::new() };
+    let Some(entry) = language_parsers.get(&ext) else {
+        return Vec::new();
+    };
 
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&entry.language).is_err() {
         return Vec::new();
     }
 
-    let Some(tree) = parser.parse(content, None) else { return Vec::new() };
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
 
     let root_node = tree.root_node();
     let content_bytes = content.as_bytes();

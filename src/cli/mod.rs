@@ -496,7 +496,7 @@ pub struct Cli {
 }
 
 /// Parse and return the CLI structure.
-#[must_use] 
+#[must_use]
 pub fn parse() -> Cli {
     Cli::parse()
 }
@@ -532,7 +532,8 @@ pub fn apply_config_override(cli: &Cli) {
 }
 
 fn cli_log_file_path_from(data_dir: &Path, log_dir: Option<&Path>) -> PathBuf {
-    log_dir.map_or_else(|| data_dir.join("logs"), Path::to_path_buf)
+    log_dir
+        .map_or_else(|| data_dir.join("logs"), Path::to_path_buf)
         .join("sned.1.log")
 }
 
@@ -692,9 +693,7 @@ fn build_symbol_index_service(
                         let _ = std::fs::remove_file(&db_path);
                     }
                     // Return in-memory service (service was moved into with_persistence, so create new one)
-                    crate::services::symbol_index::SymbolIndexService::new(
-                        cwd_str,
-                    )
+                    crate::services::symbol_index::SymbolIndexService::new(cwd_str)
                 }
             }
         }
@@ -896,8 +895,7 @@ pub(crate) fn create_provider(
                 .clone()
                 .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
                 .unwrap_or_default();
-            let model_id_str = model_id
-                .unwrap_or_else(|| "deepseek-chat".to_string());
+            let model_id_str = model_id.unwrap_or_else(|| "deepseek-chat".to_string());
             Arc::new(crate::providers::Providers::DeepSeek(
                 crate::providers::deepseek::DeepSeekProvider::new(
                     crate::providers::deepseek::DeepSeekConfig {
@@ -916,8 +914,8 @@ pub(crate) fn create_provider(
                 .clone()
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .unwrap_or_default();
-            let model_id_str = model_id
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4.5".to_string());
+            let model_id_str =
+                model_id.unwrap_or_else(|| "anthropic/claude-sonnet-4.5".to_string());
             Arc::new(crate::providers::Providers::OpenRouter(
                 crate::providers::openrouter::OpenRouterProvider::new(
                     crate::providers::openrouter::OpenRouterConfig {
@@ -1482,9 +1480,9 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::Provider;
     use clap::Parser;
     use std::sync::Mutex;
-    use crate::providers::Provider;
     static PROVIDER_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -2053,8 +2051,8 @@ mod tests {
         // /tmp/sned-symbol-index-{hash}/{INDEX_DIR}/data.db. Compute the same
         // hash the service uses, then create a corrupted DB at that path.
         let index_root = format!("/tmp/sned-symbol-index-{}", hash_cwd(temp_dir));
-        let db_dir = std::path::Path::new(&index_root)
-            .join(crate::services::symbol_index::INDEX_DIR);
+        let db_dir =
+            std::path::Path::new(&index_root).join(crate::services::symbol_index::INDEX_DIR);
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = db_dir.join(crate::services::symbol_index::DB_FILENAME);
         {

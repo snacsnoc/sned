@@ -8,7 +8,7 @@ pub enum ThinkOpenKind {
     TagOrUnicode,
 }
 
-#[must_use] 
+#[must_use]
 pub fn classify_think_start(line: &str) -> Option<ThinkOpenKind> {
     let trimmed = line.trim();
     if trimmed == "```think" {
@@ -20,7 +20,7 @@ pub fn classify_think_start(line: &str) -> Option<ThinkOpenKind> {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn is_think_end(line: &str, open_kind: ThinkOpenKind) -> bool {
     let trimmed = line.trim();
     // These end markers are unambiguous — always valid regardless of how thinking started
@@ -58,7 +58,7 @@ pub struct TruncatedJson {
 /// semantic correctness (no lying data) at the cost of losing partial values.
 /// The graceful fallback in `parse_tool_arguments` wraps unparseable JSON in
 /// `{"_raw_arguments": "..."}` so no data is lost, just degraded.
-#[must_use] 
+#[must_use]
 pub fn truncate_json_arguments(args: &str, max_size: usize) -> TruncatedJson {
     if args.len() <= max_size {
         return TruncatedJson {
@@ -278,7 +278,7 @@ fn strip_common_indent(lines: &[&str]) -> Vec<String> {
         .collect()
 }
 
-#[must_use] 
+#[must_use]
 pub fn split_model_output(text: &str) -> (Option<String>, Option<String>) {
     let mut thinking: Option<String> = None;
     let mut response: Option<String> = None;
@@ -362,7 +362,7 @@ pub fn split_model_output(text: &str) -> (Option<String>, Option<String>) {
 /// - `⏳` — "waiting" / in-progress
 /// - `⠋` — spinner character
 /// - `[sned]` — internal status messages
-#[must_use] 
+#[must_use]
 pub fn strip_tool_call_lines(input: &str) -> String {
     input
         .lines()
@@ -394,10 +394,7 @@ fn is_tool_call_marker_line(line: &str) -> bool {
     // "⏳" — pending / in-progress
     // "⠋" — spinner character
     let first_char = trimmed.chars().next().unwrap();
-    matches!(
-        first_char,
-        '▶' | '✓' | '📝' | '⏱' | '⏳' | '⠋'
-    )
+    matches!(first_char, '▶' | '✓' | '📝' | '⏱' | '⏳' | '⠋')
 }
 
 #[cfg(test)]

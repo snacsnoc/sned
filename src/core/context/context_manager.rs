@@ -73,7 +73,7 @@ pub struct CompactedSummary {
 }
 
 impl CompactedSummary {
-    #[must_use] 
+    #[must_use]
     pub fn new(summary_text: String, messages_compacted: usize) -> Self {
         Self {
             summary_text,
@@ -128,7 +128,7 @@ fn effective_cache_tokens(info: &ApiReqInfo, provider_name: &str) -> u64 {
 ///   input_tokens excludes cache_reads — add cache_reads back for true prompt size.
 /// - Anthropic/Gemini: input_tokens excludes all cache tokens — add both
 ///   cache_writes and cache_reads.
-#[must_use] 
+#[must_use]
 pub fn should_compact_context_window(
     api_req_info: &ApiReqInfo,
     context_window: u64,
@@ -153,7 +153,7 @@ pub fn should_compact_context_window(
 }
 
 /// Primary entry point for getting up-to-date context.
-#[must_use] 
+#[must_use]
 pub fn get_new_context_messages_and_metadata(
     api_conversation_history: &[StorageMessage],
     api_req_info: Option<&ApiReqInfo>,
@@ -177,7 +177,9 @@ pub fn get_new_context_messages_and_metadata(
         let threshold_pct = if use_auto_condense { 0.7 } else { 0.8 };
         let max_allowed_size = info
             .context_window
-            .map_or((256_000.0 * threshold_pct) as u64, |cw| (cw as f64 * threshold_pct) as u64);
+            .map_or((256_000.0 * threshold_pct) as u64, |cw| {
+                (cw as f64 * threshold_pct) as u64
+            });
 
         if total_tokens >= max_allowed_size {
             let keep = if (total_tokens / 2) > max_allowed_size {
@@ -215,7 +217,7 @@ pub fn get_new_context_messages_and_metadata(
 ///
 /// This function uses saturating arithmetic to prevent underflow, but callers
 /// should ensure `api_messages.len() >= 2` to avoid degenerate cases.
-#[must_use] 
+#[must_use]
 pub fn get_next_truncation_range(
     api_messages: &[StorageMessage],
     current_deleted_range: Option<(usize, usize)>,
@@ -260,7 +262,7 @@ pub fn get_next_truncation_range(
     (range_start_index, range_end_index)
 }
 
-#[must_use] 
+#[must_use]
 pub fn get_truncated_messages(
     messages: &[StorageMessage],
     deleted_range: Option<(usize, usize)>,

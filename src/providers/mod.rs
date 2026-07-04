@@ -26,12 +26,12 @@ use reqwest::StatusCode;
 
 /// Maximum size for tool call arguments (128KB).
 /// Cap arguments to prevent a single tool call from exhausting memory while
-    /// still allowing large but legitimate payloads.
-    pub const MAX_TOOL_ARGUMENT_SIZE: usize = 131_072;
-    use reqwest::header::HeaderMap;
-    use serde::{Deserialize, Serialize};
+/// still allowing large but legitimate payloads.
+pub const MAX_TOOL_ARGUMENT_SIZE: usize = 131_072;
+use reqwest::header::HeaderMap;
+use serde::{Deserialize, Serialize};
 
-    // ============================================================================
+// ============================================================================
 // Content Block Types (ported from dirac/src/shared/messages/content.ts)
 // ============================================================================
 
@@ -611,17 +611,17 @@ impl SseLineBuffer {
         self.pending.extend_from_slice(chunk);
 
         if self.pending.len() >= self.max_line_length {
-        if let Some(last_newline) = self.pending.iter().rposition(|&b| b == b'\n') {
-            let lines = self.take_complete_lines(last_newline + 1);
-            if self.pending.len() >= self.max_line_length {
-                self.pending.clear();
-                self.limit_exceeded = true;
+            if let Some(last_newline) = self.pending.iter().rposition(|&b| b == b'\n') {
+                let lines = self.take_complete_lines(last_newline + 1);
+                if self.pending.len() >= self.max_line_length {
+                    self.pending.clear();
+                    self.limit_exceeded = true;
+                }
+                return lines;
             }
-            return lines;
-        }
-        self.pending.clear();
-        self.limit_exceeded = true;
-        return Vec::new();
+            self.pending.clear();
+            self.limit_exceeded = true;
+            return Vec::new();
         }
 
         self.pending
@@ -888,11 +888,10 @@ pub struct RetryTestProvider {
 }
 
 impl Provider for RetryTestProvider {
-    async fn create_message(
-        &self,
-        _request: ProviderRequest,
-    ) -> Result<ApiStream, ProviderError> {
-        let attempt = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    async fn create_message(&self, _request: ProviderRequest) -> Result<ApiStream, ProviderError> {
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if attempt < self.fail_until {
             return Err(ProviderError::RateLimitError {
                 message: "rate limited".to_string(),
@@ -1352,10 +1351,7 @@ impl RecordingChunkProvider {
 
 #[cfg(test)]
 impl Provider for RecordingChunkProvider {
-    async fn create_message(
-        &self,
-        request: ProviderRequest,
-    ) -> Result<ApiStream, ProviderError> {
+    async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         self.requests.lock().unwrap().push(request);
         let response = {
             let mut idx = self.response_index.lock().unwrap();
@@ -1389,10 +1385,7 @@ pub struct TinyContextProvider;
 
 #[cfg(test)]
 impl Provider for TinyContextProvider {
-    async fn create_message(
-        &self,
-        _request: ProviderRequest,
-    ) -> Result<ApiStream, ProviderError> {
+    async fn create_message(&self, _request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         panic!("TinyContextProvider should not be called in truncation tests")
     }
 
@@ -1419,10 +1412,7 @@ pub struct ErrorProvider;
 
 #[cfg(test)]
 impl Provider for ErrorProvider {
-    async fn create_message(
-        &self,
-        _request: ProviderRequest,
-    ) -> Result<ApiStream, ProviderError> {
+    async fn create_message(&self, _request: ProviderRequest) -> Result<ApiStream, ProviderError> {
         Err(ProviderError::RateLimitError {
             message: "forced error".to_string(),
             retry_delay_ms: None,

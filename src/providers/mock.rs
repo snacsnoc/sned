@@ -37,7 +37,7 @@ pub struct MockToolCall {
 }
 
 impl MockProvider {
-    #[must_use] 
+    #[must_use]
     pub fn new(responses: Vec<MockResponse>) -> Self {
         Self {
             responses,
@@ -47,7 +47,7 @@ impl MockProvider {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn new_with_repeat(responses: Vec<MockResponse>) -> Self {
         Self {
             responses,
@@ -57,7 +57,7 @@ impl MockProvider {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn new_with_context_window(responses: Vec<MockResponse>, context_window: u64) -> Self {
         Self {
             responses,
@@ -67,17 +67,17 @@ impl MockProvider {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn single_text_response(text: &str) -> Self {
         Self::new(vec![MockResponse::Text(text.to_string())])
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn single_text_response_repeat(text: &str) -> Self {
         Self::new_with_repeat(vec![MockResponse::Text(text.to_string())])
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn single_tool_call(call_id: &str, name: &str, arguments: serde_json::Value) -> Self {
         Self::new(vec![MockResponse::ToolCalls(vec![MockToolCall {
             call_id: call_id.to_string(),
@@ -86,7 +86,7 @@ impl MockProvider {
         }])])
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn approval_scroll_scenario() -> Self {
         let mut first_text = String::new();
         for i in 1..=30 {
@@ -160,7 +160,7 @@ impl MockProvider {
         ])
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn busy_stream_scenario() -> Self {
         let mut events = Vec::new();
         events.push(MockStreamEvent::Chunk(ApiStreamChunk::Text(

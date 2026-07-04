@@ -365,7 +365,7 @@ impl TaskState {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_denied_tool_action(
         &self,
         tool_name: &str,

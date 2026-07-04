@@ -56,7 +56,7 @@ pub enum ToolCategory {
 }
 
 impl ToolCategory {
-    #[must_use] 
+    #[must_use]
     pub const fn is_read_only(self) -> bool {
         matches!(self, Self::ReadOnly)
     }
@@ -64,7 +64,7 @@ impl ToolCategory {
 
 impl SnedTool {
     /// Returns the string name of the tool.
-    #[must_use] 
+    #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
             Self::AskFollowupQuestion => "ask_followup_question",
@@ -93,7 +93,7 @@ impl SnedTool {
     }
 
     /// Returns the approval category for this tool.
-    #[must_use] 
+    #[must_use]
     pub const fn category(self) -> ToolCategory {
         match self {
             Self::ReadFile
@@ -107,10 +107,9 @@ impl SnedTool {
 
             Self::UseSubagents => ToolCategory::Other,
 
-            Self::WriteToFile
-            | Self::EditFile
-            | Self::ReplaceSymbol
-            | Self::RenameSymbol => ToolCategory::EditFiles,
+            Self::WriteToFile | Self::EditFile | Self::ReplaceSymbol | Self::RenameSymbol => {
+                ToolCategory::EditFiles
+            }
 
             Self::ExecuteCommand => ToolCategory::ExecuteCommand,
             Self::WebFetch => ToolCategory::WebFetch,
@@ -127,7 +126,7 @@ impl SnedTool {
     }
 
     /// Parses a tool name string into a SnedTool.
-    #[must_use] 
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "ask_followup_question" => Some(Self::AskFollowupQuestion),
@@ -169,7 +168,7 @@ impl Default for ToolRegistry {
 }
 
 impl ToolRegistry {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             handlers: HashMap::with_capacity(16),
@@ -182,13 +181,13 @@ impl ToolRegistry {
     }
 
     /// Get a handler for a tool.
-    #[must_use] 
+    #[must_use]
     pub fn get_handler(&self, tool: &SnedTool) -> Option<Arc<dyn ToolHandler + Send + Sync>> {
         self.handlers.get(tool).cloned()
     }
 
     /// Check if a handler is registered.
-    #[must_use] 
+    #[must_use]
     pub fn has_handler(&self, tool: &SnedTool) -> bool {
         self.handlers.contains_key(tool)
     }
@@ -429,7 +428,7 @@ pub enum ToolError {
 }
 
 impl ToolError {
-    #[must_use] 
+    #[must_use]
     pub fn metadata(&self) -> Option<&ToolFailureMetadata> {
         match self {
             Self::InvalidInputWithMetadata(_, metadata)
@@ -441,7 +440,7 @@ impl ToolError {
 
 /// Convert a tool result value into plain text for conversation history.
 /// Uses compact JSON to minimize token usage in conversation history.
-#[must_use] 
+#[must_use]
 pub fn tool_result_to_text(value: serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text,
@@ -489,7 +488,8 @@ mod tests {
             &self,
             _ctx: &ToolContext,
             params: serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>>
+        {
             Box::pin(async move { Ok(params) })
         }
 

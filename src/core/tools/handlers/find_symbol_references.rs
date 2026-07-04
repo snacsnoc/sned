@@ -1,9 +1,9 @@
 use crate::core::hash_utils::format_line_with_hash;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
-use std::future::Future;
-use std::pin::Pin;
 use crate::services::tree_sitter::load_required_language_parsers;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use streaming_iterator::StreamingIterator;
 use tokio::fs;
 
@@ -75,7 +75,10 @@ impl FindSymbolReferencesHandler {
                     ToolError::ExecutionFailed(format!("Error finding references: {e}"))
                 })?;
 
-            let lines: Vec<String> = content.lines().map(std::string::ToString::to_string).collect();
+            let lines: Vec<String> = content
+                .lines()
+                .map(std::string::ToString::to_string)
+                .collect();
             file_data.insert(path.clone(), FileData { lines, hits });
         }
 

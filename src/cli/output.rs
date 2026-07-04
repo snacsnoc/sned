@@ -306,7 +306,9 @@ impl OutputWriter for StderrOutputWriter {
                     }
                 }
             }
-            OutputEvent::TurnEnd { .. } | OutputEvent::TurnIndicator(_) | OutputEvent::ApprovalDropped => {}
+            OutputEvent::TurnEnd { .. }
+            | OutputEvent::TurnIndicator(_)
+            | OutputEvent::ApprovalDropped => {}
         }
     }
 
@@ -330,14 +332,18 @@ impl DropCounters {
     fn total(&self) -> u64 {
         self.model_text.load(std::sync::atomic::Ordering::Relaxed)
             + self.tool_output.load(std::sync::atomic::Ordering::Relaxed)
-            + self.approval_prompt.load(std::sync::atomic::Ordering::Relaxed)
+            + self
+                .approval_prompt
+                .load(std::sync::atomic::Ordering::Relaxed)
             + self.other.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn format_summary(&self) -> String {
         let m = self.model_text.load(std::sync::atomic::Ordering::Relaxed);
         let t = self.tool_output.load(std::sync::atomic::Ordering::Relaxed);
-        let a = self.approval_prompt.load(std::sync::atomic::Ordering::Relaxed);
+        let a = self
+            .approval_prompt
+            .load(std::sync::atomic::Ordering::Relaxed);
         let o = self.other.load(std::sync::atomic::Ordering::Relaxed);
         let mut parts = Vec::new();
         if m > 0 {
@@ -436,27 +442,37 @@ impl OutputWriter for ChannelOutputWriter {
                 // An approval prompt was emitted but the RawAnsi that
                 // carries it was dropped. Auto-deny so the agent loop
                 // unblocks from recv_timeout instead of hanging.
-                counters.approval_prompt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                counters
+                    .approval_prompt
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(sender) = crate::core::approval::take_approval_sender() {
                     let _ = sender.send(crate::core::approval::ApprovalResult::Denied);
                 }
             } else {
                 match &dropped {
                     OutputEvent::Line(_) => {
-                        counters.model_text.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        counters
+                            .model_text
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     OutputEvent::ToolOutputLine(_)
                     | OutputEvent::ToolHeaderLine(_)
                     | OutputEvent::CommandHeaderLine(_)
                     | OutputEvent::CommandOutputLine(_) => {
-                        counters.tool_output.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        counters
+                            .tool_output
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     OutputEvent::RawAnsi(_) => {
                         // Non-approval RawAnsi is non-critical; track as other.
-                        counters.other.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        counters
+                            .other
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     _ => {
-                        counters.other.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        counters
+                            .other
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }

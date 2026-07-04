@@ -51,7 +51,7 @@ pub const INDEX_DIR: &str = ".sned-symbol-index";
 pub const DB_FILENAME: &str = "data.db";
 
 impl SymbolIndexService {
-    #[must_use] 
+    #[must_use]
     pub fn new(project_root: String) -> Self {
         Self {
             files: HashMap::with_capacity(1024),
@@ -88,10 +88,7 @@ impl SymbolIndexService {
         }
 
         // Use index_root override if set, otherwise fall back to project_root.
-        let db_base = self
-            .index_root
-            .as_deref()
-            .unwrap_or(&self.project_root);
+        let db_base = self.index_root.as_deref().unwrap_or(&self.project_root);
         let db_dir = std::path::Path::new(db_base).join(INDEX_DIR);
         std::fs::create_dir_all(&db_dir)?;
 
@@ -215,7 +212,9 @@ pub fn extract_symbols_for_indexing(
         .unwrap_or("")
         .to_lowercase();
 
-    let Some(entry) = language_parsers.get(&ext) else { return Ok(Vec::new()) };
+    let Some(entry) = language_parsers.get(&ext) else {
+        return Ok(Vec::new());
+    };
 
     let mut parser = tree_sitter::Parser::new();
     parser

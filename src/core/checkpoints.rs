@@ -395,7 +395,9 @@ impl TaskCheckpointManager {
     /// Save a checkpoint of the current workspace state.
     /// Runs git commands in a blocking thread to avoid stalling the async runtime.
     pub async fn save_checkpoint(&mut self) -> Option<String> {
-        let Some(tracker) = &self.tracker else { return None };
+        let Some(tracker) = &self.tracker else {
+            return None;
+        };
         let tracker_for_commit = tracker.clone();
         match tokio::task::spawn_blocking(move || tracker_for_commit.commit()).await {
             Ok(Ok(Some(hash))) => {
@@ -473,13 +475,13 @@ impl TaskCheckpointManager {
     }
 
     /// Get the last checkpoint hash, if any.
-    #[must_use] 
+    #[must_use]
     pub fn last_checkpoint(&self) -> Option<&String> {
         self.checkpoint_history.last()
     }
 
     /// Get the checkpoint error message, if any.
-    #[must_use] 
+    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }

@@ -15,7 +15,7 @@ use ratatui::text::{Line, Span};
 /// Block-level markdown (tables, code blocks, lists, headings) is broken
 /// into multiple `Line`s. Inline formatting (bold, italic, inline code)
 /// is applied as `Span` styling.
-#[must_use] 
+#[must_use]
 pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
     render_markdown(Some(prefix), text)
 }
@@ -25,7 +25,7 @@ pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>
 /// The first line is prefixed with `prefix` (e.g. "✗ Error") styled in red.
 /// The error text is rendered as plain styled lines (no markdown parsing).
 /// Lines that exceed the terminal width are word-wrapped.
-#[must_use] 
+#[must_use]
 pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
     let wrap_width = crate::cli::text_utils::get_terminal_width();
     let prefix_width = unicode_width::UnicodeWidthStr::width(prefix) + 2;
@@ -46,7 +46,11 @@ pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
 
         // The first physical line of the message carries the prefix,
         // so its wrap budget is smaller than continuation lines.
-        let width_budget = if first { first_width } else { continuation_width };
+        let width_budget = if first {
+            first_width
+        } else {
+            continuation_width
+        };
         let wrapped = crate::cli::text_utils::wrap_text(raw_line, width_budget, "");
 
         for (i, line) in wrapped.lines().enumerate() {
@@ -62,10 +66,7 @@ pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
                     Span::styled(line.to_string(), Style::default()),
                 ]));
             } else {
-                out.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default(),
-                )));
+                out.push(Line::from(Span::styled(line.to_string(), Style::default())));
             }
         }
     }
@@ -87,7 +88,7 @@ pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
 /// banner). If `prefix` is `None`, no banner is applied — the lines
 /// render as plain styled markdown, suitable for re-rendering streamed
 /// agent output after a turn completes.
-#[must_use] 
+#[must_use]
 pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
         let banner = prefix.unwrap_or("");
@@ -136,9 +137,7 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
             out.push(Line::from(""));
             return;
         }
-        if is_first
-            && let Some(p) = prefix
-        {
+        if is_first && let Some(p) = prefix {
             current_spans.insert(
                 0,
                 Span::styled(
@@ -501,11 +500,7 @@ mod tests {
         assert!(text.contains("A second paragraph"), "got: {}", text);
         // No prefix in any line.
         for (i, line) in lines.iter().enumerate() {
-            let joined: String = line
-                .spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
                 !joined.contains("🚀"),
                 "line {} unexpectedly contains the banner: {:?}",
@@ -553,8 +548,7 @@ mod tests {
         // Remaining lines get only the "• " bullet
         assert!(lines.len() >= 3);
         // First line should have both prefixes
-        let first_text: String =
-            lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let first_text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(first_text.contains("🚀"));
         assert!(first_text.contains("• "));
         // Subsequent lines should have bullet but not the completion prefix
@@ -600,7 +594,10 @@ mod tests {
             assert!(
                 width <= term_width,
                 "line {i} overflowed terminal width {term_width}: width={width} content={:?}",
-                line.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
             );
         }
     }
@@ -609,10 +606,10 @@ mod tests {
     /// lines must not repeat it.
     #[test]
     fn render_error_markdown_prefix_only_on_first_line() {
-        let long = "first part of error that fills more than a line of output so it must wrap second part";
+        let long =
+            "first part of error that fills more than a line of output so it must wrap second part";
         let lines = render_error_markdown("✗ Error", long);
-        let first_text: String =
-            lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let first_text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(first_text.starts_with("✗ Error"));
         for line in &lines[1..] {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -629,17 +626,14 @@ mod tests {
     fn render_error_markdown_preserves_blank_lines() {
         let lines = render_error_markdown("✗ Error", "first\n\nthird");
         assert_eq!(lines.len(), 3, "expected 3 lines, got {:?}", lines);
-        let first_text: String =
-            lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let first_text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(first_text.contains("first"));
-        let middle_text: String =
-            lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let middle_text: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             middle_text.is_empty(),
             "expected blank middle line, got: {middle_text:?}",
         );
-        let last_text: String =
-            lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        let last_text: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(last_text.contains("third"));
     }
 }

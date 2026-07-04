@@ -109,7 +109,7 @@ pub struct ContextLoader {
 }
 
 impl ContextLoader {
-    #[must_use] 
+    #[must_use]
     pub fn new(cwd: String) -> Self {
         Self {
             cwd,
@@ -155,7 +155,7 @@ impl ContextLoader {
     }
 
     /// Extract file/directory paths and symbols from text.
-    #[must_use] 
+    #[must_use]
     pub fn extract_context(text: &str) -> Vec<String> {
         let mut mentions = Vec::new();
         let mention_regex = regex::Regex::new(r"@([A-Za-z0-9_./\-]+)").unwrap();
@@ -203,8 +203,8 @@ impl ContextLoader {
         let without_code_fences = CODE_FENCE_REGEX.replace_all(text, " ");
         let without_urls = URL_REGEX.replace_all(&without_code_fences, " ");
         let without_mentions = MENTION_REGEX.replace_all(&without_urls, " ");
-        let scrubbed_text =
-            SLASH_COMMAND_REGEX.replace_all(&without_mentions, |caps: &regex::Captures<'_>| {
+        let scrubbed_text = SLASH_COMMAND_REGEX
+            .replace_all(&without_mentions, |caps: &regex::Captures<'_>| {
                 format!("{} ", caps.get(1).map_or("", |m| m.as_str()))
             });
 
@@ -311,15 +311,13 @@ impl ContextLoader {
                 };
 
                 // Check if we already have this exact location
-                let existing = file_locations
-                    .get(loc_path_str)
-                    .is_some_and(|locs| {
-                        locs.iter().any(|(s, l)| {
-                            l.path.as_deref() == Some(loc_path_str.as_str())
-                                && l.start_line == loc.start_line
-                                && s == symbol
-                        })
-                    });
+                let existing = file_locations.get(loc_path_str).is_some_and(|locs| {
+                    locs.iter().any(|(s, l)| {
+                        l.path.as_deref() == Some(loc_path_str.as_str())
+                            && l.start_line == loc.start_line
+                            && s == symbol
+                    })
+                });
 
                 if !existing {
                     file_locations

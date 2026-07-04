@@ -16,7 +16,7 @@ use std::pin::Pin;
 pub struct PlanModeRespondHandler;
 
 impl PlanModeRespondHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -92,9 +92,7 @@ impl PlanModeRespondHandler {
             use ratatui::style::{Modifier, Style};
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("\n📋 Plan Generated\n{response}\n"),
-                Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ));
         }
 

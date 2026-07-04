@@ -7,11 +7,10 @@
 //! Each function provides escalating guidance based on consecutive failures.
 
 /// Guidance for missing or invalid parameters.
-#[must_use] 
+#[must_use]
 pub fn missing_parameter(param: &str, consecutive_failures: u32) -> String {
-    let base = format!(
-        "Missing or invalid '{param}' parameter. The tool requires this to proceed."
-    );
+    let base =
+        format!("Missing or invalid '{param}' parameter. The tool requires this to proceed.");
 
     match consecutive_failures {
         0 | 1 => format!("{base} Check the tool schema and provide a valid value."),
@@ -25,7 +24,7 @@ pub fn missing_parameter(param: &str, consecutive_failures: u32) -> String {
 }
 
 /// Guidance for file not found errors.
-#[must_use] 
+#[must_use]
 pub fn file_not_found(path: &str, consecutive_failures: u32) -> String {
     let base = format!("File '{path}' does not exist.");
 
@@ -43,14 +42,12 @@ pub fn file_not_found(path: &str, consecutive_failures: u32) -> String {
 }
 
 /// Guidance for permission denied errors.
-#[must_use] 
+#[must_use]
 pub fn permission_denied(path: &str, action: &str, consecutive_failures: u32) -> String {
     let base = format!("Permission denied when trying to {action} '{path}'.");
 
     match consecutive_failures {
-        0 | 1 => format!(
-            "{base} Check file permissions and ensure you have read/write access."
-        ),
+        0 | 1 => format!("{base} Check file permissions and ensure you have read/write access."),
         2 => format!(
             "{base} This is the second failed attempt. You cannot proceed without permissions. Ask the user to adjust permissions or choose a different file."
         ),
@@ -61,14 +58,14 @@ pub fn permission_denied(path: &str, action: &str, consecutive_failures: u32) ->
 }
 
 /// Guidance for symbol not found errors.
-#[must_use] 
+#[must_use]
 pub fn symbol_not_found(symbol: &str, path: &str, consecutive_failures: u32) -> String {
     let base = format!("Symbol '{symbol}' not found in {path}.");
 
     match consecutive_failures {
-        0 | 1 => format!(
-            "{base} Verify the symbol name and file path are correct. Check for typos."
-        ),
+        0 | 1 => {
+            format!("{base} Verify the symbol name and file path are correct. Check for typos.")
+        }
         2 => format!(
             "{base} This is the second failed attempt. The symbol genuinely does not exist in this file. Check if the symbol was renamed, moved to another file, or never existed."
         ),
@@ -79,17 +76,15 @@ pub fn symbol_not_found(symbol: &str, path: &str, consecutive_failures: u32) -> 
 }
 
 /// Guidance for overlapping replacements.
-#[must_use] 
+#[must_use]
 pub fn overlapping_replacements(symbols: &[&str], path: &str, consecutive_failures: u32) -> String {
     let symbol_list = symbols.join("', '");
-    let base = format!(
-        "Overlapping replacements detected for symbols '{symbol_list}' in {path}."
-    );
+    let base = format!("Overlapping replacements detected for symbols '{symbol_list}' in {path}.");
 
     match consecutive_failures {
-        0 | 1 => format!(
-            "{base} Process symbols one at a time, or ensure replacements do not overlap."
-        ),
+        0 | 1 => {
+            format!("{base} Process symbols one at a time, or ensure replacements do not overlap.")
+        }
         2 => format!(
             "{base} This is the second failed attempt. Split the overlapping replacements into separate tool calls."
         ),
@@ -100,7 +95,7 @@ pub fn overlapping_replacements(symbols: &[&str], path: &str, consecutive_failur
 }
 
 /// Guidance for empty content in write operations.
-#[must_use] 
+#[must_use]
 pub fn empty_content(path: &str, consecutive_failures: u32) -> String {
     let base = format!(
         "Failed to write '{path}': the 'content' parameter was empty. This usually means the model ran out of output budget or tried to emit the file in one oversized response."
@@ -120,7 +115,7 @@ pub fn empty_content(path: &str, consecutive_failures: u32) -> String {
 }
 
 /// Guidance for network/URL errors.
-#[must_use] 
+#[must_use]
 pub fn network_error(url: &str, consecutive_failures: u32) -> String {
     let base = format!(
         "Failed to fetch '{url}'. The request may have failed due to network issues, DNS resolution, or the server being unreachable."
@@ -140,7 +135,7 @@ pub fn network_error(url: &str, consecutive_failures: u32) -> String {
 }
 
 /// Guidance for command execution failures.
-#[must_use] 
+#[must_use]
 pub fn command_failed(cmd: &str, consecutive_failures: u32) -> String {
     let base = format!("Command failed: {cmd}");
 
@@ -158,7 +153,7 @@ pub fn command_failed(cmd: &str, consecutive_failures: u32) -> String {
 }
 
 /// Guidance for tool-specific schema errors.
-#[must_use] 
+#[must_use]
 pub fn invalid_tool_input(tool: &str, reason: &str, consecutive_failures: u32) -> String {
     let base = format!("Invalid input for '{tool}': {reason}");
 

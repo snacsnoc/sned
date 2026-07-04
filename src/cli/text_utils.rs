@@ -6,7 +6,7 @@ use std::io::{self, IsTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Get the current terminal width, or a sensible default.
-#[must_use] 
+#[must_use]
 pub fn get_terminal_width() -> usize {
     crossterm::terminal::size()
         .map(|(cols, _)| cols as usize)
@@ -14,7 +14,7 @@ pub fn get_terminal_width() -> usize {
 }
 
 /// Check if stderr is a TTY.
-#[must_use] 
+#[must_use]
 pub fn stderr_is_tty() -> bool {
     io::stderr().is_terminal()
 }
@@ -26,7 +26,7 @@ pub fn stderr_is_tty() -> bool {
 /// │ Content line 1                             │
 /// │ Content line 2                             │
 /// ╰────────────────────────────────────────────╯
-#[must_use] 
+#[must_use]
 pub fn draw_completion_box(title: &str, content: &str, width: usize) -> String {
     draw_box(title, content, width, "✓")
 }
@@ -38,7 +38,7 @@ pub fn draw_completion_box(title: &str, content: &str, width: usize) -> String {
 /// │ Error message line 1                       │
 /// │ Error message line 2                       │
 /// ╰────────────────────────────────────────────╯
-#[must_use] 
+#[must_use]
 pub fn draw_error_box(title: &str, content: &str, width: usize) -> String {
     draw_box(title, content, width, "✗")
 }
@@ -128,7 +128,7 @@ fn draw_box(title: &str, content: &str, width: usize, symbol: &str) -> String {
 /// - Preserves code blocks (text between ``` markers)
 /// - Indents continuation lines with the specified indent
 /// - Returns wrapped text with newlines
-#[must_use] 
+#[must_use]
 pub fn wrap_text(text: &str, width: usize, indent: &str) -> String {
     if width == 0 {
         return text.to_string();
@@ -319,8 +319,7 @@ mod tests {
             for (i, line) in result.lines().enumerate() {
                 let w = UnicodeWidthStr::width(line);
                 assert_eq!(
-                    w,
-                    width,
+                    w, width,
                     "line {i} (display width={w}) != width={width}: |{line}|",
                 );
             }
@@ -338,11 +337,7 @@ mod tests {
         let result = draw_completion_box("T", &content_36, 40);
         for (i, line) in result.lines().enumerate() {
             let w = UnicodeWidthStr::width(line);
-            assert_eq!(
-                w,
-                40,
-                "line {i} overflowed: |{line}| (display width={w})",
-            );
+            assert_eq!(w, 40, "line {i} overflowed: |{line}| (display width={w})",);
         }
     }
 
@@ -353,11 +348,7 @@ mod tests {
         let result = draw_completion_box("Title", content, 40);
         for (i, line) in result.lines().enumerate() {
             let w = UnicodeWidthStr::width(line);
-            assert_eq!(
-                w,
-                40,
-                "line {i} wrong width: |{line}| (display width={w})",
-            );
+            assert_eq!(w, 40, "line {i} wrong width: |{line}| (display width={w})",);
         }
     }
 
@@ -368,11 +359,7 @@ mod tests {
         let result = draw_completion_box("T", "日本語", 40);
         for (i, line) in result.lines().enumerate() {
             let w = UnicodeWidthStr::width(line);
-            assert_eq!(
-                w,
-                40,
-                "line {i} overflowed: |{line}| (display width={w})",
-            );
+            assert_eq!(w, 40, "line {i} overflowed: |{line}| (display width={w})",);
         }
     }
 
@@ -383,11 +370,7 @@ mod tests {
         let result = draw_completion_box("タスク", "body", 40);
         for (i, line) in result.lines().enumerate() {
             let w = UnicodeWidthStr::width(line);
-            assert_eq!(
-                w,
-                40,
-                "line {i} overflowed: |{line}| (display width={w})",
-            );
+            assert_eq!(w, 40, "line {i} overflowed: |{line}| (display width={w})",);
         }
     }
 
@@ -400,8 +383,7 @@ mod tests {
             for (i, line) in result.lines().enumerate() {
                 let w = UnicodeWidthStr::width(line);
                 assert_eq!(
-                    w,
-                    width,
+                    w, width,
                     "line {i} (display width={w}) != width={width}: |{line}|",
                 );
             }
@@ -417,8 +399,7 @@ mod tests {
             for (i, line) in result.lines().enumerate() {
                 let w = UnicodeWidthStr::width(line);
                 assert_eq!(
-                    w,
-                    width,
+                    w, width,
                     "width={width} line {i} overflowed: |{line}| (display width={w})",
                 );
             }
@@ -433,8 +414,7 @@ mod tests {
             for (i, line) in result.lines().enumerate() {
                 let w = UnicodeWidthStr::width(line);
                 assert_eq!(
-                    w,
-                    width,
+                    w, width,
                     "width={width} line {i} overflowed: |{line}| (display width={w})",
                 );
             }

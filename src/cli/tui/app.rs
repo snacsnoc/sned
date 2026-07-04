@@ -753,9 +753,7 @@ impl App {
         let have_indicator = self.turn_indicator.take().is_some();
         let mut rendered: Vec<Line<'static>> =
             crate::cli::markdown::render_markdown(None, markdown_text);
-        if have_indicator
-            && let Some(first) = rendered.first_mut()
-        {
+        if have_indicator && let Some(first) = rendered.first_mut() {
             let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
             new_spans.push(Span::styled(
                 "\u{2666} ",
@@ -1460,8 +1458,9 @@ impl App {
                         | BlockKind::Reasoning
                         | BlockKind::UserPrompt,
                     BlockKind::Model,
-                ) | (BlockKind::ToolHeader, BlockKind::ToolOutput)
-                    | (BlockKind::CommandHeader, BlockKind::CommandOutput)
+                )
+                | (BlockKind::ToolHeader, BlockKind::ToolOutput)
+                | (BlockKind::CommandHeader, BlockKind::CommandOutput)
         )
     }
 
@@ -2063,9 +2062,9 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::Terminal;
 
     fn make_scrolling_app(total_lines: usize, content_height: usize) -> App {
         let mut app = App::new();
@@ -2092,7 +2091,10 @@ mod tests {
             .height
             .saturating_sub(1)
             .saturating_sub(app.render_input_height()) as usize;
-        rendered_rows(buffer).into_iter().take(output_height).collect()
+        rendered_rows(buffer)
+            .into_iter()
+            .take(output_height)
+            .collect()
     }
 
     #[test]

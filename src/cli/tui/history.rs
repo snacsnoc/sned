@@ -81,7 +81,7 @@ pub struct FileHistory {
 
 impl FileHistory {
     /// Load command history from disk.
-    #[must_use] 
+    #[must_use]
     pub fn load() -> Self {
         Self {
             entries: load_command_history(),
@@ -137,7 +137,7 @@ impl FileHistory {
     }
 
     /// Whether the user is currently navigating history (index >= 0).
-    #[must_use] 
+    #[must_use]
     pub fn is_navigating(&self) -> bool {
         self.index >= 0
     }
@@ -149,7 +149,7 @@ impl FileHistory {
     }
 
     /// Get a reference to the underlying entries (for `/history` command).
-    #[must_use] 
+    #[must_use]
     pub fn entries(&self) -> &[String] {
         &self.entries
     }

@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use ulid::Ulid;
 
 use std::time::Instant;
@@ -367,7 +367,7 @@ pub enum GlobalStateKey {
 
 impl GlobalStateKey {
     /// Get the string value for this key from GlobalState (for CLI config display).
-    #[must_use] 
+    #[must_use]
     pub fn get_string_value(&self, state: &GlobalState) -> Option<String> {
         match self {
             Self::Mode => Some(state.mode.clone()),
@@ -382,46 +382,28 @@ impl GlobalStateKey {
             Self::CustomPrompt => state.custom_prompt.clone(),
             Self::WorktreeAutoOpenPath => state.worktree_auto_open_path.clone(),
             Self::LastShownAnnouncementId => state.last_shown_announcement_id.clone(),
-            Self::WritePromptMetadataDirectory => {
-                state.write_prompt_metadata_directory.clone()
-            }
+            Self::WritePromptMetadataDirectory => state.write_prompt_metadata_directory.clone(),
             Self::LiteLlmBaseUrl => state.lite_llm_base_url.clone(),
             Self::AnthropicBaseUrl => state.anthropic_base_url.clone(),
             Self::OpenAiBaseUrl => state.open_ai_base_url.clone(),
             Self::OpenRouterBaseUrl => state.open_router_base_url.clone(),
             Self::GeminiBaseUrl => state.gemini_base_url.clone(),
             Self::AwsRegion => state.aws_region.clone(),
-            Self::OpenTelemetryMetricsExporter => {
-                state.open_telemetry_metrics_exporter.clone()
-            }
+            Self::OpenTelemetryMetricsExporter => state.open_telemetry_metrics_exporter.clone(),
             Self::OpenTelemetryLogsExporter => state.open_telemetry_logs_exporter.clone(),
-            Self::OpenTelemetryOtlpProtocol => {
-                Some(state.open_telemetry_otlp_protocol.clone())
-            }
-            Self::OpenTelemetryOtlpEndpoint => {
-                Some(state.open_telemetry_otlp_endpoint.clone())
-            }
+            Self::OpenTelemetryOtlpProtocol => Some(state.open_telemetry_otlp_protocol.clone()),
+            Self::OpenTelemetryOtlpEndpoint => Some(state.open_telemetry_otlp_endpoint.clone()),
             Self::OpenTelemetryOtlpMetricsProtocol => {
                 state.open_telemetry_otlp_metrics_protocol.clone()
             }
             Self::OpenTelemetryOtlpMetricsEndpoint => {
                 state.open_telemetry_otlp_metrics_endpoint.clone()
             }
-            Self::OpenTelemetryOtlpLogsProtocol => {
-                state.open_telemetry_otlp_logs_protocol.clone()
-            }
-            Self::OpenTelemetryOtlpLogsEndpoint => {
-                state.open_telemetry_otlp_logs_endpoint.clone()
-            }
-            Self::ShellIntegrationTimeout => {
-                Some(state.shell_integration_timeout.to_string())
-            }
-            Self::TerminalOutputLineLimit => {
-                Some(state.terminal_output_line_limit.to_string())
-            }
-            Self::MaxConsecutiveMistakes => {
-                Some(state.max_consecutive_mistakes.to_string())
-            }
+            Self::OpenTelemetryOtlpLogsProtocol => state.open_telemetry_otlp_logs_protocol.clone(),
+            Self::OpenTelemetryOtlpLogsEndpoint => state.open_telemetry_otlp_logs_endpoint.clone(),
+            Self::ShellIntegrationTimeout => Some(state.shell_integration_timeout.to_string()),
+            Self::TerminalOutputLineLimit => Some(state.terminal_output_line_limit.to_string()),
+            Self::MaxConsecutiveMistakes => Some(state.max_consecutive_mistakes.to_string()),
             Self::OpenTelemetryMetricExportInterval => {
                 Some(state.open_telemetry_metric_export_interval.to_string())
             }
@@ -439,34 +421,24 @@ impl GlobalStateKey {
             Self::PlanActSeparateModelsSetting => {
                 Some(state.plan_act_separate_models_setting.to_string())
             }
-            Self::StrictPlanModeEnabled => {
-                Some(state.strict_plan_mode_enabled.to_string())
-            }
+            Self::StrictPlanModeEnabled => Some(state.strict_plan_mode_enabled.to_string()),
             Self::HooksEnabled => Some(state.hooks_enabled.to_string()),
             Self::UseAutoCondense => Some(state.use_auto_condense.to_string()),
             Self::ShowTokenUsage => Some(state.show_token_usage.to_string()),
             Self::SubagentsEnabled => Some(state.subagents_enabled.to_string()),
             Self::SnedWebToolsEnabled => Some(state.sned_web_tools_enabled.to_string()),
             Self::WorktreesEnabled => Some(state.worktrees_enabled.to_string()),
-            Self::BackgroundEditEnabled => {
-                Some(state.background_edit_enabled.to_string())
-            }
-            Self::OptOutOfRemoteConfig => {
-                Some(state.opt_out_of_remote_config.to_string())
-            }
+            Self::BackgroundEditEnabled => Some(state.background_edit_enabled.to_string()),
+            Self::OptOutOfRemoteConfig => Some(state.opt_out_of_remote_config.to_string()),
             Self::DoubleCheckCompletionEnabled => {
                 Some(state.double_check_completion_enabled.to_string())
             }
             Self::OpenTelemetryEnabled => Some(state.open_telemetry_enabled.to_string()),
-            Self::OpenTelemetryOtlpInsecure => {
-                Some(state.open_telemetry_otlp_insecure.to_string())
-            }
+            Self::OpenTelemetryOtlpInsecure => Some(state.open_telemetry_otlp_insecure.to_string()),
             Self::WritePromptMetadataEnabled => {
                 Some(state.write_prompt_metadata_enabled.to_string())
             }
-            Self::EnableParallelToolCalling => {
-                Some(state.enable_parallel_tool_calling.to_string())
-            }
+            Self::EnableParallelToolCalling => Some(state.enable_parallel_tool_calling.to_string()),
             Self::SnedVersion => state.sned_version.clone(),
             Self::TaskHistory | Self::FavoritedModelIds | Self::GlobalSnedRulesToggles => None,
             Self::TerminalReuseEnabled => Some(state.terminal_reuse_enabled.to_string()),
@@ -475,42 +447,26 @@ impl GlobalStateKey {
     }
 
     /// Get the JSON value for this key from GlobalState.
-    #[must_use] 
+    #[must_use]
     pub fn get_json_value(&self, state: &GlobalState) -> Option<serde_json::Value> {
         match self {
             Self::SnedVersion => serde_json::to_value(&state.sned_version).ok(),
             Self::TaskHistory => serde_json::to_value(&state.task_history).ok(),
-            Self::FavoritedModelIds => {
-                serde_json::to_value(&state.favorited_model_ids).ok()
-            }
-            Self::TerminalReuseEnabled => {
-                serde_json::to_value(state.terminal_reuse_enabled).ok()
-            }
+            Self::FavoritedModelIds => serde_json::to_value(&state.favorited_model_ids).ok(),
+            Self::TerminalReuseEnabled => serde_json::to_value(state.terminal_reuse_enabled).ok(),
             Self::IsNewUser => serde_json::to_value(state.is_new_user).ok(),
             Self::Mode => serde_json::to_value(&state.mode).ok(),
             Self::SubagentsEnabled => serde_json::to_value(state.subagents_enabled).ok(),
             Self::GlobalSnedRulesToggles => {
                 serde_json::to_value(&state.global_sned_rules_toggles).ok()
             }
-            Self::EnableCheckpoints => {
-                serde_json::to_value(state.enable_checkpoints_setting).ok()
-            }
-            Self::ActModeApiProvider => {
-                serde_json::to_value(&state.act_mode_api_provider).ok()
-            }
-            Self::PlanModeApiProvider => {
-                serde_json::to_value(&state.plan_mode_api_provider).ok()
-            }
-            Self::ActModeApiModelId => {
-                serde_json::to_value(&state.act_mode_api_model_id).ok()
-            }
-            Self::PlanModeApiModelId => {
-                serde_json::to_value(&state.plan_mode_api_model_id).ok()
-            }
+            Self::EnableCheckpoints => serde_json::to_value(state.enable_checkpoints_setting).ok(),
+            Self::ActModeApiProvider => serde_json::to_value(&state.act_mode_api_provider).ok(),
+            Self::PlanModeApiProvider => serde_json::to_value(&state.plan_mode_api_provider).ok(),
+            Self::ActModeApiModelId => serde_json::to_value(&state.act_mode_api_model_id).ok(),
+            Self::PlanModeApiModelId => serde_json::to_value(&state.plan_mode_api_model_id).ok(),
             Self::AzureApiVersion => serde_json::to_value(&state.azure_api_version).ok(),
-            Self::PreferredLanguage => {
-                serde_json::to_value(&state.preferred_language).ok()
-            }
+            Self::PreferredLanguage => serde_json::to_value(&state.preferred_language).ok(),
             Self::TelemetrySetting => serde_json::to_value(&state.telemetry_setting).ok(),
             Self::DefaultTerminalProfile => {
                 serde_json::to_value(&state.default_terminal_profile).ok()
@@ -619,22 +575,14 @@ impl GlobalStateKey {
             Self::HooksEnabled => serde_json::to_value(state.hooks_enabled).ok(),
             Self::UseAutoCondense => serde_json::to_value(state.use_auto_condense).ok(),
             Self::ShowTokenUsage => serde_json::to_value(state.show_token_usage).ok(),
-            Self::SnedWebToolsEnabled => {
-                serde_json::to_value(state.sned_web_tools_enabled).ok()
-            }
+            Self::SnedWebToolsEnabled => serde_json::to_value(state.sned_web_tools_enabled).ok(),
             Self::WorktreesEnabled => serde_json::to_value(state.worktrees_enabled).ok(),
-            Self::BackgroundEditEnabled => {
-                serde_json::to_value(state.background_edit_enabled).ok()
-            }
-            Self::OptOutOfRemoteConfig => {
-                serde_json::to_value(state.opt_out_of_remote_config).ok()
-            }
+            Self::BackgroundEditEnabled => serde_json::to_value(state.background_edit_enabled).ok(),
+            Self::OptOutOfRemoteConfig => serde_json::to_value(state.opt_out_of_remote_config).ok(),
             Self::DoubleCheckCompletionEnabled => {
                 serde_json::to_value(state.double_check_completion_enabled).ok()
             }
-            Self::OpenTelemetryEnabled => {
-                serde_json::to_value(state.open_telemetry_enabled).ok()
-            }
+            Self::OpenTelemetryEnabled => serde_json::to_value(state.open_telemetry_enabled).ok(),
             Self::OpenTelemetryOtlpInsecure => {
                 serde_json::to_value(state.open_telemetry_otlp_insecure).ok()
             }
@@ -905,9 +853,7 @@ impl std::str::FromStr for GlobalStateKey {
             // favoritedModelIds
             "favoritedModelIds" | "favorited_model_ids" => Ok(Self::FavoritedModelIds),
             // terminalReuseEnabled
-            "terminalReuseEnabled" | "terminal_reuse_enabled" => {
-                Ok(Self::TerminalReuseEnabled)
-            }
+            "terminalReuseEnabled" | "terminal_reuse_enabled" => Ok(Self::TerminalReuseEnabled),
             // isNewUser
             "isNewUser" | "is_new_user" => Ok(Self::IsNewUser),
             // mode
@@ -921,19 +867,13 @@ impl std::str::FromStr for GlobalStateKey {
             // enableCheckpoints
             "enableCheckpoints" | "enable_checkpoints" => Ok(Self::EnableCheckpoints),
             // actModeApiProvider
-            "actModeApiProvider" | "act_mode_api_provider" => {
-                Ok(Self::ActModeApiProvider)
-            }
+            "actModeApiProvider" | "act_mode_api_provider" => Ok(Self::ActModeApiProvider),
             // planModeApiProvider
-            "planModeApiProvider" | "plan_mode_api_provider" => {
-                Ok(Self::PlanModeApiProvider)
-            }
+            "planModeApiProvider" | "plan_mode_api_provider" => Ok(Self::PlanModeApiProvider),
             // actModeApiModelId
             "actModeApiModelId" | "act_mode_api_model_id" => Ok(Self::ActModeApiModelId),
             // planModeApiModelId
-            "planModeApiModelId" | "plan_mode_api_model_id" => {
-                Ok(Self::PlanModeApiModelId)
-            }
+            "planModeApiModelId" | "plan_mode_api_model_id" => Ok(Self::PlanModeApiModelId),
             // azureApiVersion
             "azureApiVersion" | "azure_api_version" => Ok(Self::AzureApiVersion),
             // preferredLanguage
@@ -947,9 +887,7 @@ impl std::str::FromStr for GlobalStateKey {
             // customPrompt
             "customPrompt" | "custom_prompt" => Ok(Self::CustomPrompt),
             // worktreeAutoOpenPath
-            "worktreeAutoOpenPath" | "worktree_auto_open_path" => {
-                Ok(Self::WorktreeAutoOpenPath)
-            }
+            "worktreeAutoOpenPath" | "worktree_auto_open_path" => Ok(Self::WorktreeAutoOpenPath),
             // lastShownAnnouncementId
             "lastShownAnnouncementId" | "last_shown_announcement_id" => {
                 Ok(Self::LastShownAnnouncementId)
@@ -1037,9 +975,7 @@ impl std::str::FromStr for GlobalStateKey {
                 Ok(Self::PlanActSeparateModelsSetting)
             }
             // strictPlanModeEnabled
-            "strictPlanModeEnabled" | "strict_plan_mode_enabled" => {
-                Ok(Self::StrictPlanModeEnabled)
-            }
+            "strictPlanModeEnabled" | "strict_plan_mode_enabled" => Ok(Self::StrictPlanModeEnabled),
             // hooksEnabled
             "hooksEnabled" | "hooks_enabled" => Ok(Self::HooksEnabled),
             // useAutoCondense
@@ -1047,27 +983,19 @@ impl std::str::FromStr for GlobalStateKey {
             // showTokenUsage
             "showTokenUsage" | "show_token_usage" => Ok(Self::ShowTokenUsage),
             // snedWebToolsEnabled
-            "snedWebToolsEnabled" | "sned_web_tools_enabled" => {
-                Ok(Self::SnedWebToolsEnabled)
-            }
+            "snedWebToolsEnabled" | "sned_web_tools_enabled" => Ok(Self::SnedWebToolsEnabled),
             // worktreesEnabled
             "worktreesEnabled" | "worktrees_enabled" => Ok(Self::WorktreesEnabled),
             // backgroundEditEnabled
-            "backgroundEditEnabled" | "background_edit_enabled" => {
-                Ok(Self::BackgroundEditEnabled)
-            }
+            "backgroundEditEnabled" | "background_edit_enabled" => Ok(Self::BackgroundEditEnabled),
             // optOutOfRemoteConfig
-            "optOutOfRemoteConfig" | "opt_out_of_remote_config" => {
-                Ok(Self::OptOutOfRemoteConfig)
-            }
+            "optOutOfRemoteConfig" | "opt_out_of_remote_config" => Ok(Self::OptOutOfRemoteConfig),
             // doubleCheckCompletionEnabled
             "doubleCheckCompletionEnabled" | "double_check_completion_enabled" => {
                 Ok(Self::DoubleCheckCompletionEnabled)
             }
             // openTelemetryEnabled
-            "openTelemetryEnabled" | "open_telemetry_enabled" => {
-                Ok(Self::OpenTelemetryEnabled)
-            }
+            "openTelemetryEnabled" | "open_telemetry_enabled" => Ok(Self::OpenTelemetryEnabled),
             // openTelemetryOtlpInsecure
             "openTelemetryOtlpInsecure" | "open_telemetry_otlp_insecure" => {
                 Ok(Self::OpenTelemetryOtlpInsecure)
@@ -1257,12 +1185,18 @@ impl StateManager {
 
         // Load global state
         let global_state = self.load_global_state()?;
-        *self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner) = global_state;
+        *self
+            .global_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = global_state;
 
         // Generate machine ID if not present
         let mut needs_persist = false;
         {
-            let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .global_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.sned_generated_machine_id.is_none() {
                 let machine_id = Ulid::new().to_string();
                 state.sned_generated_machine_id = Some(machine_id);
@@ -1275,7 +1209,10 @@ impl StateManager {
         if needs_persist {
             let settings_dir = self.state_dir.join("..").join("settings");
             fs::create_dir_all(&settings_dir)?;
-            let state = self.global_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = self
+                .global_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let data = serde_json::to_string_pretty(&*state)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             drop(state);
@@ -1285,7 +1222,10 @@ impl StateManager {
 
         // Load secrets
         let secrets = self.secrets_store.load();
-        *self.secrets.write().unwrap_or_else(std::sync::PoisonError::into_inner) = secrets;
+        *self
+            .secrets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = secrets;
 
         // Load workspace state (if exists)
         if let Ok(workspace_state) = self.load_workspace_state() {
@@ -1298,7 +1238,10 @@ impl StateManager {
         // Load task states from disk (SM4 fix)
         let tasks_dir = self.state_dir.join("..").join("tasks");
         if tasks_dir.exists() {
-            let mut task_states = self.task_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut task_states = self
+                .task_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut pending_task_states = self
                 .pending_task_states
                 .lock()
@@ -1340,7 +1283,10 @@ impl StateManager {
     /// Reads from `sned_generated_machine_id` field.
     /// Falls back to "anonymous" if not set.
     pub fn get_distinct_id(&self) -> String {
-        let state = self.global_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .global_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .sned_generated_machine_id
             .clone()
@@ -1369,7 +1315,10 @@ impl StateManager {
 
     /// Add a task to history (or update existing)
     pub fn add_task_to_history(&self, item: HistoryItem) {
-        let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .global_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         state.task_history.retain(|h| h.id != item.id);
         state.task_history.push(item);
@@ -1381,7 +1330,10 @@ impl StateManager {
 
     /// Remove a task from history
     pub fn remove_task_from_history(&self, task_id: &str) {
-        let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .global_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.task_history.retain(|h| h.id != task_id);
         drop(state);
         self.mark_global_key_pending("taskHistory".to_string());
@@ -1422,7 +1374,10 @@ impl StateManager {
     where
         T: Clone + for<'de> Deserialize<'de>,
     {
-        let state = self.global_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .global_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let json_value = key.get_json_value(&state)?;
         drop(state);
         match serde_json::from_value(json_value) {
@@ -1441,14 +1396,20 @@ impl StateManager {
     /// Get a config value by string key name.
     pub fn get_config_value(&self, key: &str) -> Option<String> {
         let enum_key = key.parse::<GlobalStateKey>().ok()?;
-        let state = self.global_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .global_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         enum_key.get_string_value(&state)
     }
 
     /// Set a global state key (typed enum version)
     pub fn set_global_state_key(&self, key: GlobalStateKey, value: serde_json::Value) {
         {
-            let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .global_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             key.set_json_value(&mut state, value);
         }
         self.mark_global_key_pending(key.to_string());
@@ -1468,8 +1429,7 @@ impl StateManager {
         value: String,
     ) -> Result<(), ConfigFieldError> {
         // First, check if the key is valid
-        let Some(key_info) = VALID_CONFIG_KEYS.iter().find(|k| k.name == key)
-        else {
+        let Some(key_info) = VALID_CONFIG_KEYS.iter().find(|k| k.name == key) else {
             return Err(ConfigFieldError::UnsupportedField(key.to_string()));
         };
 
@@ -1492,7 +1452,10 @@ impl StateManager {
             _ => {} // String fields accept any value
         }
 
-        let mut state = self.global_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .global_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let handled = match key {
             // String fields
             "mode" => {
@@ -1653,18 +1616,15 @@ impl StateManager {
                 true
             }
             "hooks_enabled" => {
-                state.hooks_enabled =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
+                state.hooks_enabled = matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
             "use_auto_condense" => {
-                state.use_auto_condense =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
+                state.use_auto_condense = matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
             "show_token_usage" => {
-                state.show_token_usage =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
+                state.show_token_usage = matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
             "sned_web_tools_enabled" => {
@@ -1673,8 +1633,7 @@ impl StateManager {
                 true
             }
             "worktrees_enabled" => {
-                state.worktrees_enabled =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
+                state.worktrees_enabled = matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
             "background_edit_enabled" => {
@@ -1745,7 +1704,10 @@ impl StateManager {
     /// Set task state for a specific task
     pub fn set_task_state(&self, task_id: &str, key: &str, value: serde_json::Value) {
         {
-            let mut task_states = self.task_state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut task_states = self
+                .task_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let task_state = task_states.entry(task_id.to_string()).or_default();
             task_state.insert(key.to_string(), value);
             drop(task_states);
@@ -1776,7 +1738,10 @@ impl StateManager {
     /// Set a secret
     pub fn set_secret(&self, key: &str, value: String) {
         {
-            let mut secrets = self.secrets.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut secrets = self
+                .secrets
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             secrets.insert(key.to_string(), value);
         }
         self.mark_secret_pending(key.to_string());
@@ -1966,7 +1931,10 @@ impl StateManager {
         self.persist_workspace_state()?;
 
         // Update last persist time
-        *self.last_persist.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+        *self
+            .last_persist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
 
         Ok(())
     }
@@ -2039,7 +2007,10 @@ impl StateManager {
         &self,
         task_states: &HashMap<String, HashSet<String>>,
     ) -> io::Result<()> {
-        let states = self.task_state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let states = self
+            .task_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         for (task_id, keys) in task_states {
             if let Some(task_state) = states.get(task_id) {
@@ -2076,7 +2047,10 @@ impl StateManager {
 
     /// Persist secrets to disk
     fn persist_secrets(&self, keys: &HashSet<String>) -> io::Result<()> {
-        let secrets = self.secrets.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let secrets = self
+            .secrets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Use secrets_store.set() for each key to do proper read-merge-write
         // This prevents overwriting the entire file with only pending keys (S7 fix)
@@ -2482,7 +2456,8 @@ mod tests {
         *manager
             .global_state
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = serde_json::from_value(initial_state).unwrap();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            serde_json::from_value(initial_state).unwrap();
 
         manager.set_global_state_key(
             GlobalStateKey::TerminalReuseEnabled,
@@ -2544,9 +2519,13 @@ mod tests {
                 manager.get_global_state_key(GlobalStateKey::TerminalReuseEnabled);
             assert!(value.is_none());
 
-            let log_output =
-                String::from_utf8(captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
-                    .unwrap();
+            let log_output = String::from_utf8(
+                captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )
+            .unwrap();
             assert!(log_output.contains("failed to deserialize global state value"));
             assert!(log_output.contains("key=terminalReuseEnabled"));
             assert!(log_output.contains("error="));

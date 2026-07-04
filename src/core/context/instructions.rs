@@ -91,7 +91,7 @@ pub struct SkillSupportingFiles {
 /// Scan directory for AGENTS.md files recursively.
 /// Only searches if a top-level AGENTS.md file exists.
 /// Uses ignore::WalkBuilder for .gitignore-aware filtering and skips common heavy directories.
-#[must_use] 
+#[must_use]
 pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
     let top_level = cwd.join("AGENTS.md");
     if !top_level.exists() {
@@ -299,11 +299,7 @@ fn read_directory_recursive(dir: &Path, extension: &str) -> Result<Vec<PathBuf>,
     {
         if entry.file_type().is_file() {
             let path = entry.path();
-            if extension.is_empty()
-                || path
-                    .extension()
-                    .is_some_and(|e| e == &extension[1..])
-            {
+            if extension.is_empty() || path.extension().is_some_and(|e| e == &extension[1..]) {
                 results.push(path.to_path_buf());
             }
         }
@@ -314,7 +310,7 @@ fn read_directory_recursive(dir: &Path, extension: &str) -> Result<Vec<PathBuf>,
 
 /// Synchronize rule toggles with current filesystem state.
 /// Adds defaults for new files, removes toggles for deleted files.
-#[must_use] 
+#[must_use]
 pub fn synchronize_rule_toggles(
     rules_path: &Path,
     current_toggles: &RuleToggles,
@@ -358,7 +354,7 @@ pub fn synchronize_rule_toggles(
 }
 
 /// Combine two rule toggle maps (toggles2 takes precedence)
-#[must_use] 
+#[must_use]
 pub fn combine_rule_toggles(toggles1: &RuleToggles, toggles2: &RuleToggles) -> RuleToggles {
     let mut combined = toggles1.clone();
     combined.extend(toggles2.iter().map(|(k, v)| (k.clone(), *v)));
@@ -366,7 +362,7 @@ pub fn combine_rule_toggles(toggles1: &RuleToggles, toggles2: &RuleToggles) -> R
 }
 
 /// Get skills directories to scan
-#[must_use] 
+#[must_use]
 pub fn get_skills_directories_for_scan(cwd: &Path) -> Vec<(PathBuf, SkillSource)> {
     let mut dirs = vec![
         (cwd.join(".agents/skills"), SkillSource::Project),
@@ -579,7 +575,9 @@ fn parse_yaml_frontmatter(content: &str) -> (serde_yml::Mapping, String, bool, O
     }
 
     let rest = &trimmed[3..];
-    let Some(end_pos) = rest.find("---") else { return (serde_yml::Mapping::new(), content.to_string(), false, None) };
+    let Some(end_pos) = rest.find("---") else {
+        return (serde_yml::Mapping::new(), content.to_string(), false, None);
+    };
 
     let yaml_str = &rest[..end_pos];
     let body = rest[end_pos + 3..].to_string();
@@ -596,7 +594,7 @@ fn parse_yaml_frontmatter(content: &str) -> (serde_yml::Mapping, String, bool, O
 }
 
 /// Discover all skills from project and global directories
-#[must_use] 
+#[must_use]
 pub fn discover_skills(cwd: &Path) -> Vec<SkillMetadata> {
     let mut skills = Vec::new();
     let scan_dirs = get_skills_directories_for_scan(cwd);
@@ -610,7 +608,7 @@ pub fn discover_skills(cwd: &Path) -> Vec<SkillMetadata> {
 }
 
 /// Get available skills with override resolution (global > project)
-#[must_use] 
+#[must_use]
 pub fn get_available_skills(skills: Vec<SkillMetadata>) -> Vec<SkillMetadata> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
@@ -628,7 +626,7 @@ pub fn get_available_skills(skills: Vec<SkillMetadata>) -> Vec<SkillMetadata> {
 }
 
 /// List supporting files (docs and scripts) in a skill directory
-#[must_use] 
+#[must_use]
 pub fn list_supporting_files(skill_md_path: &Path) -> SkillSupportingFiles {
     let skill_dir = skill_md_path.parent().unwrap_or(Path::new("."));
     let docs_dir = skill_dir.join("docs");
@@ -666,14 +664,16 @@ pub fn list_supporting_files(skill_md_path: &Path) -> SkillSupportingFiles {
 }
 
 /// Get full skill content including instructions
-#[must_use] 
+#[must_use]
 pub fn get_skill_content(
     skill_name: &str,
     available_skills: &[SkillMetadata],
 ) -> Option<SkillContent> {
     let skill = available_skills.iter().find(|s| s.name == skill_name)?;
 
-    let Ok(file_content) = fs::read_to_string(&skill.path) else { return None };
+    let Ok(file_content) = fs::read_to_string(&skill.path) else {
+        return None;
+    };
 
     let (_, body, _, _) = parse_yaml_frontmatter(&file_content);
     let instructions = body.trim().to_string();

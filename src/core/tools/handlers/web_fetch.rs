@@ -5,10 +5,10 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
-use std::future::Future;
-use std::pin::Pin;
 use futures::StreamExt;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::pin::Pin;
 use url::Url;
 
 /// Maximum redirect count to prevent redirect loops and open redirect attacks
@@ -57,9 +57,7 @@ async fn read_response_capped(
     max_size: usize,
 ) -> Result<(Vec<u8>, bool, Option<u64>), reqwest::Error> {
     let content_length = response.content_length();
-    let stream = response
-        .bytes_stream()
-        .map(|r| r.map(|b| b.to_vec()));
+    let stream = response.bytes_stream().map(|r| r.map(|b| b.to_vec()));
     let (buf, truncated) = collect_capped(content_length, stream, max_size).await?;
     Ok((buf, truncated, content_length))
 }
@@ -379,9 +377,7 @@ impl WebFetchHandler {
                     "Successfully fetched {url} (response truncated at {max_size} bytes{full_size_note}). Content:\n\n{text}"
                 ))
             } else {
-                Ok(format!(
-                    "Successfully fetched {url}. Content:\n\n{text}"
-                ))
+                Ok(format!("Successfully fetched {url}. Content:\n\n{text}"))
             };
         }
     }

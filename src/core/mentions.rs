@@ -19,7 +19,7 @@ static COMMIT_HASH_REGEX: LazyLock<Regex> =
 
 /// Regex for matching mentions in text.
 /// Matches: @/path/to/file, @folder/, @git-changes, @commit-hash
-#[must_use] 
+#[must_use]
 pub fn get_mention_regex() -> &'static Regex {
     &MENTION_REGEX
 }
@@ -64,7 +64,7 @@ impl Mention {
     }
 
     /// Get a description for the mention.
-    #[must_use] 
+    #[must_use]
     pub fn description(&self) -> String {
         match self {
             Self::File(path) => format!(

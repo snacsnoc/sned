@@ -281,7 +281,7 @@ pub struct BrowserSettings {
 
 /// Load global state from the default path (~/.sned/data/settings/global_settings.json)
 /// Uses integrity validation (SHA256 checksum) when available.
-#[must_use] 
+#[must_use]
 pub fn load_global_state() -> GlobalState {
     load_global_state_with_integrity()
 }

@@ -1,9 +1,9 @@
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
-use std::future::Future;
-use std::pin::Pin;
 use crate::services::tree_sitter::get_file_skeleton;
 use crate::services::tree_sitter::load_required_language_parsers;
 use futures::future::join_all;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Handler for get_file_skeleton tool.

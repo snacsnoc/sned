@@ -2,12 +2,12 @@ use crate::core::agent_loop::TaskState;
 use crate::core::hash_utils::strip_hashes;
 use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
-use std::future::Future;
-use std::pin::Pin;
 use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::{SymbolRange, get_symbol_range, load_required_language_parsers};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::fs;
 
@@ -209,7 +209,8 @@ impl ToolHandler for ReplaceSymbolHandler {
         let params = params.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
-            handler.execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
+            handler
+                .execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
                 .await
                 .map(serde_json::Value::String)
         })

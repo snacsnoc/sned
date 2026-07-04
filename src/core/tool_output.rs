@@ -120,12 +120,14 @@ pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> Strin
         ),
         _ => return tool_name.to_string(),
     };
-    let Some(path_str) = path else { return format!("  {verb}") };
+    let Some(path_str) = path else {
+        return format!("  {verb}");
+    };
     let hyperlinked = crate::cli::colors::hyperlink_path(&path_str);
     format!("  ▶ {verb} {hyperlinked}")
 }
 
-#[must_use] 
+#[must_use]
 pub fn path_from_read_file_header(text: &str) -> Option<&str> {
     let first_line = text.lines().next()?;
     if let Some(rest) = first_line.strip_prefix("[File: ") {
@@ -138,24 +140,24 @@ pub fn path_from_read_file_header(text: &str) -> Option<&str> {
 /// Normalizes a path for comparison: extracts the last path component (filename)
 /// to handle both absolute paths from read_file headers and relative paths from edit_file.
 /// E.g. "/foo/bar/baz.rs" and "baz.rs" both normalize to "baz.rs"
-#[must_use] 
+#[must_use]
 pub fn normalize_path_for_matching(path: &str) -> String {
     std::path::Path::new(path)
-        .file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string())
+        .file_name()
+        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string())
 }
 
-#[must_use] 
+#[must_use]
 pub fn summarize_matching_sections(text: &str, edited_paths: &[String]) -> String {
     let sections: Vec<&str> = text.split("\n---\n").collect();
     let mut result = Vec::new();
     for section in &sections {
-        let matches = path_from_read_file_header(section)
-            .is_some_and(|p| {
-                let normalized_p = normalize_path_for_matching(p);
-                edited_paths
-                    .iter()
-                    .any(|ep| normalize_path_for_matching(ep) == normalized_p)
-            });
+        let matches = path_from_read_file_header(section).is_some_and(|p| {
+            let normalized_p = normalize_path_for_matching(p);
+            edited_paths
+                .iter()
+                .any(|ep| normalize_path_for_matching(ep) == normalized_p)
+        });
         if matches {
             result.push(summarize_single_section(section));
         } else {
@@ -165,7 +167,7 @@ pub fn summarize_matching_sections(text: &str, edited_paths: &[String]) -> Strin
     result.join("\n---\n")
 }
 
-#[must_use] 
+#[must_use]
 pub fn summarize_single_section(section: &str) -> String {
     let file_hash = section
         .lines()
@@ -192,9 +194,7 @@ pub fn summarize_single_section(section: &str) -> String {
         .take(MAX_PRESERVED_ANCHORS)
         .collect();
 
-    let mut out = format!(
-        "[Context pruned: {line_count} lines, ~{size_kb}KB. Hash: {file_hash}]"
-    );
+    let mut out = format!("[Context pruned: {line_count} lines, ~{size_kb}KB. Hash: {file_hash}]");
 
     if anchored_lines.is_empty() {
         out.push_str(" Re-read with read_file if you need current anchors.");
@@ -211,7 +211,7 @@ pub fn summarize_single_section(section: &str) -> String {
 
 const MAX_PRESERVED_ANCHORS: usize = 80;
 
-#[must_use] 
+#[must_use]
 pub fn extract_edit_stats_detailed(result: &str) -> (String, String, i32, i32) {
     let mut files_changed = 0;
     let mut total_added = 0;
@@ -241,9 +241,7 @@ pub fn extract_edit_stats_detailed(result: &str) -> (String, String, i32, i32) {
     }
 
     let stats = if files_changed > 0 {
-        format!(
-            "{files_changed} file(s) (+{total_added}, -{total_removed})"
-        )
+        format!("{files_changed} file(s) (+{total_added}, -{total_removed})")
     } else {
         result.lines().next().unwrap_or("").to_string()
     };
@@ -251,7 +249,7 @@ pub fn extract_edit_stats_detailed(result: &str) -> (String, String, i32, i32) {
     (stats, file_path, total_added, total_removed)
 }
 
-#[must_use] 
+#[must_use]
 pub fn format_heat_map(edit_files: &[(String, i32, i32)]) -> String {
     if edit_files.is_empty() {
         return String::new();
@@ -302,7 +300,7 @@ fn strip_anchor(line: &str) -> &str {
     line
 }
 
-#[must_use] 
+#[must_use]
 pub fn format_tool_result(result: &str, max_lines: usize) -> String {
     // Strip hash anchors (Word§line content) from display — they're agent-internal
     // for edit_file, not user-facing. The § delimiter separates the anchor word

@@ -19,7 +19,7 @@ pub enum CliError {
 
 impl CliError {
     /// Get the exit code for this error
-    #[must_use] 
+    #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Config(_) => crate::exit_codes::EXIT_CONFIG,

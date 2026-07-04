@@ -5,7 +5,7 @@ use std::pin::Pin;
 pub struct NewTaskHandler;
 
 impl NewTaskHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -52,8 +52,7 @@ impl ToolHandler for NewTaskHandler {
         let ctx = ctx.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
-            Self::execute(handler, &mut state, params)
-                .map(serde_json::Value::String)
+            Self::execute(handler, &mut state, params).map(serde_json::Value::String)
         })
     }
 
@@ -81,13 +80,12 @@ mod tests {
         let handler = NewTaskHandler::new();
         let mut state = TaskState::default();
 
-        let result = handler
-            .execute(
-                &mut state,
-                serde_json::json!({
-                    "context": "Test context summary"
-                }),
-            );
+        let result = handler.execute(
+            &mut state,
+            serde_json::json!({
+                "context": "Test context summary"
+            }),
+        );
 
         assert!(result.is_ok());
         assert!(state.consecutive_mistakes == 0);

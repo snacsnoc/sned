@@ -16,7 +16,7 @@ use std::pin::Pin;
 pub struct AttemptCompletionHandler;
 
 impl AttemptCompletionHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -124,8 +124,7 @@ mod tests {
             ..Default::default()
         };
         // Simulate second attempt (after double-check rejection)
-        let result = handler
-            .execute(&mut state, serde_json::json!({"result": "Done!"}));
+        let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Done!");
     }
@@ -138,8 +137,7 @@ mod tests {
         assert!(state.double_check_completion_enabled);
         assert!(!state.double_check_completion_pending);
 
-        let result = handler
-            .execute(&mut state, serde_json::json!({"result": "Done!"}));
+        let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -161,8 +159,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handler
-            .execute(&mut state, serde_json::json!({"result": "Done!"}));
+        let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));
         assert!(result.is_ok(), "Second attempt should succeed");
         assert_eq!(result.unwrap(), "Done!");
         assert!(
@@ -179,8 +176,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handler
-            .execute(&mut state, serde_json::json!({"result": "Done!"}));
+        let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));
         assert!(
             result.is_ok(),
             "First attempt should succeed when double-check is disabled"
@@ -198,20 +194,17 @@ mod tests {
         let mut state = TaskState::default();
 
         // First attempt: rejected
-        let result = handler
-            .execute(&mut state, serde_json::json!({"result": "Done!"}));
+        let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));
         assert!(result.is_err());
         assert!(state.double_check_completion_pending);
 
         // Second attempt: succeeds
-        let result = handler
-            .execute(&mut state, serde_json::json!({"result": "Done!"}));
+        let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));
         assert!(result.is_ok());
         assert!(!state.double_check_completion_pending);
 
         // Third attempt (new pair): rejected again
-        let result = handler
-            .execute(&mut state, serde_json::json!({"result": "Done!"}));
+        let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));
         assert!(
             result.is_err(),
             "Third attempt should be rejected again (new double-check cycle)"

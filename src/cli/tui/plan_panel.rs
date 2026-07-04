@@ -84,9 +84,7 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
     let filled = (progress_pct / 100.0 * bar_width as f64) as usize;
     let bar_str: String = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
     lines.push(Line::from(Span::styled(
-        format!(
-            "[{bar_str}] {progress_pct:.0}% ({done_count}/{total})"
-        ),
+        format!("[{bar_str}] {progress_pct:.0}% ({done_count}/{total})"),
         theme::dim_style(),
     )));
 

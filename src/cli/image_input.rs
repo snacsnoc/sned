@@ -28,7 +28,7 @@ pub enum ImageLoadError {
 }
 
 /// Check if a file path has a supported image extension.
-#[must_use] 
+#[must_use]
 pub fn is_image_path(file_path: &str) -> bool {
     let ext = Path::new(file_path)
         .extension()
@@ -90,7 +90,7 @@ pub fn load_image_to_content_block(
 ///
 /// Files that fail to load are skipped (errors are silently ignored,
 /// matching the TypeScript `processImagePaths` behavior).
-#[must_use] 
+#[must_use]
 pub fn load_images_to_content_blocks(
     image_paths: &[String],
 ) -> Vec<crate::providers::ImageContentBlock> {
@@ -110,7 +110,7 @@ pub fn load_images_to_content_blocks(
 ///
 /// Supports `@/path/to/image.png` syntax as well as standalone absolute paths
 /// that look like images. Returns the cleaned prompt and extracted paths.
-#[must_use] 
+#[must_use]
 pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
     let mut image_paths = Vec::new();
 

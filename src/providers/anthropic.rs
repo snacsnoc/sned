@@ -129,10 +129,7 @@ impl AnthropicProvider {
         let model_info = self.get_model().info;
         let budget_tokens = self.config.thinking_budget_tokens.unwrap_or(0);
         let reasoning_on = model_info.supports_reasoning.unwrap_or(false) && budget_tokens != 0;
-        let native_tools_on = request
-            .tools
-            .as_ref()
-            .is_some_and(|t| !t.is_empty());
+        let native_tools_on = request.tools.as_ref().is_some_and(|t| !t.is_empty());
         let supports_cache = model_info.supports_prompt_cache;
 
         let max_tokens = request

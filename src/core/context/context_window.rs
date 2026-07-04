@@ -1,13 +1,13 @@
 //! Context window utilities.
 //!
 
-use crate::providers::{Provider, Providers, ProviderRequest};
+use crate::providers::{Provider, ProviderRequest, Providers};
 
 const HARD_LIMIT: u64 = 1_000_000;
 
 /// Estimate token count for a provider request.
 /// Uses rough heuristic: ~4 chars per token for English text.
-#[must_use] 
+#[must_use]
 pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
     let system_tokens = request.system_prompt.len() as f64 / 4.0;
 
@@ -87,21 +87,18 @@ pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
         })
         .sum();
 
-    let tool_def_tokens: f64 = request
-        .tools
-        .as_ref()
-        .map_or(0.0, |tools| {
-            tools
-                .iter()
-                .map(|t| {
-                    t.function.name.len() as f64 / 4.0
-                        + t.function.description.len() as f64 / 4.0
-                        + serde_json::to_string(&t.function.parameters)
-                            .map(|s| s.len() as f64 / 4.0)
-                            .unwrap_or(10.0)
-                })
-                .sum()
-        });
+    let tool_def_tokens: f64 = request.tools.as_ref().map_or(0.0, |tools| {
+        tools
+            .iter()
+            .map(|t| {
+                t.function.name.len() as f64 / 4.0
+                    + t.function.description.len() as f64 / 4.0
+                    + serde_json::to_string(&t.function.parameters)
+                        .map(|s| s.len() as f64 / 4.0)
+                        .unwrap_or(10.0)
+            })
+            .sum()
+    });
 
     (system_tokens + message_tokens + tool_def_tokens) as u64
 }
@@ -161,7 +158,7 @@ pub fn get_context_window_info(provider: &Providers) -> ContextWindowInfo {
 /// - Gemini: `input_tokens = prompt_tokens - cached_content_token_count`
 ///
 /// Returns percentage (0.0-100.0) of context window consumed.
-#[must_use] 
+#[must_use]
 pub fn calculate_context_usage_percentage(
     tokens_in: u32,
     tokens_out: u32,
@@ -188,10 +185,7 @@ mod tests {
 
     fn make_mock_provider(context_window: Option<u64>) -> crate::providers::Providers {
         let mock = if let Some(cw) = context_window {
-            MockProvider::new_with_context_window(
-                vec![MockResponse::Text("test".to_string())],
-                cw,
-            )
+            MockProvider::new_with_context_window(vec![MockResponse::Text("test".to_string())], cw)
         } else {
             MockProvider::new(vec![MockResponse::Text("test".to_string())])
         };

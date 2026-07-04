@@ -23,9 +23,12 @@ use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor, st
 /// Split file content into logical lines while preserving a trailing empty line
 /// when the file ends with `\n`. Anchor reconciliation and edit resolution must
 /// use identical line semantics.
-#[must_use] 
+#[must_use]
 pub fn split_content_lines(content: &str) -> Vec<String> {
-    content.split('\n').map(std::string::ToString::to_string).collect()
+    content
+        .split('\n')
+        .map(std::string::ToString::to_string)
+        .collect()
 }
 
 // ============================================================================
@@ -47,7 +50,7 @@ pub enum FileEditorError {
 
 impl FileEditorError {
     /// Return an actionable display string with a suggestion for fixing the error.
-    #[must_use] 
+    #[must_use]
     pub fn actionable_display(&self) -> String {
         match self {
             Self::AllEditsFailed { message } => {
@@ -153,7 +156,10 @@ impl AnchorStorage {
 
     fn get_dictionary(&mut self) -> &[String] {
         if self.dictionary.is_empty() {
-            self.dictionary = ANCHOR_DICTIONARY.iter().map(std::string::ToString::to_string).collect();
+            self.dictionary = ANCHOR_DICTIONARY
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
         }
         &self.dictionary
     }
@@ -258,7 +264,7 @@ pub struct AnchorStateManager {
 }
 
 impl AnchorStateManager {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             storage: Arc::new(Mutex::new(AnchorStorage::load())),
@@ -377,7 +383,7 @@ impl AnchorStateManager {
 
     /// Reconciles the current file content with saved state using diff.
     ///
-    #[must_use] 
+    #[must_use]
     pub fn reconcile(
         &self,
         absolute_path: &str,
@@ -388,9 +394,7 @@ impl AnchorStateManager {
 
         // Safeguard for massive files
         if current_lines.len() > MAX_TRACKED_LINES {
-            return (1..=current_lines.len())
-                .map(|i| format!("L{i}"))
-                .collect();
+            return (1..=current_lines.len()).map(|i| format!("L{i}")).collect();
         }
 
         let current_hashes = compute_hashes(current_lines);
@@ -518,7 +522,7 @@ impl AnchorStateManager {
     }
 
     /// Returns true if the file is currently being tracked.
-    #[must_use] 
+    #[must_use]
     pub fn is_tracking(&self, absolute_path: &str, task_id: Option<&str>) -> bool {
         let task_id = task_id.unwrap_or("default");
         let state = self.get_task_state(task_id);
@@ -526,7 +530,7 @@ impl AnchorStateManager {
     }
 
     /// Gets current anchors for a file if it's being tracked.
-    #[must_use] 
+    #[must_use]
     pub fn get_anchors(&self, absolute_path: &str, task_id: Option<&str>) -> Option<Vec<String>> {
         let task_id = task_id.unwrap_or("default");
         let state = self.get_task_state(task_id);
@@ -672,13 +676,13 @@ pub struct AppliedEdit {
 pub struct EditExecutor;
 
 impl EditExecutor {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
 
     /// Resolves edits to line indices.
-    #[must_use] 
+    #[must_use]
     pub fn resolve_edits(
         &self,
         edits: &[Edit],
@@ -939,7 +943,10 @@ impl EditExecutor {
             let replacement_lines: Vec<String> = if clean_text.is_empty() {
                 Vec::new()
             } else {
-                clean_text.lines().map(std::string::ToString::to_string).collect()
+                clean_text
+                    .lines()
+                    .map(std::string::ToString::to_string)
+                    .collect()
             };
 
             let (removed_in_this_edit, splice_index) = if edit_type == "insert_after" {
@@ -1002,7 +1009,7 @@ impl EditExecutor {
     }
 
     /// Formats a failure message for an edit.
-    #[must_use] 
+    #[must_use]
     pub fn format_failure_message(&self, edit: &Edit, error: Option<&str>) -> String {
         let diagnostic = error.map_or_else(
             || " This almost certainly is because the anchors used were incorrect or not in ascending order or the text supplied was incorrect. please check again edit again".to_string(),
@@ -1029,7 +1036,7 @@ pub struct FileEditor {
 }
 
 impl FileEditor {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             executor: EditExecutor::new(),
@@ -1038,7 +1045,7 @@ impl FileEditor {
     }
 
     /// Reconciles anchors for a file and returns the anchor words.
-    #[must_use] 
+    #[must_use]
     pub fn reconcile_anchors(
         &self,
         absolute_path: &str,
@@ -1086,7 +1093,8 @@ impl FileEditor {
         let final_content = final_lines.join("\n");
 
         // Reconcile anchors for the modified content
-        let _ = self.anchor_mgr
+        let _ = self
+            .anchor_mgr
             .reconcile(absolute_path, &final_lines, task_id);
 
         Ok((final_content, applied_edits, failed_edits))

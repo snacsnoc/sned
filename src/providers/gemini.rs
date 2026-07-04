@@ -642,10 +642,7 @@ async fn finish_gemini_sse_to_chunks(
 ) {
     // Do not flush tool calls if the model was blocked or only emitted
     // recitation content. Those states are explicit terminal responses.
-    if !matches!(
-        last_stop_reason.as_deref(),
-        Some("RECITATION" | "BLOCKED")
-    ) {
+    if !matches!(last_stop_reason.as_deref(), Some("RECITATION" | "BLOCKED")) {
         // Flush accumulated tool calls on stream end.
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls {
             if !completed_tool_call_ids.contains(call_id)

@@ -76,7 +76,7 @@ pub enum DiffMode {
 }
 
 impl BatchProcessor {
-    #[must_use] 
+    #[must_use]
     pub fn new(diff_mode: DiffMode) -> Self {
         Self {
             executor: EditExecutor::new(),
@@ -234,7 +234,7 @@ impl BatchProcessor {
     }
 
     /// Generates diff for a batch.
-    #[must_use] 
+    #[must_use]
     pub fn generate_diff(&self, display_path: &str, prepared: &PreparedEdits) -> String {
         let mut diff = String::new();
         if !crate::cli::colors::stdout_colors_disabled() {
@@ -269,7 +269,12 @@ impl BatchProcessor {
             } else {
                 search_lines =
                     prepared.lines[applied.original_start_idx..=applied.original_end_idx].to_vec();
-                replace_lines = applied.edit.text.lines().map(std::string::ToString::to_string).collect();
+                replace_lines = applied
+                    .edit
+                    .text
+                    .lines()
+                    .map(std::string::ToString::to_string)
+                    .collect();
             }
 
             let colored = !crate::cli::colors::stdout_colors_disabled();
@@ -311,7 +316,7 @@ impl BatchProcessor {
 
     /// Formats the final result for a batch.
     ///
-    #[must_use] 
+    #[must_use]
     pub fn format_result(
         &self,
         prepared: &PreparedEdits,

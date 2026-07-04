@@ -13,9 +13,9 @@ use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::{AnchorStateManager, split_content_lines};
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
+use futures::StreamExt;
 use std::future::Future;
 use std::pin::Pin;
-use futures::StreamExt;
 
 fn max_file_read_size() -> usize {
     use std::sync::OnceLock;
@@ -52,7 +52,7 @@ struct FileReadResult {
 pub struct ReadFileHandler;
 
 impl ReadFileHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -645,7 +645,7 @@ impl ToolHandler for ReadFileHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::core::agent_loop::TaskState;
+    use crate::core::agent_loop::TaskState;
     use crate::core::file_editor::AnchorStateManager;
     use crate::core::tools::{ToolContext, ToolHandler};
     use std::io::Write;
