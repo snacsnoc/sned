@@ -10,6 +10,8 @@ Helper scripts for profiling, memory analysis, TUI testing, build, signing, and 
 | Analyze a dhat heap dump | `./scripts/analyze-dhat-heap.sh dhat-heap.json` |
 | Test the TUI | `./scripts/tui-smoke-test.sh` |
 | Build a universal macOS binary | `./scripts/build-universal-macos.sh` |
+| Build and package Linux amd64 | `./scripts/build-linux-amd64.sh` |
+| Build and package FreeBSD amd64 | `./scripts/build-freebsd-amd64.sh` |
 | Sign a macOS binary | `./scripts/sign-macos.sh` |
 | Notarize a macOS binary | `./scripts/notarize-macos.sh` |
 | Update the Homebrew formula | `./scripts/homebrew-formula.sh` |
@@ -106,6 +108,20 @@ Dependencies: `python3`, `gcc`/`clang` (only for the rebuild).
 ### `build-universal-macos.sh`
 
 Builds a universal (arm64 + x86_64) release binary.
+
+### `build-release-package.sh`
+
+Shared helper used by the Linux and FreeBSD packaging wrappers. Builds a
+single target triple and writes a tar.gz release artifact under
+`target/dist/<suffix>/`.
+
+### `build-linux-amd64.sh`
+
+Builds `x86_64-unknown-linux-gnu` and packages `sned-<version>-linux-amd64.tar.gz`.
+
+### `build-freebsd-amd64.sh`
+
+Builds `x86_64-unknown-freebsd` and packages `sned-<version>-freebsd-amd64.tar.gz`.
 
 ### `sign-macos.sh`
 
