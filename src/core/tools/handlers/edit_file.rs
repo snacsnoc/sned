@@ -1773,6 +1773,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_edit_file_strips_anchored_multiline_replacement_text() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let raw_content = "line 1\nline 2\nline 3\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(raw_content);
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let anchor = format!("{}§line 1", anchors[0]);
+        let anchored_text = format!(
+            "{}§replacement line 1\n{}§replacement line 2",
+            anchors[1], anchors[2]
+        );
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": anchored_text
+                }]
+            }]
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "anchored multiline replacement text should still apply: {:?}",
+            result.err()
+        );
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            updated,
+            "replacement line 1\nreplacement line 2\nline 2\nline 3\n"
+        );
+        assert!(
+            !updated.contains('§'),
+            "replacement text must not write read_file anchors into the file: {updated:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_edit_file_accepts_first_line_of_multiline_anchor() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();

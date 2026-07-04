@@ -1,8 +1,8 @@
 use sned::core::edit_batch::BatchProcessor;
-use sned::core::file_editor::{AnchorStateManager, Edit, EditExecutor};
+use sned::core::file_editor::{AnchorStateManager, Edit, EditExecutor, split_content_lines};
 
 fn lines(content: &str) -> Vec<String> {
-    content.lines().map(|line| line.to_string()).collect()
+    split_content_lines(content)
 }
 
 fn anchor_lines(absolute_path: &str, content: &str, task_id: &str) -> Vec<String> {
@@ -218,4 +218,47 @@ fn file_editor_matches_ts_partial_success_flow() {
             .unwrap()
             .contains("new line 4")
     );
+}
+
+#[test]
+fn file_editor_preserves_trailing_newline_semantics() {
+    let task_id = "parity-trailing-newline";
+    let path = "/tmp/sned-trailing-newline-parity.txt";
+    let content = "line 1\nline 2\n";
+    let anchor_mgr = AnchorStateManager::new();
+    anchor_mgr.reset(Some(task_id));
+
+    let current_hashes = anchor_mgr.reconcile(path, &lines(content), Some(task_id));
+    let anchored: Vec<String> = lines(content)
+        .into_iter()
+        .zip(current_hashes.iter())
+        .map(|(line, hash)| format!("{hash}§{line}"))
+        .collect();
+    let edits = vec![Edit {
+        anchor: anchored[1].clone(),
+        end_anchor: Some(anchored[1].clone()),
+        edit_type: "replace".to_string(),
+        text: "new line 2".to_string(),
+    }];
+
+    let processor = BatchProcessor::new(sned::core::edit_batch::DiffMode::Full);
+    let prepared = processor
+        .prepare_edits(
+            path,
+            "sned-trailing-newline-parity.txt",
+            content,
+            &edits,
+            &anchor_mgr.reconcile(path, &lines(content), Some(task_id)),
+        )
+        .unwrap();
+    let mut prepared = prepared;
+    let batch = processor.apply_batch(
+        &mut prepared,
+        "sned-trailing-newline-parity.txt",
+        "sned-trailing-newline-parity.txt",
+    );
+
+    assert!(batch.success);
+    assert_eq!(batch.final_content.as_deref(), Some("line 1\nnew line 2\n"));
+    assert_eq!(prepared.final_lines, lines("line 1\nnew line 2\n"));
 }
