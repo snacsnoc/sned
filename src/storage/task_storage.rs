@@ -144,7 +144,7 @@ impl TaskStorage {
         Ok(Self { task_dir })
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn task_dir(&self) -> &Path {
         &self.task_dir
     }
@@ -313,7 +313,7 @@ impl TaskStorage {
     }
 
     /// Read task metadata
-    #[must_use] 
+    #[must_use]
     pub fn read_task_metadata(&self) -> TaskMetadata {
         let file_path = self.task_dir.join(GlobalFileNames::TASK_METADATA);
         Self::read_task_metadata_from_path(&file_path)
@@ -363,7 +363,7 @@ impl TaskStorage {
     }
 
     /// Read per-task settings
-    #[must_use] 
+    #[must_use]
     pub fn read_settings<T>(&self) -> Option<T>
     where
         T: for<'de> Deserialize<'de>,
@@ -523,7 +523,7 @@ impl TaskStorage {
     }
 
     /// Load file context metadata (files_in_context) from task metadata.
-    #[must_use] 
+    #[must_use]
     pub fn load_file_context_metadata(
         &self,
     ) -> Vec<crate::core::context::trackers::FileMetadataEntry> {
