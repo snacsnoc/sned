@@ -575,6 +575,7 @@ impl EditFileHandler {
         let file_edits = file_edits?;
 
         let batches = processor.group_edits_by_path(&file_edits, &|path| Some(path.to_string()));
+        let unique_file_count = batches.len();
 
         let mut all_results: Vec<String> = Vec::new();
         let mut total_applied = 0usize;
@@ -1329,7 +1330,7 @@ impl EditFileHandler {
         let summary = if total_overlap > 0 {
             format!(
                 "Edited {} file(s): {} edit(s) applied, {} edit(s) failed, {} edit(s) overlapped.",
-                files.len(),
+                unique_file_count,
                 total_applied,
                 total_failed,
                 total_overlap
@@ -1337,7 +1338,7 @@ impl EditFileHandler {
         } else {
             format!(
                 "Edited {} file(s): {} edit(s) applied, {} edit(s) failed.",
-                files.len(),
+                unique_file_count,
                 total_applied,
                 total_failed
             )
@@ -4703,7 +4704,6 @@ edition = "2021"
 
         let anchor1 = format!("{}§line 1", anchors[0]);
         let anchor2 = format!("{}§line 2", anchors[1]);
-        // Model sends same path twice — group_edits_by_path should merge into one batch
         let params = serde_json::json!({
             "files": [
                 {
@@ -4729,8 +4729,10 @@ edition = "2021"
         assert!(
             result.is_ok(),
             "duplicate file entries should be merged. Error: {:?}",
-            result.err()
+            result.as_ref().err()
         );
+        let output = result.unwrap();
+        assert!(output.as_str().unwrap().contains("Edited 1 file(s)"));
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert!(content.contains("replaced 1"), "first edit should be applied");
         assert!(content.contains("replaced 2"), "second edit should be applied");
