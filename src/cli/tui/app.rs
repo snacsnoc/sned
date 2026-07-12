@@ -43,6 +43,8 @@ pub struct MentionSearchUpdate {
 pub enum StreamKind {
     /// Raw model response text — safe to pop and re-render as markdown.
     Model,
+    /// Streamed reasoning text retained across partial chunks.
+    Reasoning,
     /// Tool result, plan completion, action digest, heat map, etc.
     /// These lines must NOT be popped by `finalize_turn_stream`.
     ToolOutput,
@@ -293,6 +295,7 @@ pub struct App {
     /// Whether the model is currently in a reasoning/thinking phase (no displayable output yet).
     /// Drives the "Reasoning..." indicator rendered above the status bar.
     pub reasoning_active: bool,
+    reasoning_partial_line: String,
     /// Manual scroll offset (top-of-viewport line index)
     pub scroll_offset: usize,
     /// Current output scroll behavior
@@ -674,6 +677,7 @@ impl App {
             pending_approval: None,
             agent_busy: false,
             reasoning_active: false,
+            reasoning_partial_line: String::new(),
             scroll_offset: 0,
             scroll_mode: ScrollMode::Auto,
             has_resized: true,
@@ -838,6 +842,33 @@ impl App {
         self.push_stream_group(lines_to_push, kind);
     }
 
+    pub fn push_reasoning_chunk(&mut self, chunk: &str) {
+        for segment in chunk.split_inclusive('\n') {
+            let complete = segment.ends_with('\n');
+            let content = segment.strip_suffix('\n').unwrap_or(segment);
+            let content = content.strip_suffix('\r').unwrap_or(content);
+            self.reasoning_partial_line.push_str(content);
+            let line = Line::from(Span::styled(
+                format!("  Ɵ {}", self.reasoning_partial_line),
+                Style::default()
+                    .fg(crate::cli::tui::theme::ACCENT)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            self.replace_last_stream_line(line, StreamKind::Reasoning);
+            if complete {
+                self.reasoning_partial_line.clear();
+                self.last_stream_group = None;
+            }
+        }
+    }
+
+    pub fn finish_reasoning_stream(&mut self) {
+        self.reasoning_partial_line.clear();
+        if matches!(self.last_stream_group, Some((_, _, StreamKind::Reasoning))) {
+            self.last_stream_group = None;
+        }
+    }
+
     /// Replace the most recent streamed logical line. Used for partial
     /// model-line updates so the TUI can repaint the current line
     /// without duplicating transcript entries.
@@ -874,6 +905,7 @@ impl App {
 
         let block_kind = match kind {
             StreamKind::Model => BlockKind::Model,
+            StreamKind::Reasoning => BlockKind::Reasoning,
             StreamKind::ToolOutput => BlockKind::ToolOutput,
         };
         let wrap_width = self.last_wrap_width();
@@ -936,6 +968,7 @@ impl App {
     /// flash where the streamed text is popped and re-inserted with
     /// different styling.
     pub fn finalize_turn_stream(&mut self, markdown_text: &str) {
+        self.finish_reasoning_stream();
         let entries = std::mem::take(&mut self.turn_stream_entries);
         self.last_stream_group = None;
         let had_streamed_line = std::mem::take(&mut self.turn_had_streamed_line);
@@ -1174,6 +1207,7 @@ impl App {
         // calling `push_output_with_kind` directly via dedicated events.
         let block_kind = match kind {
             StreamKind::Model => BlockKind::Model,
+            StreamKind::Reasoning => BlockKind::Reasoning,
             StreamKind::ToolOutput => BlockKind::ToolOutput,
         };
         let start_idx = self.output_lines.len();
@@ -1424,6 +1458,7 @@ impl App {
         self.error_lines.clear();
         self.turn_stream_entries.clear();
         self.last_stream_group = None;
+        self.reasoning_partial_line.clear();
         self.turn_indicator = None;
         self.turn_had_streamed_line = false;
         self.cached_visual_rows = 0;
@@ -1445,6 +1480,7 @@ impl App {
         self.output_lines.drain(start..);
         self.output_line_kinds.drain(start..);
         self.last_stream_group = None;
+        self.reasoning_partial_line.clear();
         // Invalidate the visual-row cache: drain changes the line buffer,
         // which can alter render-time separator insertion.
         self.cached_wrap_width = None;
@@ -3361,6 +3397,43 @@ mod tests {
             ]
         );
         assert_eq!(app.output_lines.len(), 3);
+    }
+
+    #[test]
+    fn test_reasoning_chunks_preserve_partial_and_blank_lines() {
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        app.push_reasoning_chunk("first");
+        app.push_reasoning_chunk(" thought\n\nthird");
+        app.push_reasoning_chunk(" line");
+        app.finish_reasoning_stream();
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert_eq!(rendered, ["  Ɵ first thought", "  Ɵ ", "  Ɵ third line"]);
+        assert!(
+            app.output_line_kinds
+                .iter()
+                .all(|kind| *kind == BlockKind::Reasoning)
+        );
+        let style = app.output_lines[0].spans[0].style;
+        assert_eq!(style.fg, Some(crate::cli::tui::theme::ACCENT));
+        assert!(style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn test_reasoning_stream_is_not_replaced_by_turn_markdown() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        app.push_reasoning_chunk("inspect state");
+        app.push_stream_line(Line::from("final answer"), StreamKind::Model);
+
+        app.finalize_turn_stream("final answer");
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert_eq!(rendered, ["  Ɵ inspect state", "final answer"]);
+        assert_eq!(app.output_line_kinds[0], BlockKind::Reasoning);
+        assert_eq!(app.output_line_kinds[1], BlockKind::Model);
     }
 
     #[test]

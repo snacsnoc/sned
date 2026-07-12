@@ -743,7 +743,7 @@ mod tests {
                 OutputEvent::ToolHeaderLine(line) => line.to_string(),
                 OutputEvent::CommandHeaderLine(line) => line.to_string(),
                 OutputEvent::CommandOutputLine(line) => line.to_string(),
-                OutputEvent::ReasoningLine(line) => line.to_string(),
+                OutputEvent::ReasoningChunk(chunk) => chunk,
                 OutputEvent::UserPromptLine(line) => line.to_string(),
                 OutputEvent::ApprovalRequested(request) => {
                     let text = request.details().to_string();

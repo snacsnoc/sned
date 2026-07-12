@@ -34,8 +34,8 @@ pub enum OutputEvent {
     CommandHeaderLine(Line<'static>),
     /// Command stdout / stderr / tail output line.
     CommandOutputLine(Line<'static>),
-    /// Reasoning summary line ("Ɵ ...").
-    ReasoningLine(Line<'static>),
+    /// Raw streamed reasoning text, styled and assembled by the renderer.
+    ReasoningChunk(String),
     /// User-submitted prompt line ("❯ ..." or multi-line "│ ❯ ...").
     UserPromptLine(Line<'static>),
     /// Raw ANSI escape sequences (for PTY output, etc.).
@@ -217,11 +217,8 @@ impl OutputEvent {
         Self::CommandOutputLine(Line::from(text.into()))
     }
 
-    /// Emit a reasoning-summary line (e.g. "Ɵ ...").  Tagged
-    /// separately so render-time grouping can recognise the start of a
-    /// reasoning block without confusing it with model prose.
-    pub fn reasoning_line(text: impl Into<String>) -> Self {
-        Self::ReasoningLine(Line::from(text.into()))
+    pub fn reasoning_chunk(text: impl Into<String>) -> Self {
+        Self::ReasoningChunk(text.into())
     }
 
     /// Emit a user-prompt line (e.g. "❯ ..." or "│ ❯ ...").  Routed
@@ -279,9 +276,16 @@ impl OutputWriter for StderrOutputWriter {
             | OutputEvent::ToolHeaderLine(line)
             | OutputEvent::CommandHeaderLine(line)
             | OutputEvent::CommandOutputLine(line)
-            | OutputEvent::ReasoningLine(line)
             | OutputEvent::UserPromptLine(line) => {
                 eprintln!("{line}");
+            }
+            OutputEvent::ReasoningChunk(chunk) => {
+                for segment in chunk.split_inclusive('\n') {
+                    eprint!("  Ɵ {segment}");
+                }
+                if !chunk.ends_with('\n') {
+                    eprintln!();
+                }
             }
             OutputEvent::RawAnsi(s) => {
                 eprint!("{s}");
@@ -462,7 +466,10 @@ impl OutputWriter for ChannelOutputWriter {
             let dropped = err.into_inner();
             let is_critical = matches!(
                 &dropped,
-                OutputEvent::TurnEnd { .. } | OutputEvent::Completion(_) | OutputEvent::ErrorBox(_)
+                OutputEvent::TurnEnd { .. }
+                    | OutputEvent::Completion(_)
+                    | OutputEvent::ErrorBox(_)
+                    | OutputEvent::ReasoningChunk(_)
             );
 
             if is_critical {
@@ -711,6 +718,32 @@ mod tests {
                 crate::core::approval::ApprovalResult::Denied
             ))
         ));
+        assert_eq!(writer.dropped_count(), 0);
+        assert!(!writer.take_overflow_signal());
+    }
+
+    #[test]
+    fn test_channel_overflow_preserves_reasoning_chunks_via_priority_lane() {
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        writer.emit(OutputEvent::plain("line 1"));
+        writer.emit(OutputEvent::reasoning_chunk("first\n"));
+        writer.emit(OutputEvent::reasoning_chunk("second"));
+
+        let mut reasoning = Vec::new();
+        while let Ok(event) = priority_rx.try_recv() {
+            match event {
+                OutputEvent::ReasoningChunk(chunk) => reasoning.push(chunk),
+                other => panic!("expected reasoning chunk, got {other:?}"),
+            }
+        }
+        assert_eq!(reasoning, ["first\n", "second"]);
         assert_eq!(writer.dropped_count(), 0);
         assert!(!writer.take_overflow_signal());
     }

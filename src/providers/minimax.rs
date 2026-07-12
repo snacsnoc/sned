@@ -863,6 +863,33 @@ fn parse_minimax_xml_tool_call(xml: &str) -> Option<(String, serde_json::Value)>
 struct MinimaxReasoningState {
     emitted_reasoning: String,
     in_thinking_tag: bool,
+    tag_carry: String,
+}
+
+const THINK_OPEN_MARKERS: [&str; 2] = ["<think>", "<!-- think -->"];
+const THINK_CLOSE_MARKERS: [&str; 2] = ["</think>", "<!-- /think -->"];
+
+fn partial_marker_suffix_len(text: &str, markers: &[&str]) -> usize {
+    let max_len = markers
+        .iter()
+        .map(|marker| marker.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0)
+        .min(text.len());
+    for len in (1..=max_len).rev() {
+        let start = text.len() - len;
+        if !text.is_char_boundary(start) {
+            continue;
+        }
+        let suffix = &text[start..];
+        if markers
+            .iter()
+            .any(|marker| marker.len() > suffix.len() && marker.starts_with(suffix))
+        {
+            return len;
+        }
+    }
+    0
 }
 
 fn longest_reasoning_overlap(left: &str, right: &str) -> usize {
@@ -955,11 +982,13 @@ fn find_next_think_close(text: &str) -> Option<(usize, usize)> {
 fn process_minimax_content_delta(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     event_id: &str,
-    content: &str,
+    content_ref: &str,
     pending_text: &mut String,
     pending_text_signature: &mut Option<String>,
     reasoning_state: &mut MinimaxReasoningState,
 ) {
+    let mut content = std::mem::take(&mut reasoning_state.tag_carry);
+    content.push_str(content_ref);
     let mut pos = 0usize;
     let mut force_flush_visible = false;
 
@@ -975,8 +1004,11 @@ fn process_minimax_content_delta(
                 continue;
             }
 
-            pending_text.push_str(&content[pos..]);
+            let carry_len = partial_marker_suffix_len(&content[pos..], &THINK_OPEN_MARKERS);
+            let emit_end = content.len().saturating_sub(carry_len);
+            pending_text.push_str(&content[pos..emit_end]);
             *pending_text_signature = Some(event_id.to_string());
+            reasoning_state.tag_carry.push_str(&content[emit_end..]);
             break;
         }
 
@@ -995,13 +1027,16 @@ fn process_minimax_content_delta(
             continue;
         }
 
+        let carry_len = partial_marker_suffix_len(&content[pos..], &THINK_CLOSE_MARKERS);
+        let emit_end = content.len().saturating_sub(carry_len);
         emit_minimax_reasoning(
             tx,
             reasoning_state,
             event_id,
-            content[pos..].to_string(),
+            content[pos..emit_end].to_string(),
             "reasoning_from_content",
         );
+        reasoning_state.tag_carry.push_str(&content[emit_end..]);
         break;
     }
 
@@ -1011,6 +1046,31 @@ fn process_minimax_content_delta(
         } else if minimax_text_buffer_should_flush(pending_text) {
             flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id);
         }
+    }
+}
+
+fn flush_minimax_tag_carry(
+    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    event_id: &str,
+    pending_text: &mut String,
+    pending_text_signature: &mut Option<String>,
+    reasoning_state: &mut MinimaxReasoningState,
+) {
+    let carry = std::mem::take(&mut reasoning_state.tag_carry);
+    if carry.is_empty() {
+        return;
+    }
+    if reasoning_state.in_thinking_tag {
+        emit_minimax_reasoning(
+            tx,
+            reasoning_state,
+            event_id,
+            carry,
+            "reasoning_from_content",
+        );
+    } else {
+        pending_text.push_str(&carry);
+        *pending_text_signature = Some(event_id.to_string());
     }
 }
 
@@ -1375,6 +1435,13 @@ impl Provider for MinimaxProvider {
                 if !xml_buffer.is_empty() && xml_buffer.contains("<minimax:tool_call>") {
                     extract_and_emit_xml_tool_calls(&mut xml_buffer, &tx, "flush");
                 }
+                flush_minimax_tag_carry(
+                    &tx,
+                    "flush",
+                    &mut pending_text,
+                    &mut pending_text_signature,
+                    &mut reasoning_state,
+                );
                 flush_minimax_text_buffer(
                     &tx,
                     &mut pending_text,
@@ -2312,6 +2379,85 @@ mod tests {
         let right = "🌍 world peace";
         // "🌍 world" = 4 + 1 + 5 = 10 bytes.
         assert_eq!(longest_reasoning_overlap(left, right), 10);
+    }
+
+    fn collect_minimax_content_deltas(chunks: &[String]) -> (String, String) {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut pending_text = String::new();
+        let mut pending_text_signature = None;
+        let mut reasoning_state = MinimaxReasoningState::default();
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            process_minimax_content_delta(
+                &tx,
+                &format!("evt_{index}"),
+                chunk,
+                &mut pending_text,
+                &mut pending_text_signature,
+                &mut reasoning_state,
+            );
+        }
+        flush_minimax_tag_carry(
+            &tx,
+            "flush",
+            &mut pending_text,
+            &mut pending_text_signature,
+            &mut reasoning_state,
+        );
+        flush_minimax_text_buffer(&tx, &mut pending_text, &mut pending_text_signature, "flush");
+
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                ApiStreamChunk::Text(text_chunk) => visible.push_str(&text_chunk.text),
+                ApiStreamChunk::Reasoning(reasoning_chunk) => {
+                    reasoning.push_str(&reasoning_chunk.reasoning)
+                }
+                other => panic!("unexpected chunk: {other:?}"),
+            }
+        }
+        (visible, reasoning)
+    }
+
+    #[test]
+    fn test_minimax_content_think_markers_survive_every_chunk_boundary() {
+        for (open, close) in [
+            ("<think>", "</think>"),
+            ("<!-- think -->", "<!-- /think -->"),
+        ] {
+            for split in 1..open.len() {
+                let chunks = vec![
+                    format!("before {}", &open[..split]),
+                    format!("{}hidden{close} after", &open[split..]),
+                ];
+                let (visible, reasoning) = collect_minimax_content_deltas(&chunks);
+                assert_eq!(visible, "before  after", "open marker split at {split}");
+                assert_eq!(reasoning, "hidden", "open marker split at {split}");
+            }
+
+            for split in 1..close.len() {
+                let chunks = vec![
+                    format!("before {open}hidden{}", &close[..split]),
+                    format!("{} after", &close[split..]),
+                ];
+                let (visible, reasoning) = collect_minimax_content_deltas(&chunks);
+                assert_eq!(visible, "before  after", "close marker split at {split}");
+                assert_eq!(reasoning, "hidden", "close marker split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_minimax_incomplete_think_marker_carry_flushes_to_current_stream() {
+        let (visible, reasoning) = collect_minimax_content_deltas(&["visible <thi".to_string()]);
+        assert_eq!(visible, "visible <thi");
+        assert!(reasoning.is_empty());
+
+        let (visible, reasoning) =
+            collect_minimax_content_deltas(&["<think>hidden</thi".to_string()]);
+        assert!(visible.is_empty());
+        assert_eq!(reasoning, "hidden</thi");
     }
 
     #[tokio::test]

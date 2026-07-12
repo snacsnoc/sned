@@ -2031,26 +2031,11 @@ impl AgentLoop {
                                 })
                                 .to_string()
                             );
-                        } else {
-                            // Stream all reasoning text as individual lines with Ɵ prefix.
-                            // Each line is emitted as OutputEvent::ReasoningLine so the TUI
-                            // can display it with BlockKind::Reasoning styling.
-                            for line in reasoning_chunk.reasoning.lines() {
-                                if line.trim().is_empty() {
-                                    continue;
-                                }
-                                let reasoning_line = Line::from(Span::styled(
-                                    format!("  Ɵ {line}"),
-                                    Style::default()
-                                        .fg(crate::cli::tui::theme::ACCENT)
-                                        .add_modifier(Modifier::ITALIC),
-                                ));
-                                self.config
-                                    .output_writer
-                                    .emit(OutputEvent::ReasoningLine(reasoning_line));
-
-                                emitted_output_this_attempt = true;
-                            }
+                        } else if !reasoning_chunk.reasoning.is_empty() {
+                            self.config.output_writer.emit(OutputEvent::ReasoningChunk(
+                                reasoning_chunk.reasoning.clone(),
+                            ));
+                            emitted_output_this_attempt = true;
                         }
                         accumulated_reasoning.push_str(&reasoning_chunk.reasoning);
                         if reasoning_chunk.signature.is_some() {
@@ -4448,7 +4433,8 @@ mod tests {
     use super::*;
     use crate::core::tool_output::summarize_single_section;
     use crate::providers::{
-        ApiStreamTextChunk, ApiStreamToolCallFunction, ApiStreamToolCallsChunk,
+        ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCallFunction,
+        ApiStreamToolCallsChunk,
     };
 
     fn test_agent_config(provider: Arc<Providers>, task_id: &str) -> AgentConfig {
@@ -4503,9 +4489,7 @@ mod tests {
                 crate::cli::output::OutputEvent::CommandOutputLine(line) => {
                     rendered.push(line.to_string())
                 }
-                crate::cli::output::OutputEvent::ReasoningLine(line) => {
-                    rendered.push(line.to_string())
-                }
+                crate::cli::output::OutputEvent::ReasoningChunk(chunk) => rendered.push(chunk),
                 crate::cli::output::OutputEvent::UserPromptLine(line) => {
                     rendered.push(line.to_string())
                 }
@@ -5089,6 +5073,61 @@ mod tests {
             AgentLoop::synthetic_json_completion_event(false, false, Some("Done")).is_none(),
             "non-completing text turns should not emit completion"
         );
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_stream_emits_raw_chunks_without_flattening() {
+        let responses = vec![vec![
+            ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+                reasoning: "first".to_string(),
+                details: None,
+                signature: None,
+                redacted_data: None,
+                id: Some("reasoning-1".to_string()),
+            }),
+            ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+                reasoning: " thought\n\n".to_string(),
+                details: None,
+                signature: None,
+                redacted_data: None,
+                id: Some("reasoning-2".to_string()),
+            }),
+            ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+                reasoning: "third".to_string(),
+                details: None,
+                signature: None,
+                redacted_data: None,
+                id: Some("reasoning-3".to_string()),
+            }),
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "answer".to_string(),
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        let mut config = test_agent_config(provider, "test-reasoning-chunks");
+        config.output_writer = writer;
+        let mut agent = AgentLoop::new(config);
+
+        let _ = agent.execute_turn().await;
+
+        let reasoning: Vec<String> = drain_output_events(&mut priority_rx, &mut rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                OutputEvent::ReasoningChunk(chunk) => Some(chunk),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, ["first", " thought\n\n", "third"]);
     }
 
     #[tokio::test]

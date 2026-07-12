@@ -287,7 +287,8 @@ pub fn split_model_output(text: &str) -> (Option<String>, Option<String>) {
     let mut think_lines: Vec<&str> = Vec::new();
     let mut response_lines: Vec<&str> = Vec::new();
 
-    for line in text.lines() {
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if let Some(kind) = classify_think_start(line) {
             in_think = true;
             think_open_kind = Some(kind);
@@ -453,6 +454,22 @@ mod tests {
         let (thinking, response) = split_model_output(input);
         assert_eq!(thinking, Some("First thought".to_string()));
         assert_eq!(response, Some("Response with marker".to_string()));
+    }
+
+    #[test]
+    fn test_split_model_output_preserves_blank_line_boundaries() {
+        let input = "<think>\n\nfirst\n\n</think>\n\nanswer\n";
+        let (thinking, response) = split_model_output(input);
+        assert_eq!(thinking, Some("\nfirst\n".to_string()));
+        assert_eq!(response, Some("\nanswer\n".to_string()));
+    }
+
+    #[test]
+    fn test_split_model_output_preserves_crlf_content_without_carriage_returns() {
+        let input = "<think>\r\nfirst\r\n\r\nsecond\r\n</think>\r\nanswer\r\n";
+        let (thinking, response) = split_model_output(input);
+        assert_eq!(thinking, Some("first\n\nsecond".to_string()));
+        assert_eq!(response, Some("answer\n".to_string()));
     }
 
     #[test]

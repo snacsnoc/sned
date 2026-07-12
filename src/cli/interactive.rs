@@ -505,6 +505,10 @@ fn apply_output_event(
         }
     };
 
+    if !matches!(&event, OutputEvent::ReasoningChunk(_)) {
+        app.finish_reasoning_stream();
+    }
+
     match event {
         OutputEvent::Line(line) => {
             flush_model_update(app, pending_model_update);
@@ -529,9 +533,9 @@ fn apply_output_event(
             flush_model_update(app, pending_model_update);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
         }
-        OutputEvent::ReasoningLine(line) => {
+        OutputEvent::ReasoningChunk(chunk) => {
             flush_model_update(app, pending_model_update);
-            app.push_output_with_kind(line, crate::cli::tui::BlockKind::Reasoning);
+            app.push_reasoning_chunk(&chunk);
         }
         OutputEvent::UserPromptLine(line) => {
             flush_model_update(app, pending_model_update);
@@ -3459,6 +3463,37 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_output_reassembles_reasoning_chunks_before_model_output() {
+        use crate::cli::output::OutputEvent;
+        use ratatui::text::Line;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(OutputEvent::reasoning_chunk("first")).unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" thought\n\nnext"))
+            .unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" step")).unwrap();
+        tx.try_send(OutputEvent::Line(Line::from("answer")))
+            .unwrap();
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        drain_output(&mut rx, &mut app);
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered,
+            ["  Ɵ first thought", "  Ɵ ", "  Ɵ next step", "answer"]
+        );
+        assert_eq!(app.output_line_kinds[0], BlockKind::Reasoning);
+        assert_eq!(app.output_line_kinds[3], BlockKind::Model);
+
+        reset_prompt_state();
+    }
+
+    #[test]
     fn test_drain_output_priority_lane_preserves_critical_prompt_under_stress() {
         use crate::cli::output::{OutputEvent, OutputWriter};
 
@@ -3481,6 +3516,33 @@ mod tests {
         drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
 
         assert!(app.has_pending_approval());
+        assert_eq!(writer.dropped_count(), 0);
+        assert!(!writer.take_overflow_signal());
+    }
+
+    #[test]
+    fn test_drain_output_priority_lane_preserves_reasoning_under_stress() {
+        use crate::cli::output::{OutputEvent, OutputWriter};
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        writer.emit(OutputEvent::plain("line 1"));
+        writer.emit(OutputEvent::reasoning_chunk("first"));
+        writer.emit(OutputEvent::reasoning_chunk(" thought\n\nnext step"));
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered,
+            ["line 1", "  Ɵ first thought", "  Ɵ ", "  Ɵ next step"]
+        );
         assert_eq!(writer.dropped_count(), 0);
         assert!(!writer.take_overflow_signal());
     }

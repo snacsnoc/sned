@@ -758,9 +758,7 @@ mod tests {
                 crate::cli::output::OutputEvent::CommandOutputLine(line) => {
                     rendered.push(line.to_string())
                 }
-                crate::cli::output::OutputEvent::ReasoningLine(line) => {
-                    rendered.push(line.to_string())
-                }
+                crate::cli::output::OutputEvent::ReasoningChunk(chunk) => rendered.push(chunk),
                 crate::cli::output::OutputEvent::UserPromptLine(line) => {
                     rendered.push(line.to_string())
                 }
