@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SNED_BIN="${REPO_ROOT}/target/debug/sned"
+SNED_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
