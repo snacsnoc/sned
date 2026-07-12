@@ -3875,7 +3875,7 @@ impl AgentLoop {
         conversation_history: Arc<Mutex<Vec<StorageMessage>>>,
         message_counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> ToolExecutionOutput {
-        let params_for_execution = tool_params.clone();
+        let mut params_for_execution = tool_params.clone();
         let _ = if let Some(ref hook_mgr) = hook_manager {
             let pre_result = hook_mgr.pre_tool_use(&config.task_id, tool_name, tool_params);
             if let Some(output) = pre_result.output {
@@ -3908,6 +3908,22 @@ impl AgentLoop {
         } else {
             false
         };
+
+        if tool_name == "condense" {
+            let history = conversation_history.lock().await;
+            let history = match serde_json::to_value(&*history) {
+                Ok(history) => history,
+                Err(error) => {
+                    return ToolExecutionOutput::error(
+                        format!("Failed to prepare conversation history for condense: {error}"),
+                        None,
+                    );
+                }
+            };
+            if let Some(params) = params_for_execution.as_object_mut() {
+                params.insert("history".to_string(), history);
+            }
+        }
 
         match handler.execute(&tool_context, params_for_execution).await {
             Ok(res) => {
@@ -5839,6 +5855,60 @@ mod tests {
         } else {
             panic!("Expected at least one message in history");
         }
+    }
+
+    #[tokio::test]
+    async fn test_condense_uses_internal_conversation_history() {
+        use crate::core::context::context_manager::CompactedSummary;
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::condense::CondenseHandler;
+
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_tool_call(
+                "call_1",
+                "condense",
+                serde_json::json!({
+                    "context": "Updated summary",
+                    "auto_accept": true,
+                }),
+            ),
+        ));
+        let mut config = test_agent_config(provider, "test-condense-history");
+        config.interactive_mode = false;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::Condense, Arc::new(CondenseHandler::new()));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        {
+            let mut history = agent.conversation_history.lock().await;
+            history.extend((0..12).map(|index| StorageMessage {
+                id: Some(format!("msg_{index}")),
+                role: if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: MessageContent::Text(format!("message {index}")),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }));
+        }
+        {
+            let mut state = agent.state.lock().await;
+            state.compacted_summary = Some(CompactedSummary::new("Old summary".to_string(), 10));
+            state.conversation_history_deleted_range = Some((2, 7));
+        }
+
+        let result = agent.execute_turn().await;
+
+        assert!(matches!(result, TurnResult::Continue));
+        let state = agent.state.lock().await;
+        let summary = state.compacted_summary.as_ref().unwrap();
+        assert_eq!(summary.summary_text, "Updated summary");
+        assert_eq!(summary.messages_compacted, 13);
+        assert!(state.conversation_history_deleted_range.is_some());
     }
 
     #[test]
