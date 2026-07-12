@@ -452,6 +452,9 @@ pub struct App {
     pub completion_lines: VecDeque<Line<'static>>,
     /// Cached completion row count, valid when cached_wrap_width matches.
     pub cached_completion_rows: usize,
+    completion_scroll_offset: usize,
+    completion_viewport_rows: usize,
+    completion_area: Option<Rect>,
     /// Error box lines rendered as a dedicated Block widget with red border.
     /// Takes priority over completion_lines when non-empty.
     pub error_lines: VecDeque<Line<'static>>,
@@ -731,6 +734,9 @@ impl App {
             model_picker_selected: 0,
             completion_lines: VecDeque::new(),
             cached_completion_rows: 0,
+            completion_scroll_offset: 0,
+            completion_viewport_rows: 0,
+            completion_area: None,
             error_lines: VecDeque::new(),
             cached_error_rows: 0,
             cached_visible_window: None,
@@ -1141,6 +1147,9 @@ impl App {
     pub fn push_completion_line(&mut self, line: Line<'static>) {
         self.needs_redraw = true;
         self.completion_lines.push_back(line);
+        self.completion_scroll_offset = 0;
+        self.completion_viewport_rows = 0;
+        self.completion_area = None;
         // Invalidate the visual-row cache so cached_completion_rows is
         // recomputed on the next render. Without this, the completion box
         // keeps its stale height (just borders) and the text is clipped.
@@ -1152,6 +1161,9 @@ impl App {
         self.needs_redraw = true;
         self.completion_lines.clear();
         self.cached_completion_rows = 0;
+        self.completion_scroll_offset = 0;
+        self.completion_viewport_rows = 0;
+        self.completion_area = None;
         self.cached_wrap_width = None;
     }
 
@@ -1462,7 +1474,11 @@ impl App {
         self.turn_indicator = None;
         self.turn_had_streamed_line = false;
         self.cached_visual_rows = 0;
+        self.cached_completion_rows = 0;
         self.cached_error_rows = 0;
+        self.completion_scroll_offset = 0;
+        self.completion_viewport_rows = 0;
+        self.completion_area = None;
         self.cached_wrap_width = Some(self.last_wrap_width());
         self.cached_visible_window = None;
         self.in_scrollback = false;
@@ -1591,6 +1607,51 @@ impl App {
         let page_height = self.last_content_height.saturating_sub(1).max(1);
         let page_height = page_height.min(isize::MAX as usize) as isize;
         self.scroll_lines(delta_pages.saturating_mul(page_height));
+    }
+
+    pub fn scroll_completion_lines(&mut self, delta: isize) -> bool {
+        if !self.error_lines.is_empty()
+            || self.completion_lines.is_empty()
+            || self.completion_viewport_rows == 0
+        {
+            return false;
+        }
+        let max_offset = self
+            .cached_completion_rows
+            .saturating_sub(self.completion_viewport_rows);
+        if max_offset == 0 {
+            return false;
+        }
+        self.completion_scroll_offset = if delta.is_negative() {
+            self.completion_scroll_offset
+                .saturating_sub(delta.unsigned_abs())
+        } else {
+            self.completion_scroll_offset
+                .saturating_add(delta as usize)
+                .min(max_offset)
+        };
+        self.needs_redraw = true;
+        true
+    }
+
+    pub fn scroll_completion_pages(&mut self, delta_pages: isize) -> bool {
+        let page_height = self.completion_viewport_rows.saturating_sub(1).max(1);
+        let page_height = page_height.min(isize::MAX as usize) as isize;
+        self.scroll_completion_lines(delta_pages.saturating_mul(page_height))
+    }
+
+    pub fn scroll_completion_at(&mut self, column: u16, row: u16, delta: isize) -> bool {
+        let Some(area) = self.completion_area else {
+            return false;
+        };
+        if column < area.x
+            || column >= area.x.saturating_add(area.width)
+            || row < area.y
+            || row >= area.y.saturating_add(area.height)
+        {
+            return false;
+        }
+        self.scroll_completion_lines(delta)
     }
 
     pub fn resolved_scroll_y_for(&self, total_lines: usize, content_height: usize) -> usize {
@@ -2194,17 +2255,22 @@ impl App {
         // using the stale cached row count from the prior render.
         let wrap_width = Self::content_wrap_width(output_area.width as usize);
         let _ = self.total_visual_rows(wrap_width);
-        // +2 accounts for top and bottom borders of the Block widget.
         let bottom_height: u16 = if has_error {
             self.cached_error_rows
                 .saturating_add(2)
                 .min(u16::MAX as usize)
                 .min(output_area.height as usize) as u16
         } else if has_completion {
+            // Keeping half the region available prevents a long final result from hiding history.
+            let max_completion_height = output_area
+                .height
+                .div_ceil(2)
+                .max(3)
+                .min(output_area.height);
             self.cached_completion_rows
                 .saturating_add(2)
                 .min(u16::MAX as usize)
-                .min(output_area.height as usize) as u16
+                .min(max_completion_height as usize) as u16
         } else {
             0
         };
@@ -2228,8 +2294,18 @@ impl App {
         } else {
             output_area
         };
+        if has_completion && !has_error {
+            self.completion_viewport_rows = bottom_area.height.saturating_sub(2) as usize;
+            self.completion_scroll_offset = self.completion_scroll_offset.min(
+                self.cached_completion_rows
+                    .saturating_sub(self.completion_viewport_rows),
+            );
+            self.completion_area = Some(bottom_area);
+        } else {
+            self.completion_viewport_rows = 0;
+            self.completion_area = None;
+        }
 
-        // Output pane with themed border and padding
         let visible_height = main_output_area.height as usize;
         // Content height excludes border (1 line top + 1 line bottom)
         let content_height = visible_height.saturating_sub(2);
@@ -2286,7 +2362,6 @@ impl App {
             frame.render_widget(indicator, indicator_area);
         }
 
-        // Render error box (priority) or completion box below the main output area.
         if has_error {
             frame.render_widget(Clear, bottom_area);
             let error_lines: Vec<Line<'static>> = self.error_lines.iter().cloned().collect();
@@ -2303,15 +2378,44 @@ impl App {
             frame.render_widget(Clear, bottom_area);
             let completion_lines: Vec<Line<'static>> =
                 self.completion_lines.iter().cloned().collect();
+            let max_completion_scroll = self
+                .cached_completion_rows
+                .saturating_sub(self.completion_viewport_rows);
+            let mut completion_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::PROMPT_FG))
+                .border_type(ratatui::widgets::BorderType::Rounded);
+            if max_completion_scroll > 0 {
+                completion_block =
+                    completion_block.title(Span::styled(" Scroll: PgUp/PgDn ", theme::dim_style()));
+            }
             let completion = Paragraph::new(completion_lines)
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme::PROMPT_FG))
-                        .border_type(ratatui::widgets::BorderType::Rounded),
-                );
+                .scroll((
+                    Self::terminal_scroll_offset(self.completion_scroll_offset),
+                    0,
+                ))
+                .block(completion_block);
             frame.render_widget(completion, bottom_area);
+            if max_completion_scroll > 0 {
+                let mut completion_scrollbar_state =
+                    ScrollbarState::new(self.cached_completion_rows)
+                        .viewport_content_length(self.completion_viewport_rows)
+                        .position(self.completion_scroll_offset);
+                frame.render_stateful_widget(
+                    Scrollbar::default()
+                        .orientation(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(Some("↑"))
+                        .end_symbol(Some("↓"))
+                        .style(theme::scrollbar_style())
+                        .thumb_style(theme::scrollbar_thumb_style()),
+                    bottom_area.inner(ratatui::layout::Margin {
+                        horizontal: 0,
+                        vertical: 1,
+                    }),
+                    &mut completion_scrollbar_state,
+                );
+            }
         }
 
         // Scrollbar on output pane (render inside the border).
@@ -2330,7 +2434,7 @@ impl App {
                 .end_symbol(Some("↓"))
                 .style(theme::scrollbar_style())
                 .thumb_style(theme::scrollbar_thumb_style()),
-            output_area.inner(ratatui::layout::Margin {
+            main_output_area.inner(ratatui::layout::Margin {
                 horizontal: 0,
                 vertical: 1,
             }),
@@ -3869,6 +3973,44 @@ mod tests {
             rendered.contains("MARKER_COMPLETION_TEXT"),
             "completion line should appear in rendered buffer; got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn test_long_completion_keeps_transcript_visible_and_scrolls_to_overflow() {
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.push_plain("TRANSCRIPT_MARKER");
+        let long_completion = (0..20)
+            .map(|index| format!("COMPLETION_WORD_{index:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        app.push_completion_line(long_completion.into());
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial render should succeed");
+
+        let initial = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert!(initial.contains("TRANSCRIPT_MARKER"), "got:\n{initial}");
+        assert!(initial.contains("COMPLETION_WORD_00"), "got:\n{initial}");
+        assert!(!initial.contains("COMPLETION_WORD_19"), "got:\n{initial}");
+
+        let completion_area = app.completion_area.expect("completion area should render");
+        assert!(app.scroll_completion_at(
+            completion_area.x.saturating_add(1),
+            completion_area.y.saturating_add(1),
+            isize::MAX,
+        ));
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("scrolled render should succeed");
+
+        let scrolled = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert!(scrolled.contains("TRANSCRIPT_MARKER"), "got:\n{scrolled}");
+        assert!(!scrolled.contains("COMPLETION_WORD_00"), "got:\n{scrolled}");
+        assert!(scrolled.contains("COMPLETION_WORD_19"), "got:\n{scrolled}");
     }
 
     #[test]

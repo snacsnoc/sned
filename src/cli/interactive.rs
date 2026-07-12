@@ -1211,13 +1211,16 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    // PageUp/PageDown for scrolling
     if key.code == KeyCode::PageUp {
-        app.scroll_pages(-1);
+        if !app.scroll_completion_pages(-1) {
+            app.scroll_pages(-1);
+        }
         return Ok(None);
     }
     if key.code == KeyCode::PageDown {
-        app.scroll_pages(1);
+        if !app.scroll_completion_pages(1) {
+            app.scroll_pages(1);
+        }
         return Ok(None);
     }
 
@@ -3039,14 +3042,22 @@ async fn run_main_loop(
                         ratatui::crossterm::event::MouseEventKind::ScrollDown => {
                             if app.has_pending_approval() {
                                 app.scroll_pending_approval(-3);
-                            } else {
+                            } else if !app.scroll_completion_at(
+                                mouse_event.column,
+                                mouse_event.row,
+                                3,
+                            ) {
                                 app.scroll_lines(3);
                             }
                         }
                         ratatui::crossterm::event::MouseEventKind::ScrollUp => {
                             if app.has_pending_approval() {
                                 app.scroll_pending_approval(3);
-                            } else {
+                            } else if !app.scroll_completion_at(
+                                mouse_event.column,
+                                mouse_event.row,
+                                -3,
+                            ) {
                                 app.scroll_lines(-3);
                             }
                         }
@@ -3769,6 +3780,63 @@ mod tests {
         );
 
         reset_prompt_state();
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_pages_through_long_completion_before_transcript()
+    -> anyhow::Result<()> {
+        use crate::cli::tui::app::ScrollMode;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        for index in 0..20 {
+            app.push_plain(format!("TRANSCRIPT_ROW_{index:02}"));
+        }
+        for index in 0..12 {
+            app.push_completion_line(format!("COMPLETION_ROW_{index:02}").into());
+        }
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial render should succeed");
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 2;
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert_eq!(app.scroll_offset, 2);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("scrolled render should succeed");
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("COMPLETION_ROW_00"), "got:\n{rendered}");
+        assert!(rendered.contains("COMPLETION_ROW_03"), "got:\n{rendered}");
+
+        reset_prompt_state();
+        Ok(())
     }
 
     /// Regression test: when a model's streamed text matches the
