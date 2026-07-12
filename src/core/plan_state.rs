@@ -242,15 +242,14 @@ impl PlanState {
         self.steps.get(self.current_step_index)
     }
 
-    /// Advance to the next pending step. Returns the index of the new current step, or None if done.
+    /// Advance to the next pending step after the current step.
+    /// Returns the index of the new current step, or None if no forward step remains.
     ///
     /// NOTE: Returns `usize` instead of `&PlanStep` to avoid reference-escaping-the-mutex issues
     /// when called through `Arc<Mutex<Session>>`. This is a deliberate Rust-native adaptation.
     pub fn advance(&mut self) -> Option<usize> {
-        let mut changed = false;
         let current_out_of_bounds = self.current_step_index >= self.steps.len();
 
-        // If current_step_index is out of range, clamp to the first pending step.
         if current_out_of_bounds {
             if let Some(next_idx) = self
                 .steps
@@ -258,19 +257,18 @@ impl PlanState {
                 .position(|s| s.status == PlanStepStatus::Pending)
             {
                 self.current_step_index = next_idx;
-                changed = true;
+                self.steps[next_idx].status = PlanStepStatus::Running;
+                self.bump_version();
+                return Some(next_idx);
             } else {
-                if self.is_complete() && !self.complete {
-                    self.complete = true;
-                    changed = true;
-                }
-                if changed {
-                    self.bump_version();
+                if self.is_complete() {
+                    self.mark_complete();
                 }
                 return None;
             }
         }
 
+        let mut changed = false;
         if let Some(step) = self.steps.get_mut(self.current_step_index)
             && step.status == PlanStepStatus::Running
         {
@@ -288,11 +286,12 @@ impl PlanState {
             return None;
         }
 
-        // Find next pending step
         if let Some(next_idx) = self
             .steps
             .iter()
-            .position(|s| s.status == PlanStepStatus::Pending)
+            .enumerate()
+            .skip(self.current_step_index.saturating_add(1))
+            .find_map(|(index, step)| (step.status == PlanStepStatus::Pending).then_some(index))
         {
             if self.current_step_index != next_idx {
                 self.current_step_index = next_idx;
@@ -893,6 +892,43 @@ mod tests {
         assert_eq!(plan.advance().unwrap(), 2);
         assert_eq!(plan.steps[2].status, PlanStepStatus::Running);
         assert!(!plan.is_complete());
+    }
+
+    #[test]
+    fn test_advance_ignores_pending_step_inserted_before_current() {
+        let mut plan = PlanState::create_plan(vec![
+            "Step 1".to_string(),
+            "Step 2".to_string(),
+            "Step 3".to_string(),
+        ]);
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.current_step_index = 1;
+        plan.mark_step(1, PlanStepStatus::Running).unwrap();
+        plan.insert_step_at_beginning("Inserted first".to_string())
+            .unwrap();
+
+        assert_eq!(plan.current_step_index, 2);
+        assert_eq!(plan.advance(), Some(3));
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Pending);
+        assert_eq!(plan.steps[2].status, PlanStepStatus::Done);
+        assert_eq!(plan.steps[3].status, PlanStepStatus::Running);
+    }
+
+    #[test]
+    fn test_advance_does_not_fallback_to_earlier_pending_step() {
+        let mut plan = PlanState::create_plan(vec!["Step 1".to_string(), "Step 2".to_string()]);
+        plan.mark_step(0, PlanStepStatus::Done).unwrap();
+        plan.current_step_index = 1;
+        plan.mark_step(1, PlanStepStatus::Running).unwrap();
+        plan.insert_step_at_beginning("Inserted first".to_string())
+            .unwrap();
+
+        assert_eq!(plan.current_step_index, 2);
+        assert_eq!(plan.advance(), None);
+        assert_eq!(plan.current_step_index, 2);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Pending);
+        assert_eq!(plan.steps[2].status, PlanStepStatus::Done);
+        assert!(!plan.complete);
     }
 
     #[test]
