@@ -8,7 +8,7 @@ use crate::cli::tui::BlockKind;
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
-use crate::core::approval::{ApprovalResult, is_approval_prompt_active, take_approval_sender};
+use crate::core::approval::ApprovalResult;
 use crate::providers::Provider;
 use futures::FutureExt;
 use ratatui::crossterm::event::{
@@ -540,16 +540,22 @@ fn apply_output_event(
         OutputEvent::RawAnsi(s) => {
             flush_model_update(app, pending_model_update);
             let lines = ansi_to_ratatui_lines(&s);
-            let kind = if crate::core::approval::is_approval_prompt_active()
-                || crate::core::approval::is_any_followup_question_active()
-            {
-                crate::cli::tui::BlockKind::UserPrompt
+            let kind = if crate::core::approval::is_any_followup_question_active() {
+                crate::cli::tui::BlockKind::BlockingPrompt
             } else {
                 crate::cli::tui::BlockKind::ToolOutput
             };
             for line in lines {
                 app.push_output_with_kind(line, kind);
             }
+        }
+        OutputEvent::ApprovalRequested(request) => {
+            flush_model_update(app, pending_model_update);
+            app.set_pending_approval(request);
+        }
+        OutputEvent::ApprovalFinished { id } => {
+            flush_model_update(app, pending_model_update);
+            app.finish_pending_approval(id);
         }
         OutputEvent::Completion(result) => {
             flush_model_update(app, pending_model_update);
@@ -620,16 +626,6 @@ fn apply_output_event(
             flush_model_update(app, pending_model_update);
             app.push_turn_indicator(line);
         }
-        // Approval prompt was durably dropped. The user never saw it,
-        // so show a warning and suggest recovery via /retry.
-        OutputEvent::ApprovalDropped => {
-            flush_model_update(app, pending_model_update);
-            app.push_styled(
-                "[sned] Approval prompt was lost due to output overflow. Tool was auto-denied. Use /retry to regenerate the last response.",
-                ratatui::style::Style::default()
-                    .fg(crate::cli::tui::theme::WARNING_FG),
-            );
-        }
     }
 }
 
@@ -643,27 +639,33 @@ fn drain_output_queues(
     let mut saw_output = false;
     let mut pending_model_update: Option<ratatui::text::Line<'static>> = None;
 
+    let mut deferred_priority = Vec::new();
+    while let Ok(event) = priority_rx.try_recv() {
+        if matches!(
+            &event,
+            OutputEvent::ApprovalRequested(_) | OutputEvent::ApprovalFinished { .. }
+        ) {
+            saw_output = true;
+            apply_output_event(app, event, &mut pending_model_update);
+        } else {
+            deferred_priority.push(event);
+        }
+    }
+
     while let Ok(event) = rx.try_recv() {
         saw_output = true;
         apply_output_event(app, event, &mut pending_model_update);
     }
-    // Priority-lane events are emitted only when the bounded queue rejected
-    // them, so they are newer than the still-buffered main-queue backlog.
-    // Draining them last preserves the user-visible chronology and keeps a
-    // blocking approval prompt anchored at the bottom instead of burying it
-    // above older output that happened to drain later.
-    while let Ok(event) = priority_rx.try_recv() {
+    for event in deferred_priority {
         saw_output = true;
         apply_output_event(app, event, &mut pending_model_update);
     }
     if let Some(line) = pending_model_update.take() {
         app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
     }
-    if crate::core::approval::take_approval_prompt_scroll()
-        || crate::core::approval::take_followup_prompt_scroll()
-    {
+    if app.has_pending_approval() {
         app.pin_approval_bottom();
-    } else if crate::core::approval::is_approval_prompt_active() {
+    } else if crate::core::approval::take_followup_prompt_scroll() {
         app.pin_approval_bottom();
     } else if crate::core::approval::is_any_followup_question_active() {
         // Any interactive prompt that blocks progress must keep its input line
@@ -745,16 +747,78 @@ pub(crate) fn drain_output_for_test_with_priority(
     drain_output_queues(priority_rx, rx, app);
 }
 
-fn approval_result_for_key(key: &KeyEvent) -> Option<ApprovalResult> {
+fn approval_result_for_key(app: &App, key: &KeyEvent) -> Option<ApprovalResult> {
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(ApprovalResult::Denied)
-        }
-        KeyCode::Char('y' | 'Y') => Some(ApprovalResult::Approved),
-        KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(ApprovalResult::Denied),
-        KeyCode::Char('a' | 'A') => Some(ApprovalResult::Always),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app
+            .pending_approval_has_result(ApprovalResult::Denied)
+            .then_some(ApprovalResult::Denied),
+        KeyCode::Esc => app
+            .pending_approval_has_result(ApprovalResult::Denied)
+            .then_some(ApprovalResult::Denied),
+        KeyCode::Char(shortcut) => app.pending_approval_result_for_shortcut(shortcut),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalKeyOutcome {
+    Consumed,
+    Resolved {
+        result: ApprovalResult,
+        delivered: bool,
+    },
+}
+
+fn handle_approval_key(app: &mut App, key: &KeyEvent) -> Option<ApprovalKeyOutcome> {
+    if !app.has_pending_approval() {
+        return None;
+    }
+    if !app.approval_accepts_input() {
+        return Some(ApprovalKeyOutcome::Consumed);
+    }
+
+    match key.code {
+        KeyCode::Up => {
+            app.scroll_pending_approval(1);
+            return Some(ApprovalKeyOutcome::Consumed);
+        }
+        KeyCode::Down => {
+            app.scroll_pending_approval(-1);
+            return Some(ApprovalKeyOutcome::Consumed);
+        }
+        KeyCode::PageUp => {
+            app.scroll_pending_approval(5);
+            return Some(ApprovalKeyOutcome::Consumed);
+        }
+        KeyCode::PageDown => {
+            app.scroll_pending_approval(-5);
+            return Some(ApprovalKeyOutcome::Consumed);
+        }
+        KeyCode::Home => {
+            app.scroll_pending_approval(isize::MAX);
+            return Some(ApprovalKeyOutcome::Consumed);
+        }
+        KeyCode::End => {
+            app.scroll_pending_approval(-isize::MAX);
+            return Some(ApprovalKeyOutcome::Consumed);
+        }
+        _ => {}
+    }
+
+    let Some(result) = approval_result_for_key(app, key) else {
+        return Some(ApprovalKeyOutcome::Consumed);
+    };
+    let Some(delivered) = app.resolve_pending_approval(result.clone()) else {
+        return Some(ApprovalKeyOutcome::Consumed);
+    };
+    Some(ApprovalKeyOutcome::Resolved { result, delivered })
+}
+
+fn handle_paste_event(app: &mut App, content: &str) -> bool {
+    if app.has_pending_approval() {
+        return false;
+    }
+    app.handle_paste(content)
 }
 
 /// Spawn agent task with proper state management.
@@ -1086,6 +1150,18 @@ async fn handle_key_event(
         // Normal submit - expand all paste markers before sending
         let text = app.get_input_with_expanded_pastes();
         if !text.is_empty() {
+            if app.has_pending_approval() {
+                app.push_styled(
+                    "Approval pending. Type y, n, or a first.",
+                    Style::default().fg(theme::WARNING_FG),
+                );
+                app.slash_command_active = false;
+                app.slash_command_results.clear();
+                app.slash_command_selected = 0;
+                app.slash_command_completed_text = None;
+                return Ok(None);
+            }
+
             // Shutdown commands should bypass the session echo lock so /quit still works
             // even if the agent is currently holding the session mutex.
             if is_shutdown_submit(&text) {
@@ -1098,18 +1174,6 @@ async fn handle_key_event(
                 app.slash_command_selected = 0;
                 app.slash_command_completed_text = None;
                 return Ok(Some(Action::Submit(text)));
-            }
-
-            if is_approval_prompt_active() {
-                app.push_styled(
-                    "Approval pending. Type y, n, or a first.",
-                    Style::default().fg(theme::WARNING_FG),
-                );
-                app.slash_command_active = false;
-                app.slash_command_results.clear();
-                app.slash_command_selected = 0;
-                app.slash_command_completed_text = None;
-                return Ok(None);
             }
 
             // Turn separator before user message (only if a previous turn completed)
@@ -2522,11 +2586,8 @@ async fn run_main_loop(
         {
             let t = std::time::Instant::now();
             drain_output_queues(priority_output_rx, output_rx, app);
-            // Surface channel overflow to the user. The writer silently
-            // drops events on a full channel (src/cli/output.rs:198-213);
-            // if the dropped event was the approval prompt, the user
-            // cannot see it and must blindly hit "y". The status bar
-            // shows a warning when overflow is detected.
+            // Lost transcript context remains visible because it may affect
+            // whether the user can safely approve a pending operation.
             if output_writer.take_overflow_signal() {
                 app.output_overflow = true;
                 app.output_overflow_count = output_writer.dropped_count();
@@ -2630,7 +2691,9 @@ async fn run_main_loop(
 
         // 2. Render (skip if nothing changed)
         let should_render = if app.needs_redraw || app.has_resized {
-            if app.agent_busy {
+            if app.has_unrendered_approval() {
+                true
+            } else if app.agent_busy {
                 last_draw_at.is_none_or(|last| last.elapsed() >= BUSY_REDRAW_INTERVAL)
             } else {
                 true
@@ -2668,27 +2731,8 @@ async fn run_main_loop(
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {
                     app.needs_redraw = true;
-                    // Approval prompt: route y/n/a to approval channel
-                    if is_approval_prompt_active()
-                        && let Some(result) = approval_result_for_key(&key)
-                    {
-                        if let Some(sender) = take_approval_sender() {
-                            let prompt_lines = app.output_lines.len();
-                            let _ = sender.send(result.clone());
-                            app.drain_output_from(prompt_lines);
-
-                            if key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                app.force_bottom();
-                                cancel_agent(&state_handle, &agent_task, &agent_done, &agent_busy)
-                                    .await?;
-                                app.push_plain("^C");
-                                app.agent_busy = false;
-                                continue;
-                            }
-
-                            // Echo approval decision
+                    if let Some(outcome) = handle_approval_key(app, &key) {
+                        if let ApprovalKeyOutcome::Resolved { result, delivered } = outcome {
                             app.push_styled(
                                 format!(
                                     "  ↳ {}",
@@ -2700,8 +2744,22 @@ async fn run_main_loop(
                                 ),
                                 Style::default().fg(theme::ACCENT),
                             );
-                            app.clear_approval_pin();
-                            app.force_bottom();
+                            if !delivered {
+                                app.push_styled(
+                                    "Approval expired before the decision was delivered.",
+                                    Style::default().fg(theme::WARNING_FG),
+                                );
+                            }
+
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                app.force_bottom();
+                                cancel_agent(&state_handle, &agent_task, &agent_done, &agent_busy)
+                                    .await?;
+                                app.push_plain("^C");
+                                app.agent_busy = false;
+                            }
                         }
                         continue;
                     }
@@ -2882,8 +2940,7 @@ async fn run_main_loop(
                                         continue;
                                     }
 
-                                    // Block slash commands while approval prompt is active
-                                    if is_approval_prompt_active() {
+                                    if app.has_pending_approval() {
                                         app.push_styled(
                                         "Blocked: cannot process commands while approval is pending.",
                                         theme::status_style(),
@@ -2946,8 +3003,7 @@ async fn run_main_loop(
                 }
                 Event::Paste(content) => {
                     app.needs_redraw = true;
-                    // Handle paste event with folding for large pastes
-                    let folded = app.handle_paste(&content);
+                    let folded = handle_paste_event(app, &content);
                     if folded {
                         app.push_styled(
                             format!(
@@ -2967,10 +3023,18 @@ async fn run_main_loop(
                     app.needs_redraw = true;
                     match mouse_event.kind {
                         ratatui::crossterm::event::MouseEventKind::ScrollDown => {
-                            app.scroll_lines(3);
+                            if app.has_pending_approval() {
+                                app.scroll_pending_approval(-3);
+                            } else {
+                                app.scroll_lines(3);
+                            }
                         }
                         ratatui::crossterm::event::MouseEventKind::ScrollUp => {
-                            app.scroll_lines(-3);
+                            if app.has_pending_approval() {
+                                app.scroll_pending_approval(3);
+                            } else {
+                                app.scroll_lines(-3);
+                            }
                         }
                         _ => {}
                     }
@@ -3256,8 +3320,6 @@ mod tests {
     use serde::ser::{Error as _, Serialize, Serializer};
 
     fn reset_prompt_state() {
-        crate::core::approval::clear_approval_prompt_scroll();
-        crate::core::approval::set_approval_prompt_active(false);
         crate::core::approval::clear_followup_prompt_scroll();
         crate::core::approval::set_followup_question_active("test-task", false);
     }
@@ -3386,12 +3448,6 @@ mod tests {
     fn test_drain_output_priority_lane_preserves_critical_prompt_under_stress() {
         use crate::cli::output::{OutputEvent, OutputWriter};
 
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
-        // Set approval prompt active so the auto-deny path triggers when
-        // the RawAnsi is dropped from the full channel.
-        crate::core::approval::set_approval_prompt_active(true);
-
         let (tx, mut rx) = mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
         let mut priority_rx = writer
@@ -3399,43 +3455,27 @@ mod tests {
             .expect("priority receiver should be available");
 
         writer.emit(OutputEvent::plain("line 1"));
-        writer.emit(OutputEvent::RawAnsi(
-            "\nExecute this tool? (y/n/always): ".to_string(),
-        ));
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            40,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        writer.emit(OutputEvent::ApprovalRequested(request));
 
         let mut app = App::new();
         app.set_content_width(80);
         drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
 
-        // Approval prompts are no longer sent to the priority lane. They are
-        // dropped from the full channel and auto-denied via take_approval_sender().
-        // The priority lane should be empty because the approval prompt was
-        // non-critical and dropped.
-        assert!(
-            priority_rx.try_recv().is_err(),
-            "approval prompt should not be in priority lane (auto-denied instead)"
-        );
-        // The dropped count should be > 0 because the approval prompt
-        // was dropped from the full channel.
-        assert!(
-            writer.dropped_count() > 0,
-            "approval prompt drop should be counted: {:?}",
-            app.output_lines
-        );
-
-        reset_prompt_state();
+        assert!(app.has_pending_approval());
+        assert_eq!(writer.dropped_count(), 0);
+        assert!(!writer.take_overflow_signal());
     }
 
     #[test]
-    fn test_drain_output_priority_lane_keeps_approval_prompt_last_for_visibility() {
+    fn test_drain_output_priority_lane_preempts_backlog_for_approval_panel() {
         use crate::cli::output::{OutputEvent, OutputWriter};
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
-        crate::core::approval::set_approval_prompt_active(true);
-        crate::core::approval::set_approval_prompt_scroll();
 
         let (tx, mut rx) = mpsc::channel(20);
         let writer = ChannelOutputWriter::new(tx);
@@ -3446,9 +3486,12 @@ mod tests {
         for index in 0..20 {
             writer.emit(OutputEvent::plain(format!("backlog line {index:02}")));
         }
-        writer.emit(OutputEvent::RawAnsi(
-            "\nExecute this tool? (y/n/always): \n".to_string(),
-        ));
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            41,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        writer.emit(OutputEvent::ApprovalRequested(request));
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -3462,22 +3505,17 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("render should succeed");
 
-        // Approval prompts are no longer sent to the priority lane. They are
-        // dropped from the full channel and auto-denied via take_approval_sender().
-        // The priority lane should be empty.
-        assert!(
-            priority_rx.try_recv().is_err(),
-            "approval prompt should not be in priority lane (auto-denied instead)"
-        );
-        // The overflow signal should be set because the main channel was full.
-        assert!(
-            writer.take_overflow_signal(),
-            "overflow should be signaled when main channel is saturated"
-        );
-
-        crate::core::approval::set_approval_prompt_active(false);
-        crate::core::approval::clear_approval_prompt_scroll();
-        reset_prompt_state();
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(app.approval_accepts_input());
+        assert!(rendered.contains("Execute this tool?"));
+        assert_eq!(writer.dropped_count(), 0);
+        assert!(!writer.take_overflow_signal());
     }
 
     #[test]
@@ -3502,55 +3540,25 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_output_forces_scroll_for_approval_prompt() {
+    fn test_drain_output_keeps_scroll_pinned_while_approval_is_pending() {
         use crate::cli::tui::app::ScrollMode;
 
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
-
         let (_tx, mut rx) = mpsc::channel(1);
-
-        // Ensure clean state before test
-        crate::core::approval::clear_approval_prompt_scroll();
-        crate::core::approval::set_approval_prompt_scroll();
 
         let mut app = App::new();
         app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 7;
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            42,
+            "Approval required · edit_file",
+            "🔧 Tool: edit_file\nExecute this tool?",
+        );
+        assert!(app.set_pending_approval(request));
 
         drain_output(&mut rx, &mut app);
 
         assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
         assert_eq!(app.scroll_offset, 0);
-
-        reset_prompt_state();
-    }
-
-    #[test]
-    fn test_drain_output_forces_scroll_while_approval_prompt_is_active() {
-        use crate::cli::tui::app::ScrollMode;
-
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
-
-        let (_tx, mut rx) = mpsc::channel(1);
-
-        // Ensure clean state before test
-        crate::core::approval::clear_approval_prompt_scroll();
-        crate::core::approval::set_approval_prompt_active(true);
-
-        let mut app = App::new();
-        app.scroll_mode = ScrollMode::Manual;
-        app.scroll_offset = 7;
-
-        drain_output(&mut rx, &mut app);
-
-        crate::core::approval::set_approval_prompt_active(false);
-
-        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
-        assert_eq!(app.scroll_offset, 0);
-
-        reset_prompt_state();
     }
 
     #[test]
@@ -3612,8 +3620,6 @@ mod tests {
         reset_prompt_state();
 
         let (_tx, mut rx) = mpsc::channel(1);
-        crate::core::approval::clear_approval_prompt_scroll();
-        crate::core::approval::set_approval_prompt_active(false);
 
         let mut app = App::new();
         app.pin_approval_bottom();
@@ -4060,22 +4066,116 @@ mod tests {
     fn test_approval_result_for_key_only_accepts_prompt_shortcuts() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+        let mut app = App::new();
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            59,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        assert!(app.set_pending_approval(request));
+
         assert_eq!(
-            approval_result_for_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty())),
+            approval_result_for_key(
+                &app,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty())
+            ),
             Some(ApprovalResult::Approved)
         );
         assert_eq!(
-            approval_result_for_key(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            approval_result_for_key(
+                &app,
+                &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
             Some(ApprovalResult::Denied)
         );
         assert_eq!(
-            approval_result_for_key(&KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty())),
+            approval_result_for_key(
+                &app,
+                &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty())
+            ),
             None
         );
         assert_eq!(
-            approval_result_for_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())),
+            approval_result_for_key(
+                &app,
+                &KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())
+            ),
             None
         );
+    }
+
+    #[test]
+    fn test_approval_keys_are_consumed_only_after_panel_render() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new();
+        app.set_input_text("draft");
+        let (request, response_rx) = crate::core::approval::approval_request_for_test(
+            62,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\n    cargo test\nExecute this tool?",
+        );
+        assert!(app.set_pending_approval(request));
+
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty());
+        assert_eq!(
+            handle_approval_key(&mut app, &y),
+            Some(ApprovalKeyOutcome::Consumed)
+        );
+        assert!(app.has_pending_approval());
+        assert!(matches!(
+            response_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("approval panel should render");
+        assert!(app.approval_accepts_input());
+
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty());
+        assert_eq!(
+            handle_approval_key(&mut app, &q),
+            Some(ApprovalKeyOutcome::Consumed)
+        );
+        assert_eq!(app.input.lines().join("\n"), "draft");
+
+        let outcome = handle_approval_key(&mut app, &y);
+        assert!(matches!(
+            outcome,
+            Some(ApprovalKeyOutcome::Resolved {
+                result: ApprovalResult::Approved,
+                delivered: true,
+                ..
+            })
+        ));
+        assert!(!app.has_pending_approval());
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(crate::core::approval::ApprovalResponse::Decision(
+                ApprovalResult::Approved
+            ))
+        ));
+        assert_eq!(app.input.lines().join("\n"), "draft");
+    }
+
+    #[test]
+    fn test_paste_does_not_mutate_hidden_input_during_approval() {
+        let mut app = App::new();
+        app.set_input_text("draft");
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            63,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        assert!(app.set_pending_approval(request));
+
+        assert!(!handle_paste_event(&mut app, "pasted command"));
+        assert_eq!(app.input.lines().join("\n"), "draft");
     }
 
     #[test]
@@ -4673,20 +4773,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_key_event_blocks_normal_submit_while_approval_is_active()
+    async fn test_handle_key_event_blocks_normal_submit_while_approval_is_pending()
     -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
 
         let (tx, _rx) = mpsc::channel(4);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
         let state_handle = Arc::new(Mutex::new(None));
         let mut app = App::new();
         app.input = App::new_textarea(vec!["hello".to_string()]);
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            60,
+            "Approval required · edit_file",
+            "🔧 Tool: edit_file\nExecute this tool?",
+        );
+        assert!(app.set_pending_approval(request));
 
-        crate::core::approval::set_approval_prompt_active(true);
         let action = handle_key_event(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
             &mut app,
@@ -4695,7 +4797,6 @@ mod tests {
             "task-1",
         )
         .await?;
-        crate::core::approval::set_approval_prompt_active(false);
 
         assert!(action.is_none());
         assert_eq!(app.input.lines().join("\n"), "hello");
@@ -4707,25 +4808,25 @@ mod tests {
                 .contains("Approval pending. Type y, n, or a first.")
         }));
 
-        reset_prompt_state();
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_handle_key_event_allows_shutdown_submit_during_approval() -> anyhow::Result<()> {
+    async fn test_handle_key_event_blocks_shutdown_submit_during_approval() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
 
         let (tx, _rx) = mpsc::channel(4);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
         let state_handle = Arc::new(Mutex::new(None));
         let mut app = App::new();
         app.input = App::new_textarea(vec!["/quit".to_string()]);
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            61,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        assert!(app.set_pending_approval(request));
 
-        crate::core::approval::set_approval_prompt_active(true);
         let action = handle_key_event(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
             &mut app,
@@ -4734,12 +4835,9 @@ mod tests {
             "task-1",
         )
         .await?;
-        crate::core::approval::set_approval_prompt_active(false);
 
-        assert!(matches!(action, Some(Action::Submit(text)) if text == "/quit"));
-        assert!(app.input.lines().join("\n").is_empty());
-
-        reset_prompt_state();
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "/quit");
 
         Ok(())
     }

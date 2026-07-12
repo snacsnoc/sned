@@ -7,11 +7,10 @@
 //!
 //! - `ApprovalManager` tracks per-session auto-approvals (when the user
 //!   selects "always" for a tool).
-//! - `prompt_for_approval` prints the tool name and parameters, then reads
-//!   a single character from stdin.
+//! - Request-scoped responders prevent one prompt from resolving another.
 //! - Read-only tools (ReadFile, ListFiles, SearchFiles, etc.) are always
 //!   approved without prompting.
-//! - Non-read-only tools prompt with "Execute this tool? (y/n/always)".
+//! - Non-read-only tools require an explicit interactive decision.
 //! - Per-path auto-approval: local vs external file paths can have different
 //!   approval levels, ported from `autoApprove.ts:126-180`.
 //! - Approval prompt routes through `output_writer.emit()` for TUI visibility.
@@ -24,7 +23,7 @@ use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(test)]
 static APPROVAL_TEST_MUTEX: LazyLock<std::sync::Mutex<()>> =
@@ -38,9 +37,27 @@ pub fn approval_test_guard() -> std::sync::MutexGuard<'static, ()> {
     let guard = APPROVAL_TEST_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    set_approval_prompt_active(false);
-    clear_approval_prompt_scroll();
+    APPROVAL_SLOT_CLAIMED.store(false, Ordering::SeqCst);
     guard
+}
+
+#[cfg(test)]
+pub(crate) fn approval_request_for_test(
+    id: u64,
+    title: &str,
+    details: &str,
+) -> (ApprovalRequest, std::sync::mpsc::Receiver<ApprovalResponse>) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    (
+        ApprovalRequest::new(
+            id,
+            title.to_string(),
+            details.to_string(),
+            standard_approval_choices(),
+            sender,
+        ),
+        receiver,
+    )
 }
 
 const SAFE_BASE_COMMANDS: &[&str] = &[
@@ -840,7 +857,7 @@ impl ApprovalManager {
 }
 
 /// Result of an approval prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalResult {
     /// User approved the tool execution.
     Approved,
@@ -848,6 +865,141 @@ pub enum ApprovalResult {
     Denied,
     /// User approved and wants to auto-approve this tool for the session.
     Always,
+}
+
+/// Keeping each shortcut with its result prevents approval sources and the
+/// decision panel from silently disagreeing about what a key means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalChoice {
+    shortcut: char,
+    label: String,
+    result: ApprovalResult,
+}
+
+impl ApprovalChoice {
+    #[must_use]
+    pub fn new(shortcut: char, label: impl Into<String>, result: ApprovalResult) -> Self {
+        Self {
+            shortcut,
+            label: label.into(),
+            result,
+        }
+    }
+
+    #[must_use]
+    pub fn shortcut(&self) -> char {
+        self.shortcut
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    #[must_use]
+    pub fn result(&self) -> ApprovalResult {
+        self.result
+    }
+}
+
+fn standard_approval_choices() -> Vec<ApprovalChoice> {
+    vec![
+        ApprovalChoice::new('y', "Approve", ApprovalResult::Approved),
+        ApprovalChoice::new('n', "Deny", ApprovalResult::Denied),
+        ApprovalChoice::new('a', "Always", ApprovalResult::Always),
+    ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApprovalResponse {
+    Decision(ApprovalResult),
+    Unavailable(String),
+}
+
+/// The responder travels with the prompt so UI state cannot resolve a
+/// different process-global approval by mistake.
+#[derive(Clone)]
+pub struct ApprovalRequest {
+    id: u64,
+    title: String,
+    details: String,
+    choices: Vec<ApprovalChoice>,
+    responder: std::sync::mpsc::Sender<ApprovalResponse>,
+}
+
+impl std::fmt::Debug for ApprovalRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApprovalRequest")
+            .field("id", &self.id)
+            .field("title", &self.title)
+            .field("details_len", &self.details.len())
+            .field("choices", &self.choices)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ApprovalRequest {
+    pub(crate) fn new(
+        id: u64,
+        title: String,
+        details: String,
+        choices: Vec<ApprovalChoice>,
+        responder: std::sync::mpsc::Sender<ApprovalResponse>,
+    ) -> Self {
+        Self {
+            id,
+            title,
+            details,
+            choices,
+            responder,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    #[must_use]
+    pub fn details(&self) -> &str {
+        &self.details
+    }
+
+    #[must_use]
+    pub fn choices(&self) -> &[ApprovalChoice] {
+        &self.choices
+    }
+
+    #[must_use]
+    pub fn result_for_shortcut(&self, shortcut: char) -> Option<ApprovalResult> {
+        self.choices
+            .iter()
+            .find(|choice| choice.shortcut.eq_ignore_ascii_case(&shortcut))
+            .map(ApprovalChoice::result)
+    }
+
+    #[must_use]
+    pub fn has_result(&self, result: ApprovalResult) -> bool {
+        self.choices.iter().any(|choice| choice.result == result)
+    }
+
+    pub fn respond(self, result: ApprovalResult) -> bool {
+        self.responder
+            .send(ApprovalResponse::Decision(result))
+            .is_ok()
+    }
+
+    /// Failing closed prevents an undisplayed operation from proceeding.
+    pub fn fail(self, reason: impl Into<String>) -> bool {
+        self.responder
+            .send(ApprovalResponse::Unavailable(reason.into()))
+            .is_ok()
+    }
 }
 
 /// Format the standard denial message for a tool.
@@ -991,59 +1143,62 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
     }
 }
 
-/// RAII guard that resets the approval prompt flag on drop.
-/// Ensures `set_approval_prompt_active(false)` runs even on early return.
+/// Tying slot release to stack lifetime prevents error and timeout paths from
+/// deadlocking every later approval request.
 struct ApprovalPromptGuard;
+
+impl ApprovalPromptGuard {
+    fn claim() -> io::Result<Self> {
+        APPROVAL_SLOT_CLAIMED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| io::Error::other("another approval prompt is already active"))?;
+        Ok(Self)
+    }
+}
 
 impl Drop for ApprovalPromptGuard {
     fn drop(&mut self) {
-        set_approval_prompt_active(false);
+        APPROVAL_SLOT_CLAIMED.store(false, Ordering::SeqCst);
     }
 }
 
-/// Channel sender for approval responses. The prompt function creates
-/// a channel, stores the sender here, and blocks on the receiver. The
-/// TUI loop reads the key event and sends the result through this sender.
-static APPROVAL_SENDER: LazyLock<Mutex<Option<std::sync::mpsc::Sender<ApprovalResult>>>> =
-    LazyLock::new(|| Mutex::new(None));
+/// Claiming the slot before emission prevents concurrent prompts from
+/// replacing each other's responder or obscuring the actionable request.
+fn begin_approval_prompt(
+    title: String,
+    details: String,
+    choices: Vec<ApprovalChoice>,
+) -> io::Result<(
+    ApprovalPromptGuard,
+    ApprovalRequest,
+    std::sync::mpsc::Receiver<ApprovalResponse>,
+)> {
+    let guard = ApprovalPromptGuard::claim()?;
 
-/// Store the sender for an approval response. If a sender is already pending,
-/// drain it first so its receiver gets a closed signal.
-pub fn set_approval_sender(sender: std::sync::mpsc::Sender<ApprovalResult>) {
-    let mut guard = APPROVAL_SENDER.lock();
-    if let Some(old) = guard.take() {
-        drop(old);
-    }
-    *guard = Some(sender);
-}
-
-/// Take the stored approval sender (TUI loop consumes it).
-pub fn take_approval_sender() -> Option<std::sync::mpsc::Sender<ApprovalResult>> {
-    let mut guard = APPROVAL_SENDER.lock();
-    guard.take()
-}
-
-/// Begin an approval prompt lifecycle.
-///
-/// Sets the prompt visible state before the prompt text is emitted so the
-/// TUI can scroll to it immediately and route the next keypress correctly.
-///
-/// Returns a closed receiver if another approval prompt is already in
-/// flight. Without this guard, a concurrent call would clobber the
-/// active sender via `set_approval_sender`, leaving the first
-/// receiver stranded on a closed channel and causing a confusing
-/// "approval channel closed" error mid-prompt.
-fn begin_approval_prompt() -> std::sync::mpsc::Receiver<ApprovalResult> {
-    if APPROVAL_PROMPT_ACTIVE.load(Ordering::SeqCst) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        drop(tx);
-        return rx;
-    }
     let (sender, receiver) = std::sync::mpsc::channel();
-    set_approval_sender(sender);
-    set_approval_prompt_scroll();
-    set_approval_prompt_active(true);
-    receiver
+    let id = NEXT_APPROVAL_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    Ok((
+        guard,
+        ApprovalRequest::new(id, title, details, choices, sender),
+        receiver,
+    ))
+}
+
+fn receive_approval_response(
+    receiver: &std::sync::mpsc::Receiver<ApprovalResponse>,
+) -> io::Result<ApprovalResult> {
+    match receiver.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(ApprovalResponse::Decision(result)) => Ok(result),
+        Ok(ApprovalResponse::Unavailable(reason)) => {
+            Err(io::Error::other(format!("approval unavailable: {reason}")))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(io::Error::other("approval prompt timed out (5 minutes)"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("approval channel closed"))
+        }
+    }
 }
 
 /// Prompt the user for approval of a tool execution.
@@ -1062,71 +1217,33 @@ pub fn prompt_for_approval(
 
     let params_str = format_tool_parameters(tool_name, params);
 
-    let prompt = build_tool_approval_prompt(
+    let details = build_tool_approval_prompt(
         &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
         &crate::cli::colors::tool_name(tool_name),
         &params_str,
-        &crate::cli::colors::colorize_stderr("y", crate::cli::colors::style::GREEN),
-        &crate::cli::colors::colorize_stderr("n", crate::cli::colors::style::RED),
-        &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
     );
 
     use crate::cli::output::OutputEvent;
-    let receiver = begin_approval_prompt();
-    output_writer.emit(OutputEvent::RawAnsi(format!("{prompt}\n")));
+    let (_guard, request, receiver) = begin_approval_prompt(
+        format!("Approval required · {tool_name}"),
+        details,
+        standard_approval_choices(),
+    )?;
+    let request_id = request.id();
+    output_writer.emit(OutputEvent::ApprovalRequested(request));
 
-    // Channel-based: the TUI loop reads the key event and sends the result
-    // through the channel. Timeout prevents hanging forever if user walks
-    // away or terminal crashes.
-    let _guard = ApprovalPromptGuard;
-
-    let result = receiver
-        .recv_timeout(std::time::Duration::from_secs(300))
-        .map_err(|e| {
-            if e == std::sync::mpsc::RecvTimeoutError::Timeout {
-                io::Error::other("approval prompt timed out (5 minutes)")
-            } else {
-                io::Error::other("approval channel closed")
-            }
-        })?;
-
-    Ok(result)
+    // A matching finish event keeps timeouts and UI failures from leaving a
+    // stale panel that permanently blocks normal input.
+    let result = receive_approval_response(&receiver);
+    output_writer.emit(OutputEvent::ApprovalFinished { id: request_id });
+    result
 }
 
-/// Flag indicating if an approval prompt is currently active and waiting for input.
-/// When true, the CLI main loop routes the next line of input to the approval prompt
-/// instead of treating it as a user message.
-static APPROVAL_PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// A single modal slot prevents concurrent requests from obscuring which
+/// operation owns the visible decision panel.
+static APPROVAL_SLOT_CLAIMED: AtomicBool = AtomicBool::new(false);
 
-/// Mark whether an approval prompt is currently active.
-pub fn set_approval_prompt_active(active: bool) {
-    APPROVAL_PROMPT_ACTIVE.store(active, Ordering::SeqCst);
-}
-
-/// Check if an approval prompt is currently active.
-pub fn is_approval_prompt_active() -> bool {
-    APPROVAL_PROMPT_ACTIVE.load(Ordering::SeqCst)
-}
-
-/// Flag indicating if the approval prompt was just emitted and needs a forced scroll.
-/// Set when the prompt is emitted, cleared after one scroll in drain_output.
-static APPROVAL_PROMPT_SCROLL: AtomicBool = AtomicBool::new(false);
-
-/// Mark that the approval prompt was just emitted and needs a forced scroll.
-pub fn set_approval_prompt_scroll() {
-    APPROVAL_PROMPT_SCROLL.store(true, Ordering::SeqCst);
-}
-
-/// Check if the approval prompt needs a forced scroll, and clear the flag.
-pub fn take_approval_prompt_scroll() -> bool {
-    APPROVAL_PROMPT_SCROLL.swap(false, Ordering::SeqCst)
-}
-
-/// Clear the approval prompt scroll flag without consuming it.
-/// Used for test teardown to ensure clean state between tests.
-pub fn clear_approval_prompt_scroll() {
-    APPROVAL_PROMPT_SCROLL.store(false, Ordering::SeqCst);
-}
+static NEXT_APPROVAL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Flag indicating if a followup prompt was just emitted and needs a forced scroll.
 /// This covers tool-driven prompts like ask_followup_question and slash-command confirmations.
@@ -1247,7 +1364,7 @@ pub async fn prompt_for_combined_approval(
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
     // SECURITY (F-01): Non-interactive stdin DENIES by default
-    if !stdin.is_terminal() {
+    if std::env::var("SNED_APPROVAL_DENY").is_ok() || !stdin.is_terminal() {
         return Ok(ApprovalResult::Denied);
     }
 
@@ -1257,48 +1374,30 @@ pub async fn prompt_for_combined_approval(
         format!("{file_count} files")
     };
 
-    let prompt = build_combined_approval_prompt(
+    let details = build_combined_approval_prompt(
         &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
         &crate::cli::colors::colorize_stderr(&file_names, crate::cli::colors::style::BOLD),
         edit_count,
         diff_preview,
-        &crate::cli::colors::colorize_stderr("y", crate::cli::colors::style::GREEN),
-        &crate::cli::colors::colorize_stderr("n", crate::cli::colors::style::RED),
-        &crate::cli::colors::colorize_stderr("always", crate::cli::colors::style::CYAN),
     );
 
     use crate::cli::output::OutputEvent;
-    let receiver = begin_approval_prompt();
-    output_writer.emit(OutputEvent::RawAnsi(format!("{prompt}\n")));
+    let (_guard, request, receiver) = begin_approval_prompt(
+        format!("Approval required · edit {file_names}"),
+        details,
+        standard_approval_choices(),
+    )?;
+    let request_id = request.id();
+    output_writer.emit(OutputEvent::ApprovalRequested(request));
 
-    // Wrap blocking channel recv in spawn_blocking to avoid blocking the tokio runtime
-    tokio::task::spawn_blocking(move || {
-        let _guard = ApprovalPromptGuard;
-
-        let result = receiver
-            .recv_timeout(std::time::Duration::from_secs(300))
-            .map_err(|e| {
-                if e == std::sync::mpsc::RecvTimeoutError::Timeout {
-                    io::Error::other("approval prompt timed out (5 minutes)")
-                } else {
-                    io::Error::other("approval channel closed")
-                }
-            })?;
-
-        Ok(result)
-    })
-    .await
-    .map_err(|e| io::Error::other(format!("spawn_blocking failed: {e}")))?
+    let result = tokio::task::spawn_blocking(move || receive_approval_response(&receiver))
+        .await
+        .map_err(|e| io::Error::other(format!("spawn_blocking failed: {e}")))?;
+    output_writer.emit(OutputEvent::ApprovalFinished { id: request_id });
+    result
 }
 
-fn build_tool_approval_prompt(
-    icon: &str,
-    tool_name: &str,
-    params_str: &str,
-    yes_label: &str,
-    no_label: &str,
-    always_label: &str,
-) -> String {
+fn build_tool_approval_prompt(icon: &str, tool_name: &str, params_str: &str) -> String {
     let mut prompt = String::new();
     prompt.push('\n');
     let _ = write!(&mut prompt, "{icon} Tool: {tool_name}");
@@ -1307,10 +1406,7 @@ fn build_tool_approval_prompt(
         prompt.push_str(params_str);
     }
     prompt.push('\n');
-    let _ = write!(
-        &mut prompt,
-        "Execute this tool? ({yes_label}/{no_label}/{always_label} — 'a' auto-approves this tool for the session): "
-    );
+    prompt.push_str("Execute this tool?");
     prompt
 }
 
@@ -1319,9 +1415,6 @@ fn build_combined_approval_prompt(
     file_names: &str,
     edit_count: usize,
     diff_preview: &str,
-    yes_label: &str,
-    no_label: &str,
-    always_label: &str,
 ) -> String {
     let mut prompt = String::new();
     prompt.push('\n');
@@ -1334,10 +1427,7 @@ fn build_combined_approval_prompt(
         prompt.push_str(diff_preview);
     }
     prompt.push('\n');
-    let _ = write!(
-        &mut prompt,
-        "Approve these edits? ({yes_label}/{no_label}/{always_label}): "
-    );
+    prompt.push_str("Approve these edits?");
     prompt
 }
 
@@ -1385,44 +1475,60 @@ mod tests {
     }
 
     #[test]
-    fn test_approval_prompt_active_flag_is_initially_false() {
-        assert!(!is_approval_prompt_active());
+    fn test_approval_slot_is_initially_available() {
+        let _guard = approval_test_guard();
+        assert!(!APPROVAL_SLOT_CLAIMED.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn test_begin_approval_prompt_sets_visibility_flags() {
-        struct ApprovalPromptCleanup;
+    fn test_begin_approval_prompt_claims_slot() {
+        let _guard = approval_test_guard();
+        let (prompt_guard, request, receiver) = begin_approval_prompt(
+            "Approval required · test".to_string(),
+            "Approve?".to_string(),
+            standard_approval_choices(),
+        )
+        .expect("first prompt should claim the approval slot");
 
-        impl Drop for ApprovalPromptCleanup {
-            fn drop(&mut self) {
-                set_approval_prompt_active(false);
-                clear_approval_prompt_scroll();
-                let _ = take_approval_sender();
-            }
-        }
+        assert!(APPROVAL_SLOT_CLAIMED.load(Ordering::SeqCst));
+        assert_eq!(request.title(), "Approval required · test");
+        assert!(
+            begin_approval_prompt(
+                "second".to_string(),
+                "Approve?".to_string(),
+                standard_approval_choices(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            request.result_for_shortcut('Y'),
+            Some(ApprovalResult::Approved)
+        );
+        assert_eq!(
+            request.result_for_shortcut('n'),
+            Some(ApprovalResult::Denied)
+        );
+        assert_eq!(
+            request.result_for_shortcut('a'),
+            Some(ApprovalResult::Always)
+        );
 
-        let _cleanup = ApprovalPromptCleanup;
-        clear_approval_prompt_scroll();
-        set_approval_prompt_active(false);
-        let receiver = begin_approval_prompt();
-
-        assert!(is_approval_prompt_active());
-        assert!(take_approval_prompt_scroll());
-
-        drop(receiver);
-        let _ = take_approval_sender();
-        set_approval_prompt_active(false);
+        assert!(request.respond(ApprovalResult::Approved));
+        assert_eq!(
+            receive_approval_response(&receiver).expect("response should arrive"),
+            ApprovalResult::Approved
+        );
+        drop(prompt_guard);
+        assert!(!APPROVAL_SLOT_CLAIMED.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn test_approval_prompt_active_flag_always_resets() {
-        // Simulate the invariant: set true, then false, verify clean.
-        // If prompt_for_approval ever leaks the flag (e.g. early return
-        // between set and clear), the TUI loop permanently skips stdin.
-        set_approval_prompt_active(true);
-        assert!(is_approval_prompt_active());
-        set_approval_prompt_active(false);
-        assert!(!is_approval_prompt_active());
+    fn test_approval_slot_releases_on_drop() {
+        let _guard = approval_test_guard();
+        let prompt_guard = ApprovalPromptGuard::claim().expect("slot should be available");
+        assert!(APPROVAL_SLOT_CLAIMED.load(Ordering::SeqCst));
+        drop(prompt_guard);
+        assert!(!APPROVAL_SLOT_CLAIMED.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1618,29 +1724,21 @@ mod tests {
 
     #[test]
     fn test_build_tool_approval_prompt_is_compact() {
-        let prompt = build_tool_approval_prompt("🔧", "execute_command", "\n    ls", "y", "n", "a");
+        let prompt = build_tool_approval_prompt("🔧", "execute_command", "\n    ls");
 
         assert_eq!(
             prompt,
-            "\n🔧 Tool: execute_command\n    ls\nExecute this tool? (y/n/a — 'a' auto-approves this tool for the session): "
+            "\n🔧 Tool: execute_command\n    ls\nExecute this tool?"
         );
     }
 
     #[test]
     fn test_build_combined_approval_prompt_is_compact() {
-        let prompt = build_combined_approval_prompt(
-            "🔧",
-            "1 file",
-            2,
-            "--- diff preview ---",
-            "y",
-            "n",
-            "a",
-        );
+        let prompt = build_combined_approval_prompt("🔧", "1 file", 2, "--- diff preview ---");
 
         assert_eq!(
             prompt,
-            "\n🔧 Sned wants to edit 1 file with 2 anchored edit(s)\n\n--- diff preview ---\nApprove these edits? (y/n/a): "
+            "\n🔧 Sned wants to edit 1 file with 2 anchored edit(s)\n\n--- diff preview ---\nApprove these edits?"
         );
     }
 

@@ -688,7 +688,11 @@ mod tests {
                 crate::cli::output::OutputEvent::UserPromptLine(line) => {
                     rendered.push(line.to_string())
                 }
-                crate::cli::output::OutputEvent::ApprovalDropped => {}
+                crate::cli::output::OutputEvent::ApprovalRequested(request) => {
+                    rendered.push(request.details().to_string());
+                    request.fail("test output has no interactive approval UI");
+                }
+                crate::cli::output::OutputEvent::ApprovalFinished { .. } => {}
             }
         }
         rendered

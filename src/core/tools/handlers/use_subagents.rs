@@ -745,7 +745,12 @@ mod tests {
                 OutputEvent::CommandOutputLine(line) => line.to_string(),
                 OutputEvent::ReasoningLine(line) => line.to_string(),
                 OutputEvent::UserPromptLine(line) => line.to_string(),
-                OutputEvent::ApprovalDropped => String::new(),
+                OutputEvent::ApprovalRequested(request) => {
+                    let text = request.details().to_string();
+                    request.fail("subagent output has no interactive approval UI");
+                    text
+                }
+                OutputEvent::ApprovalFinished { .. } => String::new(),
             };
             self.events.lock().unwrap().push(text);
         }

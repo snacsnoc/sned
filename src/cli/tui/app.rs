@@ -21,6 +21,7 @@ use unicode_width::UnicodeWidthStr;
 
 const INPUT_MAX_VISIBLE_LINES: usize = 6;
 const BLOCKING_PROMPT_INPUT_VISIBLE_LINES: usize = 1;
+const APPROVAL_PANEL_MAX_DETAIL_ROWS: usize = 10;
 const SCROLLBACK_FLUSH_LINE_BATCH: usize = 128;
 
 /// Async @-mention search result delivered back to the interactive loop.
@@ -63,6 +64,8 @@ pub enum BlockKind {
     Reasoning,
     /// User-submitted prompt line.
     UserPrompt,
+    /// Kept distinct so transcript pruning cannot hide a blocking prompt.
+    BlockingPrompt,
     /// Explicit turn separator (e.g. "──── ♦ ────").
     Separator,
 }
@@ -104,6 +107,15 @@ pub struct PasteChunk {
     pub expanded: bool,
 }
 
+struct PendingApproval {
+    request: crate::core::approval::ApprovalRequest,
+    lines: Vec<Line<'static>>,
+    rendered: bool,
+    scroll_from_bottom: usize,
+    total_rows: usize,
+    viewport_rows: usize,
+}
+
 /// Application state for the ratatui TUI.
 pub struct App {
     /// Output lines buffer (agent output, submitted prompts, etc.)
@@ -114,6 +126,7 @@ pub struct App {
     pub output_line_kinds: VecDeque<BlockKind>,
     /// Input textarea (live user input)
     pub input: TextArea<'static>,
+    pending_approval: Option<PendingApproval>,
     /// Whether the agent is currently busy
     pub agent_busy: bool,
     /// Whether the model is currently in a reasoning/thinking phase (no displayable output yet).
@@ -339,6 +352,145 @@ impl App {
         (self.input.lines().len().clamp(1, INPUT_MAX_VISIBLE_LINES) as u16) + 2
     }
 
+    pub fn set_pending_approval(
+        &mut self,
+        request: crate::core::approval::ApprovalRequest,
+    ) -> bool {
+        if self.pending_approval.is_some() {
+            request.fail("another approval request is already visible");
+            return false;
+        }
+
+        let mut lines = super::ansi_converter::ansi_to_ratatui_lines(request.details());
+        while lines
+            .first()
+            .is_some_and(|line| Self::line_to_string(line).trim().is_empty())
+        {
+            lines.remove(0);
+        }
+        while lines
+            .last()
+            .is_some_and(|line| Self::line_to_string(line).trim().is_empty())
+        {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            lines.push(Line::from("Approval details unavailable"));
+        }
+
+        self.pending_approval = Some(PendingApproval {
+            request,
+            lines,
+            rendered: false,
+            scroll_from_bottom: 0,
+            total_rows: 0,
+            viewport_rows: 0,
+        });
+        self.picker_active = false;
+        self.mention_search_active = false;
+        self.slash_command_active = false;
+        self.model_picker_active = false;
+        self.needs_redraw = true;
+        self.pin_approval_bottom();
+        true
+    }
+
+    #[must_use]
+    pub fn has_pending_approval(&self) -> bool {
+        self.pending_approval.is_some()
+    }
+
+    #[must_use]
+    pub fn has_unrendered_approval(&self) -> bool {
+        self.pending_approval
+            .as_ref()
+            .is_some_and(|pending| !pending.rendered)
+    }
+
+    #[must_use]
+    pub fn approval_accepts_input(&self) -> bool {
+        self.pending_approval
+            .as_ref()
+            .is_some_and(|pending| pending.rendered)
+    }
+
+    #[must_use]
+    pub fn pending_approval_result_for_shortcut(
+        &self,
+        shortcut: char,
+    ) -> Option<crate::core::approval::ApprovalResult> {
+        self.pending_approval
+            .as_ref()
+            .and_then(|pending| pending.request.result_for_shortcut(shortcut))
+    }
+
+    #[must_use]
+    pub fn pending_approval_has_result(
+        &self,
+        result: crate::core::approval::ApprovalResult,
+    ) -> bool {
+        self.pending_approval
+            .as_ref()
+            .is_some_and(|pending| pending.request.has_result(result))
+    }
+
+    pub fn resolve_pending_approval(
+        &mut self,
+        result: crate::core::approval::ApprovalResult,
+    ) -> Option<bool> {
+        let pending = self.pending_approval.take()?;
+        let delivered = pending.request.respond(result);
+        self.needs_redraw = true;
+        self.clear_approval_pin();
+        Some(delivered)
+    }
+
+    pub fn finish_pending_approval(&mut self, id: u64) -> bool {
+        if self
+            .pending_approval
+            .as_ref()
+            .is_none_or(|pending| pending.request.id() != id)
+        {
+            return false;
+        }
+        self.pending_approval.take();
+        self.needs_redraw = true;
+        self.clear_approval_pin();
+        true
+    }
+
+    pub fn scroll_pending_approval(&mut self, rows_toward_history: isize) {
+        let Some(pending) = self.pending_approval.as_mut() else {
+            return;
+        };
+        let max = pending.total_rows.saturating_sub(pending.viewport_rows);
+        if rows_toward_history >= 0 {
+            pending.scroll_from_bottom = pending
+                .scroll_from_bottom
+                .saturating_add(rows_toward_history as usize)
+                .min(max);
+        } else {
+            pending.scroll_from_bottom = pending
+                .scroll_from_bottom
+                .saturating_sub(rows_toward_history.unsigned_abs());
+        }
+        self.needs_redraw = true;
+    }
+
+    fn approval_panel_height(&self) -> u16 {
+        let Some(pending) = self.pending_approval.as_ref() else {
+            return 0;
+        };
+        let wrap_width = self.last_wrap_width().saturating_sub(2).max(1);
+        let detail_rows = pending
+            .lines
+            .iter()
+            .map(|line| Self::output_row_visual_rows(Some(line), wrap_width))
+            .sum::<usize>()
+            .clamp(1, APPROVAL_PANEL_MAX_DETAIL_ROWS);
+        (detail_rows + 3).min(u16::MAX as usize) as u16
+    }
+
     /// Update the textarea placeholder based on current mode.
     pub fn update_placeholder(&mut self) {
         if self.mode == "PLAN" {
@@ -357,6 +509,7 @@ impl App {
             output_lines: VecDeque::new(),
             output_line_kinds: VecDeque::new(),
             input: Self::new_textarea(Vec::new()),
+            pending_approval: None,
             agent_busy: false,
             reasoning_active: false,
             scroll_offset: 0,
@@ -1196,7 +1349,7 @@ impl App {
         }
 
         let max_offset = Self::max_scroll_offset_for(total_rows, content_height);
-        let Some(prompt_tail_row) = self.last_user_prompt_tail_row(wrap_width) else {
+        let Some(prompt_tail_row) = self.last_blocking_prompt_tail_row(wrap_width) else {
             return max_offset;
         };
 
@@ -1222,14 +1375,14 @@ impl App {
         total_lines.saturating_sub(content_height) as u16
     }
 
-    fn last_user_prompt_tail_row(&self, wrap_width: usize) -> Option<usize> {
+    fn last_blocking_prompt_tail_row(&self, wrap_width: usize) -> Option<usize> {
         let mut tail_row = None;
         let mut rendered_rows = 0usize;
 
         self.for_each_output_row(|line, kind| {
             rendered_rows =
                 rendered_rows.saturating_add(Self::output_row_visual_rows(line, wrap_width));
-            if kind == BlockKind::UserPrompt {
+            if kind == BlockKind::BlockingPrompt {
                 tail_row = Some(rendered_rows);
             }
         });
@@ -1448,15 +1601,18 @@ impl App {
                     | BlockKind::ToolOutput
                     | BlockKind::CommandOutput
                     | BlockKind::Reasoning
-                    | BlockKind::UserPrompt,
+                    | BlockKind::UserPrompt
+                    | BlockKind::BlockingPrompt,
             ) | (_, BlockKind::UserPrompt)
+                | (_, BlockKind::BlockingPrompt)
                 | (
                     BlockKind::ToolOutput
                         | BlockKind::CommandOutput
                         | BlockKind::ToolHeader
                         | BlockKind::CommandHeader
                         | BlockKind::Reasoning
-                        | BlockKind::UserPrompt,
+                        | BlockKind::UserPrompt
+                        | BlockKind::BlockingPrompt,
                     BlockKind::Model,
                 )
                 | (BlockKind::ToolHeader, BlockKind::ToolOutput)
@@ -1536,9 +1692,12 @@ impl App {
     }
 
     fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
-        let input_title = if crate::core::approval::is_approval_prompt_active() {
-            " Approval pending (y/n/a) ".to_string()
-        } else if crate::core::approval::is_any_followup_question_active() {
+        if self.pending_approval.is_some() {
+            self.render_approval_panel(frame, input_area);
+            return;
+        }
+
+        let input_title = if crate::core::approval::is_any_followup_question_active() {
             " Follow-up reply ".to_string()
         } else if self.agent_busy {
             if self.reasoning_active {
@@ -1559,13 +1718,102 @@ impl App {
         frame.render_widget(&self.input, input_area);
     }
 
+    fn render_approval_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(pending) = self.pending_approval.as_ref() else {
+            return;
+        };
+        let id = pending.request.id();
+        let title = pending.request.title().to_string();
+        let lines = pending.lines.clone();
+        let choices = pending.request.choices().to_vec();
+        let scroll_from_bottom = pending.scroll_from_bottom;
+
+        let block = theme::input_block(format!(" {title} "), true)
+            .border_style(Style::default().fg(theme::WARNING_FG));
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+
+        let detail_height = inner.height.saturating_sub(1);
+        let detail_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: detail_height,
+        };
+        let action_area = Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(detail_height),
+            width: inner.width,
+            height: inner.height.saturating_sub(detail_height),
+        };
+
+        let wrap_width = detail_area.width.max(1) as usize;
+        let total_rows = lines
+            .iter()
+            .map(|line| Self::output_row_visual_rows(Some(line), wrap_width))
+            .sum::<usize>();
+        let viewport_rows = detail_area.height as usize;
+        let max_scroll = total_rows.saturating_sub(viewport_rows);
+        let scroll_y = max_scroll.saturating_sub(scroll_from_bottom.min(max_scroll));
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll_y.min(u16::MAX as usize) as u16, 0)),
+            detail_area,
+        );
+
+        let mut actions = Vec::new();
+        for (index, choice) in choices.iter().enumerate() {
+            if index > 0 {
+                actions.push(Span::raw("  "));
+            }
+            let shortcut = if choice.result() == crate::core::approval::ApprovalResult::Denied {
+                format!("{}/Esc", choice.shortcut())
+            } else {
+                choice.shortcut().to_string()
+            };
+            let color = match choice.result() {
+                crate::core::approval::ApprovalResult::Approved => theme::PROMPT_FG,
+                crate::core::approval::ApprovalResult::Denied => theme::ERROR_FG,
+                crate::core::approval::ApprovalResult::Always => theme::ACCENT,
+            };
+            actions.push(Span::styled(
+                format!("[{shortcut}]"),
+                Style::default().fg(color),
+            ));
+            actions.push(Span::raw(format!(" {}", choice.label())));
+        }
+        if max_scroll > 0 {
+            actions.push(Span::styled(
+                "  [↑/↓] Review",
+                Style::default().fg(theme::STATUS_FG),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(actions)), action_area);
+
+        if let Some(pending) = self
+            .pending_approval
+            .as_mut()
+            .filter(|pending| pending.request.id() == id)
+        {
+            pending.total_rows = total_rows;
+            pending.viewport_rows = viewport_rows;
+            pending.scroll_from_bottom = pending.scroll_from_bottom.min(max_scroll);
+            pending.rendered =
+                detail_area.height > 0 && action_area.height > 0 && !choices.is_empty();
+        }
+    }
+
     fn has_blocking_prompt(&self) -> bool {
-        crate::core::approval::is_approval_prompt_active()
-            || crate::core::approval::is_any_followup_question_active()
+        self.has_pending_approval() || crate::core::approval::is_any_followup_question_active()
     }
 
     fn render_input_height(&self) -> u16 {
-        if self.has_blocking_prompt() {
+        if self.has_pending_approval() {
+            self.approval_panel_height()
+        } else if self.has_blocking_prompt() {
             (BLOCKING_PROMPT_INPUT_VISIBLE_LINES as u16) + 2
         } else {
             self.input_height()
@@ -2281,27 +2529,40 @@ mod tests {
     }
 
     #[test]
-    fn test_render_output_hides_loading_overlay_during_approval_prompt() {
-        let _approval_guard = crate::core::approval::approval_test_guard();
-        struct ApprovalPromptCleanup;
-
-        impl Drop for ApprovalPromptCleanup {
-            fn drop(&mut self) {
-                crate::core::approval::set_approval_prompt_active(false);
-            }
-        }
-
-        let _cleanup = ApprovalPromptCleanup;
-        crate::core::approval::set_approval_prompt_active(true);
-
+    fn test_render_approval_panel_replaces_busy_input() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
         app.agent_busy = true;
+        app.set_input_text("draft that must remain untouched");
         app.force_bottom();
         app.push_plain("line 1");
         app.push_plain("line 2");
-        app.push_plain("Approve these edits? (y/n/always):");
+        let (response_tx, _response_rx) = std::sync::mpsc::channel();
+        let request = crate::core::approval::ApprovalRequest::new(
+            1,
+            "Approval required · edit_file".to_string(),
+            "🔧 Tool: edit_file\nApprove these edits?".to_string(),
+            vec![
+                crate::core::approval::ApprovalChoice::new(
+                    'y',
+                    "Run once",
+                    crate::core::approval::ApprovalResult::Approved,
+                ),
+                crate::core::approval::ApprovalChoice::new(
+                    'n',
+                    "Stop",
+                    crate::core::approval::ApprovalResult::Denied,
+                ),
+                crate::core::approval::ApprovalChoice::new(
+                    'a',
+                    "Trust session",
+                    crate::core::approval::ApprovalResult::Always,
+                ),
+            ],
+            response_tx,
+        );
+        assert!(app.set_pending_approval(request));
 
         terminal
             .draw(|frame| app.render(frame))
@@ -2317,7 +2578,48 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("Approve these edits?"));
+        assert!(rendered.contains("[y] Run once"));
+        assert!(rendered.contains("[n/Esc] Stop"));
+        assert!(rendered.contains("[a] Trust session"));
         assert!(!rendered.contains("Agent processing..."));
+        assert!(!rendered.contains("draft that must remain untouched"));
+        assert!(app.approval_accepts_input());
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "draft that must remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_sequential_approval_ids_ignore_stale_finish_events() {
+        let mut app = App::new();
+        let (first, first_rx) = crate::core::approval::approval_request_for_test(
+            10,
+            "Approval required · first",
+            "Approve first?",
+        );
+        assert!(app.set_pending_approval(first));
+        assert!(matches!(
+            app.resolve_pending_approval(crate::core::approval::ApprovalResult::Approved),
+            Some(true)
+        ));
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(crate::core::approval::ApprovalResponse::Decision(
+                crate::core::approval::ApprovalResult::Approved
+            ))
+        ));
+
+        let (second, _second_rx) = crate::core::approval::approval_request_for_test(
+            11,
+            "Approval required · second",
+            "Approve second?",
+        );
+        assert!(app.set_pending_approval(second));
+        assert!(!app.finish_pending_approval(10));
+        assert!(app.has_pending_approval());
+        assert!(app.finish_pending_approval(11));
+        assert!(!app.has_pending_approval());
     }
 
     #[test]
@@ -2410,31 +2712,20 @@ mod tests {
 
     #[test]
     fn test_render_approval_prompt_stays_visible_with_tall_input() {
-        let _approval_guard = crate::core::approval::approval_test_guard();
-        struct ApprovalPromptCleanup;
-
-        impl Drop for ApprovalPromptCleanup {
-            fn drop(&mut self) {
-                crate::core::approval::set_approval_prompt_active(false);
-                crate::core::approval::clear_approval_prompt_scroll();
-            }
-        }
-
-        let _cleanup = ApprovalPromptCleanup;
-        crate::core::approval::set_approval_prompt_active(true);
-        crate::core::approval::set_approval_prompt_scroll();
-
-        let backend = TestBackend::new(60, 10);
+        let backend = TestBackend::new(60, 14);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
-        app.pin_approval_bottom();
         app.set_input_text("1\n2\n3\n4\n5\n6\n7\n8");
         app.push_plain("A long wrapped tool explanation line that takes multiple rows.");
         app.push_plain("Another wrapped line that used to crowd the prompt below the input box.");
-        app.push_plain("🔧 Tool: edit_file");
-        app.push_plain("Execute this tool? (y/n/always):");
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            2,
+            "Approval required · edit_file",
+            "🔧 Tool: edit_file\npath: src/lib.rs\nExecute this tool?",
+        );
+        assert!(app.set_pending_approval(request));
 
-        assert_eq!(app.render_input_height(), 3);
+        assert!(app.render_input_height() > 3);
 
         terminal
             .draw(|frame| app.render(frame))
@@ -2442,29 +2733,15 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let rendered = rendered_rows(buffer).join("\n");
-        let output_rows = rendered_output_rows(&app, buffer).join("\n");
 
-        assert!(rendered.contains("Approval pending"));
-        assert!(output_rows.contains("Execute this tool?"));
-        assert!(output_rows.contains("edit_file"));
+        assert!(rendered.contains("Approval required · edit_file"));
+        assert!(rendered.contains("Execute this tool?"));
+        assert!(rendered.contains("[n/Esc] Deny"));
+        assert!(!rendered.contains("1\n2\n3"));
     }
 
     #[test]
     fn test_render_approval_pin_tracks_prompt_tail_not_transcript_tail() {
-        let _approval_guard = crate::core::approval::approval_test_guard();
-        struct ApprovalPromptCleanup;
-
-        impl Drop for ApprovalPromptCleanup {
-            fn drop(&mut self) {
-                crate::core::approval::set_approval_prompt_active(false);
-                crate::core::approval::clear_approval_prompt_scroll();
-            }
-        }
-
-        let _cleanup = ApprovalPromptCleanup;
-        crate::core::approval::set_approval_prompt_active(true);
-        crate::core::approval::set_approval_prompt_scroll();
-
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
@@ -2473,10 +2750,10 @@ mod tests {
         for index in 0..8 {
             app.push_plain(format!("old line {index}"));
         }
-        app.push_output_with_kind(Line::from("🔧 Tool: edit_file"), BlockKind::UserPrompt);
+        app.push_output_with_kind(Line::from("🔧 Tool: edit_file"), BlockKind::BlockingPrompt);
         app.push_output_with_kind(
             Line::from("Execute this tool? (y/n/always):"),
-            BlockKind::UserPrompt,
+            BlockKind::BlockingPrompt,
         );
         for index in 0..6 {
             app.push_plain(format!("late tool output {index}"));
@@ -3465,54 +3742,25 @@ mod tests {
         assert!(all_rendered.contains("third line"));
     }
 
-    /// Contract test for the "approval prompt invisible after multi-line tool
-    /// output" bug. The reported scenario: Gemini streams a tool result
-    /// (multi-line), then the agent immediately requests approval for the
-    /// next tool. The approval prompt was being scrolled out of view or
-    /// failing to pin to the bottom, so the user could not see it.
-    ///
-    /// This test reproduces the post-`begin_approval_prompt` state, then
-    /// drains both the tool result AND the approval prompt emit, then
-    /// renders, and asserts the approval prompt text appears in the
-    /// visible bottom rows of the output pane.
     #[test]
     fn test_approval_prompt_visible_after_multiline_tool_result() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use std::sync::Arc;
         use tokio::sync::mpsc;
 
-        let _approval_guard = crate::core::approval::approval_test_guard();
-
-        // Simulate the approval prompt being armed BEFORE the emit lands,
-        // which is exactly what begin_approval_prompt() does in
-        // src/core/approval.rs:1027-1038.
-        crate::core::approval::set_approval_prompt_active(true);
-        crate::core::approval::set_approval_prompt_scroll();
-
         let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(16);
-        let writer: Arc<dyn crate::cli::output::OutputWriter> =
-            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 
-        // 80x24 terminal: ~20 rows for the output area, minus 2 for borders
-        // = ~18 rows of content.
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
 
         let mut app = App::new();
-        // Seed enough content to push old lines out of the visible bottom
-        // and force the viewport to scroll.
         for index in 0..50 {
             app.push_plain(format!("old line {}", index));
         }
-        // Initial render to populate cached_wrap_width and viewport state.
         terminal
             .draw(|frame| app.render(frame))
             .expect("initial render should succeed");
 
-        // Simulate a multi-line tool result (e.g. execute_command output).
-        // In production this comes from agent_loop.rs:3018-3028 which emits
-        // one event per line up to MAX_COMMAND_RESULT_DISPLAY_LINES.
         let tool_result_lines = [
             "  ✓ src/foo.rs",
             "    line 1 of output",
@@ -3522,39 +3770,33 @@ mod tests {
             "    line 5 of output",
         ];
         for line in tool_result_lines {
-            writer.emit(crate::cli::output::OutputEvent::dim(line.to_string()));
+            tx.try_send(crate::cli::output::OutputEvent::dim(line.to_string()))
+                .expect("tool output should fit");
         }
 
-        // Simulate the approval prompt emit. The prompt is RawAnsi with a
-        // trailing \n, which ansi_to_ratatui_lines splits into one Line per
-        // visible row. We use a representative multi-line approval prompt
-        // shape (matches the structure from build_tool_approval_prompt).
         let prompt = "\n\
                       \x1b[33m🔧 Tool:\x1b[0m \x1b[1medit_file\x1b[0m\n\
                       \x1b[2m  path: src/baz.rs\x1b[0m\n\
                       Execute this tool? (y/n/always): ";
-        writer.emit(crate::cli::output::OutputEvent::RawAnsi(format!(
-            "{}\n",
-            prompt
-        )));
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            30,
+            "Approval required · edit_file",
+            prompt,
+        );
+        tx.try_send(crate::cli::output::OutputEvent::ApprovalRequested(request))
+            .expect("approval request should fit");
 
-        // Full pipeline: drain + clamp + render. This is what the main
-        // loop does on every tick (interactive.rs:2165-2252).
         crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
         terminal
             .draw(|frame| app.render(frame))
             .expect("post-prompt render should succeed");
 
-        // Assert the scroll mode is ApprovalPinned so the user can't be
-        // scrolled away from the prompt.
         assert_eq!(
             app.scroll_mode,
             ScrollMode::ApprovalPinned,
             "scroll mode must be ApprovalPinned while approval prompt is active"
         );
 
-        // Read the rendered buffer and assert the approval prompt text is
-        // visible in the bottom rows of the output pane.
         let buffer = terminal.backend().buffer().clone();
         let width = buffer.area.width as usize;
         let rows: Vec<String> = buffer
@@ -3563,22 +3805,16 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect();
 
-        // The output pane occupies the upper rows; status bar (1) and
-        // input area (3) are at the bottom. Scan the bottom 15 rows of
-        // the terminal to cover the output pane content above the status/input.
         let output_bottom_rows: Vec<&String> = rows.iter().rev().take(15).collect();
 
-        // The "Execute this tool?" line is the user-visible prompt anchor.
         let has_prompt_question = output_bottom_rows
             .iter()
             .any(|row| row.contains("Execute this tool?"));
 
-        // The tool name "edit_file" should also be visible.
         let has_tool_name = output_bottom_rows
             .iter()
             .any(|row| row.contains("edit_file"));
 
-        // The tool result lines should be visible above the prompt.
         let has_tool_result = output_bottom_rows
             .iter()
             .any(|row| row.contains("line 5 of output"));
@@ -3598,40 +3834,15 @@ mod tests {
             "tool result must remain visible above the prompt. \
              bottom rows: {output_bottom_rows:?}"
         );
-
-        // Teardown: clear the approval state so the test guard's
-        // cleanup sees a clean slate.
-        crate::core::approval::set_approval_prompt_active(false);
-        crate::core::approval::clear_approval_prompt_scroll();
     }
 
-    /// Contract test for the race where the approval scroll flag is set
-    /// (by `begin_approval_prompt`) BEFORE the prompt emit lands in the
-    /// channel. The first drain call should consume the flag and pin;
-    /// the second drain (after the prompt actually arrives) should keep
-    /// the pin via the `is_approval_prompt_active()` branch.
-    ///
-    /// The user reported this exact sequence (multi-line tool output →
-    /// approval prompt) left the prompt invisible. This test pins down
-    /// the expected behavior across the two-drain sequence.
     #[test]
-    fn test_approval_prompt_visible_when_flag_set_before_emit() {
+    fn test_approval_request_becomes_actionable_only_after_render() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use std::sync::Arc;
         use tokio::sync::mpsc;
 
-        let _approval_guard = crate::core::approval::approval_test_guard();
-
-        // Step 1: Begin approval prompt. In production this is what
-        // approval.rs:1035 does — sets the scroll flag BEFORE the
-        // prompt emit lands in the channel.
-        crate::core::approval::set_approval_prompt_active(true);
-        crate::core::approval::set_approval_prompt_scroll();
-
         let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(16);
-        let writer: Arc<dyn crate::cli::output::OutputWriter> =
-            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -3644,51 +3855,29 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("initial render should succeed");
 
-        // Step 2: Multi-line tool result emit.
-        let tool_result_lines = [
-            "  ✓ src/foo.rs",
-            "    line 1 of output",
-            "    line 2 of output",
-            "    line 3 of output",
-            "    line 4 of output",
-        ];
-        for line in tool_result_lines {
-            writer.emit(crate::cli::output::OutputEvent::dim(line.to_string()));
-        }
-
-        // Step 3: First drain — flag is already set, tool result lands.
-        // This should consume the flag and pin.
-        crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
-        assert_eq!(
-            app.scroll_mode,
-            ScrollMode::ApprovalPinned,
-            "first drain must pin the scroll (flag was set before emit)"
-        );
-
-        // Step 4: Prompt emit happens AFTER the first drain (this is the
-        // exact race that begin_approval_prompt creates).
         let prompt = "\n\
                       \x1b[33m🔧 Tool:\x1b[0m \x1b[1medit_file\x1b[0m\n\
                       Execute this tool? (y/n/always): ";
-        writer.emit(crate::cli::output::OutputEvent::RawAnsi(format!(
-            "{}\n",
-            prompt
-        )));
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            31,
+            "Approval required · edit_file",
+            prompt,
+        );
+        tx.try_send(crate::cli::output::OutputEvent::ApprovalRequested(request))
+            .expect("approval request should fit");
 
-        // Step 5: Second drain — flag is already consumed, but
-        // is_approval_prompt_active() is still true, so the else-if
-        // branch should re-pin.
         crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
         assert_eq!(
             app.scroll_mode,
             ScrollMode::ApprovalPinned,
-            "second drain must keep the pin via is_approval_prompt_active()"
+            "a pending approval should pin transcript output"
         );
+        assert!(!app.approval_accepts_input());
 
-        // Step 6: Render and verify the prompt is visible.
         terminal
             .draw(|frame| app.render(frame))
             .expect("post-prompt render should succeed");
+        assert!(app.approval_accepts_input());
 
         let buffer = terminal.backend().buffer().clone();
         let width = buffer.area.width as usize;
@@ -3698,23 +3887,12 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect();
 
-        let output_bottom_rows: Vec<&String> = rows.iter().rev().take(15).collect();
-
-        let has_prompt_question = output_bottom_rows
-            .iter()
-            .any(|row| row.contains("Execute this tool?"));
+        let rendered = rows.join("\n");
 
         assert!(
-            has_prompt_question,
-            "approval prompt must be visible after the two-drain sequence. \
-             This is the exact bug the user reported: multi-line tool output \
-             followed by an approval prompt left the prompt invisible. \
-             bottom rows: {output_bottom_rows:?}"
+            rendered.contains("Execute this tool?"),
+            "approval panel must be visible before accepting input: {rendered}"
         );
-
-        // Teardown.
-        crate::core::approval::set_approval_prompt_active(false);
-        crate::core::approval::clear_approval_prompt_scroll();
     }
 
     /// Regression test for the silent channel-overflow bug. When the
@@ -3953,13 +4131,6 @@ mod tests {
         );
     }
 
-    /// Test that the overflow indicator and an approval prompt
-    /// coexist in the same render frame. The user's original bug
-    /// report was: "approval prompt dropped because channel was full,
-    /// user had to blindly hit y." This test verifies that AFTER
-    /// the channel overflow, when an approval prompt IS emitted and
-    /// drained successfully, both the overflow indicator AND the
-    /// approval prompt are visible.
     #[test]
     fn test_overflow_indicator_persists_during_approval_prompt() {
         use ratatui::Terminal;
@@ -3973,13 +4144,14 @@ mod tests {
         app.model_name = "MiniMax-M3".to_string();
         app.task_id = "01KTPHXKHBJ49KXMAGPAR423BC".to_string();
         app.mode = "ACT".to_string();
-        // Overflow already happened earlier in the session.
         app.output_overflow = true;
         app.output_overflow_count = 3;
-        // An approval prompt was successfully drained and pushed to
-        // the output buffer.
-        app.push_plain("\x1b[33m🔧 Tool:\x1b[0m \x1b[1mexecute_command\x1b[0m".to_string());
-        app.push_plain("Execute this tool? (y/n/always): ".to_string());
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            70,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        assert!(app.set_pending_approval(request));
         app.needs_redraw = true;
 
         terminal
@@ -3994,20 +4166,16 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect();
 
-        // The approval prompt must be in the output pane (rows 0..10).
-        let output_rows: Vec<&String> = rows.iter().take(10).collect();
-        let has_approval = output_rows
-            .iter()
-            .any(|row| row.contains("Execute this tool?"));
+        let has_approval = rows.iter().any(|row| row.contains("Execute this tool?"));
         assert!(
             has_approval,
-            "approval prompt must be visible in the output pane. \
-             output rows: {output_rows:?}"
+            "approval panel must remain visible with an overflow warning: {rows:?}"
         );
 
-        // The status bar must STILL show the overflow indicator (sticky
-        // warning, per the design from commit a1da7ea).
-        let status_row = &rows[10];
+        let status_row = rows
+            .iter()
+            .find(|row| row.contains("output overflow"))
+            .expect("status bar should contain overflow warning");
         assert!(
             status_row.contains("output overflow"),
             "status bar must still show overflow warning during approval prompt. \

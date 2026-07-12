@@ -56,10 +56,11 @@ pub enum OutputEvent {
     /// streamed model text so that `finalize_turn_stream` does not
     /// strip it when re-rendering the turn as markdown.
     TurnIndicator(Line<'static>),
-    /// Signal that an approval prompt was durably dropped. The TUI
-    /// main loop receives this and auto-denies the pending tool
-    /// execution so the agent doesn't hang on a 5-minute timeout.
-    ApprovalDropped,
+    /// A dedicated event prevents approval visibility from depending on
+    /// transcript ordering or `RawAnsi` classification timing.
+    ApprovalRequested(crate::core::approval::ApprovalRequest),
+    /// Prompt identity prevents an old timeout from clearing a newer panel.
+    ApprovalFinished { id: u64 },
 }
 
 impl OutputEvent {
@@ -306,9 +307,14 @@ impl OutputWriter for StderrOutputWriter {
                     }
                 }
             }
+            OutputEvent::ApprovalRequested(request) => {
+                eprintln!("{}", request.details());
+                let _ = std::io::stderr().flush();
+                request.fail("interactive approval UI is unavailable");
+            }
             OutputEvent::TurnEnd { .. }
             | OutputEvent::TurnIndicator(_)
-            | OutputEvent::ApprovalDropped => {}
+            | OutputEvent::ApprovalFinished { .. } => {}
         }
     }
 
@@ -377,6 +383,7 @@ pub struct ChannelOutputWriter {
     tx: mpsc::Sender<OutputEvent>,
     priority_tx: mpsc::UnboundedSender<OutputEvent>,
     priority_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
+    priority_attached: std::sync::atomic::AtomicBool,
     drop_counters: DropCounters,
     overflow_signaled: std::sync::atomic::AtomicBool,
 }
@@ -390,6 +397,7 @@ impl ChannelOutputWriter {
             tx,
             priority_tx,
             priority_rx: std::sync::Mutex::new(Some(priority_rx)),
+            priority_attached: std::sync::atomic::AtomicBool::new(false),
             drop_counters: DropCounters::default(),
             overflow_signaled: std::sync::atomic::AtomicBool::new(false),
         }
@@ -397,15 +405,51 @@ impl ChannelOutputWriter {
 
     #[must_use]
     pub fn take_priority_rx(&self) -> Option<mpsc::UnboundedReceiver<OutputEvent>> {
-        self.priority_rx
+        let receiver = self
+            .priority_rx
             .lock()
             .expect("priority rx mutex poisoned")
-            .take()
+            .take();
+        if receiver.is_some() {
+            self.priority_attached
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        receiver
+    }
+
+    fn fail_control_delivery(&self, event: OutputEvent, reason: &'static str) {
+        if let OutputEvent::ApprovalRequested(request) = event {
+            self.drop_counters
+                .approval_prompt
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.overflow_signaled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            request.fail(reason);
+        }
     }
 }
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
+        if matches!(
+            &event,
+            OutputEvent::ApprovalRequested(_) | OutputEvent::ApprovalFinished { .. }
+        ) {
+            // Approval bypasses transcript backlog so the panel is rendered
+            // before the user can accidentally act on an unseen request.
+            if !self
+                .priority_attached
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.fail_control_delivery(event, "interactive approval receiver is not attached");
+                return;
+            }
+            if let Err(err) = self.priority_tx.send(event) {
+                self.fail_control_delivery(err.0, "interactive approval receiver is closed");
+            }
+            return;
+        }
+
         let is_lossy_update = matches!(event, OutputEvent::ModelUpdateLine(_));
         if let Err(err) = self.tx.try_send(event) {
             if is_lossy_update {
@@ -418,10 +462,7 @@ impl OutputWriter for ChannelOutputWriter {
             let dropped = err.into_inner();
             let is_critical = matches!(
                 &dropped,
-                OutputEvent::TurnEnd { .. }
-                    | OutputEvent::Completion(_)
-                    | OutputEvent::ErrorBox(_)
-                    | OutputEvent::ApprovalDropped
+                OutputEvent::TurnEnd { .. } | OutputEvent::Completion(_) | OutputEvent::ErrorBox(_)
             );
 
             if is_critical {
@@ -436,44 +477,24 @@ impl OutputWriter for ChannelOutputWriter {
             // full. Track for diagnostics so the status bar can surface
             // the count to the user.
             let counters = &self.drop_counters;
-            let is_approval_drop = matches!(&dropped, OutputEvent::RawAnsi(_))
-                && crate::core::approval::is_approval_prompt_active();
-            if is_approval_drop {
-                // An approval prompt was emitted but the RawAnsi that
-                // carries it was dropped. Auto-deny so the agent loop
-                // unblocks from recv_timeout instead of hanging.
-                counters
-                    .approval_prompt
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(sender) = crate::core::approval::take_approval_sender() {
-                    let _ = sender.send(crate::core::approval::ApprovalResult::Denied);
+            match &dropped {
+                OutputEvent::Line(_) => {
+                    counters
+                        .model_text
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            } else {
-                match &dropped {
-                    OutputEvent::Line(_) => {
-                        counters
-                            .model_text
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    OutputEvent::ToolOutputLine(_)
-                    | OutputEvent::ToolHeaderLine(_)
-                    | OutputEvent::CommandHeaderLine(_)
-                    | OutputEvent::CommandOutputLine(_) => {
-                        counters
-                            .tool_output
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    OutputEvent::RawAnsi(_) => {
-                        // Non-approval RawAnsi is non-critical; track as other.
-                        counters
-                            .other
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    _ => {
-                        counters
-                            .other
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                OutputEvent::ToolOutputLine(_)
+                | OutputEvent::ToolHeaderLine(_)
+                | OutputEvent::CommandHeaderLine(_)
+                | OutputEvent::CommandOutputLine(_) => {
+                    counters
+                        .tool_output
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {
+                    counters
+                        .other
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             // Set the overflow signal so the TUI can surface a
@@ -668,45 +689,80 @@ mod tests {
             .expect("priority receiver should be available");
 
         writer.emit(OutputEvent::plain("line 1"));
-        writer.emit(OutputEvent::plain("line 2"));
-        writer.emit(OutputEvent::plain("line 3"));
+        let (request, response_rx) = crate::core::approval::approval_request_for_test(
+            50,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        writer.emit(OutputEvent::ApprovalRequested(request));
 
-        let approval_prompt = OutputEvent::RawAnsi(
-            "\n\x1b[33m🔧 Tool:\x1b[0m \x1b[1mexecute_command\x1b[0m\n\
-             Execute this tool? (y/n/always): "
-                .to_string(),
-        );
-        writer.emit(approval_prompt.clone());
+        let event = priority_rx
+            .try_recv()
+            .expect("approval should bypass the saturated transcript queue");
+        let OutputEvent::ApprovalRequested(request) = event else {
+            panic!("expected approval request in control lane");
+        };
+        assert!(request.details().contains("Execute this tool?"));
+        assert_eq!(request.choices().len(), 3);
+        assert!(request.respond(crate::core::approval::ApprovalResult::Denied));
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(crate::core::approval::ApprovalResponse::Decision(
+                crate::core::approval::ApprovalResult::Denied
+            ))
+        ));
+        assert_eq!(writer.dropped_count(), 0);
+        assert!(!writer.take_overflow_signal());
+    }
 
-        let priority_events: Vec<OutputEvent> =
-            std::iter::from_fn(|| priority_rx.try_recv().ok()).collect();
+    #[test]
+    fn test_approval_request_fails_closed_without_attached_ui() {
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        // Approval prompts are no longer sent to the priority lane. They are
-        // dropped from the full channel and auto-denied via take_approval_sender().
-        // The priority lane should be empty because the approval prompt was
-        // non-critical and dropped.
-        assert!(
-            priority_events.is_empty(),
-            "approval prompt should not be in priority lane (auto-denied instead)"
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let (request, response_rx) = crate::core::approval::approval_request_for_test(
+            51,
+            "Approval required · edit_file",
+            "Approve edit?",
         );
-        // The dropped count should be > 0 because the approval prompt
-        // was dropped from the full channel.
-        assert!(
-            writer.dropped_count() > 0,
-            "approval prompt drop should be counted"
+
+        writer.emit(OutputEvent::ApprovalRequested(request));
+
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(crate::core::approval::ApprovalResponse::Unavailable(reason))
+                if reason.contains("not attached")
+        ));
+        assert_eq!(writer.dropped_count(), 1);
+        assert!(writer.take_overflow_signal());
+    }
+
+    #[test]
+    fn test_approval_request_fails_closed_after_ui_disconnects() {
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        drop(priority_rx);
+        let (request, response_rx) = crate::core::approval::approval_request_for_test(
+            52,
+            "Approval required · execute_command",
+            "Execute command?",
         );
-        // Overflow signal fires when the main channel is full, even if
-        // critical events are preserved via the priority lane. This
-        // ensures the status bar surfaces the saturation to the user.
-        assert!(
-            writer.take_overflow_signal(),
-            "overflow should be signaled when main channel is saturated"
-        );
-        // Non-critical events dropped from the full channel are tracked.
-        assert!(
-            writer.dropped_count() >= 2,
-            "non-critical events lost to the full channel should be counted"
-        );
+
+        writer.emit(OutputEvent::ApprovalRequested(request));
+
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(crate::core::approval::ApprovalResponse::Unavailable(reason))
+                if reason.contains("closed")
+        ));
+        assert_eq!(writer.dropped_count(), 1);
+        assert!(writer.take_overflow_signal());
     }
 
     #[test]
