@@ -4,6 +4,7 @@
 //! and edit statistics for display to the user.
 
 use crate::core::tools::SnedTool;
+use std::collections::HashSet;
 
 pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> String {
     let tool = SnedTool::from_name(tool_name);
@@ -137,26 +138,83 @@ pub fn path_from_read_file_header(text: &str) -> Option<&str> {
     }
 }
 
-/// Normalizes a path for comparison: extracts the last path component (filename)
-/// to handle both absolute paths from read_file headers and relative paths from edit_file.
-/// E.g. "/foo/bar/baz.rs" and "baz.rs" both normalize to "baz.rs"
+/// Preserves path components so files with duplicate basenames remain distinguishable.
 #[must_use]
 pub fn normalize_path_for_matching(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string())
+    let path = path.replace('\\', "/");
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." if components.last().is_some_and(|last| *last != "..") => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    components.join("/")
+}
+
+fn path_components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+fn unique_paths_with_basename(paths: &[String], basename: &str) -> usize {
+    paths
+        .iter()
+        .map(|path| normalize_path_for_matching(path))
+        .filter(|path| path.rsplit('/').next() == Some(basename))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn paths_match(
+    read_path: &str,
+    edited_path: &str,
+    known_read_paths: &[String],
+    edited_paths: &[String],
+) -> bool {
+    let read_path = normalize_path_for_matching(read_path);
+    let edited_path = normalize_path_for_matching(edited_path);
+    if read_path == edited_path {
+        return true;
+    }
+
+    let read_components = path_components(&read_path);
+    let edited_components = path_components(&edited_path);
+    let qualified_suffix = (edited_components.len() > 1
+        && read_components.ends_with(&edited_components))
+        || (read_components.len() > 1 && edited_components.ends_with(&read_components));
+    if qualified_suffix {
+        return true;
+    }
+
+    let Some(read_basename) = read_components.last() else {
+        return false;
+    };
+    if edited_components.last() != Some(read_basename) {
+        return false;
+    }
+
+    unique_paths_with_basename(known_read_paths, read_basename) == 1
+        && unique_paths_with_basename(edited_paths, read_basename) == 1
 }
 
 #[must_use]
-pub fn summarize_matching_sections(text: &str, edited_paths: &[String]) -> String {
+pub fn summarize_matching_sections(
+    text: &str,
+    edited_paths: &[String],
+    known_read_paths: &[String],
+) -> String {
     let sections: Vec<&str> = text.split("\n---\n").collect();
     let mut result = Vec::new();
     for section in &sections {
-        let matches = path_from_read_file_header(section).is_some_and(|p| {
-            let normalized_p = normalize_path_for_matching(p);
-            edited_paths
-                .iter()
-                .any(|ep| normalize_path_for_matching(ep) == normalized_p)
+        let matches = path_from_read_file_header(section).is_some_and(|read_path| {
+            edited_paths.iter().any(|edited_path| {
+                paths_match(read_path, edited_path, known_read_paths, edited_paths)
+            })
         });
         if matches {
             result.push(summarize_single_section(section));

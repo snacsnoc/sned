@@ -68,7 +68,7 @@ use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
 use crate::core::tool_output::{
     extract_edit_stats_detailed, format_heat_map, format_tool_result, format_tool_summary,
-    normalize_path_for_matching, path_from_read_file_header, summarize_matching_sections,
+    path_from_read_file_header, summarize_matching_sections,
 };
 
 const MAX_TOOL_RESULT_DISPLAY_LINES: usize = 5;
@@ -3397,42 +3397,37 @@ impl AgentLoop {
                 let edited_paths: Vec<String> =
                     edit_files.iter().map(|(p, _, _)| p.clone()).collect();
                 let mut history = self.conversation_history.lock().await;
+                let mut known_read_paths = Vec::new();
+                for msg in history.iter() {
+                    if let MessageContent::UserBlocks(blocks) = &msg.content {
+                        for block in blocks {
+                            if let UserContentBlock::ToolResult(tr) = block
+                                && let ToolResultContent::Text(text) = &tr.content
+                            {
+                                known_read_paths.extend(
+                                    text.split("\n---\n")
+                                        .filter_map(path_from_read_file_header)
+                                        .map(String::from),
+                                );
+                            }
+                        }
+                    }
+                }
                 for msg in history.iter_mut().rev() {
                     if let MessageContent::UserBlocks(ref mut blocks) = msg.content {
                         for block in blocks.iter_mut() {
-                            let needs_summary = match block {
-                                UserContentBlock::ToolResult(tr) => {
-                                    if let ToolResultContent::Text(ref text) = tr.content {
-                                        if text.contains("[File: ")
-                                            || text.starts_with("[File Hash:")
-                                        {
-                                            let sections: Vec<&str> =
-                                                text.split("\n---\n").collect();
-                                            sections.iter().any(|sec| {
-                                                path_from_read_file_header(sec).is_some_and(|p| {
-                                                    let normalized_p =
-                                                        normalize_path_for_matching(p);
-                                                    edited_paths.iter().any(|ep| {
-                                                        normalize_path_for_matching(ep)
-                                                            == normalized_p
-                                                    })
-                                                })
-                                            })
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                }
-                                _ => false,
-                            };
-                            if needs_summary
-                                && let UserContentBlock::ToolResult(tr) = block
-                                && let ToolResultContent::Text(ref text) = tr.content
+                            if let UserContentBlock::ToolResult(tr) = block
+                                && let ToolResultContent::Text(text) = &tr.content
+                                && text.contains("[File: ")
                             {
-                                let new_text = summarize_matching_sections(text, &edited_paths);
-                                tr.content = ToolResultContent::Text(new_text);
+                                let new_text = summarize_matching_sections(
+                                    text,
+                                    &edited_paths,
+                                    &known_read_paths,
+                                );
+                                if new_text != *text {
+                                    tr.content = ToolResultContent::Text(new_text);
+                                }
                             }
                         }
                     }
@@ -4431,7 +4426,7 @@ fn truncate_old_thinking_blocks(history: &mut [StorageMessage]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::tool_output::summarize_single_section;
+    use crate::core::tool_output::{normalize_path_for_matching, summarize_single_section};
     use crate::providers::{
         ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCallFunction,
         ApiStreamToolCallsChunk,
@@ -6965,7 +6960,8 @@ mod tests {
         let text =
             "[File: src/foo.rs, Hash: aaa]\n1§foo\n---\n[File: src/bar.rs, Hash: bbb]\n1§bar";
         let edited = vec!["src/foo.rs".to_string()];
-        let result = summarize_matching_sections(text, &edited);
+        let known = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
+        let result = summarize_matching_sections(text, &edited, &known);
         assert!(result.contains("Hash: aaa"));
         assert!(
             result.contains("1§foo"),
@@ -6979,7 +6975,8 @@ mod tests {
         let text =
             "[File: src/foo.rs, Hash: aaa]\n1§foo\n---\n[File: src/bar.rs, Hash: bbb]\n1§bar";
         let edited = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
-        let result = summarize_matching_sections(text, &edited);
+        let known = edited.clone();
+        let result = summarize_matching_sections(text, &edited, &known);
         assert!(
             result.contains("1§foo"),
             "pruned section preserves anchored lines"
@@ -6995,37 +6992,69 @@ mod tests {
     #[test]
     fn test_normalize_path_for_matching() {
         assert_eq!(normalize_path_for_matching("main.rs"), "main.rs");
-        assert_eq!(normalize_path_for_matching("/foo/bar/main.rs"), "main.rs");
+        assert_eq!(
+            normalize_path_for_matching("/foo/bar/main.rs"),
+            "foo/bar/main.rs"
+        );
         assert_eq!(
             normalize_path_for_matching("/Users/test/project/main.c"),
-            "main.c"
+            "Users/test/project/main.c"
         );
-        assert_eq!(normalize_path_for_matching("src/lib.rs"), "lib.rs");
+        assert_eq!(normalize_path_for_matching("./src/lib.rs"), "src/lib.rs");
+        assert_eq!(
+            normalize_path_for_matching(r"src\nested\lib.rs"),
+            "src/nested/lib.rs"
+        );
     }
 
     #[test]
     fn test_path_matching_with_absolute_and_relative() {
-        // Absolute path from read_file header vs relative path from edit_file
-        let header_path = "/Users/easto/test/tictactoe/main.c";
-        let edited_path = "main.c";
-        assert_eq!(
-            normalize_path_for_matching(header_path),
-            normalize_path_for_matching(edited_path)
-        );
+        let text = "[File: /Users/easto/test/tictactoe/main.c, Hash: abc123]\n1§hello";
+        let edited = vec!["tictactoe/main.c".to_string()];
+        let known = vec!["/Users/easto/test/tictactoe/main.c".to_string()];
+        let result = summarize_matching_sections(text, &edited, &known);
+        assert!(result.starts_with("[Context pruned:"));
     }
 
     #[test]
     fn test_summarize_matching_sections_with_mixed_paths() {
-        // read_file header has absolute path, edit_file tracks relative
         let text = "[File: /Users/test/project/main.c, Hash: abc123]\n1§hello\n2§world";
         let edited = vec!["main.c".to_string()];
-        let result = summarize_matching_sections(text, &edited);
-        // Pruned section preserves hash-anchored lines for use with edit_file
+        let known = vec!["/Users/test/project/main.c".to_string()];
+        let result = summarize_matching_sections(text, &edited, &known);
         assert!(
             result.contains("1§hello"),
             "pruned section preserves anchored lines"
         );
         assert!(result.contains("Hash: abc123"));
+    }
+
+    #[test]
+    fn test_summarize_matching_sections_disambiguates_duplicate_basenames() {
+        let text = "[File: /workspace/src/config.rs, Hash: aaa]\n1§source\n---\n[File: /workspace/tests/config.rs, Hash: bbb]\n1§test";
+        let edited = vec!["src/config.rs".to_string()];
+        let known = vec![
+            "/workspace/src/config.rs".to_string(),
+            "/workspace/tests/config.rs".to_string(),
+        ];
+
+        let result = summarize_matching_sections(text, &edited, &known);
+
+        assert_eq!(result.matches("[Context pruned:").count(), 1);
+        assert!(!result.contains("[File: /workspace/src/config.rs"));
+        assert!(result.contains("[File: /workspace/tests/config.rs"));
+    }
+
+    #[test]
+    fn test_summarize_matching_sections_rejects_ambiguous_filename_fallback() {
+        let text = "[File: /workspace/src/config.rs, Hash: aaa]\n1§source";
+        let edited = vec!["config.rs".to_string()];
+        let known = vec![
+            "/workspace/src/config.rs".to_string(),
+            "/workspace/tests/config.rs".to_string(),
+        ];
+
+        assert_eq!(summarize_matching_sections(text, &edited, &known), text);
     }
 
     #[tokio::test]
