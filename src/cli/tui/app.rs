@@ -15,6 +15,10 @@ use ratatui::{
     },
 };
 use std::collections::VecDeque;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
@@ -116,6 +120,163 @@ struct PendingApproval {
     viewport_rows: usize,
 }
 
+enum ScrollbackCommand {
+    Append(String),
+    Flush(std_mpsc::Sender<io::Result<()>>),
+    Clear(std_mpsc::Sender<io::Result<()>>),
+    Shutdown(std_mpsc::Sender<io::Result<()>>),
+}
+
+struct ScrollbackWriter {
+    path: PathBuf,
+    sender: std_mpsc::Sender<ScrollbackCommand>,
+    errors: std_mpsc::Receiver<String>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ScrollbackWriter {
+    fn start(path: PathBuf) -> io::Result<Self> {
+        let (sender, receiver) = std_mpsc::channel();
+        let (error_sender, errors) = std_mpsc::channel();
+        let worker_path = path.clone();
+        let handle = std::thread::Builder::new()
+            .name("sned-scrollback-writer".to_string())
+            .spawn(move || scrollback_writer_loop(&worker_path, receiver, &error_sender))?;
+        Ok(Self {
+            path,
+            sender,
+            errors,
+            handle: Some(handle),
+        })
+    }
+
+    fn append(&self, batch: String) -> Result<(), String> {
+        match self.sender.send(ScrollbackCommand::Append(batch)) {
+            Ok(()) => Ok(()),
+            Err(std_mpsc::SendError(ScrollbackCommand::Append(batch))) => Err(batch),
+            Err(_) => unreachable!("append send must return the append command"),
+        }
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        let (sender, receiver) = std_mpsc::channel();
+        self.sender
+            .send(ScrollbackCommand::Flush(sender))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "scrollback writer stopped"))?;
+        receiver
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "scrollback writer stopped"))?
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        let (sender, receiver) = std_mpsc::channel();
+        self.sender
+            .send(ScrollbackCommand::Clear(sender))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "scrollback writer stopped"))?;
+        receiver
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "scrollback writer stopped"))?
+    }
+
+    fn take_error(&self) -> Option<String> {
+        let mut latest = None;
+        while let Ok(error) = self.errors.try_recv() {
+            latest = Some(error);
+        }
+        latest
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        let (sender, receiver) = std_mpsc::channel();
+        let result = match self.sender.send(ScrollbackCommand::Shutdown(sender)) {
+            Ok(()) => receiver.recv().unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "scrollback writer stopped",
+                ))
+            }),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "scrollback writer stopped",
+            )),
+        };
+        if handle.join().is_err() {
+            return Err(io::Error::other("scrollback writer panicked"));
+        }
+        result
+    }
+}
+
+fn scrollback_writer_loop(
+    path: &Path,
+    receiver: std_mpsc::Receiver<ScrollbackCommand>,
+    error_sender: &std_mpsc::Sender<String>,
+) {
+    let mut pending = Vec::new();
+    while let Ok(command) = receiver.recv() {
+        match command {
+            ScrollbackCommand::Append(batch) => {
+                pending.extend_from_slice(batch.as_bytes());
+                if let Err(error) = write_scrollback_pending(path, &mut pending) {
+                    let _ = error_sender.send(error.to_string());
+                }
+            }
+            ScrollbackCommand::Flush(sender) => {
+                let _ = sender.send(write_scrollback_pending(path, &mut pending));
+            }
+            ScrollbackCommand::Clear(sender) => {
+                pending.clear();
+                let result = match std::fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                };
+                let _ = sender.send(result);
+            }
+            ScrollbackCommand::Shutdown(sender) => {
+                let _ = sender.send(write_scrollback_pending(path, &mut pending));
+                return;
+            }
+        }
+    }
+    let _ = write_scrollback_pending(path, &mut pending);
+}
+
+fn write_scrollback_pending(path: &Path, pending: &mut Vec<u8>) -> io::Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut written = 0;
+    while written < pending.len() {
+        match file.write(&pending[written..]) {
+            Ok(0) => {
+                pending.drain(..written);
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write scrollback batch",
+                ));
+            }
+            Ok(count) => written = written.saturating_add(count),
+            Err(error) => {
+                pending.drain(..written);
+                return Err(error);
+            }
+        }
+    }
+    pending.clear();
+    Ok(())
+}
+
 /// Application state for the ratatui TUI.
 pub struct App {
     /// Output lines buffer (agent output, submitted prompts, etc.)
@@ -133,7 +294,7 @@ pub struct App {
     /// Drives the "Reasoning..." indicator rendered above the status bar.
     pub reasoning_active: bool,
     /// Manual scroll offset (top-of-viewport line index)
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     /// Current output scroll behavior
     pub scroll_mode: ScrollMode,
     /// Whether the next draw should re-sync layout from the terminal size.
@@ -186,6 +347,7 @@ pub struct App {
     pub scrollback_pending: String,
     /// Number of buffered lines waiting in `scrollback_pending`.
     pub scrollback_pending_lines: usize,
+    scrollback_writer: Option<ScrollbackWriter>,
     /// True when the user is viewing scrollback history.
     pub in_scrollback: bool,
     /// Session elapsed time for status bar
@@ -577,6 +739,7 @@ impl App {
             scrollback_count: 0,
             scrollback_pending: String::new(),
             scrollback_pending_lines: 0,
+            scrollback_writer: None,
             in_scrollback: false,
             mention_search_generation: 0,
             mention_search_tx: None,
@@ -1092,41 +1255,105 @@ impl App {
         self.scroll_offset = 0;
     }
 
-    pub fn flush_scrollback_pending(&mut self) -> std::io::Result<()> {
-        if self.scrollback_pending.is_empty() {
+    pub fn start_scrollback_writer(&mut self) -> io::Result<()> {
+        self.ensure_scrollback_writer()
+    }
+
+    fn ensure_scrollback_writer(&mut self) -> io::Result<()> {
+        let Some(path) = self.scrollback_file.clone() else {
+            return Ok(());
+        };
+        if self
+            .scrollback_writer
+            .as_ref()
+            .is_some_and(|writer| writer.path == path)
+        {
             return Ok(());
         }
-
-        if let Some(ref file_path) = self.scrollback_file {
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(file_path)?;
-            std::io::Write::write_all(&mut file, self.scrollback_pending.as_bytes())?;
+        if let Some(mut writer) = self.scrollback_writer.take() {
+            writer.shutdown()?;
         }
-
-        self.scrollback_pending.clear();
-        self.scrollback_pending_lines = 0;
+        self.scrollback_writer = Some(ScrollbackWriter::start(path)?);
         Ok(())
     }
 
-    pub fn flush_scrollback_pending_if_needed(&mut self) -> std::io::Result<()> {
-        if self.scrollback_pending_lines >= SCROLLBACK_FLUSH_LINE_BATCH {
-            self.flush_scrollback_pending()?;
+    fn enqueue_scrollback_pending(&mut self) -> io::Result<()> {
+        if self.scrollback_pending.is_empty() {
+            return Ok(());
+        }
+        if self.scrollback_file.is_none() {
+            self.scrollback_pending.clear();
+            self.scrollback_pending_lines = 0;
+            return Ok(());
+        }
+        self.ensure_scrollback_writer()?;
+        let batch = std::mem::take(&mut self.scrollback_pending);
+        let line_count = self.scrollback_pending_lines;
+        self.scrollback_pending_lines = 0;
+        if let Some(writer) = self.scrollback_writer.as_ref()
+            && let Err(batch) = writer.append(batch)
+        {
+            self.scrollback_pending = batch;
+            self.scrollback_pending_lines = line_count;
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "scrollback writer stopped",
+            ));
         }
         Ok(())
+    }
+
+    pub fn flush_scrollback_pending(&mut self) -> io::Result<()> {
+        self.enqueue_scrollback_pending()?;
+        if let Some(writer) = self.scrollback_writer.as_ref() {
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_scrollback_pending_if_needed(&mut self) -> io::Result<()> {
+        if self.scrollback_pending_lines >= SCROLLBACK_FLUSH_LINE_BATCH {
+            self.enqueue_scrollback_pending()?;
+        }
+        Ok(())
+    }
+
+    pub fn take_scrollback_writer_error(&self) -> Option<String> {
+        self.scrollback_writer
+            .as_ref()
+            .and_then(ScrollbackWriter::take_error)
+    }
+
+    pub fn shutdown_scrollback_writer(&mut self) -> io::Result<()> {
+        self.enqueue_scrollback_pending()?;
+        if let Some(mut writer) = self.scrollback_writer.take() {
+            writer.shutdown()?;
+        }
+        Ok(())
+    }
+
+    fn clear_scrollback_storage(&mut self) -> io::Result<()> {
+        let result = if self.scrollback_file.is_none() {
+            Ok(())
+        } else {
+            self.ensure_scrollback_writer().and_then(|()| {
+                self.scrollback_writer
+                    .as_ref()
+                    .map_or(Ok(()), ScrollbackWriter::clear)
+            })
+        };
+        self.scrollback_pending.clear();
+        self.scrollback_pending_lines = 0;
+        result
     }
 
     /// Load scrollback content from the scrollback file and merge with
     /// the current buffer.  The file stores one raw text line per line;
     /// we reconstruct Line objects and prepend them to output_lines.
-    pub fn enter_scrollback(&mut self) {
+    pub fn enter_scrollback(&mut self) -> io::Result<()> {
+        self.flush_scrollback_pending()?;
         self.in_scrollback = true;
         self.needs_redraw = true;
-        let _ = self.flush_scrollback_pending();
 
         if let Some(ref file_path) = self.scrollback_file
             && let Ok(content) = std::fs::read_to_string(file_path)
@@ -1137,14 +1364,12 @@ impl App {
                 scrollback_lines.push_back(Line::from(line.to_string()));
                 scrollback_kinds.push_back(BlockKind::ToolOutput);
             }
-            // Prepend scrollback content before current session content
             let mut new_lines: VecDeque<Line<'static>> = VecDeque::new();
             let mut new_kinds: VecDeque<BlockKind> = VecDeque::new();
             for line in &scrollback_lines {
                 new_lines.push_back(line.clone());
                 new_kinds.push_back(BlockKind::ToolOutput);
             }
-            // Insert divider line between scrollback and session content
             if !self.output_lines.is_empty() {
                 let divider = Line::from("─".repeat(40));
                 new_lines.push_back(divider);
@@ -1161,40 +1386,37 @@ impl App {
             self.cached_wrap_width = None;
             self.cached_visible_window = None;
         }
-        // Reset scroll to bottom of combined buffer
         self.scroll_mode = ScrollMode::Auto;
         self.scroll_offset = 0;
+        Ok(())
     }
 
     /// Exit scrollback mode: clear the scrollback file, reset buffer to
     /// the original session content, and return to bottom.
-    pub fn exit_scrollback(&mut self) {
+    pub fn exit_scrollback(&mut self) -> io::Result<()> {
+        let result = self.clear_scrollback_storage();
         self.in_scrollback = false;
         self.needs_redraw = true;
-        // Clear the scrollback file - history was seen
-        if let Some(ref file_path) = self.scrollback_file {
-            let _ = std::fs::remove_file(file_path);
-        }
         self.scrollback_count = 0;
-        self.scrollback_pending.clear();
-        self.scrollback_pending_lines = 0;
         self.cached_wrap_width = None;
         self.cached_visible_window = None;
         self.scroll_mode = ScrollMode::Auto;
         self.scroll_offset = 0;
+        result
     }
 
     /// Toggle between normal and scrollback modes.
-    pub fn toggle_scrollback(&mut self) {
+    pub fn toggle_scrollback(&mut self) -> io::Result<()> {
         if self.in_scrollback {
-            self.exit_scrollback();
+            self.exit_scrollback()
         } else {
-            self.enter_scrollback();
+            self.enter_scrollback()
         }
     }
 
     /// Clear all output and reset the visual-row cache.
-    pub fn clear_output(&mut self) {
+    pub fn clear_output(&mut self) -> io::Result<()> {
+        let result = self.clear_scrollback_storage();
         self.needs_redraw = true;
         self.output_lines.clear();
         self.output_line_kinds.clear();
@@ -1210,8 +1432,7 @@ impl App {
         self.cached_visible_window = None;
         self.in_scrollback = false;
         self.scrollback_count = 0;
-        self.scrollback_pending.clear();
-        self.scrollback_pending_lines = 0;
+        result
     }
 
     /// Drain output from the given index onward and keep the visual-row cache in sync.
@@ -1318,19 +1539,25 @@ impl App {
             return;
         }
 
-        let max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height) as isize;
-        let next = (self.scroll_offset as isize + delta).clamp(0, max_offset);
-        self.scroll_offset = next as u16;
+        let max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height);
+        self.scroll_offset = if delta.is_negative() {
+            self.scroll_offset.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.scroll_offset
+                .saturating_add(delta as usize)
+                .min(max_offset)
+        };
         self.clamp_to_content();
     }
 
     pub fn scroll_pages(&mut self, delta_pages: isize) {
         self.needs_redraw = true;
         let page_height = self.last_content_height.saturating_sub(1).max(1);
-        self.scroll_lines(delta_pages * page_height as isize);
+        let page_height = page_height.min(isize::MAX as usize) as isize;
+        self.scroll_lines(delta_pages.saturating_mul(page_height));
     }
 
-    pub fn resolved_scroll_y_for(&self, total_lines: usize, content_height: usize) -> u16 {
+    pub fn resolved_scroll_y_for(&self, total_lines: usize, content_height: usize) -> usize {
         let max_offset = Self::max_scroll_offset_for(total_lines, content_height);
         match self.scroll_mode {
             ScrollMode::Auto | ScrollMode::ApprovalPinned => max_offset,
@@ -1343,7 +1570,7 @@ impl App {
         wrap_width: usize,
         total_rows: usize,
         content_height: usize,
-    ) -> u16 {
+    ) -> usize {
         if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
             return self.resolved_scroll_y_for(total_rows, content_height);
         }
@@ -1355,7 +1582,7 @@ impl App {
 
         prompt_tail_row
             .saturating_sub(content_height)
-            .min(max_offset as usize) as u16
+            .min(max_offset)
     }
 
     fn enter_manual_mode(&mut self, total_rows: usize) -> bool {
@@ -1371,8 +1598,12 @@ impl App {
         }
     }
 
-    fn max_scroll_offset_for(total_lines: usize, content_height: usize) -> u16 {
-        total_lines.saturating_sub(content_height) as u16
+    fn max_scroll_offset_for(total_lines: usize, content_height: usize) -> usize {
+        total_lines.saturating_sub(content_height)
+    }
+
+    fn terminal_scroll_offset(offset: usize) -> u16 {
+        offset.min(u16::MAX as usize) as u16
     }
 
     fn last_blocking_prompt_tail_row(&self, wrap_width: usize) -> Option<usize> {
@@ -1760,7 +1991,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .scroll((scroll_y.min(u16::MAX as usize) as u16, 0)),
+                .scroll((Self::terminal_scroll_offset(scroll_y), 0)),
             detail_area,
         );
 
@@ -1929,9 +2160,15 @@ impl App {
         let _ = self.total_visual_rows(wrap_width);
         // +2 accounts for top and bottom borders of the Block widget.
         let bottom_height: u16 = if has_error {
-            ((self.cached_error_rows + 2) as u16).min(output_area.height)
+            self.cached_error_rows
+                .saturating_add(2)
+                .min(u16::MAX as usize)
+                .min(output_area.height as usize) as u16
         } else if has_completion {
-            ((self.cached_completion_rows + 2) as u16).min(output_area.height)
+            self.cached_completion_rows
+                .saturating_add(2)
+                .min(u16::MAX as usize)
+                .min(output_area.height as usize) as u16
         } else {
             0
         };
@@ -1972,7 +2209,7 @@ impl App {
             .saturating_sub(self.cached_error_rows);
         let scroll_y = self.resolved_output_scroll_y_for(wrap_width, output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
-            self.visible_output_window(wrap_width, scroll_y as usize, content_height);
+            self.visible_output_window(wrap_width, scroll_y, content_height);
 
         // Render the full transcript. Cached row counts keep scroll math cheap,
         // but slicing the render buffer can clip wrapped prompt text.
@@ -1985,7 +2222,7 @@ impl App {
             let visible_lines = self.collect_output_rows_range(start_idx, visible_count);
             let output = Paragraph::new(visible_lines)
                 .wrap(Wrap { trim: false })
-                .scroll((visible_scroll_y as u16, 0))
+                .scroll((Self::terminal_scroll_offset(visible_scroll_y), 0))
                 .block(
                     theme::border_block(" sned ")
                         .padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
@@ -2049,7 +2286,7 @@ impl App {
             .scrollbar_state
             .content_length(output_rows)
             .viewport_content_length(content_height.max(1).min(output_rows))
-            .position(scroll_y.min(output_rows as u16) as usize);
+            .position(scroll_y.min(output_rows));
         frame.render_stateful_widget(
             Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
@@ -2382,8 +2619,8 @@ mod tests {
 
     #[test]
     fn scroll_mode_transition_table() {
-        let max_offset = 15u16; // make_scrolling_app(20, 5) → max_offset = 15
-        let cases: &[(ScrollMode, u16, ScrollMode, &str)] = &[
+        let max_offset = 15usize;
+        let cases: &[(ScrollMode, usize, ScrollMode, &str)] = &[
             // Manual at exact bottom → Auto
             (
                 ScrollMode::Manual,
@@ -2449,8 +2686,49 @@ mod tests {
     }
 
     #[test]
+    fn test_scroll_offsets_remain_full_width_until_terminal_boundary() {
+        let total_rows = u16::MAX as usize + 4_096;
+        let content_height = 24;
+        let max_offset = total_rows - content_height;
+        let mut app = App::new();
+
+        assert_eq!(
+            App::max_scroll_offset_for(total_rows, content_height),
+            max_offset
+        );
+        assert_eq!(
+            app.resolved_scroll_y_for(total_rows, content_height),
+            max_offset
+        );
+
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = max_offset - 1;
+        assert_eq!(
+            app.resolved_scroll_y_for(total_rows, content_height),
+            max_offset - 1
+        );
+        assert_eq!(App::terminal_scroll_offset(max_offset), u16::MAX);
+    }
+
+    #[test]
+    fn test_large_manual_scroll_does_not_wrap() {
+        let mut app = App::new();
+        app.set_content_height(20);
+        app.set_content_width(80);
+        let total_rows = u16::MAX as usize + 2_048;
+        app.cached_visual_rows = total_rows;
+        app.cached_wrap_width = Some(app.last_wrap_width());
+
+        app.scroll_lines(-1);
+
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, total_rows - 21);
+    }
+
+    #[test]
     fn test_cached_visual_rows_tracks_push_clear_and_drain() {
         let mut app = App::new();
+        app.scrollback_file = None;
         app.set_content_width(24);
         let wrap_width = app.last_wrap_width();
 
@@ -2475,7 +2753,7 @@ mod tests {
         let drained_total = app.total_visual_rows(wrap_width);
         assert_eq!(app.cached_visual_rows, drained_total);
 
-        app.clear_output();
+        app.clear_output().unwrap();
         assert_eq!(app.total_visual_rows(wrap_width), 0);
         assert_eq!(app.cached_visual_rows, 0);
     }
@@ -4521,6 +4799,94 @@ mod tests {
         let _ = std::fs::remove_dir(&tmp_dir);
     }
 
+    #[test]
+    fn test_scrollback_batches_preserve_order_in_background_writer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let mut app = App::new();
+        app.scrollback_file = Some(file_path.clone());
+        app.scrollback_pending = "first\n".repeat(SCROLLBACK_FLUSH_LINE_BATCH);
+        app.scrollback_pending_lines = SCROLLBACK_FLUSH_LINE_BATCH;
+
+        app.flush_scrollback_pending_if_needed().unwrap();
+        assert!(app.scrollback_pending.is_empty());
+        app.scrollback_pending = "last\n".to_string();
+        app.scrollback_pending_lines = 1;
+        app.flush_scrollback_pending().unwrap();
+
+        let content = std::fs::read_to_string(file_path).unwrap();
+        assert_eq!(
+            content,
+            format!("{}last\n", "first\n".repeat(SCROLLBACK_FLUSH_LINE_BATCH))
+        );
+    }
+
+    #[test]
+    fn test_scrollback_clear_is_ordered_after_queued_append() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let mut app = App::new();
+        app.scrollback_file = Some(file_path.clone());
+        app.scrollback_pending = "queued\n".repeat(SCROLLBACK_FLUSH_LINE_BATCH);
+        app.scrollback_pending_lines = SCROLLBACK_FLUSH_LINE_BATCH;
+
+        app.flush_scrollback_pending_if_needed().unwrap();
+        app.clear_scrollback_storage().unwrap();
+
+        assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn test_scrollback_shutdown_persists_final_partial_batch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let mut app = App::new();
+        app.scrollback_file = Some(file_path.clone());
+        app.scrollback_pending = "final partial batch\n".to_string();
+        app.scrollback_pending_lines = 1;
+
+        app.shutdown_scrollback_writer().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "final partial batch\n"
+        );
+    }
+
+    #[test]
+    fn test_scrollback_writer_reports_filesystem_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parent_file = temp_dir.path().join("not-a-directory");
+        std::fs::write(&parent_file, "block directory creation").unwrap();
+        let mut app = App::new();
+        app.scrollback_file = Some(parent_file.join("lines"));
+        app.scrollback_pending = "unwritten\n".repeat(SCROLLBACK_FLUSH_LINE_BATCH);
+        app.scrollback_pending_lines = SCROLLBACK_FLUSH_LINE_BATCH;
+
+        app.flush_scrollback_pending_if_needed().unwrap();
+        assert!(app.flush_scrollback_pending().is_err());
+        assert!(app.take_scrollback_writer_error().is_some());
+        assert!(app.shutdown_scrollback_writer().is_err());
+    }
+
+    #[test]
+    fn test_scrollback_clear_failure_does_not_block_ui_clear() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parent_file = temp_dir.path().join("not-a-directory");
+        std::fs::write(&parent_file, "block directory creation").unwrap();
+        let mut app = App::new();
+        app.scrollback_file = Some(parent_file.join("lines"));
+        app.scrollback_pending = "discarded\n".to_string();
+        app.scrollback_pending_lines = 1;
+        app.push_plain("visible output");
+
+        assert!(app.clear_output().is_err());
+
+        assert!(app.output_lines.is_empty());
+        assert!(app.scrollback_pending.is_empty());
+        assert_eq!(app.scrollback_pending_lines, 0);
+    }
+
     /// Entering scrollback mode loads file content and merges with buffer.
     #[test]
     fn test_enter_scrollback_loads_file_content() {
@@ -4544,7 +4910,7 @@ mod tests {
         app.push_plain("session line 1");
 
         // Enter scrollback mode
-        app.enter_scrollback();
+        app.enter_scrollback().unwrap();
 
         // Verify: buffer contains scrollback lines + divider + session lines
         assert!(app.in_scrollback);
@@ -4586,10 +4952,10 @@ mod tests {
 
         app.push_plain("session line");
 
-        app.enter_scrollback();
+        app.enter_scrollback().unwrap();
         assert!(app.in_scrollback);
 
-        app.exit_scrollback();
+        app.exit_scrollback().unwrap();
 
         assert!(!app.in_scrollback);
         assert_eq!(app.scrollback_count, 0);
@@ -4617,14 +4983,14 @@ mod tests {
         app.push_plain("session");
 
         assert!(!app.in_scrollback);
-        app.toggle_scrollback();
+        app.toggle_scrollback().unwrap();
         assert!(app.in_scrollback, "first toggle should enter scrollback");
         assert!(
             app.output_lines.len() >= 2,
             "buffer should contain scrollback lines"
         );
 
-        app.toggle_scrollback();
+        app.toggle_scrollback().unwrap();
         assert!(!app.in_scrollback, "second toggle should exit scrollback");
         assert_eq!(app.scrollback_count, 0, "count should be reset");
 

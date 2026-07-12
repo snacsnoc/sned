@@ -7,6 +7,8 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+const HISTORY_RECORD_PREFIX: &str = "v1\t";
+
 fn get_history_file_path() -> PathBuf {
     crate::storage::disk::get_sned_dir().join("cli_history")
 }
@@ -23,16 +25,27 @@ fn max_history_lines() -> usize {
 /// Returns lines with most recent last.
 pub(crate) fn load_command_history() -> Vec<String> {
     let history_path = get_history_file_path();
+    load_command_history_from(&history_path)
+}
+
+fn load_command_history_from(history_path: &Path) -> Vec<String> {
     if !history_path.exists() {
         return Vec::new();
     }
 
-    match std::fs::read_to_string(&history_path) {
+    match std::fs::read_to_string(history_path) {
         Ok(content) => {
             let mut lines: Vec<String> = content
                 .lines()
-                .map(std::string::ToString::to_string)
-                .filter(|s| !s.is_empty())
+                .filter_map(|line| {
+                    if let Some(encoded) = line.strip_prefix(HISTORY_RECORD_PREFIX) {
+                        serde_json::from_str(encoded).ok()
+                    } else if line.is_empty() {
+                        None
+                    } else {
+                        Some(line.to_string())
+                    }
+                })
                 .collect();
 
             let max = max_history_lines();
@@ -58,7 +71,8 @@ fn append_command_to_history(history_path: &Path, command: &str) -> io::Result<(
         .create(true)
         .append(true)
         .open(history_path)?;
-    writeln!(file, "{command}")?;
+    let encoded = serde_json::to_string(command).map_err(io::Error::other)?;
+    writeln!(file, "{HISTORY_RECORD_PREFIX}{encoded}")?;
     Ok(())
 }
 
@@ -160,7 +174,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_append_command_to_history_appends_lines() {
+    fn test_append_command_to_history_appends_versioned_records() {
         let temp_dir = tempfile::tempdir().unwrap();
         let history_path = temp_dir.path().join("cli_history");
 
@@ -168,7 +182,45 @@ mod tests {
         append_command_to_history(&history_path, "second").unwrap();
 
         let content = std::fs::read_to_string(&history_path).unwrap();
-        assert_eq!(content, "first\nsecond\n");
+        assert_eq!(content, "v1\t\"first\"\nv1\t\"second\"\n");
+    }
+
+    #[test]
+    fn test_multiline_history_round_trips_as_one_entry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let history_path = temp_dir.path().join("cli_history");
+        let command = "first line\nsecond\tline \\\"quoted\\\" \\ path 🦀";
+
+        append_command_to_history(&history_path, command).unwrap();
+
+        assert_eq!(load_command_history_from(&history_path), vec![command]);
+        assert_eq!(
+            std::fs::read_to_string(history_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_load_history_preserves_legacy_lines_and_skips_malformed_records() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let history_path = temp_dir.path().join("cli_history");
+        std::fs::write(
+            &history_path,
+            "legacy command\nv1\tnot-json\nv1\t\"new\\ncommand\"\nanother legacy command\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_command_history_from(&history_path),
+            vec![
+                "legacy command".to_string(),
+                "new\ncommand".to_string(),
+                "another legacy command".to_string(),
+            ]
+        );
     }
 
     #[test]

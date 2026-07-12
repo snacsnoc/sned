@@ -681,6 +681,9 @@ fn drain_output_queues(
     if let Err(err) = app.flush_scrollback_pending_if_needed() {
         tracing::warn!("Failed to flush scrollback batch: {err}");
     }
+    if let Some(err) = app.take_scrollback_writer_error() {
+        tracing::warn!("Failed to persist scrollback batch: {err}");
+    }
 }
 
 /// Drain the main output channel into the app buffer.
@@ -1214,13 +1217,12 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    // Handle pending clear confirmation
     if app.pending_clear.is_some() {
         if key.code == KeyCode::Char('y')
             || key.code == KeyCode::Char('Y')
             || key.code == KeyCode::Enter
         {
-            app.clear_output();
+            let clear_error = app.clear_output().err();
             app.force_bottom();
             let trigger = app.pending_clear.take().unwrap();
             if let Some(sh) = state_handle.lock().await.as_ref() {
@@ -1228,6 +1230,12 @@ async fn handle_key_event(
                 state.last_injected_plan_state_hash = None;
             }
             app.push_plain(format!("Conversation cleared (confirmed via {trigger})."));
+            if let Some(err) = clear_error {
+                app.push_styled(
+                    format!("Failed to clear persisted scrollback: {err}"),
+                    Style::default().fg(theme::WARNING_FG),
+                );
+            }
         } else {
             app.pending_clear = None;
             app.push_styled("Clear cancelled.", theme::dim_style());
@@ -1343,14 +1351,14 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    // Shift+S - toggle scrollback mode (view evicted output history).
-    // Matches the Shift+Up/Down scroll pattern (lines 1017-1027). Shift+S
-    // cannot be produced by normal letter typing (plain 's' or CapsLock+s
-    // have no SHIFT modifier), so no empty-input guard is needed — the
-    // user can press Shift+S with text in the buffer. The in-app hint
-    // in src/cli/tui/app.rs:1615 mirrors this: "press Shift+S to view".
+    // Requiring Shift keeps plain and caps-lock S available for draft input.
     if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::SHIFT) {
-        app.toggle_scrollback();
+        if let Err(err) = app.toggle_scrollback() {
+            app.push_styled(
+                format!("Failed to update scrollback view: {err}"),
+                Style::default().fg(theme::WARNING_FG),
+            );
+        }
         return Ok(None);
     }
 
@@ -3147,9 +3155,13 @@ pub async fn run_interactive_shell_inner(
     let mut app = App::new();
     let (mention_search_tx, mut mention_search_rx) = mpsc::unbounded_channel();
     app.mention_search_tx = Some(mention_search_tx);
-    // Clear stale scrollback file from a previous session
+    // A prior crash must not leak old transcript data into this session.
     if let Some(ref file_path) = app.scrollback_file {
         let _ = std::fs::remove_file(file_path);
+    }
+    if let Err(err) = app.start_scrollback_writer() {
+        tracing::warn!("Failed to start scrollback writer: {err}");
+        app.scrollback_file = None;
     }
     if let Ok(cwd) = std::env::current_dir() {
         app.cwd = cwd.to_string_lossy().to_string();
@@ -3280,7 +3292,9 @@ pub async fn run_interactive_shell_inner(
         auto_approve,
     )
     .await;
-    let _ = app.flush_scrollback_pending();
+    if let Err(err) = app.shutdown_scrollback_writer() {
+        tracing::warn!("Failed to shut down scrollback writer: {err}");
+    }
     run_result?;
     // In JSON mode stdout is reserved for structured events, so route
     // the session ID to stderr to keep stdout parseable as JSONL.
