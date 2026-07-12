@@ -5,7 +5,7 @@
 
 use crate::providers::{
     ModelInfo, OpenAiCompatibleModelInfo, Provider,
-    openai::{OpenAiConfig, OpenAiProvider},
+    openai::{OpenAiConfig, OpenAiEndpointKind, OpenAiProvider},
 };
 use anyhow::Result;
 
@@ -45,6 +45,7 @@ impl DeepSeekProvider {
             model_info: config.model_info,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: Some("deepseek".to_string()),
         };
 

@@ -93,6 +93,7 @@ fn test_secrets_from_env() {
     assert_eq!(map.get("ANTHROPIC_API_KEY"), Some(&"apiKey"));
     assert_eq!(map.get("OPENAI_API_KEY"), Some(&"openAiApiKey"));
     assert_eq!(map.get("GEMINI_API_KEY"), Some(&"geminiApiKey"));
+    assert!(!map.contains_key("QWEN_API_KEY"));
 }
 
 #[test]
@@ -111,5 +112,6 @@ fn test_secret_keys_list() {
     assert!(keys.contains(&"geminiApiKey"));
     assert!(!keys.contains(&"groqApiKey"));
     assert!(!keys.contains(&"xaiApiKey"));
-    assert_eq!(keys.len(), 37); // Groq/xAI keys were removed with those providers
+    assert!(!keys.contains(&"qwenApiKey"));
+    assert_eq!(keys.len(), 36);
 }

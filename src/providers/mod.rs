@@ -378,6 +378,20 @@ pub struct ModelInfo {
     pub api_format: Option<String>,
 }
 
+pub(crate) fn apply_qwen_model_profile(model_id: &str, info: &mut ModelInfo) -> bool {
+    if !crate::core::context::is_qwen_model(model_id) {
+        return false;
+    }
+
+    info.max_tokens = Some(65_536);
+    info.context_window = Some(262_144);
+    info.supports_images = Some(false);
+    info.supports_prompt_cache = false;
+    info.supports_reasoning = Some(true);
+    info.supports_tools = Some(true);
+    true
+}
+
 /// OpenAI-compatible model info extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OpenAiCompatibleModelInfo {

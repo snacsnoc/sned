@@ -28,7 +28,7 @@ pub struct SystemPromptContext {
     pub enable_parallel_tool_calling: bool,
     pub user_instructions: Option<String>,
     pub sned_rules: Option<String>,
-    /// Active model identifier (e.g. "qwen3-coder", "gpt-4o", "qwen/qwen3-coder").
+    /// Active model identifier (e.g. "qwen3.6-35b-a3b", "gpt-4o", "qwen/qwen3.6-35b-a3b").
     /// Used for model-specific prompt routing. None = generic behavior.
     pub model_id: Option<String>,
     pub active_shell_type: Option<String>,
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn test_qwen_model_id_injects_qwen_section() {
         let context = SystemPromptContext {
-            model_id: Some("qwen3-coder".to_string()),
+            model_id: Some("qwen3.6-35b-a3b".to_string()),
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn test_qwen_model_id_injects_tool_examples() {
         let context = SystemPromptContext {
-            model_id: Some("qwen3-coder".to_string()),
+            model_id: Some("qwen3.5-27b".to_string()),
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn test_qwen_routed_model_id_injects() {
         let context = SystemPromptContext {
-            model_id: Some("qwen/qwen3-coder".to_string()),
+            model_id: Some("openrouter/qwen/qwen3.6-35b-a3b".to_string()),
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();

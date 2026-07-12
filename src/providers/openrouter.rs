@@ -5,8 +5,8 @@
 //! a single API key.
 
 use crate::providers::{
-    ModelInfo, OpenAiCompatibleModelInfo, Provider,
-    openai::{OpenAiConfig, OpenAiProvider},
+    ModelInfo, OpenAiCompatibleModelInfo, Provider, apply_qwen_model_profile,
+    openai::{OpenAiConfig, OpenAiEndpointKind, OpenAiProvider},
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -61,6 +61,7 @@ impl OpenRouterProvider {
             model_info: config.model_info,
             reasoning_effort: None,
             custom_headers: Some(custom_headers),
+            endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: Some(
                 config
                     .provider_name
@@ -117,6 +118,17 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         supports_tools: Some(true),
         api_format: None,
     };
+
+    if apply_qwen_model_profile(model_id, &mut info) {
+        return OpenAiCompatibleModelInfo {
+            base: info,
+            temperature: None,
+            is_r1_format_required: None,
+            system_role: None,
+            supports_reasoning_effort: Some(false),
+            supports_streaming: Some(true),
+        };
+    }
 
     // Anthropic Claude models
     if model_id.starts_with("anthropic/") {
@@ -402,6 +414,24 @@ mod tests {
         assert_eq!(info.base.supports_reasoning, Some(true));
         assert_eq!(info.base.input_price, Some(0.55));
         assert_eq!(info.base.output_price, Some(2.19));
+    }
+
+    #[test]
+    fn test_openrouter_model_info_qwen_family() {
+        for model_id in [
+            "qwen3.6-35b-a3b",
+            "qwen/qwen3.6-35b-a3b",
+            "qwen/qwen3.5-27b",
+        ] {
+            let info = get_openrouter_model_info(model_id);
+            assert_eq!(info.base.context_window, Some(262_144));
+            assert_eq!(info.base.max_tokens, Some(65_536));
+            assert_eq!(info.base.supports_tools, Some(true));
+            assert_eq!(info.base.supports_images, Some(false));
+            assert!(!info.base.supports_prompt_cache);
+            assert_eq!(info.base.supports_reasoning, Some(true));
+            assert_eq!(info.supports_reasoning_effort, Some(false));
+        }
     }
 
     #[test]

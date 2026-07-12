@@ -700,6 +700,17 @@ fn build_symbol_index_service(
     }
 }
 
+fn openai_endpoint_kind(
+    provider_name: &str,
+    base_url: Option<&str>,
+) -> crate::providers::openai::OpenAiEndpointKind {
+    if provider_name == "openai-native" || base_url.is_none() {
+        crate::providers::openai::OpenAiEndpointKind::Official
+    } else {
+        crate::providers::openai::OpenAiEndpointKind::Compatible
+    }
+}
+
 pub(crate) fn create_provider(
     task_opts: &TaskOptions,
 ) -> anyhow::Result<Arc<crate::providers::Providers>> {
@@ -725,7 +736,6 @@ pub(crate) fn create_provider(
              \x1b[36m  GEMINI_API_KEY\x1b[0m          - Google Gemini\n\
              \x1b[36m  OPENROUTER_API_KEY\x1b[0m      - OpenRouter\n\
              \x1b[36m  DEEPSEEK_API_KEY\x1b[0m       - DeepSeek\n\
-             \x1b[36m  QWEN_API_KEY\x1b[0m            - Qwen\n\
              \n\
              Or use --provider flag with --api-key and/or --base-url"
         );
@@ -833,6 +843,7 @@ pub(crate) fn create_provider(
                 .base_url
                 .clone()
                 .or_else(|| std::env::var("OPENAI_API_BASE").ok());
+            let endpoint_kind = openai_endpoint_kind(provider_name, base_url.as_deref());
             // Use stored model ID default if not specified
             let default_model = model_id
                 .or_else(|| {
@@ -840,20 +851,25 @@ pub(crate) fn create_provider(
                     state.act_mode_api_model_id
                 })
                 .unwrap_or_else(|| "gpt-4o".to_string());
+            let model_info = crate::core::context::is_qwen_model(&default_model)
+                .then(|| crate::providers::openai::get_openai_model_info(&default_model));
             Arc::new(crate::providers::Providers::OpenAi(
                 crate::providers::openai::OpenAiProvider::new(
                     crate::providers::openai::OpenAiConfig {
                         model_id: default_model,
                         api_key,
                         base_url,
-                        model_info: None,
+                        model_info,
                         reasoning_effort: task_opts.reasoning_effort.clone(),
                         custom_headers: user_agent.map(|ua| {
                             let mut headers = std::collections::HashMap::with_capacity(1);
                             headers.insert("User-Agent".to_string(), ua);
                             headers
                         }),
-                        provider_name: None, // Use default "OpenAI"
+                        endpoint_kind,
+                        provider_name: (endpoint_kind
+                            == crate::providers::openai::OpenAiEndpointKind::Compatible)
+                            .then(|| "openai-compatible".to_string()),
                     },
                 )?,
             ))
@@ -2118,7 +2134,6 @@ mod tests {
                 "MISTRAL_API_KEY",
                 "MOONSHOT_API_KEY",
                 "ZAI_API_KEY",
-                "QWEN_API_KEY",
                 "TOGETHER_API_KEY",
                 "FIREWORKS_API_KEY",
                 "NEBIUS_API_KEY",
@@ -2182,7 +2197,6 @@ mod tests {
                 "GEMINI_API_KEY",
                 "OPENROUTER_API_KEY",
                 "DEEPSEEK_API_KEY",
-                "QWEN_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
                 "MISTRAL_API_KEY",
@@ -2264,7 +2278,6 @@ mod tests {
                 "GEMINI_API_KEY",
                 "OPENROUTER_API_KEY",
                 "DEEPSEEK_API_KEY",
-                "QWEN_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
                 "MISTRAL_API_KEY",
@@ -2342,7 +2355,6 @@ mod tests {
                 "GEMINI_API_KEY",
                 "OPENROUTER_API_KEY",
                 "DEEPSEEK_API_KEY",
-                "QWEN_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
                 "MISTRAL_API_KEY",
@@ -2411,8 +2423,8 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_returns_typed_config_error_for_unsupported_provider() {
-        let cli = Cli::try_parse_from(["sned", "--provider", "nope", "test prompt"]).unwrap();
+    fn test_create_provider_rejects_qwen_provider() {
+        let cli = Cli::try_parse_from(["sned", "--provider", "qwen", "test prompt"]).unwrap();
         let err = match create_provider(&cli.task_opts) {
             Ok(_) => panic!("unsupported provider should fail"),
             Err(err) => err,
@@ -2423,8 +2435,26 @@ mod tests {
             .expect("unsupported provider should be a typed CliError");
         assert!(matches!(
             cli_err,
-            crate::error::CliError::Config(message) if message == "Unsupported provider: nope"
+            crate::error::CliError::Config(message) if message == "Unsupported provider: qwen"
         ));
+    }
+
+    #[test]
+    fn test_openai_endpoint_kind_mapping() {
+        use crate::providers::openai::OpenAiEndpointKind;
+
+        assert_eq!(
+            openai_endpoint_kind("openai", None),
+            OpenAiEndpointKind::Official
+        );
+        assert_eq!(
+            openai_endpoint_kind("openai", Some("https://gateway.example.com/v1")),
+            OpenAiEndpointKind::Compatible
+        );
+        assert_eq!(
+            openai_endpoint_kind("openai-native", Some("https://proxy.example.com/v1")),
+            OpenAiEndpointKind::Official
+        );
     }
 
     #[test]
@@ -2436,13 +2466,17 @@ mod tests {
             "--api-key",
             "sk-test123",
             "--model",
-            "custom-model",
+            "qwen/qwen3.5-27b",
             "test prompt",
         ])
         .unwrap();
         match create_provider(&cli.task_opts) {
             Ok(provider) => {
                 assert_eq!(provider.name(), "openai");
+                let info = provider.get_model().info;
+                assert_eq!(info.context_window, Some(262_144));
+                assert_eq!(info.max_tokens, Some(65_536));
+                assert_eq!(info.supports_reasoning, Some(true));
             }
             Err(err) => panic!("custom base_url+api_key should work: {}", err),
         }

@@ -34,14 +34,14 @@ mod tests {
 
     #[test]
     fn test_tool_examples_for_model_qwen() {
-        let result = tool_examples_for_model(Some("qwen3-coder"));
+        let result = tool_examples_for_model(Some("qwen3.6-35b-a3b"));
         assert!(result.is_some());
         assert!(result.unwrap().contains("EXAMPLE TOOL CALLS (Qwen)"));
     }
 
     #[test]
     fn test_tool_examples_for_model_qwen_routed() {
-        let result = tool_examples_for_model(Some("qwen/qwen3-coder"));
+        let result = tool_examples_for_model(Some("qwen/qwen3.5-27b"));
         assert!(result.is_some());
         assert!(result.unwrap().contains("EXAMPLE TOOL CALLS (Qwen)"));
     }

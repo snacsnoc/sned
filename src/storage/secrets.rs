@@ -20,7 +20,6 @@ pub const SECRET_KEYS: &[&str] = &[
     "requestyApiKey",
     "togetherApiKey",
     "fireworksApiKey",
-    "qwenApiKey",
     "doubaoApiKey",
     "mistralApiKey",
     "liteLlmApiKey",
@@ -64,7 +63,6 @@ pub fn env_var_to_secret_key() -> HashMap<&'static str, &'static str> {
     map.insert("OPENCODE_API_KEY", "openAiNativeApiKey");
     map.insert("KIMI_API_KEY", "moonshotApiKey");
     map.insert("DEEPSEEK_API_KEY", "deepSeekApiKey");
-    map.insert("QWEN_API_KEY", "qwenApiKey");
     map.insert("TOGETHER_API_KEY", "togetherApiKey");
     map.insert("FIREWORKS_API_KEY", "fireworksApiKey");
     map.insert("NEBIUS_API_KEY", "nebiusApiKey");

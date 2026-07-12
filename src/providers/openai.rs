@@ -7,7 +7,7 @@ use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, MessageRole,
     ModelInfo, OpenAiCompatibleModelInfo, Provider, ProviderError, ProviderHttpError,
-    ProviderModel, ProviderRequest,
+    ProviderModel, ProviderRequest, apply_qwen_model_profile,
 };
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -16,6 +16,12 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiEndpointKind {
+    Official,
+    Compatible,
+}
 
 /// Configuration for the OpenAI provider.
 #[derive(Clone)]
@@ -26,6 +32,7 @@ pub struct OpenAiConfig {
     pub model_info: Option<OpenAiCompatibleModelInfo>,
     pub reasoning_effort: Option<String>,
     pub custom_headers: Option<std::collections::HashMap<String, String>>,
+    pub endpoint_kind: OpenAiEndpointKind,
     /// Provider name for error messages (defaults to "OpenAI" if not set).
     /// Used by OpenAI-compatible providers (OpenRouter, DeepSeek) to identify themselves in errors.
     pub provider_name: Option<String>,
@@ -43,6 +50,7 @@ impl std::fmt::Debug for OpenAiConfig {
             .field("model_info", &self.model_info)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("custom_headers", &self.custom_headers)
+            .field("endpoint_kind", &self.endpoint_kind)
             .field("provider_name", &self.provider_name)
             .finish()
     }
@@ -120,15 +128,17 @@ impl OpenAiProvider {
 
     fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
         let model_id = &self.config.model_id;
-        let is_reasoning_family = ["o1", "o3", "o4", "gpt-5"]
-            .iter()
-            .any(|prefix| model_id.starts_with(prefix) || model_id.contains(&format!("/{prefix}")))
+        let uses_official_reasoning_shape = self.config.endpoint_kind
+            == OpenAiEndpointKind::Official
+            && ["o1", "o3", "o4", "gpt-5"].iter().any(|prefix| {
+                model_id.starts_with(prefix) || model_id.contains(&format!("/{prefix}"))
+            })
             && !model_id.contains("chat");
 
         let mut messages = vec![];
 
         // System/developer message
-        if is_reasoning_family {
+        if uses_official_reasoning_shape {
             messages.push(json!({
                 "role": "developer",
                 "content": request.system_prompt
@@ -227,7 +237,7 @@ impl OpenAiProvider {
         // If model_info.temperature is set and non-zero, send it.
         // If model_info.temperature is 0, omit (TS converts 0 → undefined).
         // Reasoning family models never support temperature.
-        if !is_reasoning_family
+        if !uses_official_reasoning_shape
             && let Some(temp) = self.config.model_info.as_ref().and_then(|i| i.temperature)
             && temp != 0.0
         {
@@ -245,7 +255,7 @@ impl OpenAiProvider {
             })
             .filter(|m| *m > 0)
         {
-            if is_reasoning_family {
+            if uses_official_reasoning_shape {
                 body["max_completion_tokens"] = json!(max_tokens);
             } else {
                 body["max_tokens"] = json!(max_tokens);
@@ -1126,8 +1136,50 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         api_format: None,
     };
 
+    if apply_qwen_model_profile(model_id, &mut info) {
+        return OpenAiCompatibleModelInfo {
+            base: info,
+            temperature: None,
+            is_r1_format_required: None,
+            system_role: None,
+            supports_reasoning_effort: Some(false),
+            supports_streaming: None,
+        };
+    }
+
+    let is_current_reasoning_model = model_id.contains("gpt-5.6")
+        || model_id.contains("gpt-5.4")
+        || model_id.contains("gpt-5.3-codex");
+
     // Model-specific overrides — most-specific-first ordering
-    if model_id.contains("gpt-5.5") {
+    if model_id.contains("gpt-5.6-terra") {
+        info.max_tokens = Some(128_000);
+        info.context_window = Some(1_050_000);
+        info.supports_prompt_cache = true;
+        info.input_price = Some(2.5);
+        info.output_price = Some(15.0);
+        info.cache_reads_price = Some(0.25);
+        info.cache_writes_price = Some(3.125);
+        info.supports_reasoning = Some(true);
+    } else if model_id.contains("gpt-5.6-luna") {
+        info.max_tokens = Some(128_000);
+        info.context_window = Some(1_050_000);
+        info.supports_prompt_cache = true;
+        info.input_price = Some(1.0);
+        info.output_price = Some(6.0);
+        info.cache_reads_price = Some(0.1);
+        info.cache_writes_price = Some(1.25);
+        info.supports_reasoning = Some(true);
+    } else if model_id.contains("gpt-5.6") {
+        info.max_tokens = Some(128_000);
+        info.context_window = Some(1_050_000);
+        info.supports_prompt_cache = true;
+        info.input_price = Some(5.0);
+        info.output_price = Some(30.0);
+        info.cache_reads_price = Some(0.5);
+        info.cache_writes_price = Some(6.25);
+        info.supports_reasoning = Some(true);
+    } else if model_id.contains("gpt-5.5") {
         info.max_tokens = Some(128_000);
         info.context_window = Some(1_000_000);
         info.supports_prompt_cache = true;
@@ -1152,7 +1204,7 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         info.input_price = Some(0.75);
         info.output_price = Some(4.5);
         info.cache_reads_price = Some(0.075);
-        info.cache_writes_price = Some(0.0);
+        info.cache_writes_price = Some(0.9375);
         info.supports_reasoning = Some(true);
     } else if model_id.contains("gpt-5.4-nano") {
         info.max_tokens = Some(128_000);
@@ -1165,12 +1217,21 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         info.supports_reasoning = Some(true);
     } else if model_id.contains("gpt-5.4") {
         info.max_tokens = Some(128_000);
-        info.context_window = Some(1_000_000);
+        info.context_window = Some(1_050_000);
         info.supports_prompt_cache = true;
         info.input_price = Some(2.5);
         info.output_price = Some(15.0);
         info.cache_reads_price = Some(0.25);
-        info.cache_writes_price = Some(0.0);
+        info.cache_writes_price = Some(3.125);
+        info.supports_reasoning = Some(true);
+    } else if model_id.contains("gpt-5.3-codex") {
+        info.max_tokens = Some(128_000);
+        info.context_window = Some(400_000);
+        info.supports_prompt_cache = true;
+        info.input_price = Some(1.75);
+        info.output_price = Some(14.0);
+        info.cache_reads_price = Some(0.175);
+        info.cache_writes_price = Some(2.1875);
         info.supports_reasoning = Some(true);
     } else if model_id.contains("gpt-4.1-mini") {
         info.max_tokens = Some(128_000);
@@ -1253,8 +1314,8 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         temperature: None,
         is_r1_format_required: None,
         system_role: None,
-        supports_reasoning_effort: None,
-        supports_streaming: None,
+        supports_reasoning_effort: is_current_reasoning_model.then_some(true),
+        supports_streaming: is_current_reasoning_model.then_some(true),
     }
 }
 
@@ -1274,6 +1335,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1289,6 +1351,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1304,6 +1367,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1319,6 +1383,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1354,6 +1419,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1405,6 +1471,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1557,6 +1624,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1579,6 +1647,69 @@ mod tests {
             body.get("max_tokens").is_none(),
             "reasoning model should NOT have max_tokens"
         );
+        assert_eq!(body["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn test_compatible_endpoint_uses_standard_shape_for_openai_model_id() {
+        let config = OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some("https://gateway.example.com/v1".to_string()),
+            model_id: "gpt-5.4".to_string(),
+            model_info: Some(get_openai_model_info("gpt-5.4")),
+            reasoning_effort: None,
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            provider_name: Some("openai-compatible".to_string()),
+        };
+        let provider = OpenAiProvider::new(config).unwrap();
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["max_tokens"], 128_000);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn test_compatible_endpoint_qwen_reasoning_uses_max_tokens() {
+        let model_id = "qwen/qwen3.5-27b";
+        let model_info = get_openai_model_info(model_id);
+        assert_eq!(model_info.base.supports_reasoning, Some(true));
+
+        let config = OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some("https://gateway.example.com/v1".to_string()),
+            model_id: model_id.to_string(),
+            model_info: Some(model_info),
+            reasoning_effort: None,
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            provider_name: Some("openai-compatible".to_string()),
+        };
+        let provider = OpenAiProvider::new(config).unwrap();
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["max_tokens"], 65_536);
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
@@ -1618,6 +1749,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1679,6 +1811,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1714,6 +1847,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1771,6 +1905,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1828,6 +1963,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1885,6 +2021,7 @@ mod tests {
             }),
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1927,12 +2064,45 @@ mod tests {
     }
 
     #[test]
-    fn test_get_openai_model_info_gpt54() {
-        let info = get_openai_model_info("gpt-5.4");
-        assert_eq!(info.base.context_window, Some(1_000_000));
-        assert_eq!(info.base.max_tokens, Some(128_000));
-        assert_eq!(info.base.input_price, Some(2.5));
-        assert_eq!(info.base.output_price, Some(15.0));
+    fn test_get_openai_model_info_current_models() {
+        let cases = [
+            ("gpt-5.6", 1_050_000, 5.0, 30.0, 0.5, 6.25),
+            ("gpt-5.6-terra", 1_050_000, 2.5, 15.0, 0.25, 3.125),
+            ("gpt-5.6-luna", 1_050_000, 1.0, 6.0, 0.1, 1.25),
+            ("gpt-5.3-codex", 400_000, 1.75, 14.0, 0.175, 2.1875),
+            ("gpt-5.4", 1_050_000, 2.5, 15.0, 0.25, 3.125),
+            ("gpt-5.4-mini", 400_000, 0.75, 4.5, 0.075, 0.9375),
+        ];
+
+        for (model_id, context_window, input, output, cache_read, cache_write) in cases {
+            let info = get_openai_model_info(model_id);
+            assert_eq!(info.base.context_window, Some(context_window));
+            assert_eq!(info.base.max_tokens, Some(128_000));
+            assert_eq!(info.base.input_price, Some(input));
+            assert_eq!(info.base.output_price, Some(output));
+            assert_eq!(info.base.cache_reads_price, Some(cache_read));
+            assert_eq!(info.base.cache_writes_price, Some(cache_write));
+            assert_eq!(info.base.supports_images, Some(true));
+            assert_eq!(info.base.supports_tools, Some(true));
+            assert_eq!(info.base.supports_reasoning, Some(true));
+            assert!(info.base.supports_prompt_cache);
+            assert_eq!(info.supports_reasoning_effort, Some(true));
+            assert_eq!(info.supports_streaming, Some(true));
+        }
+    }
+
+    #[test]
+    fn test_get_openai_model_info_qwen_family() {
+        for model_id in ["qwen3.6-35b-a3b", "qwen/qwen3.5-27b"] {
+            let info = get_openai_model_info(model_id);
+            assert_eq!(info.base.context_window, Some(262_144));
+            assert_eq!(info.base.max_tokens, Some(65_536));
+            assert_eq!(info.base.supports_tools, Some(true));
+            assert_eq!(info.base.supports_images, Some(false));
+            assert!(!info.base.supports_prompt_cache);
+            assert_eq!(info.base.supports_reasoning, Some(true));
+            assert_eq!(info.supports_reasoning_effort, Some(false));
+        }
     }
 
     #[test]
@@ -1954,6 +2124,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2003,6 +2174,7 @@ mod tests {
             model_info: Some(custom_info.clone()),
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2026,6 +2198,7 @@ mod tests {
             model_info: None,
             reasoning_effort: None,
             custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: Some("openai".to_string()),
         };
         let _provider = OpenAiProvider::new(config).unwrap();

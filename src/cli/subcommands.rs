@@ -686,7 +686,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
                     "Could not auto-detect provider. Use --provider to specify one.",
                 );
                 eprintln!(
-                    "Supported providers: anthropic, openai, openai-native, openrouter, gemini, mistral, moonshot, deepseek, qwen, together, fireworks, nebius, zai, minimax, cerebras, huggingface, vercel-ai-gateway, openai"
+                    "Supported providers: anthropic, openai, openai-native, openrouter, gemini, mistral, moonshot, deepseek, together, fireworks, nebius, zai, minimax, cerebras, huggingface, vercel-ai-gateway, openai"
                 );
                 return Ok(());
             }
@@ -718,7 +718,6 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
         "mistral" => "mistralApiKey",
         "moonshot" => "moonshotApiKey",
         "deepseek" => "deepSeekApiKey",
-        "qwen" => "qwenApiKey",
         "together" => "togetherApiKey",
         "fireworks" => "fireworksApiKey",
         "nebius" => "nebiusApiKey",
@@ -794,7 +793,6 @@ pub fn run_doctor() -> anyhow::Result<i32> {
         ("mistral", "MISTRAL_API_KEY"),
         ("moonshot", "MOONSHOT_API_KEY"),
         ("deepseek", "DEEPSEEK_API_KEY"),
-        ("qwen", "QWEN_API_KEY"),
         ("together", "TOGETHER_API_KEY"),
         ("fireworks", "FIREWORKS_API_KEY"),
         ("nebius", "NEBIUS_API_KEY"),

@@ -6,8 +6,8 @@
 /// Returns true when `model_id` matches the Qwen family.
 ///
 /// Recognizes:
-/// - bare ids: `qwen3-coder`, `qwen-max`, `qwq-preview`, `qwen2.5-coder-7b`
-/// - routed ids: `qwen/qwen3-coder`, `openrouter/qwen/qwen-max`
+/// - bare ids: `qwen3.6-35b-a3b`, `qwen-max`, `qwq-preview`, `qwen2.5-coder-7b`
+/// - routed ids: `qwen/qwen3.6-35b-a3b`, `openrouter/qwen/qwen-max`
 ///
 /// Match rule (case-insensitive): the id starts with `qwen-`,
 /// `qwen<digit>`, `qwen<dot>`, or `qwq-`, OR a `/`-separated segment
@@ -56,7 +56,8 @@ mod tests {
 
     #[test]
     fn test_is_qwen_model_bare_ids() {
-        assert!(is_qwen_model("qwen3-coder"));
+        assert!(is_qwen_model("qwen3.6-35b-a3b"));
+        assert!(is_qwen_model("qwen3.5-27b"));
         assert!(is_qwen_model("qwen-max"));
         assert!(is_qwen_model("qwen2.5-coder-7b"));
         assert!(is_qwen_model("qwq-preview"));
@@ -66,14 +67,15 @@ mod tests {
 
     #[test]
     fn test_is_qwen_model_routed_ids() {
-        assert!(is_qwen_model("qwen/qwen3-coder"));
-        assert!(is_qwen_model("openrouter/qwen/qwen-max"));
+        assert!(is_qwen_model("qwen/qwen3.6-35b-a3b"));
+        assert!(is_qwen_model("openrouter/qwen/qwen3.6-35b-a3b"));
+        assert!(is_qwen_model("qwen/qwen3.5-27b"));
         assert!(is_qwen_model("some/route/qwq-32b"));
     }
 
     #[test]
     fn test_is_qwen_model_case_insensitive() {
-        assert!(is_qwen_model("QWEN-3-CODER"));
+        assert!(is_qwen_model("QWEN3.6-35B-A3B"));
         assert!(is_qwen_model("Qwen/Max")); // vendor "qwen" routes a model called "max" — treated as Qwen family
     }
 
