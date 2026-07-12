@@ -593,8 +593,8 @@ try:
         print("TUI_TEST_FAIL approval prompt appeared in transcript but not in the visible viewport")
     elif not sent_approve:
         print("TUI_TEST_FAIL approval prompt was not acknowledged")
-    elif "attempt_completion" not in visible_tail(text):
-        print("TUI_TEST_FAIL completion box did not appear in visible viewport after approval")
+    elif "approval-scroll smoke test complete" not in visible_tail(text):
+        print("TUI_TEST_FAIL completion result did not appear in visible viewport after approval")
     elif exit_code not in (0, None):
         print(f"TUI_TEST_FAIL sned exited with {exit_code}")
     else:

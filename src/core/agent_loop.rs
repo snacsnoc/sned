@@ -3204,7 +3204,8 @@ impl AgentLoop {
                             | "ask_followup_question"
                             | "condense"
                             | "use_subagents"
-                    ) {
+                    ) && (tool_name != "attempt_completion" || is_error)
+                    {
                         let max_lines = MAX_TOOL_RESULT_DISPLAY_LINES;
                         let displayed = format_tool_result(&result_output.text, max_lines);
                         let status = if is_error { "✗" } else { "✓" };
@@ -4516,6 +4517,20 @@ mod tests {
             }
         }
         rendered
+    }
+
+    fn drain_output_events(
+        priority_rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutputEvent>,
+        rx: &mut tokio::sync::mpsc::Receiver<OutputEvent>,
+    ) -> Vec<OutputEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = priority_rx.try_recv() {
+            events.push(event);
+        }
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
     }
 
     #[test]
@@ -7939,6 +7954,121 @@ mod tests {
         assert_eq!(
             plan.steps[1].status,
             crate::core::plan_state::PlanStepStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attempt_completion_success_emits_only_completion_output() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::attempt_completion::AttemptCompletionHandler;
+
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_complete".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("attempt_completion".to_string()),
+                    arguments: Some(serde_json::json!({"result": "Done once"}).to_string()),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-attempt-completion-output");
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        config.output_writer = writer;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        agent.state.lock().await.double_check_completion_enabled = false;
+
+        let result = agent.execute_turn().await;
+
+        assert!(matches!(result, TurnResult::Complete));
+        let mut completions = Vec::new();
+        let mut tool_output = Vec::new();
+        for event in drain_output_events(&mut priority_rx, &mut rx) {
+            match event {
+                OutputEvent::Completion(text) => completions.push(text),
+                OutputEvent::ToolOutputLine(line) => tool_output.push(line.to_string()),
+                _ => {}
+            }
+        }
+        assert_eq!(completions, vec!["Done once"]);
+        assert!(
+            !tool_output.iter().any(|line| line.contains("Done once")),
+            "completion result was also emitted as tool output: {tool_output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attempt_completion_rejection_remains_visible() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::attempt_completion::AttemptCompletionHandler;
+
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_complete".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("attempt_completion".to_string()),
+                    arguments: Some(serde_json::json!({"result": "Done once"}).to_string()),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-attempt-completion-rejection-output");
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        config.output_writer = writer;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        agent.state.lock().await.double_check_completion_enabled = true;
+
+        let _ = agent.execute_turn().await;
+
+        let mut completion_count = 0;
+        let mut tool_output = Vec::new();
+        for event in drain_output_events(&mut priority_rx, &mut rx) {
+            match event {
+                OutputEvent::Completion(_) => completion_count += 1,
+                OutputEvent::ToolOutputLine(line) => tool_output.push(line.to_string()),
+                _ => {}
+            }
+        }
+        assert_eq!(completion_count, 0);
+        assert!(
+            tool_output
+                .iter()
+                .any(|line| line.contains("Before completing, re-verify your work")),
+            "completion rejection was not emitted as tool output: {tool_output:?}"
         );
     }
 
