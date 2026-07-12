@@ -52,6 +52,20 @@ impl CondenseHandler {
         let mut hook_context_modification: Option<String> = None;
         if let Some(ref hook_mgr) = ctx.hook_manager {
             let result = hook_mgr.pre_compact(&ctx.task_id, "<conversation_history>");
+
+            if let Some(output) = &result.output
+                && output.cancel == Some(true)
+            {
+                tracing::warn!(
+                    "[PreCompact] Hook requested cancellation for task {}, aborting condensation",
+                    ctx.task_id
+                );
+                return Err(ToolError::ExecutionFailed(
+                    "Context compaction was cancelled by PreCompact hook. Task has been aborted."
+                        .to_string(),
+                ));
+            }
+
             if result.error.is_none() {
                 if let Some(output) = result.output
                     && let Some(modification) = output.context_modification
@@ -826,5 +840,63 @@ mod tests {
 
         let state_guard = state.lock().await;
         assert!(state_guard.compacted_summary.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_condense_respects_pre_compact_cancellation() {
+        use crate::core::hooks::HookManager;
+        use crate::core::tools::ToolContext;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let hook_path = temp_dir.path().join("PreCompact");
+        fs::write(
+            &hook_path,
+            "#!/bin/sh\necho '{\"cancel\":true,\"contextModification\":\"ignored\"}'",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook_path, permissions).unwrap();
+
+        let mut hook_manager = HookManager::new("test-user");
+        hook_manager.set_runtime_hooks_dir(temp_dir.path().to_path_buf());
+
+        let mut initial_state = TaskState::default();
+        initial_state.consecutive_mistakes = 2;
+        let state = Arc::new(tokio::sync::Mutex::new(initial_state));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            Some(Arc::new(hook_manager)),
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = CondenseHandler::new()
+            .execute(
+                &ctx,
+                serde_json::json!({
+                    "context": "Condensed summary",
+                    "auto_accept": true,
+                }),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ToolError::ExecutionFailed(message))
+                if message.contains("cancelled by PreCompact hook")
+        ));
+        let state = state.lock().await;
+        assert_eq!(state.consecutive_mistakes, 2);
+        assert!(state.compacted_summary.is_none());
     }
 }
