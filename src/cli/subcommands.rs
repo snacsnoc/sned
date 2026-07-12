@@ -673,6 +673,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
     }
 
     let state_manager = crate::storage::state_manager::StateManager::new()?;
+    state_manager.initialize()?;
 
     let provider = match &opts.provider {
         Some(p) => p.clone(),
@@ -686,11 +687,16 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
                     "Could not auto-detect provider. Use --provider to specify one.",
                 );
                 eprintln!(
-                    "Supported providers: anthropic, openai, openai-native, openrouter, gemini, mistral, moonshot, deepseek, together, fireworks, nebius, zai, minimax, cerebras, huggingface, vercel-ai-gateway, openai"
+                    "Supported providers: anthropic, openai, openai-native, openrouter, gemini, minimax, deepseek"
                 );
                 return Ok(());
             }
         },
+    };
+
+    let Some(secret_key) = super::runtime_provider_secret_key(&provider) else {
+        crate::cli::colors::eprint_error(&format!("Unknown provider '{provider}'"));
+        return Ok(());
     };
 
     let api_key = match &opts.apikey {
@@ -709,40 +715,15 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let secret_key = match provider.as_str() {
-        "anthropic" => "apiKey",
-        "openai" | "openai-native" => "openAiApiKey",
-        "openrouter" => "openRouterApiKey",
-        "gemini" => "geminiApiKey",
-        "cerebras" => "cerebrasApiKey",
-        "mistral" => "mistralApiKey",
-        "moonshot" => "moonshotApiKey",
-        "deepseek" => "deepSeekApiKey",
-        "together" => "togetherApiKey",
-        "fireworks" => "fireworksApiKey",
-        "nebius" => "nebiusApiKey",
-        "zai" => "zaiApiKey",
-        "minimax" => "minimaxApiKey",
-        "huggingface" => "huggingFaceApiKey",
-        "vercel-ai-gateway" => "vercelAiGatewayApiKey",
-        "openai-compatible" => "openAiCompatibleCustomApiKey",
-        _ => {
-            crate::cli::colors::eprint_error(&format!("Unknown provider '{provider}'"));
-            return Ok(());
-        }
-    };
-
     state_manager.set_secret(secret_key, api_key);
-    println!("Stored API key for {provider}");
+    state_manager.set_global_state_string_field("act_mode_api_provider", provider.clone())?;
+    state_manager.set_global_state_string_field("plan_mode_api_provider", provider.clone())?;
 
-    // Persist model ID if provided (applies to both act and plan modes)
     if let Some(model_id) = &opts.modelid {
         state_manager.set_global_state_string_field("act_mode_api_model_id", model_id.clone())?;
         state_manager.set_global_state_string_field("plan_mode_api_model_id", model_id.clone())?;
-        println!("Stored model ID: {model_id}");
     }
 
-    // Persist base URL if provided (provider-specific)
     if let Some(base_url) = &opts.baseurl {
         let base_url_key = match provider.as_str() {
             "anthropic" => "anthropic_base_url",
@@ -753,14 +734,21 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
             _ => "open_ai_base_url",
         };
         state_manager.set_global_state_string_field(base_url_key, base_url.clone())?;
-        println!("Stored base URL for {provider}: {base_url}");
     }
 
-    // Persist Azure API version if provided (stored for Azure OpenAI provider)
     if let Some(azure_version) = &opts.azure_api_version {
-        // Azure API version is typically used with Azure OpenAI
-        // Store it as a setting that can be referenced later
         state_manager.set_global_state_string_field("azure_api_version", azure_version.clone())?;
+    }
+
+    state_manager.persist()?;
+    println!("Stored API key for {provider}");
+    if let Some(model_id) = &opts.modelid {
+        println!("Stored model ID: {model_id}");
+    }
+    if let Some(base_url) = &opts.baseurl {
+        println!("Stored base URL for {provider}: {base_url}");
+    }
+    if let Some(azure_version) = &opts.azure_api_version {
         println!("Stored Azure API version: {azure_version}");
     }
 
@@ -931,14 +919,16 @@ pub fn run_doctor() -> anyhow::Result<i32> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Test that run_auth accepts and processes modelid flag without error.
-    ///
-    /// Note: This test verifies the flag is accepted and processed.
-    /// Persistence to disk happens asynchronously via StateManager's background persist.
+    static AUTH_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_run_auth_accepts_model_id_flag() {
+        let _guard = AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let tasks_dir = temp.path().join("tasks");
         let settings_dir = temp.path().join("settings");
@@ -947,9 +937,9 @@ mod tests {
         fs::create_dir_all(&settings_dir).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
 
-        // Override SNED_DATA_DIR for this test
         let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
-        // SAFETY: single-threaded test; sequential env mutation
+        let original_sned_dir = std::env::var("SNED_DIR").ok();
+        // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
         unsafe {
             std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
         }
@@ -965,27 +955,50 @@ mod tests {
             config: Some(temp.path().to_str().unwrap().to_string()),
         };
 
-        // Should complete without error
         let result = run_auth(opts);
         assert!(result.is_ok(), "run_auth should succeed with modelid flag");
 
-        // Restore original env var
+        let reloaded = crate::storage::state_manager::StateManager::new().unwrap();
+        reloaded.initialize().unwrap();
+        assert_eq!(reloaded.get_secret("apiKey").as_deref(), Some("test-api-key"));
+        assert_eq!(
+            reloaded
+                .get_config_value("act_mode_api_provider")
+                .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            reloaded
+                .get_config_value("act_mode_api_model_id")
+                .as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+
         if let Some(val) = original_data_dir {
-            // SAFETY: single-threaded test; restoring env after assertion
+            // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
             unsafe {
                 std::env::set_var("SNED_DATA_DIR", val);
             }
         } else {
-            // SAFETY: single-threaded test; restoring env after assertion
+            // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
             unsafe {
                 std::env::remove_var("SNED_DATA_DIR");
             }
         }
+        if let Some(val) = original_sned_dir {
+            // SAFETY: serialized test restores the prior process environment.
+            unsafe { std::env::set_var("SNED_DIR", val) };
+        } else {
+            // SAFETY: serialized test restores the prior process environment.
+            unsafe { std::env::remove_var("SNED_DIR") };
+        }
     }
 
-    /// Test that run_auth accepts and processes baseurl flag without error.
     #[test]
     fn test_run_auth_accepts_baseurl_flag() {
+        let _guard = AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let tasks_dir = temp.path().join("tasks");
         let settings_dir = temp.path().join("settings");
@@ -994,9 +1007,9 @@ mod tests {
         fs::create_dir_all(&settings_dir).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
 
-        // Override SNED_DATA_DIR for this test
         let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
-        // SAFETY: single-threaded test; sequential env mutation
+        let original_sned_dir = std::env::var("SNED_DIR").ok();
+        // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
         unsafe {
             std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
         }
@@ -1012,21 +1025,33 @@ mod tests {
             config: Some(temp.path().to_str().unwrap().to_string()),
         };
 
-        // Should complete without error
         let result = run_auth(opts);
         assert!(result.is_ok(), "run_auth should succeed with baseurl flag");
 
-        // Restore original env var
+        let reloaded = crate::storage::state_manager::StateManager::new().unwrap();
+        reloaded.initialize().unwrap();
+        assert_eq!(
+            reloaded.get_config_value("anthropic_base_url").as_deref(),
+            Some("https://custom.anthropic.com")
+        );
+
         if let Some(val) = original_data_dir {
-            // SAFETY: single-threaded test; restoring env after assertion
+            // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
             unsafe {
                 std::env::set_var("SNED_DATA_DIR", val);
             }
         } else {
-            // SAFETY: single-threaded test; restoring env after assertion
+            // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
             unsafe {
                 std::env::remove_var("SNED_DATA_DIR");
             }
+        }
+        if let Some(val) = original_sned_dir {
+            // SAFETY: serialized test restores the prior process environment.
+            unsafe { std::env::set_var("SNED_DIR", val) };
+        } else {
+            // SAFETY: serialized test restores the prior process environment.
+            unsafe { std::env::remove_var("SNED_DIR") };
         }
     }
 }

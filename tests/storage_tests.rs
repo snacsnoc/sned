@@ -93,6 +93,8 @@ fn test_secrets_from_env() {
     assert_eq!(map.get("ANTHROPIC_API_KEY"), Some(&"apiKey"));
     assert_eq!(map.get("OPENAI_API_KEY"), Some(&"openAiApiKey"));
     assert_eq!(map.get("GEMINI_API_KEY"), Some(&"geminiApiKey"));
+    assert!(!map.contains_key("OPENAI_COMPATIBLE_CUSTOM_KEY"));
+    assert!(!map.contains_key("OPENAI_API_BASE"));
     assert!(!map.contains_key("QWEN_API_KEY"));
 }
 
@@ -113,5 +115,6 @@ fn test_secret_keys_list() {
     assert!(!keys.contains(&"groqApiKey"));
     assert!(!keys.contains(&"xaiApiKey"));
     assert!(!keys.contains(&"qwenApiKey"));
-    assert_eq!(keys.len(), 36);
+    assert!(!keys.contains(&"openAiCompatibleCustomApiKey"));
+    assert_eq!(keys.len(), 35);
 }

@@ -1568,8 +1568,9 @@ async fn handle_cli_only_command(
             let mut temp_opts = task_opts.clone();
             temp_opts.provider = Some(provider_name.to_string());
             temp_opts.model = Some(model_id.to_string());
+            let state_manager = session.lock().await.state_manager.clone();
 
-            match crate::cli::create_provider(&temp_opts) {
+            match crate::cli::create_provider(&temp_opts, Some(&state_manager)) {
                 Ok(new_provider) => {
                     let sess = session.lock().await;
                     sess.agent_loop_mut().await.set_provider(new_provider);

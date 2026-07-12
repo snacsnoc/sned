@@ -366,7 +366,7 @@ pub enum ConfigAction {
 /// Source: `dirac/cli/src/index.ts` `program.command("auth")` options.
 #[derive(Debug, Clone, Parser)]
 pub struct AuthOptions {
-    /// Provider ID for quick setup (e.g., openai-native, anthropic, moonshot)
+    /// Provider ID for quick setup (e.g., openai-native, anthropic, openrouter)
     #[arg(short = 'p', long)]
     pub provider: Option<String>,
 
@@ -711,22 +711,116 @@ fn openai_endpoint_kind(
     }
 }
 
+fn runtime_provider_secret_key(provider_name: &str) -> Option<&'static str> {
+    match provider_name {
+        "anthropic" => Some("apiKey"),
+        "openai" | "openai-native" => Some("openAiApiKey"),
+        "openrouter" => Some("openRouterApiKey"),
+        "gemini" => Some("geminiApiKey"),
+        "minimax" => Some("minimaxApiKey"),
+        "deepseek" => Some("deepSeekApiKey"),
+        _ => None,
+    }
+}
+
+fn api_key_from_sources(
+    task_opts: &TaskOptions,
+    state_manager: Option<&crate::storage::state_manager::StateManager>,
+    env_vars: &[&str],
+    secret_key: &str,
+) -> Option<String> {
+    task_opts
+        .api_key
+        .clone()
+        .filter(|key| !key.is_empty())
+        .or_else(|| {
+            env_vars.iter().find_map(|env_var| {
+                std::env::var(env_var)
+                    .ok()
+                    .filter(|key| !key.is_empty())
+            })
+        })
+        .or_else(|| {
+            state_manager
+                .and_then(|state| state.get_secret(secret_key))
+                .filter(|key| !key.is_empty())
+        })
+}
+
+fn provider_from_state(
+    state_manager: &crate::storage::state_manager::StateManager,
+) -> Option<String> {
+    use crate::storage::state_manager::GlobalStateKey;
+
+    let configured: Option<String> =
+        state_manager.get_global_state_key(GlobalStateKey::ActModeApiProvider);
+    if let Some(provider) = configured
+        && let Some(secret_key) = runtime_provider_secret_key(&provider)
+        && state_manager
+            .get_secret(secret_key)
+            .is_some_and(|key| !key.is_empty())
+    {
+        return Some(provider);
+    }
+
+    for (provider, secret_key) in
+        [("anthropic", "apiKey"), ("openrouter", "openRouterApiKey")]
+    {
+        if state_manager
+            .get_secret(secret_key)
+            .is_some_and(|key| !key.is_empty())
+        {
+            return Some(provider.to_string());
+        }
+    }
+
+    if state_manager
+        .get_secret("openAiApiKey")
+        .is_some_and(|key| !key.is_empty())
+    {
+        let base_url: Option<String> =
+            state_manager.get_global_state_key(GlobalStateKey::OpenAiBaseUrl);
+        return Some(
+            if base_url.is_some_and(|url| !url.is_empty()) {
+                "openai"
+            } else {
+                "openai-native"
+            }
+            .to_string(),
+        );
+    }
+
+    for (provider, secret_key) in [
+        ("gemini", "geminiApiKey"),
+        ("minimax", "minimaxApiKey"),
+        ("deepseek", "deepSeekApiKey"),
+    ] {
+        if state_manager
+            .get_secret(secret_key)
+            .is_some_and(|key| !key.is_empty())
+        {
+            return Some(provider.to_string());
+        }
+    }
+
+    None
+}
+
 pub(crate) fn create_provider(
     task_opts: &TaskOptions,
+    state_manager: Option<&crate::storage::state_manager::StateManager>,
 ) -> anyhow::Result<Arc<crate::providers::Providers>> {
     use crate::providers::env_auth::get_provider_from_env;
 
-    // Determine provider: --provider flag > auto-detection from env > custom base_url (with api_key from flag/env) > error
     let (provider_name, was_auto_detected) = if let Some(explicit) = &task_opts.provider {
-        (explicit.as_str(), false)
+        (explicit.clone(), false)
     } else if let Some(detected) = get_provider_from_env() {
-        (detected, true)
+        (detected.to_string(), true)
     } else if task_opts.base_url.is_some() {
-        // Custom OpenAI-compatible endpoint with explicit base URL
-        // API key will be resolved from --api-key flag or OPENAI_API_KEY env var
-        ("openai", false)
+        ("openai".to_string(), false)
+    } else if let Some(stored) = state_manager.and_then(provider_from_state) {
+        (stored, true)
     } else {
-        // No provider flag and no auto-detected keys - show helpful error
         anyhow::bail!(
             "No API provider configured. Set one of these environment variables:\n\
              \n\
@@ -737,15 +831,14 @@ pub(crate) fn create_provider(
              \x1b[36m  OPENROUTER_API_KEY\x1b[0m      - OpenRouter\n\
              \x1b[36m  DEEPSEEK_API_KEY\x1b[0m       - DeepSeek\n\
              \n\
-             Or use --provider flag with --api-key and/or --base-url"
+             Or use --provider with --api-key/--base-url, or run sned auth --provider <name>"
         );
     };
 
-    // Only override to openai for custom base URL if user didn't explicitly specify provider
     let is_custom_provider =
         task_opts.base_url.is_some() || std::env::var("OPENAI_API_BASE").is_ok();
     let provider_name = if is_custom_provider && task_opts.provider.is_none() {
-        "openai"
+        "openai".to_string()
     } else {
         provider_name
     };
@@ -769,18 +862,20 @@ pub(crate) fn create_provider(
         });
     let user_agent = task_opts.user_agent.clone();
 
-    let provider: Arc<crate::providers::Providers> = match provider_name {
+    let provider: Arc<crate::providers::Providers> = match provider_name.as_str() {
         "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "ANTHROPIC_API_KEY is not set. \n\
-                         Set the environment variable or pass --api-key."
-                    )
-                })?;
-            // Use stored model ID default and base URL if not specified
+            let api_key = api_key_from_sources(
+                task_opts,
+                state_manager,
+                &["ANTHROPIC_API_KEY"],
+                "apiKey",
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ANTHROPIC_API_KEY is not set. \n\
+                     Set the environment variable, pass --api-key, or run sned auth --provider anthropic."
+                )
+            })?;
             let state = crate::storage::global_state::load_global_state();
             let default_model = model_id
                 .or_else(|| state.act_mode_api_model_id.clone())
@@ -799,22 +894,24 @@ pub(crate) fn create_provider(
             ))
         }
         "minimax" => {
-            // Use stored model ID default if not specified
             let default_model = model_id
                 .or_else(|| {
                     let state = crate::storage::global_state::load_global_state();
                     state.act_mode_api_model_id
                 })
                 .unwrap_or_else(|| "MiniMax-M2.7".to_string());
-            // Determine api_line: "china" if MINIMAX_CN_API_KEY is set, otherwise default
             let api_line = if std::env::var("MINIMAX_CN_API_KEY").is_ok() {
                 Some("china".to_string())
             } else {
                 std::env::var("MINIMAX_API_LINE").ok()
             };
-            let api_key = std::env::var("MINIMAX_CN_API_KEY")
-                .or_else(|_| std::env::var("MINIMAX_API_KEY"))
-                .unwrap_or_default();
+            let api_key = api_key_from_sources(
+                task_opts,
+                state_manager,
+                &["MINIMAX_CN_API_KEY", "MINIMAX_API_KEY"],
+                "minimaxApiKey",
+            )
+            .unwrap_or_default();
             Arc::new(crate::providers::Providers::Minimax(
                 crate::providers::minimax::MinimaxProvider::new(
                     crate::providers::minimax::MinimaxConfig {
@@ -828,23 +925,31 @@ pub(crate) fn create_provider(
             ))
         }
         "openai" | "openai-native" => {
-            let api_key = task_opts
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .unwrap_or_default();
+            let api_key = api_key_from_sources(
+                task_opts,
+                state_manager,
+                &["OPENAI_API_KEY"],
+                "openAiApiKey",
+            )
+            .unwrap_or_default();
             if api_key.is_empty() {
                 anyhow::bail!(
                     "No API key found for OpenAI-compatible provider. \n\
-                     Set OPENAI_API_KEY environment variable or use --api-key flag."
+                     Set OPENAI_API_KEY, use --api-key, or run sned auth --provider openai."
                 );
             }
             let base_url = task_opts
                 .base_url
                 .clone()
-                .or_else(|| std::env::var("OPENAI_API_BASE").ok());
-            let endpoint_kind = openai_endpoint_kind(provider_name, base_url.as_deref());
-            // Use stored model ID default if not specified
+                .or_else(|| std::env::var("OPENAI_API_BASE").ok())
+                .or_else(|| {
+                    state_manager.and_then(|state| {
+                        state.get_global_state_key(
+                            crate::storage::state_manager::GlobalStateKey::OpenAiBaseUrl,
+                        )
+                    })
+                });
+            let endpoint_kind = openai_endpoint_kind(&provider_name, base_url.as_deref());
             let default_model = model_id
                 .or_else(|| {
                     let state = crate::storage::global_state::load_global_state();
@@ -875,16 +980,24 @@ pub(crate) fn create_provider(
             ))
         }
         "gemini" => {
-            let api_key = task_opts
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-                .unwrap_or_default();
+            let api_key = api_key_from_sources(
+                task_opts,
+                state_manager,
+                &["GEMINI_API_KEY"],
+                "geminiApiKey",
+            )
+            .unwrap_or_default();
             let base_url = task_opts
                 .base_url
                 .clone()
-                .or_else(|| std::env::var("GEMINI_BASE_URL").ok());
-            // Use stored model ID default if not specified
+                .or_else(|| std::env::var("GEMINI_BASE_URL").ok())
+                .or_else(|| {
+                    state_manager.and_then(|state| {
+                        state.get_global_state_key(
+                            crate::storage::state_manager::GlobalStateKey::GeminiBaseUrl,
+                        )
+                    })
+                });
             let default_model = model_id
                 .or_else(|| {
                     let state = crate::storage::global_state::load_global_state();
@@ -906,11 +1019,13 @@ pub(crate) fn create_provider(
             ))
         }
         "deepseek" => {
-            let api_key = task_opts
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
-                .unwrap_or_default();
+            let api_key = api_key_from_sources(
+                task_opts,
+                state_manager,
+                &["DEEPSEEK_API_KEY"],
+                "deepSeekApiKey",
+            )
+            .unwrap_or_default();
             let model_id_str = model_id.unwrap_or_else(|| "deepseek-chat".to_string());
             Arc::new(crate::providers::Providers::DeepSeek(
                 crate::providers::deepseek::DeepSeekProvider::new(
@@ -925,11 +1040,13 @@ pub(crate) fn create_provider(
             ))
         }
         "openrouter" => {
-            let api_key = task_opts
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .unwrap_or_default();
+            let api_key = api_key_from_sources(
+                task_opts,
+                state_manager,
+                &["OPENROUTER_API_KEY"],
+                "openRouterApiKey",
+            )
+            .unwrap_or_default();
             let model_id_str =
                 model_id.unwrap_or_else(|| "anthropic/claude-sonnet-4.5".to_string());
             Arc::new(crate::providers::Providers::OpenRouter(
@@ -1160,7 +1277,7 @@ async fn build_task_components(
     let state_manager = Arc::new(StateManager::new()?);
     state_manager.initialize()?;
 
-    let provider = create_provider(&task_opts)?;
+    let provider = create_provider(&task_opts, Some(&state_manager))?;
 
     let mode = if task_opts.plan {
         AgentMode::Plan
@@ -2222,7 +2339,6 @@ mod tests {
                 "OPENAI_API_BASE",
                 "OPENCODE_API_KEY",
                 "KIMI_API_KEY",
-                "OPENAI_COMPATIBLE_CUSTOM_KEY",
             ];
             for var in &all_provider_vars {
                 // SAFETY: clearing under mutex lock
@@ -2261,7 +2377,7 @@ mod tests {
                 max_tokens: None,
                 debug: false,
             };
-            let result = create_provider(&task_opts);
+            let result = create_provider(&task_opts, None);
             assert!(result.is_ok(), "Expected Ok when ANTHROPIC_API_KEY is set");
             // SAFETY: cleanup under mutex lock
             unsafe { env::remove_var("ANTHROPIC_API_KEY") };
@@ -2293,7 +2409,6 @@ mod tests {
                 "OPENAI_API_BASE",
                 "OPENCODE_API_KEY",
                 "KIMI_API_KEY",
-                "OPENAI_COMPATIBLE_CUSTOM_KEY",
             ];
             for var in &all_provider_vars {
                 // SAFETY: clearing under mutex lock
@@ -2330,7 +2445,7 @@ mod tests {
                 max_tokens: None,
                 debug: false,
             };
-            let result = create_provider(&task_opts);
+            let result = create_provider(&task_opts, None);
             assert!(
                 result.is_err(),
                 "Expected Err when ANTHROPIC_API_KEY is unset (not a dummy-key Ok)"
@@ -2380,7 +2495,6 @@ mod tests {
                 "OPENAI_API_BASE",
                 "OPENCODE_API_KEY",
                 "KIMI_API_KEY",
-                "OPENAI_COMPATIBLE_CUSTOM_KEY",
             ];
             for var in &all_provider_vars {
                 unsafe { env::remove_var(var) };
@@ -2417,7 +2531,7 @@ mod tests {
                 max_tokens: None,
                 debug: false,
             };
-            let result = create_provider(&task_opts);
+            let result = create_provider(&task_opts, None);
             assert!(result.is_ok(), "Expected Ok with explicit provider");
             unsafe { env::remove_var("ANTHROPIC_API_KEY") };
         }
@@ -2426,7 +2540,7 @@ mod tests {
     #[test]
     fn test_create_provider_rejects_qwen_provider() {
         let cli = Cli::try_parse_from(["sned", "--provider", "qwen", "test prompt"]).unwrap();
-        let err = match create_provider(&cli.task_opts) {
+        let err = match create_provider(&cli.task_opts, None) {
             Ok(_) => panic!("unsupported provider should fail"),
             Err(err) => err,
         };
@@ -2438,6 +2552,60 @@ mod tests {
             cli_err,
             crate::error::CliError::Config(message) if message == "Unsupported provider: qwen"
         ));
+    }
+
+    #[test]
+    fn test_create_provider_rejects_openai_compatible_alias() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "openai-compatible",
+            "--api-key",
+            "test-key",
+            "test prompt",
+        ])
+        .unwrap();
+        let err = match create_provider(&cli.task_opts, None) {
+            Ok(_) => panic!("unsupported provider should fail"),
+            Err(err) => err,
+        };
+
+        let cli_err = err
+            .downcast_ref::<crate::error::CliError>()
+            .expect("unsupported provider should be a typed CliError");
+        assert!(matches!(
+            cli_err,
+            crate::error::CliError::Config(message)
+                if message == "Unsupported provider: openai-compatible"
+        ));
+    }
+
+    #[test]
+    fn test_create_provider_uses_stored_auth_secret() {
+        let _guard = PROVIDER_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for env_var in [
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENAI_API_BASE",
+            "GEMINI_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ] {
+            // SAFETY: provider environment mutation is serialized by PROVIDER_ENV_MUTEX.
+            unsafe { std::env::remove_var(env_var) };
+        }
+
+        let state_manager = crate::storage::state_manager::StateManager::new().unwrap();
+        state_manager.set_secret("apiKey", "stored-anthropic-key".to_string());
+        let cli = Cli::try_parse_from(["sned", "test prompt"]).unwrap();
+
+        let provider = create_provider(&cli.task_opts, Some(&state_manager)).unwrap();
+
+        assert_eq!(provider.name(), "anthropic");
     }
 
     #[test]
@@ -2473,7 +2641,7 @@ mod tests {
             "test prompt",
         ])
         .unwrap();
-        let provider = create_provider(&cli.task_opts).unwrap();
+        let provider = create_provider(&cli.task_opts, None).unwrap();
         let crate::providers::Providers::OpenRouter(openrouter) = provider.as_ref() else {
             panic!("expected OpenRouter provider");
         };
@@ -2504,7 +2672,7 @@ mod tests {
             "test prompt",
         ])
         .unwrap();
-        match create_provider(&cli.task_opts) {
+        match create_provider(&cli.task_opts, None) {
             Ok(provider) => {
                 assert_eq!(provider.name(), "openai");
                 let info = provider.get_model().info;

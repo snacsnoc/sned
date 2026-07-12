@@ -1728,11 +1728,22 @@ impl StateManager {
 
     /// Get a secret
     pub fn get_secret(&self, key: &str) -> Option<String> {
-        self.secrets
+        if let Some(secret) = self
+            .secrets
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .cloned()
+        {
+            return Some(secret);
+        }
+
+        let secret = self.secrets_store.get(key)?;
+        self.secrets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.to_string(), secret.clone());
+        Some(secret)
     }
 
     /// Set a secret

@@ -34,7 +34,6 @@ pub const SECRET_KEYS: &[&str] = &[
     "basetenApiKey",
     "vercelAiGatewayApiKey",
     "difyApiKey",
-    "openAiCompatibleCustomApiKey",
     "minimaxApiKey",
     "aihubmixApiKey",
     "nousResearchApiKey",
@@ -66,11 +65,6 @@ pub fn env_var_to_secret_key() -> HashMap<&'static str, &'static str> {
     map.insert("TOGETHER_API_KEY", "togetherApiKey");
     map.insert("FIREWORKS_API_KEY", "fireworksApiKey");
     map.insert("NEBIUS_API_KEY", "nebiusApiKey");
-    map.insert(
-        "OPENAI_COMPATIBLE_CUSTOM_KEY",
-        "openAiCompatibleCustomApiKey",
-    );
-    map.insert("OPENAI_API_BASE", "openAiCompatibleCustomApiKey");
     map.insert("AWS_ACCESS_KEY_ID", "awsAccessKey");
     map.insert("AWS_SECRET_ACCESS_KEY", "awsSecretKey");
     map.insert("AWS_SESSION_TOKEN", "awsSessionToken");
@@ -91,7 +85,11 @@ impl SecretsStore {
         let file_path = sned_dir.join(".secrets.json");
         Ok(Self {
             file_path,
-            service_name: "sned-cli".to_string(),
+            service_name: if cfg!(test) {
+                format!("sned-cli-test-{}", std::process::id())
+            } else {
+                "sned-cli".to_string()
+            },
         })
     }
 
