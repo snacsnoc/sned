@@ -104,19 +104,15 @@ pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> Strin
         Some(SnedTool::SearchFiles) => (
             "searched",
             params
-                .get("paths")
-                .and_then(|p| p.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
+                .get("path")
+                .and_then(|p| p.as_str())
                 .map(String::from),
         ),
         Some(SnedTool::ListFiles) => (
             "listed",
             params
-                .get("paths")
-                .and_then(|p| p.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
+                .get("path")
+                .and_then(|p| p.as_str())
                 .map(String::from),
         ),
         _ => return tool_name.to_string(),
@@ -461,6 +457,27 @@ mod tests {
         assert!(summary.contains("▶"));
         assert!(summary.contains("edited"));
         assert!(summary.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_search_files_uses_path() {
+        let params = serde_json::json!({
+            "path": "src/core",
+            "regex": "PlanState"
+        });
+        let summary = format_tool_summary("search_files", &params);
+        assert!(summary.contains("searched"));
+        assert!(summary.contains("src/core"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_list_files_uses_path() {
+        let params = serde_json::json!({
+            "path": "src/providers"
+        });
+        let summary = format_tool_summary("list_files", &params);
+        assert!(summary.contains("listed"));
+        assert!(summary.contains("src/providers"));
     }
 
     #[test]
