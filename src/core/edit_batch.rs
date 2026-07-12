@@ -729,6 +729,9 @@ mod tests {
 
     #[test]
     fn test_replace_preserves_trailing_empty_lines_in_content_and_diff() {
+        let _env_lock = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let task_id = "replacement_trailing_lines_test";
         let anchor_mgr = AnchorStateManager::new();
         anchor_mgr.reset(Some(task_id));
@@ -757,11 +760,13 @@ mod tests {
             prepared.final_lines,
             split_content_lines("line1\nreplacement\n\n")
         );
-        assert!(
-            prepared
-                .diff
-                .contains("+ replacement\n+ \n+ \n>>>>>>> REPLACE")
+        let expected_diff = format!(
+            "{}\n{}\n{}\n",
+            crate::cli::colors::diff_addition("replacement"),
+            crate::cli::colors::diff_addition(""),
+            crate::cli::colors::diff_addition("")
         );
+        assert!(prepared.diff.contains(&expected_diff));
     }
 
     #[test]
