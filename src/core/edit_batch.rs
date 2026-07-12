@@ -75,6 +75,25 @@ pub enum DiffMode {
     AdditionsOnly,
 }
 
+fn count_line_hash_changes(original_hashes: &[String], final_hashes: &[String]) -> (usize, usize) {
+    let mut counts: std::collections::HashMap<&str, isize> =
+        std::collections::HashMap::with_capacity(original_hashes.len() + final_hashes.len());
+    for hash in original_hashes {
+        *counts.entry(hash.as_str()).or_default() += 1;
+    }
+    for hash in final_hashes {
+        *counts.entry(hash.as_str()).or_default() -= 1;
+    }
+
+    counts.values().fold((0, 0), |(added, removed), count| {
+        if *count < 0 {
+            (added + count.unsigned_abs(), removed)
+        } else {
+            (added, removed + *count as usize)
+        }
+    })
+}
+
 impl BatchProcessor {
     #[must_use]
     pub fn new(diff_mode: DiffMode) -> Self {
@@ -330,30 +349,12 @@ impl BatchProcessor {
         let mut applied_diffs: Vec<String> = Vec::new();
 
         for applied in &prepared.applied_edits {
-            let original_hashes_set: std::collections::HashSet<&String> = prepared.line_hashes
-                [applied.original_start_idx..=applied.original_end_idx]
-                .iter()
-                .collect();
-            let final_hashes_set: std::collections::HashSet<&String> = final_hashes
-                [applied.start_idx..=applied.end_idx]
-                .iter()
-                .collect();
-
-            // Count removed lines
-            for line_hash in
-                &prepared.line_hashes[applied.original_start_idx..=applied.original_end_idx]
-            {
-                if !final_hashes_set.contains(line_hash) {
-                    total_removed += 1;
-                }
-            }
-
-            // Count added lines
-            for line_hash in &final_hashes[applied.start_idx..=applied.end_idx] {
-                if !original_hashes_set.contains(line_hash) {
-                    total_added += 1;
-                }
-            }
+            let (added, removed) = count_line_hash_changes(
+                &prepared.line_hashes[applied.original_start_idx..=applied.original_end_idx],
+                &final_hashes[applied.start_idx..=applied.end_idx],
+            );
+            total_added += added;
+            total_removed += removed;
 
             let diff_block = if self.diff_mode == DiffMode::AdditionsOnly {
                 self.get_addition_only_diff_block(prepared, final_lines, final_hashes, applied)
@@ -912,6 +913,51 @@ mod tests {
 
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
         assert!(formatted.contains("NOTE the UPDATED anchors below"));
+    }
+
+    #[test]
+    fn test_format_result_counts_duplicate_hash_occurrences() {
+        let edit = Edit {
+            anchor: "Apple§same".to_string(),
+            end_anchor: Some("Banana§same".to_string()),
+            edit_type: "replace".to_string(),
+            text: "same".to_string(),
+        };
+        let prepared = PreparedEdits {
+            content: "same\nsame".to_string(),
+            final_content: "same".to_string(),
+            diff: String::new(),
+            resolved_edits: vec![ResolvedEdit {
+                line_idx: 0,
+                end_idx: 1,
+                edit: edit.clone(),
+            }],
+            failed_edits: Vec::new(),
+            applied_edits: vec![AppliedEdit {
+                start_idx: 0,
+                end_idx: 0,
+                original_start_idx: 0,
+                original_end_idx: 1,
+                edit,
+                lines_added: 1,
+                lines_deleted: 2,
+            }],
+            lines: vec!["same".to_string(), "same".to_string()],
+            line_hashes: vec!["duplicate".to_string(), "duplicate".to_string()],
+            final_lines: vec!["same".to_string()],
+            initial_mtime: None,
+        };
+        let processor = BatchProcessor::new(DiffMode::Full);
+        let formatted = processor.format_result(
+            &prepared,
+            &prepared.final_lines,
+            &["duplicate".to_string()],
+            None,
+            None,
+            None,
+        );
+
+        assert!(formatted.contains("(+0, -1 lines)"));
     }
 
     #[test]
