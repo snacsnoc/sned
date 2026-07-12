@@ -15,6 +15,7 @@ use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use futures::StreamExt;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 
 fn max_file_read_size() -> usize {
@@ -47,6 +48,16 @@ struct FileReadResult {
     error: Option<String>,
 }
 
+impl FileReadResult {
+    fn with_display_path(mut self, display_path: &str) -> Self {
+        let execution_path = std::mem::replace(&mut self.path, display_path.to_string());
+        if let Some(error) = &mut self.error {
+            *error = error.replace(&execution_path, display_path);
+        }
+        self
+    }
+}
+
 /// Read file tool handler.
 #[derive(Debug, Clone, Default)]
 pub struct ReadFileHandler;
@@ -55,6 +66,15 @@ impl ReadFileHandler {
     #[must_use]
     pub fn new() -> Self {
         Self
+    }
+
+    fn workspace_relative_display_path(workspace_root: &Path, requested_path: &str) -> String {
+        let requested_path = Path::new(requested_path);
+        requested_path
+            .strip_prefix(workspace_root)
+            .unwrap_or(requested_path)
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn ranged_read_too_large(
@@ -88,11 +108,39 @@ impl ReadFileHandler {
         task_id: Option<&str>,
         output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Vec<FileReadResult> {
+        let display_paths = paths.clone();
+        self.read_files_with_display_paths(
+            paths,
+            &display_paths,
+            start_line,
+            end_line,
+            anchor_mgr,
+            task_id,
+            output_writer,
+        )
+        .await
+    }
+
+    async fn read_files_with_display_paths(
+        &self,
+        paths: Vec<String>,
+        display_paths: &[String],
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        anchor_mgr: &AnchorStateManager,
+        task_id: Option<&str>,
+        output_writer: Option<&crate::cli::output::OutputWriterArc>,
+    ) -> Vec<FileReadResult> {
         let read_futures: Vec<_> = paths
             .iter()
-            .map(|path| {
-                self.read_file(
+            .enumerate()
+            .map(|(index, path)| {
+                let display_path = display_paths
+                    .get(index)
+                    .map_or(path.as_str(), String::as_str);
+                self.read_file_with_display_path(
                     path,
+                    display_path,
                     start_line,
                     end_line,
                     anchor_mgr,
@@ -115,9 +163,32 @@ impl ReadFileHandler {
     ///
     /// Returns the file content with hash-anchored lines if successful,
     /// or an error message if the file cannot be read.
+    #[cfg(test)]
     async fn read_file(
         &self,
         path: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        anchor_mgr: &AnchorStateManager,
+        task_id: Option<&str>,
+        output_writer: Option<&crate::cli::output::OutputWriterArc>,
+    ) -> FileReadResult {
+        self.read_file_with_display_path(
+            path,
+            path,
+            start_line,
+            end_line,
+            anchor_mgr,
+            task_id,
+            output_writer,
+        )
+        .await
+    }
+
+    async fn read_file_with_display_path(
+        &self,
+        path: &str,
+        display_path: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
         anchor_mgr: &AnchorStateManager,
@@ -130,9 +201,10 @@ impl ReadFileHandler {
         let canonical_path = match tokio::fs::canonicalize(path).await {
             Ok(p) => p,
             Err(e) => {
-                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                let err =
+                    crate::cli::actionable_errors::file_not_found(display_path, &e.to_string());
                 return FileReadResult {
-                    path: path.to_string(),
+                    path: display_path.to_string(),
                     canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
@@ -145,9 +217,10 @@ impl ReadFileHandler {
         let metadata = match tokio::fs::metadata(&canonical_path).await {
             Ok(m) => m,
             Err(e) => {
-                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                let err =
+                    crate::cli::actionable_errors::file_not_found(display_path, &e.to_string());
                 return FileReadResult {
-                    path: path.to_string(),
+                    path: display_path.to_string(),
                     canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
@@ -159,11 +232,11 @@ impl ReadFileHandler {
 
         if !metadata.is_file() {
             let err = crate::cli::actionable_errors::file_not_found(
-                path,
-                &format!("{path} is not a file"),
+                display_path,
+                &format!("{display_path} is not a file"),
             );
             return FileReadResult {
-                path: path.to_string(),
+                path: display_path.to_string(),
                 canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                 content: String::new(),
                 hash: String::new(),
@@ -176,7 +249,7 @@ impl ReadFileHandler {
         let has_line_range = start_line.is_some() || end_line.is_some();
         if has_line_range && metadata.len() > max_read_size as u64 {
             return Self::ranged_read_too_large(
-                path,
+                display_path,
                 &canonical_path,
                 metadata.len(),
                 max_read_size,
@@ -195,7 +268,7 @@ impl ReadFileHandler {
                     .await
                 {
                     Ok(v) => v,
-                    Err(e) => return e,
+                    Err(e) => return e.with_display_path(display_path),
                 }
             } else if metadata.len() > max_read_size as u64 {
                 match self
@@ -216,7 +289,7 @@ impl ReadFileHandler {
                             lines.len(),
                         )
                     }
-                    Err(e) => return e,
+                    Err(e) => return e.with_display_path(display_path),
                 }
             } else {
                 match self
@@ -231,7 +304,7 @@ impl ReadFileHandler {
                         0,
                         lines.len(),
                     ),
-                    Err(e) => return e,
+                    Err(e) => return e.with_display_path(display_path),
                 }
             };
 
@@ -255,21 +328,20 @@ impl ReadFileHandler {
 
         if output_lines.len() != output_anchors.len() {
             return FileReadResult {
-                path: path.to_string(),
+                path: display_path.to_string(),
                 canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                 content: String::new(),
                 hash: String::new(),
                 success: false,
                 error: Some(format!(
                     "Internal error: anchor/line length mismatch for {}: {} lines vs {} anchors",
-                    path,
+                    display_path,
                     output_lines.len(),
                     output_anchors.len()
                 )),
             };
         }
 
-        // Format each line with its hash anchor
         let anchored_content = output_lines
             .iter()
             .zip(output_anchors.iter())
@@ -277,16 +349,15 @@ impl ReadFileHandler {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Calculate file-level hash
         let hash = content_hash(&content_for_hash);
 
-        let mut content = format!("[File: {path}, Hash: {hash}]\n{anchored_content}");
+        let mut content = format!("[File: {display_path}, Hash: {hash}]\n{anchored_content}");
         if let Some(note) = clamping_note {
             content = format!("{note}\n{content}");
         }
 
         FileReadResult {
-            path: path.to_string(),
+            path: display_path.to_string(),
             canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
             content,
             hash,
@@ -682,6 +753,10 @@ impl ToolHandler for ReadFileHandler {
         let ctx = ctx.clone();
         Box::pin(async move {
             let (paths, start_line, end_line) = Self::parse_params(&params)?;
+            let display_paths: Vec<String> = paths
+                .iter()
+                .map(|path| Self::workspace_relative_display_path(&ctx.workspace_root, path))
+                .collect();
 
             let sanitized: Result<Vec<String>, ToolError> = paths
                 .iter()
@@ -693,8 +768,9 @@ impl ToolHandler for ReadFileHandler {
             let paths = sanitized?;
 
             let results = handler
-                .read_files(
+                .read_files_with_display_paths(
                     paths.clone(),
+                    &display_paths,
                     start_line,
                     end_line,
                     &ctx.anchor_mgr,
@@ -817,6 +893,61 @@ mod tests {
         assert!(result.content.contains("Hello, world!"));
         assert!(result.content.contains("[File: "));
         assert_eq!(result.error, None);
+    }
+
+    #[tokio::test]
+    async fn test_dispatched_read_file_renders_workspace_relative_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let relative_path = Path::new("nested").join("example.txt");
+        let file_path = workspace.path().join(&relative_path);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "Hello, world!\n").unwrap();
+
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = ToolHandler::execute(
+            &ReadFileHandler::new(),
+            &ctx,
+            serde_json::json!({"path": file_path.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+        let output = result.as_str().unwrap();
+
+        assert!(output.starts_with(&format!("[File: {}, Hash: ", relative_path.display())));
+        assert!(!output.contains(&workspace.path().to_string_lossy().to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_error_renders_display_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("missing.txt");
+        let anchor_mgr = AnchorStateManager::new();
+        let result = ReadFileHandler::new()
+            .read_file_with_display_path(
+                file_path.to_str().unwrap(),
+                "missing.txt",
+                None,
+                None,
+                &anchor_mgr,
+                Some("test-task"),
+                None,
+            )
+            .await;
+
+        let output = ReadFileHandler::format_results(vec![result]);
+        assert!(output.starts_with("Error reading missing.txt: "));
+        assert!(!output.contains(file_path.to_str().unwrap()));
     }
 
     #[tokio::test]
