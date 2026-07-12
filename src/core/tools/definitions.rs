@@ -571,14 +571,6 @@ pub fn use_subagents_schema() -> ToolSchema {
                 items: None,
                 extra: None,
             },
-            ToolParameter {
-                name: "include_history",
-                required: false,
-                param_type: "boolean",
-                description: "Optional boolean to include the main task's conversation history. This benefits from context caching and provides more context, but consumes context window space.",
-                items: None,
-                extra: None,
-            },
         ],
     }
 }
@@ -1117,6 +1109,18 @@ mod tests {
         assert_eq!(
             auto_accept.extra.as_ref(),
             Some(&serde_json::json!({"default": false}))
+        );
+    }
+
+    #[test]
+    fn test_use_subagents_schema_omits_unsupported_history() {
+        let schema = use_subagents_schema();
+
+        assert!(
+            schema
+                .parameters
+                .iter()
+                .all(|param| param.name != "include_history")
         );
     }
 

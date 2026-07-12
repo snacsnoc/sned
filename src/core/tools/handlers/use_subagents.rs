@@ -97,13 +97,6 @@ impl UseSubagentsHandler {
             .map(|t| if t > 0 { t as u32 } else { 1 })
     }
 
-    fn parse_include_history(params: &serde_json::Value) -> bool {
-        params
-            .get("include_history")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s.to_lowercase() == "true")
-    }
-
     async fn collect_stream_output<R>(
         reader: R,
         prefix: String,
@@ -147,7 +140,6 @@ impl UseSubagentsHandler {
         prompt: &str,
         timeout_secs: u64,
         max_turns: Option<u32>,
-        _include_history: bool,
         cwd: &Path,
         task_state: Option<Arc<Mutex<TaskState>>>,
         progress_writer: Option<crate::cli::output::OutputWriterArc>,
@@ -355,6 +347,27 @@ impl UseSubagentsHandler {
         result
     }
 
+    async fn collect_subagent_results(
+        handles: Vec<(usize, tokio::task::JoinHandle<SubagentResult>)>,
+    ) -> Vec<(usize, SubagentResult)> {
+        let mut results = Vec::with_capacity(handles.len());
+        for (idx, handle) in handles {
+            match handle.await {
+                Ok(result) => results.push((idx, result)),
+                Err(e) => results.push((
+                    idx,
+                    SubagentResult {
+                        status: "failed".to_string(),
+                        error: Some(format!("Join error: {e}")),
+                        ..Default::default()
+                    },
+                )),
+            }
+        }
+        results.sort_by_key(|(idx, _)| *idx);
+        results
+    }
+
     async fn execute_with_workspace_root(
         &self,
         state: Arc<Mutex<TaskState>>,
@@ -443,7 +456,6 @@ impl UseSubagentsHandler {
 
         let timeout_secs = Self::parse_timeout(&params);
         let max_turns = Self::parse_max_turns(&params);
-        let include_history = Self::parse_include_history(&params);
 
         if timeout_secs == 0 {
             let mut state = state.lock().await;
@@ -498,40 +510,24 @@ impl UseSubagentsHandler {
             let state_clone = Arc::clone(&state);
             let progress_writer_clone = progress_writer.clone();
 
-            handles.push(tokio::spawn(async move {
-                let result = Self::run_subagent(
-                    i,
-                    &prompt_clone,
-                    timeout_secs,
-                    max_turns,
-                    include_history,
-                    cwd_clone.as_path(),
-                    Some(state_clone),
-                    progress_writer_clone,
-                )
-                .await;
-                (i, result)
-            }));
+            handles.push((
+                i,
+                tokio::spawn(async move {
+                    Self::run_subagent(
+                        i,
+                        &prompt_clone,
+                        timeout_secs,
+                        max_turns,
+                        cwd_clone.as_path(),
+                        Some(state_clone),
+                        progress_writer_clone,
+                    )
+                    .await
+                }),
+            ));
         }
 
-        let mut results: Vec<(usize, SubagentResult)> = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok((idx, result)) => results.push((idx, result)),
-                Err(e) => {
-                    results.push((
-                        results.len(),
-                        SubagentResult {
-                            status: "failed".to_string(),
-                            error: Some(format!("Join error: {e}")),
-                            ..Default::default()
-                        },
-                    ));
-                }
-            }
-        }
-
-        results.sort_by_key(|(i, _)| *i);
+        let results = Self::collect_subagent_results(handles).await;
 
         let mut successes = 0usize;
         let mut failures = 0usize;
@@ -814,16 +810,51 @@ mod tests {
         assert_eq!(max_turns, Some(10));
     }
 
-    #[test]
-    fn test_parse_include_history_default() {
-        let params = serde_json::json!({});
-        assert!(!UseSubagentsHandler::parse_include_history(&params));
-    }
+    #[tokio::test]
+    async fn test_collect_subagent_results_preserves_join_failure_index() {
+        let handles = vec![
+            (
+                2,
+                tokio::spawn(async {
+                    SubagentResult {
+                        status: "completed".to_string(),
+                        result: Some("third".to_string()),
+                        ..Default::default()
+                    }
+                }),
+            ),
+            (
+                0,
+                tokio::spawn(async {
+                    panic!("subagent task panic");
+                }),
+            ),
+            (
+                1,
+                tokio::spawn(async {
+                    SubagentResult {
+                        status: "completed".to_string(),
+                        result: Some("second".to_string()),
+                        ..Default::default()
+                    }
+                }),
+            ),
+        ];
 
-    #[test]
-    fn test_parse_include_history_true() {
-        let params = serde_json::json!({"include_history": "true"});
-        assert!(UseSubagentsHandler::parse_include_history(&params));
+        let results = UseSubagentsHandler::collect_subagent_results(handles).await;
+
+        assert_eq!(
+            results.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(results[0].1.status, "failed");
+        assert!(
+            results[0]
+                .1
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Join error"))
+        );
     }
 
     #[tokio::test]
