@@ -266,11 +266,10 @@ pub fn summarize_single_section(section: &str) -> String {
 const MAX_PRESERVED_ANCHORS: usize = 80;
 
 #[must_use]
-pub fn extract_edit_stats_detailed(result: &str) -> (String, String, i32, i32) {
+pub fn extract_edit_stats_detailed(result: &str) -> (String, i32, i32) {
     let mut files_changed = 0;
     let mut total_added = 0;
     let mut total_removed = 0;
-    let file_path = String::new();
 
     for line in result.lines() {
         if line.starts_with("Edited ")
@@ -300,7 +299,7 @@ pub fn extract_edit_stats_detailed(result: &str) -> (String, String, i32, i32) {
         result.lines().next().unwrap_or("").to_string()
     };
 
-    (stats, file_path, total_added, total_removed)
+    (stats, total_added, total_removed)
 }
 
 #[must_use]
@@ -485,6 +484,16 @@ mod tests {
         let params = serde_json::json!({});
         let summary = format_tool_summary("unknown_tool", &params);
         assert_eq!(summary, "unknown_tool");
+    }
+
+    #[test]
+    fn test_extract_edit_stats_detailed_returns_parsed_stats() {
+        let result = "Edited 2 file(s):\nApplied 3 edit(s) successfully (+4, -2 lines)\nApplied 1 edit(s) successfully (+1, -3 lines)";
+
+        assert_eq!(
+            extract_edit_stats_detailed(result),
+            ("2 file(s) (+5, -5)".to_string(), 5, 5)
+        );
     }
 
     #[test]

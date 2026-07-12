@@ -3158,7 +3158,7 @@ impl AgentLoop {
                     let is_error = result_output.is_error;
 
                     if tool_name == "edit_file" {
-                        let (stats, _, added, removed) =
+                        let (stats, added, removed) =
                             extract_edit_stats_detailed(&result_output.text);
                         for path in &edit_file_path {
                             if added > 0 || removed > 0 {
