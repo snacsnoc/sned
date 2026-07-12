@@ -18,6 +18,7 @@ pub struct OpenRouterConfig {
     pub model_id: String,
     pub model_info: Option<OpenAiCompatibleModelInfo>,
     pub provider_sort: Option<String>,
+    pub reasoning_effort: Option<String>,
     /// Provider name for error messages (defaults to "openrouter" if not set).
     pub provider_name: Option<String>,
 }
@@ -32,6 +33,7 @@ impl std::fmt::Debug for OpenRouterConfig {
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
             .field("provider_sort", &self.provider_sort)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("provider_name", &self.provider_name)
             .finish()
     }
@@ -45,7 +47,7 @@ pub struct OpenRouterProvider {
 
 impl OpenRouterProvider {
     pub fn new(config: OpenRouterConfig) -> Result<Self> {
-        // OpenRouter-specific custom headers
+        let provider_sort = config.provider_sort;
         let mut custom_headers = HashMap::with_capacity(4);
         custom_headers.insert("HTTP-Referer".to_string(), "https://sned.run".to_string());
         custom_headers.insert("X-Title".to_string(), "Sned".to_string());
@@ -59,7 +61,7 @@ impl OpenRouterProvider {
             base_url: Some("https://openrouter.ai/api/v1".to_string()),
             model_id: config.model_id,
             model_info: config.model_info,
-            reasoning_effort: None,
+            reasoning_effort: config.reasoning_effort,
             custom_headers: Some(custom_headers),
             endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: Some(
@@ -69,8 +71,18 @@ impl OpenRouterProvider {
             ),
         };
 
-        let inner = OpenAiProvider::new(openai_config)?;
+        let inner = OpenAiProvider::new(openai_config)?
+            .with_provider_sort(provider_sort)
+            .with_explicit_reasoning_effort_none();
         Ok(Self { inner })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_request_body_for_test(
+        &self,
+        request: &crate::providers::ProviderRequest,
+    ) -> Result<serde_json::Value> {
+        self.inner.build_request_body(request)
     }
 }
 
@@ -312,10 +324,20 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     }
 }
 
-/// Create an OpenRouter provider from environment variables.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_request() -> crate::providers::ProviderRequest {
+        crate::providers::ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        }
+    }
 
     #[test]
     fn test_openrouter_config() {
@@ -324,6 +346,7 @@ mod tests {
             model_id: "anthropic/claude-sonnet-4.5".to_string(),
             model_info: None,
             provider_sort: None,
+            reasoning_effort: None,
             provider_name: None,
         };
         let provider = OpenRouterProvider::new(config).unwrap();
@@ -331,35 +354,53 @@ mod tests {
     }
 
     #[test]
+    fn test_openrouter_request_body_applies_sort_and_reasoning_effort() {
+        for reasoning_effort in ["high", "none"] {
+            let provider = OpenRouterProvider::new(OpenRouterConfig {
+                api_key: "test-key".to_string(),
+                model_id: "openai/gpt-5.4".to_string(),
+                model_info: None,
+                provider_sort: Some("throughput".to_string()),
+                reasoning_effort: Some(reasoning_effort.to_string()),
+                provider_name: None,
+            })
+            .unwrap();
+
+            let body = provider
+                .build_request_body_for_test(&test_request())
+                .unwrap();
+
+            assert_eq!(body["provider"]["sort"], "throughput");
+            assert_eq!(body["reasoning_effort"], reasoning_effort);
+        }
+    }
+
+    #[test]
     fn test_openrouter_provider_name() {
-        // Verify that OpenRouter provider sets the correct provider name for error messages
         let config = OpenRouterConfig {
             api_key: "test-key".to_string(),
             model_id: "anthropic/claude-sonnet-4.5".to_string(),
             model_info: None,
             provider_sort: None,
+            reasoning_effort: None,
             provider_name: None,
         };
         let provider = OpenRouterProvider::new(config).unwrap();
-        // The inner OpenAiProvider should have "openrouter" as the provider name
-        // This is tested indirectly via the name() method and ensures error messages
-        // will show "openrouter" instead of "OpenAI"
         assert_eq!(provider.name(), "openrouter");
     }
 
     #[test]
     fn test_openrouter_custom_provider_name() {
-        // Verify custom provider name can be set
         let config = OpenRouterConfig {
             api_key: "test-key".to_string(),
             model_id: "anthropic/claude-sonnet-4.5".to_string(),
             model_info: None,
             provider_sort: None,
+            reasoning_effort: None,
             provider_name: Some("custom-openrouter".to_string()),
         };
         let provider = OpenRouterProvider::new(config).unwrap();
         assert_eq!(provider.name(), "openrouter");
-        // Custom provider name would appear in error messages, not in the name() method
     }
 
     #[test]

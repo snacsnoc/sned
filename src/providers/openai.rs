@@ -62,6 +62,8 @@ pub struct OpenAiProvider {
     config: OpenAiConfig,
     client: reqwest::Client,
     provider_name: String,
+    provider_sort: Option<String>,
+    send_reasoning_effort_none: bool,
 }
 
 impl OpenAiProvider {
@@ -80,7 +82,19 @@ impl OpenAiProvider {
             config,
             client,
             provider_name,
+            provider_sort: None,
+            send_reasoning_effort_none: false,
         })
+    }
+
+    pub(super) fn with_provider_sort(mut self, provider_sort: Option<String>) -> Self {
+        self.provider_sort = provider_sort;
+        self
+    }
+
+    pub(super) fn with_explicit_reasoning_effort_none(mut self) -> Self {
+        self.send_reasoning_effort_none = true;
+        self
     }
 
     fn build_headers(&self) -> anyhow::Result<HeaderMap> {
@@ -126,7 +140,10 @@ impl OpenAiProvider {
             .unwrap_or_else(|| "https://api.openai.com/v1".to_owned())
     }
 
-    fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
+    pub(super) fn build_request_body(
+        &self,
+        request: &ProviderRequest,
+    ) -> anyhow::Result<serde_json::Value> {
         let model_id = &self.config.model_id;
         let uses_official_reasoning_shape = self.config.endpoint_kind
             == OpenAiEndpointKind::Official
@@ -233,6 +250,10 @@ impl OpenAiProvider {
             "stream_options": {"include_usage": true},
         });
 
+        if let Some(sort) = &self.provider_sort {
+            body["provider"] = json!({"sort": sort});
+        }
+
         // Temperature: match TS behavior — omit by default (API uses model default).
         // If model_info.temperature is set and non-zero, send it.
         // If model_info.temperature is 0, omit (TS converts 0 → undefined).
@@ -262,9 +283,8 @@ impl OpenAiProvider {
             }
         }
 
-        // Reasoning effort
         if let Some(effort) = &self.config.reasoning_effort
-            && effort != "none"
+            && (effort != "none" || self.send_reasoning_effort_none)
         {
             body["reasoning_effort"] = json!(effort);
         }

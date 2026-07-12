@@ -941,7 +941,8 @@ pub(crate) fn create_provider(
                             &model_id_str,
                         )),
                         provider_sort: None,
-                        provider_name: None, // Use default "openrouter"
+                        reasoning_effort: task_opts.reasoning_effort.clone(),
+                        provider_name: None,
                     },
                 )?,
             ))
@@ -2455,6 +2456,39 @@ mod tests {
             openai_endpoint_kind("openai-native", Some("https://proxy.example.com/v1")),
             OpenAiEndpointKind::Official
         );
+    }
+
+    #[test]
+    fn test_create_provider_openrouter_preserves_reasoning_effort() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "openrouter",
+            "--api-key",
+            "sk-test123",
+            "--model",
+            "openai/gpt-5.4",
+            "--reasoning-effort",
+            "high",
+            "test prompt",
+        ])
+        .unwrap();
+        let provider = create_provider(&cli.task_opts).unwrap();
+        let crate::providers::Providers::OpenRouter(openrouter) = provider.as_ref() else {
+            panic!("expected OpenRouter provider");
+        };
+        let request = crate::providers::ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = openrouter.build_request_body_for_test(&request).unwrap();
+
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]
