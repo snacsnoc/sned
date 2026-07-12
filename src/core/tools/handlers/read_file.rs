@@ -4,7 +4,7 @@
 //! Core behavior:
 //! - Read single or multiple files
 //! - Support line ranges (start_line, end_line)
-//! - Enforce 100KB size limit for full file reads
+//! - Enforce a configured size limit for file reads
 //! - Calculate FNV-1a content hash
 //! - Return file content with hash-anchored lines for edit compatibility
 //! - Handle errors gracefully
@@ -55,6 +55,26 @@ impl ReadFileHandler {
     #[must_use]
     pub fn new() -> Self {
         Self
+    }
+
+    fn ranged_read_too_large(
+        path: &str,
+        canonical_path: &std::path::Path,
+        actual_bytes: u64,
+        max_bytes: usize,
+    ) -> FileReadResult {
+        let actual_kb = actual_bytes.div_ceil(1024);
+        let max_kb = (max_bytes as u64).div_ceil(1024);
+        FileReadResult {
+            path: path.to_string(),
+            canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
+            content: String::new(),
+            hash: String::new(),
+            success: false,
+            error: Some(format!(
+                "Line-range read requires a file no larger than {max_kb}KB, but this file is {actual_kb}KB. Increase SNED_MAX_FILE_READ_SIZE or reduce the file size."
+            )),
+        }
     }
 
     /// Read one or more files.
@@ -152,28 +172,44 @@ impl ReadFileHandler {
             };
         }
 
+        let max_read_size = max_file_read_size();
+        let has_line_range = start_line.is_some() || end_line.is_some();
+        if has_line_range && metadata.len() > max_read_size as u64 {
+            return Self::ranged_read_too_large(
+                path,
+                &canonical_path,
+                metadata.len(),
+                max_read_size,
+            );
+        }
+
         let (content_for_hash, sliced_lines, clamping_note, full_lines, range_start, range_end) =
-            if start_line.is_some() || end_line.is_some() {
+            if has_line_range {
                 match self
-                    .read_lines_range(&canonical_path.to_string_lossy(), start_line, end_line)
+                    .read_lines_range(
+                        &canonical_path.to_string_lossy(),
+                        start_line,
+                        end_line,
+                        max_read_size,
+                    )
                     .await
                 {
                     Ok(v) => v,
                     Err(e) => return e,
                 }
-            } else if metadata.len() > max_file_read_size() as u64 {
+            } else if metadata.len() > max_read_size as u64 {
                 match self
-                    .read_truncated(&canonical_path.to_string_lossy(), max_file_read_size())
+                    .read_truncated(&canonical_path.to_string_lossy(), max_read_size)
                     .await
                 {
                     Ok((content, lines)) => {
                         let size_kb = metadata.len() / 1024;
-                        let max_kb = max_file_read_size() as u64 / 1024;
+                        let max_kb = max_read_size as u64 / 1024;
                         (
                             content,
                             lines.clone(),
                             Some(format!(
-                                "[Note: File truncated to {max_kb}KB (file is {size_kb}KB). Use start_line and end_line parameters to read specific sections.]"
+                                "[Note: File truncated to {max_kb}KB (file is {size_kb}KB). Increase SNED_MAX_FILE_READ_SIZE to read more.]"
                             )),
                             Some(lines.clone()),
                             0,
@@ -206,9 +242,8 @@ impl ReadFileHandler {
         );
         let anchors = anchor_mgr.reconcile(path, lines_for_reconcile, task_id);
 
-        // For output, use only the sliced lines and their corresponding anchors
         let output_lines = &sliced_lines;
-        let output_anchors = if start_line.is_some() || end_line.is_some() {
+        let output_anchors = if has_line_range {
             // Guard against invalid ranges (range_start > range_end) that can occur
             // when the model sends start_line > end_line or out-of-order values.
             let safe_start = range_start.min(anchors.len());
@@ -269,6 +304,7 @@ impl ReadFileHandler {
         path: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
+        max_bytes: usize,
     ) -> Result<
         (
             String,
@@ -296,8 +332,10 @@ impl ReadFileHandler {
             }
         };
 
-        let content = match tokio::fs::read_to_string(&canonical_path).await {
-            Ok(c) => c,
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let file = match tokio::fs::File::open(&canonical_path).await {
+            Ok(file) => file,
             Err(e) => {
                 let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                 return Err(FileReadResult {
@@ -311,12 +349,50 @@ impl ReadFileHandler {
             }
         };
 
-        // Use split_content_lines() to match edit_file.rs line semantics: split('\n')
-        // preserves \r from CRLF line endings, ensuring anchor consistency.
-        let all_lines: Vec<String> = split_content_lines(&content);
+        let limit = max_bytes.saturating_add(1) as u64;
+        let mut reader = BufReader::new(file.take(limit));
+        let mut all_lines = Vec::new();
+        let mut line = String::new();
+        let mut bytes_read = 0usize;
+        let mut ended_with_newline = false;
+        loop {
+            let read = match reader.read_line(&mut line).await {
+                Ok(read) => read,
+                Err(e) => {
+                    let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                    return Err(FileReadResult {
+                        path: path.to_string(),
+                        canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
+                        content: String::new(),
+                        hash: String::new(),
+                        success: false,
+                        error: Some(err.display()),
+                    });
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            bytes_read = bytes_read.saturating_add(read);
+            if bytes_read > max_bytes {
+                return Err(Self::ranged_read_too_large(
+                    path,
+                    &canonical_path,
+                    bytes_read as u64,
+                    max_bytes,
+                ));
+            }
+            ended_with_newline = line.ends_with('\n');
+            if ended_with_newline {
+                line.pop();
+            }
+            all_lines.push(std::mem::take(&mut line));
+        }
+        if all_lines.is_empty() || ended_with_newline {
+            all_lines.push(String::new());
+        }
         let total_lines = all_lines.len();
 
-        // Calculate the actual range (with clamping)
         let original_start = start_line.unwrap_or(1);
         let mut clamped_start = original_start;
         let mut clamped_end = end_line;
@@ -933,7 +1009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_large_with_line_range() {
+    async fn test_read_file_rejects_oversized_line_range() {
         let mut temp_file = NamedTempFile::new().unwrap();
         let data = "x".repeat(101 * 1024);
         temp_file.write_all(data.as_bytes()).unwrap();
@@ -951,7 +1027,49 @@ mod tests {
             )
             .await;
 
-        assert!(result.success);
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Line-range read requires a file no larger"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_lines_range_enforces_stream_cap() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"first line\nsecond line\nthird line\n")
+            .unwrap();
+
+        let result = ReadFileHandler::new()
+            .read_lines_range(temp_file.path().to_str().unwrap(), Some(1), Some(1), 16)
+            .await;
+
+        let error = result.expect_err("streamed range must stop at the byte cap");
+        assert!(
+            error
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("Line-range read requires"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_lines_range_preserves_split_content_semantics() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"first\r\nsecond\n").unwrap();
+
+        let (_, sliced_lines, _, full_lines, range_start, range_end) = ReadFileHandler::new()
+            .read_lines_range(temp_file.path().to_str().unwrap(), Some(1), Some(3), 1024)
+            .await
+            .unwrap();
+
+        let expected = vec!["first\r".to_string(), "second".to_string(), String::new()];
+        assert_eq!(sliced_lines, expected);
+        assert_eq!(full_lines.unwrap(), expected);
+        assert_eq!((range_start, range_end), (0, 3));
     }
 
     #[tokio::test]
