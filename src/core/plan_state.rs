@@ -89,6 +89,42 @@ impl PlanState {
         self.version = self.version.saturating_add(1);
     }
 
+    pub fn approve_at(&mut self, index: usize) -> Result<(), String> {
+        let step = self
+            .steps
+            .get(index)
+            .ok_or_else(|| format!("Step {} does not exist", index + 1))?;
+        if step.status != PlanStepStatus::Pending {
+            return Err(format!("Step {} is not pending", index + 1));
+        }
+
+        self.current_step_index = index;
+        self.approved = true;
+        self.steps[index].status = PlanStepStatus::Running;
+        self.bump_version();
+        Ok(())
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        if self.paused != paused {
+            self.paused = paused;
+            self.bump_version();
+        }
+    }
+
+    pub fn mark_complete(&mut self) {
+        if !self.complete {
+            self.complete = true;
+            self.bump_version();
+        }
+    }
+
+    pub fn replace_steps(&mut self, step_descriptions: Vec<String>) {
+        let next_version = self.version.saturating_add(1);
+        *self = Self::create_plan(step_descriptions);
+        self.version = next_version;
+    }
+
     /// Update a step's description.
     pub fn update_step(&mut self, index: usize, description: String) -> Result<(), String> {
         let step = self
@@ -570,6 +606,41 @@ mod tests {
         plan.current_step_index = 0;
         assert!(plan.advance().is_some());
         assert!(plan.version > after_remove);
+    }
+
+    #[test]
+    fn test_lifecycle_mutations_increment_version() {
+        let mut plan = PlanState::create_plan(vec!["First".to_string(), "Second".to_string()]);
+
+        plan.approve_at(0).unwrap();
+        let after_approve = plan.version;
+        assert!(after_approve > 0);
+        assert!(plan.approved);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+
+        plan.set_paused(true);
+        let after_pause = plan.version;
+        assert!(after_pause > after_approve);
+        plan.set_paused(true);
+        assert_eq!(plan.version, after_pause);
+
+        plan.set_paused(false);
+        let after_resume = plan.version;
+        assert!(after_resume > after_pause);
+
+        plan.mark_complete();
+        let after_complete = plan.version;
+        assert!(after_complete > after_resume);
+        plan.mark_complete();
+        assert_eq!(plan.version, after_complete);
+
+        plan.replace_steps(vec!["Replacement".to_string()]);
+        assert!(plan.version > after_complete);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].description, "Replacement");
+        assert!(!plan.approved);
+        assert!(!plan.paused);
+        assert!(!plan.complete);
     }
 
     #[test]

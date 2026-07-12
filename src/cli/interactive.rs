@@ -2163,8 +2163,10 @@ async fn handle_cli_only_command(
                             } else if new_desc.trim().is_empty() {
                                 app.push_plain("Step description cannot be empty.");
                             } else {
-                                plan.steps[step_num - 1].description = new_desc.trim().to_string();
-                                app.push_plain(format!("Step {step_num} updated."));
+                                match plan.update_step(step_num - 1, new_desc.trim().to_string()) {
+                                    Ok(()) => app.push_plain(format!("Step {step_num} updated.")),
+                                    Err(e) => app.push_plain(format!("Error: {e}")),
+                                }
                             }
                         }
                         PlanSubcommand::Add(after_step, step_text) => {
@@ -2230,11 +2232,8 @@ async fn handle_cli_only_command(
                                     crate::core::plan_state::PlanState::parse_plan(&plan_text);
                                 match parsed {
                                         Some(steps) if !steps.is_empty() => {
-                                            let new_plan = crate::core::plan_state::PlanState::create_plan(steps);
-                                            let plan_len = {
-                                                *plan = new_plan;
-                                                plan.steps.len()
-                                            };
+                                            plan.replace_steps(steps);
+                                            let plan_len = plan.steps.len();
                                             state.last_injected_plan_state_hash = None;
                                             app.push_plain(format!(
                                                 "Plan replaced ({plan_len} steps)."
@@ -2268,7 +2267,7 @@ async fn handle_cli_only_command(
                             };
                             let Some(start_index) = start_index else {
                                 if plan.is_complete() {
-                                    plan.complete = true;
+                                    plan.mark_complete();
                                     app.push_plain("All steps are complete.");
                                 } else if plan.steps.iter().all(|s| {
                                     s.status == crate::core::plan_state::PlanStepStatus::Failed
@@ -2285,12 +2284,12 @@ async fn handle_cli_only_command(
                                 }
                                 return Ok(false);
                             };
-                            plan.current_step_index = start_index;
                             let steps_len = plan.steps.len();
                             let step_desc = plan.steps[start_index].description.clone();
-                            plan.approved = true;
-                            plan.steps[start_index].status =
-                                crate::core::plan_state::PlanStepStatus::Running;
+                            if let Err(e) = plan.approve_at(start_index) {
+                                app.push_plain(format!("Cannot approve plan: {e}"));
+                                return Ok(false);
+                            }
                             drop(state);
                             {
                                 let state_handle = sess.agent_loop_mut().await.state_handle();
@@ -2331,7 +2330,7 @@ async fn handle_cli_only_command(
                     }
                     CliOnlyCommand::PlanPause => {
                         if plan.approved && plan.current_step_index < plan.steps.len() {
-                            plan.paused = true;
+                            plan.set_paused(true);
                             app.push_plain("Plan paused. Use /plan resume to continue.");
                         } else {
                             app.push_plain("No active plan to pause.");
@@ -2358,10 +2357,13 @@ async fn handle_cli_only_command(
                             let step_desc = current_step.description.clone();
                             let step_num = plan.current_step_index + 1;
                             let step_total = plan.steps.len();
-                            plan.paused = false;
+                            plan.set_paused(false);
                             if current_step_failed {
-                                plan.steps[plan.current_step_index].status =
-                                    crate::core::plan_state::PlanStepStatus::Running;
+                                plan.mark_step(
+                                    plan.current_step_index,
+                                    crate::core::plan_state::PlanStepStatus::Running,
+                                )
+                                .ok();
                             }
                             drop(state);
                             drop(sess);
@@ -2397,7 +2399,7 @@ async fn handle_cli_only_command(
                             .ok();
                             let next = plan.advance();
                             if next.is_none() && plan.is_complete() {
-                                plan.complete = true;
+                                plan.mark_complete();
                                 app.push_plain("All steps marked complete. Plan finished.");
                             } else {
                                 app.push_plain(format!(
@@ -2418,7 +2420,7 @@ async fn handle_cli_only_command(
                                 crate::core::plan_state::PlanStepStatus::Failed,
                             )
                             .ok();
-                            plan.paused = true;
+                            plan.set_paused(true);
                             app.push_plain(format!(
                                 "Step {}/{} marked as failed. Execution paused. Use /plan resume to retry.",
                                 plan.current_step_index + 1,
@@ -5282,6 +5284,12 @@ mod tests {
 
         let mut app = App::new();
         app.mode = "PLAN".to_string();
+        {
+            let state = state_handle.lock().await;
+            let plan = state.plan_state.as_ref().expect("plan should exist");
+            assert!(app.sync_plan_state_cache(Some(plan)));
+            assert!(!app.sync_plan_state_cache(Some(plan)));
+        }
         let agent_busy = Arc::new(AtomicBool::new(false));
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
@@ -5333,6 +5341,13 @@ mod tests {
         assert_eq!(plan.current_step_index, 0);
         assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
         assert_eq!(plan.steps[1].status, PlanStepStatus::Pending);
+        assert!(app.sync_plan_state_cache(Some(plan)));
+        assert!(
+            app.plan_state_cache
+                .as_ref()
+                .expect("approved plan should be cached")
+                .approved
+        );
 
         if let Some(task) = agent_task.lock().await.take() {
             task.abort();
@@ -5402,6 +5417,12 @@ mod tests {
 
         let mut app = App::new();
         app.mode = "ACT".to_string();
+        {
+            let state = state_handle.lock().await;
+            let plan = state.plan_state.as_ref().expect("plan should exist");
+            assert!(app.sync_plan_state_cache(Some(plan)));
+            assert!(!app.sync_plan_state_cache(Some(plan)));
+        }
         let agent_busy = Arc::new(AtomicBool::new(false));
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
@@ -5446,6 +5467,13 @@ mod tests {
         assert!(plan.paused);
         assert_eq!(plan.current_step_index, 0);
         assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+        assert!(app.sync_plan_state_cache(Some(plan)));
+        assert!(
+            app.plan_state_cache
+                .as_ref()
+                .expect("paused plan should be cached")
+                .paused
+        );
 
         Ok(())
     }
@@ -5512,6 +5540,12 @@ mod tests {
 
         let mut app = App::new();
         app.mode = "ACT".to_string();
+        {
+            let state = state_handle.lock().await;
+            let plan = state.plan_state.as_ref().expect("plan should exist");
+            assert!(app.sync_plan_state_cache(Some(plan)));
+            assert!(!app.sync_plan_state_cache(Some(plan)));
+        }
         let agent_busy = Arc::new(AtomicBool::new(false));
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
@@ -5559,6 +5593,13 @@ mod tests {
             assert_eq!(plan.current_step_index, 0);
             assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
             assert_eq!(plan.steps[1].status, PlanStepStatus::Pending);
+            assert!(app.sync_plan_state_cache(Some(plan)));
+            assert!(
+                !app.plan_state_cache
+                    .as_ref()
+                    .expect("resumed plan should be cached")
+                    .paused
+            );
         }
 
         if let Some(task) = agent_task.lock().await.take() {

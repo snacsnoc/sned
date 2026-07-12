@@ -3297,7 +3297,7 @@ impl AgentLoop {
                         if *current_status != PlanStepStatus::Failed {
                             plan.mark_step(plan.current_step_index, PlanStepStatus::Failed)
                                 .ok();
-                            plan.paused = true;
+                            plan.set_paused(true);
                             tracing::info!(
                                 step_index = plan.current_step_index,
                                 "Plan step failed. Execution paused. User action required."
