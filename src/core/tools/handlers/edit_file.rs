@@ -4618,6 +4618,36 @@ edition = "2021"
         assert!(content.ends_with('\n'), "trailing newline should be preserved");
     }
 
+    #[tokio::test]
+    async fn test_edit_file_preserves_trailing_newlines_in_replacement_text() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("line 1\nline 2", "replacement-trailing-newlines").await;
+        let ctx = ctx_for_dir(&dir, "replacement-trailing-newlines");
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": format!("{}§line 2", anchors[1]),
+                    "edit_type": "replace",
+                    "text": "replacement\n\n"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+
+        assert!(
+            result.is_ok(),
+            "replacement should preserve terminal newlines: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "line 1\nreplacement\n\n"
+        );
+    }
+
     // --- Pattern 10: multiple edits in one file in one call ---
     // Seen in: prompt 6 (DeepSeek), prompt 5 (unknown model)
     // Model sends two edits for the same file in one edit_file call.

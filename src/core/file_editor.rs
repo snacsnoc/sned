@@ -943,10 +943,7 @@ impl EditExecutor {
             let replacement_lines: Vec<String> = if clean_text.is_empty() {
                 Vec::new()
             } else {
-                clean_text
-                    .lines()
-                    .map(std::string::ToString::to_string)
-                    .collect()
+                split_content_lines(&clean_text)
             };
 
             let (removed_in_this_edit, splice_index) = if edit_type == "insert_after" {

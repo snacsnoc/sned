@@ -269,12 +269,11 @@ impl BatchProcessor {
             } else {
                 search_lines =
                     prepared.lines[applied.original_start_idx..=applied.original_end_idx].to_vec();
-                replace_lines = applied
-                    .edit
-                    .text
-                    .lines()
-                    .map(std::string::ToString::to_string)
-                    .collect();
+                replace_lines = if applied.edit.text.is_empty() {
+                    Vec::new()
+                } else {
+                    split_content_lines(&applied.edit.text)
+                };
             }
 
             let colored = !crate::cli::colors::stdout_colors_disabled();
@@ -725,6 +724,43 @@ mod tests {
         assert!(result.final_content.is_some());
         let final_content = result.final_content.unwrap();
         assert!(final_content.contains("fn greeting()"));
+    }
+
+    #[test]
+    fn test_replace_preserves_trailing_empty_lines_in_content_and_diff() {
+        let task_id = "replacement_trailing_lines_test";
+        let anchor_mgr = AnchorStateManager::new();
+        anchor_mgr.reset(Some(task_id));
+        let processor = BatchProcessor::new(DiffMode::Full);
+        let content = "line1\nline2";
+        let lines = split_content_lines(content);
+        let hashes = anchor_mgr.reconcile("/tmp/trailing.rs", &lines, Some(task_id));
+        let edits = vec![Edit {
+            anchor: format!("{}§line2", hashes[1]),
+            end_anchor: Some(format!("{}§line2", hashes[1])),
+            edit_type: "replace".to_string(),
+            text: "replacement\n\n".to_string(),
+        }];
+
+        let mut prepared = processor
+            .prepare_edits("/tmp/trailing.rs", "trailing.rs", content, &edits, &hashes)
+            .unwrap();
+        let result = processor.apply_batch(&mut prepared, "trailing.rs", "trailing.rs");
+
+        assert!(result.success);
+        assert_eq!(
+            result.final_content.as_deref(),
+            Some("line1\nreplacement\n\n")
+        );
+        assert_eq!(
+            prepared.final_lines,
+            split_content_lines("line1\nreplacement\n\n")
+        );
+        assert!(
+            prepared
+                .diff
+                .contains("+ replacement\n+ \n+ \n>>>>>>> REPLACE")
+        );
     }
 
     #[test]
