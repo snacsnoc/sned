@@ -270,7 +270,7 @@ pub struct AgentConfig {
     pub provider: Arc<Mutex<Arc<Providers>>>,
     /// The mode (plan or act).
     pub mode: AgentMode,
-    /// Task ID (also used as ULID for telemetry).
+    /// Task ID.
     pub task_id: String,
     /// Whether to enable checkpoints.
     pub enable_checkpoints: bool,

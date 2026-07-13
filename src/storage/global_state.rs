@@ -56,8 +56,6 @@ pub struct GlobalState {
     pub global_skills_toggles: HashMap<String, bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_settings: Option<BrowserSettings>,
-    #[serde(default = "default_unset")]
-    pub telemetry_setting: String,
     #[serde(default)]
     pub plan_act_separate_models_setting: bool,
     #[serde(default = "default_true")]
@@ -101,36 +99,6 @@ pub struct GlobalState {
     #[serde(default)]
     pub double_check_completion_enabled: bool,
 
-    // OpenTelemetry settings
-    #[serde(default = "default_true")]
-    pub open_telemetry_enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_telemetry_metrics_exporter: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_telemetry_logs_exporter: Option<String>,
-    #[serde(default = "default_http_json")]
-    pub open_telemetry_otlp_protocol: String,
-    #[serde(default = "default_localhost_4318")]
-    pub open_telemetry_otlp_endpoint: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_telemetry_otlp_metrics_protocol: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_telemetry_otlp_metrics_endpoint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_telemetry_otlp_logs_protocol: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_telemetry_otlp_logs_endpoint: Option<String>,
-    #[serde(default = "default_metric_interval")]
-    pub open_telemetry_metric_export_interval: i32,
-    #[serde(default)]
-    pub open_telemetry_otlp_insecure: bool,
-    #[serde(default = "default_log_batch_size")]
-    pub open_telemetry_log_batch_size: i32,
-    #[serde(default = "default_log_batch_timeout")]
-    pub open_telemetry_log_batch_timeout: i32,
-    #[serde(default = "default_log_max_queue")]
-    pub open_telemetry_log_max_queue_size: i32,
-
     #[serde(default)]
     pub write_prompt_metadata_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,9 +140,6 @@ fn default_true() -> bool {
 fn default_vscode_terminal() -> String {
     "vscodeTerminal".to_string()
 }
-fn default_unset() -> String {
-    "unset".to_string()
-}
 fn default_shell_timeout() -> i32 {
     4000
 }
@@ -195,24 +160,6 @@ fn default_act_mode() -> String {
 }
 fn default_anthropic() -> String {
     "anthropic".to_string()
-}
-fn default_http_json() -> String {
-    "http/json".to_string()
-}
-fn default_localhost_4318() -> String {
-    "http://localhost:4318".to_string()
-}
-fn default_metric_interval() -> i32 {
-    60000
-}
-fn default_log_batch_size() -> i32 {
-    512
-}
-fn default_log_batch_timeout() -> i32 {
-    5000
-}
-fn default_log_max_queue() -> i32 {
-    2048
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -456,6 +403,23 @@ mod tests {
         let serialized = serde_json::to_value(state).unwrap();
         assert!(serialized.get("remote_workflow_toggles").is_none());
         assert!(serialized.get("global_workflow_toggles").is_none());
+    }
+
+    #[test]
+    fn test_legacy_telemetry_settings_are_ignored() {
+        let state: GlobalState = serde_json::from_str(
+            r#"{
+                "telemetry_setting": "enabled",
+                "open_telemetry_enabled": true,
+                "open_telemetry_otlp_endpoint": "http://localhost:4318"
+            }"#,
+        )
+        .unwrap();
+
+        let serialized = serde_json::to_value(state).unwrap();
+        assert!(serialized.get("telemetry_setting").is_none());
+        assert!(serialized.get("open_telemetry_enabled").is_none());
+        assert!(serialized.get("open_telemetry_otlp_endpoint").is_none());
     }
 
     #[test]

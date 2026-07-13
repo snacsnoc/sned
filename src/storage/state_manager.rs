@@ -61,11 +61,6 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Preferred language for responses",
     },
     ConfigKeyInfo {
-        name: "telemetry_setting",
-        key_type: "string",
-        description: "Telemetry setting (unset/enabled/disabled)",
-    },
-    ConfigKeyInfo {
         name: "default_terminal_profile",
         key_type: "string",
         description: "Default terminal profile",
@@ -120,46 +115,6 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key_type: "string",
         description: "AWS region",
     },
-    ConfigKeyInfo {
-        name: "open_telemetry_metrics_exporter",
-        key_type: "string",
-        description: "OpenTelemetry metrics exporter",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_logs_exporter",
-        key_type: "string",
-        description: "OpenTelemetry logs exporter",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_otlp_protocol",
-        key_type: "string",
-        description: "OpenTelemetry OTLP protocol",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_otlp_endpoint",
-        key_type: "string",
-        description: "OpenTelemetry OTLP endpoint",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_otlp_metrics_protocol",
-        key_type: "string",
-        description: "OpenTelemetry OTLP metrics protocol",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_otlp_metrics_endpoint",
-        key_type: "string",
-        description: "OpenTelemetry OTLP metrics endpoint",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_otlp_logs_protocol",
-        key_type: "string",
-        description: "OpenTelemetry OTLP logs protocol",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_otlp_logs_endpoint",
-        key_type: "string",
-        description: "OpenTelemetry OTLP logs endpoint",
-    },
     // Numeric fields
     ConfigKeyInfo {
         name: "shell_integration_timeout",
@@ -175,26 +130,6 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         name: "max_consecutive_mistakes",
         key_type: "number",
         description: "Max consecutive mistakes before intervention",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_metric_export_interval",
-        key_type: "number",
-        description: "OpenTelemetry metric export interval (ms)",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_log_batch_size",
-        key_type: "number",
-        description: "OpenTelemetry log batch size",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_log_batch_timeout",
-        key_type: "number",
-        description: "OpenTelemetry log batch timeout (ms)",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_log_max_queue_size",
-        key_type: "number",
-        description: "OpenTelemetry log max queue size",
     },
     ConfigKeyInfo {
         name: "request_timeout_ms",
@@ -263,16 +198,6 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Enable double-check completion",
     },
     ConfigKeyInfo {
-        name: "open_telemetry_enabled",
-        key_type: "boolean",
-        description: "Enable OpenTelemetry",
-    },
-    ConfigKeyInfo {
-        name: "open_telemetry_otlp_insecure",
-        key_type: "boolean",
-        description: "Use insecure OTLP connection",
-    },
-    ConfigKeyInfo {
         name: "write_prompt_metadata_enabled",
         key_type: "boolean",
         description: "Enable prompt metadata writing",
@@ -321,7 +246,6 @@ pub enum GlobalStateKey {
     PlanModeApiModelId,
     AzureApiVersion,
     PreferredLanguage,
-    TelemetrySetting,
     DefaultTerminalProfile,
     CustomPrompt,
     WorktreeAutoOpenPath,
@@ -333,21 +257,9 @@ pub enum GlobalStateKey {
     OpenRouterBaseUrl,
     GeminiBaseUrl,
     AwsRegion,
-    OpenTelemetryMetricsExporter,
-    OpenTelemetryLogsExporter,
-    OpenTelemetryOtlpProtocol,
-    OpenTelemetryOtlpEndpoint,
-    OpenTelemetryOtlpMetricsProtocol,
-    OpenTelemetryOtlpMetricsEndpoint,
-    OpenTelemetryOtlpLogsProtocol,
-    OpenTelemetryOtlpLogsEndpoint,
     ShellIntegrationTimeout,
     TerminalOutputLineLimit,
     MaxConsecutiveMistakes,
-    OpenTelemetryMetricExportInterval,
-    OpenTelemetryLogBatchSize,
-    OpenTelemetryLogBatchTimeout,
-    OpenTelemetryLogMaxQueueSize,
     RequestTimeoutMs,
     PlanActSeparateModelsSetting,
     StrictPlanModeEnabled,
@@ -359,8 +271,6 @@ pub enum GlobalStateKey {
     BackgroundEditEnabled,
     OptOutOfRemoteConfig,
     DoubleCheckCompletionEnabled,
-    OpenTelemetryEnabled,
-    OpenTelemetryOtlpInsecure,
     WritePromptMetadataEnabled,
     EnableParallelToolCalling,
 }
@@ -377,7 +287,6 @@ impl GlobalStateKey {
             Self::PlanModeApiModelId => state.plan_mode_api_model_id.clone(),
             Self::AzureApiVersion => state.azure_api_version.clone(),
             Self::PreferredLanguage => Some(state.preferred_language.clone()),
-            Self::TelemetrySetting => Some(state.telemetry_setting.clone()),
             Self::DefaultTerminalProfile => Some(state.default_terminal_profile.clone()),
             Self::CustomPrompt => state.custom_prompt.clone(),
             Self::WorktreeAutoOpenPath => state.worktree_auto_open_path.clone(),
@@ -389,33 +298,9 @@ impl GlobalStateKey {
             Self::OpenRouterBaseUrl => state.open_router_base_url.clone(),
             Self::GeminiBaseUrl => state.gemini_base_url.clone(),
             Self::AwsRegion => state.aws_region.clone(),
-            Self::OpenTelemetryMetricsExporter => state.open_telemetry_metrics_exporter.clone(),
-            Self::OpenTelemetryLogsExporter => state.open_telemetry_logs_exporter.clone(),
-            Self::OpenTelemetryOtlpProtocol => Some(state.open_telemetry_otlp_protocol.clone()),
-            Self::OpenTelemetryOtlpEndpoint => Some(state.open_telemetry_otlp_endpoint.clone()),
-            Self::OpenTelemetryOtlpMetricsProtocol => {
-                state.open_telemetry_otlp_metrics_protocol.clone()
-            }
-            Self::OpenTelemetryOtlpMetricsEndpoint => {
-                state.open_telemetry_otlp_metrics_endpoint.clone()
-            }
-            Self::OpenTelemetryOtlpLogsProtocol => state.open_telemetry_otlp_logs_protocol.clone(),
-            Self::OpenTelemetryOtlpLogsEndpoint => state.open_telemetry_otlp_logs_endpoint.clone(),
             Self::ShellIntegrationTimeout => Some(state.shell_integration_timeout.to_string()),
             Self::TerminalOutputLineLimit => Some(state.terminal_output_line_limit.to_string()),
             Self::MaxConsecutiveMistakes => Some(state.max_consecutive_mistakes.to_string()),
-            Self::OpenTelemetryMetricExportInterval => {
-                Some(state.open_telemetry_metric_export_interval.to_string())
-            }
-            Self::OpenTelemetryLogBatchSize => {
-                Some(state.open_telemetry_log_batch_size.to_string())
-            }
-            Self::OpenTelemetryLogBatchTimeout => {
-                Some(state.open_telemetry_log_batch_timeout.to_string())
-            }
-            Self::OpenTelemetryLogMaxQueueSize => {
-                Some(state.open_telemetry_log_max_queue_size.to_string())
-            }
             Self::RequestTimeoutMs => state.request_timeout_ms.map(|v| v.to_string()),
             Self::EnableCheckpoints => Some(state.enable_checkpoints_setting.to_string()),
             Self::PlanActSeparateModelsSetting => {
@@ -433,8 +318,6 @@ impl GlobalStateKey {
             Self::DoubleCheckCompletionEnabled => {
                 Some(state.double_check_completion_enabled.to_string())
             }
-            Self::OpenTelemetryEnabled => Some(state.open_telemetry_enabled.to_string()),
-            Self::OpenTelemetryOtlpInsecure => Some(state.open_telemetry_otlp_insecure.to_string()),
             Self::WritePromptMetadataEnabled => {
                 Some(state.write_prompt_metadata_enabled.to_string())
             }
@@ -467,7 +350,6 @@ impl GlobalStateKey {
             Self::PlanModeApiModelId => serde_json::to_value(&state.plan_mode_api_model_id).ok(),
             Self::AzureApiVersion => serde_json::to_value(&state.azure_api_version).ok(),
             Self::PreferredLanguage => serde_json::to_value(&state.preferred_language).ok(),
-            Self::TelemetrySetting => serde_json::to_value(&state.telemetry_setting).ok(),
             Self::DefaultTerminalProfile => {
                 serde_json::to_value(&state.default_terminal_profile).ok()
             }
@@ -511,36 +393,6 @@ impl GlobalStateKey {
                 .aws_region
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            Self::OpenTelemetryMetricsExporter => state
-                .open_telemetry_metrics_exporter
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::OpenTelemetryLogsExporter => state
-                .open_telemetry_logs_exporter
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::OpenTelemetryOtlpProtocol => {
-                serde_json::to_value(&state.open_telemetry_otlp_protocol).ok()
-            }
-            Self::OpenTelemetryOtlpEndpoint => {
-                serde_json::to_value(&state.open_telemetry_otlp_endpoint).ok()
-            }
-            Self::OpenTelemetryOtlpMetricsProtocol => state
-                .open_telemetry_otlp_metrics_protocol
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::OpenTelemetryOtlpMetricsEndpoint => state
-                .open_telemetry_otlp_metrics_endpoint
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::OpenTelemetryOtlpLogsProtocol => state
-                .open_telemetry_otlp_logs_protocol
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::OpenTelemetryOtlpLogsEndpoint => state
-                .open_telemetry_otlp_logs_endpoint
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
             Self::ShellIntegrationTimeout => {
                 serde_json::to_value(state.shell_integration_timeout).ok()
             }
@@ -549,18 +401,6 @@ impl GlobalStateKey {
             }
             Self::MaxConsecutiveMistakes => {
                 serde_json::to_value(state.max_consecutive_mistakes).ok()
-            }
-            Self::OpenTelemetryMetricExportInterval => {
-                serde_json::to_value(state.open_telemetry_metric_export_interval).ok()
-            }
-            Self::OpenTelemetryLogBatchSize => {
-                serde_json::to_value(state.open_telemetry_log_batch_size).ok()
-            }
-            Self::OpenTelemetryLogBatchTimeout => {
-                serde_json::to_value(state.open_telemetry_log_batch_timeout).ok()
-            }
-            Self::OpenTelemetryLogMaxQueueSize => {
-                serde_json::to_value(state.open_telemetry_log_max_queue_size).ok()
             }
             Self::RequestTimeoutMs => state
                 .request_timeout_ms
@@ -581,10 +421,6 @@ impl GlobalStateKey {
             Self::OptOutOfRemoteConfig => serde_json::to_value(state.opt_out_of_remote_config).ok(),
             Self::DoubleCheckCompletionEnabled => {
                 serde_json::to_value(state.double_check_completion_enabled).ok()
-            }
-            Self::OpenTelemetryEnabled => serde_json::to_value(state.open_telemetry_enabled).ok(),
-            Self::OpenTelemetryOtlpInsecure => {
-                serde_json::to_value(state.open_telemetry_otlp_insecure).ok()
             }
             Self::WritePromptMetadataEnabled => {
                 serde_json::to_value(state.write_prompt_metadata_enabled).ok()
@@ -663,11 +499,6 @@ impl GlobalStateKey {
                     state.preferred_language = v;
                 }
             }
-            Self::TelemetrySetting => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.telemetry_setting = v;
-                }
-            }
             Self::DefaultTerminalProfile => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.default_terminal_profile = v;
@@ -701,34 +532,6 @@ impl GlobalStateKey {
                 state.gemini_base_url = serde_json::from_value(value).ok();
             }
             Self::AwsRegion => state.aws_region = serde_json::from_value(value).ok(),
-            Self::OpenTelemetryMetricsExporter => {
-                state.open_telemetry_metrics_exporter = serde_json::from_value(value).ok();
-            }
-            Self::OpenTelemetryLogsExporter => {
-                state.open_telemetry_logs_exporter = serde_json::from_value(value).ok();
-            }
-            Self::OpenTelemetryOtlpProtocol => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.open_telemetry_otlp_protocol = v;
-                }
-            }
-            Self::OpenTelemetryOtlpEndpoint => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.open_telemetry_otlp_endpoint = v;
-                }
-            }
-            Self::OpenTelemetryOtlpMetricsProtocol => {
-                state.open_telemetry_otlp_metrics_protocol = serde_json::from_value(value).ok();
-            }
-            Self::OpenTelemetryOtlpMetricsEndpoint => {
-                state.open_telemetry_otlp_metrics_endpoint = serde_json::from_value(value).ok();
-            }
-            Self::OpenTelemetryOtlpLogsProtocol => {
-                state.open_telemetry_otlp_logs_protocol = serde_json::from_value(value).ok();
-            }
-            Self::OpenTelemetryOtlpLogsEndpoint => {
-                state.open_telemetry_otlp_logs_endpoint = serde_json::from_value(value).ok();
-            }
             Self::ShellIntegrationTimeout => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.shell_integration_timeout = v;
@@ -742,26 +545,6 @@ impl GlobalStateKey {
             Self::MaxConsecutiveMistakes => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.max_consecutive_mistakes = v;
-                }
-            }
-            Self::OpenTelemetryMetricExportInterval => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.open_telemetry_metric_export_interval = v;
-                }
-            }
-            Self::OpenTelemetryLogBatchSize => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.open_telemetry_log_batch_size = v;
-                }
-            }
-            Self::OpenTelemetryLogBatchTimeout => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.open_telemetry_log_batch_timeout = v;
-                }
-            }
-            Self::OpenTelemetryLogMaxQueueSize => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.open_telemetry_log_max_queue_size = v;
                 }
             }
             Self::RequestTimeoutMs => {
@@ -817,16 +600,6 @@ impl GlobalStateKey {
                     state.double_check_completion_enabled = v;
                 }
             }
-            Self::OpenTelemetryEnabled => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.open_telemetry_enabled = v;
-                }
-            }
-            Self::OpenTelemetryOtlpInsecure => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.open_telemetry_otlp_insecure = v;
-                }
-            }
             Self::WritePromptMetadataEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.write_prompt_metadata_enabled = v;
@@ -878,8 +651,6 @@ impl std::str::FromStr for GlobalStateKey {
             "azureApiVersion" | "azure_api_version" => Ok(Self::AzureApiVersion),
             // preferredLanguage
             "preferredLanguage" | "preferred_language" => Ok(Self::PreferredLanguage),
-            // telemetrySetting
-            "telemetrySetting" | "telemetry_setting" => Ok(Self::TelemetrySetting),
             // defaultTerminalProfile
             "defaultTerminalProfile" | "default_terminal_profile" => {
                 Ok(Self::DefaultTerminalProfile)
@@ -908,38 +679,6 @@ impl std::str::FromStr for GlobalStateKey {
             "geminiBaseUrl" | "gemini_base_url" => Ok(Self::GeminiBaseUrl),
             // awsRegion
             "awsRegion" | "aws_region" => Ok(Self::AwsRegion),
-            // openTelemetryMetricsExporter
-            "openTelemetryMetricsExporter" | "open_telemetry_metrics_exporter" => {
-                Ok(Self::OpenTelemetryMetricsExporter)
-            }
-            // openTelemetryLogsExporter
-            "openTelemetryLogsExporter" | "open_telemetry_logs_exporter" => {
-                Ok(Self::OpenTelemetryLogsExporter)
-            }
-            // openTelemetryOtlpProtocol
-            "openTelemetryOtlpProtocol" | "open_telemetry_otlp_protocol" => {
-                Ok(Self::OpenTelemetryOtlpProtocol)
-            }
-            // openTelemetryOtlpEndpoint
-            "openTelemetryOtlpEndpoint" | "open_telemetry_otlp_endpoint" => {
-                Ok(Self::OpenTelemetryOtlpEndpoint)
-            }
-            // openTelemetryOtlpMetricsProtocol
-            "openTelemetryOtlpMetricsProtocol" | "open_telemetry_otlp_metrics_protocol" => {
-                Ok(Self::OpenTelemetryOtlpMetricsProtocol)
-            }
-            // openTelemetryOtlpMetricsEndpoint
-            "openTelemetryOtlpMetricsEndpoint" | "open_telemetry_otlp_metrics_endpoint" => {
-                Ok(Self::OpenTelemetryOtlpMetricsEndpoint)
-            }
-            // openTelemetryOtlpLogsProtocol
-            "openTelemetryOtlpLogsProtocol" | "open_telemetry_otlp_logs_protocol" => {
-                Ok(Self::OpenTelemetryOtlpLogsProtocol)
-            }
-            // openTelemetryOtlpLogsEndpoint
-            "openTelemetryOtlpLogsEndpoint" | "open_telemetry_otlp_logs_endpoint" => {
-                Ok(Self::OpenTelemetryOtlpLogsEndpoint)
-            }
             // shellIntegrationTimeout
             "shellIntegrationTimeout" | "shell_integration_timeout" => {
                 Ok(Self::ShellIntegrationTimeout)
@@ -951,22 +690,6 @@ impl std::str::FromStr for GlobalStateKey {
             // maxConsecutiveMistakes
             "maxConsecutiveMistakes" | "max_consecutive_mistakes" => {
                 Ok(Self::MaxConsecutiveMistakes)
-            }
-            // openTelemetryMetricExportInterval
-            "openTelemetryMetricExportInterval" | "open_telemetry_metric_export_interval" => {
-                Ok(Self::OpenTelemetryMetricExportInterval)
-            }
-            // openTelemetryLogBatchSize
-            "openTelemetryLogBatchSize" | "open_telemetry_log_batch_size" => {
-                Ok(Self::OpenTelemetryLogBatchSize)
-            }
-            // openTelemetryLogBatchTimeout
-            "openTelemetryLogBatchTimeout" | "open_telemetry_log_batch_timeout" => {
-                Ok(Self::OpenTelemetryLogBatchTimeout)
-            }
-            // openTelemetryLogMaxQueueSize
-            "openTelemetryLogMaxQueueSize" | "open_telemetry_log_max_queue_size" => {
-                Ok(Self::OpenTelemetryLogMaxQueueSize)
             }
             // requestTimeoutMs
             "requestTimeoutMs" | "request_timeout_ms" => Ok(Self::RequestTimeoutMs),
@@ -993,12 +716,6 @@ impl std::str::FromStr for GlobalStateKey {
             // doubleCheckCompletionEnabled
             "doubleCheckCompletionEnabled" | "double_check_completion_enabled" => {
                 Ok(Self::DoubleCheckCompletionEnabled)
-            }
-            // openTelemetryEnabled
-            "openTelemetryEnabled" | "open_telemetry_enabled" => Ok(Self::OpenTelemetryEnabled),
-            // openTelemetryOtlpInsecure
-            "openTelemetryOtlpInsecure" | "open_telemetry_otlp_insecure" => {
-                Ok(Self::OpenTelemetryOtlpInsecure)
             }
             // writePromptMetadataEnabled
             "writePromptMetadataEnabled" | "write_prompt_metadata_enabled" => {
@@ -1031,7 +748,6 @@ impl std::fmt::Display for GlobalStateKey {
             Self::PlanModeApiModelId => write!(f, "planModeApiModelId"),
             Self::AzureApiVersion => write!(f, "azureApiVersion"),
             Self::PreferredLanguage => write!(f, "preferredLanguage"),
-            Self::TelemetrySetting => write!(f, "telemetrySetting"),
             Self::DefaultTerminalProfile => write!(f, "defaultTerminalProfile"),
             Self::CustomPrompt => write!(f, "customPrompt"),
             Self::WorktreeAutoOpenPath => write!(f, "worktreeAutoOpenPath"),
@@ -1045,37 +761,9 @@ impl std::fmt::Display for GlobalStateKey {
             Self::OpenRouterBaseUrl => write!(f, "openRouterBaseUrl"),
             Self::GeminiBaseUrl => write!(f, "geminiBaseUrl"),
             Self::AwsRegion => write!(f, "awsRegion"),
-            Self::OpenTelemetryMetricsExporter => {
-                write!(f, "openTelemetryMetricsExporter")
-            }
-            Self::OpenTelemetryLogsExporter => write!(f, "openTelemetryLogsExporter"),
-            Self::OpenTelemetryOtlpProtocol => write!(f, "openTelemetryOtlpProtocol"),
-            Self::OpenTelemetryOtlpEndpoint => write!(f, "openTelemetryOtlpEndpoint"),
-            Self::OpenTelemetryOtlpMetricsProtocol => {
-                write!(f, "openTelemetryOtlpMetricsProtocol")
-            }
-            Self::OpenTelemetryOtlpMetricsEndpoint => {
-                write!(f, "openTelemetryOtlpMetricsEndpoint")
-            }
-            Self::OpenTelemetryOtlpLogsProtocol => {
-                write!(f, "openTelemetryOtlpLogsProtocol")
-            }
-            Self::OpenTelemetryOtlpLogsEndpoint => {
-                write!(f, "openTelemetryOtlpLogsEndpoint")
-            }
             Self::ShellIntegrationTimeout => write!(f, "shellIntegrationTimeout"),
             Self::TerminalOutputLineLimit => write!(f, "terminalOutputLineLimit"),
             Self::MaxConsecutiveMistakes => write!(f, "maxConsecutiveMistakes"),
-            Self::OpenTelemetryMetricExportInterval => {
-                write!(f, "openTelemetryMetricExportInterval")
-            }
-            Self::OpenTelemetryLogBatchSize => write!(f, "openTelemetryLogBatchSize"),
-            Self::OpenTelemetryLogBatchTimeout => {
-                write!(f, "openTelemetryLogBatchTimeout")
-            }
-            Self::OpenTelemetryLogMaxQueueSize => {
-                write!(f, "openTelemetryLogMaxQueueSize")
-            }
             Self::RequestTimeoutMs => write!(f, "requestTimeoutMs"),
             Self::PlanActSeparateModelsSetting => {
                 write!(f, "planActSeparateModelsSetting")
@@ -1091,8 +779,6 @@ impl std::fmt::Display for GlobalStateKey {
             Self::DoubleCheckCompletionEnabled => {
                 write!(f, "doubleCheckCompletionEnabled")
             }
-            Self::OpenTelemetryEnabled => write!(f, "openTelemetryEnabled"),
-            Self::OpenTelemetryOtlpInsecure => write!(f, "openTelemetryOtlpInsecure"),
             Self::WritePromptMetadataEnabled => write!(f, "writePromptMetadataEnabled"),
             Self::EnableParallelToolCalling => write!(f, "enableParallelToolCalling"),
         }
@@ -1279,7 +965,7 @@ impl StateManager {
         Ok(())
     }
 
-    /// Get the distinct ID for telemetry/hooks.
+    /// Get the distinct ID used by hooks.
     /// Reads from `sned_generated_machine_id` field.
     /// Falls back to "anonymous" if not set.
     pub fn get_distinct_id(&self) -> String {
@@ -1486,10 +1172,6 @@ impl StateManager {
                 state.preferred_language = value;
                 true
             }
-            "telemetry_setting" => {
-                state.telemetry_setting = value;
-                true
-            }
             "default_terminal_profile" => {
                 state.default_terminal_profile = value;
                 true
@@ -1534,38 +1216,6 @@ impl StateManager {
                 state.aws_region = Some(value);
                 true
             }
-            "open_telemetry_metrics_exporter" => {
-                state.open_telemetry_metrics_exporter = Some(value);
-                true
-            }
-            "open_telemetry_logs_exporter" => {
-                state.open_telemetry_logs_exporter = Some(value);
-                true
-            }
-            "open_telemetry_otlp_protocol" => {
-                state.open_telemetry_otlp_protocol = value;
-                true
-            }
-            "open_telemetry_otlp_endpoint" => {
-                state.open_telemetry_otlp_endpoint = value;
-                true
-            }
-            "open_telemetry_otlp_metrics_protocol" => {
-                state.open_telemetry_otlp_metrics_protocol = Some(value);
-                true
-            }
-            "open_telemetry_otlp_metrics_endpoint" => {
-                state.open_telemetry_otlp_metrics_endpoint = Some(value);
-                true
-            }
-            "open_telemetry_otlp_logs_protocol" => {
-                state.open_telemetry_otlp_logs_protocol = Some(value);
-                true
-            }
-            "open_telemetry_otlp_logs_endpoint" => {
-                state.open_telemetry_otlp_logs_endpoint = Some(value);
-                true
-            }
             // Numeric fields
             "shell_integration_timeout" => {
                 state.shell_integration_timeout = value.parse::<i32>().unwrap_or(4000);
@@ -1577,22 +1227,6 @@ impl StateManager {
             }
             "max_consecutive_mistakes" => {
                 state.max_consecutive_mistakes = value.parse::<i32>().unwrap_or(5);
-                true
-            }
-            "open_telemetry_metric_export_interval" => {
-                state.open_telemetry_metric_export_interval = value.parse::<i32>().unwrap_or(60);
-                true
-            }
-            "open_telemetry_log_batch_size" => {
-                state.open_telemetry_log_batch_size = value.parse::<i32>().unwrap_or(512);
-                true
-            }
-            "open_telemetry_log_batch_timeout" => {
-                state.open_telemetry_log_batch_timeout = value.parse::<i32>().unwrap_or(5000);
-                true
-            }
-            "open_telemetry_log_max_queue_size" => {
-                state.open_telemetry_log_max_queue_size = value.parse::<i32>().unwrap_or(2048);
                 true
             }
             "request_timeout_ms" => {
@@ -1648,16 +1282,6 @@ impl StateManager {
             }
             "double_check_completion_enabled" => {
                 state.double_check_completion_enabled =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "open_telemetry_enabled" => {
-                state.open_telemetry_enabled =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "open_telemetry_otlp_insecure" => {
-                state.open_telemetry_otlp_insecure =
                     matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
@@ -2175,6 +1799,17 @@ mod tests {
             let manager = StateManager::new();
             assert!(manager.is_ok());
         });
+    }
+
+    #[test]
+    fn test_telemetry_keys_are_not_configurable() {
+        assert!("telemetry_setting".parse::<GlobalStateKey>().is_err());
+        assert!("open_telemetry_enabled".parse::<GlobalStateKey>().is_err());
+        assert!(
+            !VALID_CONFIG_KEYS
+                .iter()
+                .any(|key| key.name.contains("telemetry"))
+        );
     }
 
     #[test]
