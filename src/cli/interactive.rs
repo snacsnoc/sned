@@ -4,7 +4,6 @@
 //! file picker, input queuing, and agent lifecycle.
 
 use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
-use crate::cli::tui::BlockKind;
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
@@ -564,40 +563,16 @@ fn apply_output_event(
         OutputEvent::Completion(result) => {
             flush_model_update(app, pending_model_update);
             app.clear_completion_lines();
-            // Concatenate consecutive Model lines because wrapped responses and
-            // markdown-re-rendered content split the original text across multiple
-            // visual lines. Comparing individual lines would always fail to match.
-            let mut model_text = String::new();
-            let mut in_model_sequence = false;
-            for (line, kind) in app.output_lines.iter().zip(app.output_line_kinds.iter()) {
-                if *kind == BlockKind::Model {
-                    if !in_model_sequence {
-                        in_model_sequence = true;
-                        model_text.clear();
-                    }
-                    if !model_text.is_empty() {
-                        model_text.push('\n');
-                    }
-                    model_text.push_str(&App::line_to_string(line));
-                } else {
-                    if in_model_sequence {
-                        if model_text.trim() == result.trim() {
-                            for line in crate::cli::markdown::render_completion_markdown(
-                                "🚀 ",
-                                "Task Completed",
-                            ) {
-                                app.push_completion_line(line);
-                            }
-                            return;
-                        }
-                        in_model_sequence = false;
-                        model_text.clear();
-                    }
-                }
-            }
-            // Model lines may end at the last entry without a non-Model line to
-            // trigger the comparison, so we must check the trailing sequence here.
-            if in_model_sequence && model_text.trim() == result.trim() {
+            // Historical model blocks must not suppress a result from the current turn.
+            let model_text = app
+                .turn_stream_entries
+                .iter()
+                .filter(|(_, kind)| *kind == crate::cli::tui::StreamKind::Model)
+                .filter_map(|(index, _)| app.output_lines.get(*index))
+                .map(App::line_to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !model_text.trim().is_empty() && model_text.trim() == result.trim() {
                 for line in
                     crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed")
                 {
@@ -605,8 +580,6 @@ fn apply_output_event(
                 }
                 return;
             }
-            // The completion text contains information not already visible in the
-            // output area, so we must render it to avoid losing the result.
             for line in
                 crate::cli::markdown::render_completion_markdown("🚀 Task Completed: ", &result)
             {
@@ -3348,6 +3321,7 @@ pub fn render_interactive_prompt_prefix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::tui::BlockKind;
     use ratatui::text::Line;
     use serde::ser::{Error as _, Serialize, Serializer};
 
@@ -3909,6 +3883,45 @@ mod tests {
         assert!(
             kinds.contains(&&BlockKind::Model),
             "model line should still be in output_lines"
+        );
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_completion_dedup_ignores_prior_model_turns() {
+        use crate::cli::output::OutputEvent;
+        use crate::cli::tui::StreamKind;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let repeated_text = "Completed the requested checks.";
+        let mut app = App::new();
+        app.push_stream_line(Line::from(repeated_text), StreamKind::Model);
+        app.finalize_turn_stream(repeated_text);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::Line(Line::from(
+            "The current turn has different model text.",
+        )))
+        .unwrap();
+        tx.try_send(OutputEvent::tool_call("▶ attempt_completion"))
+            .unwrap();
+        tx.try_send(OutputEvent::Completion(repeated_text.to_string()))
+            .unwrap();
+
+        drain_output(&mut rx, &mut app);
+
+        let rendered = app
+            .completion_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains(repeated_text),
+            "completion text matching an earlier turn must remain visible, got: {rendered}"
         );
 
         reset_prompt_state();
