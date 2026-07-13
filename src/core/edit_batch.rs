@@ -342,8 +342,6 @@ impl BatchProcessor {
         final_lines: &[String],
         final_hashes: &[String],
         diagnostics: Option<&DiagnosticsResult>,
-        user_edits: Option<&str>,
-        auto_formatting_edits: Option<&str>,
     ) -> String {
         let mut total_added = 0;
         let mut total_removed = 0;
@@ -427,28 +425,6 @@ impl BatchProcessor {
                     diag.new_problems_message.trim()
                 ));
             }
-        }
-
-        // Add user edits and auto-formatting messages (for editor integration compatibility)
-        // Note: Native CLI uses atomic_write_file() directly, so these fields are typically None
-        // Fields exist for API compatibility with TypeScript Sned's VS Code integration
-        if let Some(edits) = user_edits
-            && !edits.is_empty()
-        {
-            results.push(format!(
-                "The user made the following updates to your content:\n\n{edits}"
-            ));
-        }
-
-        if let Some(auto_fmt) = auto_formatting_edits
-            && !auto_fmt.is_empty()
-        {
-            results.push(format!(
-                    "The user's editor also applied the following auto-formatting to your content:\n\n{auto_fmt}"
-                ));
-            results.push(
-                    "(Note: Pay close attention to changes such as single quotes being converted to double quotes, semicolons being removed or added, long lines being broken into multiple lines, adjusting indentation style, adding/removing trailing commas, etc. This will help you ensure future edit_file operations to this file are accurate.)".to_string()
-                );
         }
 
         format!("{}\n\n{}", summary, results.join("\n\n---\n\n"))
@@ -925,8 +901,7 @@ mod tests {
         let final_lines = prepared.final_lines.clone();
         let final_hashes = anchor_mgr.reconcile("/tmp/format.rs", &final_lines, Some(task_id));
 
-        let formatted =
-            processor.format_result(&prepared, &final_lines, &final_hashes, None, None, None);
+        let formatted = processor.format_result(&prepared, &final_lines, &final_hashes, None);
 
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
         assert!(formatted.contains("NOTE the UPDATED anchors below"));
@@ -970,8 +945,6 @@ mod tests {
             &prepared.final_lines,
             &["duplicate".to_string()],
             None,
-            None,
-            None,
         );
 
         assert!(formatted.contains("(+0, -1 lines)"));
@@ -1010,8 +983,7 @@ mod tests {
         let final_lines = prepared.final_lines.clone();
         let final_hashes = anchor_mgr.reconcile("/tmp/additions.rs", &final_lines, Some(task_id));
 
-        let formatted =
-            processor.format_result(&prepared, &final_lines, &final_hashes, None, None, None);
+        let formatted = processor.format_result(&prepared, &final_lines, &final_hashes, None);
 
         // In additions-only mode, deleted lines should show as "X lines have been deleted"
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
@@ -1051,106 +1023,12 @@ mod tests {
                     .to_string(),
         };
 
-        let formatted = processor.format_result(
-            &prepared,
-            &final_lines,
-            &final_hashes,
-            Some(&diagnostics),
-            None,
-            None,
-        );
+        let formatted =
+            processor.format_result(&prepared, &final_lines, &final_hashes, Some(&diagnostics));
 
         assert!(formatted.contains("Fixed 2 linter error(s)."));
         assert!(formatted.contains("New problems detected after saving the file:"));
         assert!(formatted.contains("error[E0425]"));
-    }
-
-    #[test]
-    fn test_format_result_user_edits() {
-        let task_id = "user_edits_test";
-        let anchor_mgr = AnchorStateManager::new();
-        anchor_mgr.reset(Some(task_id));
-
-        let processor = BatchProcessor::new(DiffMode::Full);
-
-        let content = "line1\nline2\nline3";
-        let lines = split_content_lines(content);
-        let hashes = anchor_mgr.reconcile("/tmp/user.rs", &lines, Some(task_id));
-
-        let edits = vec![Edit {
-            anchor: format!("{}§line2", hashes[1]),
-            end_anchor: Some(format!("{}§line2", hashes[1])),
-            edit_type: "replace".to_string(),
-            text: "new_line2".to_string(),
-        }];
-
-        let mut prepared = processor
-            .prepare_edits("/tmp/user.rs", "user.rs", content, &edits, &hashes)
-            .unwrap();
-        let _result = processor.apply_batch(&mut prepared, "user.rs", "user.rs");
-
-        let final_lines = prepared.final_lines.clone();
-        let final_hashes = anchor_mgr.reconcile("/tmp/user.rs", &final_lines, Some(task_id));
-
-        let user_edits = "// User added this comment\nlet user_var = 42;";
-
-        let formatted = processor.format_result(
-            &prepared,
-            &final_lines,
-            &final_hashes,
-            None,
-            Some(user_edits),
-            None,
-        );
-
-        assert!(formatted.contains("The user made the following updates to your content:"));
-        assert!(formatted.contains("// User added this comment"));
-    }
-
-    #[test]
-    fn test_format_result_auto_formatting_edits() {
-        let task_id = "auto_fmt_test";
-        let anchor_mgr = AnchorStateManager::new();
-        anchor_mgr.reset(Some(task_id));
-
-        let processor = BatchProcessor::new(DiffMode::Full);
-
-        let content = "line1\nline2\nline3";
-        let lines = split_content_lines(content);
-        let hashes = anchor_mgr.reconcile("/tmp/fmt.rs", &lines, Some(task_id));
-
-        let edits = vec![Edit {
-            anchor: format!("{}§line2", hashes[1]),
-            end_anchor: Some(format!("{}§line2", hashes[1])),
-            edit_type: "replace".to_string(),
-            text: "new_line2".to_string(),
-        }];
-
-        let mut prepared = processor
-            .prepare_edits("/tmp/fmt.rs", "fmt.rs", content, &edits, &hashes)
-            .unwrap();
-        let _result = processor.apply_batch(&mut prepared, "fmt.rs", "fmt.rs");
-
-        let final_lines = prepared.final_lines.clone();
-        let final_hashes = anchor_mgr.reconcile("/tmp/fmt.rs", &final_lines, Some(task_id));
-
-        let auto_fmt = "fn foo() {\n    println!(\"hello\");\n}";
-
-        let formatted = processor.format_result(
-            &prepared,
-            &final_lines,
-            &final_hashes,
-            None,
-            None,
-            Some(auto_fmt),
-        );
-
-        assert!(formatted.contains(
-            "The user's editor also applied the following auto-formatting to your content:"
-        ));
-        assert!(formatted.contains(
-            "Pay close attention to changes such as single quotes being converted to double quotes"
-        ));
     }
 
     #[test]

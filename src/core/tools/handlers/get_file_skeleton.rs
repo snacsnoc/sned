@@ -100,11 +100,3 @@ impl ToolHandler for GetFileSkeletonHandler {
         Self::description(self, params)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[allow(dead_code)]
-    fn _dummy_test() {
-        // Placeholder to keep test module
-    }
-}

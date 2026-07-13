@@ -248,8 +248,6 @@ pub struct FileContextTracker {
     tracked_files: HashMap<PathBuf, SystemTime>,
     /// Files recently edited by Sned (to suppress false positives)
     recently_edited_by_sned: HashSet<PathBuf>,
-    /// Legacy: recently modified files (for compatibility)
-    pub recently_modified_files: Vec<String>,
     /// File watcher for real-time change detection
     pub file_watcher: Option<FileWatcher>,
     /// Task ID for persistent metadata storage
@@ -263,7 +261,6 @@ impl Default for FileContextTracker {
         Self {
             tracked_files: HashMap::with_capacity(16),
             recently_edited_by_sned: HashSet::new(),
-            recently_modified_files: Vec::new(),
             file_watcher: FileWatcher::new().ok(),
             task_id: None,
             files_in_context: Vec::new(),
@@ -379,12 +376,6 @@ impl FileContextTracker {
         match source {
             FileRecordSource::UserEdited => {
                 new_entry.user_edit_date = Some(now);
-                if !self
-                    .recently_modified_files
-                    .contains(&file_path.to_string())
-                {
-                    self.recently_modified_files.push(file_path.to_string());
-                }
             }
             FileRecordSource::SnedEdited => {
                 new_entry.sned_read_date = Some(now);
@@ -506,28 +497,6 @@ impl FileContextTracker {
         }
     }
 
-    /// Records that a file was modified by the user (legacy).
-    pub fn mark_file_as_user_edited(&mut self, file_path: &str) {
-        if !self
-            .recently_modified_files
-            .contains(&file_path.to_string())
-        {
-            self.recently_modified_files.push(file_path.to_string());
-        }
-    }
-
-    /// Returns and clears the set of recently modified files (legacy).
-    pub fn get_and_clear_recently_modified_files(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.recently_modified_files)
-    }
-
-    /// Determines if a file was recently modified by the user (legacy).
-    #[must_use]
-    pub fn is_recently_modified(&self, file_path: &str) -> bool {
-        self.recently_modified_files
-            .contains(&file_path.to_string())
-    }
-
     /// Get the list of tracked files (for debugging/testing)
     #[must_use]
     pub fn tracked_files(&self) -> &HashMap<PathBuf, SystemTime> {
@@ -603,21 +572,6 @@ pub struct EnvironmentMetadataEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_file_context_tracker() {
-        let mut tracker = FileContextTracker::new();
-        tracker.mark_file_as_edited_by_sned(std::path::Path::new("/tmp/test.txt"));
-        tracker.mark_file_as_user_edited("/tmp/other.txt");
-
-        assert!(tracker.is_recently_modified("/tmp/other.txt"));
-        assert!(!tracker.is_recently_modified("/tmp/test.txt"));
-
-        let modified = tracker.get_and_clear_recently_modified_files();
-        assert_eq!(modified.len(), 1);
-        assert_eq!(modified[0], "/tmp/other.txt");
-        assert!(tracker.recently_modified_files.is_empty());
-    }
 
     #[tokio::test]
     async fn test_track_file_context_adds_entry() {

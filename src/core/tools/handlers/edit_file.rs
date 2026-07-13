@@ -1308,8 +1308,6 @@ impl EditFileHandler {
                 &file_result.final_lines,
                 &file_result.final_hashes,
                 diagnostics.as_ref(),
-                None,
-                None,
             );
             all_results.push(formatted);
         }

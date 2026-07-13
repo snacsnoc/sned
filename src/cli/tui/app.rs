@@ -1862,21 +1862,6 @@ impl App {
         self.cached_wrap_width = Some(wrap_width);
     }
 
-    /// Returns the renderable output rows: each entry of
-    /// `output_lines` paired with its `BlockKind`, with one blank-line
-    /// separator inserted on every transition between non-Separated
-    /// kinds (so the visual row count matches what `render_output`
-    /// will actually draw).  Used by both the visual-row cache and
-    /// the renderer so they cannot drift.
-    #[allow(dead_code)]
-    fn output_rows_for_render(&self) -> Vec<(Line<'static>, BlockKind)> {
-        let mut out: Vec<(Line<'static>, BlockKind)> = Vec::with_capacity(self.output_lines.len());
-        self.for_each_output_row(|line, kind| {
-            out.push((line.cloned().unwrap_or_else(|| Line::from("")), kind));
-        });
-        out
-    }
-
     fn for_each_output_row(&self, mut visitor: impl FnMut(Option<&Line<'static>>, BlockKind)) {
         let mut prev: Option<BlockKind> = None;
         for (line, kind) in self.output_lines.iter().zip(self.output_line_kinds.iter()) {
@@ -2334,12 +2319,6 @@ impl App {
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y, content_height);
 
-        // Render the full transcript. Cached row counts keep scroll math cheap,
-        // but slicing the render buffer can clip wrapped prompt text.
-        // `output_rows_for_render` returns the same expanded (line, kind)
-        // list that the visual-row cache was built from, so the visible
-        // slice and the scroll math stay in lockstep after separator
-        // insertion.
         {
             frame.render_widget(Clear, main_output_area);
             let visible_lines = self.collect_output_rows_range(start_idx, visible_count);

@@ -1101,13 +1101,6 @@ impl StateManager {
         self.mark_global_key_pending(key.to_string());
     }
 
-    /// Set a global state key by string (deprecated, use enum version)
-    pub fn set_global_state_key_str(&self, key: &str, value: serde_json::Value) {
-        if let Ok(parsed) = key.parse::<GlobalStateKey>() {
-            self.set_global_state_key(parsed, value);
-        }
-    }
-
     /// Set a string-backed global config field by its JSON field name.
     pub fn set_global_state_string_field(
         &self,

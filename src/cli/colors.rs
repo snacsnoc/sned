@@ -156,17 +156,6 @@ pub fn eprint_info(text: &str) {
     eprintln!("{}", info(text));
 }
 
-/// Print a success message to stdout.
-///
-/// # Warning
-/// Do NOT call this from agent execution paths (tool handlers, agent_loop, etc.).
-/// Agent output goes to stderr; stdout writes during agent execution cause cursor
-/// races with TUI rendering. Use `eprint_success()` for agent-path success messages.
-#[deprecated = "Use eprint_success() for agent-path output to avoid stdout/stderr cursor races"]
-pub fn print_success(text: &str) {
-    println!("{}", success(text));
-}
-
 /// Print a success message to stderr.
 /// Safe for agent-path output (tool handlers, agent_loop, etc.).
 pub fn eprint_success(text: &str) {
@@ -178,22 +167,6 @@ pub fn eprint_raw(text: &str) {
     use std::io::Write;
     let stderr = std::io::stderr();
     let mut handle = stderr.lock();
-    let _ = handle.write_all(text.replace('\n', "\r\n").as_bytes());
-    let _ = handle.write_all(b"\r\n");
-    let _ = handle.flush();
-}
-
-/// Print multi-line text to stdout with `\r\n` line endings (for raw mode).
-///
-/// # Warning
-/// Do NOT call this from agent execution paths (tool handlers, agent_loop, etc.).
-/// Agent output goes to stderr; stdout writes during agent execution cause cursor
-/// races with TUI rendering. Use `eprint_raw()` for agent-path text output.
-#[deprecated = "Use eprint_raw() for agent-path output to avoid stdout/stderr cursor races"]
-pub fn print_raw(text: &str) {
-    use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
     let _ = handle.write_all(text.replace('\n', "\r\n").as_bytes());
     let _ = handle.write_all(b"\r\n");
     let _ = handle.flush();
