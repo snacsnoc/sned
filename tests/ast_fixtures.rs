@@ -5,9 +5,35 @@ use sned::core::tools::{ToolContext, ToolHandler};
 use sned::services::tree_sitter::get_functions;
 use sned::services::tree_sitter::parser::load_required_language_parsers;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as TokioMutex;
+
+struct WorkingDirectoryGuard(PathBuf);
+
+impl Drop for WorkingDirectoryGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+fn strip_reference_anchors(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            line.split_once(") ").map_or_else(
+                || line.to_string(),
+                |(prefix, anchored)| {
+                    format!(
+                        "{prefix}) {}",
+                        sned::core::hash_utils::strip_hashes(anchored)
+                    )
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[derive(Deserialize)]
 struct FixtureTests {
@@ -40,16 +66,8 @@ fn run_language_fixtures(lang: &str, extension: &str) {
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(lang);
-    let fixture_dir = match fs::canonicalize(&fixture_dir) {
-        Ok(path) => path,
-        Err(_) => {
-            eprintln!(
-                "Skipping {} AST fixtures: historical TypeScript fixture directory is absent",
-                lang
-            );
-            return;
-        }
-    };
+    let fixture_dir = fs::canonicalize(&fixture_dir)
+        .unwrap_or_else(|error| panic!("Missing {lang} fixture directory: {error}"));
     let tests_json_path = fixture_dir.join("tests.json");
     let sample_file_path = fixture_dir.join(format!("sample.{}", extension));
     let sample_rel_path = format!("sample.{}", extension);
@@ -62,34 +80,28 @@ fn run_language_fixtures(lang: &str, extension: &str) {
         .unwrap_or_else(|e| e.into_inner());
     let original_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(&fixture_dir).unwrap();
+    let _cwd_guard = WorkingDirectoryGuard(original_cwd);
 
     let result = (|| {
-        if !tests_json_path.exists() {
-            println!("Skipping {}: tests.json not found", lang);
-            return Ok(());
-        }
-
-        let tests_json_content = fs::read_to_string(&tests_json_path).unwrap();
-        let tests: FixtureTests = serde_json::from_str(&tests_json_content).unwrap();
+        let tests_json_content = fs::read_to_string(&tests_json_path)
+            .unwrap_or_else(|error| panic!("Missing {}: {error}", tests_json_path.display()));
+        let tests: FixtureTests = serde_json::from_str(&tests_json_content)
+            .unwrap_or_else(|error| panic!("Invalid {}: {error}", tests_json_path.display()));
 
         let sample_content = fs::read_to_string(&sample_file_path).unwrap();
-        let language_parsers = match load_required_language_parsers(&[sample_rel_path.as_str()]) {
-            Ok(parsers) => parsers,
-            Err(e) => {
-                println!("Skipping {}: language parser not available: {}", lang, e);
-                return Ok(());
-            }
-        };
+        let language_parsers = load_required_language_parsers(&[sample_rel_path.as_str()])
+            .unwrap_or_else(|error| panic!("Failed to load {lang} parser: {error}"));
 
         if let Some(get_function_tests) = tests.get_function {
             for test in get_function_tests {
                 println!("Running get_function test: {} for {}", test.name, lang);
                 let expected_path = fixture_dir.join(format!("get_function_{}.txt", test.name));
-                if !expected_path.exists() {
-                    println!("  Skipping: expected file not found: {:?}", expected_path);
-                    continue;
-                }
-                let expected_output = fs::read_to_string(expected_path).unwrap();
+                let expected_output = fs::read_to_string(&expected_path).unwrap_or_else(|error| {
+                    panic!(
+                        "Missing expected fixture {}: {error}",
+                        expected_path.display()
+                    )
+                });
 
                 let anchor_mgr = AnchorStateManager::new();
                 let result = get_functions(
@@ -106,12 +118,12 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                 if let Some(res) = result {
                     let actual_output =
                         sned::core::hash_utils::strip_hashes(&res.formatted_content);
-                    if actual_output.trim() != expected_output.trim() {
-                        println!(
-                            "Parity failed for {}. Actual:\n{}\nExpected:\n{}",
-                            test.name, actual_output, expected_output
-                        );
-                    }
+                    assert_eq!(
+                        actual_output.trim(),
+                        expected_output.trim(),
+                        "get_function parity failed for {}",
+                        test.name
+                    );
                 } else {
                     panic!("get_functions returned None for {}", test.name);
                 }
@@ -126,11 +138,12 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                 );
                 let expected_path =
                     fixture_dir.join(format!("find_symbol_references_{}.txt", test.name));
-                if !expected_path.exists() {
-                    println!("  Skipping: expected file not found: {:?}", expected_path);
-                    continue;
-                }
-                let expected_output = fs::read_to_string(expected_path).unwrap();
+                let expected_output = fs::read_to_string(&expected_path).unwrap_or_else(|error| {
+                    panic!(
+                        "Missing expected fixture {}: {error}",
+                        expected_path.display()
+                    )
+                });
                 let handler = sned::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler;
                 let state = Arc::new(TokioMutex::new(sned::core::agent_loop::TaskState::default()));
                 let tool_context = ToolContext::new(
@@ -149,23 +162,21 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                     &tool_context,
                     serde_json::json!({
                         "paths": [sample_rel_path.clone()],
-                        "symbols": test.symbols,
+                        "names": test.symbols,
                         "find_type": test.find_type,
                     }),
                 ));
-                let actual_output = match result {
-                    Ok(v) => sned::core::hash_utils::strip_hashes(v.as_str().unwrap()),
-                    Err(e) => {
-                        println!("  find_symbol_references error for {}: {}", test.name, e);
-                        continue;
-                    }
-                };
-                if actual_output.trim() != expected_output.trim() {
-                    println!(
-                        "Parity failed for {}. Actual:\n{}\nExpected:\n{}",
-                        test.name, actual_output, expected_output
-                    );
-                }
+                let value = result.unwrap_or_else(|error| {
+                    panic!("find_symbol_references failed for {}: {error}", test.name)
+                });
+                let actual_output =
+                    strip_reference_anchors(value.as_str().expect("tool result must be a string"));
+                assert_eq!(
+                    actual_output.trim(),
+                    expected_output.trim(),
+                    "find_symbol_references parity failed for {}",
+                    test.name
+                );
             }
         }
 
@@ -174,11 +185,12 @@ fn run_language_fixtures(lang: &str, extension: &str) {
             for test in replace_tests {
                 println!("Running replace_symbol test: {} for {}", test.name, lang);
                 let expected_path = fixture_dir.join(format!("replace_symbol_{}.txt", test.name));
-                if !expected_path.exists() {
-                    println!("  Skipping: expected file not found: {:?}", expected_path);
-                    continue;
-                }
-                let expected_output = fs::read_to_string(expected_path).unwrap();
+                let expected_output = fs::read_to_string(&expected_path).unwrap_or_else(|error| {
+                    panic!(
+                        "Missing expected fixture {}: {error}",
+                        expected_path.display()
+                    )
+                });
                 let handler =
                     sned::core::tools::handlers::replace_symbol::ReplaceSymbolHandler::new();
                 let state = Arc::new(TokioMutex::new(sned::core::agent_loop::TaskState::default()));
@@ -202,27 +214,25 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                         "text": test.text,
                     }),
                 ));
-                let actual_output = match result {
-                    Ok(v) => sned::core::hash_utils::strip_hashes(v.as_str().unwrap()),
-                    Err(e) => {
-                        println!("  replace_symbol error for {}: {}", test.name, e);
-                        continue;
-                    }
-                };
-                if actual_output.trim() != expected_output.trim() {
-                    println!(
-                        "Parity failed for {}. Actual:\n{}\nExpected:\n{}",
-                        test.name, actual_output, expected_output
-                    );
-                }
+                let value = result.unwrap_or_else(|error| {
+                    panic!("replace_symbol failed for {}: {error}", test.name)
+                });
+                let actual_output = sned::core::hash_utils::strip_hashes(
+                    value.as_str().expect("tool result must be a string"),
+                );
                 fs::write(&sample_file_path, &original_content).unwrap();
+                assert_eq!(
+                    actual_output.trim(),
+                    expected_output.trim(),
+                    "replace_symbol parity failed for {}",
+                    test.name
+                );
             }
         }
 
         Ok::<(), ()>(())
     })();
 
-    std::env::set_current_dir(original_cwd).unwrap();
     result.unwrap();
 }
 
@@ -234,49 +244,4 @@ fn test_rust_fixtures() {
 #[test]
 fn test_python_fixtures() {
     run_language_fixtures("python", "py");
-}
-
-#[test]
-fn test_typescript_fixtures() {
-    run_language_fixtures("typescript", "ts");
-}
-
-#[test]
-fn test_c_fixtures() {
-    run_language_fixtures("c", "c");
-}
-
-#[test]
-fn test_cpp_fixtures() {
-    run_language_fixtures("cpp", "cpp");
-}
-
-#[test]
-fn test_csharp_fixtures() {
-    run_language_fixtures("csharp", "cs");
-}
-
-#[test]
-fn test_go_fixtures() {
-    run_language_fixtures("go", "go");
-}
-
-#[test]
-fn test_java_fixtures() {
-    run_language_fixtures("java", "java");
-}
-
-#[test]
-fn test_php_fixtures() {
-    run_language_fixtures("php", "php");
-}
-
-#[test]
-fn test_ruby_fixtures() {
-    run_language_fixtures("ruby", "rb");
-}
-
-#[test]
-fn test_swift_fixtures() {
-    run_language_fixtures("swift", "swift");
 }
