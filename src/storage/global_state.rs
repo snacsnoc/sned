@@ -41,8 +41,6 @@ pub struct GlobalState {
     #[serde(default)]
     pub remote_rules_toggles: HashMap<String, bool>,
     #[serde(default)]
-    pub remote_workflow_toggles: HashMap<String, bool>,
-    #[serde(default)]
     pub dismissed_banners: Vec<DismissedBanner>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_auto_open_path: Option<String>,
@@ -54,8 +52,6 @@ pub struct GlobalState {
     pub auto_approve_patterns: Vec<String>,
     #[serde(default)]
     pub global_sned_rules_toggles: HashMap<String, bool>,
-    #[serde(default)]
-    pub global_workflow_toggles: HashMap<String, bool>,
     #[serde(default)]
     pub global_skills_toggles: HashMap<String, bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -445,6 +441,21 @@ mod tests {
         }
 
         result
+    }
+
+    #[test]
+    fn test_legacy_workflow_toggles_are_ignored() {
+        let state: GlobalState = serde_json::from_str(
+            r#"{
+                "remote_workflow_toggles": {"review": true},
+                "global_workflow_toggles": {"release": false}
+            }"#,
+        )
+        .unwrap();
+
+        let serialized = serde_json::to_value(state).unwrap();
+        assert!(serialized.get("remote_workflow_toggles").is_none());
+        assert!(serialized.get("global_workflow_toggles").is_none());
     }
 
     #[test]

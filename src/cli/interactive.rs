@@ -2051,35 +2051,6 @@ async fn handle_cli_only_command(
                 }
             }
         }
-        CliOnlyCommand::Expand => {
-            if let Some(index) = crate::cli::slash_commands::parse_expand_index(text) {
-                let sess = session.lock().await;
-                let sh = sess.agent_loop().await.state_handle();
-                drop(sess);
-                let state = sh.lock().await;
-                if let Some(block) = state
-                    .snipped_code_blocks
-                    .iter()
-                    .find(|block| block.index == index)
-                {
-                    if block.language.is_empty() {
-                        app.push_plain("```");
-                    } else {
-                        app.push_plain(format!("```{}", block.language));
-                    }
-                    let highlighted =
-                        crate::cli::syntax_highlight::highlight_code(&block.code, &block.language);
-                    for line in ansi_to_ratatui_lines(&highlighted) {
-                        app.push_output(line);
-                    }
-                    app.push_plain("```");
-                } else {
-                    app.push_plain(format!("No snipped code block {index}."));
-                }
-            } else {
-                app.push_plain("Usage: /expand N");
-            }
-        }
         CliOnlyCommand::PlanPrompt(_) => {
             app.push_plain("Plan prompt should be handled by the main loop.");
         }
@@ -3240,25 +3211,12 @@ pub async fn run_interactive_shell_inner(
         let mut sh = state_handle.lock().await;
         *sh = Some(sess.state_handle().await);
 
-        let _cwd = app.cwd.clone();
         let agent_loop = sess.agent_loop().await.state_handle();
         let skills = {
             let state = agent_loop.lock().await;
             state.available_skills.clone()
         };
-        let local_toggles: std::collections::HashMap<String, bool> =
-            std::collections::HashMap::new();
-        let global_toggles: std::collections::HashMap<String, bool> =
-            std::collections::HashMap::new();
-        let remote_toggles: std::collections::HashMap<String, bool> =
-            std::collections::HashMap::new();
-
-        let entries = crate::cli::slash_commands::build_slash_command_entries(
-            &skills,
-            &local_toggles,
-            &global_toggles,
-            &remote_toggles,
-        );
+        let entries = crate::cli::slash_commands::build_slash_command_entries(&skills);
         app.slash_command_all_entries = entries;
     }
 

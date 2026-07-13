@@ -1,6 +1,4 @@
 use regex::Regex;
-use std::collections::HashMap;
-use std::path::Path;
 
 use crate::core::context::instructions::{self, SkillMetadata};
 
@@ -11,9 +9,7 @@ pub enum SlashCommand {
     NewTask,
     Compact,
     NewRule,
-    ExplainChanges,
     SkillCommand { name: String },
-    WorkflowCommand { name: String },
 }
 
 impl SlashCommand {
@@ -23,19 +19,14 @@ impl SlashCommand {
             "newtask" => Some(Self::NewTask),
             "compact" => Some(Self::Compact),
             "newrule" => Some(Self::NewRule),
-            "explain-changes" => Some(Self::ExplainChanges),
             _ => None,
         }
     }
 
     #[must_use] 
-    pub fn parse_with_skills_and_workflows(
+    pub fn parse_with_skills(
         command_name: &str,
         available_skills: &[SkillMetadata],
-        local_workflow_toggles: &HashMap<String, bool>,
-        global_workflow_toggles: &HashMap<String, bool>,
-        remote_workflow_toggles: &HashMap<String, bool>,
-        cwd: &Path,
     ) -> Option<Self> {
         if let Some(slash_cmd) = Self::parse(command_name) {
             return Some(slash_cmd);
@@ -47,29 +38,12 @@ impl SlashCommand {
             });
         }
 
-        let workflows = build_workflows_list(
-            local_workflow_toggles,
-            global_workflow_toggles,
-            remote_workflow_toggles,
-            cwd,
-        );
-        if let Some(workflow) = workflows.iter().find(|w| w.file_name == command_name) {
-            return Some(Self::WorkflowCommand {
-                name: workflow.file_name.clone(),
-            });
-        }
-
         None
     }
 
     #[must_use] 
     pub fn is_skill_command(&self) -> bool {
         matches!(self, Self::SkillCommand { .. })
-    }
-
-    #[must_use] 
-    pub fn is_workflow_command(&self) -> bool {
-        matches!(self, Self::WorkflowCommand { .. })
     }
 
     #[must_use] 
@@ -83,8 +57,7 @@ impl SlashCommand {
             Self::NewTask => NEW_TASK_INSTRUCTION,
             Self::Compact => CONDENSE_INSTRUCTION,
             Self::NewRule => NEW_RULE_INSTRUCTION,
-            Self::ExplainChanges => EXPLAIN_CHANGES_INSTRUCTION,
-            Self::SkillCommand { .. } | Self::WorkflowCommand { .. } => "",
+            Self::SkillCommand { .. } => "",
         }
     }
 
@@ -92,14 +65,6 @@ impl SlashCommand {
     pub fn skill_name(&self) -> Option<&str> {
         match self {
             Self::SkillCommand { name } => Some(name),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn workflow_name(&self) -> Option<&str> {
-        match self {
-            Self::WorkflowCommand { name } => Some(name),
             _ => None,
         }
     }
@@ -117,116 +82,6 @@ pub struct ParsedSlashCommand {
 pub struct SlashCommandParseResult {
     pub processed_text: String,
     pub command: Option<ParsedSlashCommand>,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkflowInfo {
-    pub file_name: String,
-    pub full_path: String,
-    pub is_remote: bool,
-    pub contents: Option<String>,
-}
-
-fn build_workflows_list(
-    local_workflow_toggles: &HashMap<String, bool>,
-    global_workflow_toggles: &HashMap<String, bool>,
-    _remote_workflow_toggles: &HashMap<String, bool>,
-    cwd: &Path,
-) -> Vec<WorkflowInfo> {
-    let mut workflows = Vec::new();
-
-    let local_dir = cwd.join(".agents/workflows");
-    if local_dir.exists()
-        && local_dir.is_dir()
-        && let Ok(entries) = std::fs::read_dir(&local_dir)
-    {
-        for entry in entries.filter_map(std::result::Result::ok) {
-            let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == "md") {
-                let file_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.strip_suffix(".md").unwrap_or(s).to_string())
-                    .unwrap_or_default();
-
-                if local_workflow_toggles
-                    .get(&file_name)
-                    .copied()
-                    .unwrap_or(true)
-                {
-                    workflows.push(WorkflowInfo {
-                        file_name,
-                        full_path: path.to_string_lossy().to_string(),
-                        is_remote: false,
-                        contents: None,
-                    });
-                }
-            }
-        }
-    }
-
-    let global_dir = dirs::home_dir()
-        .map(|h| h.join(".sned/workflows"))
-        .filter(|p| p.exists() && p.is_dir());
-
-    if let Some(global_dir) = global_dir
-        && let Ok(entries) = std::fs::read_dir(&global_dir)
-    {
-        for entry in entries.filter_map(std::result::Result::ok) {
-            let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == "md") {
-                let file_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.strip_suffix(".md").unwrap_or(s).to_string())
-                    .unwrap_or_default();
-
-                if global_workflow_toggles
-                    .get(&file_name)
-                    .copied()
-                    .unwrap_or(true)
-                    && !workflows.iter().any(|w| w.file_name == file_name)
-                {
-                    workflows.push(WorkflowInfo {
-                        file_name,
-                        full_path: path.to_string_lossy().to_string(),
-                        is_remote: false,
-                        contents: None,
-                    });
-                }
-            }
-        }
-    }
-
-    workflows
-}
-
-#[must_use] 
-pub fn get_workflow_content(
-    workflow_name: &str,
-    local_workflow_toggles: &HashMap<String, bool>,
-    global_workflow_toggles: &HashMap<String, bool>,
-    remote_workflow_toggles: &HashMap<String, bool>,
-    cwd: &Path,
-) -> Option<String> {
-    let workflows = build_workflows_list(
-        local_workflow_toggles,
-        global_workflow_toggles,
-        remote_workflow_toggles,
-        cwd,
-    );
-
-    workflows
-        .iter()
-        .find(|w| w.file_name == workflow_name)
-        .and_then(|w| {
-            if w.full_path.is_empty() {
-                None
-            } else {
-                std::fs::read_to_string(&w.full_path).ok()
-            }
-        })
-        .map(|c| c.trim().to_string())
 }
 
 #[must_use] 
@@ -257,7 +112,6 @@ pub enum CliOnlyCommand {
     CheckpointList,
     CheckpointRestore,
     CheckpointUndo,
-    Expand,
     Changes,
     HelpOption(String),
     Queue,
@@ -359,7 +213,6 @@ impl CliOnlyCommand {
             "checkpoint-list" | "checkpoint list" => Some(Self::CheckpointList),
             "checkpoint-restore" | "checkpoint restore" => Some(Self::CheckpointRestore),
             "checkpoint-undo" | "checkpoint undo" => Some(Self::CheckpointUndo),
-            "expand" => Some(Self::Expand),
             "changes" => Some(Self::Changes),
             "queue" => Some(Self::Queue),
             "retry" => Some(Self::Retry),
@@ -446,7 +299,6 @@ impl CliOnlyCommand {
                 | Self::Models
                 | Self::ResetCompact
                 | Self::Stats
-                | Self::Expand
                 | Self::Changes
                 | Self::Queue
                 | Self::Retry
@@ -558,21 +410,10 @@ pub fn process_slash_command(text: &str) -> String {
 pub fn process_slash_command_with_context(
     text: &str,
     available_skills: &[SkillMetadata],
-    local_workflow_toggles: &HashMap<String, bool>,
-    global_workflow_toggles: &HashMap<String, bool>,
-    remote_workflow_toggles: &HashMap<String, bool>,
-    cwd: &Path,
 ) -> String {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command
-        && let Some(slash_cmd) = SlashCommand::parse_with_skills_and_workflows(
-            &cmd.command,
-            available_skills,
-            local_workflow_toggles,
-            global_workflow_toggles,
-            remote_workflow_toggles,
-            cwd,
-        )
+        && let Some(slash_cmd) = SlashCommand::parse_with_skills(&cmd.command, available_skills)
     {
         if slash_cmd.is_skill_command() {
             if let Some(skill_name) = slash_cmd.skill_name()
@@ -592,21 +433,6 @@ pub fn process_slash_command_with_context(
                     return format!("{instruction}{activation_note}{text_after}");
                 }
                 return format!("{instruction}\n{text_after}");
-            }
-        } else if slash_cmd.is_workflow_command() {
-            if let Some(workflow_name) = slash_cmd.workflow_name()
-                && let Some(content) = get_workflow_content(
-                    workflow_name,
-                    local_workflow_toggles,
-                    global_workflow_toggles,
-                    remote_workflow_toggles,
-                    cwd,
-                )
-            {
-                let instruction = format!(
-                    "<explicit_instructions type=\"{workflow_name}\">\n{content}\n</explicit_instructions>"
-                );
-                return format!("{}\n{}", instruction, result.processed_text);
             }
         } else if slash_cmd.instruction_block().is_empty() {
             return result.processed_text.clone();
@@ -648,7 +474,6 @@ pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
         {
             return Some(parsed);
         }
-        // Try the command word first (handles /expand 1, /commit "msg", etc.)
         if let Some(parsed) = CliOnlyCommand::parse(&cmd.command) {
             return Some(parsed);
         }
@@ -663,23 +488,7 @@ pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
     None
 }
 
-#[must_use] 
-pub fn parse_expand_index(text: &str) -> Option<usize> {
-    let result = parse_slash_command(text);
-    let cmd = result.command?;
-    if !cmd.command.eq_ignore_ascii_case("expand") {
-        return None;
-    }
-
-    result
-        .processed_text
-        .split_whitespace()
-        .next()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|index| *index > 0)
-}
-
-#[must_use] 
+#[must_use]
 pub fn parse_checkpoint_restore(text: &str) -> Option<usize> {
     let result = parse_slash_command(text);
     let cmd = result.command?;
@@ -735,8 +544,6 @@ pub enum SlashCommandCategory {
     Plan,
     /// Skills loaded from available skills
     Skill,
-    /// Workflows loaded from .agents/workflows/ or ~/.sned/workflows/
-    Workflow,
 }
 
 /// A single slash command entry for the autocomplete picker.
@@ -750,23 +557,17 @@ pub struct SlashCommandEntry {
     pub aliases: Vec<String>,
     /// Category for grouping/coloring
     pub category: SlashCommandCategory,
-    /// Whether this command requires arguments (e.g. /commit, /expand)
+    /// Whether this command requires arguments (e.g. /commit)
     pub requires_args: bool,
 }
 
 /// Build the list of all available slash command entries.
 ///
-/// Combines built-in agent commands, local CLI commands, skills, and workflows
-/// into a single list for the autocomplete picker.
+/// Combines built-in agent commands, local CLI commands, plans, and skills into
+/// a single list for the autocomplete picker.
 #[must_use] 
-pub fn build_slash_command_entries(
-    available_skills: &[SkillMetadata],
-    local_workflow_toggles: &HashMap<String, bool>,
-    global_workflow_toggles: &HashMap<String, bool>,
-    remote_workflow_toggles: &HashMap<String, bool>,
-) -> Vec<SlashCommandEntry> {
+pub fn build_slash_command_entries(available_skills: &[SkillMetadata]) -> Vec<SlashCommandEntry> {
     let mut entries = vec![
-        // Agent-injected slash commands
         SlashCommandEntry {
             name: "newtask".to_string(),
             description: "Create a new task with the current context".to_string(),
@@ -788,14 +589,6 @@ pub fn build_slash_command_entries(
             category: SlashCommandCategory::Agent,
             requires_args: true,
         },
-        SlashCommandEntry {
-            name: "explain-changes".to_string(),
-            description: "Explain recent code changes".to_string(),
-            aliases: vec!["explain".to_string()],
-            category: SlashCommandCategory::Agent,
-            requires_args: false,
-        },
-        // Local CLI commands
         SlashCommandEntry {
             name: "exit".to_string(),
             description: "Exit the interactive shell".to_string(),
@@ -853,13 +646,6 @@ pub fn build_slash_command_entries(
             requires_args: false,
         },
         SlashCommandEntry {
-            name: "expand".to_string(),
-            description: "Expand a snipped block by index".to_string(),
-            aliases: vec!["e".to_string()],
-            category: SlashCommandCategory::Local,
-            requires_args: true,
-        },
-        SlashCommandEntry {
             name: "undo".to_string(),
             description: "Undo the last edit operation".to_string(),
             aliases: vec![],
@@ -882,7 +668,6 @@ pub fn build_slash_command_entries(
         },
     ];
 
-    // Skills
     for skill in available_skills {
         let desc = if skill.description.is_empty() {
             "Skill".to_string()
@@ -898,31 +683,7 @@ pub fn build_slash_command_entries(
         });
     }
 
-    // Note: workflows are loaded from disk and require cwd — the TUI layer
-    // calls build_slash_command_entries with a populated workflow list.
-    // For simplicity, the TUI passes a pre-built WorkflowInfo list below.
-    let _ = (
-        local_workflow_toggles,
-        global_workflow_toggles,
-        remote_workflow_toggles,
-    );
-
     entries
-}
-
-/// Build workflow entries from a pre-loaded workflow list.
-#[must_use] 
-pub fn build_workflow_entries(workflows: &[(String, String)]) -> Vec<SlashCommandEntry> {
-    workflows
-        .iter()
-        .map(|(name, _content)| SlashCommandEntry {
-            name: name.clone(),
-            description: "Workflow".to_string(),
-            aliases: vec![],
-            category: SlashCommandCategory::Workflow,
-            requires_args: true,
-        })
-        .collect()
 }
 
 /// Extract the slash command query from the input text.
@@ -1076,15 +837,13 @@ pub fn format_help_text() -> String {
         style::DIM
     ));
     s.push_str(&format!(
-        "  {}{}{}  - {}Create a new Snad rule based on your conversation{}\n",
+        "  {}{}{}  - {}Create a new Snad rule based on your conversation{}\n\n",
         style::CYAN,
         "/newrule",
         style::DIM,
         style::RESET,
         style::DIM
     ));
-    s.push_str(&format!("  {}{}{}  - {}Explain the changes you have made to the code (alias: /explain_changes){}\n\n", style::CYAN, "/explain-changes", style::DIM, style::RESET, style::DIM));
-
     s.push_str(&format!(
         "{}{}CLI-Only Commands (handled locally):{}\n",
         style::BOLD,
@@ -1206,14 +965,6 @@ pub fn format_help_text() -> String {
         style::RESET,
         style::YELLOW,
         "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show a previously snipped code block{}\n",
-        style::CYAN,
-        "/expand N",
-        style::DIM,
-        style::RESET,
         style::DIM
     ));
     s.push_str(&format!(
@@ -1430,15 +1181,6 @@ pub fn format_help_text() -> String {
         "[requires --track-changes]",
         style::DIM
     ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show snipped code block 1{}",
-        style::CYAN,
-        "/expand 1",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-
     s
 }
 
@@ -1486,15 +1228,6 @@ Use when:
   - You want to codify a pattern from your current work
   - Creating project-specific conventions
   - Documenting recurring workflows"
-        }
-
-        "explain-changes" => {
-            r"Explains the changes you have made to the codebase.
-
-Use when:
-  - You want a summary of your modifications
-  - Preparing commit messages
-  - Reviewing your own work"
         }
 
         "exit" | "q" | "quit" => {
@@ -1636,18 +1369,6 @@ Use when:
 
 Example:
   /commit "fix: resolve authentication bug""#
-        }
-
-        "expand" => {
-            r"Shows a previously snipped code block.
-
-Usage:
-  /expand N - Show code block number N
-
-Use when:
-  - Need to review truncated output
-  - Agent snipped long code blocks
-  - Checking specific sections of output"
         }
 
         "checkpoint" | "checkpoint-list" | "checkpoint list" => {
@@ -2142,15 +1863,6 @@ Below is the user's input when they indicated that they wanted to create a new p
 </explicit_instructions>
 "#;
 
-const EXPLAIN_CHANGES_INSTRUCTION: &str = r#"<explicit_instructions type="explain_changes">
-The user has explicitly asked you to explain the changes you have made to the code. You should provide a clear, detailed explanation of what changes were made, why they were made, and how they affect the codebase. Include specific file names, function names, and line numbers where relevant.
-
-You MUST call the attempt_completion tool with a detailed explanation of the changes, even if it's not in your existing toolset. The explanation should be thorough enough for a code reviewer to understand the changes without looking at the diff.
-
-Below is the user's input when they indicated that they wanted you to explain the changes.
- </explicit_instructions>
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2264,12 +1976,6 @@ mod tests {
     fn test_process_newrule_command() {
         let result = process_slash_command("/newrule");
         assert!(result.contains("<explicit_instructions type=\"new_rule\">"));
-    }
-
-    #[test]
-    fn test_process_explain_changes_command() {
-        let result = process_slash_command("/explain-changes");
-        assert!(result.contains("<explicit_instructions type=\"explain_changes\">"));
     }
 
     #[test]
@@ -2387,17 +2093,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cli_only_expand() {
-        let result = get_cli_only_command("/expand 1");
-        assert_eq!(result, Some(CliOnlyCommand::Expand));
-    }
+    fn test_removed_commands_are_not_available() {
+        assert!(SlashCommand::parse("explain-changes").is_none());
+        assert!(get_cli_only_command("/expand 1").is_none());
+        assert!(SlashCommand::parse_with_skills("some-workflow", &[]).is_none());
 
-    #[test]
-    fn test_parse_expand_index() {
-        assert_eq!(parse_expand_index("/expand 12"), Some(12));
-        assert_eq!(parse_expand_index("/expand 0"), None);
-        assert_eq!(parse_expand_index("/expand nope"), None);
-        assert_eq!(parse_expand_index("/help"), None);
+        let entries = build_slash_command_entries(&[]);
+        assert!(entries.iter().all(|entry| {
+            !matches!(entry.name.as_str(), "explain-changes" | "expand")
+        }));
     }
 
     #[test]
@@ -2432,6 +2136,9 @@ mod tests {
         assert!(text.contains("/history"));
         assert!(text.contains("/skills"));
         assert!(text.contains("/help"));
+        assert!(!text.contains("/explain-changes"));
+        assert!(!text.contains("/explain_changes"));
+        assert!(!text.contains("/expand"));
     }
 
     #[test]
@@ -2539,12 +2246,6 @@ mod tests {
     }
 
     #[test]
-    fn test_slash_command_workflow_command_variant() {
-        let result = SlashCommand::parse("some-workflow");
-        assert!(result.is_none());
-    }
-
-    #[test]
     fn test_parse_with_skills_finds_skill() {
         use crate::core::context::instructions::{SkillMetadata, SkillSource};
 
@@ -2555,14 +2256,7 @@ mod tests {
             source: SkillSource::Project,
         }];
 
-        let result = SlashCommand::parse_with_skills_and_workflows(
-            "test-skill",
-            &skills,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            Path::new("/tmp"),
-        );
+        let result = SlashCommand::parse_with_skills("test-skill", &skills);
 
         assert!(result.is_some());
         let cmd = result.unwrap();
@@ -2581,33 +2275,18 @@ mod tests {
             source: SkillSource::Project,
         }];
 
-        let result = SlashCommand::parse_with_skills_and_workflows(
-            "unknown-cmd",
-            &skills,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            Path::new("/tmp"),
-        );
+        let result = SlashCommand::parse_with_skills("unknown-cmd", &skills);
 
         assert!(result.is_none());
     }
 
     #[test]
     fn test_builtin_commands_still_work() {
-        let result = SlashCommand::parse_with_skills_and_workflows(
-            "newtask",
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            Path::new("/tmp"),
-        );
+        let result = SlashCommand::parse_with_skills("newtask", &[]);
 
         assert!(result.is_some());
         let cmd = result.unwrap();
         assert!(!cmd.is_skill_command());
-        assert!(!cmd.is_workflow_command());
         assert_eq!(cmd.instruction_block(), NEW_TASK_INSTRUCTION);
     }
 
@@ -2617,20 +2296,7 @@ mod tests {
             name: "my-skill".to_string(),
         };
         assert!(skill_cmd.is_skill_command());
-        assert!(!skill_cmd.is_workflow_command());
         assert_eq!(skill_cmd.skill_name(), Some("my-skill"));
-        assert_eq!(skill_cmd.workflow_name(), None);
-    }
-
-    #[test]
-    fn test_workflow_command_helper_methods() {
-        let workflow_cmd = SlashCommand::WorkflowCommand {
-            name: "my-workflow".to_string(),
-        };
-        assert!(!workflow_cmd.is_skill_command());
-        assert!(workflow_cmd.is_workflow_command());
-        assert_eq!(workflow_cmd.skill_name(), None);
-        assert_eq!(workflow_cmd.workflow_name(), Some("my-workflow"));
     }
 
     #[test]
@@ -2644,14 +2310,7 @@ mod tests {
             source: SkillSource::Project,
         }];
 
-        let result = SlashCommand::parse_with_skills_and_workflows(
-            "test-skill",
-            &skills,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            Path::new("/tmp"),
-        );
+        let result = SlashCommand::parse_with_skills("test-skill", &skills);
 
         assert!(result.is_some());
         let cmd = result.unwrap();
@@ -2661,10 +2320,27 @@ mod tests {
 
     #[test]
     fn test_process_slash_command_with_skill_injects_content() {
+        use crate::core::context::instructions::{SkillMetadata, SkillSource};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let skill_path = temp.path().join("SKILL.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: test-skill\ndescription: A test skill\n---\nFollow this skill.",
+        )
+        .unwrap();
+        let skills = vec![SkillMetadata {
+            name: "test-skill".to_string(),
+            description: "A test skill".to_string(),
+            path: skill_path.to_string_lossy().into_owned(),
+            source: SkillSource::Project,
+        }];
         let text = "/test-skill do something";
-        let result = parse_slash_command(text);
-        assert!(result.command.is_some());
-        assert_eq!(result.processed_text, "do something");
+        let result = process_slash_command_with_context(text, &skills);
+
+        assert!(result.contains("<explicit_instructions type=\"skill\" name=\"test-skill\">"));
+        assert!(result.contains("Follow this skill."));
+        assert!(result.ends_with("do something"));
     }
 
     #[test]
@@ -2922,8 +2598,8 @@ mod tests {
                 requires_args: false,
             },
             SlashCommandEntry {
-                name: "expand".to_string(),
-                description: "Expand".to_string(),
+                name: "execute".to_string(),
+                description: "Execute".to_string(),
                 aliases: vec![],
                 category: SlashCommandCategory::Local,
                 requires_args: false,
@@ -2931,10 +2607,8 @@ mod tests {
         ];
         let results = filter_slash_commands(&entries, "ex");
         assert_eq!(results.len(), 2);
-        // exit comes before expand alphabetically in this case
-        // but both should match prefix
         assert!(results.iter().any(|e| e.name == "exit"));
-        assert!(results.iter().any(|e| e.name == "expand"));
+        assert!(results.iter().any(|e| e.name == "execute"));
     }
 
     #[test]
@@ -3055,7 +2729,6 @@ mod tests {
         assert_eq!(format!("{:?}", SlashCommandCategory::Local), "Local");
         assert_eq!(format!("{:?}", SlashCommandCategory::Plan), "Plan");
         assert_eq!(format!("{:?}", SlashCommandCategory::Skill), "Skill");
-        assert_eq!(format!("{:?}", SlashCommandCategory::Workflow), "Workflow");
     }
 
     #[test]

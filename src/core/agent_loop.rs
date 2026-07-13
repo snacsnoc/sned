@@ -14,7 +14,7 @@
 use crate::cli::output::OutputEvent;
 use crate::cli::tui::theme::{ERROR_FG, PROMPT_FG};
 pub use crate::core::agent_types::{
-    AgentConfig, AgentError, AgentMode, SnippedCodeBlock, TaskState, TurnResult,
+    AgentConfig, AgentError, AgentMode, TaskState, TurnResult,
 };
 use crate::core::agent_types::{
     MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE, MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT,
@@ -288,26 +288,8 @@ fn code_block_display_limit(interactive_mode: bool) -> usize {
     }
 }
 
-fn snipped_code_block_hint(index: Option<usize>) -> String {
-    match index {
-        Some(index) => format!("  ... [snipped - type /expand {index} to show full block]"),
-        None => "  ... [snipped]".to_string(),
-    }
-}
-
-fn push_snipped_code_block(
-    blocks: &mut Vec<SnippedCodeBlock>,
-    start_index: usize,
-    language: &str,
-    lines: &[String],
-) -> usize {
-    let index = start_index + blocks.len() + 1;
-    blocks.push(SnippedCodeBlock {
-        index,
-        language: language.to_string(),
-        code: lines.join("\n"),
-    });
-    index
+fn snipped_code_block_hint() -> &'static str {
+    "  ... [snipped from streamed display]"
 }
 
 fn message_queue_max_len() -> usize {
@@ -1684,7 +1666,6 @@ impl AgentLoop {
             accumulated_redacted_data,
             mut tool_calls_map,
             tool_call_order,
-            snipped_blocks_this_turn,
         ) = 'provider_stream_attempt: loop {
             // Create channel for stream chunks with large buffer to prevent
             // backpressure deadlocks when the provider emits faster than the
@@ -1790,15 +1771,9 @@ impl AgentLoop {
             let mut in_code_block = false;
             let mut code_block_lang = String::new();
             let mut code_block_buffer: Vec<String> = Vec::new();
-            let mut code_block_full_buffer: Vec<String> = Vec::new();
             let mut code_block_lines: usize = 0;
             let mut code_block_snipped = false;
             let code_block_display_limit = code_block_display_limit(self.config.interactive_mode);
-            let snipped_block_start_index = {
-                let state = self.state.lock().await;
-                state.snipped_code_blocks.len()
-            };
-            let mut snipped_blocks_this_turn: Vec<SnippedCodeBlock> = Vec::new();
 
             let mut stream_errored = false;
             let mut retryable_stream_error_before_output: Option<String> = None;
@@ -1907,24 +1882,13 @@ impl AgentLoop {
                                                 &self.config.output_writer,
                                             );
                                             if code_block_snipped {
-                                                let index = if self.config.interactive_mode {
-                                                    Some(push_snipped_code_block(
-                                                        &mut snipped_blocks_this_turn,
-                                                        snipped_block_start_index,
-                                                        &code_block_lang,
-                                                        &code_block_full_buffer,
-                                                    ))
-                                                } else {
-                                                    None
-                                                };
                                                 self.config.output_writer.emit(OutputEvent::dim(
-                                                    snipped_code_block_hint(index),
+                                                    snipped_code_block_hint(),
                                                 ));
                                             }
                                             in_code_block = false;
                                             code_block_lang.clear();
                                             code_block_buffer.clear();
-                                            code_block_full_buffer.clear();
                                             code_block_lines = 0;
                                             code_block_snipped = false;
                                         } else {
@@ -1932,7 +1896,6 @@ impl AgentLoop {
                                             code_block_lang =
                                                 code_fence_language(trimmed_line).to_string();
                                             code_block_buffer.clear();
-                                            code_block_full_buffer.clear();
                                             code_block_lines = 0;
                                             code_block_snipped = false;
                                         }
@@ -1952,7 +1915,6 @@ impl AgentLoop {
                                         code_block_lines += 1;
                                         // For code blocks, preserve leading indentation (only trim end)
                                         let code_line = line.trim_end().to_string();
-                                        code_block_full_buffer.push(code_line.clone());
                                         if code_block_lines > code_block_display_limit {
                                             code_block_snipped = true;
                                             continue;
@@ -2315,7 +2277,6 @@ impl AgentLoop {
                 let remaining = display_buffer.trim_end().to_string();
                 if !remaining.is_empty() {
                     code_block_lines += 1;
-                    code_block_full_buffer.push(remaining.clone());
                     if code_block_lines <= code_block_display_limit {
                         code_block_buffer.push(remaining);
                     } else {
@@ -2328,19 +2289,9 @@ impl AgentLoop {
                     &self.config.output_writer,
                 );
                 if code_block_snipped {
-                    let index = if self.config.interactive_mode {
-                        Some(push_snipped_code_block(
-                            &mut snipped_blocks_this_turn,
-                            snipped_block_start_index,
-                            &code_block_lang,
-                            &code_block_full_buffer,
-                        ))
-                    } else {
-                        None
-                    };
                     self.config
                         .output_writer
-                        .emit(OutputEvent::dim(snipped_code_block_hint(index)));
+                        .emit(OutputEvent::dim(snipped_code_block_hint()));
                 }
                 self.config.output_writer.flush();
             } else if !display_buffer.is_empty() && !self.config.json_output {
@@ -2430,14 +2381,8 @@ impl AgentLoop {
                 accumulated_redacted_data,
                 tool_calls_map,
                 tool_call_order,
-                snipped_blocks_this_turn,
             );
         };
-
-        if !snipped_blocks_this_turn.is_empty() {
-            let mut state = self.state.lock().await;
-            state.snipped_code_blocks.extend(snipped_blocks_this_turn);
-        }
 
         if !self.config.json_output && !accumulated_text.is_empty() {
             tracing::debug!("");
@@ -4644,7 +4589,6 @@ mod tests {
         assert_eq!(state.consecutive_mistakes, 0);
         assert!(!state.is_cancelled);
         assert!(!state.did_complete_reading_stream);
-        assert!(state.snipped_code_blocks.is_empty());
     }
 
     #[test]
@@ -5041,13 +4985,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_interactive_stream_tracks_snipped_code_block_for_expand() {
+    async fn test_interactive_stream_snips_long_code_block_without_recovery_command() {
         let mut code = String::from("```rust\n");
         for line in 1..=25 {
             code.push_str(&format!("fn line_{}() {{}}\n", line));
         }
         code.push_str("```\n");
 
+        let (tx, mut rx) = mpsc::channel(64);
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
                 crate::providers::mock::MockProvider::single_text_response(&code),
@@ -5067,7 +5012,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: true,
-            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            output_writer: Arc::new(crate::cli::output::ChannelOutputWriter::new(tx)),
             strict_plan_mode_enabled: true,
         };
 
@@ -5075,12 +5020,9 @@ mod tests {
         let result = agent.execute_turn().await;
         assert!(matches!(result, TurnResult::Continue));
 
-        let state = agent.state.lock().await;
-        assert_eq!(state.snipped_code_blocks.len(), 1);
-        let block = &state.snipped_code_blocks[0];
-        assert_eq!(block.index, 1);
-        assert_eq!(block.language, "rust");
-        assert!(block.code.contains("fn line_25() {}"));
+        let rendered = drain_rendered_output(&mut rx).join("\n");
+        assert!(rendered.contains("[snipped from streamed display]"));
+        assert!(!rendered.contains("/expand"));
     }
 
     #[tokio::test]
@@ -5091,6 +5033,7 @@ mod tests {
         }
         code.push_str("```\n");
 
+        let (tx, mut rx) = mpsc::channel(64);
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
                 crate::providers::mock::MockProvider::single_text_response(&code),
@@ -5110,7 +5053,7 @@ mod tests {
             max_context_turns: 50,
             max_tokens: None,
             interactive_mode: false,
-            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            output_writer: Arc::new(crate::cli::output::ChannelOutputWriter::new(tx)),
             strict_plan_mode_enabled: true,
         };
 
@@ -5118,8 +5061,8 @@ mod tests {
         let result = agent.execute_turn().await;
         assert!(matches!(result, TurnResult::Complete));
 
-        let state = agent.state.lock().await;
-        assert!(state.snipped_code_blocks.is_empty());
+        let rendered = drain_rendered_output(&mut rx).join("\n");
+        assert!(!rendered.contains("[snipped"));
     }
 
     #[tokio::test]

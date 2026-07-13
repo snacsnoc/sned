@@ -2525,7 +2525,6 @@ impl App {
                     crate::cli::slash_commands::SlashCommandCategory::Local => "● ",
                     crate::cli::slash_commands::SlashCommandCategory::Plan => "◆ ",
                     crate::cli::slash_commands::SlashCommandCategory::Skill => "★ ",
-                    crate::cli::slash_commands::SlashCommandCategory::Workflow => "▸ ",
                 };
                 let label = format!("{} {} - {}", category_marker, entry.name, entry.description);
                 if i == self.slash_command_selected {

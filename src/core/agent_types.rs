@@ -25,14 +25,6 @@ pub const MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE: usize = 15;
 /// Default max lines to display for code blocks in one-shot mode.
 pub const MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT: usize = 40;
 
-/// A snipped code block tracked for the /expand command.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnippedCodeBlock {
-    pub index: usize,
-    pub language: String,
-    pub code: String,
-}
-
 /// Exact denied tool action fingerprint for the current recovery context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeniedToolAction {
@@ -139,8 +131,6 @@ pub struct TaskState {
     pub commands_executed: u32,
     /// Number of turns in this session.
     pub turns_completed: u32,
-    /// Full code blocks shortened in terminal display.
-    pub snipped_code_blocks: Vec<SnippedCodeBlock>,
     /// File changes tracked across all turns for session summary.
     /// Maps absolute file path -> change stats (lines added/removed, action).
     pub session_file_changes:
@@ -220,7 +210,6 @@ impl Default for TaskState {
             consecutive_provider_failures: 0,
             commands_executed: 0,
             turns_completed: 0,
-            snipped_code_blocks: Vec::new(),
             session_file_changes: std::collections::HashMap::with_capacity(8),
             last_executed_command: None,
             must_reread_before_edit: HashSet::new(),
