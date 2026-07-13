@@ -3739,6 +3739,32 @@ mod tests {
         terminal
             .draw(|frame| app.render(frame))
             .expect("initial render should succeed");
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("transcript render should succeed");
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("TRANSCRIPT_ROW_13"), "got:\n{rendered}");
+        assert!(!rendered.contains("TRANSCRIPT_ROW_19"), "got:\n{rendered}");
+
         app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 2;
 

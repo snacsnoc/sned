@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use crate::providers::{
-    ApiStream, ApiStreamChunk, ApiStreamTextChunk, ApiStreamToolCall, ApiStreamToolCallFunction,
-    ApiStreamToolCallsChunk, ApiStreamUsageChunk, ModelInfo, Provider, ProviderError,
-    ProviderModel, ProviderRequest,
+    ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
+    ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, ModelInfo, Provider,
+    ProviderError, ProviderModel, ProviderRequest,
 };
 
 /// A mock provider for testing that returns predefined responses.
@@ -157,6 +157,108 @@ impl MockProvider {
                 })),
             ]),
             MockResponse::ToolCalls(vec![attempt_completion]),
+        ])
+    }
+
+    #[must_use]
+    pub fn approval_under_backpressure_scenario() -> Self {
+        let mut events = Vec::new();
+        for i in 1..=256 {
+            events.push(MockStreamEvent::Chunk(ApiStreamChunk::Text(
+                ApiStreamTextChunk {
+                    text: format!("approval backpressure line {i:03}: saturating normal output\n"),
+                    id: None,
+                    signature: None,
+                },
+            )));
+            if i % 4 == 0 {
+                let reasoning = if i == 256 {
+                    "APPROVAL_BACKPRESSURE_REASONING_TAIL\n".to_string()
+                } else {
+                    format!("approval backpressure reasoning {i:03}\n")
+                };
+                events.push(MockStreamEvent::Chunk(ApiStreamChunk::Reasoning(
+                    ApiStreamReasoningChunk {
+                        reasoning,
+                        details: None,
+                        signature: None,
+                        redacted_data: None,
+                        id: None,
+                    },
+                )));
+            }
+        }
+        events.push(MockStreamEvent::Chunk(ApiStreamChunk::ToolCalls(
+            ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("approval-backpressure-exec".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("execute_command".to_string()),
+                        arguments: Some(
+                            serde_json::json!({
+                                "commands": ["touch /tmp/sned-approval-backpressure-smoke"]
+                            })
+                            .to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            },
+        )));
+        events.push(MockStreamEvent::Chunk(ApiStreamChunk::Usage(
+            ApiStreamUsageChunk {
+                input_tokens: 10,
+                output_tokens: 320,
+                cache_write_tokens: None,
+                cache_read_tokens: None,
+                reasoning_tokens: Some(64),
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: None,
+                id: None,
+            },
+        )));
+
+        Self::new_with_repeat(vec![
+            MockResponse::Stream(events),
+            MockResponse::ToolCalls(vec![MockToolCall {
+                call_id: "approval-backpressure-complete".to_string(),
+                name: "attempt_completion".to_string(),
+                arguments: serde_json::json!({
+                    "result": "APPROVAL_BACKPRESSURE_COMPLETION"
+                }),
+            }]),
+        ])
+    }
+
+    #[must_use]
+    pub fn long_completion_navigation_scenario() -> Self {
+        let mut transcript = String::new();
+        for i in 1..=20 {
+            transcript.push_str(&format!("completion navigation transcript {i:02}\n\n"));
+        }
+        transcript.push_str("TRANSCRIPT_NAV_OLDER\n\n");
+        for i in 21..=24 {
+            transcript.push_str(&format!("completion navigation transcript {i:02}\n\n"));
+        }
+        transcript.push_str("TRANSCRIPT_NAV_RECENT\n");
+
+        let mut completion = String::from("COMPLETION_NAV_TOP\n");
+        for i in 1..=28 {
+            completion.push_str(&format!("completion navigation result {i:02}\n"));
+        }
+        completion.push_str("COMPLETION_NAV_BOTTOM");
+
+        Self::new_with_repeat(vec![
+            MockResponse::Text(transcript),
+            MockResponse::ToolCalls(vec![MockToolCall {
+                call_id: "long-completion-navigation".to_string(),
+                name: "attempt_completion".to_string(),
+                arguments: serde_json::json!({ "result": completion }),
+            }]),
         ])
     }
 

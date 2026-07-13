@@ -19,8 +19,8 @@ SNED_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-history-navigation tui-slash-commands tui-auto-scroll tui-model-switch tui-busy-exit help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
-TOTAL_TESTS=15
+ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-auto-scroll tui-model-switch tui-busy-exit help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
+TOTAL_TESTS=17
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -58,6 +58,8 @@ tui-startup-exit      Start ratatui in a pty, render banner, send /exit
 tui-user-echo         Type a prompt, verify ❯ prefix appears in transcript
 tui-turn-indicators   Type a prompt, verify ♦ and ─ turn markers appear
 tui-approval-scroll   Scroll away, then verify approval prompt stays visible
+tui-approval-under-backpressure Flood output, block input, then approve after render
+tui-long-completion-navigation Scroll completion and transcript at both boundaries
 tui-history-navigation Type prompts, press Up arrow, verify previous prompt appears
 tui-slash-commands    Type /help, verify help text renders in output
 tui-auto-scroll       Type multiple prompts, verify output scrolls to show latest
@@ -108,6 +110,8 @@ test_description() {
         tui-user-echo) echo "Type a prompt, verify ❯ prefix appears in transcript" ;;
         tui-turn-indicators) echo "Type a prompt, verify ✦ and ─ turn markers appear" ;;
         tui-approval-scroll) echo "Scroll away, then verify approval prompt stays visible" ;;
+        tui-approval-under-backpressure) echo "Flood output, block input, then approve after render" ;;
+        tui-long-completion-navigation) echo "Scroll completion and transcript at both boundaries" ;;
         tui-history-navigation) echo "Type prompts, press Up arrow, verify previous prompt appears in input" ;;
         tui-slash-commands) echo "Type /help, verify help text renders in output" ;;
         tui-auto-scroll) echo "Type multiple prompts, verify output scrolls to show latest" ;;
@@ -129,6 +133,8 @@ test_source() {
         tui-user-echo) echo "src/cli/tui/app.rs push_user_message / src/cli/interactive.rs Enter handler" ;;
         tui-turn-indicators) echo "src/core/agent_loop.rs assistant turn indicator / src/cli/tui/app.rs push_turn_separator" ;;
         tui-approval-scroll) echo "src/cli/interactive.rs drain_output approval scroll path / src/core/approval.rs begin_approval_prompt" ;;
+        tui-approval-under-backpressure) echo "src/cli/output.rs priority delivery / src/cli/interactive.rs approval input routing" ;;
+        tui-long-completion-navigation) echo "src/cli/tui/app.rs completion scroll boundaries / src/cli/interactive.rs navigation routing" ;;
         tui-history-navigation) echo "src/cli/interactive.rs handle_key_event Up/Down arrow history / src/cli/tui/history.rs FileHistory" ;;
         tui-slash-commands) echo "src/cli/interactive.rs handle_cli_only_command / src/cli/slash_commands.rs format_help_text" ;;
         tui-auto-scroll) echo "src/cli/tui/app.rs scroll_mode / src/cli/interactive.rs drain_output auto-scroll" ;;
@@ -599,6 +605,421 @@ try:
         print(f"TUI_TEST_FAIL sned exited with {exit_code}")
     else:
         print("TUI_TEST_PASS approval prompt stayed visible after scrolling")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
+test_tui_approval_under_backpressure() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import tempfile
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-approval-backpressure.")
+command_marker = "/tmp/sned-approval-backpressure-smoke"
+blocked_probe = "BLOCKED_PROBE_555"
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+    "SNED_MOCK_APPROVAL_BACKPRESSURE": "1",
+    "SNED_OUTPUT_CHANNEL_CAPACITY": "1",
+})
+
+cmd = [
+    os.path.join(repo, "scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+sent_prompt = False
+sent_blocked_input = False
+sent_approve = False
+sent_exit = False
+prompt_visible = False
+overflow_visible = False
+reasoning_tail_visible = False
+completion_visible = False
+blocked_input_rendered = False
+blocked_input_sent_at = None
+approve_offset = None
+exit_code = None
+timed_out = False
+deadline = time.time() + 24
+
+ansi_re = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+def clean_output(data: bytes) -> str:
+    return ansi_re.sub("", data.decode("utf-8", "replace")).replace("\r", "\n")
+
+def visible_tail(text: str, rows: int = 24) -> str:
+    lines = [line for line in text.split("\n") if line.strip()]
+    return "\n".join(lines[-rows:])
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.05)
+        if fd in readable:
+            try:
+                data = os.read(fd, 8192)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+
+        if buf:
+            clean = clean_output(buf)
+            tail = visible_tail(clean)
+            if "type a prompt" in clean and not sent_prompt:
+                os.write(fd, b"trigger approval under backpressure\r")
+                sent_prompt = True
+            if re.search(r"output overflow \(([1-9][0-9]*) dro", clean):
+                overflow_visible = True
+            if "APPROVAL_BACKPRESSURE_REASONING_TAIL" in clean:
+                reasoning_tail_visible = True
+            if "Execute this tool?" in tail and not sent_blocked_input:
+                prompt_visible = True
+                os.write(fd, blocked_probe.encode())
+                sent_blocked_input = True
+                blocked_input_sent_at = time.time()
+            if (
+                sent_blocked_input
+                and not sent_approve
+                and time.time() - blocked_input_sent_at >= 0.25
+            ):
+                approve_offset = len(buf)
+                os.write(fd, b"y\r")
+                sent_approve = True
+            if "APPROVAL_BACKPRESSURE_COMPLETION" in tail:
+                completion_visible = True
+                if not sent_exit:
+                    os.write(fd, b"/exit\r")
+                    sent_exit = True
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        timed_out = True
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None and timed_out:
+        stop_deadline = time.time() + 1
+        while time.time() < stop_deadline and exit_code is None:
+            try:
+                ended, status = os.waitpid(pid, os.WNOHANG)
+                if ended:
+                    exit_code = os.waitstatus_to_exitcode(status)
+                    break
+            except ChildProcessError:
+                exit_code = 0
+                break
+            time.sleep(0.05)
+        if exit_code is None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                exit_code = -signal.SIGKILL
+            except (ChildProcessError, ProcessLookupError):
+                exit_code = 0
+    elif exit_code is None:
+        exit_deadline = time.time() + 1
+        while time.time() < exit_deadline and exit_code is None:
+            try:
+                ended, status = os.waitpid(pid, os.WNOHANG)
+                if ended:
+                    exit_code = os.waitstatus_to_exitcode(status)
+                    break
+            except ChildProcessError:
+                exit_code = 0
+                break
+            time.sleep(0.05)
+        if exit_code is None:
+            timed_out = True
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    text = buf.decode("utf-8", "replace")
+    if approve_offset is not None:
+        blocked_input_rendered = blocked_probe in clean_output(buf[approve_offset:])
+    if verbose:
+        print(text)
+
+    if not sent_prompt:
+        print("TUI_TEST_FAIL initial user prompt was not sent")
+    elif not overflow_visible:
+        print("TUI_TEST_FAIL bounded output channel did not report dropped output")
+    elif not reasoning_tail_visible:
+        print("TUI_TEST_FAIL priority reasoning tail was lost under backpressure")
+    elif not prompt_visible:
+        print("TUI_TEST_FAIL approval overlay was not visible before input")
+    elif not sent_blocked_input:
+        print("TUI_TEST_FAIL blocked-input probe was not sent")
+    elif blocked_input_rendered:
+        print("TUI_TEST_FAIL ordinary typing mutated the input during approval")
+    elif not sent_approve:
+        print("TUI_TEST_FAIL approval shortcut was not sent after rendering")
+    elif not os.path.exists(command_marker):
+        print("TUI_TEST_FAIL approved command did not execute")
+    elif not completion_visible:
+        print("TUI_TEST_FAIL completion was not visible after approval")
+    elif not sent_exit:
+        print("TUI_TEST_FAIL /exit was not sent after completion")
+    elif timed_out:
+        print("TUI_TEST_FAIL sned did not exit before timeout")
+    elif exit_code != 0:
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS approval remained actionable under output backpressure")
+finally:
+    try:
+        os.unlink(command_marker)
+    except FileNotFoundError:
+        pass
+    shutil.rmtree(tmp, ignore_errors=True)
+PY
+}
+
+test_tui_long_completion_navigation() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "TUI_TEST_FAIL python3 is required for pty smoke test"
+        return 0
+    fi
+
+    SNED_BIN="$SNED_BIN" REPO_ROOT="$REPO_ROOT" VERBOSE="$VERBOSE" python3 - <<'PY'
+import fcntl
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import struct
+import tempfile
+import termios
+import time
+
+repo = os.environ["REPO_ROOT"]
+sned_bin = os.environ["SNED_BIN"]
+verbose = os.environ.get("VERBOSE") == "1"
+tmp = tempfile.mkdtemp(prefix="sned-long-completion.")
+env = os.environ.copy()
+env.update({
+    "SNED_NO_ALTERNATE_SCREEN": "1",
+    "SNED_DIR": tmp,
+    "SNED_DATA_DIR": os.path.join(tmp, "data"),
+    "SNED_MOCK_LONG_COMPLETION": "1",
+})
+
+cmd = [
+    os.path.join(repo, "scripts", "sned-pty-helper"),
+    "24",
+    "80",
+    sned_bin,
+    "--provider",
+    "mock",
+]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    os.execvpe(cmd[0], cmd, env)
+
+buf = b""
+sent_prompt = False
+sent_scroll_up = False
+scroll_up_offset = None
+top_boundary_fell_through = False
+scroll_down_count = 0
+next_scroll_down_at = None
+completion_bottom_visible = False
+sent_bottom_scroll = False
+boundary_offset = None
+boundary_fell_through = False
+completion_stayed_visible = False
+sent_exit = False
+exit_code = None
+timed_out = False
+deadline = time.time() + 24
+scroll_up = b"\x1b[5~"
+scroll_down = b"\x1b[6~"
+
+ansi_re = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+def clean_output(data: bytes) -> str:
+    return ansi_re.sub("", data.decode("utf-8", "replace")).replace("\r", "\n")
+
+def visible_tail(text: str, rows: int = 24) -> str:
+    lines = [line for line in text.split("\n") if line.strip()]
+    return "\n".join(lines[-rows:])
+
+try:
+    while time.time() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.05)
+        if fd in readable:
+            try:
+                data = os.read(fd, 8192)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            if b"\x1b[6n" in data:
+                os.write(fd, b"\x1b[1;1R")
+
+        if buf:
+            clean = clean_output(buf)
+            tail = visible_tail(clean)
+            if "type a prompt" in clean and not sent_prompt:
+                os.write(fd, b"trigger long completion navigation\r")
+                sent_prompt = True
+            if (
+                "COMPLETION_NAV_TOP" in tail
+                and "COMPLETION_NAV_BOTTOM" not in tail
+                and not sent_scroll_up
+            ):
+                scroll_up_offset = len(buf)
+                time.sleep(0.2)
+                os.write(fd, scroll_up * 3 + b"\r")
+                time.sleep(0.1)
+                os.kill(pid, signal.SIGWINCH)
+                sent_scroll_up = True
+            if sent_scroll_up and not top_boundary_fell_through:
+                phase = clean_output(buf[scroll_up_offset:])
+                if "TRANSCRIPT_NAV_OLDER" in phase:
+                    top_boundary_fell_through = True
+                    next_scroll_down_at = time.time()
+            if (
+                top_boundary_fell_through
+                and not completion_bottom_visible
+                and scroll_down_count < 8
+                and time.time() >= next_scroll_down_at
+            ):
+                os.write(fd, scroll_down + b"\r")
+                scroll_down_count += 1
+                next_scroll_down_at = time.time() + 0.15
+            if top_boundary_fell_through and "COMPLETION_NAV_BOTTOM" in tail:
+                completion_bottom_visible = True
+                if not sent_bottom_scroll:
+                    boundary_offset = len(buf)
+                    os.write(fd, scroll_down * 3 + b"\r")
+                    time.sleep(0.1)
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 81, 0, 0))
+                    sent_bottom_scroll = True
+            if sent_bottom_scroll:
+                boundary_phase = clean_output(buf[boundary_offset:])
+                if "TRANSCRIPT_NAV_RECENT" in boundary_phase:
+                    boundary_fell_through = True
+                if "COMPLETION_NAV_BOTTOM" in boundary_phase:
+                    completion_stayed_visible = True
+                if boundary_fell_through and completion_stayed_visible and not sent_exit:
+                    time.sleep(0.2)
+                    os.write(fd, b"/exit\r")
+                    sent_exit = True
+
+        ended, status = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            exit_code = os.waitstatus_to_exitcode(status)
+            break
+    else:
+        timed_out = True
+        os.kill(pid, signal.SIGTERM)
+
+    if exit_code is None and timed_out:
+        stop_deadline = time.time() + 1
+        while time.time() < stop_deadline and exit_code is None:
+            try:
+                ended, status = os.waitpid(pid, os.WNOHANG)
+                if ended:
+                    exit_code = os.waitstatus_to_exitcode(status)
+                    break
+            except ChildProcessError:
+                exit_code = 0
+                break
+            time.sleep(0.05)
+        if exit_code is None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                exit_code = -signal.SIGKILL
+            except (ChildProcessError, ProcessLookupError):
+                exit_code = 0
+    elif exit_code is None:
+        exit_deadline = time.time() + 1
+        while time.time() < exit_deadline and exit_code is None:
+            try:
+                ended, status = os.waitpid(pid, os.WNOHANG)
+                if ended:
+                    exit_code = os.waitstatus_to_exitcode(status)
+                    break
+            except ChildProcessError:
+                exit_code = 0
+                break
+            time.sleep(0.05)
+        if exit_code is None:
+            timed_out = True
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    text = buf.decode("utf-8", "replace")
+    clean = clean_output(buf)
+    if verbose:
+        print(text)
+
+    if not sent_prompt:
+        print("TUI_TEST_FAIL initial user prompt was not sent")
+    elif not sent_scroll_up:
+        print("TUI_TEST_FAIL long completion did not open at its top")
+    elif not top_boundary_fell_through:
+        print("TUI_TEST_FAIL upward navigation at completion top did not scroll transcript")
+    elif not completion_bottom_visible:
+        print("TUI_TEST_FAIL downward navigation did not reach completion bottom")
+    elif not sent_bottom_scroll:
+        print("TUI_TEST_FAIL downward navigation was not sent at completion bottom")
+    elif not boundary_fell_through:
+        print("TUI_TEST_FAIL downward navigation at completion bottom did not scroll transcript")
+    elif not completion_stayed_visible:
+        print("TUI_TEST_FAIL completion disappeared after transcript fallthrough")
+    elif re.search(r"✓\s+COMPLETION_NAV_TOP", clean):
+        print("TUI_TEST_FAIL completion also rendered as a generic tool result")
+    elif not sent_exit:
+        print("TUI_TEST_FAIL /exit was not sent after navigation")
+    elif timed_out:
+        print("TUI_TEST_FAIL sned did not exit before timeout")
+    elif exit_code != 0:
+        print(f"TUI_TEST_FAIL sned exited with {exit_code}")
+    else:
+        print("TUI_TEST_PASS long completion and transcript navigation shared boundaries")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 PY
@@ -1445,6 +1866,8 @@ run_one() {
         tui-user-echo) result="$(test_tui_user_echo 2>&1)" ;;
         tui-turn-indicators) result="$(test_tui_turn_indicators 2>&1)" ;;
         tui-approval-scroll) result="$(test_tui_approval_scroll 2>&1)" ;;
+        tui-approval-under-backpressure) result="$(test_tui_approval_under_backpressure 2>&1)" ;;
+        tui-long-completion-navigation) result="$(test_tui_long_completion_navigation 2>&1)" ;;
         tui-history-navigation) result="$(test_tui_history_navigation 2>&1)" ;;
         tui-slash-commands) result="$(test_tui_slash_commands 2>&1)" ;;
         tui-auto-scroll) result="$(test_tui_auto_scroll 2>&1)" ;;

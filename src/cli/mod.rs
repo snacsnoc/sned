@@ -1065,7 +1065,15 @@ pub(crate) fn create_provider(
             ))
         }
         "mock" => {
-            if std::env::var_os("SNED_MOCK_APPROVAL_SCROLL").is_some() {
+            if std::env::var_os("SNED_MOCK_APPROVAL_BACKPRESSURE").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::approval_under_backpressure_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_LONG_COMPLETION").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::long_completion_navigation_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_APPROVAL_SCROLL").is_some() {
                 Arc::new(crate::providers::Providers::Mock(
                     crate::providers::mock::MockProvider::approval_scroll_scenario(),
                 ))

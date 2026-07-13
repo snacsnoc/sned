@@ -1567,7 +1567,7 @@ impl App {
     }
 
     pub fn clamp_to_content(&mut self) {
-        let total_rows = self.total_visual_rows(self.last_wrap_width());
+        let total_rows = self.output_visual_rows(self.last_wrap_width());
         let max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height);
 
         match self.scroll_mode {
@@ -1586,7 +1586,7 @@ impl App {
 
     pub fn scroll_lines(&mut self, delta: isize) {
         self.needs_redraw = true;
-        let total_rows = self.total_visual_rows(self.last_wrap_width());
+        let total_rows = self.output_visual_rows(self.last_wrap_width());
         if !self.enter_manual_mode(total_rows) {
             return;
         }
@@ -1957,6 +1957,13 @@ impl App {
             self.rebuild_visual_row_cache(wrap_width);
         }
         self.cached_visual_rows
+    }
+
+    fn output_visual_rows(&mut self, wrap_width: usize) -> usize {
+        let total_rows = self.total_visual_rows(wrap_width);
+        total_rows
+            .saturating_sub(self.cached_completion_rows)
+            .saturating_sub(self.cached_error_rows)
     }
 
     /// Render the application state to the frame.
@@ -2866,6 +2873,24 @@ mod tests {
 
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
         assert_eq!(app.scroll_offset, total_rows - 21);
+    }
+
+    #[test]
+    fn test_transcript_scroll_excludes_completion_rows() {
+        let mut app = App::new();
+        app.set_content_height(5);
+        app.set_content_width(80);
+        for index in 0..12 {
+            app.push_plain(format!("transcript row {index}"));
+            app.push_completion_line(format!("completion row {index}").into());
+        }
+        let output_rows = app.output_visual_rows(app.last_wrap_width());
+        let output_max_offset = output_rows.saturating_sub(app.last_content_height);
+
+        app.scroll_lines(-1);
+
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, output_max_offset.saturating_sub(1));
     }
 
     #[test]
