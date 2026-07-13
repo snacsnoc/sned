@@ -94,6 +94,12 @@ struct ToolExecutionOutput {
     is_error: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileActionPath {
+    normalized: String,
+    display: String,
+}
+
 impl ToolExecutionOutput {
     fn success(text: String) -> Self {
         Self {
@@ -2616,7 +2622,7 @@ impl AgentLoop {
                 String,
                 Option<ToolExecutionOutput>,
                 Option<futures::future::BoxFuture<'static, ToolExecutionOutput>>,
-                Vec<String>,
+                Vec<FileActionPath>,
             );
             let mut tool_tasks: Vec<ToolTask> = Vec::with_capacity(prepared_tool_calls.len());
 
@@ -2894,7 +2900,11 @@ impl AgentLoop {
                                 let task_storage = self.deps.task_storage.clone().map(Arc::new);
                                 let edit_file_paths =
                                     if tool_name == "edit_file" || tool_name == "write_to_file" {
-                                        Self::extract_file_action_path(&tool_name, &tool_params)
+                                        Self::extract_file_action_path(
+                                            &tool_name,
+                                            &tool_params,
+                                            &tool_context.workspace_root,
+                                        )
                                     } else {
                                         vec![]
                                     };
@@ -2992,7 +3002,10 @@ impl AgentLoop {
                     && let Some(future) = task.take()
                 {
                     let paths: std::collections::HashSet<String> =
-                        edit_file_paths.iter().cloned().collect();
+                        edit_file_paths
+                            .iter()
+                            .map(|path| path.normalized.clone())
+                            .collect();
                     let mut found_group = None;
                     for (idx, (group_paths, _)) in edit_groups.iter().enumerate() {
                         if paths.iter().any(|p| group_paths.contains(p)) {
@@ -3107,7 +3120,7 @@ impl AgentLoop {
                             extract_edit_stats_detailed(&result_output.text);
                         for path in &edit_file_path {
                             if added > 0 || removed > 0 {
-                                edit_files.push((path.clone(), added, removed));
+                                edit_files.push((path.display.clone(), added, removed));
                             }
                         }
                         let status = if is_error { "✗" } else { "✓" };
@@ -3781,30 +3794,70 @@ impl AgentLoop {
         ))
     }
 
-    /// Extract all file paths from file-modifying tool params for per-file grouping.
-    /// Supports edit_file (files array) and write_to_file (single path).
-    /// Returns empty vec if params don't contain valid paths.
-    fn extract_file_action_path(tool_name: &str, params: &serde_json::Value) -> Vec<String> {
-        match tool_name {
-            "edit_file" => params
-                .get("files")
-                .and_then(|f| f.as_array())
-                .map(|files| {
-                    files
-                        .iter()
-                        .filter_map(|file| file.get("path"))
-                        .filter_map(|p| p.as_str())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
+    fn extract_file_action_path(
+        tool_name: &str,
+        params: &serde_json::Value,
+        workspace_root: &std::path::Path,
+    ) -> Vec<FileActionPath> {
+        let requested_paths = match tool_name {
+            "edit_file" => {
+                let Some(files) = params.get("files").and_then(|files| files.as_array()) else {
+                    return vec![];
+                };
+                let fallback = params.get("path").and_then(|path| path.as_str());
+                let use_fallback = fallback.is_some()
+                    && !files.is_empty()
+                    && files.iter().all(|file| {
+                        file.get("path").is_none() && file.get("edits").is_some()
+                    });
+
+                files
+                    .iter()
+                    .filter_map(|file| {
+                        if use_fallback {
+                            return fallback.map(String::from);
+                        }
+                        match file.get("path") {
+                            Some(path) => path.as_str().map(String::from),
+                            None => file
+                                .get("edits")
+                                .and_then(|edits| edits.as_array())
+                                .and_then(|edits| edits.first())
+                                .and_then(|edit| edit.get("path"))
+                                .and_then(|path| path.as_str())
+                                .map(String::from),
+                        }
+                    })
+                    .collect()
+            }
             "write_to_file" => params
                 .get("path")
-                .and_then(|p| p.as_str())
-                .map(|s| vec![String::from(s)])
+                .and_then(|path| path.as_str())
+                .map(|path| vec![String::from(path)])
                 .unwrap_or_default(),
-            _ => vec![],
-        }
+            _ => return vec![],
+        };
+
+        let mut seen = std::collections::HashSet::with_capacity(requested_paths.len());
+        requested_paths
+            .into_iter()
+            .filter_map(|display| {
+                let normalized = crate::core::tools::resolve_sanitized_path(
+                    workspace_root,
+                    &display,
+                )
+                .ok()?
+                .to_string_lossy()
+                .into_owned();
+                if !seen.insert(normalized.clone()) {
+                    return None;
+                }
+                Some(FileActionPath {
+                    normalized,
+                    display,
+                })
+            })
+            .collect()
     }
 
     /// Static version of execute_tool_with_hooks for parallel execution.
@@ -6701,23 +6754,75 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_path_edit_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.rs"), "").unwrap();
+        std::fs::write(workspace.path().join("b.rs"), "").unwrap();
         let params = serde_json::json!({"files": [{"path": "a.rs"}, {"path": "b.rs"}]});
-        let paths = AgentLoop::extract_file_action_path("edit_file", &params);
-        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        let paths = AgentLoop::extract_file_action_path("edit_file", &params, workspace.path());
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].display, "a.rs");
+        assert_eq!(paths[1].display, "b.rs");
+        assert_eq!(
+            paths[0].normalized,
+            std::fs::canonicalize(workspace.path().join("a.rs"))
+                .unwrap()
+                .to_string_lossy()
+        );
     }
 
     #[test]
     fn test_extract_file_action_path_write_to_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "fn main() {}\n").unwrap();
         let params = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"});
-        let paths = AgentLoop::extract_file_action_path("write_to_file", &params);
-        assert_eq!(paths, vec!["src/main.rs".to_string()]);
+        let paths =
+            AgentLoop::extract_file_action_path("write_to_file", &params, workspace.path());
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].display, "src/main.rs");
+        assert_eq!(
+            paths[0].normalized,
+            std::fs::canonicalize(path).unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn test_extract_file_action_path_applies_fallback_and_deduplicates() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let edit_params = serde_json::json!({
+            "path": "src/./main.rs",
+            "files": [
+                {"edits": [{"anchor": "One§a"}]},
+                {"edits": [{"anchor": "Two§b"}]}
+            ]
+        });
+        let write_params = serde_json::json!({
+            "path": path,
+            "content": "fn main() {}\n"
+        });
+
+        let edit_paths =
+            AgentLoop::extract_file_action_path("edit_file", &edit_params, workspace.path());
+        let write_paths =
+            AgentLoop::extract_file_action_path("write_to_file", &write_params, workspace.path());
+
+        assert_eq!(edit_paths.len(), 1);
+        assert_eq!(edit_paths[0].display, "src/./main.rs");
+        assert_eq!(edit_paths[0].normalized, write_paths[0].normalized);
     }
 
     #[test]
     fn test_extract_file_action_path_unknown_tool() {
+        let workspace = tempfile::tempdir().unwrap();
         let params = serde_json::json!({"path": "foo.rs"});
-        let paths = AgentLoop::extract_file_action_path("read_file", &params);
-        assert_eq!(paths, Vec::<String>::new());
+        let paths = AgentLoop::extract_file_action_path("read_file", &params, workspace.path());
+        assert!(paths.is_empty());
     }
 
     #[test]
