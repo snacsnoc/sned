@@ -564,17 +564,14 @@ impl EditFileHandler {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        // Group edits by resolved absolute path
-        let file_edits: Result<Vec<(String, Vec<Edit>)>, ToolError> = parsed
-            .into_iter()
-            .map(|(path, edits)| {
-                let abs_path = self.resolve_path(workspace_root, &path)?;
-                Ok((abs_path, edits))
-            })
+        let resolved_paths: Result<HashMap<String, String>, ToolError> = parsed
+            .iter()
+            .map(|(path, _)| Ok((path.clone(), self.resolve_path(workspace_root, path)?)))
             .collect();
-        let file_edits = file_edits?;
+        let resolved_paths = resolved_paths?;
 
-        let batches = processor.group_edits_by_path(&file_edits, &|path| Some(path.to_string()));
+        let batches =
+            processor.group_edits_by_path(&parsed, &|path| resolved_paths.get(path).cloned());
         let unique_file_count = batches.len();
 
         let mut all_results: Vec<String> = Vec::new();
@@ -3425,6 +3422,10 @@ edition = "2021"
             err_msg.contains("must re-read"),
             "Error should mention re-read required, got: {}",
             err_msg
+        );
+        assert!(
+            err_msg.contains("must re-read test.txt before"),
+            "Error should use the requested workspace-relative path, got: {err_msg}"
         );
     }
 
