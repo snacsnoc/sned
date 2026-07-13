@@ -233,6 +233,7 @@ impl BatchProcessor {
             };
         };
 
+        let resolved_count = applied_edits.len();
         batch.final_lines = final_lines.clone();
         batch.final_content = final_lines.join("\n");
         batch.applied_edits = applied_edits;
@@ -244,7 +245,7 @@ impl BatchProcessor {
         BatchResult {
             success: true,
             final_content: Some(batch.final_content.clone()),
-            resolved_count: batch.resolved_edits.len(),
+            resolved_count,
             failed_count: batch.failed_edits.len(),
             overlap: false,
             lines_added: added_count as u32,
@@ -392,17 +393,28 @@ impl BatchProcessor {
             );
         }
 
-        let line_changes = format!(" (+{total_added}, -{total_removed} lines)");
-        let summary = format!(
-            "Applied {} edit(s) successfully{}. NOTE the UPDATED anchors below.{}",
-            prepared.resolved_edits.len(),
-            line_changes,
-            if prepared.failed_edits.is_empty() {
-                String::new()
-            } else {
-                format!(" {} edit(s) failed.", prepared.failed_edits.len())
-            }
-        );
+        let unchanged_count = prepared
+            .resolved_edits
+            .len()
+            .saturating_sub(prepared.applied_edits.len());
+        let unchanged_note = if unchanged_count == 0 {
+            String::new()
+        } else {
+            format!(" {unchanged_count} edit(s) already matched the file.")
+        };
+        let failure_note = if prepared.failed_edits.is_empty() {
+            String::new()
+        } else {
+            format!(" {} edit(s) failed.", prepared.failed_edits.len())
+        };
+        let summary = if prepared.applied_edits.is_empty() {
+            format!("No changes applied.{unchanged_note}{failure_note}")
+        } else {
+            format!(
+                "Applied {} edit(s) successfully (+{total_added}, -{total_removed} lines). NOTE the UPDATED anchors below.{unchanged_note}{failure_note}",
+                prepared.applied_edits.len()
+            )
+        };
 
         // Add diagnostics feedback
         if let Some(diag) = diagnostics {

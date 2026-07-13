@@ -576,6 +576,7 @@ impl EditFileHandler {
 
         let mut all_results: Vec<String> = Vec::new();
         let mut total_applied = 0usize;
+        let mut total_unchanged = 0usize;
         let mut total_failed = 0usize;
         let mut total_overlap = 0usize;
         let mut total_edits = 0usize;
@@ -905,6 +906,10 @@ impl EditFileHandler {
 
             if result.success {
                 total_applied += result.resolved_count;
+                total_unchanged += prepared
+                    .resolved_edits
+                    .len()
+                    .saturating_sub(result.resolved_count);
             }
             total_failed += result.failed_count;
             if result.overlap {
@@ -925,7 +930,7 @@ impl EditFileHandler {
                 entry.lines_removed = entry.lines_removed.saturating_add(result.lines_removed);
             }
 
-            if result.success {
+            if result.success && result.resolved_count > 0 {
                 // Track for post-diagnostics if there were pre-errors
                 if any_pre_errors {
                     successfully_edited_files
@@ -1324,22 +1329,18 @@ impl EditFileHandler {
         // edit_file emits diagnostics via output_writer but does not mutate the counter
         // to avoid double-counting when a single edit_file call has multiple file failures.
 
-        let summary = if total_overlap > 0 {
-            format!(
-                "Edited {} file(s): {} edit(s) applied, {} edit(s) failed, {} edit(s) overlapped.",
-                unique_file_count,
-                total_applied,
-                total_failed,
-                total_overlap
-            )
-        } else {
-            format!(
-                "Edited {} file(s): {} edit(s) applied, {} edit(s) failed.",
-                unique_file_count,
-                total_applied,
-                total_failed
-            )
-        };
+        let mut summary_counts = vec![format!("{total_applied} edit(s) applied")];
+        if total_unchanged > 0 {
+            summary_counts.push(format!("{total_unchanged} edit(s) unchanged"));
+        }
+        summary_counts.push(format!("{total_failed} edit(s) failed"));
+        if total_overlap > 0 {
+            summary_counts.push(format!("{total_overlap} edit(s) overlapped"));
+        }
+        let summary = format!(
+            "Edited {unique_file_count} file(s): {}.",
+            summary_counts.join(", ")
+        );
 
         Ok(format!(
             "{}\n\n{}",
@@ -3426,6 +3427,74 @@ edition = "2021"
         assert!(
             err_msg.contains("must re-read test.txt before"),
             "Error should use the requested workspace-relative path, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_noop_does_not_require_reread() {
+        use tempfile::tempdir;
+
+        let _guard = TEST_MUTEX.lock().await;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let raw_content = "line 1\nline 2\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+
+        let prep_anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(str::to_string).collect();
+        let anchors =
+            prep_anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("noop-task"));
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "noop-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let anchor = format!("{}§line 1", anchors[0]);
+        let noop_params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "line 1"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, noop_params)
+            .await
+            .expect("no-op edit should be accepted");
+        let output = result.as_str().unwrap();
+        assert!(output.contains("0 edit(s) applied"), "got: {output}");
+        assert!(output.contains("1 edit(s) unchanged"), "got: {output}");
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), raw_content);
+        assert!(state.lock().await.must_reread_before_edit.is_empty());
+
+        let real_params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": format!("{}§line 1", anchors[0]),
+                    "edit_type": "replace",
+                    "text": "changed line 1"
+                }]
+            }]
+        });
+        let real_result = ToolHandler::execute(&handler, &ctx, real_params).await;
+        assert!(
+            real_result.is_ok(),
+            "a no-op must not stale otherwise reusable anchors: {real_result:?}"
         );
     }
 

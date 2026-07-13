@@ -889,13 +889,30 @@ impl EditExecutor {
         lines: &[String],
         resolved_edits: &[ResolvedEdit],
     ) -> Option<(Vec<String>, usize, usize, Vec<AppliedEdit>)> {
-        // Detect overlapping edit ranges before applying
-        // For replace: range is [line_idx, end_idx]
-        // For insert: range is [line_idx, line_idx]
-        for i in 0..resolved_edits.len() {
-            for j in (i + 1)..resolved_edits.len() {
-                let a = &resolved_edits[i];
-                let b = &resolved_edits[j];
+        let effective_edits: Vec<&ResolvedEdit> = resolved_edits
+            .iter()
+            .filter(|resolved| {
+                let clean_text = strip_hashes(&resolved.edit.text);
+                let replacement_lines = if clean_text.is_empty() {
+                    Vec::new()
+                } else {
+                    split_content_lines(&clean_text)
+                };
+
+                if resolved.edit.edit_type == "insert_after"
+                    || resolved.edit.edit_type == "insert_before"
+                {
+                    !replacement_lines.is_empty()
+                } else {
+                    lines[resolved.line_idx..=resolved.end_idx] != replacement_lines
+                }
+            })
+            .collect();
+
+        for i in 0..effective_edits.len() {
+            for j in (i + 1)..effective_edits.len() {
+                let a = effective_edits[i];
+                let b = effective_edits[j];
 
                 let a_start = a.line_idx;
                 let a_end =
@@ -929,7 +946,7 @@ impl EditExecutor {
             }
         }
 
-        let mut sorted_edits: Vec<&ResolvedEdit> = resolved_edits.iter().collect();
+        let mut sorted_edits = effective_edits;
         sorted_edits.sort_by_key(|b| std::cmp::Reverse(b.line_idx));
 
         let mut new_lines: Vec<String> = lines.to_vec();
