@@ -501,6 +501,23 @@ impl EditFileHandler {
             },
         )
     }
+
+    fn file_lock_error(
+        display_path: &str,
+        absolute_path: &str,
+        error: &std::fs::TryLockError,
+    ) -> ToolError {
+        ToolError::ExecutionFailedWithMetadata(
+            format!(
+                "Could not acquire an exclusive lock for file {display_path}: {error}. Aborting write to prevent data loss. Re-read the file and retry."
+            ),
+            ToolFailureMetadata {
+                class: ToolFailureClass::AnchorInvalid,
+                affected_paths: vec![absolute_path.to_string()],
+                required_next_step: Some(ToolRequiredNextStep::ReadFile),
+            },
+        )
+    }
 }
 
 impl EditFileHandler {
@@ -1022,144 +1039,93 @@ impl EditFileHandler {
                     }
                 };
 
-                let lock_result = std_file.try_lock();
-
-                if lock_result.is_err() {
-                    tracing::debug!(
-                        "File {} locked by another process, skipping exclusive lock",
-                        item.display_path
-                    );
-
-                    // Re-check mtime immediately before write to close TOCTOU window
-                    let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
-                        match tokio::fs::metadata(&item.absolute_path).await {
-                            Ok(current_metadata) => match current_metadata.modified() {
-                                Ok(current_mtime) => &current_mtime == initial_mtime,
-                                Err(_) => true,
-                            },
-                            Err(_) => true,
+                if let Err(lock_error) = std_file.try_lock() {
+                    for path in written_paths.iter().rev() {
+                        if let Some(orig) = original_contents.get(path)
+                            && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
+                        {
+                            rollback_errors.push(format!("Failed to rollback {path}: {re}"));
                         }
-                    } else {
-                        true
-                    };
-
-                    if !mtime_ok {
-                        Self::mark_must_reread(state, &item.absolute_path);
-                        return Err(Self::external_modification_error(
-                            &item.display_path,
-                            &item.absolute_path,
-                        ));
                     }
-
-                    state.insert_file_content(
-                        item.absolute_path.clone(),
-                        item.final_content.clone(),
-                    );
-                    state
-                        .file_context_tracker
-                        .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
-
-                    let write_result = crate::storage::disk::atomic_write_file_async(
+                    Self::mark_must_reread(state, &item.absolute_path);
+                    if !rollback_errors.is_empty() {
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "Failed to lock file {}: {}. Rollback incomplete: {}",
+                            item.display_path,
+                            lock_error,
+                            rollback_errors.join(", ")
+                        )));
+                    }
+                    return Err(Self::file_lock_error(
+                        &item.display_path,
                         &item.absolute_path,
-                        &item.final_content,
-                    )
-                    .await;
+                        &lock_error,
+                    ));
+                }
 
-                    match write_result {
-                        Ok(()) => {
-                            written_paths.push(item.absolute_path.clone());
-                        }
-                        Err(e) => {
-                            for path in written_paths.iter().rev() {
-                                if let Some(orig) = original_contents.get(path)
-                                    && let Err(re) =
-                                        crate::storage::disk::atomic_write_file(path, orig)
-                                {
-                                    rollback_errors
-                                        .push(format!("Failed to rollback {path}: {re}"));
-                                }
-                            }
-                            if rollback_errors.is_empty() {
-                                all_results.push(format!(
-                                    "Error writing file {}: {}",
-                                    item.display_path, e
-                                ));
-                            } else {
-                                all_results.push(format!(
-                                    "Error writing file {}: {}. Rollback incomplete: {}",
-                                    item.display_path,
-                                    e,
-                                    rollback_errors.join(", ")
-                                ));
-                            }
-                        }
+                // Re-check mtime immediately before write to close TOCTOU window
+                let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
+                    match tokio::fs::metadata(&item.absolute_path).await {
+                        Ok(current_metadata) => match current_metadata.modified() {
+                            Ok(current_mtime) => &current_mtime == initial_mtime,
+                            Err(_) => true,
+                        },
+                        Err(_) => true,
                     }
                 } else {
-                    // Re-check mtime immediately before write to close TOCTOU window
-                    let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
-                        match tokio::fs::metadata(&item.absolute_path).await {
-                            Ok(current_metadata) => match current_metadata.modified() {
-                                Ok(current_mtime) => &current_mtime == initial_mtime,
-                                Err(_) => true,
-                            },
-                            Err(_) => true,
-                        }
-                    } else {
-                        true
-                    };
+                    true
+                };
 
-                    if !mtime_ok {
-                        let _ = std_file.unlock();
-                        Self::mark_must_reread(state, &item.absolute_path);
-                        return Err(Self::external_modification_error(
-                            &item.display_path,
-                            &item.absolute_path,
-                        ));
-                    }
-
-                    state.insert_file_content(
-                        item.absolute_path.clone(),
-                        item.final_content.clone(),
-                    );
-                    state
-                        .file_context_tracker
-                        .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
-
-                    let write_result = crate::storage::disk::atomic_write_file_async(
-                        &item.absolute_path,
-                        &item.final_content,
-                    )
-                    .await;
-
+                if !mtime_ok {
                     let _ = std_file.unlock();
+                    Self::mark_must_reread(state, &item.absolute_path);
+                    return Err(Self::external_modification_error(
+                        &item.display_path,
+                        &item.absolute_path,
+                    ));
+                }
 
-                    match write_result {
-                        Ok(()) => {
-                            written_paths.push(item.absolute_path.clone());
+                state.insert_file_content(
+                    item.absolute_path.clone(),
+                    item.final_content.clone(),
+                );
+                state
+                    .file_context_tracker
+                    .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
+
+                let write_result = crate::storage::disk::atomic_write_file_async(
+                    &item.absolute_path,
+                    &item.final_content,
+                )
+                .await;
+
+                let _ = std_file.unlock();
+
+                match write_result {
+                    Ok(()) => {
+                        written_paths.push(item.absolute_path.clone());
+                    }
+                    Err(e) => {
+                        for path in written_paths.iter().rev() {
+                            if let Some(orig) = original_contents.get(path)
+                                && let Err(re) =
+                                    crate::storage::disk::atomic_write_file(path, orig)
+                            {
+                                rollback_errors.push(format!("Failed to rollback {path}: {re}"));
+                            }
                         }
-                        Err(e) => {
-                            for path in written_paths.iter().rev() {
-                                if let Some(orig) = original_contents.get(path)
-                                    && let Err(re) =
-                                        crate::storage::disk::atomic_write_file(path, orig)
-                                {
-                                    rollback_errors
-                                        .push(format!("Failed to rollback {path}: {re}"));
-                                }
-                            }
-                            if rollback_errors.is_empty() {
-                                all_results.push(format!(
-                                    "Error writing file {}: {}",
-                                    item.display_path, e
-                                ));
-                            } else {
-                                all_results.push(format!(
-                                    "Error writing file {}: {}. Rollback incomplete: {}",
-                                    item.display_path,
-                                    e,
-                                    rollback_errors.join(", ")
-                                ));
-                            }
+                        if rollback_errors.is_empty() {
+                            all_results.push(format!(
+                                "Error writing file {}: {}",
+                                item.display_path, e
+                            ));
+                        } else {
+                            all_results.push(format!(
+                                "Error writing file {}: {}. Rollback incomplete: {}",
+                                item.display_path,
+                                e,
+                                rollback_errors.join(", ")
+                            ));
                         }
                     }
                 }
@@ -2911,7 +2877,70 @@ mod tests {
         }
     }
 
-    /// Test that file locking prevents TOCTOU race during external modification
+    #[tokio::test]
+    async fn test_edit_file_aborts_when_exclusive_lock_is_unavailable() {
+        let _guard = TEST_MUTEX.lock().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("test.txt");
+        let original = "Line 1\nLine 2\n";
+        std::fs::write(&file_path, original).unwrap();
+
+        let held_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        held_file.lock().unwrap();
+
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = original.lines().map(String::from).collect();
+        let anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &lines,
+            Some("lock-contention"),
+        );
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            workspace.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "lock-contention".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": format!("{}§Line 1", anchors[0]),
+                    "edit_type": "replace",
+                    "text": "Changed"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+
+        let error = result.expect_err("lock contention must abort the edit");
+        assert!(error.to_string().contains("exclusive lock"));
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), original);
+        let resolved_path = std::fs::canonicalize(&file_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&resolved_path)
+        );
+        held_file.unlock().unwrap();
+    }
+
     #[tokio::test]
     async fn test_external_modification_detected_with_lock() {
         use std::io::Write;
