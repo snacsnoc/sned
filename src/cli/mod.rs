@@ -1370,6 +1370,11 @@ async fn build_task_components(
         .and_then(|p| p.to_str().map(String::from));
 
     let skills = load_skills();
+    let enable_parallel_tool_calling = state_manager
+        .get_global_state_key::<bool>(
+            crate::storage::state_manager::GlobalStateKey::EnableParallelToolCalling,
+        )
+        .unwrap_or(false);
 
     let (agents_rules, cursor_rules_file, cursor_rules_dir, windsurf_rules) =
         if let Ok(cwd_path) = std::env::current_dir() {
@@ -1391,7 +1396,7 @@ async fn build_task_components(
         active_shell_type: shell_type,
         active_shell_is_posix: true,
         available_cores: Some(available_cores),
-        enable_parallel_tool_calling: true,
+        enable_parallel_tool_calling,
         skills,
         local_agents_rules_file_instructions: agents_rules,
         local_cursor_rules_file_instructions: cursor_rules_file,

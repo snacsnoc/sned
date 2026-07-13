@@ -1545,7 +1545,7 @@ impl AgentLoop {
                             .and_then(|n| n.to_str().map(String::from))
                     }),
                     active_shell_is_posix: true,
-                    enable_parallel_tool_calling: true,
+                    enable_parallel_tool_calling: false,
                     model_id: self.resolve_active_model_id(),
                     ..Default::default()
                 });
@@ -2636,7 +2636,7 @@ impl AgentLoop {
             checkpoint_mgr.save_checkpoint().await;
         }
 
-        // 8. Dispatch tools (parallel execution for independent tools)
+        // Provider tool-call order must remain stable even when independent work overlaps.
         let mut tool_failure_count = 0usize;
         if !prepared_tool_calls.is_empty() {
             let mut edit_files: Vec<(String, i32, i32)> = Vec::new();
@@ -2936,10 +2936,8 @@ impl AgentLoop {
                                 tracing::debug!(tool = %tool_name, "tool execution denied by approval");
                                 denied_text
                             } else {
-                                // Tool is approved - prepare for parallel execution.
-                                // When the user was prompted and approved, skip safety checks
-                                // (the user already reviewed the command). When auto-approved
-                                // without a prompt, safety checks still apply in the handler.
+                                // Prompt approval already performed the safety review that the
+                                // handler otherwise applies to an auto-approved command.
                                 let mut tool_context = (*tool_context).clone();
                                 tool_context.explicitly_approved = user_prompted;
                                 let tool_context = Arc::new(tool_context);
@@ -2994,7 +2992,7 @@ impl AgentLoop {
                                     ),
                                     edit_file_paths,
                                 ));
-                                continue; // Skip adding immediate output for parallel tools
+                                continue;
                             }
                         }
                     } else {
@@ -3017,15 +3015,25 @@ impl AgentLoop {
                     )
                 };
 
-                // For denied/restricted/unknown tools, add immediately (no parallel execution needed)
                 tool_tasks.push((tool_id, tool_name, Some(immediate_output), None, vec![]));
             }
 
-            // Execute with serialization only for same-file edit_file calls
-            let mut non_edit_executed = std::collections::HashSet::new();
+            let parallel_enabled = self
+                .deps
+                .system_prompt_context
+                .as_ref()
+                .is_some_and(|context| context.enable_parallel_tool_calling);
+            let mut result_map: std::collections::HashMap<usize, ToolExecutionOutput> =
+                std::collections::HashMap::with_capacity(tool_tasks.len());
+            if !parallel_enabled {
+                for (i, (_, _, _, task, _)) in tool_tasks.iter_mut().enumerate() {
+                    if let Some(future) = task.take() {
+                        result_map.insert(i, future.await);
+                    }
+                }
+            }
 
-            // Collect edit_file and write_to_file futures grouped by file paths (take ownership)
-            // Both tools modify files, so they need path-based serialization
+            let mut non_edit_executed = std::collections::HashSet::new();
             type EditGroup = (
                 std::collections::HashSet<String>,
                 Vec<(
@@ -3040,7 +3048,6 @@ impl AgentLoop {
                 {
                     let paths: std::collections::HashSet<String> =
                         edit_file_paths.iter().cloned().collect();
-                    // Find existing group with overlapping paths
                     let mut found_group = None;
                     for (idx, (group_paths, _)) in edit_groups.iter().enumerate() {
                         if paths.iter().any(|p| group_paths.contains(p)) {
@@ -3056,7 +3063,6 @@ impl AgentLoop {
                 }
             }
 
-            // Extract non-edit futures (exclude both edit_file and write_to_file which are grouped)
             let non_edit_futures: Vec<_> = tool_tasks
                 .iter_mut()
                 .enumerate()
@@ -3070,7 +3076,6 @@ impl AgentLoop {
                 })
                 .collect();
 
-            // Cap concurrency to prevent I/O contention when many tools run simultaneously
             let non_edit_results: Vec<_> = {
                 use futures::StreamExt;
                 futures::stream::iter(non_edit_futures)
@@ -3079,7 +3084,7 @@ impl AgentLoop {
                     .await
             };
 
-            // Execute edit_file groups in parallel, but calls within each group sequentially
+            // Overlapping file writes stay ordered to avoid stale reads and lost updates.
             let edit_group_futures: Vec<_> = edit_groups
                 .into_iter()
                 .map(|(_paths, calls)| {
@@ -3097,9 +3102,6 @@ impl AgentLoop {
 
             let edit_group_results = futures::future::join_all(edit_group_futures).await;
 
-            // Map results back to original indices
-            let mut result_map: std::collections::HashMap<usize, ToolExecutionOutput> =
-                std::collections::HashMap::with_capacity(tool_tasks.len());
             let mut non_edit_iter = non_edit_results.into_iter();
             for i in 0..tool_tasks.len() {
                 if non_edit_executed.contains(&i) {
@@ -3124,24 +3126,22 @@ impl AgentLoop {
                 }
             }
 
-            // Collect results in order
-            let parallel_results: Vec<ToolExecutionOutput> = (0..tool_tasks.len())
+            let execution_results: Vec<ToolExecutionOutput> = (0..tool_tasks.len())
                 .filter_map(|i| result_map.remove(&i))
                 .collect();
 
             // Track tool execution statistics for consecutive_mistakes tracking
-            let tools_called = !parallel_results.is_empty();
-            tool_failure_count = parallel_results.iter().filter(|r| r.is_error).count();
+            let tools_called = !execution_results.is_empty();
+            tool_failure_count = execution_results.iter().filter(|r| r.is_error).count();
 
             // Phase 3: Collect results in order, then push as ONE StorageMessage
-            let mut parallel_results_iter = parallel_results.into_iter();
+            let mut execution_results_iter = execution_results.into_iter();
             let mut tool_result_blocks: Vec<UserContentBlock> = Vec::new();
             for (tool_id, tool_name, immediate_result_text, _task, edit_file_path) in tool_tasks {
                 let mut result_output = if let Some(result_text) = immediate_result_text {
                     result_text
                 } else {
-                    // Parallel execution result
-                    parallel_results_iter.next().unwrap_or_else(|| {
+                    execution_results_iter.next().unwrap_or_else(|| {
                         ToolExecutionOutput::error("Tool execution failed".to_string(), None)
                     })
                 };
@@ -4469,6 +4469,101 @@ mod tests {
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
         }
+    }
+
+    struct ConcurrencyProbeHandler {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::core::tools::ToolHandler for ConcurrencyProbeHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let active = self.active.clone();
+            let max_active = self.max_active.clone();
+            Box::pin(async move {
+                let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!("ok"))
+            })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "probe".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disabled_parallel_tool_calling_serializes_tools() {
+        let responses = vec![vec![
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_1".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("list_files".to_string()),
+                        arguments: Some("{}".to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_2".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("list_files".to_string()),
+                        arguments: Some("{}".to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::ListFiles,
+            Arc::new(ConcurrencyProbeHandler {
+                active,
+                max_active: max_active.clone(),
+            }),
+        );
+
+        let mut agent = AgentLoop::new(test_agent_config(provider, "sequential-tools"))
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                enable_parallel_tool_calling: false,
+                ..Default::default()
+            });
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+        assert_eq!(
+            max_active.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "disabled parallel tool calling must keep tool execution sequential"
+        );
     }
 
     fn drain_rendered_output(
