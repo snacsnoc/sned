@@ -21,7 +21,7 @@ use crate::core::tools::{
     ToolRequiredNextStep,
 };
 use crate::services::symbol_index::SymbolIndexService;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::future::Future;
@@ -901,6 +901,9 @@ impl EditFileHandler {
             final_lines: Vec<String>,
             final_hashes: Vec<String>,
             had_success: bool,
+            applied_count: usize,
+            lines_added: u32,
+            lines_removed: u32,
         }
         let mut file_results: Vec<FileResult> = Vec::new();
 
@@ -933,27 +936,7 @@ impl EditFileHandler {
                 total_overlap += result.resolved_count;
             }
 
-            // Record file change for session summary
             if result.success && result.resolved_count > 0 {
-                let entry = state
-                    .session_file_changes
-                    .entry(batch.absolute_path.clone())
-                    .or_insert_with(|| crate::core::agent_types::FileChangeStats {
-                        lines_added: 0,
-                        lines_removed: 0,
-                        action: "edited".to_string(),
-                    });
-                entry.lines_added = entry.lines_added.saturating_add(result.lines_added);
-                entry.lines_removed = entry.lines_removed.saturating_add(result.lines_removed);
-            }
-
-            if result.success && result.resolved_count > 0 {
-                // Track for post-diagnostics if there were pre-errors
-                if any_pre_errors {
-                    successfully_edited_files
-                        .push((batch.absolute_path.clone(), batch.display_path.clone()));
-                }
-
                 // Collect for write phase (Phase 4b)
                 if let Some(ref final_content) = result.final_content {
                     write_items.push(WriteItem {
@@ -987,11 +970,15 @@ impl EditFileHandler {
                 final_lines,
                 final_hashes,
                 had_success: result.success,
+                applied_count: result.resolved_count,
+                lines_added: result.lines_added,
+                lines_removed: result.lines_removed,
             });
         }
 
         // Phase 4b: Write all files with rollback on failure
         // If any file fails to write, restore all previously written files to original content
+        let mut write_failed_paths: HashSet<String> = HashSet::new();
         if !write_items.is_empty() {
             // Snapshot original content for all files before any writes
             let mut original_contents: std::collections::HashMap<String, String> =
@@ -1106,6 +1093,8 @@ impl EditFileHandler {
                         written_paths.push(item.absolute_path.clone());
                     }
                     Err(e) => {
+                        write_failed_paths.insert(item.absolute_path.clone());
+                        write_failed_paths.extend(written_paths.iter().cloned());
                         for path in written_paths.iter().rev() {
                             if let Some(orig) = original_contents.get(path)
                                 && let Err(re) =
@@ -1132,6 +1121,39 @@ impl EditFileHandler {
             }
         }
 
+        for file_result in &mut file_results {
+            if file_result.had_success
+                && write_failed_paths.contains(&file_result.batch_absolute_path)
+            {
+                file_result.had_success = false;
+                total_applied = total_applied.saturating_sub(file_result.applied_count);
+                total_failed = total_failed.saturating_add(file_result.applied_count);
+                continue;
+            }
+
+            if file_result.had_success && file_result.applied_count > 0 {
+                let entry = state
+                    .session_file_changes
+                    .entry(file_result.batch_absolute_path.clone())
+                    .or_insert_with(|| crate::core::agent_types::FileChangeStats {
+                        lines_added: 0,
+                        lines_removed: 0,
+                        action: "edited".to_string(),
+                    });
+                entry.lines_added = entry.lines_added.saturating_add(file_result.lines_added);
+                entry.lines_removed = entry
+                    .lines_removed
+                    .saturating_add(file_result.lines_removed);
+
+                if any_pre_errors {
+                    successfully_edited_files.push((
+                        file_result.batch_absolute_path.clone(),
+                        file_result.batch_display_path.clone(),
+                    ));
+                }
+            }
+        }
+
         // After successful write, mark all written files as requiring re-read
         // so the model's cached anchors cannot become stale silently.
         for item in &write_items {
@@ -1143,22 +1165,23 @@ impl EditFileHandler {
         // Emit a hint so the model knows it must re-read before the next edit.
         // Without this, the model often tries to reuse anchors from a prior read_file
         // call and hits Hash anchor validation errors, triggering read/edit loops.
-        if !write_items.is_empty() && total_applied > 0 && !json_output {
+        let changed_paths: Vec<String> = write_items
+            .iter()
+            .filter(|item| !write_failed_paths.contains(&item.absolute_path))
+            .map(|item| {
+                std::path::Path::new(&item.absolute_path)
+                    .file_name().map_or_else(|| item.absolute_path.clone(), |n| n.to_string_lossy().to_string())
+            })
+            .collect();
+        if !changed_paths.is_empty() && total_applied > 0 && !json_output {
             use crate::cli::output::OutputEvent;
             use crate::cli::tui::theme::ACCENT;
             use ratatui::style::Style;
-            let written_paths: Vec<String> = write_items
-                .iter()
-                .map(|item| {
-                    std::path::Path::new(&item.absolute_path)
-                        .file_name().map_or_else(|| item.absolute_path.clone(), |n| n.to_string_lossy().to_string())
-                })
-                .collect();
             output_writer.emit(OutputEvent::tool_output_line(
                 format!(
                     "✓ {} file(s) changed: {}. Call read_file before the next edit on these files to refresh anchors.",
-                    written_paths.len(),
-                    written_paths.join(", ")
+                    changed_paths.len(),
+                    changed_paths.join(", ")
                 ),
                 Style::default().fg(ACCENT),
             ));
@@ -3368,6 +3391,122 @@ edition = "2021"
             output.contains("0 edit(s) applied") || output.contains("failed"),
             "Summary should report 0 applied or mention failures, got: {}",
             output
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_atomic_write_failure_does_not_report_rolled_back_edits_as_applied() {
+        use tempfile::tempdir;
+
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempdir().unwrap();
+        let first_file_name = "first.txt";
+        let first_file_path = dir.path().join(first_file_name);
+        let first_content = "first line 1\nfirst line 2\n";
+        std::fs::write(&first_file_path, first_content).unwrap();
+
+        // The target fits NAME_MAX while the atomic-write suffix does not.
+        let failing_file_name = format!("{}.txt", "a".repeat(240));
+        let failing_file_path = dir.path().join(&failing_file_name);
+        let failing_content = "failing line 1\nfailing line 2\n";
+        std::fs::write(&failing_file_path, failing_content).unwrap();
+
+        let last_file_name = "last.txt";
+        let last_file_path = dir.path().join(last_file_name);
+        let last_content = "last line 1\nlast line 2\n";
+        std::fs::write(&last_file_path, last_content).unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let first_lines = crate::core::file_editor::split_content_lines(first_content);
+        let first_anchors = anchor_mgr.reconcile(
+            first_file_path.to_str().unwrap(),
+            &first_lines,
+            Some("write-failure-task"),
+        );
+        let failing_lines = crate::core::file_editor::split_content_lines(failing_content);
+        let failing_anchors = anchor_mgr.reconcile(
+            failing_file_path.to_str().unwrap(),
+            &failing_lines,
+            Some("write-failure-task"),
+        );
+        let last_lines = crate::core::file_editor::split_content_lines(last_content);
+        let last_anchors = anchor_mgr.reconcile(
+            last_file_path.to_str().unwrap(),
+            &last_lines,
+            Some("write-failure-task"),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "write-failure-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": [
+                {
+                    "path": first_file_name,
+                    "edits": [{
+                        "anchor": format!("{}§first line 2", first_anchors[1]),
+                        "edit_type": "replace",
+                        "text": "first replacement"
+                    }]
+                },
+                {
+                    "path": failing_file_name,
+                    "edits": [{
+                        "anchor": format!("{}§failing line 2", failing_anchors[1]),
+                        "edit_type": "replace",
+                        "text": "failing replacement"
+                    }]
+                },
+                {
+                    "path": last_file_name,
+                    "edits": [{
+                        "anchor": format!("{}§last line 2", last_anchors[1]),
+                        "edit_type": "replace",
+                        "text": "last replacement"
+                    }]
+                }
+            ]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .expect("write failure should be returned in the tool result");
+        let output = result.as_str().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&first_file_path).unwrap(),
+            first_content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&failing_file_path).unwrap(),
+            failing_content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&last_file_path).unwrap(),
+            "last line 1\nlast replacement\n"
+        );
+        assert!(output.contains("Error writing file"), "got: {output}");
+        assert!(output.contains("1 edit(s) applied"), "got: {output}");
+        assert!(output.contains("2 edit(s) failed"), "got: {output}");
+        assert!(!output.contains("first replacement"), "got: {output}");
+        assert!(!output.contains("failing replacement"), "got: {output}");
+        assert!(output.contains("last replacement"), "got: {output}");
+        let state = state.lock().await;
+        assert_eq!(state.session_file_changes.len(), 1);
+        assert!(
+            state
+                .session_file_changes
+                .keys()
+                .any(|path| Path::new(path).file_name() == Some(last_file_name.as_ref()))
         );
     }
 
