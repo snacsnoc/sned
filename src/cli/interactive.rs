@@ -3810,6 +3810,20 @@ mod tests {
         assert!(!rendered.contains("COMPLETION_ROW_00"), "got:\n{rendered}");
         assert!(rendered.contains("COMPLETION_ROW_03"), "got:\n{rendered}");
 
+        app.scroll_completion_lines(isize::MAX);
+        let transcript_offset = app.scroll_offset;
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.scroll_offset > transcript_offset);
+
         reset_prompt_state();
         Ok(())
     }

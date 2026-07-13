@@ -1622,7 +1622,7 @@ impl App {
         if max_offset == 0 {
             return false;
         }
-        self.completion_scroll_offset = if delta.is_negative() {
+        let next_offset = if delta.is_negative() {
             self.completion_scroll_offset
                 .saturating_sub(delta.unsigned_abs())
         } else {
@@ -1630,6 +1630,10 @@ impl App {
                 .saturating_add(delta as usize)
                 .min(max_offset)
         };
+        if next_offset == self.completion_scroll_offset {
+            return false;
+        }
+        self.completion_scroll_offset = next_offset;
         self.needs_redraw = true;
         true
     }
