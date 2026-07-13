@@ -617,32 +617,6 @@ pub fn diagnostics_scan_schema() -> ToolSchema {
 }
 
 #[must_use]
-pub fn summarize_task_schema() -> ToolSchema {
-    ToolSchema {
-        name: "summarize_task",
-        description: "Summarize the task to free up context window space.",
-        parameters: vec![
-            ToolParameter {
-                name: "context",
-                required: true,
-                param_type: "string",
-                description: "Detailed summary of the conversation so far, including current work, technical concepts, modified files, problems solved, and exact pending next steps.",
-                items: None,
-                extra: None,
-            },
-            ToolParameter {
-                name: "required_files",
-                required: false,
-                param_type: "array",
-                description: "List of relative paths to the most important files needed to continue the task.",
-                items: Some(serde_json::json!({"type": "string"})),
-                extra: None,
-            },
-        ],
-    }
-}
-
-#[must_use]
 pub fn condense_schema() -> ToolSchema {
     ToolSchema {
         name: "condense",
@@ -684,22 +658,6 @@ pub fn web_fetch_schema() -> ToolSchema {
     }
 }
 
-#[must_use]
-pub fn new_task_schema() -> ToolSchema {
-    ToolSchema {
-        name: "new_task",
-        description: "Creates a new task with preloaded context from the current conversation.",
-        parameters: vec![ToolParameter {
-            name: "context",
-            required: true,
-            param_type: "string",
-            description: "Detailed summary of the conversation so far, including current work, technical concepts, modified files, problems solved, and exact pending next steps.",
-            items: None,
-            extra: None,
-        }],
-    }
-}
-
 // ============================================================================
 // Active Tool Definitions
 // ============================================================================
@@ -731,10 +689,8 @@ pub fn get_tool_schema(tool: SnedTool) -> ToolSchema {
         SnedTool::UseSkill => use_skill_schema(),
         SnedTool::ListSkills => list_skills_schema(),
         SnedTool::DiagnosticsScan => diagnostics_scan_schema(),
-        SnedTool::SummarizeTask => summarize_task_schema(),
         SnedTool::Condense => condense_schema(),
         SnedTool::WebFetch => web_fetch_schema(),
-        SnedTool::NewTask => new_task_schema(),
     }
 }
 
@@ -859,10 +815,8 @@ impl ToolProfile {
                 SnedTool::UseSkill,
                 SnedTool::ListSkills,
                 SnedTool::DiagnosticsScan,
-                SnedTool::SummarizeTask,
                 SnedTool::Condense,
                 SnedTool::WebFetch,
-                SnedTool::NewTask,
             ],
         }
     }
@@ -1078,7 +1032,7 @@ mod tests {
     #[test]
     fn test_active_tools_count() {
         let defs = get_active_tool_definitions();
-        assert_eq!(defs.len(), 22);
+        assert_eq!(defs.len(), 20);
     }
 
     #[test]
@@ -1190,7 +1144,6 @@ mod tests {
             SnedTool::UseSkill,
             SnedTool::ListSkills,
             SnedTool::DiagnosticsScan,
-            SnedTool::SummarizeTask,
             SnedTool::Condense,
             SnedTool::WebFetch,
         ];
@@ -1208,7 +1161,7 @@ mod tests {
         assert!(ToolProfile::CoreEdit.tools().len() >= 7);
         assert!(ToolProfile::Validate.tools().len() >= 9);
         assert!(ToolProfile::Symbol.tools().len() >= 9);
-        assert_eq!(ToolProfile::Full.tools().len(), 22);
+        assert_eq!(ToolProfile::Full.tools().len(), 20);
     }
 
     #[test]

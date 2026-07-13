@@ -1219,10 +1219,6 @@ fn build_tool_registry(
         ),
     );
     registry.register(
-        crate::core::tools::SnedTool::SummarizeTask,
-        Arc::new(crate::core::tools::handlers::summarize_task::SummarizeTaskHandler::new()),
-    );
-    registry.register(
         crate::core::tools::SnedTool::Condense,
         Arc::new(crate::core::tools::handlers::condense::CondenseHandler::new()),
     );
@@ -1246,11 +1242,6 @@ fn build_tool_registry(
         crate::core::tools::SnedTool::UseSubagents,
         Arc::new(crate::core::tools::handlers::use_subagents::UseSubagentsHandler::new()),
     );
-    registry.register(
-        crate::core::tools::SnedTool::NewTask,
-        Arc::new(crate::core::tools::handlers::new_task::NewTaskHandler::new()),
-    );
-
     registry
 }
 

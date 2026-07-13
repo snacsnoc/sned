@@ -28,10 +28,8 @@ pub enum SnedTool {
     SearchFiles,
     ListFiles,
     WebFetch,
-    NewTask,
     PlanModeRespond,
     Condense,
-    SummarizeTask,
     UseSkill,
     ListSkills,
     UseSubagents,
@@ -75,10 +73,8 @@ impl SnedTool {
             Self::SearchFiles => "search_files",
             Self::ListFiles => "list_files",
             Self::WebFetch => "web_fetch",
-            Self::NewTask => "new_task",
             Self::PlanModeRespond => "plan_mode_respond",
             Self::Condense => "condense",
-            Self::SummarizeTask => "summarize_task",
             Self::UseSkill => "use_skill",
             Self::ListSkills => "list_skills",
             Self::UseSubagents => "use_subagents",
@@ -118,10 +114,7 @@ impl SnedTool {
             | Self::AttemptCompletion
             | Self::PlanModeRespond
             | Self::AskFollowupQuestion
-            | Self::Condense
-            | Self::SummarizeTask => ToolCategory::ReadOnly,
-
-            _ => ToolCategory::Other,
+            | Self::Condense => ToolCategory::ReadOnly,
         }
     }
 
@@ -137,10 +130,8 @@ impl SnedTool {
             "search_files" => Some(Self::SearchFiles),
             "list_files" => Some(Self::ListFiles),
             "web_fetch" => Some(Self::WebFetch),
-            "new_task" => Some(Self::NewTask),
             "plan_mode_respond" => Some(Self::PlanModeRespond),
             "condense" => Some(Self::Condense),
-            "summarize_task" => Some(Self::SummarizeTask),
             "use_skill" => Some(Self::UseSkill),
             "list_skills" => Some(Self::ListSkills),
             "use_subagents" => Some(Self::UseSubagents),

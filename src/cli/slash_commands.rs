@@ -6,7 +6,6 @@ const SLASH_COMMAND_REGEX: &str = r"(^|\s)\/([a-zA-Z0-9_.:@-]+)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
-    NewTask,
     Compact,
     NewRule,
     SkillCommand { name: String },
@@ -16,7 +15,6 @@ impl SlashCommand {
     #[must_use] 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "newtask" => Some(Self::NewTask),
             "compact" => Some(Self::Compact),
             "newrule" => Some(Self::NewRule),
             _ => None,
@@ -54,7 +52,6 @@ impl SlashCommand {
     #[must_use] 
     pub fn instruction_block(&self) -> &'static str {
         match self {
-            Self::NewTask => NEW_TASK_INSTRUCTION,
             Self::Compact => CONDENSE_INSTRUCTION,
             Self::NewRule => NEW_RULE_INSTRUCTION,
             Self::SkillCommand { .. } => "",
@@ -536,7 +533,7 @@ pub fn parse_checkpoint_restore(text: &str) -> Option<usize> {
 /// Category of a slash command entry for grouping in the picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommandCategory {
-    /// Commands injected to the agent (newtask, compact, etc.)
+    /// Commands injected to the agent (compact, newrule, etc.)
     Agent,
     /// Local CLI-only commands (exit, clear, help, etc.)
     Local,
@@ -568,13 +565,6 @@ pub struct SlashCommandEntry {
 #[must_use] 
 pub fn build_slash_command_entries(available_skills: &[SkillMetadata]) -> Vec<SlashCommandEntry> {
     let mut entries = vec![
-        SlashCommandEntry {
-            name: "newtask".to_string(),
-            description: "Create a new task with the current context".to_string(),
-            aliases: vec!["nt".to_string()],
-            category: SlashCommandCategory::Agent,
-            requires_args: true,
-        },
         SlashCommandEntry {
             name: "compact".to_string(),
             description: "Condense the current context to reduce token usage".to_string(),
@@ -819,14 +809,6 @@ pub fn format_help_text() -> String {
         "{}─────────────────────────────{}\n",
         style::DIM,
         style::RESET
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Create a new task with context from the current task{}\n",
-        style::CYAN,
-        "/newtask",
-        style::DIM,
-        style::RESET,
-        style::DIM
     ));
     s.push_str(&format!(
         "  {}{}{}  - {}Condense your current context window{}\n",
@@ -1136,14 +1118,6 @@ pub fn format_help_text() -> String {
         style::DIM
     ));
     s.push_str(&format!(
-        "  {}{}{}  - {}Start a new task, carrying over context{}\n",
-        style::CYAN,
-        "/newtask",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
         "  {}{}{}  - {}Show this help{}\n",
         style::CYAN,
         "/help",
@@ -1198,18 +1172,6 @@ pub fn format_help_for_command(cmd: &str) -> String {
     );
 
     let help_text = match cmd_lower.as_str() {
-        "newtask" => {
-            r"Creates a new task while preserving context from the current conversation.
-
-Use when:
-  - Starting a new subtask within a larger project
-  - Switching to a different topic while keeping conversation history
-  - Creating a focused task with inherited context
-
-Example:
-  /newtask - Create a new task with current context"
-        }
-
         "compact" => {
             r"Condenses the current conversation history to reduce token usage.
 
@@ -1277,7 +1239,7 @@ Usage:
   /help <command> - Show detailed help for a specific command
 
 Examples:
-  /help newtask - Get detailed help for /newtask
+  /help compact - Get detailed help for /compact
   /help checkpoint - Get help for checkpoint commands"
         }
 
@@ -1779,28 +1741,6 @@ pub fn format_changes_text(state: &crate::core::agent_types::TaskState) -> Strin
     lines.join("\n")
 }
 
-const NEW_TASK_INSTRUCTION: &str = r#"<explicit_instructions type="new_task">
-The user has explicitly asked you to help them create a new task with preloaded context, which you will generate. The user may have provided instructions or additional information for you to consider when summarizing existing work and creating the context for the new task.
-Irrespective of whether additional information or instructions are given, you are ONLY allowed to respond to this message by calling the new_task tool. You MUST call the new_task tool EVEN if it's not in your existing toolset.
-
-The new_task tool is defined below:
-
-Description:
-Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing with the new task.
-The user will be presented with a preview of your generated context and can choose to create a new task or keep chatting in the current conversation.
-
-Parameters:
-- Context: (required) The context to preload the new task with. If applicable based on the current task, this should include:
-  1. Current Work: Describe in detail what was being worked on prior to this request to create a new task. Pay special attention to the more recent messages / conversation.
-  2. Key Technical Concepts: List all important technical concepts, technologies, coding conventions, and frameworks discussed, which might be relevant for the new task.
-  3. Relevant Files and Code: If applicable, enumerate specific files and code sections examined, modified, or created for the task continuation. Pay special attention to the most recent messages and changes.
-  4. Problem Solving: Document problems solved thus far and any ongoing troubleshooting efforts.
-  5. Pending Tasks and Next Steps: Outline all pending tasks that you have explicitly been asked to work on, as well as list the next steps you will take for all outstanding work, if applicable. Include code snippets where they add clarity. For any next steps, include direct quotes from the most recent conversation showing exactly what task you were working on and where you left off. This should be verbatim to ensure there's no information loss in context between tasks.
-
-Below is the user's input when they indicated that they wanted to create a new task.
-</explicit_instructions>
-"#;
-
 const CONDENSE_INSTRUCTION: &str = r#"<explicit_instructions type="condense">
 The user has explicitly asked you to create a detailed summary of the conversation so far, which will be used to compact the current context window while retaining key information. The user may have provided instructions or additional information for you to consider when summarizing the conversation.
 Irrespective of whether additional information or instructions are given, you are only allowed to respond to this message by calling the condense tool.
@@ -1887,10 +1827,10 @@ mod tests {
 
     #[test]
     fn test_slash_command_with_whitespace_prefix() {
-        let result = parse_slash_command("Please /newtask now");
+        let result = parse_slash_command("Please /compact now");
         assert_eq!(result.processed_text, "Please now");
         let cmd = result.command.unwrap();
-        assert_eq!(cmd.command, "newtask");
+        assert_eq!(cmd.command, "compact");
         assert_eq!(cmd.prefix, " ");
         assert_eq!(cmd.start_index, 6);
         assert_eq!(cmd.end_index, 15);
@@ -1898,17 +1838,17 @@ mod tests {
 
     #[test]
     fn test_slash_command_inside_tags_not_detected() {
-        let result = parse_slash_command("<task>/newtask</task>");
-        assert_eq!(result.processed_text, "<task>/newtask</task>");
+        let result = parse_slash_command("<task>/compact</task>");
+        assert_eq!(result.processed_text, "<task>/compact</task>");
         assert!(result.command.is_none());
     }
 
     #[test]
     fn test_slash_command_with_numbers() {
-        let result = parse_slash_command("/newtask2");
+        let result = parse_slash_command("/compact2");
         assert_eq!(result.processed_text, "");
         let cmd = result.command.unwrap();
-        assert_eq!(cmd.command, "newtask2");
+        assert_eq!(cmd.command, "compact2");
     }
 
     #[test]
@@ -1929,15 +1869,15 @@ mod tests {
 
     #[test]
     fn test_no_false_positive_in_url() {
-        let result = parse_slash_command("Check http://example.com/newtask");
-        assert_eq!(result.processed_text, "Check http://example.com/newtask");
+        let result = parse_slash_command("Check http://example.com/compact");
+        assert_eq!(result.processed_text, "Check http://example.com/compact");
         assert!(result.command.is_none());
     }
 
     #[test]
     fn test_no_false_positive_in_path() {
-        let result = parse_slash_command("Path: /usr/local/newtask");
-        assert_eq!(result.processed_text, "Path: /usr/local/newtask");
+        let result = parse_slash_command("Path: /usr/local/compact");
+        assert_eq!(result.processed_text, "Path: /usr/local/compact");
         assert!(result.command.is_none());
     }
 
@@ -1955,13 +1895,6 @@ mod tests {
         assert_eq!(result.processed_text, "");
         let cmd = result.command.unwrap();
         assert_eq!(cmd.command, "compact");
-    }
-
-    #[test]
-    fn test_process_newtask_command() {
-        let result = process_slash_command("/newtask make it work");
-        assert!(result.contains("<explicit_instructions type=\"new_task\">"));
-        assert!(result.contains("make it work"));
     }
 
     #[test]
@@ -1995,8 +1928,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_compact_command_newtask() {
-        assert!(!is_compact_command("/newtask"));
+    fn test_is_compact_command_unknown() {
+        assert!(!is_compact_command("/unknown"));
     }
 
     #[test]
@@ -2048,15 +1981,15 @@ mod tests {
 
     #[test]
     fn test_parse_cli_only_help_with_arg() {
-        let result = get_cli_only_command("/help newtask");
-        assert!(matches!(result, Some(CliOnlyCommand::HelpOption(ref cmd)) if cmd == "newtask"));
+        let result = get_cli_only_command("/help compact");
+        assert!(matches!(result, Some(CliOnlyCommand::HelpOption(ref cmd)) if cmd == "compact"));
     }
 
     #[test]
-    fn test_format_help_for_command_newtask() {
-        let text = format_help_for_command("newtask");
-        assert!(text.contains("newtask"));
-        assert!(text.contains("Creates a new task"));
+    fn test_format_help_for_command_compact() {
+        let text = format_help_for_command("compact");
+        assert!(text.contains("compact"));
+        assert!(text.contains("Condenses the current conversation"));
         assert!(text.contains("═══════"));
     }
 
@@ -2095,12 +2028,13 @@ mod tests {
     #[test]
     fn test_removed_commands_are_not_available() {
         assert!(SlashCommand::parse("explain-changes").is_none());
+        assert!(SlashCommand::parse("newtask").is_none());
         assert!(get_cli_only_command("/expand 1").is_none());
         assert!(SlashCommand::parse_with_skills("some-workflow", &[]).is_none());
 
         let entries = build_slash_command_entries(&[]);
         assert!(entries.iter().all(|entry| {
-            !matches!(entry.name.as_str(), "explain-changes" | "expand")
+            !matches!(entry.name.as_str(), "explain-changes" | "expand" | "newtask")
         }));
     }
 
@@ -2129,7 +2063,7 @@ mod tests {
     #[test]
     fn test_format_help_text_contains_commands() {
         let text = format_help_text();
-        assert!(text.contains("/newtask"));
+        assert!(!text.contains("/newtask"));
         assert!(text.contains("/compact"));
         assert!(text.contains("/exit"));
         assert!(text.contains("/clear"));
@@ -2282,12 +2216,12 @@ mod tests {
 
     #[test]
     fn test_builtin_commands_still_work() {
-        let result = SlashCommand::parse_with_skills("newtask", &[]);
+        let result = SlashCommand::parse_with_skills("compact", &[]);
 
         assert!(result.is_some());
         let cmd = result.unwrap();
         assert!(!cmd.is_skill_command());
-        assert_eq!(cmd.instruction_block(), NEW_TASK_INSTRUCTION);
+        assert_eq!(cmd.instruction_block(), CONDENSE_INSTRUCTION);
     }
 
     #[test]

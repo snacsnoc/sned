@@ -180,12 +180,6 @@ fn bench_tool_registry_creation(c: &mut Criterion) {
                 ),
             );
             registry.register(
-                sned::core::tools::SnedTool::SummarizeTask,
-                Arc::new(
-                    sned::core::tools::handlers::summarize_task::SummarizeTaskHandler::new(),
-                ),
-            );
-            registry.register(
                 sned::core::tools::SnedTool::Condense,
                 Arc::new(
                     sned::core::tools::handlers::condense::CondenseHandler::new(),
