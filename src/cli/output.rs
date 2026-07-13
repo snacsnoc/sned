@@ -431,6 +431,44 @@ impl ChannelOutputWriter {
             request.fail(reason);
         }
     }
+
+    fn record_dropped_event(&self, event: &OutputEvent) {
+        let counters = &self.drop_counters;
+        match event {
+            OutputEvent::Line(_) => {
+                counters
+                    .model_text
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            OutputEvent::ToolOutputLine(_)
+            | OutputEvent::ToolHeaderLine(_)
+            | OutputEvent::CommandHeaderLine(_)
+            | OutputEvent::CommandOutputLine(_) => {
+                counters
+                    .tool_output
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {
+                counters
+                    .other
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.overflow_signaled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let total = counters.total();
+        if total > 0 && total.is_multiple_of(100) {
+            tracing::warn!(
+                dropped = total,
+                summary = counters.format_summary(),
+                "Output channel full; TUI render loop is falling behind. \
+                 {} events dropped so far ({}).",
+                total,
+                counters.format_summary()
+            );
+        }
+    }
 }
 
 impl OutputWriter for ChannelOutputWriter {
@@ -476,50 +514,13 @@ impl OutputWriter for ChannelOutputWriter {
                 // Critical events survive channel saturation: send them
                 // into the unbounded priority lane so the TUI always sees
                 // them even when the main queue is backed up.
-                let _ = self.priority_tx.send(dropped);
+                if let Err(err) = self.priority_tx.send(dropped) {
+                    self.record_dropped_event(&err.0);
+                }
                 return;
             }
 
-            // Non-critical events are dropped when the main channel is
-            // full. Track for diagnostics so the status bar can surface
-            // the count to the user.
-            let counters = &self.drop_counters;
-            match &dropped {
-                OutputEvent::Line(_) => {
-                    counters
-                        .model_text
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                OutputEvent::ToolOutputLine(_)
-                | OutputEvent::ToolHeaderLine(_)
-                | OutputEvent::CommandHeaderLine(_)
-                | OutputEvent::CommandOutputLine(_) => {
-                    counters
-                        .tool_output
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                _ => {
-                    counters
-                        .other
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            // Set the overflow signal so the TUI can surface a
-            // user-visible indicator.
-            self.overflow_signaled
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-
-            let total = counters.total();
-            if total > 0 && total.is_multiple_of(100) {
-                tracing::warn!(
-                    dropped = total,
-                    summary = counters.format_summary(),
-                    "Output channel full; TUI render loop is falling behind. \
-                     {} events dropped so far ({}).",
-                    total,
-                    counters.format_summary()
-                );
-            }
+            self.record_dropped_event(&dropped);
         }
     }
 
@@ -795,6 +796,30 @@ mod tests {
                 if reason.contains("closed")
         ));
         assert_eq!(writer.dropped_count(), 1);
+        assert!(writer.take_overflow_signal());
+    }
+
+    #[test]
+    fn test_channel_overflow_counts_critical_events_after_priority_disconnect() {
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        writer.emit(OutputEvent::plain("line 1"));
+        drop(priority_rx);
+        writer.emit(OutputEvent::TurnEnd {
+            accumulated_text: "done".to_string(),
+        });
+        writer.emit(OutputEvent::Completion("done".to_string()));
+        writer.emit(OutputEvent::ErrorBox("failed".to_string()));
+        writer.emit(OutputEvent::ReasoningChunk("thinking".to_string()));
+
+        assert_eq!(writer.dropped_count(), 4);
+        assert_eq!(writer.drop_summary(), "4 other");
         assert!(writer.take_overflow_signal());
     }
 
