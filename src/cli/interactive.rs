@@ -2524,7 +2524,7 @@ async fn run_main_loop(
 
     const BUSY_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
     const BUSY_POLL_INTERVAL: Duration = BUSY_REDRAW_INTERVAL;
-    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(8);
+    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
     let mut last_draw_at: Option<std::time::Instant> = None;
     let mut timing = TimingSummary {
@@ -2680,9 +2680,8 @@ async fn run_main_loop(
             app.needs_redraw = false;
         }
 
-        // 3. Poll for events. Busy-state polling matches the redraw cadence so
-        // streaming does not burn extra wakeups between frames, while idle mode
-        // stays tighter to preserve typing responsiveness.
+        // Crossterm wakes immediately for input, so idle sessions can wait longer
+        // without adding typing latency while busy streams keep their redraw cadence.
         let poll_interval = if app.agent_busy {
             BUSY_POLL_INTERVAL
         } else {
