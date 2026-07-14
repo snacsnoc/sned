@@ -603,7 +603,7 @@ def slash_commands():
         if "type a prompt" in session.text and not sent_help:
             session.send(b"/help\r")
             sent_help = True
-        if sent_help and "Sned Commands" in session.text and not sent_exit:
+        if sent_help and "Keyboard Shortcuts:" in session.text and not sent_exit:
             time.sleep(0.25)
             session.send(b"/exit\r")
             sent_exit = True
@@ -614,8 +614,10 @@ def slash_commands():
         report(
             [
                 (sent_help, "/help was not sent"),
+                (sent_exit, "/exit was not sent after help rendered"),
                 ("Ctrl+C" in session.text, "help text with keyboard shortcuts not found in output"),
-                (session.exit_code in (0, None), f"sned exited with {session.exit_code}"),
+                (not session.timed_out, "sned did not exit before timeout"),
+                (session.exit_code == 0, f"sned exited with {session.exit_code}"),
             ],
             "/help rendered help text in output",
         )
