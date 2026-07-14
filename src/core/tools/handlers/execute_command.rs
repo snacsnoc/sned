@@ -573,6 +573,10 @@ impl ExecuteCommandHandler {
             }
         }
 
+        if combined_output.is_empty() {
+            combined_output.push_str("Command executed successfully with no output.");
+        }
+
         if !all_filtered_names.is_empty() {
             all_filtered_names.sort();
             all_filtered_names.dedup();
@@ -603,25 +607,20 @@ impl ExecuteCommandHandler {
             "execute_command result assembled"
         );
 
-        if combined_output.is_empty() {
-            Ok("Command executed successfully with no output.".to_string())
-        } else {
-            // Truncate output if it's too large (default 10KB, configurable via SNED_COMMAND_OUTPUT_LIMIT)
-            let limit_bytes = std::env::var("SNED_COMMAND_OUTPUT_LIMIT")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&v| v > 0 && v <= 1024 * 1024)
-                .unwrap_or(10 * 1024);
+        let limit_bytes = std::env::var("SNED_COMMAND_OUTPUT_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0 && v <= 1024 * 1024)
+            .unwrap_or(10 * 1024);
 
-            if combined_output.len() > limit_bytes {
-                // Use floor_char_boundary to avoid splitting multi-byte UTF-8 characters
-                let safe_end = combined_output.floor_char_boundary(limit_bytes);
-                let mut truncated = combined_output[..safe_end].to_string();
-                truncated.push_str("\n\n(Output truncated due to size limit.)");
-                Ok(truncated)
-            } else {
-                Ok(combined_output)
-            }
+        if combined_output.len() > limit_bytes {
+            // Use floor_char_boundary to avoid splitting multi-byte UTF-8 characters
+            let safe_end = combined_output.floor_char_boundary(limit_bytes);
+            let mut truncated = combined_output[..safe_end].to_string();
+            truncated.push_str("\n\n(Output truncated due to size limit.)");
+            Ok(truncated)
+        } else {
+            Ok(combined_output)
         }
     }
 
@@ -1553,61 +1552,39 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_notification_appears_in_output() {
+    fn test_silent_command_reports_success_before_sandbox_notification() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let env_var = "EXECUTE_COMMAND_TEST_SECRET";
+        let original = std::env::var_os(env_var);
+        unsafe { std::env::set_var(env_var, "filtered") };
+
         let rt = tokio::runtime::Runtime::new().unwrap();
         let handler = ExecuteCommandHandler::new();
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
-        let result = rt
-            .block_on(handler.execute_commands_with_timeout(
-                vec!["echo $HOME".to_string()],
-                None,
-                None,
-                false,
-                None,
-                false,
-                &output_writer,
-            ))
-            .unwrap();
+        let result = rt.block_on(handler.execute_commands_with_timeout(
+            vec!["true".to_string()],
+            None,
+            None,
+            true,
+            None,
+            false,
+            &output_writer,
+        ));
 
-        if std::env::vars().any(|(k, _)| {
-            !k.starts_with("SNED_")
-                && !matches!(
-                    k.as_str(),
-                    "PATH"
-                        | "HOME"
-                        | "USER"
-                        | "LANG"
-                        | "LC_ALL"
-                        | "TERM"
-                        | "TERM_PROGRAM"
-                        | "TZ"
-                        | "SHELL"
-                        | "PWD"
-                        | "TMPDIR"
-                        | "XDG_CACHE_HOME"
-                        | "XDG_CONFIG_HOME"
-                        | "XDG_DATA_HOME"
-                        | "XDG_STATE_HOME"
-                        | "EDITOR"
-                        | "VISUAL"
-                        | "PAGER"
-                        | "LESS"
-                        | "MORE"
-                        | "LOGNAME"
-                        | "HOSTNAME"
-                        | "DOCKER_HOST"
-                        | "CARGO_HOME"
-                        | "RUSTUP_HOME"
-                        | "GOPATH"
-                        | "NPM_CONFIG_PREFIX"
-                )
-        }) {
-            assert!(
-                result.contains("[Sandbox:"),
-                "output should contain sandbox notification when env vars are filtered, got: {}",
-                result
-            );
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var(env_var, value),
+                None => std::env::remove_var(env_var),
+            }
         }
+
+        let result = result.unwrap();
+        assert!(
+            result.starts_with("Command executed successfully with no output.\n[Sandbox:"),
+            "silent success should remain explicit before sandbox metadata, got: {result}"
+        );
     }
 }
