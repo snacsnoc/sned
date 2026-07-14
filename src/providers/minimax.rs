@@ -657,26 +657,16 @@ struct OpenAIStreamUsage {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct OpenAIStreamResponse {
     id: String,
     choices: Vec<OpenAIStreamChoice>,
     usage: Option<OpenAIStreamUsage>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    object: Option<String>,
-    #[serde(default)]
-    created: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAIStreamChoice {
     delta: OpenAIStreamDelta,
     finish_reason: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    index: usize,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -687,12 +677,6 @@ struct OpenAIStreamDelta {
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning_details: Vec<MiniMaxReasoningDetail>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    role: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -704,9 +688,6 @@ struct MiniMaxReasoningDetail {
 struct OpenAIStreamToolCall {
     index: usize,
     id: Option<String>,
-    #[serde(rename = "type", default)]
-    #[allow(dead_code)]
-    tool_type: Option<String>,
     function: Option<OpenAIStreamFunction>,
 }
 
@@ -2589,7 +2570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sse_parse_minimax_delta_with_name_and_role_fields() {
+    fn test_sse_parse_minimax_delta_ignores_name_and_role_fields() {
         let line = r#"{"id":"06606d9933ccdc19dddfa3af953a03d3","choices":[{"index":0,"delta":{"role":"assistant","name":"MiniMax AI","tool_calls":[{"function":{"arguments":"|event::\"}"},"index":0}]}}],"created":1779514009,"model":"MiniMax-M2.7","object":"chat.completion.chunk","usage":{"total_tokens":0,"total_characters":0},"input_sensitive":false,"output_sensitive":false,"input_sensitive_type":0,"output_sensitive_type":0,"output_sensitive_int":0}"#;
         let result = serde_json::from_str::<OpenAIStreamResponse>(line);
         match &result {
@@ -2604,12 +2585,12 @@ mod tests {
                     Some("|event::\"}")
                 );
             }
-            Err(e) => panic!("SSE line with delta.name/role should parse: {}", e),
+            Err(e) => panic!("SSE line with extra delta fields should parse: {}", e),
         }
     }
 
     #[test]
-    fn test_sse_parse_minimax_tool_call_with_type_field() {
+    fn test_sse_parse_minimax_tool_call_ignores_type_field() {
         let line = r#"{"id":"06606d99","choices":[{"finish_reason":"tool_calls","index":0,"delta":{"role":"assistant","name":"MiniMax AI","tool_calls":[{"id":"call_function_jpaq2z2bgfh7_2","type":"function","function":{"name":"read_file","arguments":"{\"paths\": [\"src/providers/minimax.rs\"]}"},"index":1}]}}],"created":1779514009,"model":"MiniMax-M2.7","object":"chat.completion.chunk"}"#;
         let result = serde_json::from_str::<OpenAIStreamResponse>(line);
         match &result {
@@ -2619,7 +2600,7 @@ mod tests {
                 assert_eq!(tc.len(), 1);
                 assert_eq!(tc[0].index, 1);
             }
-            Err(e) => panic!("SSE line with tool_call.type should parse: {}", e),
+            Err(e) => panic!("SSE line with extra tool call fields should parse: {}", e),
         }
     }
 
