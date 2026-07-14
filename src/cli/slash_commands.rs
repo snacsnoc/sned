@@ -2,7 +2,470 @@ use regex::Regex;
 
 use crate::core::context::instructions::{self, SkillMetadata};
 
-const SLASH_COMMAND_REGEX: &str = r"(^|\s)\/([a-zA-Z0-9_.:@-]+)";
+const SLASH_COMMAND_REGEX: &str = r"(^|\s)\/([a-zA-Z0-9_.:@?-]+)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCommandId {
+    Compact,
+    NewRule,
+    Exit,
+    Clear,
+    History,
+    Skills,
+    Help,
+    Settings,
+    Models,
+    ResetCompact,
+    Stats,
+    Undo,
+    Diff,
+    Log,
+    Commit,
+    CheckpointList,
+    CheckpointRestore,
+    CheckpointUndo,
+    Changes,
+    Queue,
+    Retry,
+    Model,
+    Plan,
+    PlanApprove,
+    PlanPause,
+    PlanResume,
+    PlanAbort,
+    PlanComplete,
+    PlanFail,
+    PlanEdit,
+    PlanAdd,
+    PlanRemove,
+    PlanReplace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandRequirement {
+    Always,
+    TrackChanges,
+    RetryableRequest,
+    CompactedSummary,
+    PlanExists,
+    PlanPending,
+    PlanRunning,
+    PlanPaused,
+    PlanActive,
+    PlanEditable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SlashCommandAvailability {
+    pub track_changes: bool,
+    pub has_retryable_request: bool,
+    pub has_compacted_summary: bool,
+    pub has_plan: bool,
+    pub plan_approved: bool,
+    pub plan_paused: bool,
+    pub plan_complete: bool,
+    pub plan_mode: bool,
+}
+
+impl SlashCommandAvailability {
+    #[must_use]
+    pub fn from_task_state(
+        state: &crate::core::agent_types::TaskState,
+        track_changes: bool,
+        plan_mode: bool,
+    ) -> Self {
+        let plan = state.plan_state.as_ref();
+        Self {
+            track_changes,
+            has_retryable_request: state.retryable_failed_request.is_some(),
+            has_compacted_summary: state.compacted_summary.is_some(),
+            has_plan: plan.is_some(),
+            plan_approved: plan.is_some_and(|plan| plan.approved),
+            plan_paused: plan.is_some_and(|plan| plan.paused),
+            plan_complete: plan.is_some_and(|plan| plan.complete),
+            plan_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlashCommandSpec {
+    id: SlashCommandId,
+    name: &'static str,
+    aliases: &'static [&'static str],
+    description: &'static str,
+    usage: &'static str,
+    detail: &'static str,
+    category: SlashCommandCategory,
+    requires_args: bool,
+    requirement: CommandRequirement,
+}
+
+const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        id: SlashCommandId::Compact,
+        name: "compact",
+        aliases: &["c"],
+        description: "Condense context to reduce token usage",
+        usage: "/compact",
+        detail: "Condenses the active model context while preserving the information needed to continue the task.",
+        category: SlashCommandCategory::Agent,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::NewRule,
+        name: "newrule",
+        aliases: &["nr"],
+        description: "Draft a rule from the current conversation",
+        usage: "/newrule <rule request>",
+        detail: "Asks the model to turn the current conversation into a concise project rule.",
+        category: SlashCommandCategory::Agent,
+        requires_args: true,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Exit,
+        name: "exit",
+        aliases: &["quit", "q"],
+        description: "Exit the interactive shell",
+        usage: "/exit",
+        detail: "Closes the interactive session after flushing pending local output.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Clear,
+        name: "clear",
+        aliases: &["cls"],
+        description: "Clear the visible display",
+        usage: "/clear",
+        detail: "Clears the transcript shown in this terminal. Model context and saved conversation history are unchanged.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::History,
+        name: "history",
+        aliases: &["h"],
+        description: "Show recent command input",
+        usage: "/history",
+        detail: "Shows the ten most recent entries from interactive command history.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Skills,
+        name: "skills",
+        aliases: &[],
+        description: "List available skills",
+        usage: "/skills",
+        detail: "Lists discovered skills. Enter a skill as its own slash command to activate it.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Help,
+        name: "help",
+        aliases: &["?"],
+        description: "Search commands and view details",
+        usage: "/help [query]",
+        detail: "Opens searchable command help. Enter inserts the selected command; Esc closes help.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Settings,
+        name: "settings",
+        aliases: &[],
+        description: "Show current session settings",
+        usage: "/settings",
+        detail: "Shows the current provider, model, mode, and approval setting.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Models,
+        name: "models",
+        aliases: &[],
+        description: "List configured model examples",
+        usage: "/models",
+        detail: "Shows provider and model examples accepted by the model switch command.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::ResetCompact,
+        name: "resetcompact",
+        aliases: &["clearcompact"],
+        description: "Clear the active compacted summary",
+        usage: "/resetcompact",
+        detail: "Removes the saved compacted summary so the uncompacted context path can be used again.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::CompactedSummary,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Stats,
+        name: "stats",
+        aliases: &[],
+        description: "Show token usage and session cost",
+        usage: "/stats",
+        detail: "Shows cumulative token, cache, timing, command, and cost statistics for this session.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Undo,
+        name: "undo",
+        aliases: &[],
+        description: "Undo the last tracked turn",
+        usage: "/undo",
+        detail: "Restores the most recent tracked checkpoint and removes the corresponding conversation turn.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::TrackChanges,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Diff,
+        name: "diff",
+        aliases: &[],
+        description: "Show changes from the last tracked turn",
+        usage: "/diff",
+        detail: "Shows the shadow-git diff for the most recent tracked turn.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::TrackChanges,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Log,
+        name: "log",
+        aliases: &[],
+        description: "Show tracked turn history",
+        usage: "/log",
+        detail: "Shows recent shadow-git checkpoints created for tracked turns.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::TrackChanges,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Commit,
+        name: "commit",
+        aliases: &[],
+        description: "Commit pending tracked changes",
+        usage: "/commit <message>",
+        detail: "Reviews pending changes and asks for confirmation before committing them to the workspace repository.",
+        category: SlashCommandCategory::Local,
+        requires_args: true,
+        requirement: CommandRequirement::TrackChanges,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::CheckpointList,
+        name: "checkpoint list",
+        aliases: &["checkpoint-list"],
+        description: "List tracked checkpoints",
+        usage: "/checkpoint list",
+        detail: "Lists available tracked checkpoints with their numbers and timestamps.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::TrackChanges,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::CheckpointRestore,
+        name: "checkpoint restore",
+        aliases: &["checkpoint-restore"],
+        description: "Restore a tracked checkpoint",
+        usage: "/checkpoint restore <number>",
+        detail: "Shows affected files and asks for confirmation before restoring the selected checkpoint.",
+        category: SlashCommandCategory::Local,
+        requires_args: true,
+        requirement: CommandRequirement::TrackChanges,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::CheckpointUndo,
+        name: "checkpoint undo",
+        aliases: &["checkpoint-undo"],
+        description: "Restore the previous checkpoint",
+        usage: "/checkpoint undo",
+        detail: "Restores the previous tracked checkpoint and trims the corresponding conversation turn.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::TrackChanges,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Changes,
+        name: "changes",
+        aliases: &[],
+        description: "Show files changed in this session",
+        usage: "/changes",
+        detail: "Summarizes files created or edited during the current session.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Queue,
+        name: "queue",
+        aliases: &[],
+        description: "Show queued messages",
+        usage: "/queue",
+        detail: "Shows messages waiting for the current agent turn to finish.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Retry,
+        name: "retry",
+        aliases: &[],
+        description: "Retry the last safe failed request",
+        usage: "/retry",
+        detail: "Replays the last user-authored request that failed before any tool execution.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::RetryableRequest,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Model,
+        name: "model",
+        aliases: &[],
+        description: "Switch the active provider and model",
+        usage: "/model [provider/model_id]",
+        detail: "Opens the model picker without an argument, or switches directly to a provider/model_id pair.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Plan,
+        name: "plan",
+        aliases: &[],
+        description: "View a plan or start plan mode",
+        usage: "/plan [task description]",
+        detail: "Shows the current plan without arguments, or starts plan mode for the supplied task description.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanApprove,
+        name: "plan approve",
+        aliases: &[],
+        description: "Approve the pending plan",
+        usage: "/plan approve",
+        detail: "Approves the current pending plan and starts execution at its first pending step.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::PlanPending,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanPause,
+        name: "plan pause",
+        aliases: &[],
+        description: "Pause the running plan",
+        usage: "/plan pause",
+        detail: "Pauses plan progression after the current operation.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::PlanRunning,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanResume,
+        name: "plan resume",
+        aliases: &[],
+        description: "Resume the paused plan",
+        usage: "/plan resume",
+        detail: "Resumes execution from the current plan step.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::PlanPaused,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanAbort,
+        name: "plan abort",
+        aliases: &[],
+        description: "Exit plan mode",
+        usage: "/plan abort",
+        detail: "Aborts the active plan or exits plan mode while keeping changes already applied.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::PlanActive,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanComplete,
+        name: "plan complete",
+        aliases: &[],
+        description: "Mark the active plan complete",
+        usage: "/plan complete",
+        detail: "Marks the active plan complete and exits its execution flow.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::PlanExists,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanFail,
+        name: "plan fail",
+        aliases: &[],
+        description: "Mark the current plan step failed",
+        usage: "/plan fail",
+        detail: "Marks the current plan step failed and pauses progression for recovery.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::PlanExists,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanEdit,
+        name: "plan edit",
+        aliases: &[],
+        description: "Edit a plan step",
+        usage: "/plan edit <step> <description>",
+        detail: "Changes one step while the plan is pending or paused.",
+        category: SlashCommandCategory::Plan,
+        requires_args: true,
+        requirement: CommandRequirement::PlanEditable,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanAdd,
+        name: "plan add",
+        aliases: &[],
+        description: "Add a plan step",
+        usage: "/plan add <after_step> <description>",
+        detail: "Adds a step after the selected step, or at the beginning when the index is zero.",
+        category: SlashCommandCategory::Plan,
+        requires_args: true,
+        requirement: CommandRequirement::PlanEditable,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanRemove,
+        name: "plan remove",
+        aliases: &[],
+        description: "Remove a plan step",
+        usage: "/plan remove <step>",
+        detail: "Removes one step while the plan is pending or paused.",
+        category: SlashCommandCategory::Plan,
+        requires_args: true,
+        requirement: CommandRequirement::PlanEditable,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanReplace,
+        name: "plan replace",
+        aliases: &[],
+        description: "Replace all plan steps",
+        usage: "/plan replace <numbered plan>",
+        detail: "Replaces the current plan with a new numbered plan while execution is not running.",
+        category: SlashCommandCategory::Plan,
+        requires_args: true,
+        requirement: CommandRequirement::PlanEditable,
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -12,25 +475,29 @@ pub enum SlashCommand {
 }
 
 impl SlashCommand {
-    #[must_use] 
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "compact" => Some(Self::Compact),
-            "newrule" => Some(Self::NewRule),
+        let spec = command_spec_for_name(s)?;
+        match spec.id {
+            SlashCommandId::Compact => Some(Self::Compact),
+            SlashCommandId::NewRule => Some(Self::NewRule),
             _ => None,
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn parse_with_skills(
         command_name: &str,
         available_skills: &[SkillMetadata],
     ) -> Option<Self> {
-        if let Some(slash_cmd) = Self::parse(command_name) {
-            return Some(slash_cmd);
+        if command_spec_for_name(command_name).is_some() {
+            return Self::parse(command_name);
         }
 
-        if let Some(skill) = available_skills.iter().find(|s| s.name == command_name) {
+        if let Some(skill) = available_skills
+            .iter()
+            .find(|skill| skill.name.eq_ignore_ascii_case(command_name))
+        {
             return Some(Self::SkillCommand {
                 name: skill.name.clone(),
             });
@@ -190,44 +657,15 @@ pub fn parse_plan_subcommand(args: &str) -> Option<PlanSubcommand> {
 }
 
 impl CliOnlyCommand {
-    #[must_use] 
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "exit" => Some(Self::Exit),
-            "q" | "quit" => Some(Self::Quit),
-            "clear" => Some(Self::Clear),
-            "history" => Some(Self::History),
-            "skills" => Some(Self::Skills),
-            "help" => Some(Self::Help),
-            "settings" => Some(Self::Settings),
-            "models" => Some(Self::Models),
-            "resetcompact" | "clearcompact" => Some(Self::ResetCompact),
-            "stats" => Some(Self::Stats),
-            "undo" => Some(Self::Undo),
-            "diff" => Some(Self::Diff),
-            "log" => Some(Self::Log),
-            "commit" => Some(Self::Commit),
-            "checkpoint-list" | "checkpoint list" => Some(Self::CheckpointList),
-            "checkpoint-restore" | "checkpoint restore" => Some(Self::CheckpointRestore),
-            "checkpoint-undo" | "checkpoint undo" => Some(Self::CheckpointUndo),
-            "changes" => Some(Self::Changes),
-            "queue" => Some(Self::Queue),
-            "retry" => Some(Self::Retry),
-            "model" => Some(Self::ModelSwitch(String::new())),
-            "plan" => Some(Self::Plan(PlanSubcommand::Status)),
-            "plan approve" => Some(Self::PlanApprove),
-            "plan pause" => Some(Self::PlanPause),
-            "plan resume" => Some(Self::PlanResume),
-            "plan abort" => Some(Self::PlanAbort),
-            "plan complete" => Some(Self::PlanComplete),
-            "plan fail" => Some(Self::PlanFail),
-            _ => None,
-        }
+        let matched = match_static_command(s)?;
+        cli_command_from_match(&matched)
     }
 
     /// Parse plan subcommands with arguments.
     /// Called when the command is "plan" and there's additional text.
-    #[must_use] 
+    #[must_use]
     pub fn parse_plan_with_args(args: &str) -> Option<Self> {
         let args_trimmed = args.trim();
         let subcmd = parse_plan_subcommand(args_trimmed);
@@ -256,32 +694,33 @@ impl CliOnlyCommand {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn parse_with_arg(cmd: &str, arg: &str) -> Option<Self> {
-        match cmd.to_lowercase().as_str() {
-            "help" if !arg.is_empty() => Some(Self::HelpOption(arg.to_lowercase())),
-            "model" => Some(Self::ModelSwitch(arg.to_string())),
-            _ => Self::parse(cmd),
-        }
+        let invocation = if arg.trim().is_empty() {
+            cmd.to_string()
+        } else {
+            format!("{} {}", cmd, arg.trim())
+        };
+        Self::parse(&invocation)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_shutdown(&self) -> bool {
         matches!(self, Self::Exit | Self::Quit)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_clear(&self) -> bool {
         matches!(self, Self::Clear)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_reset_compact(&self) -> bool {
         matches!(self, Self::ResetCompact)
     }
 
     /// Returns true if this command can execute locally without the agent.
-    #[must_use] 
+    #[must_use]
     pub fn is_local_command(&self) -> bool {
         matches!(
             self,
@@ -343,7 +782,145 @@ impl CliOnlyCommand {
     }
 }
 
-#[must_use] 
+struct StaticCommandMatch<'a> {
+    spec: &'a SlashCommandSpec,
+    matched_name: &'a str,
+    args: &'a str,
+}
+
+fn command_spec_for_name(name: &str) -> Option<&'static SlashCommandSpec> {
+    SLASH_COMMAND_SPECS.iter().find(|spec| {
+        spec.name.eq_ignore_ascii_case(name)
+            || spec
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(name))
+    })
+}
+
+fn match_static_command(input: &str) -> Option<StaticCommandMatch<'_>> {
+    let input = input.trim();
+    SLASH_COMMAND_SPECS
+        .iter()
+        .flat_map(|spec| {
+            std::iter::once(spec.name)
+                .chain(spec.aliases.iter().copied())
+                .map(move |name| (spec, name))
+        })
+        .filter_map(|(spec, name)| {
+            if input.eq_ignore_ascii_case(name) {
+                return Some(StaticCommandMatch {
+                    spec,
+                    matched_name: name,
+                    args: "",
+                });
+            }
+
+            let prefix = input.get(..name.len())?;
+            if prefix.eq_ignore_ascii_case(name)
+                && input
+                    .get(name.len()..)
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+            {
+                return Some(StaticCommandMatch {
+                    spec,
+                    matched_name: name,
+                    args: input[name.len()..].trim_start(),
+                });
+            }
+            None
+        })
+        .max_by_key(|matched| matched.matched_name.len())
+}
+
+fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCommand> {
+    let args = matched.args;
+    match matched.spec.id {
+        SlashCommandId::Compact | SlashCommandId::NewRule => None,
+        SlashCommandId::Exit => {
+            if matched.matched_name.eq_ignore_ascii_case("exit") {
+                Some(CliOnlyCommand::Exit)
+            } else {
+                Some(CliOnlyCommand::Quit)
+            }
+        }
+        SlashCommandId::Clear => Some(CliOnlyCommand::Clear),
+        SlashCommandId::History => Some(CliOnlyCommand::History),
+        SlashCommandId::Skills => Some(CliOnlyCommand::Skills),
+        SlashCommandId::Help => {
+            if args.is_empty() {
+                Some(CliOnlyCommand::Help)
+            } else {
+                Some(CliOnlyCommand::HelpOption(args.to_lowercase()))
+            }
+        }
+        SlashCommandId::Settings => Some(CliOnlyCommand::Settings),
+        SlashCommandId::Models => Some(CliOnlyCommand::Models),
+        SlashCommandId::ResetCompact => Some(CliOnlyCommand::ResetCompact),
+        SlashCommandId::Stats => Some(CliOnlyCommand::Stats),
+        SlashCommandId::Undo => Some(CliOnlyCommand::Undo),
+        SlashCommandId::Diff => Some(CliOnlyCommand::Diff),
+        SlashCommandId::Log => Some(CliOnlyCommand::Log),
+        SlashCommandId::Commit => Some(CliOnlyCommand::Commit),
+        SlashCommandId::CheckpointList => Some(CliOnlyCommand::CheckpointList),
+        SlashCommandId::CheckpointRestore => Some(CliOnlyCommand::CheckpointRestore),
+        SlashCommandId::CheckpointUndo => Some(CliOnlyCommand::CheckpointUndo),
+        SlashCommandId::Changes => Some(CliOnlyCommand::Changes),
+        SlashCommandId::Queue => Some(CliOnlyCommand::Queue),
+        SlashCommandId::Retry => Some(CliOnlyCommand::Retry),
+        SlashCommandId::Model => Some(CliOnlyCommand::ModelSwitch(args.to_string())),
+        SlashCommandId::Plan => CliOnlyCommand::parse_plan_with_args(args),
+        SlashCommandId::PlanApprove => Some(CliOnlyCommand::PlanApprove),
+        SlashCommandId::PlanPause => Some(CliOnlyCommand::PlanPause),
+        SlashCommandId::PlanResume => Some(CliOnlyCommand::PlanResume),
+        SlashCommandId::PlanAbort => Some(CliOnlyCommand::PlanAbort),
+        SlashCommandId::PlanComplete => Some(CliOnlyCommand::PlanComplete),
+        SlashCommandId::PlanFail => Some(CliOnlyCommand::PlanFail),
+        SlashCommandId::PlanEdit => CliOnlyCommand::parse_plan_with_args(&format!("edit {args}")),
+        SlashCommandId::PlanAdd => CliOnlyCommand::parse_plan_with_args(&format!("add {args}")),
+        SlashCommandId::PlanRemove => {
+            CliOnlyCommand::parse_plan_with_args(&format!("remove {args}"))
+        }
+        SlashCommandId::PlanReplace => {
+            CliOnlyCommand::parse_plan_with_args(&format!("replace {args}"))
+        }
+    }
+}
+
+fn command_is_available(spec: &SlashCommandSpec, availability: SlashCommandAvailability) -> bool {
+    match spec.requirement {
+        CommandRequirement::Always => true,
+        CommandRequirement::TrackChanges => availability.track_changes,
+        CommandRequirement::RetryableRequest => availability.has_retryable_request,
+        CommandRequirement::CompactedSummary => availability.has_compacted_summary,
+        CommandRequirement::PlanExists => availability.has_plan && !availability.plan_complete,
+        CommandRequirement::PlanPending => {
+            availability.has_plan && !availability.plan_approved && !availability.plan_complete
+        }
+        CommandRequirement::PlanRunning => {
+            availability.has_plan
+                && availability.plan_approved
+                && !availability.plan_paused
+                && !availability.plan_complete
+        }
+        CommandRequirement::PlanPaused => {
+            availability.has_plan
+                && availability.plan_approved
+                && availability.plan_paused
+                && !availability.plan_complete
+        }
+        CommandRequirement::PlanActive => {
+            availability.plan_mode || (availability.has_plan && !availability.plan_complete)
+        }
+        CommandRequirement::PlanEditable => {
+            availability.has_plan
+                && !availability.plan_complete
+                && (!availability.plan_approved || availability.plan_paused)
+        }
+    }
+}
+
+#[must_use]
 pub fn parse_slash_command(text: &str) -> SlashCommandParseResult {
     let regex = Regex::new(SLASH_COMMAND_REGEX).unwrap();
     let caps = regex.captures(text);
@@ -455,75 +1032,55 @@ pub fn is_compact_command(text: &str) -> bool {
     false
 }
 
-#[must_use] 
+#[must_use]
 pub fn get_cli_only_command(text: &str) -> Option<CliOnlyCommand> {
     let result = parse_slash_command(text);
-    if let Some(cmd) = result.command {
-        // Special handling for /plan commands with subcommands
-        if cmd.command.eq_ignore_ascii_case("plan") {
-            return CliOnlyCommand::parse_plan_with_args(&result.processed_text);
-        }
-
-        // Try the command with argument first (handles /help <command>, etc.)
-        if !result.processed_text.is_empty()
-            && let Some(parsed) =
-                CliOnlyCommand::parse_with_arg(&cmd.command, result.processed_text.trim())
-        {
-            return Some(parsed);
-        }
-        if let Some(parsed) = CliOnlyCommand::parse(&cmd.command) {
-            return Some(parsed);
-        }
-        // Fall back to full command + args (handles /checkpoint list, /checkpoint restore N, etc.)
-        if !result.processed_text.is_empty()
-            && let Some(parsed) =
-                CliOnlyCommand::parse(&format!("{} {}", cmd.command, result.processed_text))
-        {
-            return Some(parsed);
-        }
-    }
-    None
+    let cmd = result.command?;
+    let invocation = if result.processed_text.is_empty() {
+        cmd.command
+    } else {
+        format!("{} {}", cmd.command, result.processed_text)
+    };
+    CliOnlyCommand::parse(&invocation)
 }
 
 #[must_use]
 pub fn parse_checkpoint_restore(text: &str) -> Option<usize> {
     let result = parse_slash_command(text);
     let cmd = result.command?;
-
-    let full_command = if result.processed_text.is_empty() {
-        cmd.command.clone()
+    let invocation = if result.processed_text.is_empty() {
+        cmd.command
     } else {
-        format!(
-            "{} {}",
-            cmd.command,
-            result
-                .processed_text
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-        )
+        format!("{} {}", cmd.command, result.processed_text)
     };
-
-    let is_match = cmd.command.eq_ignore_ascii_case("checkpoint-restore")
-        || cmd.command.eq_ignore_ascii_case("checkpoint restore")
-        || full_command.eq_ignore_ascii_case("checkpoint restore");
-
-    if !is_match {
+    let matched = match_static_command(&invocation)?;
+    if matched.spec.id != SlashCommandId::CheckpointRestore {
         return None;
     }
-
-    // For /checkpoint-restore N, processed_text is "N"
-    // For /checkpoint restore N, processed_text is "restore N" — skip the subcommand word
-    let number_str = if cmd.command.eq_ignore_ascii_case("checkpoint-restore") {
-        result.processed_text.split_whitespace().next()
-    } else {
-        // /checkpoint restore N or /checkpoint-restore matched via full_command
-        result.processed_text.split_whitespace().nth(1)
-    };
-
-    number_str
+    matched
+        .args
+        .split_whitespace()
+        .next()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|index| *index > 0)
+}
+
+#[must_use]
+pub fn unknown_leading_slash_command(
+    text: &str,
+    available_skills: &[SkillMetadata],
+) -> Option<String> {
+    let body = text.trim_start().strip_prefix('/')?;
+    let command_name = body.split_whitespace().next()?;
+    if command_name.is_empty()
+        || match_static_command(body).is_some()
+        || available_skills
+            .iter()
+            .any(|skill| skill.name.eq_ignore_ascii_case(command_name))
+    {
+        return None;
+    }
+    Some(command_name.to_string())
 }
 
 // =============================================================================
@@ -546,119 +1103,66 @@ pub enum SlashCommandCategory {
 /// A single slash command entry for the autocomplete picker.
 #[derive(Debug, Clone)]
 pub struct SlashCommandEntry {
-    /// Command name without the leading slash (e.g. "compact")
     pub name: String,
-    /// One-line description shown in the picker
     pub description: String,
-    /// Alternative names that match this command (e.g. ["q", "quit"] for exit)
     pub aliases: Vec<String>,
-    /// Category for grouping/coloring
     pub category: SlashCommandCategory,
-    /// Whether this command requires arguments (e.g. /commit)
     pub requires_args: bool,
 }
 
-/// Build the list of all available slash command entries.
-///
-/// Combines built-in agent commands, local CLI commands, plans, and skills into
-/// a single list for the autocomplete picker.
-#[must_use] 
+impl SlashCommandEntry {
+    #[must_use]
+    pub fn usage(&self) -> String {
+        command_spec_for_name(&self.name).map_or_else(
+            || format!("/{} <request>", self.name),
+            |spec| spec.usage.to_string(),
+        )
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> String {
+        command_spec_for_name(&self.name)
+            .map_or_else(|| self.description.clone(), |spec| spec.detail.to_string())
+    }
+}
+
+#[must_use]
 pub fn build_slash_command_entries(available_skills: &[SkillMetadata]) -> Vec<SlashCommandEntry> {
-    let mut entries = vec![
-        SlashCommandEntry {
-            name: "compact".to_string(),
-            description: "Condense the current context to reduce token usage".to_string(),
-            aliases: vec!["c".to_string()],
-            category: SlashCommandCategory::Agent,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "newrule".to_string(),
-            description: "Add a new rule to the agent's behavior".to_string(),
-            aliases: vec!["nr".to_string()],
-            category: SlashCommandCategory::Agent,
-            requires_args: true,
-        },
-        SlashCommandEntry {
-            name: "exit".to_string(),
-            description: "Exit the interactive shell".to_string(),
-            aliases: vec!["quit".to_string(), "q".to_string()],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "clear".to_string(),
-            description: "Clear the output screen".to_string(),
-            aliases: vec!["cls".to_string()],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "help".to_string(),
-            description: "Show available commands".to_string(),
-            aliases: vec!["?".to_string()],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "settings".to_string(),
-            description: "View and edit configuration".to_string(),
-            aliases: vec![],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "history".to_string(),
-            description: "Show command history".to_string(),
-            aliases: vec!["h".to_string()],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "retry".to_string(),
-            description: "Retry the last safe failed request verbatim".to_string(),
-            aliases: vec![],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "skills".to_string(),
-            description: "List available skills".to_string(),
-            aliases: vec![],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "plan".to_string(),
-            description: "View or manage the current plan".to_string(),
-            aliases: vec![],
-            category: SlashCommandCategory::Plan,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "undo".to_string(),
-            description: "Undo the last edit operation".to_string(),
-            aliases: vec![],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-        SlashCommandEntry {
-            name: "commit".to_string(),
-            description: "Create a git commit with pending changes".to_string(),
-            aliases: vec![],
-            category: SlashCommandCategory::Local,
-            requires_args: true,
-        },
-        SlashCommandEntry {
-            name: "checkpoint".to_string(),
-            description: "Create or restore a checkpoint".to_string(),
-            aliases: vec!["cp".to_string()],
-            category: SlashCommandCategory::Local,
-            requires_args: false,
-        },
-    ];
+    build_slash_command_entries_with_availability(available_skills, None)
+}
+
+#[must_use]
+pub fn build_available_slash_command_entries(
+    available_skills: &[SkillMetadata],
+    availability: SlashCommandAvailability,
+) -> Vec<SlashCommandEntry> {
+    build_slash_command_entries_with_availability(available_skills, Some(availability))
+}
+
+fn build_slash_command_entries_with_availability(
+    available_skills: &[SkillMetadata],
+    availability: Option<SlashCommandAvailability>,
+) -> Vec<SlashCommandEntry> {
+    let mut entries: Vec<SlashCommandEntry> = SLASH_COMMAND_SPECS
+        .iter()
+        .filter(|spec| availability.is_none_or(|state| command_is_available(spec, state)))
+        .map(|spec| SlashCommandEntry {
+            name: spec.name.to_string(),
+            description: spec.description.to_string(),
+            aliases: spec
+                .aliases
+                .iter()
+                .map(|alias| (*alias).to_string())
+                .collect(),
+            category: spec.category,
+            requires_args: spec.requires_args,
+        })
+        .collect();
 
     for skill in available_skills {
+        if command_spec_for_name(&skill.name).is_some() {
+            continue;
+        }
         let desc = if skill.description.is_empty() {
             "Skill".to_string()
         } else {
@@ -787,710 +1291,101 @@ pub fn filter_slash_commands(entries: &[SlashCommandEntry], query: &str) -> Vec<
 
     substring.into_iter().take(10).collect()
 }
-#[must_use] 
+#[must_use]
 pub fn format_help_text() -> String {
     use crate::cli::colors::style;
 
-    let mut s = String::new();
-    s.push_str(&format!(
-        "{}{}═══════ Sned Commands ═══════{}\n\n",
+    let mut lines = vec![format!(
+        "{}{}═══════ Sned Commands ═══════{}",
         style::BOLD,
         style::CYAN,
         style::RESET
-    ));
-
-    s.push_str(&format!(
-        "{}{}Base Commands:{}\n",
-        style::BOLD,
-        style::CYAN,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "{}─────────────────────────────{}\n",
-        style::DIM,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Condense your current context window{}\n",
-        style::CYAN,
-        "/compact",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Create a new Snad rule based on your conversation{}\n\n",
-        style::CYAN,
-        "/newrule",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "{}{}CLI-Only Commands (handled locally):{}\n",
-        style::BOLD,
-        style::CYAN,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "{}─────────────────────────────{}\n",
-        style::DIM,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Exit the CLI (aliases: /q, /quit){}\n",
-        style::CYAN,
-        "/exit",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Clear the current conversation history{}\n",
-        style::CYAN,
-        "/clear",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show recent tasks{}\n",
-        style::CYAN,
-        "/history",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}List available skills{}\n",
-        style::CYAN,
-        "/skills",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show this help message (alias: /help <command>){}\n",
-        style::CYAN,
-        "/help",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show current settings{}\n",
-        style::CYAN,
-        "/settings",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show available models{}\n",
-        style::CYAN,
-        "/models",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show token usage and session cost{}\n",
-        style::CYAN,
-        "/stats",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Clear compacted summary (allows /compact to be used again){}\n",
-        style::CYAN,
-        "/resetcompact",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Undo the last turn {}{}{}\n",
-        style::CYAN,
-        "/undo",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show changes from the last turn {}{}{}\n",
-        style::CYAN,
-        "/diff",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show turn history {}{}{}\n",
-        style::CYAN,
-        "/log",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Commit changes to your git repo {}{}{}\n",
-        style::CYAN,
-        "/commit \"msg\"",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}List available checkpoints with timestamps {}{}{}\n",
-        style::CYAN,
-        "/checkpoint list",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Restore a specific checkpoint by number {}{}{}\n",
-        style::CYAN,
-        "/checkpoint restore N",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!("  {}{}{}  - {}Undo last turn using checkpoint (reverts files + trims history, alias: /checkpoint-undo) {}{}{}\n\n", style::CYAN, "/checkpoint undo", style::DIM, style::RESET, style::YELLOW, "[requires --track-changes]", style::DIM));
-
-    s.push_str(&format!(
-        "{}{}Plan Workflow:{}\n",
-        style::BOLD,
-        style::CYAN,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}View the current plan status and steps{}\n",
-        style::CYAN,
-        "/plan",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Approve and begin execution of the current plan{}\n\n",
-        style::CYAN,
-        "/plan approve",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-
-    s.push_str(&format!(
-        "{}{}Queue Management:{}\n",
-        style::BOLD,
-        style::CYAN,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "{}─────────────────────────────{}\n",
-        style::DIM,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show pending queued messages{}\n\n",
-        style::CYAN,
-        "/queue",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Retry the last safe failed request verbatim{}\n\n",
-        style::CYAN,
-        "/retry",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-
-    s.push_str(&format!(
-        "{}{}Keyboard Shortcuts:{}\n",
-        style::BOLD,
-        style::CYAN,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "{}─────────────────────────────{}\n",
-        style::DIM,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Move cursor to beginning of line{}\n",
-        style::CYAN,
-        "Ctrl+A / Home",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Move cursor to end of line{}\n",
-        style::CYAN,
-        "Ctrl+E / End",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Clear from cursor to beginning{}\n",
-        style::CYAN,
-        "Ctrl+U",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Clear from cursor to end{}\n",
-        style::CYAN,
-        "Ctrl+K",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Delete word backward{}\n",
-        style::CYAN,
-        "Ctrl+W",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Cancel current operation{}\n",
-        style::CYAN,
-        "Ctrl+C",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Move cursor left/right{}\n",
-        style::CYAN,
-        "Arrow Left/Right",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Navigate command history / file picker{}\n\n",
-        style::CYAN,
-        "Arrow Up/Down",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-
-    s.push_str(&format!(
-        "{}{}Examples:{}\n",
-        style::BOLD,
-        style::CYAN,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "{}─────────────────────────────{}\n",
-        style::DIM,
-        style::RESET
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Compact context before a new topic{}\n",
-        style::CYAN,
-        "/compact",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Show this help{}\n",
-        style::CYAN,
-        "/help",
-        style::DIM,
-        style::RESET,
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Undo last turn {}{}{}\n",
-        style::CYAN,
-        "/undo",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Review last turn's changes {}{}{}\n",
-        style::CYAN,
-        "/diff",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s.push_str(&format!(
-        "  {}{}{}  - {}Commit changes to git {}{}{}\n",
-        style::CYAN,
-        "/commit \"fix: auth bug\"",
-        style::DIM,
-        style::RESET,
-        style::YELLOW,
-        "[requires --track-changes]",
-        style::DIM
-    ));
-    s
+    )];
+    for spec in SLASH_COMMAND_SPECS {
+        let aliases = if spec.aliases.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (aliases: {})",
+                spec.aliases
+                    .iter()
+                    .map(|alias| format!("/{alias}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let requirement = if spec.requirement == CommandRequirement::TrackChanges {
+            " [requires --track-changes]"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "  {}{}{}  - {}{}{}{}",
+            style::CYAN,
+            spec.usage,
+            style::RESET,
+            spec.description,
+            aliases,
+            requirement,
+            style::RESET
+        ));
+    }
+    lines.extend([
+        String::new(),
+        format!(
+            "{}{}Keyboard Shortcuts:{}",
+            style::BOLD,
+            style::CYAN,
+            style::RESET
+        ),
+        "  ↑/↓ - Navigate history and pickers".to_string(),
+        "  Tab/Enter - Insert a selected picker item".to_string(),
+        "  Esc - Close the active picker".to_string(),
+        "  Ctrl+C - Cancel the current operation".to_string(),
+    ]);
+    lines.join("\n")
 }
 
 #[must_use]
 pub fn format_help_for_command(cmd: &str) -> String {
     use crate::cli::colors::style;
 
-    let cmd_lower = cmd.to_lowercase();
-    let banner = format!(
-        "{}{}═══════ Help: /{} ═══════{}",
+    let command = cmd.trim().trim_start_matches('/');
+    let Some(matched) = match_static_command(command) else {
+        return format!(
+            "{}Unknown command: /{}{}\n\nType /help to browse available commands.",
+            style::YELLOW,
+            command,
+            style::RESET
+        );
+    };
+    let spec = matched.spec;
+    let aliases = if spec.aliases.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nAliases: {}",
+            spec.aliases
+                .iter()
+                .map(|alias| format!("/{alias}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "{}{}Help: /{}{}\n\nUsage: {}\n\n{}\n{}{}",
         style::BOLD,
         style::CYAN,
-        cmd,
-        style::RESET
-    );
-
-    let help_text = match cmd_lower.as_str() {
-        "compact" => {
-            r"Condenses the current conversation history to reduce token usage.
-
-Use when:
-  - Approaching context window limits
-  - After completing a major task phase
-  - Before starting a new topic in the same session
-
-Note: Can only be used once per session. After that, use /resetcompact."
-        }
-
-        "newrule" => {
-            r"Creates a new Sned rule based on your conversation context.
-
-Use when:
-  - You want to codify a pattern from your current work
-  - Creating project-specific conventions
-  - Documenting recurring workflows"
-        }
-
-        "exit" | "q" | "quit" => {
-            r"Exits the Sned CLI.
-
-Aliases: /exit, /q, /quit
-
-Use when:
-  - Finished with your session
-  - Want to return to the shell"
-        }
-
-        "clear" => {
-            r"Clears the current conversation history.
-
-Use when:
-  - Starting fresh without context
-  - Privacy concerns require clearing history
-  - Resetting a confused session
-
-Warning: This action cannot be undone."
-        }
-
-        "history" => {
-            r"Shows recent tasks from your history.
-
-Use when:
-  - Looking for a previous task
-  - Reviewing past work sessions
-  - Finding task IDs for reference"
-        }
-
-        "skills" => {
-            r"Lists available skills that can be invoked via slash commands.
-
-Use when:
-  - Discovering available skills
-  - Checking skill names and descriptions
-  - Learning about project-specific automations"
-        }
-
-        "help" => {
-            r"Shows this help message or detailed help for a specific command.
-
-Usage:
-  /help - Show all commands
-  /help <command> - Show detailed help for a specific command
-
-Examples:
-  /help compact - Get detailed help for /compact
-  /help checkpoint - Get help for checkpoint commands"
-        }
-
-        "settings" => {
-            r"Shows current Sned settings including provider, model, and mode.
-
-Use when:
-  - Verifying current configuration
-  - Checking which model is active
-  - Confirming auto-approve status"
-        }
-
-        "models" => {
-            r"Lists available models across providers.
-
-Use when:
-  - Choosing a model for your task
-  - Checking model availability
-  - Comparing model options"
-        }
-
-        "stats" => {
-            r"Shows token usage and session cost statistics.
-
-Use when:
-  - Monitoring API costs
-  - Tracking token consumption
-  - Optimizing prompt efficiency"
-        }
-
-        "resetcompact" => {
-            r"Clears the compacted summary, allowing /compact to be used again.
-
-Alias: /clearcompact
-
-Use when:
-  - Need to compact again after first use
-  - Compacted summary is outdated
-  - Starting a new major phase"
-        }
-
-        "undo" => {
-            r"Undoes the last turn by reverting file changes.
-
-Requires: --track-changes flag
-
-Use when:
-  - This turn made incorrect changes
-  - Want to retry with a different prompt
-  - Reverting experimental modifications
-
-Note: Requires checkpoint tracking to be enabled."
-        }
-
-        "diff" => {
-            r"Shows changes from the last turn.
-
-Requires: --track-changes flag
-
-Use when:
-  - Reviewing what changed
-  - Preparing to commit changes
-  - Understanding modifications"
-        }
-
-        "log" => {
-            r"Shows turn history.
-
-Requires: --track-changes flag
-
-Use when:
-  - Reviewing session timeline
-  - Finding specific turns
-  - Auditing actions"
-        }
-
-        "commit" => {
-            r#"Commits changes to your git repository.
-
-Requires: --track-changes flag
-
-Usage:
-  /commit "message" - Commit with a custom message
-
-Use when:
-  - Ready to save changes
-  - Creating version control checkpoints
-  - Finalizing a completed task
-
-Example:
-  /commit "fix: resolve authentication bug""#
-        }
-
-        "checkpoint" | "checkpoint-list" | "checkpoint list" => {
-            r"Lists available checkpoints with timestamps.
-
-Requires: --track-changes flag
-
-Aliases: /checkpoint-list, /checkpoint list
-
-Use when:
-  - Finding restore points
-  - Reviewing checkpoint history
-  - Identifying specific turns to restore"
-        }
-
-        "checkpoint-restore" | "checkpoint restore" => {
-            r"Restores files to a specific checkpoint state.
-
-Requires: --track-changes flag
-
-Aliases: /checkpoint-restore, /checkpoint restore
-
-Usage:
-  /checkpoint restore N - Restore to checkpoint N
-
-Use when:
-  - Reverting to a known good state
-  - Undoing multiple turns at once
-  - Experimenting with different approaches
-
-Warning: Reverts all files to checkpoint state."
-        }
-
-        "checkpoint-undo" | "checkpoint undo" => {
-            r"Undoes last turn using checkpoint (reverts files + trims history).
-
-Requires: --track-changes flag
-
-Aliases: /checkpoint-undo, /checkpoint undo
-
-Use when:
-  - Complete undo of last action
-  - Both file and history rollback needed
-  - More thorough than /undo alone"
-        }
-
-        "queue" => {
-            r"Shows pending queued messages waiting for the agent to become idle.
-
-Use when:
-  - Agent is busy and you've queued commands
-  - Want to review what's waiting to execute
-  - Checking queue order and count
-
-Note: Local commands (/help, /stats, etc.) execute immediately even when the agent is busy."
-        }
-
-        "retry" => {
-            r"Retries the most recent safe failed request verbatim.
-
-Use when:
-  - A provider request or stream failed before tool execution
-  - Sned says the request is retryable
-  - You want to resend the exact failed request without retyping it
-
-Note: If the agent is busy, /retry is queued to run next."
-        }
-
-        "plan" => {
-            r"Shows the current plan workflow state and steps.
-
-Use when:
-  - Checking plan progress
-  - Viewing current step status
-  - Reviewing planned actions
-
-Note: Plan state is stored in memory and not persisted to disk."
-        }
-
-        "plan approve" => {
-            r"Approves the current plan and begins step execution.
-
-Use when:
-  - You've reviewed the plan and want to start execution
-  - All steps look correct
-  - Ready to let the agent begin working
-
-Note: Plan steps are executed sequentially with batch approval."
-        }
-
-        "plan pause" => {
-            r"Pauses execution of the current plan.
-
-Use when:
-  - Need to review progress before continuing
-  - Want to edit remaining steps
-  - Need to take a break from plan execution"
-        }
-
-        "plan resume" => {
-            r"Resumes execution of a paused plan.
-
-Use when:
-  - Ready to continue plan execution
-  - After editing steps while paused"
-        }
-
-        "plan abort" => {
-            r"Aborts the current plan and clears plan state.
-
-Use when:
-  - Plan is no longer needed
-  - Want to start over with a new plan
-  - Plan has failed and you want to reset
-
-Note: Already-applied filesystem changes are kept."
-        }
-
-        "plan edit" => {
-            r"Edits a specific step in the plan.
-
-Usage:
-  /plan edit <step> <description>
-
-Use when:
-  - Need to correct a step before approval
-  - Want to refine a step while paused"
-        }
-
-        "plan add" => {
-            r"Adds a new step after a specified step.
-
-Usage:
-  /plan add <after_step> <description>
-
-Use when:
-  - Need to insert a missing step
-  - Want to break down a complex step"
-        }
-
-        "plan remove" => {
-            r"Removes a step from the plan.
-
-Usage:
-  /plan remove <step>
-
-Use when:
-  - A step is redundant
-  - Want to simplify the plan"
-        }
-
-        _ => &format!(
-            "Unknown command: /{cmd}\n\nUse /help to see all available commands."
-        ),
-    };
-
-    format!("{banner}\n\n{help_text}")
+        spec.name,
+        style::RESET,
+        spec.usage,
+        spec.description,
+        spec.detail,
+        aliases
+    )
 }
 
-#[must_use] 
+#[must_use]
 pub fn format_settings_text(provider: &str, model: &str, mode: &str, auto_approve: bool) -> String {
     format!(
         r"Current Sned Settings:
@@ -1918,6 +1813,14 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_command_remains_plain_input_outside_interactive_rejection() {
+        assert_eq!(
+            process_slash_command_with_context("/workflow do this", &[]),
+            "/workflow do this"
+        );
+    }
+
+    #[test]
     fn test_is_compact_command_compact() {
         assert!(is_compact_command("/compact"));
     }
@@ -1988,9 +1891,9 @@ mod tests {
     #[test]
     fn test_format_help_for_command_compact() {
         let text = format_help_for_command("compact");
-        assert!(text.contains("compact"));
-        assert!(text.contains("Condenses the current conversation"));
-        assert!(text.contains("═══════"));
+        assert!(text.contains("Help: /compact"));
+        assert!(text.contains("Usage: /compact"));
+        assert!(text.contains("Condenses the active model context"));
     }
 
     #[test]
@@ -2001,10 +1904,18 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_help_describes_display_only_semantics() {
+        let text = format_help_for_command("clear");
+        assert!(text.contains("visible display"));
+        assert!(text.contains("Model context and saved conversation history are unchanged"));
+        assert!(!text.contains("conversation cleared"));
+    }
+
+    #[test]
     fn test_format_help_for_command_retry() {
         let text = format_help_for_command("retry");
-        assert!(text.contains("Retries the most recent safe failed request verbatim"));
-        assert!(text.contains("queued to run next"));
+        assert!(text.contains("Retry the last safe failed request"));
+        assert!(text.contains("before any tool execution"));
     }
 
     #[test]
@@ -2034,8 +1945,104 @@ mod tests {
 
         let entries = build_slash_command_entries(&[]);
         assert!(entries.iter().all(|entry| {
-            !matches!(entry.name.as_str(), "explain-changes" | "expand" | "newtask")
+            !matches!(
+                entry.name.as_str(),
+                "explain-changes" | "expand" | "newtask"
+            )
         }));
+    }
+
+    #[test]
+    fn test_every_advertised_static_command_parses() {
+        for spec in SLASH_COMMAND_SPECS {
+            for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
+                let invocation = format!("/{name}");
+                let parsed = match spec.id {
+                    SlashCommandId::Compact | SlashCommandId::NewRule => {
+                        SlashCommand::parse(name).is_some()
+                    }
+                    _ => get_cli_only_command(&invocation).is_some(),
+                };
+                assert!(parsed, "advertised command did not parse: {invocation}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_static_command_names_and_aliases_are_unique() {
+        let mut names = std::collections::HashSet::new();
+        for spec in SLASH_COMMAND_SPECS {
+            for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
+                assert!(
+                    names.insert(name.to_ascii_lowercase()),
+                    "duplicate command name or alias: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_availability_hides_commands_without_runtime_state() {
+        let entries =
+            build_available_slash_command_entries(&[], SlashCommandAvailability::default());
+        let names: std::collections::HashSet<&str> =
+            entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains("plan"));
+        assert!(!names.contains("undo"));
+        assert!(!names.contains("retry"));
+        assert!(!names.contains("resetcompact"));
+        assert!(!names.contains("plan approve"));
+
+        let pending_plan = build_available_slash_command_entries(
+            &[],
+            SlashCommandAvailability {
+                track_changes: true,
+                has_retryable_request: true,
+                has_compacted_summary: true,
+                has_plan: true,
+                plan_mode: true,
+                ..Default::default()
+            },
+        );
+        let pending_names: std::collections::HashSet<&str> = pending_plan
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(pending_names.contains("undo"));
+        assert!(pending_names.contains("retry"));
+        assert!(pending_names.contains("resetcompact"));
+        assert!(pending_names.contains("plan approve"));
+        assert!(pending_names.contains("plan edit"));
+        assert!(!pending_names.contains("plan pause"));
+        assert!(!pending_names.contains("plan resume"));
+    }
+
+    #[test]
+    fn test_static_commands_take_precedence_over_skill_names() {
+        use crate::core::context::instructions::{SkillMetadata, SkillSource};
+
+        let skills = vec![SkillMetadata {
+            name: "help".to_string(),
+            description: "Colliding skill".to_string(),
+            path: "/tmp/skills/help/SKILL.md".to_string(),
+            source: SkillSource::Project,
+        }];
+        assert!(SlashCommand::parse_with_skills("help", &skills).is_none());
+        let entries = build_slash_command_entries(&skills);
+        assert_eq!(
+            entries.iter().filter(|entry| entry.name == "help").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_unknown_detection_only_rejects_leading_commands() {
+        assert_eq!(
+            unknown_leading_slash_command("/workflow now", &[]),
+            Some("workflow".to_string())
+        );
+        assert!(unknown_leading_slash_command("please use /workflow now", &[]).is_none());
+        assert!(unknown_leading_slash_command("/compact", &[]).is_none());
     }
 
     #[test]
@@ -2079,52 +2086,35 @@ mod tests {
     fn test_format_help_text_contains_keyboard_shortcuts() {
         let text = format_help_text();
         assert!(text.contains("Keyboard Shortcuts"));
-        assert!(text.contains("Ctrl+A"));
-        assert!(text.contains("Ctrl+E"));
-        assert!(text.contains("Ctrl+U"));
-        assert!(text.contains("Ctrl+K"));
-        assert!(text.contains("Ctrl+W"));
         assert!(text.contains("Ctrl+C"));
-        assert!(text.contains("Arrow Left"));
-        assert!(text.contains("Arrow Up"));
+        assert!(text.contains("↑/↓"));
+        assert!(text.contains("Enter"));
+        assert!(text.contains("Esc"));
     }
 
     #[test]
     fn test_format_help_text_contains_ansi_codes() {
         let text = format_help_text();
-        // ANSI escape code prefix
         assert!(text.contains("\x1b["));
-        // Bold style
         assert!(text.contains("\x1b[1m"));
-        // Cyan color (for command names)
         assert!(text.contains("\x1b[96m"));
-        // Dim style (for descriptions)
-        assert!(text.contains("\x1b[2m"));
-        // Reset code
         assert!(text.contains("\x1b[0m"));
     }
 
     #[test]
-    fn test_format_help_text_has_visual_hierarchy() {
+    fn test_format_help_text_is_generated_from_registry() {
         let text = format_help_text();
-        // Banner at top
         assert!(text.contains("═══════ Sned Commands ═══════"));
-        // Separators between sections
-        assert!(text.contains("─────────────────────────────"));
-        // Section headers
-        assert!(text.contains("Base Commands:"));
-        assert!(text.contains("CLI-Only Commands (handled locally):"));
-        assert!(text.contains("Keyboard Shortcuts:"));
-        assert!(text.contains("Examples:"));
+        for spec in SLASH_COMMAND_SPECS {
+            assert!(text.contains(spec.usage), "missing help for {}", spec.name);
+        }
     }
 
     #[test]
     fn test_format_help_text_shows_aliases() {
         let text = format_help_text();
-        // Exit command aliases
-        assert!(text.contains("aliases: /q, /quit"));
-        // Help command alias
-        assert!(text.contains("alias: /help <command>"));
+        assert!(text.contains("aliases: /quit, /q"));
+        assert!(text.contains("aliases: /?"));
     }
 
     #[test]
@@ -2143,16 +2133,16 @@ mod tests {
     #[test]
     fn test_format_help_for_command_shows_aliases() {
         let checkpoint_list = format_help_for_command("checkpoint list");
-        assert!(checkpoint_list.contains("Aliases: /checkpoint-list, /checkpoint list"));
+        assert!(checkpoint_list.contains("Aliases: /checkpoint-list"));
 
         let checkpoint_restore = format_help_for_command("checkpoint restore");
-        assert!(checkpoint_restore.contains("Aliases: /checkpoint-restore, /checkpoint restore"));
+        assert!(checkpoint_restore.contains("Aliases: /checkpoint-restore"));
 
         let checkpoint_undo = format_help_for_command("checkpoint undo");
-        assert!(checkpoint_undo.contains("Aliases: /checkpoint-undo, /checkpoint undo"));
+        assert!(checkpoint_undo.contains("Aliases: /checkpoint-undo"));
 
         let resetcompact = format_help_for_command("resetcompact");
-        assert!(resetcompact.contains("Alias: /clearcompact"));
+        assert!(resetcompact.contains("Aliases: /clearcompact"));
     }
 
     #[test]

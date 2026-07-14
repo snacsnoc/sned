@@ -360,7 +360,7 @@ impl InteractiveSession {
         }
 
         if let Some(p) = prompt {
-            let processed_prompt = crate::cli::slash_commands::process_slash_command(&p);
+            let processed_prompt = process_prompt_with_skills(&p, &agent).await;
             let (clean_prompt, parsed_image_paths) =
                 crate::cli::image_input::parse_images_from_input(&processed_prompt);
             let mut all_image_paths = self.task_opts.image.clone();
@@ -423,6 +423,64 @@ impl InteractiveSession {
 /// Action returned by key event handler.
 enum Action {
     Submit(String),
+}
+
+async fn refresh_slash_command_entries(
+    app: &mut App,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+) {
+    let state = state_handle.lock().await.clone();
+    let (skills, availability) = if let Some(state) = state {
+        let state = state.lock().await;
+        (
+            state.available_skills.clone(),
+            crate::cli::slash_commands::SlashCommandAvailability::from_task_state(
+                &state,
+                app.slash_command_track_changes,
+                app.mode == "PLAN",
+            ),
+        )
+    } else {
+        (
+            Vec::new(),
+            crate::cli::slash_commands::SlashCommandAvailability {
+                track_changes: app.slash_command_track_changes,
+                plan_mode: app.mode == "PLAN",
+                ..Default::default()
+            },
+        )
+    };
+    app.slash_command_all_entries =
+        crate::cli::slash_commands::build_available_slash_command_entries(&skills, availability);
+}
+
+fn open_slash_command_help(app: &mut App, query: &str) {
+    app.set_input_text(query);
+    app.input.move_cursor(tui_textarea::CursorMove::End);
+    app.slash_command_active = true;
+    app.slash_command_help_active = true;
+    app.slash_command_selected = 0;
+    app.slash_command_results =
+        crate::cli::slash_commands::filter_slash_commands(&app.slash_command_all_entries, query);
+    app.slash_command_completed_text = None;
+}
+
+fn close_slash_command_help(app: &mut App) {
+    app.slash_command_active = false;
+    app.slash_command_help_active = false;
+    app.slash_command_results.clear();
+    app.slash_command_selected = 0;
+    app.slash_command_completed_text = None;
+}
+
+fn resolve_interactive_model_input(
+    text: &str,
+    skills: &[crate::core::context::instructions::SkillMetadata],
+) -> Result<String, String> {
+    if let Some(command) = crate::cli::slash_commands::unknown_leading_slash_command(text, skills) {
+        return Err(command);
+    }
+    Ok(crate::cli::slash_commands::process_slash_command_with_context(text, skills))
 }
 
 fn is_shutdown_submit(text: &str) -> bool {
@@ -884,7 +942,7 @@ async fn build_initial_message_from_prompt(
     agent_loop: &Arc<tokio::sync::Mutex<crate::core::agent_loop::AgentLoop>>,
     output_writer: &OutputWriterArc,
 ) -> crate::providers::StorageMessage {
-    let processed_prompt = crate::cli::slash_commands::process_slash_command(prompt);
+    let processed_prompt = process_prompt_with_skills(prompt, agent_loop).await;
     let (clean_prompt, parsed_image_paths) =
         crate::cli::image_input::parse_images_from_input(&processed_prompt);
 
@@ -909,6 +967,15 @@ async fn build_initial_message_from_prompt(
         metrics: None,
         ts: Some(chrono::Utc::now().timestamp_millis() as u64),
     }
+}
+
+async fn process_prompt_with_skills(
+    prompt: &str,
+    agent_loop: &Arc<tokio::sync::Mutex<crate::core::agent_loop::AgentLoop>>,
+) -> String {
+    let state_handle = agent_loop.lock().await.state_handle();
+    let skills = state_handle.lock().await.available_skills.clone();
+    crate::cli::slash_commands::process_slash_command_with_context(prompt, &skills)
 }
 
 async fn run_agent_task(
@@ -1021,6 +1088,7 @@ async fn handle_key_event(
         {
             app.set_input_text_and_cursor(&new_text, cursor_pos);
             app.slash_command_active = false;
+            app.slash_command_help_active = false;
             app.slash_command_results.clear();
             app.slash_command_selected = 0;
             // Record the post-completion text so the post-text-input
@@ -1033,6 +1101,42 @@ async fn handle_key_event(
         }
 
         false
+    }
+
+    if app.slash_command_help_active {
+        match key.code {
+            KeyCode::Up => {
+                app.slash_command_selected = app.slash_command_selected.saturating_sub(1);
+                return Ok(None);
+            }
+            KeyCode::Down => {
+                if !app.slash_command_results.is_empty() {
+                    app.slash_command_selected =
+                        (app.slash_command_selected + 1).min(app.slash_command_results.len() - 1);
+                }
+                return Ok(None);
+            }
+            KeyCode::Enter | KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if let Some(entry) = app
+                    .slash_command_results
+                    .get(app.slash_command_selected)
+                    .cloned()
+                {
+                    let suffix = if entry.requires_args { " " } else { "" };
+                    let command = format!("/{}{}", entry.name, suffix);
+                    close_slash_command_help(app);
+                    app.set_input_text(&command);
+                    app.input.move_cursor(tui_textarea::CursorMove::End);
+                }
+                return Ok(None);
+            }
+            KeyCode::Esc => {
+                close_slash_command_help(app);
+                app.set_input_text("");
+                return Ok(None);
+            }
+            _ => {}
+        }
     }
 
     // Tab or Enter with active model picker -> insert model spec into textarea
@@ -1120,6 +1224,7 @@ async fn handle_key_event(
                 // Same early-return issue: slash mode evaluation at end of
                 // handle_key_event() never runs for followup entries.
                 app.slash_command_active = false;
+                app.slash_command_help_active = false;
                 app.slash_command_results.clear();
                 app.slash_command_selected = 0;
                 app.slash_command_completed_text = None;
@@ -1136,6 +1241,7 @@ async fn handle_key_event(
                     Style::default().fg(theme::WARNING_FG),
                 );
                 app.slash_command_active = false;
+                app.slash_command_help_active = false;
                 app.slash_command_results.clear();
                 app.slash_command_selected = 0;
                 app.slash_command_completed_text = None;
@@ -1150,6 +1256,7 @@ async fn handle_key_event(
                 // Same early-return issue as main submit: slash mode evaluation
                 // at end of handle_key_event() never runs.
                 app.slash_command_active = false;
+                app.slash_command_help_active = false;
                 app.slash_command_results.clear();
                 app.slash_command_selected = 0;
                 app.slash_command_completed_text = None;
@@ -1175,6 +1282,7 @@ async fn handle_key_event(
             // the slash mode evaluation at the end of handle_key_event() never
             // runs for Enter submissions, leaving slash_command_active=true.
             app.slash_command_active = false;
+            app.slash_command_help_active = false;
             app.slash_command_results.clear();
             app.slash_command_selected = 0;
             app.slash_command_completed_text = None;
@@ -1209,7 +1317,7 @@ async fn handle_key_event(
                 let mut state = sh.lock().await;
                 state.last_injected_plan_state_hash = None;
             }
-            app.push_plain(format!("Conversation cleared (confirmed via {trigger})."));
+            app.push_plain(format!("Display cleared (confirmed via {trigger})."));
             if let Some(err) = clear_error {
                 app.push_styled(
                     format!("Failed to clear persisted scrollback: {err}"),
@@ -1218,7 +1326,7 @@ async fn handle_key_event(
             }
         } else {
             app.pending_clear = None;
-            app.push_styled("Clear cancelled.", theme::dim_style());
+            app.push_styled("Clear display cancelled.", theme::dim_style());
         }
         return Ok(None);
     }
@@ -1231,6 +1339,18 @@ async fn handle_key_event(
         }
         if key.code == KeyCode::Down {
             app.scroll_lines(1);
+            return Ok(None);
+        }
+    }
+
+    if app.slash_command_active && !app.slash_command_results.is_empty() {
+        if key.code == KeyCode::Up {
+            app.slash_command_selected = app.slash_command_selected.saturating_sub(1);
+            return Ok(None);
+        }
+        if key.code == KeyCode::Down {
+            app.slash_command_selected =
+                (app.slash_command_selected + 1).min(app.slash_command_results.len() - 1);
             return Ok(None);
         }
     }
@@ -1300,6 +1420,7 @@ async fn handle_key_event(
     // Escape key - dismiss slash command picker
     if key.code == KeyCode::Esc && app.slash_command_active {
         app.slash_command_active = false;
+        app.slash_command_help_active = false;
         app.slash_command_results.clear();
         app.slash_command_selected = 0;
         let text = app.input.lines().join("\n");
@@ -1313,7 +1434,7 @@ async fn handle_key_event(
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.pending_clear = Some("ctrl_l".to_string());
         app.push_styled(
-            "Clear output? (y to confirm, any other key to cancel): ",
+            "Clear display? (y to confirm, any other key to cancel): ",
             Style::default().fg(theme::WARNING_FG),
         );
         return Ok(None);
@@ -1348,6 +1469,17 @@ async fn handle_key_event(
 
     // Check for @ mention mode - show file picker overlay (debounced)
     let input_text = app.input.lines().join("\n");
+    if app.slash_command_help_active {
+        app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
+            &app.slash_command_all_entries,
+            input_text.trim(),
+        );
+        app.slash_command_selected = app
+            .slash_command_selected
+            .min(app.slash_command_results.len().saturating_sub(1));
+        return Ok(None);
+    }
+
     let mq = crate::core::file_search::extract_mention_query(&input_text);
     if mq.in_mention_mode && !app.cwd.is_empty() {
         let query = mq.query;
@@ -1390,7 +1522,9 @@ async fn handle_key_event(
             // next genuinely-new input can re-enable the picker.
             app.slash_command_completed_text = None;
         } else if !app.slash_command_active {
+            refresh_slash_command_entries(app, state_handle).await;
             app.slash_command_active = true;
+            app.slash_command_help_active = false;
             app.slash_command_selected = 0;
             app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
                 &app.slash_command_all_entries,
@@ -1406,6 +1540,7 @@ async fn handle_key_event(
         }
     } else if app.slash_command_active {
         app.slash_command_active = false;
+        app.slash_command_help_active = false;
         app.slash_command_results.clear();
         app.slash_command_selected = 0;
         app.slash_command_completed_text = None;
@@ -1430,13 +1565,12 @@ async fn handle_cli_only_command(
     agent_done: &Arc<tokio::sync::Notify>,
     agent_start_time: &Arc<Mutex<Option<Instant>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    _state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     task_opts: &TaskOptions,
     auto_approve: bool,
 ) -> anyhow::Result<bool> {
     use crate::cli::slash_commands::{
-        CliOnlyCommand, format_changes_text, format_help_for_command, format_help_text,
-        format_settings_text, format_stats_text,
+        CliOnlyCommand, format_changes_text, format_settings_text, format_stats_text,
     };
 
     // Local commands execute immediately; only agent-required commands are blocked
@@ -1455,7 +1589,7 @@ async fn handle_cli_only_command(
         CliOnlyCommand::Clear => {
             app.pending_clear = Some("slash".to_string());
             app.push_styled(
-                "Clear output? (y to confirm, any other key to cancel): ",
+                "Clear display? (y to confirm, any other key to cancel): ",
                 Style::default().fg(theme::WARNING_FG),
             );
         }
@@ -1498,16 +1632,12 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::Help => {
-            let help_text = format_help_text();
-            for line in ansi_to_ratatui_lines(&help_text) {
-                app.push_output(line);
-            }
+            refresh_slash_command_entries(app, state_handle).await;
+            open_slash_command_help(app, "");
         }
         CliOnlyCommand::HelpOption(cmd) => {
-            let help_text = format_help_for_command(&cmd);
-            for line in ansi_to_ratatui_lines(&help_text) {
-                app.push_output(line);
-            }
+            refresh_slash_command_entries(app, state_handle).await;
+            open_slash_command_help(app, &cmd);
         }
         CliOnlyCommand::Settings => {
             let provider = task_opts.provider.as_deref().unwrap_or("anthropic");
@@ -2929,9 +3059,28 @@ async fn run_main_loop(
                                     }
                                 }
 
-                                // Process model-side slash commands (e.g., /compact, /plan)
-                                let processed =
-                                    crate::cli::slash_commands::process_slash_command(&text);
+                                let skills = {
+                                    let state = state_handle.lock().await.clone();
+                                    if let Some(state) = state {
+                                        state.lock().await.available_skills.clone()
+                                    } else {
+                                        Vec::new()
+                                    }
+                                };
+                                let processed = match resolve_interactive_model_input(
+                                    &text, &skills,
+                                ) {
+                                    Ok(processed) => processed,
+                                    Err(command) => {
+                                        app.push_styled(
+                                            format!(
+                                                "Unknown command /{command}. Type /help to list commands."
+                                            ),
+                                            Style::default().fg(theme::WARNING_FG),
+                                        );
+                                        continue;
+                                    }
+                                };
 
                                 // If agent is busy, queue the message; otherwise spawn
                                 if agent_busy.load(Ordering::Relaxed)
@@ -3202,6 +3351,7 @@ pub async fn run_interactive_shell_inner(
     // Command history is loaded by App::new() via FileHistory::load()
     // Reload in case history was written by another session
     app.history.reload();
+    app.slash_command_track_changes = task_opts.track_changes;
 
     {
         let sess = session.lock().await;
@@ -3211,11 +3361,21 @@ pub async fn run_interactive_shell_inner(
         *sh = Some(sess.state_handle().await);
 
         let agent_loop = sess.agent_loop().await.state_handle();
-        let skills = {
+        let (skills, availability) = {
             let state = agent_loop.lock().await;
-            state.available_skills.clone()
+            (
+                state.available_skills.clone(),
+                crate::cli::slash_commands::SlashCommandAvailability::from_task_state(
+                    &state,
+                    task_opts.track_changes,
+                    app.mode == "PLAN",
+                ),
+            )
         };
-        let entries = crate::cli::slash_commands::build_slash_command_entries(&skills);
+        let entries = crate::cli::slash_commands::build_available_slash_command_entries(
+            &skills,
+            availability,
+        );
         app.slash_command_all_entries = entries;
     }
 
@@ -4357,6 +4517,146 @@ mod tests {
         }];
         app.slash_command_selected = 0;
         app
+    }
+
+    #[tokio::test]
+    async fn test_help_overlay_filters_and_inserts_without_submitting() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.slash_command_all_entries =
+            crate::cli::slash_commands::build_slash_command_entries(&[]);
+
+        open_slash_command_help(&mut app, "clear");
+        assert!(app.slash_command_help_active);
+        assert_eq!(app.slash_command_results.len(), 1);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "/clear");
+        assert!(!app.slash_command_active);
+        assert!(!app.slash_command_help_active);
+
+        open_slash_command_help(&mut app, "commit");
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "/commit ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_help_overlay_escape_closes_and_clears_query() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.slash_command_all_entries =
+            crate::cli::slash_commands::build_slash_command_entries(&[]);
+        open_slash_command_help(&mut app, "plan");
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert!(!app.slash_command_help_active);
+        assert!(app.input.lines().join("\n").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clear_confirmation_reports_display_only_semantics() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.push_plain("visible transcript");
+        app.pending_clear = Some("slash".to_string());
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        let rendered = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Display cleared"));
+        assert!(!rendered.contains("Conversation cleared"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_interactive_resolution_rejects_only_unknown_leading_commands() {
+        assert_eq!(
+            resolve_interactive_model_input("/workflow now", &[]),
+            Err("workflow".to_string())
+        );
+        assert_eq!(
+            resolve_interactive_model_input("please discuss /workflow now", &[]),
+            Ok("please discuss /workflow now".to_string())
+        );
+        assert!(
+            resolve_interactive_model_input("/compact", &[])
+                .expect("compact should resolve")
+                .contains("explicit_instructions")
+        );
+    }
+
+    #[test]
+    fn test_interactive_resolution_expands_dynamic_skill_before_unknown_rejection() {
+        use crate::core::context::instructions::{SkillMetadata, SkillSource};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let skill_path = temp.path().join("SKILL.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: test-skill\ndescription: test\n---\nFollow this skill.",
+        )
+        .unwrap();
+        let skills = vec![SkillMetadata {
+            name: "test-skill".to_string(),
+            description: "test".to_string(),
+            path: skill_path.to_string_lossy().into_owned(),
+            source: SkillSource::Project,
+        }];
+
+        let resolved = resolve_interactive_model_input("/test-skill inspect src", &skills)
+            .expect("discovered skill should resolve");
+        assert!(resolved.contains("type=\"skill\" name=\"test-skill\""));
+        assert!(resolved.ends_with("inspect src"));
     }
 
     /// Reproduces the user-reported bug: tab completion for `/plan` does

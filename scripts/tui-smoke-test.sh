@@ -51,7 +51,7 @@ tui-approval-scroll   Scroll away, then verify approval prompt stays visible
 tui-approval-under-backpressure Flood output, block input, then approve after render
 tui-long-completion-navigation Scroll completion and transcript at both boundaries
 tui-history-navigation Type prompts, press Up arrow, verify previous prompt appears
-tui-slash-commands    Type /help, verify help text renders in output
+tui-slash-commands    Search /help, then reject an unknown slash command locally
 tui-auto-scroll       Type multiple prompts, verify output scrolls to show latest
 tui-model-switch      Type /model mock/mock-model, verify switch message renders
 tui-busy-exit         While mock provider streams output, send /exit and verify prompt shutdown
@@ -103,7 +103,7 @@ test_description() {
         tui-approval-under-backpressure) echo "Flood output, block input, then approve after render" ;;
         tui-long-completion-navigation) echo "Scroll completion and transcript at both boundaries" ;;
         tui-history-navigation) echo "Type prompts, press Up arrow, verify previous prompt appears in input" ;;
-        tui-slash-commands) echo "Type /help, verify help text renders in output" ;;
+        tui-slash-commands) echo "Search /help, then reject an unknown slash command locally" ;;
         tui-auto-scroll) echo "Type multiple prompts, verify output scrolls to show latest" ;;
         tui-model-switch) echo "Type /model mock/mock-model, verify switch message renders" ;;
         tui-busy-exit) echo "While mock provider streams output, send /exit and verify prompt shutdown" ;;
@@ -126,7 +126,7 @@ test_source() {
         tui-approval-under-backpressure) echo "src/cli/output.rs priority delivery / src/cli/interactive.rs approval input routing" ;;
         tui-long-completion-navigation) echo "src/cli/tui/app.rs completion scroll boundaries / src/cli/interactive.rs navigation routing" ;;
         tui-history-navigation) echo "src/cli/interactive.rs handle_key_event Up/Down arrow history / src/cli/tui/history.rs FileHistory" ;;
-        tui-slash-commands) echo "src/cli/interactive.rs handle_cli_only_command / src/cli/slash_commands.rs format_help_text" ;;
+        tui-slash-commands) echo "src/cli/interactive.rs help overlay and unknown-command routing / src/cli/slash_commands.rs registry" ;;
         tui-auto-scroll) echo "src/cli/tui/app.rs scroll_mode / src/cli/interactive.rs drain_output auto-scroll" ;;
         tui-model-switch) echo "src/cli/interactive.rs handle_cli_only_command ModelSwitch / src/core/agent_loop.rs set_provider" ;;
         tui-busy-exit) echo "src/cli/interactive.rs busy-state shutdown path / src/providers/mock.rs busy_stream_scenario" ;;

@@ -595,17 +595,34 @@ def history_navigation():
 
 
 def slash_commands():
+    sent_unknown = False
     sent_help = False
+    searched_help = False
+    inserted_exit = False
     sent_exit = False
 
     def tick(session):
-        nonlocal sent_help, sent_exit
-        if "type a prompt" in session.text and not sent_help:
+        nonlocal sent_unknown, sent_help, searched_help, inserted_exit, sent_exit
+        text = clean_output(session.buf)
+        compact_text = re.sub(r"\s+", "", text)
+        if "type a prompt" in text and not sent_unknown:
+            session.send(b"/workflow\r")
+            sent_unknown = True
+            return
+        if sent_unknown and "Unknowncommand/workflow" in compact_text and not sent_help:
             session.send(b"/help\r")
             sent_help = True
-        if sent_help and "Keyboard Shortcuts:" in session.text and not sent_exit:
-            time.sleep(0.25)
-            session.send(b"/exit\r")
+            return
+        if sent_help and "CommandHelp" in compact_text and not searched_help:
+            session.send(b"exit")
+            searched_help = True
+            return
+        if searched_help and "Exittheinteractiveshell" in compact_text and not inserted_exit:
+            session.send(b"\r")
+            inserted_exit = True
+            return
+        if inserted_exit and not sent_exit:
+            session.send(b"\r")
             sent_exit = True
 
     with PtySession("sned-slash-cmd.") as session:
@@ -614,12 +631,19 @@ def slash_commands():
         report(
             [
                 (sent_help, "/help was not sent"),
-                (sent_exit, "/exit was not sent after help rendered"),
-                ("Ctrl+C" in session.text, "help text with keyboard shortcuts not found in output"),
+                (searched_help, "searchable help overlay did not render"),
+                (inserted_exit, "filtered command details did not render"),
+                (sent_unknown, "unknown slash command was not sent"),
+                (
+                    "Unknowncommand/workflow"
+                    in re.sub(r"\s+", "", clean_output(session.buf)),
+                    "unknown slash command was not rejected locally",
+                ),
+                (sent_exit, "/exit was not sent after local rejection"),
                 (not session.timed_out, "sned did not exit before timeout"),
                 (session.exit_code == 0, f"sned exited with {session.exit_code}"),
             ],
-            "/help rendered help text in output",
+            "/help search and unknown-command rejection worked",
         )
 
 

@@ -407,6 +407,8 @@ pub struct App {
     pub cached_window_fingerprint: (usize, usize, usize, usize, usize, ScrollMode),
     /// Whether the slash command picker is active.
     pub slash_command_active: bool,
+    pub slash_command_help_active: bool,
+    pub slash_command_track_changes: bool,
     /// Filtered slash command results for the current query.
     pub slash_command_results: Vec<crate::cli::slash_commands::SlashCommandEntry>,
     /// Currently selected index in the result list.
@@ -557,6 +559,7 @@ impl App {
         self.picker_active = false;
         self.mention_search_active = false;
         self.slash_command_active = false;
+        self.slash_command_help_active = false;
         self.model_picker_active = false;
         self.needs_redraw = true;
         self.pin_approval_bottom();
@@ -721,6 +724,8 @@ impl App {
             cached_spacer: String::new(),
             cached_spacer_len: 0,
             slash_command_active: false,
+            slash_command_help_active: false,
+            slash_command_track_changes: false,
             slash_command_results: Vec::new(),
             slash_command_selected: 0,
             slash_command_all_entries: Vec::new(),
@@ -2021,7 +2026,9 @@ impl App {
             return;
         }
 
-        let input_title = if crate::core::approval::is_any_followup_question_active() {
+        let input_title = if self.slash_command_help_active {
+            " Help search ".to_string()
+        } else if crate::core::approval::is_any_followup_question_active() {
             " Follow-up reply ".to_string()
         } else if self.agent_busy {
             if self.reasoning_active {
@@ -2489,6 +2496,11 @@ impl App {
 
     /// Render slash command picker overlay as a floating Table widget.
     fn render_slash_command_overlay(&self, frame: &mut Frame, output_area: Rect) {
+        if self.slash_command_help_active {
+            self.render_slash_command_help_overlay(frame, output_area);
+            return;
+        }
+
         let max_height = 10.min(self.slash_command_results.len() as u16);
         let width = 50.min(output_area.width);
 
@@ -2528,6 +2540,109 @@ impl App {
 
         frame.render_widget(Clear, overlay_area);
         frame.render_widget(picker, overlay_area);
+    }
+
+    fn render_slash_command_help_overlay(&self, frame: &mut Frame, output_area: Rect) {
+        let width = output_area.width.saturating_sub(4).min(100);
+        let height = output_area.height.saturating_sub(2);
+        let overlay_area = Rect {
+            x: output_area.x + output_area.width.saturating_sub(width) / 2,
+            y: output_area.y + output_area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        if overlay_area.width < 4 || overlay_area.height < 4 {
+            return;
+        }
+
+        frame.render_widget(Clear, overlay_area);
+        let block = theme::overlay_block(
+            " Command Help · type to search · ↑↓ move · Enter insert · Esc close ",
+        );
+        let inner = block.inner(overlay_area);
+        frame.render_widget(block, overlay_area);
+
+        let (list_area, detail_area) = if inner.width >= 72 {
+            let [list, detail] =
+                Layout::horizontal([Constraint::Length(34), Constraint::Min(24)]).areas(inner);
+            (list, detail)
+        } else {
+            let list_height = (inner.height / 2).max(3);
+            let [list, detail] =
+                Layout::vertical([Constraint::Length(list_height), Constraint::Min(3)])
+                    .areas(inner);
+            (list, detail)
+        };
+
+        let visible_rows = list_area.height.saturating_sub(2).max(1) as usize;
+        let first_visible = self
+            .slash_command_selected
+            .saturating_sub(visible_rows.saturating_sub(1));
+        let rows: Vec<Line> = if self.slash_command_results.is_empty() {
+            vec![Line::from(Span::styled(
+                " No matching commands",
+                theme::dim_style(),
+            ))]
+        } else {
+            self.slash_command_results
+                .iter()
+                .enumerate()
+                .skip(first_visible)
+                .take(visible_rows)
+                .map(|(index, entry)| {
+                    let label = format!(" /{}  {}", entry.name, entry.description);
+                    if index == self.slash_command_selected {
+                        Line::from(Span::styled(label, theme::picker_selected_style()))
+                    } else {
+                        Line::from(label)
+                    }
+                })
+                .collect()
+        };
+        frame.render_widget(
+            Paragraph::new(rows)
+                .block(theme::overlay_block(format!(
+                    " Commands ({}) ",
+                    self.slash_command_results.len()
+                )))
+                .wrap(Wrap { trim: true }),
+            list_area,
+        );
+
+        let detail = self
+            .slash_command_results
+            .get(self.slash_command_selected)
+            .map_or_else(
+                || vec![Line::from("Type to search available commands.")],
+                |entry| {
+                    let mut lines = vec![
+                        Line::from(Span::styled(
+                            entry.usage(),
+                            Style::default().fg(theme::ACCENT),
+                        )),
+                        Line::from(entry.description.clone()),
+                        Line::from(entry.detail()),
+                    ];
+                    if !entry.aliases.is_empty() {
+                        lines.push(Line::from(format!(
+                            "Aliases: {}",
+                            entry
+                                .aliases
+                                .iter()
+                                .map(|alias| format!("/{alias}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                    lines
+                },
+            );
+        frame.render_widget(
+            Paragraph::new(detail)
+                .block(theme::overlay_block(" Details "))
+                .wrap(Wrap { trim: false }),
+            detail_area,
+        );
     }
 
     /// Render model picker overlay as a floating widget.
@@ -3447,6 +3562,7 @@ mod tests {
     fn test_slash_command_fields_initialized() {
         let app = App::new();
         assert!(!app.slash_command_active);
+        assert!(!app.slash_command_help_active);
         assert!(app.slash_command_results.is_empty());
         assert_eq!(app.slash_command_selected, 0);
         assert!(app.slash_command_all_entries.is_empty());
@@ -3488,6 +3604,33 @@ mod tests {
             !found,
             "slash command overlay should not render when slash_command_active is false"
         );
+    }
+
+    #[test]
+    fn test_command_help_overlay_renders_list_and_details_at_wide_and_narrow_widths() {
+        for (width, height) in [(100, 24), (50, 18)] {
+            let mut app = App::new();
+            app.slash_command_active = true;
+            app.slash_command_help_active = true;
+            app.slash_command_results =
+                crate::cli::slash_commands::build_slash_command_entries(&[]);
+            app.slash_command_selected = app
+                .slash_command_results
+                .iter()
+                .position(|entry| entry.name == "clear")
+                .unwrap();
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("help overlay should render");
+
+            let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+            assert!(rendered.contains("Command Help"));
+            assert!(rendered.contains("Details"));
+            assert!(rendered.contains("/clear"));
+            assert!(rendered.contains("Clear the visible display"));
+        }
     }
 
     #[test]
