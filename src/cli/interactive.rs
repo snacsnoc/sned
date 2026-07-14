@@ -243,7 +243,6 @@ impl InteractiveSession {
         let context_info = get_context_window_info(provider.as_ref());
         let context_window = format_context_window(context_info.context_window);
 
-        // Use stderr-aware color functions since this is printed via eprint_info()
         format!(
             "{} {}/{} | task {} | {} mode | {}",
             crate::cli::colors::badge_stderr("sned"),

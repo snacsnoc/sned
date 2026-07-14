@@ -98,43 +98,6 @@ pub fn error(text: &str) -> String {
     }
 }
 
-/// Format a warning message consistently (for stderr output).
-#[must_use]
-pub fn warning(text: &str) -> String {
-    if stderr_colors_disabled() {
-        format!("[sned] Warning: {text}")
-    } else {
-        format!(
-            "{}[sned]{} {}Warning:{} {}",
-            style::DIM,
-            style::RESET,
-            style::YELLOW,
-            style::RESET,
-            text
-        )
-    }
-}
-
-/// Format an info/status message consistently (for stderr output).
-#[must_use]
-pub fn info(text: &str) -> String {
-    if stderr_colors_disabled() {
-        format!("[sned] {text}")
-    } else {
-        format!("{}[sned]{} {}", style::DIM, style::RESET, text)
-    }
-}
-
-/// Format success message (for stdout output).
-#[must_use]
-pub fn success(text: &str) -> String {
-    if stdout_colors_disabled() {
-        format!("✓ {text}")
-    } else {
-        format!("{}✓{} {}", style::GREEN, style::RESET, text)
-    }
-}
-
 /// Format the interactive prompt (stdout).
 #[must_use]
 pub fn prompt(text: &str) -> String {
@@ -144,32 +107,6 @@ pub fn prompt(text: &str) -> String {
 /// Print an error message to stderr.
 pub fn eprint_error(text: &str) {
     eprintln!("{}", error(text));
-}
-
-/// Print a warning message to stderr.
-pub fn eprint_warning(text: &str) {
-    eprintln!("{}", warning(text));
-}
-
-/// Print an info message to stderr.
-pub fn eprint_info(text: &str) {
-    eprintln!("{}", info(text));
-}
-
-/// Print a success message to stderr.
-/// Safe for agent-path output (tool handlers, agent_loop, etc.).
-pub fn eprint_success(text: &str) {
-    eprintln!("{}", success(text));
-}
-
-/// Print multi-line text to stderr with `\r\n` line endings (for raw mode).
-pub fn eprint_raw(text: &str) {
-    use std::io::Write;
-    let stderr = std::io::stderr();
-    let mut handle = stderr.lock();
-    let _ = handle.write_all(text.replace('\n', "\r\n").as_bytes());
-    let _ = handle.write_all(b"\r\n");
-    let _ = handle.flush();
 }
 
 /// Format a tool result success indicator.
@@ -442,12 +379,6 @@ mod tests {
                 None => std::env::remove_var("TERM"),
             }
         }
-    }
-
-    #[test]
-    fn test_success_format() {
-        let plain = success("done");
-        assert!(plain.contains("done"));
     }
 
     #[test]
