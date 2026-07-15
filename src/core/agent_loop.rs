@@ -689,80 +689,61 @@ impl AgentLoop {
             .is_some_and(|plan| plan.approved && !plan.complete && !plan.paused)
     }
 
-    async fn record_first_output_emit_time(&self) {
-        // Atomic fast-path: only the first chunk takes the state mutex.
-        // Subsequent chunks on the same turn see the flag set and
-        // return without contending with the TUI main loop's
-        // `try_lock` reads.
-        if self
-            .first_output_emit_recorded
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+    async fn record_first_state_update(
+        &self,
+        recorded: &std::sync::atomic::AtomicBool,
+        update: impl FnOnce(&mut TaskState),
+    ) {
+        // Only the first chunk should contend with TUI state reads for each timing marker.
+        if recorded.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         let mut state = self.state.lock().await;
-        // Double-check under the lock in case another task claimed
-        // the flag while we were waiting.
-        if self
-            .first_output_emit_recorded
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if recorded.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
-        if state.first_output_emit_time.is_none() {
-            if crate::cli::output::timing_enabled() {
-                let now = std::time::Instant::now();
-                state.first_output_emit_time = Some(now);
-                if state.first_token_time.is_none() {
-                    state.first_token_time = Some(now);
+        update(&mut state);
+    }
+
+    async fn record_first_output_emit_time(&self) {
+        self.record_first_state_update(&self.first_output_emit_recorded, |state| {
+            if state.first_output_emit_time.is_none() {
+                if crate::cli::output::timing_enabled() {
+                    let now = std::time::Instant::now();
+                    state.first_output_emit_time = Some(now);
+                    if state.first_token_time.is_none() {
+                        state.first_token_time = Some(now);
+                    }
                 }
+                state.reasoning_active = false;
             }
-            state.reasoning_active = false;
-        }
+        })
+        .await;
     }
 
     async fn record_first_reasoning_chunk_time(&self) {
-        if self
-            .first_reasoning_chunk_recorded
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        let mut state = self.state.lock().await;
-        if self
-            .first_reasoning_chunk_recorded
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
-        }
-        if state.first_reasoning_chunk_time.is_none() {
-            if crate::cli::output::timing_enabled() {
-                state.first_reasoning_chunk_time = Some(std::time::Instant::now());
+        self.record_first_state_update(&self.first_reasoning_chunk_recorded, |state| {
+            if state.first_reasoning_chunk_time.is_none() {
+                if crate::cli::output::timing_enabled() {
+                    state.first_reasoning_chunk_time = Some(std::time::Instant::now());
+                }
+                state.reasoning_active = true;
             }
-            state.reasoning_active = true;
-        }
+        })
+        .await;
     }
 
     async fn record_first_displayable_text_time(&self) {
         if !crate::cli::output::timing_enabled() {
             return;
         }
-        if self
-            .first_displayable_text_recorded
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        let mut state = self.state.lock().await;
-        if self
-            .first_displayable_text_recorded
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
-        }
-        if state.first_displayable_text_time.is_none() {
-            state.first_displayable_text_time = Some(std::time::Instant::now());
-        }
+        self.record_first_state_update(&self.first_displayable_text_recorded, |state| {
+            if state.first_displayable_text_time.is_none() {
+                let now = std::time::Instant::now();
+                state.first_displayable_text_time = Some(now);
+            }
+        })
+        .await;
     }
 
     #[must_use]
@@ -2575,48 +2556,26 @@ impl AgentLoop {
                 if (first_turn_direct_answer || text_only_turns > 1) && !plan_active {
                     text_only_completes_task = true;
                 } else if text_only_turns == 1 {
-                    if let Some(profile) = self.deps.tool_profile {
-                        if let Some(next) = profile.escalate() {
-                            tracing::info!(
-                                ?profile,
-                                ?next,
-                                "escalating tool profile after text-only response"
-                            );
-                            self.deps.tool_profile = Some(next);
-                            history.push(StorageMessage {
-                                id: Some(Self::next_message_id(&self.message_counter)),
-                                role: MessageRole::User,
-                                content: MessageContent::Text(
-                                    String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
-                                ),
-                                model_info: None,
-                                metrics: None,
-                                ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-                            });
-                        } else {
-                            history.push(StorageMessage {
-                                id: Some(Self::next_message_id(&self.message_counter)),
-                                role: MessageRole::User,
-                                content: MessageContent::Text(
-                                    String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
-                                ),
-                                model_info: None,
-                                metrics: None,
-                                ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-                            });
-                        }
-                    } else {
-                        history.push(StorageMessage {
-                            id: Some(Self::next_message_id(&self.message_counter)),
-                            role: MessageRole::User,
-                            content: MessageContent::Text(
-                                String::from("You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.")
-                            ),
-                            model_info: None,
-                            metrics: None,
-                            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-                        });
+                    if let Some(profile) = self.deps.tool_profile
+                        && let Some(next) = profile.escalate()
+                    {
+                        tracing::info!(
+                            ?profile,
+                            ?next,
+                            "escalating tool profile after text-only response"
+                        );
+                        self.deps.tool_profile = Some(next);
                     }
+                    history.push(StorageMessage {
+                        id: Some(Self::next_message_id(&self.message_counter)),
+                        role: MessageRole::User,
+                        content: MessageContent::Text(String::from(
+                            "You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.",
+                        )),
+                        model_info: None,
+                        metrics: None,
+                        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                    });
                 }
             }
         }
