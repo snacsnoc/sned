@@ -126,13 +126,6 @@ impl InteractiveSession {
         self.agent_loop.lock().await
     }
 
-    /// Get a mutable reference to the underlying AgentLoop.
-    pub async fn agent_loop_mut(
-        &self,
-    ) -> tokio::sync::MutexGuard<'_, crate::core::agent_loop::AgentLoop> {
-        self.agent_loop.lock().await
-    }
-
     pub async fn build(task_opts: TaskOptions, root_opts: RootOnlyOptions) -> anyhow::Result<Self> {
         Self::build_with_mode(task_opts, root_opts, false).await
     }
@@ -1715,7 +1708,7 @@ async fn handle_cli_only_command(
             match crate::cli::create_provider(&temp_opts, Some(&state_manager)) {
                 Ok(new_provider) => {
                     let sess = session.lock().await;
-                    sess.agent_loop_mut().await.set_provider(new_provider);
+                    sess.agent_loop().await.set_provider(new_provider);
                     app.push_plain(format!("Model switched to {provider_name}/{model_id}"));
                 }
                 Err(e) => {
@@ -2238,7 +2231,7 @@ async fn handle_cli_only_command(
             state.last_injected_plan_state_hash = None;
             state.strict_plan_mode_enabled = true;
             drop(state);
-            sess.agent_loop_mut()
+            sess.agent_loop()
                 .await
                 .set_mode(crate::core::agent_types::AgentMode::Act);
             app.mode = "ACT".to_string();
@@ -2409,11 +2402,11 @@ async fn handle_cli_only_command(
                             }
                             drop(state);
                             {
-                                let state_handle = sess.agent_loop_mut().await.state_handle();
+                                let state_handle = sess.agent_loop().await.state_handle();
                                 let mut state = state_handle.lock().await;
                                 state.strict_plan_mode_enabled = false;
                             }
-                            sess.agent_loop_mut()
+                            sess.agent_loop()
                                 .await
                                 .set_mode(crate::core::agent_types::AgentMode::Act);
                             app.mode = "ACT".to_string();
@@ -3002,7 +2995,7 @@ async fn run_main_loop(
                                         // Switch agent mode to Plan so write/edit tools are restricted
                                         {
                                             let sess = session.lock().await;
-                                            sess.agent_loop_mut().await.set_mode(
+                                            sess.agent_loop().await.set_mode(
                                                 crate::core::agent_types::AgentMode::Plan,
                                             );
                                         }
@@ -6278,7 +6271,7 @@ mod tests {
         }
         {
             let sess = session.lock().await;
-            sess.agent_loop_mut()
+            sess.agent_loop()
                 .await
                 .set_mode(crate::core::agent_types::AgentMode::Plan);
         }
