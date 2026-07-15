@@ -595,6 +595,7 @@ fn apply_output_event(
         }
         OutputEvent::UserPromptLine(line) => {
             flush_model_update(app, pending_model_update);
+            app.clear_completion_lines();
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
         OutputEvent::RawAnsi(s) => {
@@ -3871,6 +3872,24 @@ mod tests {
         );
 
         reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_clears_completion_when_queued_prompt_begins() {
+        use crate::cli::output::OutputEvent;
+
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::Completion("first completion".to_string()))
+            .unwrap();
+        tx.try_send(OutputEvent::user_prompt_line("❯ queued message"))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        assert!(app.completion_lines.is_empty());
+        assert_eq!(app.output_lines.back().unwrap().to_string(), "❯ queued message");
+        assert_eq!(app.output_line_kinds.back(), Some(&BlockKind::UserPrompt));
     }
 
     #[tokio::test]
