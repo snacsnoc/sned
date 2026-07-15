@@ -9,6 +9,9 @@ use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use std::fmt;
 use std::io::Write;
 
+const PANIC_TERMINAL_RESET_SEQUENCE: &[u8] =
+    b"\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[<1u\x1b[?1049l\x1b[?25h\x1b[0m";
+
 /// Captures clicks and wheel input without claiming drag motion, so terminals
 /// can keep their native text-selection behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +50,9 @@ impl Command for DisableSnedMouseCapture {
 pub fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Restore terminal state using raw ANSI sequences (no allocation)
+        // A panic can bypass normal TUI teardown after these modes are enabled.
         let _ = disable_raw_mode();
-        // Use raw ANSI escapes to avoid allocation in panic handler
-        let _ = std::io::stderr().write_all(b"\x1b[?1049l"); // leave alternate screen
-        let _ = std::io::stderr().write_all(b"\x1b[?25h"); // show cursor
-        let _ = std::io::stderr().write_all(b"\x1b[0m"); // reset colors
+        let _ = std::io::stderr().write_all(PANIC_TERMINAL_RESET_SEQUENCE);
         let _ = std::io::stderr().flush();
         original(info);
     }));
@@ -76,5 +76,13 @@ mod tests {
         DisableSnedMouseCapture.write_ansi(&mut output).unwrap();
 
         assert_eq!(output, "\x1b[?1006l\x1b[?1000l");
+    }
+
+    #[test]
+    fn panic_reset_clears_interactive_input_modes() {
+        assert_eq!(
+            PANIC_TERMINAL_RESET_SEQUENCE,
+            b"\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[<1u\x1b[?1049l\x1b[?25h\x1b[0m"
+        );
     }
 }
