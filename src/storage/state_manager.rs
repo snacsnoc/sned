@@ -1576,12 +1576,7 @@ impl StateManager {
             .map_err(io::Error::other)?
     }
 
-    /// Persist global state to disk, writing only the specified keys.
-    ///
-    /// Reads the full current state, applies only the pending changes to it,
-    /// then atomically writes back. This ensures atomicity for partial updates
-    /// while maintaining backward compatibility with the full-state file format.
-    fn persist_global_state(&self, keys: &HashSet<String>) -> io::Result<()> {
+    fn persist_global_state(&self, _keys: &HashSet<String>) -> io::Result<()> {
         let state = self
             .global_state
             .read()
@@ -1590,30 +1585,7 @@ impl StateManager {
         let settings_dir = self.state_dir.join("..").join("settings");
         fs::create_dir_all(&settings_dir)?;
 
-        let partial: GlobalState = if keys.len() == 1 {
-            if let Some(key) = keys.iter().next() {
-                if let Ok(parsed) = key.parse::<GlobalStateKey>() {
-                    let mut partial = state.clone();
-                    if let Some(value) = parsed.get_json_value(&state) {
-                        parsed.set_json_value(&mut partial, value);
-                    }
-                    partial
-                } else {
-                    return self.persist_full_global_state(&state, &settings_dir);
-                }
-            } else {
-                return Ok(());
-            }
-        } else {
-            return self.persist_full_global_state(&state, &settings_dir);
-        };
-
-        let data = serde_json::to_string_pretty(&partial)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let file_path = settings_dir.join("global_settings.json");
-        disk::atomic_write_file(&file_path, &data)?;
-        Ok(())
+        self.persist_full_global_state(&state, &settings_dir)
     }
 
     #[allow(clippy::unused_self)]
