@@ -13,7 +13,7 @@ use crate::core::agent_loop::TaskState;
 use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
 use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits};
 use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard, FileEditorError};
-use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor, strip_hashes};
+use crate::core::hash_utils::{ANCHOR_DELIMITER, split_anchor, strip_hashes};
 use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
 use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{
@@ -643,67 +643,67 @@ impl EditFileHandler {
                 ));
             }
 
-            // Read file content and capture mtime (check cache first for cross-call coordination)
-            let (content, initial_mtime) =
-                if let Some(cached_content) = state.file_content_cache.get(&batch.absolute_path) {
-                    // SECURITY: Re-verify file is still valid (not swapped with symlink) even when using cache
-                    match tokio::fs::symlink_metadata(&batch.absolute_path).await {
-                        Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => {
-                            tracing::debug!(
-                                "Using cached content for {} (symlink check passed)",
-                                batch.display_path
-                            );
-                            (cached_content.clone(), None)
-                        }
-                        Ok(_) => {
-                            all_results.push(format!(
-                                "File {} is no longer a regular file (may be symlink)",
-                                batch.display_path
-                            ));
-                            total_failed += 1;
-                            continue;
-                        }
+            let expected_content = state.file_content_cache.get(&batch.absolute_path).cloned();
+            if expected_content.is_some() {
+                match tokio::fs::symlink_metadata(&batch.absolute_path).await {
+                    Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => {}
+                    Ok(_) => {
+                        all_results.push(format!(
+                            "File {} is no longer a regular file (may be symlink)",
+                            batch.display_path
+                        ));
+                        total_failed += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        all_results.push(format!(
+                            "Error verifying file {}: {}",
+                            batch.display_path, e
+                        ));
+                        total_failed += 1;
+                        continue;
+                    }
+                }
+            }
+
+            let (content, initial_mtime) = match tokio::fs::metadata(&batch.absolute_path).await {
+                Ok(metadata) => {
+                    let mtime = metadata.modified().ok();
+                    match tokio::fs::read_to_string(&batch.absolute_path).await {
+                        Ok(content) => (content, mtime),
                         Err(e) => {
                             all_results.push(format!(
-                                "Error verifying file {}: {}",
+                                "Error reading file {}: {}",
                                 batch.display_path, e
                             ));
                             total_failed += 1;
                             continue;
                         }
                     }
-                } else {
-                    match tokio::fs::metadata(&batch.absolute_path).await {
-                        Ok(metadata) => {
-                            let mtime = metadata.modified().ok();
-                            match tokio::fs::read_to_string(&batch.absolute_path).await {
-                                Ok(c) => (c, mtime),
-                                Err(e) => {
-                                    all_results.push(format!(
-                                        "Error reading file {}: {}",
-                                        batch.display_path, e
-                                    ));
-                                    total_failed += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(_e) => {
-                            // If metadata fails, continue without mtime tracking
-                            match tokio::fs::read_to_string(&batch.absolute_path).await {
-                                Ok(c) => (c, None),
-                                Err(e) => {
-                                    all_results.push(format!(
-                                        "Error reading file {}: {}",
-                                        batch.display_path, e
-                                    ));
-                                    total_failed += 1;
-                                    continue;
-                                }
-                            }
-                        }
+                }
+                Err(_) => match tokio::fs::read_to_string(&batch.absolute_path).await {
+                    Ok(content) => (content, None),
+                    Err(e) => {
+                        all_results.push(format!(
+                            "Error reading file {}: {}",
+                            batch.display_path, e
+                        ));
+                        total_failed += 1;
+                        continue;
                     }
-                };
+                },
+            };
+
+            if expected_content
+                .as_ref()
+                .is_some_and(|expected| expected != &content)
+            {
+                Self::mark_must_reread(state, &batch.absolute_path);
+                return Err(Self::external_modification_error(
+                    &batch.display_path,
+                    &batch.absolute_path,
+                ));
+            }
 
             // Track file read for stale context detection
             state
@@ -958,17 +958,12 @@ impl EditFileHandler {
                 .map(|c| c.split('\n').map(std::string::ToString::to_string).collect())
                 .unwrap_or_default();
 
-            let final_hashes = compute_hashes(&final_lines)
-                .iter()
-                .map(|h| format!("{h:08x}"))
-                .collect::<Vec<_>>();
-
             file_results.push(FileResult {
                 batch_absolute_path: batch.absolute_path.clone(),
                 batch_display_path: batch.display_path.clone(),
                 prepared,
                 final_lines,
-                final_hashes,
+                final_hashes: Vec::new(),
                 had_success: result.success,
                 applied_count: result.resolved_count,
                 lines_added: result.lines_added,
@@ -1072,14 +1067,6 @@ impl EditFileHandler {
                     ));
                 }
 
-                state.insert_file_content(
-                    item.absolute_path.clone(),
-                    item.final_content.clone(),
-                );
-                state
-                    .file_context_tracker
-                    .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
-
                 let write_result = crate::storage::disk::atomic_write_file_async(
                     &item.absolute_path,
                     &item.final_content,
@@ -1090,6 +1077,13 @@ impl EditFileHandler {
 
                 match write_result {
                     Ok(()) => {
+                        state.insert_file_content(
+                            item.absolute_path.clone(),
+                            item.final_content.clone(),
+                        );
+                        state
+                            .file_context_tracker
+                            .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
                         written_paths.push(item.absolute_path.clone());
                     }
                     Err(e) => {
@@ -1131,6 +1125,14 @@ impl EditFileHandler {
                 continue;
             }
 
+            if file_result.had_success {
+                file_result.final_hashes = anchor_mgr.reconcile(
+                    &file_result.batch_absolute_path,
+                    &file_result.final_lines,
+                    task_id,
+                );
+            }
+
             if file_result.had_success && file_result.applied_count > 0 {
                 let entry = state
                     .session_file_changes
@@ -1154,37 +1156,11 @@ impl EditFileHandler {
             }
         }
 
-        // After successful write, mark all written files as requiring re-read
-        // so the model's cached anchors cannot become stale silently.
-        for item in &write_items {
-            Self::mark_must_reread(state, &item.absolute_path);
-            // Clear the read-loop counter for this file — an edit breaks the loop.
-            state.consecutive_reads.remove(&item.absolute_path);
+        for path in &write_failed_paths {
+            Self::mark_must_reread(state, path);
         }
-
-        // Emit a hint so the model knows it must re-read before the next edit.
-        // Without this, the model often tries to reuse anchors from a prior read_file
-        // call and hits Hash anchor validation errors, triggering read/edit loops.
-        let changed_paths: Vec<String> = write_items
-            .iter()
-            .filter(|item| !write_failed_paths.contains(&item.absolute_path))
-            .map(|item| {
-                std::path::Path::new(&item.absolute_path)
-                    .file_name().map_or_else(|| item.absolute_path.clone(), |n| n.to_string_lossy().to_string())
-            })
-            .collect();
-        if !changed_paths.is_empty() && total_applied > 0 && !json_output {
-            use crate::cli::output::OutputEvent;
-            use crate::cli::tui::theme::ACCENT;
-            use ratatui::style::Style;
-            output_writer.emit(OutputEvent::tool_output_line(
-                format!(
-                    "✓ {} file(s) changed: {}. Call read_file before the next edit on these files to refresh anchors.",
-                    changed_paths.len(),
-                    changed_paths.join(", ")
-                ),
-                Style::default().fg(ACCENT),
-            ));
+        for item in &write_items {
+            state.consecutive_reads.remove(&item.absolute_path);
         }
 
         // Phase 5: Run post-save diagnostics in batch for all successfully edited files
@@ -3506,10 +3482,28 @@ edition = "2021"
                 .keys()
                 .any(|path| Path::new(path).file_name() == Some(last_file_name.as_ref()))
         );
+        let first_absolute = first_file_path
+            .canonicalize()
+            .unwrap_or_else(|_| first_file_path.clone())
+            .to_string_lossy()
+            .into_owned();
+        let failing_absolute = failing_file_path
+            .canonicalize()
+            .unwrap_or_else(|_| failing_file_path.clone())
+            .to_string_lossy()
+            .into_owned();
+        let last_absolute = last_file_path
+            .canonicalize()
+            .unwrap_or_else(|_| last_file_path.clone())
+            .to_string_lossy()
+            .into_owned();
+        assert!(state.must_reread_before_edit.contains(&first_absolute));
+        assert!(state.must_reread_before_edit.contains(&failing_absolute));
+        assert!(!state.must_reread_before_edit.contains(&last_absolute));
     }
 
     #[tokio::test]
-    async fn test_successful_edit_marks_must_reread() {
+    async fn test_successful_edit_returns_reusable_anchors() {
         use tempfile::tempdir;
 
         let _guard = TEST_MUTEX.lock().await;
@@ -3519,10 +3513,16 @@ edition = "2021"
         let raw_content = "line 1\nline 2\nline 3\n";
         std::fs::write(&file_path, raw_content).unwrap();
 
-        let prep_anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
-        let anchors =
-            prep_anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+        let canonical_path = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.clone());
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(raw_content);
+        let anchors = anchor_mgr.reconcile(
+            canonical_path.to_str().unwrap(),
+            &lines,
+            Some("test-task"),
+        );
 
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
@@ -3530,7 +3530,7 @@ edition = "2021"
             state.clone(),
             None,
             dir.path().to_path_buf(),
-            AnchorStateManager::new(),
+            anchor_mgr,
             false,
             "test-task".to_string(),
             None,
@@ -3551,48 +3551,129 @@ edition = "2021"
             }]
         });
 
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok(), "First edit should succeed: {:?}", result);
-
-        {
-            let state_guard = state.lock().await;
-            let abs_path = file_path
-                .canonicalize()
-                .unwrap_or_else(|_| file_path.clone())
-                .to_string_lossy()
-                .to_string();
-            assert!(
-                state_guard.must_reread_before_edit.contains(&abs_path),
-                "must_reread_before_edit should contain the edited file path after successful edit, got: {:?}",
-                state_guard.must_reread_before_edit
-            );
-        }
+        let first_result = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect("first edit should succeed");
+        let first_output = first_result.as_str().unwrap();
+        let returned_anchor_l2 = first_output
+            .lines()
+            .map(|line| line.trim_start_matches(|c| matches!(c, ' ' | '+' | '-')))
+            .find(|line| line.ends_with("§line 2"))
+            .expect("successful edit output should include a canonical anchor for line 2")
+            .to_string();
+        assert_eq!(returned_anchor_l2, anchor_l2);
+        assert!(state.lock().await.must_reread_before_edit.is_empty());
+        state.lock().await.file_content_cache.clear();
 
         let params2 = serde_json::json!({
             "files": [{
                 "path": "test.txt",
                 "edits": [{
-                    "anchor": anchor_l2,
+                    "anchor": returned_anchor_l2,
                     "edit_type": "replace",
                     "text": "replaced line 2"
                 }]
             }]
         });
 
-        let result2 = ToolHandler::execute(&handler, &ctx, params2).await;
-        assert!(
-            result2.is_err(),
-            "Second edit on same file should fail with reread_required_error"
+        ToolHandler::execute(&handler, &ctx, params2)
+            .await
+            .expect("returned anchors should be reusable without read_file");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "replaced line 1\nreplaced line 2\nline 3\n"
         );
-        let err_msg = format!("{}", result2.unwrap_err());
-        assert!(
-            err_msg.contains("must re-read"),
-            "Error should mention re-read required, got: {}",
-            err_msg
+    }
+
+    #[tokio::test]
+    async fn test_successful_edit_detects_external_change_before_anchor_reuse() {
+        use tempfile::tempdir;
+
+        let _guard = TEST_MUTEX.lock().await;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let raw_content = "line 1\nline 2\nline 3\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+
+        let canonical_path = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.clone());
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(raw_content);
+        let anchors = anchor_mgr.reconcile(
+            canonical_path.to_str().unwrap(),
+            &lines,
+            Some("external-change-task"),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "external-change-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let handler = EditFileHandler::new();
+
+        let first_result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({
+                "files": [{
+                    "path": "test.txt",
+                    "edits": [{
+                        "anchor": format!("{}§line 1", anchors[0]),
+                        "edit_type": "replace",
+                        "text": "replaced line 1"
+                    }]
+                }]
+            }),
+        )
+        .await
+        .expect("first edit should succeed");
+        let returned_anchor_l2 = first_result
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(|line| line.trim_start_matches(|c| matches!(c, ' ' | '+' | '-')))
+            .find(|line| line.ends_with("§line 2"))
+            .unwrap()
+            .to_string();
+
+        std::fs::write(&file_path, "replaced line 1\nexternal line 2\nline 3\n").unwrap();
+        let second_result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({
+                "files": [{
+                    "path": "test.txt",
+                    "edits": [{
+                        "anchor": returned_anchor_l2,
+                        "edit_type": "replace",
+                        "text": "replaced line 2"
+                    }]
+                }]
+            }),
+        )
+        .await;
+
+        let error = second_result.expect_err("external changes must block anchor reuse");
+        assert!(error.to_string().contains("modified externally"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "replaced line 1\nexternal line 2\nline 3\n"
         );
         assert!(
-            err_msg.contains("must re-read test.txt before"),
-            "Error should use the requested workspace-relative path, got: {err_msg}"
+            state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(canonical_path.to_str().unwrap())
         );
     }
 
