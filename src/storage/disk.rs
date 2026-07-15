@@ -382,10 +382,6 @@ impl GlobalFileNames {
     pub const TASK_METADATA: &'static str = "task_metadata.json";
     pub const ENDPOINTS_JSON: &'static str = "endpoints.json";
 
-    #[must_use]
-    pub fn remote_config(org_id: &str) -> String {
-        format!("remote_config_{org_id}.json")
-    }
 }
 
 #[cfg(test)]

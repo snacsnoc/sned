@@ -300,11 +300,6 @@ impl MigrationEngine {
         }
     }
 
-    #[expect(dead_code)]
-    pub(crate) fn plan(&self) -> Result<DryRunMigrationReport, MigrationError> {
-        plan_dry_run_migration(&self.source_root, &self.destination_root)
-    }
-
     pub fn execute(&mut self) -> Result<MigrationExecutionReport, MigrationError> {
         self.executed_operations.clear();
 

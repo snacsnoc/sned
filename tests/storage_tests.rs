@@ -22,9 +22,6 @@ fn test_global_file_names() {
     );
     assert_eq!(GlobalFileNames::UI_MESSAGES, "ui_messages.json");
     assert_eq!(GlobalFileNames::TASK_METADATA, "task_metadata.json");
-
-    let remote = GlobalFileNames::remote_config("org123");
-    assert_eq!(remote, "remote_config_org123.json");
 }
 
 #[test]
@@ -83,19 +80,6 @@ fn test_task_storage() {
 
     // Cleanup
     let _ = fs::remove_dir_all(&test_dir);
-}
-
-#[test]
-fn test_secrets_from_env() {
-    // Cannot easily test env vars in unit tests without affecting environment
-    // But we can test the mapping function
-    let map = secrets::env_var_to_secret_key();
-    assert_eq!(map.get("ANTHROPIC_API_KEY"), Some(&"apiKey"));
-    assert_eq!(map.get("OPENAI_API_KEY"), Some(&"openAiApiKey"));
-    assert_eq!(map.get("GEMINI_API_KEY"), Some(&"geminiApiKey"));
-    assert!(!map.contains_key("OPENAI_COMPATIBLE_CUSTOM_KEY"));
-    assert!(!map.contains_key("OPENAI_API_BASE"));
-    assert!(!map.contains_key("QWEN_API_KEY"));
 }
 
 #[test]

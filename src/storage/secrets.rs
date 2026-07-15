@@ -42,35 +42,6 @@ pub const SECRET_KEYS: &[&str] = &[
     "github-copilot-oauth-credentials",
 ];
 
-/// Environment variable to secret key mapping (from ENV_VAR_TO_SECRET_KEY in env-config.ts)
-#[must_use]
-pub fn env_var_to_secret_key() -> HashMap<&'static str, &'static str> {
-    let mut map = HashMap::with_capacity(16);
-    map.insert("ANTHROPIC_API_KEY", "apiKey");
-    map.insert("OPENAI_API_KEY", "openAiApiKey");
-    map.insert("AZURE_OPENAI_API_KEY", "openAiApiKey");
-    map.insert("GEMINI_API_KEY", "geminiApiKey");
-    map.insert("CEREBRAS_API_KEY", "cerebrasApiKey");
-    map.insert("OPENROUTER_API_KEY", "openRouterApiKey");
-    map.insert("AI_GATEWAY_API_KEY", "vercelAiGatewayApiKey");
-    map.insert("ZAI_API_KEY", "zaiApiKey");
-    map.insert("MISTRAL_API_KEY", "mistralApiKey");
-    map.insert("MOONSHOT_API_KEY", "moonshotApiKey");
-    map.insert("MINIMAX_API_KEY", "minimaxApiKey");
-    map.insert("MINIMAX_CN_API_KEY", "minimaxApiKey");
-    map.insert("HF_TOKEN", "huggingFaceApiKey");
-    map.insert("OPENCODE_API_KEY", "openAiNativeApiKey");
-    map.insert("KIMI_API_KEY", "moonshotApiKey");
-    map.insert("DEEPSEEK_API_KEY", "deepSeekApiKey");
-    map.insert("TOGETHER_API_KEY", "togetherApiKey");
-    map.insert("FIREWORKS_API_KEY", "fireworksApiKey");
-    map.insert("NEBIUS_API_KEY", "nebiusApiKey");
-    map.insert("AWS_ACCESS_KEY_ID", "awsAccessKey");
-    map.insert("AWS_SECRET_ACCESS_KEY", "awsSecretKey");
-    map.insert("AWS_SESSION_TOKEN", "awsSessionToken");
-    map
-}
-
 /// Secrets store for secret storage (uses Keychain/Credential Manager with file fallback)
 pub struct SecretsStore {
     pub(crate) file_path: PathBuf,

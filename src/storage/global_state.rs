@@ -308,24 +308,6 @@ pub fn load_global_state_with_integrity() -> GlobalState {
     }
 }
 
-/// Save global state with integrity checksum
-pub fn save_global_state_with_integrity(state: &GlobalState) -> std::io::Result<()> {
-    let path = get_sned_home_path()
-        .join("data")
-        .join("settings")
-        .join("global_settings.json");
-
-    let json_data = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
-
-    let checksum = compute_checksum(&json_data);
-    let contents = format!("sha256:{checksum}\n{json_data}");
-
-    // Use atomic write for safety
-    crate::storage::disk::atomic_write_file(&path, &contents)?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
