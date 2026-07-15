@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_openrouter_custom_provider_name() {
+    fn test_openrouter_name_ignores_custom_provider_name() {
         let config = OpenRouterConfig {
             api_key: "test-key".to_string(),
             model_id: "anthropic/claude-sonnet-4.5".to_string(),

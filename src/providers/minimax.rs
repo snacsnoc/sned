@@ -25,12 +25,12 @@ use crate::providers::{
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, AssistantContentBlock,
     MessageContent, MessageRole, ModelInfo, Provider, ProviderError, ProviderHttpError,
     ProviderModel, ProviderRequest, StorageMessage, UserContentBlock,
+    is_retryable_stream_transport_error, normalize_reasoning_delta,
 };
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::mpsc::error::TrySendError;
 
 /// Configuration for the MiniMax provider.
 #[derive(Clone)]
@@ -697,30 +697,12 @@ struct OpenAIStreamFunction {
     arguments: Option<String>,
 }
 
-/// Send a stream chunk via try_send to avoid blocking on full channel.
-/// Logs a warning if the channel is full and drops the chunk.
 fn try_send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
     chunk_type: &str,
 ) -> bool {
-    match tx.try_send(chunk) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            tracing::warn!(
-                "MiniMax provider channel full, dropping {} chunk",
-                chunk_type
-            );
-            false
-        }
-        Err(TrySendError::Closed(_)) => {
-            tracing::debug!(
-                "MiniMax provider channel closed, cannot send {} chunk",
-                chunk_type
-            );
-            false
-        }
-    }
+    crate::providers::try_send_chunk(tx, chunk, "MiniMax", chunk_type)
 }
 
 const MAX_XML_TOOL_CALL_BUFFER: usize = 64 * 1024;
@@ -873,37 +855,6 @@ fn partial_marker_suffix_len(text: &str, markers: &[&str]) -> usize {
     0
 }
 
-fn longest_reasoning_overlap(left: &str, right: &str) -> usize {
-    let max_overlap = left.len().min(right.len());
-    for overlap in (1..=max_overlap).rev() {
-        if !left.is_char_boundary(left.len() - overlap) || !right.is_char_boundary(overlap) {
-            continue;
-        }
-        if left[left.len() - overlap..] == right[..overlap] {
-            return overlap;
-        }
-    }
-    0
-}
-
-fn normalize_minimax_reasoning_delta(
-    state: &mut MinimaxReasoningState,
-    reasoning: String,
-) -> Option<String> {
-    if reasoning.is_empty() {
-        return None;
-    }
-
-    let overlap = longest_reasoning_overlap(&state.emitted_reasoning, &reasoning);
-    let normalized = reasoning[overlap..].to_string();
-    if normalized.is_empty() {
-        return None;
-    }
-
-    state.emitted_reasoning.push_str(&normalized);
-    Some(normalized)
-}
-
 fn emit_minimax_reasoning(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     reasoning_state: &mut MinimaxReasoningState,
@@ -911,7 +862,9 @@ fn emit_minimax_reasoning(
     reasoning: String,
     chunk_type: &str,
 ) {
-    if let Some(reasoning) = normalize_minimax_reasoning_delta(reasoning_state, reasoning) {
+    if let Some(reasoning) =
+        normalize_reasoning_delta(&mut reasoning_state.emitted_reasoning, reasoning)
+    {
         try_send_chunk(
             tx,
             ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
@@ -1376,10 +1329,7 @@ impl Provider for MinimaxProvider {
                     }
                     Err(e) => {
                         let error_msg = format!("MiniMax SSE stream error: {e}");
-                        let is_retryable = e.to_string().contains("timeout")
-                            || e.to_string().contains("connection")
-                            || e.to_string().contains("incomplete")
-                            || e.to_string().contains("decode");
+                        let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "MiniMax SSE bytes_stream error");
                         try_send_chunk(
                             &tx,
@@ -2268,7 +2218,7 @@ mod tests {
     }
 
     /// Regression tests for Unicode edge cases in
-    /// `longest_reasoning_overlap`. The function uses
+    /// `longest_suffix_prefix_overlap`. The function uses
     /// `is_char_boundary` to avoid splitting multi-byte UTF-8
     /// sequences, but the existing tests only exercise ASCII.
     /// These tests guard against regressions where a refactor
@@ -2276,63 +2226,90 @@ mod tests {
     /// CJK / emoji / combining-character content.
 
     #[test]
-    fn test_longest_reasoning_overlap_ascii() {
-        assert_eq!(longest_reasoning_overlap("hello world", "world peace"), 5);
-        assert_eq!(longest_reasoning_overlap("abc", "xyz"), 0);
-        assert_eq!(longest_reasoning_overlap("", "anything"), 0);
-        assert_eq!(longest_reasoning_overlap("anything", ""), 0);
+    fn test_longest_suffix_prefix_overlap_ascii() {
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap("hello world", "world peace"),
+            5
+        );
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap("abc", "xyz"),
+            0
+        );
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap("", "anything"),
+            0
+        );
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap("anything", ""),
+            0
+        );
     }
 
     #[test]
-    fn test_longest_reasoning_overlap_cjk() {
+    fn test_longest_suffix_prefix_overlap_cjk() {
         // CJK characters are 3 bytes each in UTF-8. The overlap
         // must be measured in bytes but only at char boundaries.
         let left = "思考一下这个问题的解决方案";
         let right = "方案应该是这样的";
         // "方案" is the overlapping 6-byte (2-char) suffix/prefix.
-        assert_eq!(longest_reasoning_overlap(left, right), 6);
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap(left, right),
+            6
+        );
     }
 
     #[test]
-    fn test_longest_reasoning_overlap_cjk_no_overlap() {
+    fn test_longest_suffix_prefix_overlap_cjk_no_overlap() {
         let left = "思考问题";
         let right = "完全不同的内容";
-        assert_eq!(longest_reasoning_overlap(left, right), 0);
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap(left, right),
+            0
+        );
     }
 
     #[test]
-    fn test_longest_reasoning_overlap_emoji() {
+    fn test_longest_suffix_prefix_overlap_emoji() {
         // Emoji are 4 bytes each in UTF-8. An overlap at a
         // non-char-boundary would be a bug.
         let left = "I love 🦀 Rust";
         let right = "🦀 Rust is great";
         // "🦀 Rust" is the overlap: 4 + 1 + 4 = 9 bytes (2 chars).
-        assert_eq!(longest_reasoning_overlap(left, right), 9);
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap(left, right),
+            9
+        );
     }
 
     #[test]
-    fn test_longest_reasoning_overlap_combining_characters() {
+    fn test_longest_suffix_prefix_overlap_combining_characters() {
         // "é" can be encoded as a single codepoint (U+00E9, 2 bytes)
         // or as "e" + combining acute (U+0065 U+0301, 3 bytes).
         // The overlap must respect char boundaries in both forms.
         let left = "café"; // precomposed é
         let right = "fé"; // shares "fé" suffix/prefix
         // "fé" = 1 + 2 = 3 bytes.
-        assert_eq!(longest_reasoning_overlap(left, right), 3);
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap(left, right),
+            3
+        );
     }
 
     #[test]
-    fn test_longest_reasoning_overlap_mixed_scripts() {
+    fn test_longest_suffix_prefix_overlap_mixed_scripts() {
         // Mixed ASCII + CJK. The overlap must not split a CJK
         // character mid-byte.
         let left = "answer: 思考";
         let right = "思考过程";
         // "思考" is 6 bytes (2 × 3-byte CJK chars).
-        assert_eq!(longest_reasoning_overlap(left, right), 6);
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap(left, right),
+            6
+        );
     }
 
     #[test]
-    fn test_longest_reasoning_overlap_does_not_split_multibyte() {
+    fn test_longest_suffix_prefix_overlap_does_not_split_multibyte() {
         // Construct a case where a naive byte-based overlap
         // (without is_char_boundary checks) would find a
         // "false positive" by matching partial bytes of a
@@ -2349,17 +2326,23 @@ mod tests {
         // prevent a legitimate same-character overlap.
         let left = "X思考";
         let right = "考Y";
-        assert_eq!(longest_reasoning_overlap(left, right), 3);
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap(left, right),
+            3
+        );
     }
 
     #[test]
-    fn test_longest_reasoning_overlap_emoji_in_middle() {
+    fn test_longest_suffix_prefix_overlap_emoji_in_middle() {
         // Emoji in the middle of both strings, with the overlap
         // landing on the emoji itself.
         let left = "hello 🌍 world";
         let right = "🌍 world peace";
         // "🌍 world" = 4 + 1 + 5 = 10 bytes.
-        assert_eq!(longest_reasoning_overlap(left, right), 10);
+        assert_eq!(
+            crate::providers::longest_suffix_prefix_overlap(left, right),
+            10
+        );
     }
 
     fn collect_minimax_content_deltas(chunks: &[String]) -> (String, String) {

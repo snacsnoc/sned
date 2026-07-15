@@ -13,14 +13,13 @@ use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, ModelInfo, ModelTier,
     Provider, ProviderError, ProviderHttpError, ProviderModel, ProviderRequest, SseLineBuffer,
-    ThinkingConfig, gemini_format,
+    ThinkingConfig, gemini_format, is_retryable_stream_transport_error,
 };
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc::error::TrySendError;
 
 /// Configuration for the Gemini provider.
 #[derive(Clone)]
@@ -365,29 +364,12 @@ struct GeminiUsageMetadata {
     cached_content_token_count: Option<u32>,
 }
 
-/// Send a stream chunk via try_send to avoid blocking on full channel.
 fn try_send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
     chunk_type: &str,
 ) -> bool {
-    match tx.try_send(chunk) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            tracing::warn!(
-                "Gemini provider channel full, dropping {} chunk",
-                chunk_type
-            );
-            false
-        }
-        Err(TrySendError::Closed(_)) => {
-            tracing::debug!(
-                "Gemini provider channel closed, cannot send {} chunk",
-                chunk_type
-            );
-            false
-        }
-    }
+    crate::providers::try_send_chunk(tx, chunk, "Gemini", chunk_type)
 }
 
 #[allow(clippy::unused_async)]
@@ -770,10 +752,7 @@ impl Provider for GeminiProvider {
                     }
                     Err(e) => {
                         let error_msg = format!("Gemini SSE stream error: {e}");
-                        let is_retryable = e.to_string().contains("timeout")
-                            || e.to_string().contains("connection")
-                            || e.to_string().contains("incomplete")
-                            || e.to_string().contains("decode");
+                        let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "Gemini SSE bytes_stream error");
                         try_send_chunk(
                             &tx,

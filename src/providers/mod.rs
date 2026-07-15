@@ -266,6 +266,67 @@ pub enum ApiStreamChunk {
     Error(String),
 }
 
+pub(crate) fn try_send_chunk(
+    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    chunk: ApiStreamChunk,
+    provider_name: &str,
+    chunk_type: &str,
+) -> bool {
+    match tx.try_send(chunk) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!("{provider_name} provider channel full, dropping {chunk_type} chunk");
+            false
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!(
+                "{provider_name} provider channel closed, cannot send {chunk_type} chunk"
+            );
+            false
+        }
+    }
+}
+
+pub(crate) fn is_retryable_stream_transport_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timeout")
+        || error.contains("connection")
+        || error.contains("incomplete")
+        || error.contains("decode")
+        || error.contains("decoding")
+}
+
+pub(crate) fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
+    let max_overlap = left.len().min(right.len());
+    for overlap in (1..=max_overlap).rev() {
+        if !left.is_char_boundary(left.len() - overlap) || !right.is_char_boundary(overlap) {
+            continue;
+        }
+        if left[left.len() - overlap..] == right[..overlap] {
+            return overlap;
+        }
+    }
+    0
+}
+
+pub(crate) fn normalize_reasoning_delta(
+    emitted_reasoning: &mut String,
+    reasoning: String,
+) -> Option<String> {
+    if reasoning.is_empty() {
+        return None;
+    }
+
+    let overlap = longest_suffix_prefix_overlap(emitted_reasoning, &reasoning);
+    let normalized = reasoning[overlap..].to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    emitted_reasoning.push_str(&normalized);
+    Some(normalized)
+}
+
 /// Text chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiStreamTextChunk {

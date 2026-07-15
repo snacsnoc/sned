@@ -7,7 +7,8 @@ use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, MessageRole,
     ModelInfo, OpenAiCompatibleModelInfo, Provider, ProviderError, ProviderHttpError,
-    ProviderModel, ProviderRequest, apply_qwen_model_profile,
+    ProviderModel, ProviderRequest, apply_qwen_model_profile, is_retryable_stream_transport_error,
+    normalize_reasoning_delta,
 };
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -15,7 +16,6 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::error::TrySendError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiEndpointKind {
@@ -355,15 +355,6 @@ fn format_stream_error_diagnostics(headers: &HeaderMap, elapsed: Duration) -> St
     parts.join(", ")
 }
 
-fn is_retryable_stream_transport_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("timeout")
-        || error.contains("connection")
-        || error.contains("incomplete")
-        || error.contains("decode")
-        || error.contains("decoding")
-}
-
 fn convert_user_blocks(
     role: &str,
     blocks: &[crate::providers::UserContentBlock],
@@ -571,66 +562,17 @@ struct OpenAiCompletionTokenDetails {
     reasoning_tokens: Option<u32>,
 }
 
-/// Send a stream chunk via try_send to avoid blocking on full channel.
-/// Logs a warning if the channel is full and drops the chunk.
 fn try_send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
     chunk_type: &str,
 ) -> bool {
-    match tx.try_send(chunk) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            tracing::warn!(
-                "OpenAI provider channel full, dropping {} chunk",
-                chunk_type
-            );
-            false
-        }
-        Err(TrySendError::Closed(_)) => {
-            tracing::debug!(
-                "OpenAI provider channel closed, cannot send {} chunk",
-                chunk_type
-            );
-            false
-        }
-    }
+    crate::providers::try_send_chunk(tx, chunk, "OpenAI", chunk_type)
 }
 
 #[derive(Debug, Default)]
 pub struct OpenAiStreamDeltaState {
     emitted_reasoning: String,
-}
-
-fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
-    let max_overlap = left.len().min(right.len());
-    for overlap in (1..=max_overlap).rev() {
-        if !left.is_char_boundary(left.len() - overlap) || !right.is_char_boundary(overlap) {
-            continue;
-        }
-        if left[left.len() - overlap..] == right[..overlap] {
-            return overlap;
-        }
-    }
-    0
-}
-
-fn normalize_reasoning_delta(
-    state: &mut OpenAiStreamDeltaState,
-    reasoning: String,
-) -> Option<String> {
-    if reasoning.is_empty() {
-        return None;
-    }
-
-    let overlap = longest_suffix_prefix_overlap(&state.emitted_reasoning, &reasoning);
-    let normalized = reasoning[overlap..].to_string();
-    if normalized.is_empty() {
-        return None;
-    }
-
-    state.emitted_reasoning.push_str(&normalized);
-    Some(normalized)
 }
 
 #[allow(clippy::unused_async)]
@@ -674,7 +616,8 @@ async fn process_openai_sse_line(
             }
 
             if let Some(reasoning) = delta.reasoning_content
-                && let Some(reasoning) = normalize_reasoning_delta(delta_state, reasoning)
+                && let Some(reasoning) =
+                    normalize_reasoning_delta(&mut delta_state.emitted_reasoning, reasoning)
             {
                 try_send_chunk(
                     tx,
@@ -994,7 +937,7 @@ impl Provider for OpenAiProvider {
             let text = response.text().await.unwrap_or_default();
 
             // Add helpful hint for common model/provider mismatches
-            let error_body = if status == StatusCode::NOT_FOUND || status.as_u16() == 404 {
+            let error_body = if status == StatusCode::NOT_FOUND {
                 let model_lower = self.config.model_id.to_lowercase();
                 if model_lower.starts_with("claude-") {
                     format!(
@@ -2218,6 +2161,7 @@ mod tests {
         assert!(is_retryable_stream_transport_error(
             "error decoding response body"
         ));
+        assert!(is_retryable_stream_transport_error("Decoding timeout"));
         assert!(!is_retryable_stream_transport_error(
             "invalid request payload"
         ));
@@ -2228,19 +2172,22 @@ mod tests {
         let mut state = OpenAiStreamDeltaState::default();
 
         assert_eq!(
-            normalize_reasoning_delta(&mut state, "The".to_string()).as_deref(),
+            normalize_reasoning_delta(&mut state.emitted_reasoning, "The".to_string()).as_deref(),
             Some("The")
         );
         assert_eq!(
-            normalize_reasoning_delta(&mut state, "The user".to_string()).as_deref(),
+            normalize_reasoning_delta(&mut state.emitted_reasoning, "The user".to_string())
+                .as_deref(),
             Some(" user")
         );
         assert_eq!(
-            normalize_reasoning_delta(&mut state, " user wants".to_string()).as_deref(),
+            normalize_reasoning_delta(&mut state.emitted_reasoning, " user wants".to_string())
+                .as_deref(),
             Some(" wants")
         );
         assert_eq!(
-            normalize_reasoning_delta(&mut state, " wants me".to_string()).as_deref(),
+            normalize_reasoning_delta(&mut state.emitted_reasoning, " wants me".to_string())
+                .as_deref(),
             Some(" me")
         );
         assert_eq!(state.emitted_reasoning, "The user wants me");

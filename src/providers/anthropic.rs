@@ -6,12 +6,12 @@ use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, MessageRole,
     ModelInfo, Provider, ProviderError, ProviderHttpError, ProviderModel, ProviderRequest,
+    is_retryable_stream_transport_error,
 };
 use futures::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::mpsc::error::TrySendError;
 
 /// Configuration for the Anthropic provider.
 #[derive(Clone)]
@@ -622,10 +622,7 @@ impl Provider for AnthropicProvider {
                     }
                     Err(e) => {
                         let error_msg = format!("Anthropic SSE stream error: {e}");
-                        let is_retryable = e.to_string().contains("timeout")
-                            || e.to_string().contains("connection")
-                            || e.to_string().contains("incomplete")
-                            || e.to_string().contains("decode");
+                        let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "Anthropic SSE bytes_stream error");
                         try_send_chunk(
                             &tx,
@@ -758,23 +755,7 @@ fn try_send_chunk(
     chunk: ApiStreamChunk,
     chunk_type: &str,
 ) -> bool {
-    match tx.try_send(chunk) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            tracing::warn!(
-                "Anthropic provider channel full, dropping {} chunk",
-                chunk_type
-            );
-            false
-        }
-        Err(TrySendError::Closed(_)) => {
-            tracing::debug!(
-                "Anthropic provider channel closed, cannot send {} chunk",
-                chunk_type
-            );
-            false
-        }
-    }
+    crate::providers::try_send_chunk(tx, chunk, "Anthropic", chunk_type)
 }
 
 async fn process_anthropic_sse_line(
