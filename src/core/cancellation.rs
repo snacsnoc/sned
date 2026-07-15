@@ -6,9 +6,8 @@ use crate::core::agent_loop::TaskState;
 use crate::core::hooks::{HookData, HookInput, HookManager, HookName, TaskCancelData};
 use crate::storage::disk;
 use crate::storage::state_manager::StateManager;
-use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
-};
+use crate::terminal::input::DisableSnedMouseCapture;
+use ratatui::crossterm::event::{DisableBracketedPaste, PopKeyboardEnhancementFlags};
 use ratatui::crossterm::execute;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +25,7 @@ pub(crate) fn restore_terminal_state() {
     let _ = execute!(
         std::io::stdout(),
         DisableBracketedPaste,
-        DisableMouseCapture,
+        DisableSnedMouseCapture,
         PopKeyboardEnhancementFlags
     );
     ratatui::restore();

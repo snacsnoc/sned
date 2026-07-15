@@ -9,10 +9,11 @@ use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::ApprovalResult;
 use crate::providers::Provider;
+use crate::terminal::input::EnableSnedMouseCapture;
 use futures::FutureExt;
 use ratatui::crossterm::event::{
-    EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::style::Style;
@@ -3253,7 +3254,7 @@ pub async fn run_interactive_shell_inner(
     // Enable keyboard enhancement flags so Shift+Enter arrives distinctly
     // from Enter on terminals that support CSI-u / kitty keyboard protocol.
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnableBracketedPaste, EnableMouseCapture)?;
+    execute!(stdout, EnableBracketedPaste, EnableSnedMouseCapture)?;
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
