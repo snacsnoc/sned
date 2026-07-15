@@ -119,7 +119,6 @@ pub fn get_deepseek_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
 
     OpenAiCompatibleModelInfo {
         base: info,
-        temperature: None,
         is_r1_format_required: None,
         system_role: None,
         supports_reasoning_effort: None,

@@ -134,7 +134,6 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     if apply_qwen_model_profile(model_id, &mut info) {
         return OpenAiCompatibleModelInfo {
             base: info,
-            temperature: None,
             is_r1_format_required: None,
             system_role: None,
             supports_reasoning_effort: Some(false),
@@ -316,7 +315,6 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
 
     OpenAiCompatibleModelInfo {
         base: info,
-        temperature: None,
         is_r1_format_required: None,
         system_role: None,
         supports_reasoning_effort: None,

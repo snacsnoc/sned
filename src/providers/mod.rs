@@ -397,7 +397,6 @@ pub(crate) fn apply_qwen_model_profile(model_id: &str, info: &mut ModelInfo) -> 
 pub struct OpenAiCompatibleModelInfo {
     #[serde(flatten)]
     pub base: ModelInfo,
-    pub temperature: Option<f64>,
     pub is_r1_format_required: Option<bool>,
     pub system_role: Option<String>,
     pub supports_reasoning_effort: Option<bool>,

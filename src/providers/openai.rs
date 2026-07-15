@@ -255,11 +255,15 @@ impl OpenAiProvider {
         }
 
         // Temperature: match TS behavior — omit by default (API uses model default).
-        // If model_info.temperature is set and non-zero, send it.
-        // If model_info.temperature is 0, omit (TS converts 0 → undefined).
+        // If model_info.base.temperature is set and non-zero, send it.
+        // If model_info.base.temperature is 0, omit (TS converts 0 → undefined).
         // Reasoning family models never support temperature.
         if !uses_official_reasoning_shape
-            && let Some(temp) = self.config.model_info.as_ref().and_then(|i| i.temperature)
+            && let Some(temp) = self
+                .config
+                .model_info
+                .as_ref()
+                .and_then(|i| i.base.temperature)
             && temp != 0.0
         {
             body["temperature"] = json!(temp);
@@ -1159,7 +1163,6 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
     if apply_qwen_model_profile(model_id, &mut info) {
         return OpenAiCompatibleModelInfo {
             base: info,
-            temperature: None,
             is_r1_format_required: None,
             system_role: None,
             supports_reasoning_effort: Some(false),
@@ -1331,7 +1334,6 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
 
     OpenAiCompatibleModelInfo {
         base: info,
-        temperature: None,
         is_r1_format_required: None,
         system_role: None,
         supports_reasoning_effort: is_current_reasoning_model.then_some(true),
@@ -1483,7 +1485,6 @@ mod tests {
                     supports_tools: Some(true),
                     ..ModelInfo::default()
                 },
-                temperature: None,
                 is_r1_format_required: None,
                 system_role: None,
                 supports_reasoning_effort: None,
@@ -1636,7 +1637,6 @@ mod tests {
                     supports_tools: Some(true),
                     api_format: None,
                 },
-                temperature: None,
                 is_r1_format_required: None,
                 system_role: None,
                 supports_reasoning_effort: None,
@@ -1761,7 +1761,6 @@ mod tests {
                     supports_tools: Some(true),
                     api_format: None,
                 },
-                temperature: None,
                 is_r1_format_required: None,
                 system_role: None,
                 supports_reasoning_effort: None,
@@ -1823,7 +1822,6 @@ mod tests {
                     supports_tools: Some(true),
                     api_format: None,
                 },
-                temperature: None,
                 is_r1_format_required: None,
                 system_role: None,
                 supports_reasoning_effort: None,
@@ -1893,39 +1891,13 @@ mod tests {
         let config = OpenAiConfig {
             api_key: "test-key".to_string(),
             base_url: None,
-            model_id: "gpt-4o".to_string(),
-            model_info: Some(OpenAiCompatibleModelInfo {
-                base: ModelInfo {
-                    name: Some("gpt-4o".to_string()),
-                    max_tokens: None,
-                    context_window: Some(128_000),
-                    supports_images: Some(true),
-                    supports_prompt_cache: false,
-                    supports_reasoning: Some(false),
-                    input_price: Some(2.5),
-                    output_price: Some(10.0),
-                    image_output_price: None,
-                    thinking_config: None,
-                    supports_global_endpoint: None,
-                    cache_writes_price: None,
-                    cache_reads_price: None,
-                    description: None,
-                    tiers: None,
-                    temperature: None,
-                    top_p: None,
-                    top_k: None,
-                    supports_tools: Some(true),
-                    api_format: None,
-                },
-                temperature: Some(0.5),
-                is_r1_format_required: None,
-                system_role: None,
-                supports_reasoning_effort: None,
-                supports_streaming: None,
-            }),
+            model_id: "deepseek-chat".to_string(),
+            model_info: Some(crate::providers::deepseek::get_deepseek_model_info(
+                "deepseek-chat",
+            )),
             reasoning_effort: None,
             custom_headers: None,
-            endpoint_kind: OpenAiEndpointKind::Official,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1941,8 +1913,8 @@ mod tests {
 
         let body = provider.build_request_body(&request).unwrap();
         assert_eq!(
-            body["temperature"], 0.5,
-            "non-zero temperature should be sent"
+            body["temperature"], 0.7,
+            "profile temperature should be sent"
         );
     }
 
@@ -1975,7 +1947,6 @@ mod tests {
                     supports_tools: Some(true),
                     api_format: None,
                 },
-                temperature: None,
                 is_r1_format_required: None,
                 system_role: None,
                 supports_reasoning_effort: None,
@@ -2033,7 +2004,6 @@ mod tests {
                     supports_tools: Some(true),
                     api_format: None,
                 },
-                temperature: None,
                 is_r1_format_required: None,
                 system_role: None,
                 supports_reasoning_effort: None,
@@ -2180,7 +2150,6 @@ mod tests {
                 supports_tools: Some(false),
                 api_format: None,
             },
-            temperature: None,
             is_r1_format_required: None,
             system_role: None,
             supports_reasoning_effort: None,
@@ -2415,7 +2384,6 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
                 supports_tools: None,
                 api_format: None,
             },
-            temperature: None,
             is_r1_format_required: None,
             system_role: None,
             supports_reasoning_effort: None,
