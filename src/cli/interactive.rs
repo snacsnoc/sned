@@ -622,6 +622,7 @@ fn apply_output_event(
         OutputEvent::Completion(result) => {
             flush_model_update(app, pending_model_update);
             app.clear_completion_lines();
+            app.set_last_completion_text(result.clone());
             // Historical model blocks must not suppress a result from the current turn.
             let model_text = app
                 .turn_stream_entries
@@ -662,6 +663,40 @@ fn apply_output_event(
             flush_model_update(app, pending_model_update);
             app.push_turn_indicator(line);
         }
+    }
+}
+
+fn write_clipboard<W: std::io::Write>(mut writer: W, text: &str) -> std::io::Result<()> {
+    crossterm::execute!(
+        writer,
+        crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+    )
+}
+
+fn copy_completion_to_clipboard(text: &str) -> std::io::Result<()> {
+    // Keep terminal control output on the event-loop thread so it cannot interleave with redraws.
+    write_clipboard(std::io::stdout(), text)
+}
+
+fn handle_copy_command(app: &mut App, copy: impl FnOnce(&str) -> std::io::Result<()>) {
+    let Some(text) = app.last_completion_text().map(str::to_owned) else {
+        app.push_styled(
+            "No completion to copy yet.",
+            Style::default().fg(theme::WARNING_FG),
+        );
+        return;
+    };
+
+    let char_count = text.chars().count();
+    match copy(&text) {
+        Ok(()) => app.push_styled(
+            format!("Copied latest completion ({char_count} characters)."),
+            Style::default().fg(theme::ACCENT),
+        ),
+        Err(err) => app.push_styled(
+            format!("Failed to copy completion: {err}"),
+            Style::default().fg(theme::ERROR_FG),
+        ),
     }
 }
 
@@ -1593,6 +1628,9 @@ async fn handle_cli_only_command(
                 "Clear display? (y to confirm, any other key to cancel): ",
                 Style::default().fg(theme::WARNING_FG),
             );
+        }
+        CliOnlyCommand::Copy => {
+            handle_copy_command(app, copy_completion_to_clipboard);
         }
         CliOnlyCommand::History => {
             let last_n: Vec<String> = app
@@ -3889,8 +3927,69 @@ mod tests {
         drain_output(&mut rx, &mut app);
 
         assert!(app.completion_lines.is_empty());
-        assert_eq!(app.output_lines.back().unwrap().to_string(), "❯ queued message");
+        assert_eq!(app.last_completion_text(), Some("first completion"));
+        assert_eq!(
+            app.output_lines.back().unwrap().to_string(),
+            "❯ queued message"
+        );
         assert_eq!(app.output_line_kinds.back(), Some(&BlockKind::UserPrompt));
+    }
+
+    #[test]
+    fn test_copy_command_copies_raw_completion_and_clear_forgets_it() {
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let copied_for_callback = copied.clone();
+        let mut app = App::new();
+        app.set_last_completion_text("### Done\n\n**bold**".to_string());
+
+        handle_copy_command(&mut app, move |text| {
+            *copied_for_callback.borrow_mut() = Some(text.to_string());
+            Ok(())
+        });
+
+        assert_eq!(copied.borrow().as_deref(), Some("### Done\n\n**bold**"));
+        assert!(
+            app.output_lines
+                .back()
+                .unwrap()
+                .to_string()
+                .contains("Copied latest completion")
+        );
+
+        app.clear_output().unwrap();
+        assert_eq!(app.last_completion_text(), None);
+    }
+
+    #[test]
+    fn test_copy_command_warns_without_completion() {
+        let called = std::cell::Cell::new(false);
+        let mut app = App::new();
+
+        handle_copy_command(&mut app, |_| {
+            called.set(true);
+            Ok(())
+        });
+
+        assert!(!called.get());
+        assert!(
+            app.output_lines
+                .back()
+                .unwrap()
+                .to_string()
+                .contains("No completion to copy yet")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_write_clipboard_emits_osc52_sequence() {
+        let mut output = Vec::new();
+
+        write_clipboard(&mut output, "raw **markdown**").unwrap();
+
+        let sequence = String::from_utf8(output).unwrap();
+        assert!(sequence.starts_with("\x1b]52;c;"));
+        assert!(sequence.contains("cmF3ICoqbWFya2Rvd24qKg=="));
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ enum SlashCommandId {
     NewRule,
     Exit,
     Clear,
+    Copy,
     History,
     Skills,
     Help,
@@ -142,6 +143,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         description: "Clear the visible display",
         usage: "/clear",
         detail: "Clears the transcript shown in this terminal. Model context and saved conversation history are unchanged.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Copy,
+        name: "copy",
+        aliases: &[],
+        description: "Copy the last completion to the clipboard",
+        usage: "/copy",
+        detail: "Copies the most recent agent completion as raw Markdown through the terminal clipboard.",
         category: SlashCommandCategory::Local,
         requires_args: false,
         requirement: CommandRequirement::Always,
@@ -562,6 +574,7 @@ pub enum CliOnlyCommand {
     Exit,
     Quit,
     Clear,
+    Copy,
     History,
     Skills,
     Help,
@@ -727,6 +740,7 @@ impl CliOnlyCommand {
             Self::Exit
                 | Self::Quit
                 | Self::Clear
+                | Self::Copy
                 | Self::History
                 | Self::Skills
                 | Self::Help
@@ -845,6 +859,7 @@ fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCom
             }
         }
         SlashCommandId::Clear => Some(CliOnlyCommand::Clear),
+        SlashCommandId::Copy => Some(CliOnlyCommand::Copy),
         SlashCommandId::History => Some(CliOnlyCommand::History),
         SlashCommandId::Skills => Some(CliOnlyCommand::Skills),
         SlashCommandId::Help => {
@@ -2048,6 +2063,11 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_copy_command() {
+        assert_eq!(CliOnlyCommand::parse("copy"), Some(CliOnlyCommand::Copy));
+    }
+
+    #[test]
     fn test_parse_cli_only_no_command() {
         let result = get_cli_only_command("Hello world");
         assert_eq!(result, None);
@@ -2060,6 +2080,7 @@ mod tests {
         assert!(text.contains("/compact"));
         assert!(text.contains("/exit"));
         assert!(text.contains("/clear"));
+        assert!(text.contains("/copy"));
         assert!(text.contains("/history"));
         assert!(text.contains("/skills"));
         assert!(text.contains("/help"));

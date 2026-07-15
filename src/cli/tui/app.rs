@@ -452,6 +452,7 @@ pub struct App {
     pub model_picker_selected: usize,
     /// Completion box lines rendered as a dedicated Block widget.
     pub completion_lines: VecDeque<Line<'static>>,
+    last_completion_text: Option<String>,
     /// Cached completion row count, valid when cached_wrap_width matches.
     pub cached_completion_rows: usize,
     completion_scroll_offset: usize,
@@ -738,6 +739,7 @@ impl App {
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
             completion_lines: VecDeque::new(),
+            last_completion_text: None,
             cached_completion_rows: 0,
             completion_scroll_offset: 0,
             completion_viewport_rows: 0,
@@ -1161,6 +1163,15 @@ impl App {
         self.cached_wrap_width = None;
     }
 
+    pub fn set_last_completion_text(&mut self, text: String) {
+        self.last_completion_text = Some(text);
+    }
+
+    #[must_use]
+    pub fn last_completion_text(&self) -> Option<&str> {
+        self.last_completion_text.as_deref()
+    }
+
     /// Clear the completion box and invalidate cached layout for the next render.
     pub fn clear_completion_lines(&mut self) {
         self.needs_redraw = true;
@@ -1472,6 +1483,7 @@ impl App {
         self.output_lines.clear();
         self.output_line_kinds.clear();
         self.completion_lines.clear();
+        self.last_completion_text = None;
         self.error_lines.clear();
         self.turn_stream_entries.clear();
         self.last_stream_group = None;
