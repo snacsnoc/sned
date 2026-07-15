@@ -922,6 +922,13 @@ fn command_is_available(spec: &SlashCommandSpec, availability: SlashCommandAvail
 
 #[must_use]
 pub fn parse_slash_command(text: &str) -> SlashCommandParseResult {
+    if !text.starts_with('/') {
+        return SlashCommandParseResult {
+            processed_text: text.to_string(),
+            command: None,
+        };
+    }
+
     let regex = Regex::new(SLASH_COMMAND_REGEX).unwrap();
     let caps = regex.captures(text);
     if let Some(caps) = caps {
@@ -1070,7 +1077,7 @@ pub fn unknown_leading_slash_command(
     text: &str,
     available_skills: &[SkillMetadata],
 ) -> Option<String> {
-    let body = text.trim_start().strip_prefix('/')?;
+    let body = text.strip_prefix('/')?;
     let command_name = body.split_whitespace().next()?;
     if command_name.is_empty()
         || match_static_command(body).is_some()
@@ -1183,18 +1190,10 @@ fn build_slash_command_entries_with_availability(
 /// Extract the slash command query from the input text.
 ///
 /// Returns `Some(query)` if the user is currently typing a slash command
-/// (text contains `/` at the start of a word), `None` otherwise.
-#[must_use] 
+/// at the start of the input, `None` otherwise.
+#[must_use]
 pub fn extract_slash_query(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut last_slash_pos = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'/' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
-            last_slash_pos = Some(i);
-        }
-    }
-    let pos = last_slash_pos?;
-    let after = &text[pos + 1..];
+    let after = text.strip_prefix('/')?;
     if after.split_whitespace().count() > 1 {
         return None;
     }
@@ -1203,30 +1202,19 @@ pub fn extract_slash_query(text: &str) -> Option<String> {
 
 /// Replace the active slash query with the selected command name.
 ///
-/// The returned text keeps any prefix before the slash and any suffix after
-/// the typed query, but the current `/query` token is replaced with the
-/// completed command name including its leading slash.
-#[must_use] 
+/// The returned text keeps any suffix after the typed query, but the current
+/// `/query` token is replaced with the completed command name.
+#[must_use]
 pub fn apply_slash_completion(text: &str, command_name: &str) -> Option<(String, usize)> {
-    let bytes = text.as_bytes();
-    let mut last_slash_pos = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'/' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
-            last_slash_pos = Some(i);
-        }
-    }
-
-    let pos = last_slash_pos?;
     let query = extract_slash_query(text)?;
-    let end = pos + 1 + query.len();
+    let end = 1 + query.len();
 
-    let mut new_text = String::with_capacity(text.len() + command_name.len() + 1 - (end - pos));
-    new_text.push_str(&text[..pos]);
+    let mut new_text = String::with_capacity(text.len() + command_name.len() + 1 - end);
     new_text.push('/');
     new_text.push_str(command_name);
     new_text.push_str(&text[end..]);
 
-    let cursor_pos = text[..pos].len() + command_name.len() + 1;
+    let cursor_pos = command_name.len() + 1;
     Some((new_text, cursor_pos))
 }
 
@@ -1721,14 +1709,11 @@ mod tests {
     }
 
     #[test]
-    fn test_slash_command_with_whitespace_prefix() {
-        let result = parse_slash_command("Please /compact now");
-        assert_eq!(result.processed_text, "Please now");
-        let cmd = result.command.unwrap();
-        assert_eq!(cmd.command, "compact");
-        assert_eq!(cmd.prefix, " ");
-        assert_eq!(cmd.start_index, 6);
-        assert_eq!(cmd.end_index, 15);
+    fn test_inline_slash_command_is_plain_input() {
+        let text = "Please /compact now";
+        let result = parse_slash_command(text);
+        assert_eq!(result.processed_text, text);
+        assert!(result.command.is_none());
     }
 
     #[test]
@@ -1755,11 +1740,11 @@ mod tests {
     }
 
     #[test]
-    fn test_slash_command_at_end() {
-        let result = parse_slash_command("Please help me /compact");
-        assert_eq!(result.processed_text, "Please help me");
-        let cmd = result.command.unwrap();
-        assert_eq!(cmd.command, "compact");
+    fn test_slash_command_at_end_is_plain_input() {
+        let text = "Please help me /compact";
+        let result = parse_slash_command(text);
+        assert_eq!(result.processed_text, text);
+        assert!(result.command.is_none());
     }
 
     #[test]
@@ -2042,6 +2027,7 @@ mod tests {
             Some("workflow".to_string())
         );
         assert!(unknown_leading_slash_command("please use /workflow now", &[]).is_none());
+        assert!(unknown_leading_slash_command(" /workflow now", &[]).is_none());
         assert!(unknown_leading_slash_command("/compact", &[]).is_none());
     }
 
@@ -2331,6 +2317,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cli_only_ignores_inline_plan_command() {
+        let text = "what about action modes? we have /plan but need auto approval";
+        assert!(get_cli_only_command(text).is_none());
+        assert_eq!(process_slash_command_with_context(text, &[]), text);
+    }
+
+    #[test]
     fn test_parse_cli_only_plan_approve() {
         let result = get_cli_only_command("/plan approve");
         assert!(result.is_some());
@@ -2437,26 +2430,23 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_slash_query_after_whitespace() {
-        assert_eq!(extract_slash_query("hello /compact").unwrap(), "compact");
+    fn test_extract_slash_query_after_whitespace_is_ignored() {
+        assert!(extract_slash_query("hello /compact").is_none());
     }
 
     #[test]
     fn test_extract_slash_query_multiple_words_not_detected() {
-        // Multiple words after slash returns None
         assert!(extract_slash_query("/compact do this").is_none());
     }
 
     #[test]
-    fn test_extract_slash_query_latest_wins() {
-        assert_eq!(extract_slash_query("/a /b").unwrap(), "b");
+    fn test_extract_slash_query_with_inline_command_is_ignored() {
+        assert!(extract_slash_query("/a /b").is_none());
     }
 
     #[test]
-    fn test_apply_slash_completion_replaces_current_query() {
-        let (text, cursor) = apply_slash_completion("please /pl", "plan").unwrap();
-        assert_eq!(text, "please /plan");
-        assert_eq!(cursor, "please /plan".len());
+    fn test_apply_slash_completion_ignores_inline_query() {
+        assert!(apply_slash_completion("please /pl", "plan").is_none());
     }
 
     #[test]

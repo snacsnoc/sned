@@ -4370,12 +4370,9 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_active_slash_command_uses_last_command_position() {
-        let text = "foo/bar /baz";
-        assert_eq!(
-            strip_active_slash_command(text).as_deref(),
-            Some("foo/bar ")
-        );
+    fn test_strip_active_slash_command_only_accepts_input_start() {
+        assert_eq!(strip_active_slash_command("/baz").as_deref(), Some(""));
+        assert!(strip_active_slash_command("foo/bar /baz").is_none());
     }
 
     #[test]
