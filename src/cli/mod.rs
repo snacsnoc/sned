@@ -87,23 +87,49 @@ fn tracing_mode(json_output: bool, verbose: bool) -> TracingMode {
     }
 }
 
+fn default_human_filter(verbose: bool, debug: bool, tui_mode: bool) -> &'static str {
+    if verbose || debug {
+        "sned=debug"
+    } else if tui_mode {
+        "sned=warn,sned::tui=info"
+    } else {
+        "sned=warn"
+    }
+}
+
+struct TuiTraceSessionGuard {
+    enabled: bool,
+}
+
+impl TuiTraceSessionGuard {
+    fn new(enabled: bool) -> Self {
+        if enabled {
+            tracing::info!(target: "sned::tui", "TUI session started");
+        }
+        Self { enabled }
+    }
+}
+
+impl Drop for TuiTraceSessionGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            tracing::info!(target: "sned::tui", "TUI session ended");
+        }
+    }
+}
+
 fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
     match mode {
         TracingMode::JsonOnly => {
             tracing_subscriber::registry().with(JsonOutputLayer).init();
         }
         TracingMode::Human { verbose } => {
-            let log_level = if verbose || debug { "debug" } else { "warn" };
             let env_filter = EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(format!("sned={log_level}")));
+                .unwrap_or_else(|_| EnvFilter::new(default_human_filter(verbose, debug, tui_mode)));
 
             use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
-            // In TUI mode, route tracing to a log file to keep warnings
-            // from corrupting the alternate screen display.  Non-TUI mode
-            // writes to stderr as before.  BoxMakeWriter provides a
-            // type-erased wrapper so both branches share the same
-            // `Layer<…>` type.
+            // TUI tracing must avoid stderr because alternate-screen writes corrupt the display.
             let writer: BoxMakeWriter = if tui_mode {
                 let path =
                     std::env::temp_dir().join(format!("sned-tui-{}.log", std::process::id()));
@@ -121,7 +147,6 @@ fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
                             path.display(),
                             e
                         );
-                        // Fallback to stderr if file creation fails.
                         BoxMakeWriter::new(std::io::stderr)
                     }
                 }
@@ -1528,6 +1553,7 @@ pub fn run() -> anyhow::Result<()> {
         cli.task_opts.debug,
         tui_mode,
     );
+    let _tui_trace_session = TuiTraceSessionGuard::new(tui_mode);
 
     match cli.command {
         Some(Command::Task { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),
@@ -2750,5 +2776,16 @@ mod tests {
             tracing_mode(false, true),
             TracingMode::Human { verbose: true }
         );
+    }
+
+    #[test]
+    fn tui_tracing_records_lifecycle_without_widening_other_targets() {
+        assert_eq!(
+            default_human_filter(false, false, true),
+            "sned=warn,sned::tui=info"
+        );
+        assert_eq!(default_human_filter(false, false, false), "sned=warn");
+        assert_eq!(default_human_filter(true, false, true), "sned=debug");
+        assert_eq!(default_human_filter(false, true, true), "sned=debug");
     }
 }

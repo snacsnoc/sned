@@ -190,14 +190,28 @@ def startup_exit():
 
     with PtySession("sned-tui-smoke.") as session:
         session.run(8, tick)
+        trace_match = re.search(
+            r"TUI mode: tracing output redirected to ([^\n]+)",
+            clean_output(session.buf),
+        )
+        trace_text = ""
+        if trace_match:
+            try:
+                with open(trace_match.group(1).strip(), encoding="utf-8") as trace_file:
+                    trace_text = trace_file.read()
+            except OSError:
+                pass
         session.dump_if_verbose()
         report(
             [
                 ("type a prompt" in session.text, "startup banner not rendered"),
                 (sent_exit, "/exit was not sent"),
                 (session.exit_code in (0, None), f"sned exited with {session.exit_code}"),
+                (trace_match is not None, "TUI trace path was not reported"),
+                ("TUI session started" in trace_text, "TUI trace start event missing"),
+                ("TUI session ended" in trace_text, "TUI trace end event missing"),
             ],
-            "ratatui startup and /exit path worked",
+            "ratatui startup, tracing, and /exit path worked",
         )
 
 
