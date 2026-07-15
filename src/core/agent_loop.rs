@@ -180,7 +180,32 @@ fn get_terminal_width() -> usize {
     }
 }
 
-fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriterArc) {
+fn streaming_model_line(text: String, style_markdown: bool) -> Line<'static> {
+    if style_markdown {
+        let mut rendered = crate::cli::markdown::render_markdown(None, &text);
+        if rendered.len() == 1 {
+            let mut line = rendered.pop().unwrap();
+            for span in &mut line.spans {
+                if span.style.fg.is_none() {
+                    span.style.fg = Some(crate::cli::tui::theme::ACCENT);
+                }
+            }
+            return line;
+        }
+    }
+
+    // Block constructs need full-turn context and remain raw until TurnEnd.
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(crate::cli::tui::theme::ACCENT),
+    ))
+}
+
+fn print_model_line(
+    line: &str,
+    output_writer: &crate::cli::output::OutputWriterArc,
+    style_markdown: bool,
+) {
     use crate::cli::output::OutputEvent;
     let term_width = get_terminal_width();
     let indent = "  ";
@@ -195,19 +220,26 @@ fn print_model_line(line: &str, output_writer: &crate::cli::output::OutputWriter
     // multiple rows inside a single span, which can scramble viewport math and
     // corrupt rendering when model output is long or malformed.
     for wrapped_line in wrapped.lines() {
-        output_writer.emit(OutputEvent::model_output(wrapped_line.to_string()));
+        output_writer.emit(OutputEvent::Line(streaming_model_line(
+            wrapped_line.to_string(),
+            style_markdown,
+        )));
     }
 }
 
-fn update_model_line(line: &str, output_writer: &crate::cli::output::OutputWriterArc) {
+fn update_model_line(
+    line: &str,
+    output_writer: &crate::cli::output::OutputWriterArc,
+    style_markdown: bool,
+) {
     let sanitized = sanitize_model_text_for_display(line);
     if sanitized.trim().is_empty() {
         return;
     }
-    output_writer.emit(OutputEvent::ModelUpdateLine(Line::from(Span::styled(
+    output_writer.emit(OutputEvent::ModelUpdateLine(streaming_model_line(
         sanitized.into_owned(),
-        Style::default().fg(crate::cli::tui::theme::ACCENT),
-    ))));
+        style_markdown,
+    )));
 }
 
 /// Like `print_model_line`, but if `pending` is true, emits a separate
@@ -218,6 +250,7 @@ fn print_model_line_with_prefix_if_pending(
     line: &str,
     output_writer: &crate::cli::output::OutputWriterArc,
     pending: &mut bool,
+    style_markdown: bool,
 ) {
     if *pending && !line.trim().is_empty() {
         *pending = false;
@@ -227,21 +260,22 @@ fn print_model_line_with_prefix_if_pending(
         // were part of the streamed text, it would be lost in the re-render.
         output_writer.emit(crate::cli::output::OutputEvent::turn_indicator("\u{2666}"));
     }
-    print_model_line(line, output_writer);
+    print_model_line(line, output_writer, style_markdown);
 }
 
 fn update_model_line_with_prefix_if_pending(
     line: &str,
     output_writer: &crate::cli::output::OutputWriterArc,
     pending: &mut bool,
+    style_markdown: bool,
 ) {
     if *pending && !line.trim().is_empty() {
         *pending = false;
         output_writer.emit(crate::cli::output::OutputEvent::turn_indicator("\u{2666}"));
-        print_model_line(line, output_writer);
+        print_model_line(line, output_writer, style_markdown);
         return;
     }
-    update_model_line(line, output_writer);
+    update_model_line(line, output_writer, style_markdown);
 }
 
 fn stream_error_is_retryable(error: &str) -> bool {
@@ -1911,6 +1945,7 @@ impl AgentLoop {
                                             trimmed_line,
                                             &self.config.output_writer,
                                             &mut turn_indicator_pending,
+                                            false,
                                         );
                                         partial_line_displayed = false;
                                         last_partial_flush_at = None;
@@ -1938,6 +1973,7 @@ impl AgentLoop {
                                             trimmed_line,
                                             &self.config.output_writer,
                                             &mut turn_indicator_pending,
+                                            self.config.interactive_mode,
                                         );
                                         partial_line_displayed = false;
                                         last_partial_flush_at = None;
@@ -1946,6 +1982,7 @@ impl AgentLoop {
                                             trimmed_line,
                                             &self.config.output_writer,
                                             &mut turn_indicator_pending,
+                                            self.config.interactive_mode,
                                         );
                                     }
                                 }
@@ -1967,12 +2004,14 @@ impl AgentLoop {
                                             trimmed_partial,
                                             &self.config.output_writer,
                                             &mut turn_indicator_pending,
+                                            false,
                                         );
                                     } else {
                                         print_model_line_with_prefix_if_pending(
                                             trimmed_partial,
                                             &self.config.output_writer,
                                             &mut turn_indicator_pending,
+                                            false,
                                         );
                                         partial_line_displayed = true;
                                     }
@@ -2309,12 +2348,14 @@ impl AgentLoop {
                             &remaining,
                             &self.config.output_writer,
                             &mut turn_indicator_pending,
+                            self.config.interactive_mode,
                         );
                     } else {
                         print_model_line_with_prefix_if_pending(
                             &remaining,
                             &self.config.output_writer,
                             &mut turn_indicator_pending,
+                            self.config.interactive_mode,
                         );
                     }
                 }
@@ -4650,7 +4691,7 @@ mod tests {
         let writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 
-        print_model_line(&"x".repeat(200), &writer);
+        print_model_line(&"x".repeat(200), &writer, false);
 
         let mut emitted = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -4674,7 +4715,7 @@ mod tests {
         let writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 
-        print_model_line("ok\r\x1b[31mthere\tfriend", &writer);
+        print_model_line("ok\r\x1b[31mthere\tfriend", &writer, false);
 
         let rendered = match rx.try_recv() {
             Ok(OutputEvent::Line(line)) => line.to_string(),
@@ -4687,6 +4728,69 @@ mod tests {
         assert!(rendered.contains("ok"));
         assert!(rendered.contains("there"));
         assert!(rendered.contains("friend"));
+    }
+
+    #[test]
+    fn test_streaming_model_line_renders_completed_markdown() {
+        let inline = streaming_model_line("  **bold** and `code`".to_string(), true);
+        assert_eq!(inline.to_string(), "bold and `code`");
+        assert!(inline.spans.iter().any(|span| {
+            span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(inline.spans.iter().any(|span| {
+            span.content == "`code`"
+                && span.style.fg == Some(crate::cli::tui::theme::PROMPT_FG)
+        }));
+
+        let heading = streaming_model_line("  ### heading".to_string(), true);
+        assert!(
+            heading
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+
+        let list_item = streaming_model_line("  1. first item".to_string(), true);
+        assert!(list_item.to_string().contains("• first item"));
+    }
+
+    #[test]
+    fn test_streaming_model_line_keeps_partial_and_block_markdown_raw() {
+        let partial = streaming_model_line("**bol".to_string(), false);
+        assert_eq!(partial.to_string(), "**bol");
+        assert_eq!(partial.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
+
+        let block = streaming_model_line("---".to_string(), true);
+        assert_eq!(block.to_string(), "---");
+        assert_eq!(block.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
+    }
+
+    #[test]
+    fn test_update_model_line_styles_completed_partial_line() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        update_model_line("**bol", &writer, false);
+        update_model_line("**bold**", &writer, true);
+
+        let partial = match rx.try_recv() {
+            Ok(OutputEvent::ModelUpdateLine(line)) => line,
+            other => panic!("expected raw partial update, got {other:?}"),
+        };
+        assert_eq!(partial.to_string(), "**bol");
+
+        let completed = match rx.try_recv() {
+            Ok(OutputEvent::ModelUpdateLine(line)) => line,
+            other => panic!("expected styled completed update, got {other:?}"),
+        };
+        assert_eq!(completed.to_string(), "bold");
+        assert!(
+            completed
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
     }
 
     #[test]
