@@ -4,32 +4,37 @@
 //! environment variables. Secret and settings key mappings have been
 //! moved to `storage/secrets.rs` to avoid duplication.
 
+pub(crate) const PROVIDER_API_KEY_ENV_VARS: &[(&str, &[&str])] = &[
+    ("anthropic", &["ANTHROPIC_API_KEY"]),
+    ("openrouter", &["OPENROUTER_API_KEY"]),
+    ("openai", &["OPENAI_API_KEY"]),
+    ("gemini", &["GEMINI_API_KEY"]),
+    ("minimax", &["MINIMAX_API_KEY", "MINIMAX_CN_API_KEY"]),
+    ("deepseek", &["DEEPSEEK_API_KEY"]),
+];
+
 /// Get the best provider based on available environment variables.
 ///
 /// Source: `dirac/src/shared/storage/env-config.ts` — `getProviderFromEnv()`
 #[must_use]
 pub fn get_provider_from_env() -> Option<&'static str> {
-    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        return Some("anthropic");
+    for &(provider, env_vars) in PROVIDER_API_KEY_ENV_VARS {
+        if env_vars
+            .iter()
+            .any(|env_var| std::env::var(env_var).is_ok())
+        {
+            return Some(
+                if provider == "openai" && std::env::var("OPENAI_API_BASE").is_ok() {
+                    "openai"
+                } else if provider == "openai" {
+                    "openai-native"
+                } else {
+                    provider
+                },
+            );
+        }
     }
-    if std::env::var("OPENROUTER_API_KEY").is_ok() {
-        return Some("openrouter");
-    }
-    if std::env::var("OPENAI_API_BASE").is_ok() && std::env::var("OPENAI_API_KEY").is_ok() {
-        return Some("openai");
-    }
-    if std::env::var("OPENAI_API_KEY").is_ok() {
-        return Some("openai-native");
-    }
-    if std::env::var("GEMINI_API_KEY").is_ok() {
-        return Some("gemini");
-    }
-    if std::env::var("MINIMAX_API_KEY").is_ok() || std::env::var("MINIMAX_CN_API_KEY").is_ok() {
-        return Some("minimax");
-    }
-    if std::env::var("DEEPSEEK_API_KEY").is_ok() {
-        return Some("deepseek");
-    }
+
     None
 }
 

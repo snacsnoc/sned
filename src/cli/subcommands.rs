@@ -774,40 +774,24 @@ pub fn run_doctor() -> anyhow::Result<i32> {
 
     // Check 1: API keys
     println!("\n[API Keys]");
-    let providers = vec![
-        ("openai", "OPENAI_API_KEY"),
-        ("anthropic", "ANTHROPIC_API_KEY"),
-        ("google", "GEMINI_API_KEY"),
-        ("mistral", "MISTRAL_API_KEY"),
-        ("moonshot", "MOONSHOT_API_KEY"),
-        ("deepseek", "DEEPSEEK_API_KEY"),
-        ("together", "TOGETHER_API_KEY"),
-        ("fireworks", "FIREWORKS_API_KEY"),
-        ("nebius", "NEBIUS_API_KEY"),
-        ("zai", "ZAI_API_KEY"),
-        ("minimax", "MINIMAX_API_KEY"),
-        ("huggingface", "HUGGINGFACE_API_KEY"),
-        ("vercel-ai-gateway", "VERCEL_AI_GATEWAY_API_KEY"),
-    ];
-
-    for (provider, env_var) in providers {
-        match env::var(env_var) {
-            Ok(key) if !key.is_empty() => {
-                let masked = if key.len() > 8 {
-                    format!("{}...{}", &key[..4], &key[key.len() - 4..])
-                } else {
-                    "****".to_string()
-                };
-                println!("  [OK] {provider} ({masked})");
-            }
-            Ok(_) => {
-                println!("  [WARN] {provider} ({env_var} is set but empty)");
-                has_warn = true;
-            }
-            Err(_) => {
-                println!("  [WARN] {provider} ({env_var} not set)");
-                has_warn = true;
-            }
+    for &(provider, env_vars) in crate::providers::env_auth::PROVIDER_API_KEY_ENV_VARS {
+        let env_var_names = env_vars.join(" or ");
+        if let Some(key) = env_vars
+            .iter()
+            .find_map(|env_var| env::var(env_var).ok().filter(|key| !key.is_empty()))
+        {
+            let masked = if key.len() > 8 {
+                format!("{}...{}", &key[..4], &key[key.len() - 4..])
+            } else {
+                "****".to_string()
+            };
+            println!("  [OK] {provider} ({masked})");
+        } else if env_vars.iter().any(|env_var| env::var(env_var).is_ok()) {
+            println!("  [WARN] {provider} ({env_var_names} is set but empty)");
+            has_warn = true;
+        } else {
+            println!("  [WARN] {provider} ({env_var_names} not set)");
+            has_warn = true;
         }
     }
 
