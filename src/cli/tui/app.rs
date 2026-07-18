@@ -1983,54 +1983,36 @@ impl App {
         // Reserve the plan area even when no plan is active so the
         // Clear widget below can wipe stale plan content from the
         // right 35 columns after the plan is dismissed.
-        let [_main_area, plan_area] =
+        let [plan_main_area, plan_area] =
             Layout::horizontal([Constraint::Min(40), Constraint::Length(35)]).areas(frame.area());
-
-        if has_plan {
-            let main_area = _main_area;
-            let [output_area, status_area, input_area] = Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(self.render_input_height()),
-            ])
-            .areas(main_area);
-
-            self.render_output(frame, output_area);
-            self.render_status_bar(frame, status_area);
-            self.render_input(frame, input_area);
-            if self.picker_active {
-                self.render_picker_overlay(frame, output_area);
-            }
-            if self.slash_command_active {
-                self.render_slash_command_overlay(frame, output_area);
-            }
-            if self.model_picker_active {
-                self.render_model_picker_overlay(frame, output_area);
-            }
-            frame.render_widget(Clear, plan_area);
-            self.render_plan_panel(frame, plan_area);
+        let main_area = if has_plan {
+            plan_main_area
         } else {
-            frame.render_widget(Clear, plan_area);
+            frame.area()
+        };
+        frame.render_widget(Clear, plan_area);
 
-            let [output_area, status_area, input_area] = Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(self.render_input_height()),
-            ])
-            .areas(frame.area());
+        let [output_area, status_area, input_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(self.render_input_height()),
+        ])
+        .areas(main_area);
 
-            self.render_output(frame, output_area);
-            self.render_status_bar(frame, status_area);
-            self.render_input(frame, input_area);
-            if self.picker_active {
-                self.render_picker_overlay(frame, output_area);
-            }
-            if self.slash_command_active {
-                self.render_slash_command_overlay(frame, output_area);
-            }
-            if self.model_picker_active {
-                self.render_model_picker_overlay(frame, output_area);
-            }
+        self.render_output(frame, output_area);
+        self.render_status_bar(frame, status_area);
+        self.render_input(frame, input_area);
+        if self.picker_active {
+            self.render_picker_overlay(frame, output_area);
+        }
+        if self.slash_command_active {
+            self.render_slash_command_overlay(frame, output_area);
+        }
+        if self.model_picker_active {
+            self.render_model_picker_overlay(frame, output_area);
+        }
+        if has_plan {
+            self.render_plan_panel(frame, plan_area);
         }
     }
 
@@ -2172,18 +2154,21 @@ impl App {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect) {
-        let current_fingerprint = (
-            self.provider_name.clone(),
-            self.model_name.clone(),
-            self.task_id.clone(),
-            self.mode.clone(),
-        );
-        if self.status_left_fingerprint != current_fingerprint {
+        if self.status_left_fingerprint.0 != self.provider_name
+            || self.status_left_fingerprint.1 != self.model_name
+            || self.status_left_fingerprint.2 != self.task_id
+            || self.status_left_fingerprint.3 != self.mode
+        {
             self.cached_status_left = format!(
                 " {} / {} | {} | {} ",
                 self.provider_name, self.model_name, self.task_id, self.mode
             );
-            self.status_left_fingerprint = current_fingerprint;
+            self.status_left_fingerprint = (
+                self.provider_name.clone(),
+                self.model_name.clone(),
+                self.task_id.clone(),
+                self.mode.clone(),
+            );
         }
         let elapsed_secs = self.elapsed.map_or(u64::MAX, |e| e.as_secs());
         let context_key = (
@@ -2194,59 +2179,30 @@ impl App {
             self.queued_message_count,
         );
         if context_key != self.cached_status_right_secs {
-            let context_str = self
-                .context_pct
-                .map(|pct| format!("Context: {:.0}% left · ", 100.0 - pct));
-            let overflow_str = if self.output_overflow {
-                Some(format!(
+            let mut status = String::new();
+            if self.output_overflow {
+                let summary = if self.output_overflow_summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", self.output_overflow_summary)
+                };
+                status.push_str(&format!(
                     "⚠ output overflow ({} dropped{}) · ",
-                    self.output_overflow_count,
-                    if self.output_overflow_summary.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", self.output_overflow_summary)
-                    }
-                ))
-            } else {
-                None
-            };
-            let queued_str = if self.queued_message_count > 0 {
-                Some(format!("📨 {} queued · ", self.queued_message_count))
-            } else {
-                None
-            };
-            self.cached_status_right = match (overflow_str, context_str, queued_str, self.elapsed) {
-                (Some(ovf), Some(ctx), Some(q), Some(elapsed)) => {
-                    format!("{}{}{}⏱ {} ", ovf, ctx, q, format_duration(elapsed))
-                }
-                (Some(ovf), Some(ctx), Some(q), None) => format!("{ovf}{ctx}{q} "),
-                (Some(ovf), None, Some(q), Some(elapsed)) => {
-                    format!("{}{}⏱ {} ", ovf, q, format_duration(elapsed))
-                }
-                (Some(ovf), None, Some(q), None) => format!("{ovf}{q} "),
-                (None, Some(ctx), Some(q), Some(elapsed)) => {
-                    format!("{}{}⏱ {} ", ctx, q, format_duration(elapsed))
-                }
-                (None, Some(ctx), Some(q), None) => format!("{ctx}{q} "),
-                (None, None, Some(q), Some(elapsed)) => {
-                    format!("{}⏱ {} ", q, format_duration(elapsed))
-                }
-                (None, None, Some(q), None) => format!("{q} "),
-                (Some(ovf), Some(ctx), None, Some(elapsed)) => {
-                    format!("{}{}⏱ {} ", ovf, ctx, format_duration(elapsed))
-                }
-                (Some(ovf), Some(ctx), None, None) => format!("{ovf}{ctx} "),
-                (Some(ovf), None, None, Some(elapsed)) => {
-                    format!("{}⏱ {} ", ovf, format_duration(elapsed))
-                }
-                (Some(ovf), None, None, None) => format!("{ovf} "),
-                (None, Some(ctx), None, Some(elapsed)) => {
-                    format!("{}⏱ {} ", ctx, format_duration(elapsed))
-                }
-                (None, Some(ctx), None, None) => format!("{ctx} "),
-                (None, None, None, Some(elapsed)) => format!("⏱ {} ", format_duration(elapsed)),
-                (None, None, None, None) => String::new(),
-            };
+                    self.output_overflow_count, summary
+                ));
+            }
+            if let Some(pct) = self.context_pct {
+                status.push_str(&format!("Context: {:.0}% left · ", 100.0 - pct));
+            }
+            if self.queued_message_count > 0 {
+                status.push_str(&format!("📨 {} queued · ", self.queued_message_count));
+            }
+            if let Some(elapsed) = self.elapsed {
+                status.push_str(&format!("⏱ {} ", format_duration(elapsed)));
+            } else if !status.is_empty() {
+                status.push(' ');
+            }
+            self.cached_status_right = status;
             self.cached_status_right_secs = context_key;
         }
         let left_width = UnicodeWidthStr::width(self.cached_status_left.as_str());
