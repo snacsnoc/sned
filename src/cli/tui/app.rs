@@ -1414,12 +1414,20 @@ impl App {
     /// we reconstruct Line objects and prepend them to output_lines.
     pub fn enter_scrollback(&mut self) -> io::Result<()> {
         self.flush_scrollback_pending()?;
+
+        let scrollback_content = match self.scrollback_file.as_ref() {
+            Some(file_path) => match std::fs::read_to_string(file_path) {
+                Ok(content) => Some(content),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err),
+            },
+            None => None,
+        };
+
         self.in_scrollback = true;
         self.needs_redraw = true;
 
-        if let Some(ref file_path) = self.scrollback_file
-            && let Ok(content) = std::fs::read_to_string(file_path)
-        {
+        if let Some(content) = scrollback_content {
             let mut scrollback_lines: VecDeque<Line<'static>> = VecDeque::new();
             let mut scrollback_kinds: VecDeque<BlockKind> = VecDeque::new();
             for line in content.lines() {
@@ -5312,6 +5320,31 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(&file_path);
         let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn test_enter_scrollback_allows_missing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.scrollback_file = Some(temp_dir.path().join("missing-lines"));
+        app.push_plain("session line");
+
+        app.enter_scrollback().unwrap();
+
+        assert!(app.in_scrollback);
+        assert_eq!(app.output_lines.len(), 1);
+    }
+
+    #[test]
+    fn test_enter_scrollback_propagates_read_error_without_entering_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.scrollback_file = Some(temp_dir.path().to_path_buf());
+        app.push_plain("session line");
+
+        assert!(app.enter_scrollback().is_err());
+        assert!(!app.in_scrollback);
+        assert_eq!(app.output_lines.len(), 1);
     }
 
     /// Exiting scrollback clears the file and resets state.
