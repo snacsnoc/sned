@@ -10,10 +10,11 @@ use std::fmt;
 use std::io::Write;
 
 const PANIC_TERMINAL_RESET_SEQUENCE: &[u8] =
-    b"\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[<1u\x1b[?1049l\x1b[?25h\x1b[0m";
+    b"\x1b[?2004l\x1b[?1015l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[<1u\x1b[?1049l\x1b[?25h\x1b[0m";
 
-/// Captures clicks and wheel input without claiming drag motion, so terminals
-/// can keep their native text-selection behavior.
+/// Captures mouse events so wheel scrolling works in the TUI.
+///
+/// Users can hold Shift while dragging to bypass capture for native selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EnableSnedMouseCapture;
 
@@ -28,13 +29,13 @@ impl Command for EnableSnedMouseCapture {
     }
 }
 
-/// Clears every mouse mode Sned enables before restoring the terminal.
+/// Clears current and legacy mouse modes before restoring the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DisableSnedMouseCapture;
 
 impl Command for DisableSnedMouseCapture {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str("\x1b[?1006l\x1b[?1000l")
+        f.write_str("\x1b[?1015l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l")
     }
 
     #[cfg(windows)]
@@ -71,18 +72,20 @@ mod tests {
     }
 
     #[test]
-    fn sned_mouse_capture_teardown_matches_enabled_modes() {
+    fn sned_mouse_capture_teardown_clears_legacy_modes() {
         let mut output = String::new();
         DisableSnedMouseCapture.write_ansi(&mut output).unwrap();
 
-        assert_eq!(output, "\x1b[?1006l\x1b[?1000l");
+        for mode in [1015, 1006, 1003, 1002, 1000] {
+            assert!(output.contains(&format!("\x1b[?{mode}l")));
+        }
     }
 
     #[test]
     fn panic_reset_clears_interactive_input_modes() {
         assert_eq!(
             PANIC_TERMINAL_RESET_SEQUENCE,
-            b"\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[<1u\x1b[?1049l\x1b[?25h\x1b[0m"
+            b"\x1b[?2004l\x1b[?1015l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[<1u\x1b[?1049l\x1b[?25h\x1b[0m"
         );
     }
 }

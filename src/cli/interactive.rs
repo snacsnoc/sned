@@ -3292,7 +3292,11 @@ pub async fn run_interactive_shell_inner(
     // Enable keyboard enhancement flags so Shift+Enter arrives distinctly
     // from Enter on terminals that support CSI-u / kitty keyboard protocol.
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnableBracketedPaste, EnableSnedMouseCapture)?;
+    if std::env::var_os("SNED_DISABLE_MOUSE").is_some() {
+        execute!(stdout, EnableBracketedPaste)?;
+    } else {
+        execute!(stdout, EnableBracketedPaste, EnableSnedMouseCapture)?;
+    }
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -3372,6 +3376,10 @@ pub async fn run_interactive_shell_inner(
             );
             app.push_styled(
                 "type /help for slash commands, @ to search and mention files",
+                theme::dim_style(),
+            );
+            app.push_styled(
+                "hold Shift+drag to select text; set SNED_DISABLE_MOUSE=1 for native mouse selection",
                 theme::dim_style(),
             );
         }
