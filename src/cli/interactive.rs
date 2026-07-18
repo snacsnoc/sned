@@ -671,6 +671,10 @@ fn copy_completion_to_clipboard(text: &str) -> std::io::Result<()> {
     write_clipboard(std::io::stdout(), text)
 }
 
+fn confirmation_is_approved(response: &str) -> bool {
+    response.trim().eq_ignore_ascii_case("y")
+}
+
 fn handle_copy_command(app: &mut App, copy: impl FnOnce(&str) -> std::io::Result<()>) {
     let Some(text) = app.last_completion_text().map(str::to_owned) else {
         app.push_styled(
@@ -1837,16 +1841,18 @@ async fn handle_cli_only_command(
             }
 
             let most_recent = &checkpoints[0];
-            let current_hash = checkpoint_mgr
-                .last_checkpoint()
-                .map(std::string::String::as_str);
-            let changed_files = if let Some(current) = current_hash {
-                checkpoint_mgr
-                    .get_changed_files(&most_recent.hash, Some(current))
-                    .await
-                    .unwrap_or_else(|_| vec![])
-            } else {
-                vec![]
+            let changed_files = match checkpoint_mgr
+                .get_changed_files(&most_recent.hash, None)
+                .await
+            {
+                Ok(files) => files,
+                Err(e) => {
+                    app.push_styled(
+                        format!("Could not determine files affected by undo: {e}. Undo cancelled."),
+                        Style::default().fg(theme::WARNING_FG),
+                    );
+                    return Ok(false);
+                }
             };
 
             if !changed_files.is_empty() {
@@ -1884,7 +1890,7 @@ async fn handle_cli_only_command(
                     return Ok(false);
                 }
 
-                if confirm.trim().to_lowercase() == "n" {
+                if !confirmation_is_approved(&confirm) {
                     app.push_styled("Undo cancelled.", Style::default().fg(theme::WARNING_FG));
                     return Ok(false);
                 }
@@ -2143,11 +2149,8 @@ async fn handle_cli_only_command(
             }
 
             if let Some(checkpoint) = checkpoints.get(num - 1) {
-                let current_hash = checkpoint_mgr
-                    .last_checkpoint()
-                    .map_or("HEAD", std::string::String::as_str);
                 match checkpoint_mgr
-                    .get_changed_files(&checkpoint.hash, Some(current_hash))
+                    .get_changed_files(&checkpoint.hash, None)
                     .await
                 {
                     Ok(changed_files) => {
@@ -2186,7 +2189,7 @@ async fn handle_cli_only_command(
                                 return Ok(false);
                             }
 
-                            if confirm.trim().to_lowercase() == "n" {
+                            if !confirmation_is_approved(&confirm) {
                                 app.push_styled(
                                     "Restore cancelled.",
                                     Style::default().fg(theme::WARNING_FG),
@@ -2196,11 +2199,15 @@ async fn handle_cli_only_command(
                         }
                     }
                     Err(e) => {
-                        app.push_plain(format!("Warning: Could not determine changed files: {e}"));
+                        app.push_styled(
+                            format!("Could not determine files affected by restore: {e}. Restore cancelled."),
+                            Style::default().fg(theme::WARNING_FG),
+                        );
+                        return Ok(false);
                     }
                 }
 
-                match checkpoint_mgr.restore_by_number(num).await {
+                match checkpoint_mgr.restore_checkpoint(&checkpoint.hash).await {
                     Ok(()) => {
                         app.push_plain(format!(
                             "Checkpoint {} ({}) restored successfully.",
@@ -3971,6 +3978,15 @@ mod tests {
                 .to_string()
                 .contains("No completion to copy yet")
         );
+    }
+
+    #[test]
+    fn test_checkpoint_confirmation_requires_explicit_yes() {
+        for response in ["", "n", "no", "maybe", "Yup"] {
+            assert!(!confirmation_is_approved(response));
+        }
+        assert!(confirmation_is_approved("y"));
+        assert!(confirmation_is_approved(" Y "));
     }
 
     #[cfg(not(windows))]

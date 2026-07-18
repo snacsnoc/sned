@@ -651,6 +651,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_changed_files_compares_checkpoint_to_working_tree() {
+        if !git_available() {
+            eprintln!("Skipping test: git not available");
+            return;
+        }
+
+        ensure_test_checkpoint_base_dir();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = temp_dir.path().join("working-tree-diff");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let test_file = workspace.join("test.txt");
+        std::fs::write(&test_file, "initial content").unwrap();
+
+        let mut manager = TaskCheckpointManager::new(
+            "test-task-working-tree-diff".to_string(),
+            true,
+            workspace.to_str().unwrap(),
+        );
+        let checkpoint = manager.save_checkpoint().await.unwrap();
+
+        std::fs::write(&test_file, "modified content").unwrap();
+
+        let files = manager.get_changed_files(&checkpoint, None).await.unwrap();
+        assert!(files.contains(&"test.txt".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_disabled_checkpoints() {
         let mut manager = TaskCheckpointManager::new("test-task".to_string(), false, "/tmp");
 
