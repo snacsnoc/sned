@@ -1124,36 +1124,6 @@ mod tests {
     }
 
     #[test]
-    fn test_all_tools_have_schemas() {
-        let active = [
-            SnedTool::ReadFile,
-            SnedTool::WriteToFile,
-            SnedTool::ListFiles,
-            SnedTool::SearchFiles,
-            SnedTool::EditFile,
-            SnedTool::ExecuteCommand,
-            SnedTool::AskFollowupQuestion,
-            SnedTool::AttemptCompletion,
-            SnedTool::PlanModeRespond,
-            SnedTool::GetFunction,
-            SnedTool::GetFileSkeleton,
-            SnedTool::FindSymbolReferences,
-            SnedTool::ReplaceSymbol,
-            SnedTool::RenameSymbol,
-            SnedTool::UseSubagents,
-            SnedTool::UseSkill,
-            SnedTool::ListSkills,
-            SnedTool::DiagnosticsScan,
-            SnedTool::Condense,
-            SnedTool::WebFetch,
-        ];
-
-        for _tool in &active {
-            // get_tool_schema always returns a schema for every SnedTool variant
-        }
-    }
-
-    #[test]
     fn test_tool_profile_tool_counts() {
         assert_eq!(ToolProfile::DirectAnswer.tools().len(), 0);
         assert_eq!(ToolProfile::AnswerOnly.tools().len(), 2);

@@ -1008,8 +1008,7 @@ fn flush_minimax_tag_carry(
     }
 }
 
-#[allow(clippy::unused_async)]
-async fn process_minimax_sse_line(
+fn process_minimax_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
@@ -1320,8 +1319,7 @@ impl Provider for MinimaxProvider {
                                 &mut pending_text,
                                 &mut pending_text_signature,
                                 &mut reasoning_state,
-                            )
-                            .await;
+                            );
                         }
                         if let Some(err) = sse_buffer.take_error() {
                             try_send_chunk(&tx, ApiStreamChunk::Error(err), "error");
@@ -1357,8 +1355,7 @@ impl Provider for MinimaxProvider {
                         &mut pending_text,
                         &mut pending_text_signature,
                         &mut reasoning_state,
-                    )
-                    .await;
+                    );
                 }
 
                 // Flush any remaining XML tool calls from the buffer
@@ -2103,8 +2100,7 @@ mod tests {
                 &mut pending_text,
                 &mut pending_text_signature,
                 &mut reasoning_state,
-            )
-            .await;
+            );
         }
 
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -2146,8 +2142,7 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        )
-        .await;
+        );
         assert!(rx.try_recv().is_err(), "partial text should stay buffered");
 
         let second =
@@ -2162,8 +2157,7 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        )
-        .await;
+        );
 
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
@@ -2203,8 +2197,7 @@ mod tests {
                 &mut pending_text,
                 &mut pending_text_signature,
                 &mut reasoning_state,
-            )
-            .await;
+            );
         }
 
         let mut reasoning = String::new();
@@ -2445,8 +2438,7 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        )
-        .await;
+        );
         flush_minimax_text_buffer(&tx, &mut pending_text, &mut pending_text_signature, "flush");
 
         let mut visible = String::new();
@@ -2486,8 +2478,7 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        )
-        .await;
+        );
 
         let first_chunk = rx
             .try_recv()
@@ -2507,8 +2498,7 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        )
-        .await;
+        );
 
         let mut reasoning = String::new();
         let mut answer = String::new();
@@ -2615,8 +2605,7 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        )
-        .await;
+        );
 
         // Chunk 2: remaining args + finish_reason: "tool_call" (singular)
         process_minimax_sse_line(
@@ -2629,8 +2618,7 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        )
-        .await;
+        );
 
         drop(tx);
 

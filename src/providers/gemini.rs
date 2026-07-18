@@ -372,8 +372,7 @@ fn try_send_chunk(
     crate::providers::try_send_chunk(tx, chunk, "Gemini", chunk_type)
 }
 
-#[allow(clippy::unused_async)]
-async fn process_gemini_sse_line(
+fn process_gemini_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &mut HashMap<String, (String, String, String, Option<String>)>,
@@ -614,8 +613,7 @@ async fn process_gemini_sse_line(
     }
 }
 
-#[allow(clippy::unused_async)]
-async fn finish_gemini_sse_to_chunks(
+fn finish_gemini_sse_to_chunks(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &HashMap<String, (String, String, String, Option<String>)>,
     completed_tool_call_ids: &mut HashSet<String>,
@@ -743,8 +741,7 @@ impl Provider for GeminiProvider {
                                 &mut last_stop_reason,
                                 &mut last_grounding_metadata,
                                 &model_info,
-                            )
-                            .await;
+                            );
                         }
                         if let Some(err) = sse_buffer.take_error() {
                             try_send_chunk(&tx, ApiStreamChunk::Error(err), "error");
@@ -776,8 +773,7 @@ impl Provider for GeminiProvider {
                     &mut completed_tool_call_ids,
                     &last_stop_reason,
                     &mut last_grounding_metadata,
-                )
-                .await;
+                );
             }
         });
 
@@ -1604,8 +1600,7 @@ mod tests {
             &mut completed_tool_call_ids,
             &last_stop_reason,
             &mut last_grounding_metadata,
-        )
-        .await;
+        );
 
         assert!(
             rx.try_recv().is_err(),
