@@ -12,7 +12,7 @@ use crate::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
     resolve_sanitized_path,
 };
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use std::path::Path;
 
 const MAX_FILES_LIMIT: usize = 200;
+const MAX_CONCURRENT_LINE_COUNTS: usize = 32;
 
 /// Information about a listed file or directory.
 #[derive(Debug, Clone)]
@@ -197,14 +198,15 @@ impl ListFilesHandler {
             }
         }
 
-        // Parallel line counting for files
+        // Bound concurrent opens so large listings do not exhaust file descriptors.
         let mut file_line_counts: Vec<Option<usize>> = vec![None; file_paths.len()];
         if include_line_counts {
-            let count_futures: Vec<_> = file_paths
-                .iter()
-                .map(|(_, path, _)| count_lines_fast(path))
-                .collect();
-            file_line_counts = join_all(count_futures).await;
+            let paths: Vec<_> = file_paths.iter().map(|(_, path, _)| path.clone()).collect();
+            file_line_counts = stream::iter(paths)
+                .map(|path| async move { count_lines_fast(&path).await })
+                .buffered(MAX_CONCURRENT_LINE_COUNTS)
+                .collect()
+                .await;
         }
 
         // Build file infos with line counts in original order
@@ -322,14 +324,15 @@ impl ListFilesHandler {
             return Err(err);
         }
 
-        // Parallel line counting for files
+        // Bound concurrent opens so large listings do not exhaust file descriptors.
         let mut file_line_counts: Vec<Option<usize>> = vec![None; file_paths.len()];
         if include_line_counts {
-            let count_futures: Vec<_> = file_paths
-                .iter()
-                .map(|(_, path)| count_lines_fast(path))
-                .collect();
-            file_line_counts = join_all(count_futures).await;
+            let paths: Vec<_> = file_paths.iter().map(|(_, path)| path.clone()).collect();
+            file_line_counts = stream::iter(paths)
+                .map(|path| async move { count_lines_fast(&path).await })
+                .buffered(MAX_CONCURRENT_LINE_COUNTS)
+                .collect()
+                .await;
         }
 
         // Build file infos with line counts in original order
