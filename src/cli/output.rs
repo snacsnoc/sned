@@ -267,6 +267,12 @@ pub trait OutputWriter: Send + Sync {
 /// also writes to the channel.
 pub struct StderrOutputWriter;
 
+fn non_interactive_approval_message(title: &str) -> String {
+    format!(
+        "✗ {title}: non-interactive mode cannot accept approval. Re-run interactively or with --yolo to allow this action."
+    )
+}
+
 impl OutputWriter for StderrOutputWriter {
     fn emit(&self, event: OutputEvent) {
         match event {
@@ -312,7 +318,7 @@ impl OutputWriter for StderrOutputWriter {
                 }
             }
             OutputEvent::ApprovalRequested(request) => {
-                eprintln!("{}", request.details());
+                eprintln!("{}", non_interactive_approval_message(request.title()));
                 let _ = std::io::stderr().flush();
                 request.fail("interactive approval UI is unavailable");
             }
@@ -641,7 +647,7 @@ pub fn format_timing_phases(
 
 #[cfg(test)]
 mod tests {
-    use super::format_timing_phases;
+    use super::{format_timing_phases, non_interactive_approval_message};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -681,6 +687,17 @@ mod tests {
         );
         assert_eq!(lines[6], "[timing] first_chunk_to_first_output_us=50000");
         assert_eq!(lines[7], "[timing] first_output_to_first_render_us=16000");
+    }
+
+    #[test]
+    fn test_non_interactive_approval_message_omits_prompt_details() {
+        let message = non_interactive_approval_message("Approval required · web_fetch");
+
+        assert_eq!(
+            message,
+            "✗ Approval required · web_fetch: non-interactive mode cannot accept approval. Re-run interactively or with --yolo to allow this action."
+        );
+        assert!(!message.contains("Execute this tool?"));
     }
 
     /// Critical non-lossy events must survive a saturated main output
