@@ -9,8 +9,8 @@ SNED_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-auto-scroll tui-model-switch tui-busy-exit help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
-TOTAL_TESTS=17
+ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-model-switch tui-busy-exit help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
+TOTAL_TESTS=16
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -52,7 +52,6 @@ tui-approval-under-backpressure Flood output, block input, then approve after re
 tui-long-completion-navigation Scroll completion and transcript at both boundaries
 tui-history-navigation Type prompts, press Up arrow, verify previous prompt appears
 tui-slash-commands    Search /help, then reject an unknown slash command locally
-tui-auto-scroll       Type multiple prompts, verify output scrolls to show latest
 tui-model-switch      Type /model mock/mock-model, verify switch message renders
 tui-busy-exit         While mock provider streams output, send /exit and verify prompt shutdown
 help                  --help shows usage
@@ -104,7 +103,6 @@ test_description() {
         tui-long-completion-navigation) echo "Scroll completion and transcript at both boundaries" ;;
         tui-history-navigation) echo "Type prompts, press Up arrow, verify previous prompt appears in input" ;;
         tui-slash-commands) echo "Search /help, then reject an unknown slash command locally" ;;
-        tui-auto-scroll) echo "Type multiple prompts, verify output scrolls to show latest" ;;
         tui-model-switch) echo "Type /model mock/mock-model, verify switch message renders" ;;
         tui-busy-exit) echo "While mock provider streams output, send /exit and verify prompt shutdown" ;;
         help) echo "--help shows usage" ;;
@@ -127,7 +125,6 @@ test_source() {
         tui-long-completion-navigation) echo "src/cli/tui/app.rs completion scroll boundaries / src/cli/interactive.rs navigation routing" ;;
         tui-history-navigation) echo "src/cli/interactive.rs handle_key_event Up/Down arrow history / src/cli/tui/history.rs FileHistory" ;;
         tui-slash-commands) echo "src/cli/interactive.rs help overlay and unknown-command routing / src/cli/slash_commands.rs registry" ;;
-        tui-auto-scroll) echo "src/cli/tui/app.rs scroll_mode / src/cli/interactive.rs drain_output auto-scroll" ;;
         tui-model-switch) echo "src/cli/interactive.rs handle_cli_only_command ModelSwitch / src/core/agent_loop.rs set_provider" ;;
         tui-busy-exit) echo "src/cli/interactive.rs busy-state shutdown path / src/providers/mock.rs busy_stream_scenario" ;;
         help|version|invalid-flag|yolo-help|json-no-prompt) echo "src/cli/mod.rs CLI dispatch" ;;

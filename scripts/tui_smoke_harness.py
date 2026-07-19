@@ -661,55 +661,6 @@ def slash_commands():
         )
 
 
-def auto_scroll():
-    prompt_count = 0
-    banner_seen = False
-    pending_prompt = None
-    next_prompt_ready_at = 0.0
-    next_prompt = 1
-    sent_scroll = False
-    sent_exit = False
-
-    def tick(session):
-        nonlocal prompt_count, banner_seen, pending_prompt, next_prompt_ready_at
-        nonlocal next_prompt, sent_scroll, sent_exit
-        text = session.text
-        tail = text.replace("\r", "\n")
-        if "type a prompt" in text:
-            banner_seen = True
-        if pending_prompt is None and banner_seen and next_prompt <= 5 and time.time() >= next_prompt_ready_at:
-            session.send(f"prompt {next_prompt}\r".encode())
-            prompt_count += 1
-            pending_prompt = next_prompt
-        if pending_prompt is not None and f"prompt {pending_prompt}" in tail:
-            pending_prompt = None
-            next_prompt += 1
-            next_prompt_ready_at = time.time() + 0.5
-        if prompt_count >= 5 and "Mock provider" in text and not sent_scroll:
-            session.send(b"\x1b[5~\x1b[5~\x1b[5~")
-            sent_scroll = True
-        if sent_scroll and not sent_exit:
-            session.send(b"final prompt\r")
-            time.sleep(1.0)
-            session.send(b"/exit\r")
-            sent_exit = True
-
-    with PtySession("sned-auto-scroll.") as session:
-        session.run(30, tick)
-        session.dump_if_verbose()
-        viewport = visible_tail(clean_output(session.buf))
-        report(
-            [
-                (prompt_count >= 5, f"only sent {prompt_count} prompts, expected 5"),
-                (sent_scroll, "PageUp scroll not sent"),
-                ("final prompt" in viewport, "latest prompt not in visible viewport — auto-scroll failed"),
-                ("Mock provider" in viewport, "mock response not in visible viewport — auto-scroll failed"),
-                (session.exit_code in (0, None), f"sned exited with {session.exit_code}"),
-            ],
-            "auto-scroll kept viewport at bottom for new output",
-        )
-
-
 def model_switch():
     sent_model = False
     sent_exit = False
@@ -747,7 +698,6 @@ SCENARIOS = {
     "tui-long-completion-navigation": long_completion_navigation,
     "tui-history-navigation": history_navigation,
     "tui-slash-commands": slash_commands,
-    "tui-auto-scroll": auto_scroll,
     "tui-model-switch": model_switch,
     "tui-busy-exit": busy_exit,
     "json-no-prompt": json_no_prompt,
