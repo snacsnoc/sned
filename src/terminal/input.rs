@@ -52,9 +52,17 @@ pub fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // A panic can bypass normal TUI teardown after these modes are enabled.
-        let _ = disable_raw_mode();
-        let _ = std::io::stderr().write_all(PANIC_TERMINAL_RESET_SEQUENCE);
-        let _ = std::io::stderr().flush();
+        // However, if a background Tokio task panics while the TUI loop is still
+        // active, we must NOT disable raw mode here — doing so would corrupt the
+        // terminal with echoed keystrokes and undecoded mouse events while the TUI
+        // loop keeps running.  The TUI's own TerminalGuard handles final cleanup.
+        if !crate::core::cancellation::TERMINAL_INITIALIZED
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let _ = disable_raw_mode();
+            let _ = std::io::stdout().write_all(PANIC_TERMINAL_RESET_SEQUENCE);
+            let _ = std::io::stdout().flush();
+        }
         original(info);
     }));
 }

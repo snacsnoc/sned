@@ -16,6 +16,7 @@ use ratatui::crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::style::Style;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3276,8 +3277,11 @@ pub async fn run_interactive_shell_inner(
 ) -> anyhow::Result<()> {
     // 0. Install panic hook to restore terminal on panic
     crate::terminal::input::install_panic_hook();
+    let _guard = TerminalGuard;
 
-    // 1. Initialize ratatui (replaces enter_raw_mode, scroll_region, bracketed paste)
+    // Ratatui's convenience initializer installs an unconditional panic hook.
+    // A background task panic must not restore a TUI whose event loop is still running.
+    enable_raw_mode()?;
     let mut terminal = if std::env::var("SNED_NO_ALTERNATE_SCREEN").is_ok() {
         ratatui::Terminal::with_options(
             ratatui::backend::CrosstermBackend::new(std::io::stdout()),
@@ -3286,7 +3290,8 @@ pub async fn run_interactive_shell_inner(
             },
         )?
     } else {
-        ratatui::init()
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?
     };
 
     // Enable keyboard enhancement flags so Shift+Enter arrives distinctly
@@ -3304,7 +3309,6 @@ pub async fn run_interactive_shell_inner(
 
     crate::core::cancellation::TERMINAL_INITIALIZED
         .store(true, std::sync::atomic::Ordering::Release);
-    let _guard = TerminalGuard;
     let mut app = App::new();
     let (mention_search_tx, mut mention_search_rx) = mpsc::unbounded_channel();
     app.mention_search_tx = Some(mention_search_tx);
