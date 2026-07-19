@@ -1076,40 +1076,75 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
         }
         "edit_file" => {
             let mut output = String::new();
-            // Show anchor summary
-            if let Some(anchors) = obj.get("anchors").and_then(|v| v.as_array()) {
-                let mut file_counts: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::with_capacity(4);
-                for anchor in anchors {
-                    if let Some(file) = anchor.get("file").and_then(|v| v.as_str()) {
-                        *file_counts.entry(file.to_string()).or_insert(0) += 1;
+            if let Some(files) = obj.get("files").and_then(|v| v.as_array()) {
+                let mut file_edit_counts: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                let top_level_path = obj.get("path").and_then(|v| v.as_str()).filter(|_| {
+                    files
+                        .iter()
+                        .all(|file| file.get("path").is_none() && file.get("edits").is_some())
+                });
+                for file_entry in files {
+                    let path = top_level_path
+                        .or_else(|| file_entry.get("path").and_then(|v| v.as_str()))
+                        .or_else(|| {
+                            file_entry
+                                .get("edits")
+                                .and_then(|v| v.as_array())
+                                .and_then(|edits| edits.first())
+                                .and_then(|edit| edit.get("path"))
+                                .and_then(|v| v.as_str())
+                        });
+                    if let Some(path) = path {
+                        let edit_count = file_entry
+                            .get("edits")
+                            .and_then(|v| v.as_array())
+                            .map_or(0, Vec::len);
+                        *file_edit_counts.entry(path.to_string()).or_insert(0) += edit_count;
                     }
                 }
-                let mut summary: Vec<String> = file_counts
+                let total_files = file_edit_counts.len();
+                let total_edits: usize = file_edit_counts.values().sum();
+                let summary: Vec<String> = file_edit_counts
                     .iter()
                     .map(|(f, c)| format!("{f} ({c})"))
                     .collect();
-                summary.sort();
-                output.push_str(&format!(
-                    "\n    {} anchor(s) in {} file(s): {}",
-                    anchors.len(),
-                    file_counts.len(),
+                let _ = write!(
+                    output,
+                    "\n    {} edit(s) in {} file(s): {}",
+                    total_edits,
+                    total_files,
                     summary.join(", ")
-                ));
+                );
             }
-            // Diff is shown separately, so just return anchor summary
             output
         }
         "read_file" => {
             let mut output = String::new();
-            if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
-                output.push_str(&format!(" {path}"));
+            let mut paths: Vec<&str> = obj
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|paths| paths.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if paths.is_empty()
+                && let Some(path) = obj.get("path").and_then(|v| v.as_str())
+            {
+                paths.push(path);
             }
-            if let (Some(start), Some(end)) = (
-                obj.get("line_start").and_then(serde_json::Value::as_u64),
-                obj.get("line_end").and_then(serde_json::Value::as_u64),
+            let line_range = match (
+                obj.get("start_line").and_then(serde_json::Value::as_u64),
+                obj.get("end_line").and_then(serde_json::Value::as_u64),
             ) {
-                output.push_str(&format!(" [lines {start}-{end}]"));
+                (Some(start), Some(end)) => Some(format!("[lines {start}-{end}]")),
+                (Some(start), None) => Some(format!("[lines {start}-end]")),
+                (None, Some(end)) => Some(format!("[lines 1-{end}]")),
+                _ => None,
+            };
+            for path in paths {
+                let _ = write!(output, "\n    {path}");
+                if let Some(line_range) = &line_range {
+                    let _ = write!(output, " {line_range}");
+                }
             }
             output
         }
@@ -2223,13 +2258,44 @@ mod tests {
     #[test]
     fn test_format_tool_parameters_read_file() {
         let params = serde_json::json!({
-            "path": "src/main.rs",
-            "line_start": 10,
-            "line_end": 20
+            "paths": ["src/main.rs", "src/lib.rs"],
+            "start_line": 10,
+            "end_line": 20
+        });
+        let formatted = format_tool_parameters("read_file", &params);
+        assert_eq!(
+            formatted,
+            "\n    src/main.rs [lines 10-20]\n    src/lib.rs [lines 10-20]"
+        );
+    }
+
+    #[test]
+    fn test_format_tool_parameters_read_file_singular_path() {
+        let params = serde_json::json!({
+            "path": "src/main.rs"
         });
         let formatted = format_tool_parameters("read_file", &params);
         assert!(formatted.contains("src/main.rs"));
-        assert!(formatted.contains("lines 10-20"));
+    }
+
+    #[test]
+    fn test_format_tool_parameters_read_file_open_ended_range() {
+        let start_only = serde_json::json!({"paths": ["src/main.rs"], "start_line": 10});
+        let end_only = serde_json::json!({"paths": ["src/main.rs"], "end_line": 20});
+
+        assert!(format_tool_parameters("read_file", &start_only).contains("[lines 10-end]"));
+        assert!(format_tool_parameters("read_file", &end_only).contains("[lines 1-20]"));
+    }
+
+    #[test]
+    fn test_format_tool_parameters_read_file_multiple_paths() {
+        let params = serde_json::json!({
+            "paths": ["a.rs", "b.rs", "c.rs"]
+        });
+        let formatted = format_tool_parameters("read_file", &params);
+        assert!(formatted.contains("a.rs"));
+        assert!(formatted.contains("b.rs"));
+        assert!(formatted.contains("c.rs"));
     }
 
     #[test]
@@ -2245,19 +2311,46 @@ mod tests {
     }
 
     #[test]
-    fn test_format_tool_parameters_edit_file_with_anchors() {
+    fn test_format_tool_parameters_edit_file_with_files() {
         let params = serde_json::json!({
-            "anchors": [
-                {"file": "main.rs", "line": 10},
-                {"file": "main.rs", "line": 20},
-                {"file": "lib.rs", "line": 5}
+            "files": [
+                {"path": "main.rs", "edits": [{"type": "replace", "anchor": "fn foo", "text": "fn bar"}]},
+                {"path": "main.rs", "edits": [{"type": "insert_after", "anchor": "fn bar", "text": "fn baz"}]},
+                {"path": "lib.rs", "edits": [{"type": "replace", "anchor": "mod x", "text": "mod y"}]}
             ]
         });
         let formatted = format_tool_parameters("edit_file", &params);
-        assert!(formatted.contains("3 anchor(s)"));
+        assert!(formatted.contains("3 edit(s)"));
         assert!(formatted.contains("2 file(s)"));
         assert!(formatted.contains("main.rs (2)"));
         assert!(formatted.contains("lib.rs (1)"));
+    }
+
+    #[test]
+    fn test_format_tool_parameters_edit_file_no_edits() {
+        let params = serde_json::json!({
+            "files": [
+                {"path": "readme.md", "edits": []}
+            ]
+        });
+        let formatted = format_tool_parameters("edit_file", &params);
+        assert!(formatted.contains("0 edit(s)"));
+        assert!(formatted.contains("1 file(s)"));
+        assert!(formatted.contains("readme.md"));
+    }
+
+    #[test]
+    fn test_format_tool_parameters_edit_file_path_fallbacks() {
+        let top_level_params = serde_json::json!({
+            "path": "main.rs",
+            "files": [{"edits": [{"anchor": "fn main"}]}]
+        });
+        let per_edit_params = serde_json::json!({
+            "files": [{"edits": [{"path": "lib.rs", "anchor": "fn lib"}]}]
+        });
+
+        assert!(format_tool_parameters("edit_file", &top_level_params).contains("main.rs (1)"));
+        assert!(format_tool_parameters("edit_file", &per_edit_params).contains("lib.rs (1)"));
     }
 
     #[test]
