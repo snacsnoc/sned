@@ -126,15 +126,25 @@ impl ExecuteCommandHandler {
         commands: Vec<String>,
         cwd: Option<&Path>,
         explicitly_approved: bool,
+        session_command_scope_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
+        if session_command_scope_approved {
+            for command in &commands {
+                if let Err(e) = self.safety_checker.is_structurally_safe_for_scope(command) {
+                    tracing::warn!(command = %command, reason = %e, "command rejected by scoped approval safety checker");
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+            }
+        }
+
         self.execute_commands_with_timeout(
             commands,
             cwd,
             None,
-            explicitly_approved,
+            explicitly_approved || session_command_scope_approved,
             task_state,
             json_output,
             output_writer,
@@ -865,7 +875,7 @@ impl ExecuteCommandHandler {
                     || upper.ends_with("_PRIVATE_KEY")
                     || upper == "KEY" || upper == "SECRET" || upper == "TOKEN" || upper == "PASSWORD"
             }
-            
+
             std::env::var("SNED_ALLOW_ENV")
                 .unwrap_or_default()
                 .split(',')
@@ -928,8 +938,17 @@ impl ExecuteCommandHandler {
     ) -> Result<String, ToolError> {
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
-        self.execute_without_state(None, params, None, false, None, false, &output_writer)
-            .await
+        self.execute_without_state(
+            None,
+            params,
+            None,
+            false,
+            false,
+            None,
+            false,
+            &output_writer,
+        )
+        .await
     }
 
     async fn execute_without_state(
@@ -938,6 +957,7 @@ impl ExecuteCommandHandler {
         params: serde_json::Value,
         _task_id: Option<&str>,
         explicitly_approved: bool,
+        session_command_scope_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
@@ -957,6 +977,7 @@ impl ExecuteCommandHandler {
                 cmds,
                 cwd,
                 explicitly_approved,
+                session_command_scope_approved,
                 task_state,
                 json_output,
                 output_writer,
@@ -999,6 +1020,7 @@ impl ToolHandler for ExecuteCommandHandler {
                     params,
                     Some(&ctx.task_id),
                     ctx.explicitly_approved,
+                    ctx.session_command_scope_approved,
                     Some(ctx.state.clone()),
                     ctx.json_output,
                     &ctx.output_writer,
@@ -1035,6 +1057,43 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_scoped_approval_rechecks_structural_safety() {
+        let handler = ExecuteCommandHandler::new();
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+
+        let result = handler
+            .execute_commands_with_safety(
+                vec!["cargo --version".to_string()],
+                None,
+                false,
+                true,
+                None,
+                true,
+                &output_writer,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "scoped command should skip allowlist: {result:?}"
+        );
+
+        let result = handler
+            .execute_commands_with_safety(
+                vec!["rm -rf /tmp/sned-scoped-approval-test".to_string()],
+                None,
+                false,
+                true,
+                None,
+                true,
+                &output_writer,
+            )
+            .await;
+        let error = result.expect_err("scoped approval must retain structural safety checks");
+        assert!(error.to_string().contains("permanently denied"));
     }
 
     #[tokio::test]

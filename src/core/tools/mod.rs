@@ -197,6 +197,9 @@ pub struct ToolContext {
     /// When true, skip safety checks because user explicitly approved this execution.
     /// Safety checks still apply for auto-approved tools (from previous "always" selection).
     pub explicitly_approved: bool,
+    /// When true, the command matched a reusable approval scope for this session.
+    /// The execute-command handler still applies structural safety checks.
+    pub session_command_scope_approved: bool,
     /// Output writer for decoupled terminal output.
     pub output_writer: crate::cli::output::OutputWriterArc,
 }
@@ -222,6 +225,7 @@ impl ToolContext {
             task_id,
             hook_manager,
             explicitly_approved,
+            session_command_scope_approved: false,
             output_writer,
         }
     }

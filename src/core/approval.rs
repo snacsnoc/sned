@@ -147,10 +147,24 @@ impl CommandSafetyChecker {
         if self.yolo_mode {
             return Ok(());
         }
+        self.check_structural_safety(command)?;
+        self.check_command_allowlist(command)
+    }
+
+    /// Check the safety boundaries that continue to apply when a user has
+    /// approved a reusable command scope for this session.
+    pub fn is_structurally_safe_for_scope(&self, command: &str) -> Result<(), CommandUnsafe> {
+        if self.yolo_mode {
+            return Ok(());
+        }
+        self.check_structural_safety(command)?;
+        self.check_scope_sensitive_operations(command)
+    }
+
+    fn check_structural_safety(&self, command: &str) -> Result<(), CommandUnsafe> {
         self.check_common(command)?;
         self.check_shell_syntax(command)?;
-        self.check_deny_list(command)?;
-        Ok(())
+        self.check_deny_list(command)
     }
 
     /// Check safety for non-shell languages (Python, Node).
@@ -162,7 +176,7 @@ impl CommandSafetyChecker {
         }
         self.check_common(command)?;
         self.check_deny_list(command)?;
-        Ok(())
+        self.check_command_allowlist(command)
     }
 
     #[allow(clippy::unused_self)]
@@ -256,6 +270,27 @@ impl CommandSafetyChecker {
         Ok(())
     }
 
+    fn check_command_allowlist(&self, command: &str) -> Result<(), CommandUnsafe> {
+        let normalized = command.trim();
+        for segment in split_command_segments(normalized) {
+            let parts: Vec<&str> = segment.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+
+            let base_command = parts[0].to_lowercase();
+            if base_command != "git"
+                && !SAFE_BASE_COMMANDS.contains(&base_command.as_str())
+                && !self.is_user_safe(&base_command)
+            {
+                return Err(CommandUnsafe::new(&format!(
+                    "command '{base_command}' is not in safe list"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn check_deny_list(&self, command: &str) -> Result<(), CommandUnsafe> {
         let normalized = command.trim();
         let segments = split_command_segments(normalized);
@@ -317,15 +352,28 @@ impl CommandSafetyChecker {
                         return Err(CommandUnsafe::new("sort -o flag is not allowed"));
                     }
                 }
-            } else if !SAFE_BASE_COMMANDS.contains(&base_command.as_str())
-                && !self.is_user_safe(&base_command)
-            {
-                return Err(CommandUnsafe::new(&format!(
-                    "command '{base_command}' is not in safe list"
-                )));
             }
         }
 
+        Ok(())
+    }
+
+    fn check_scope_sensitive_operations(&self, command: &str) -> Result<(), CommandUnsafe> {
+        for segment in split_command_segments(command.trim()) {
+            let parts: Vec<&str> = segment.split_whitespace().collect();
+            if parts.is_empty() || !parts[0].eq_ignore_ascii_case("sed") {
+                continue;
+            }
+
+            if parts.iter().skip(1).any(|part| {
+                let lower = part.to_ascii_lowercase();
+                lower == "-i" || lower.starts_with("-i") || lower.starts_with("--in-place")
+            }) {
+                return Err(CommandUnsafe::new(
+                    "sed in-place editing is not allowed for reusable approval",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -334,6 +382,155 @@ impl Default for CommandSafetyChecker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CommandApprovalScope {
+    Binary(String),
+    GitSubcommand(String),
+    SedReadOnly,
+    FindReadOnly,
+}
+
+impl CommandApprovalScope {
+    fn authority_label(&self) -> String {
+        match self {
+            Self::Binary(binary) => binary.clone(),
+            Self::GitSubcommand(subcommand) => format!("git {subcommand}"),
+            Self::SedReadOnly => "read-only sed".to_string(),
+            Self::FindReadOnly => "read-only find".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for CommandApprovalScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Binary(binary) => write!(f, "binary:{binary}"),
+            Self::GitSubcommand(subcommand) => write!(f, "git:{subcommand}"),
+            Self::SedReadOnly => f.write_str("sed:read-only"),
+            Self::FindReadOnly => f.write_str("find:read-only"),
+        }
+    }
+}
+
+pub(crate) fn command_approval_scopes(
+    params: &serde_json::Value,
+) -> Option<Vec<CommandApprovalScope>> {
+    if params
+        .get("script")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        return None;
+    }
+
+    let commands = crate::core::tools::coerce_string_array(params, "commands", "command");
+    if commands.is_empty() {
+        return None;
+    }
+
+    let mut scopes = Vec::with_capacity(commands.len());
+    for command in commands {
+        let scope = command_approval_scope(&command)?;
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    Some(scopes)
+}
+
+fn command_approval_scope(command: &str) -> Option<CommandApprovalScope> {
+    if !is_simple_scope_command(command) {
+        return None;
+    }
+
+    let checker = CommandSafetyChecker::new();
+    if checker.is_structurally_safe_for_scope(command).is_err() {
+        return None;
+    }
+
+    let parts: Vec<&str> = command.split_ascii_whitespace().collect();
+    let base = parts.first()?.to_ascii_lowercase();
+    if !is_bare_command_name(&base)
+        || matches!(
+            base.as_str(),
+            "sh" | "bash" | "zsh" | "dash" | "fish" | "env" | "command" | "builtin"
+        )
+    {
+        return None;
+    }
+
+    match base.as_str() {
+        "git" => {
+            let subcommand = parts.get(1)?.to_ascii_lowercase();
+            SAFE_GIT_SUBCOMMANDS
+                .contains(&subcommand.as_str())
+                .then_some(CommandApprovalScope::GitSubcommand(subcommand))
+        }
+        "sed" => is_reusable_read_only_sed(&parts).then_some(CommandApprovalScope::SedReadOnly),
+        "find" => Some(CommandApprovalScope::FindReadOnly),
+        _ => Some(CommandApprovalScope::Binary(base)),
+    }
+}
+
+fn is_simple_scope_command(command: &str) -> bool {
+    let command = command.trim();
+    !command.is_empty()
+        && !command.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'|' | b'&'
+                    | b';'
+                    | b'<'
+                    | b'>'
+                    | b'$'
+                    | b'`'
+                    | b'\''
+                    | b'"'
+                    | b'\\'
+                    | b'\n'
+                    | b'\r'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b'*'
+                    | b'?'
+            )
+        })
+}
+
+fn is_bare_command_name(command: &str) -> bool {
+    command
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+fn is_reusable_read_only_sed(parts: &[&str]) -> bool {
+    let mut index = 1;
+    while let Some(flag) = parts.get(index) {
+        if !flag.starts_with('-') {
+            break;
+        }
+        if !matches!(*flag, "-n" | "--quiet" | "--silent") {
+            return false;
+        }
+        index += 1;
+    }
+
+    let Some(program) = parts.get(index) else {
+        return false;
+    };
+    if parts.get(index + 1).is_none()
+        || program
+            .bytes()
+            .any(|byte| matches!(byte, b'e' | b'E' | b'w' | b'W' | b'r' | b'R'))
+    {
+        return false;
+    }
+
+    true
 }
 
 /// Split a command on `|`, `&`, `;`, and newline boundaries, but only
@@ -487,11 +684,13 @@ use crate::cli::output::OutputWriterArc;
 #[derive(Clone, Debug, Default)]
 pub struct ApprovalManager {
     /// Tool names that the user has chosen to auto-approve for this session.
-    /// For execute_command, this means ALL commands are approved (use session_auto_approve_commands instead).
+    /// Execute-command approvals are tracked separately by exact request or scope.
     session_auto_approve: HashSet<String>,
     /// For execute_command: specific command fingerprints that are auto-approved.
-    /// This provides per-command granularity instead of approving all commands.
+    /// Complex commands retain this exact-request approval behavior.
     session_auto_approve_commands: HashSet<String>,
+    /// Reusable command authorities selected by the user for this session.
+    session_auto_approve_command_scopes: HashSet<CommandApprovalScope>,
     /// Tool names from SNED_AUTO_APPROVE env var — lowest priority auto-approval.
     env_auto_approve: HashSet<String>,
     /// When true, skip all approval prompts (yolo mode).
@@ -817,12 +1016,41 @@ impl ApprovalManager {
         if tool_name == "execute_command"
             && let Some(fp) = command_fingerprint
         {
-            // For execute_command, store the specific command fingerprint (F-02 fix)
             self.session_auto_approve_commands.insert(fp.to_string());
         } else {
             // For other tools, store the tool name (approves all instances of this tool)
             self.session_auto_approve.insert(tool_name.to_string());
         }
+    }
+
+    /// Remember an execute-command approval for the current session.
+    ///
+    /// Eligible simple commands receive a reusable scope; all other command
+    /// shapes keep their exact-request approval.
+    pub(crate) fn auto_approve_command(
+        &mut self,
+        command_fingerprint: &str,
+        scopes: Option<&[CommandApprovalScope]>,
+    ) {
+        if let Some(scopes) = scopes.filter(|scopes| !scopes.is_empty()) {
+            self.session_auto_approve_command_scopes
+                .extend(scopes.iter().cloned());
+        } else {
+            self.session_auto_approve_commands
+                .insert(command_fingerprint.to_string());
+        }
+    }
+
+    /// Return whether every scope in an execute-command request was approved
+    /// for this session. Auto-approve-all intentionally still prompts for
+    /// commands, so it cannot satisfy a reusable scope lookup.
+    #[must_use]
+    pub(crate) fn command_scopes_are_approved(&self, scopes: &[CommandApprovalScope]) -> bool {
+        !self.auto_approve_all
+            && !scopes.is_empty()
+            && scopes
+                .iter()
+                .all(|scope| self.session_auto_approve_command_scopes.contains(scope))
     }
 
     /// Check if a tool is in the session auto-approve list.
@@ -907,6 +1135,30 @@ fn standard_approval_choices() -> Vec<ApprovalChoice> {
         ApprovalChoice::new('y', "Approve", ApprovalResult::Approved),
         ApprovalChoice::new('n', "Deny", ApprovalResult::Denied),
         ApprovalChoice::new('a', "Always", ApprovalResult::Always),
+    ]
+}
+
+fn approval_choices_for_tool(tool_name: &str, params: &serde_json::Value) -> Vec<ApprovalChoice> {
+    if tool_name != "execute_command" {
+        return standard_approval_choices();
+    }
+
+    let always_label = command_approval_scopes(params).map_or_else(
+        || "Always approve this exact command this session".to_string(),
+        |scopes| {
+            let authorities = scopes
+                .iter()
+                .map(CommandApprovalScope::authority_label)
+                .collect::<Vec<_>>()
+                .join(" and ");
+            format!("Always approve safe {authorities} commands this session")
+        },
+    );
+
+    vec![
+        ApprovalChoice::new('y', "Approve", ApprovalResult::Approved),
+        ApprovalChoice::new('n', "Deny", ApprovalResult::Denied),
+        ApprovalChoice::new('a', always_label, ApprovalResult::Always),
     ]
 }
 
@@ -1262,7 +1514,7 @@ pub fn prompt_for_approval(
     let (_guard, request, receiver) = begin_approval_prompt(
         format!("Approval required · {tool_name}"),
         details,
-        standard_approval_choices(),
+        approval_choices_for_tool(tool_name, params),
     )?;
     let request_id = request.id();
     output_writer.emit(OutputEvent::ApprovalRequested(request));
@@ -1696,8 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_command_per_command_approval() {
-        // SECURITY TEST (F-02): "always approve" should be per-command, not per-tool
+    fn test_execute_command_exact_approval_remains_available() {
         let mut manager = ApprovalManager::new();
 
         // Auto-approve a specific command
@@ -1714,6 +1965,141 @@ mod tests {
         // Approve the second command
         manager.auto_approve(SnedTool::ExecuteCommand, Some(cmd2_fp));
         assert!(!manager.should_prompt(SnedTool::ExecuteCommand, Some(cmd2_fp)));
+    }
+
+    #[test]
+    fn test_command_approval_scopes_exclude_paths_and_match_repeated_binaries() {
+        let cat_file_one = serde_json::json!({"command": "cat file1"});
+        let cat_file_two = serde_json::json!({"command": "cat file2"});
+        let cat_scope = vec![CommandApprovalScope::Binary("cat".to_string())];
+
+        assert_eq!(
+            command_approval_scopes(&cat_file_one),
+            Some(cat_scope.clone())
+        );
+        assert_eq!(
+            command_approval_scopes(&cat_file_two),
+            Some(cat_scope.clone())
+        );
+
+        let mut manager = ApprovalManager::new();
+        manager.auto_approve_command("cat file1", Some(&cat_scope));
+        assert!(manager.command_scopes_are_approved(&cat_scope));
+        assert!(
+            !manager
+                .command_scopes_are_approved(&[CommandApprovalScope::Binary("grep".to_string(),)])
+        );
+
+        let multi_command = command_approval_scopes(&serde_json::json!({
+            "commands": ["cat file3", "grep pattern file3"]
+        }))
+        .expect("simple command arrays should derive scopes");
+        assert!(!manager.command_scopes_are_approved(&multi_command));
+        manager.auto_approve_command("cat file3; grep pattern file3", Some(&multi_command));
+        assert!(manager.command_scopes_are_approved(&multi_command));
+
+        let manager = ApprovalManager::new().with_auto_approve_all(true);
+        assert!(!manager.command_scopes_are_approved(&cat_scope));
+    }
+
+    #[test]
+    fn test_command_approval_scopes_keep_argument_sensitive_commands_distinct() {
+        assert_eq!(
+            command_approval_scopes(&serde_json::json!({"command": "git status --short"})),
+            Some(vec![CommandApprovalScope::GitSubcommand(
+                "status".to_string()
+            )])
+        );
+        assert!(
+            command_approval_scopes(&serde_json::json!({"command": "git reset --hard"})).is_none()
+        );
+
+        assert_eq!(
+            command_approval_scopes(&serde_json::json!({"command": "sed -n 1,10p file.txt"})),
+            Some(vec![CommandApprovalScope::SedReadOnly])
+        );
+        assert!(
+            command_approval_scopes(&serde_json::json!({"command": "sed -i s/a/b/ file.txt"}))
+                .is_none()
+        );
+
+        assert_eq!(
+            command_approval_scopes(&serde_json::json!({"command": "find . -name '*.rs'"})),
+            None
+        );
+        assert_eq!(
+            command_approval_scopes(&serde_json::json!({"command": "find . -name main.rs"})),
+            Some(vec![CommandApprovalScope::FindReadOnly])
+        );
+        for command in [
+            "find . -exec cat {} ;",
+            "find . -execdir cat {} ;",
+            "find . -delete",
+        ] {
+            assert!(command_approval_scopes(&serde_json::json!({"command": command})).is_none());
+        }
+    }
+
+    #[test]
+    fn test_command_approval_scopes_reject_complex_shell_and_scripts() {
+        for command in [
+            "cat file1 | cat",
+            "cat file1 > output.txt",
+            "cat $(pwd)",
+            "sh -c cat file1",
+            "/bin/cat file1",
+            "cat 'file one'",
+        ] {
+            assert!(command_approval_scopes(&serde_json::json!({"command": command})).is_none());
+        }
+        assert!(
+            command_approval_scopes(&serde_json::json!({
+                "script": "print('hello')",
+                "language": "python"
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_scoped_command_safety_keeps_structural_checks() {
+        let checker = CommandSafetyChecker::new();
+        assert!(checker.is_safe("cargo build").is_err());
+        assert!(
+            checker
+                .is_structurally_safe_for_scope("cargo build")
+                .is_ok()
+        );
+        for command in [
+            "rm -rf /tmp/example",
+            "cargo build > output.txt",
+            "cargo $(pwd)",
+            "sed -i s/a/b/ file.txt",
+            "find . -delete",
+        ] {
+            assert!(checker.is_structurally_safe_for_scope(command).is_err());
+        }
+    }
+
+    #[test]
+    fn test_execute_command_approval_choices_describe_remembered_scope() {
+        let choices = approval_choices_for_tool(
+            "execute_command",
+            &serde_json::json!({"command": "cat file1"}),
+        );
+        assert_eq!(
+            choices[2].label(),
+            "Always approve safe cat commands this session"
+        );
+
+        let exact_choices = approval_choices_for_tool(
+            "execute_command",
+            &serde_json::json!({"command": "cat file1 | cat"}),
+        );
+        assert_eq!(
+            exact_choices[2].label(),
+            "Always approve this exact command this session"
+        );
     }
 
     #[test]

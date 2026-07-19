@@ -2696,20 +2696,31 @@ impl AgentLoop {
                             )
                         } else {
                             let mut user_prompted = false;
+                            let mut session_command_scope_approved = false;
+                            let command_scopes = (tool_name == "execute_command")
+                                .then(|| {
+                                    crate::core::approval::command_approval_scopes(&tool_params)
+                                })
+                                .flatten();
                             let approval_result = if let Some(ref approval_mgr) =
                                 self.deps.approval_manager
                             {
                                 let mgr = approval_mgr.lock().await;
                                 // Check if any action paths require prompting
                                 let needs_prompt = if action_paths.is_empty() {
-                                    // No paths (e.g., execute_command): check tool-level approval
-                                    // For execute_command, pass command fingerprint for per-command approval (F-02 fix)
-                                    let cmd_fp = if tool_name == "execute_command" {
-                                        Some(params_fingerprint.as_str())
+                                    if tool_name == "execute_command" {
+                                        session_command_scope_approved =
+                                            command_scopes.as_ref().is_some_and(|scopes| {
+                                                mgr.command_scopes_are_approved(scopes)
+                                            });
+                                        !session_command_scope_approved
+                                            && mgr.should_prompt(
+                                                tool,
+                                                Some(params_fingerprint.as_str()),
+                                            )
                                     } else {
-                                        None
-                                    };
-                                    mgr.should_prompt(tool, cmd_fp)
+                                        mgr.should_prompt(tool, None)
+                                    }
                                 } else {
                                     // Has paths: check per-path approval
                                     action_paths.iter().any(|p| {
@@ -2751,13 +2762,14 @@ impl AgentLoop {
                                         Ok(crate::core::approval::ApprovalResult::Always) => {
                                             if let Some(ref am) = self.deps.approval_manager {
                                                 let mut mgr = am.lock().await;
-                                                // For execute_command, pass command fingerprint for per-command approval (F-02 fix)
-                                                let cmd_fp = if tool_name == "execute_command" {
-                                                    Some(params_fingerprint.as_str())
+                                                if tool_name == "execute_command" {
+                                                    mgr.auto_approve_command(
+                                                        &params_fingerprint,
+                                                        command_scopes.as_deref(),
+                                                    );
                                                 } else {
-                                                    None
-                                                };
-                                                mgr.auto_approve(tool, cmd_fp);
+                                                    mgr.auto_approve(tool, None);
+                                                }
                                             }
                                             None // Proceed to execute
                                         }
@@ -2783,10 +2795,20 @@ impl AgentLoop {
                                         crate::core::approval::CommandSafetyChecker::new()
                                             .with_yolo(yolo)
                                             .with_user_safe_commands(user_safe);
-                                    let any_unsafe = commands.iter().any(|cmd| {
-                                        !cmd.is_empty() && checker.is_safe(cmd).is_err()
-                                    }) || script
-                                        .is_some_and(|s| checker.is_safe(s).is_err());
+                                    let any_unsafe = if session_command_scope_approved {
+                                        commands.iter().any(|cmd| {
+                                            !cmd.is_empty()
+                                                && checker
+                                                    .is_structurally_safe_for_scope(cmd)
+                                                    .is_err()
+                                        }) || script.is_some_and(|s| {
+                                            checker.is_structurally_safe_for_scope(s).is_err()
+                                        })
+                                    } else {
+                                        commands.iter().any(|cmd| {
+                                            !cmd.is_empty() && checker.is_safe(cmd).is_err()
+                                        }) || script.is_some_and(|s| checker.is_safe(s).is_err())
+                                    };
                                     if any_unsafe {
                                         // In non-interactive mode, deny unsafe commands directly
                                         // (no TUI available to prompt the user).
@@ -2852,13 +2874,10 @@ impl AgentLoop {
                                                     if let Some(ref am) = self.deps.approval_manager
                                                     {
                                                         let mut mgr = am.lock().await;
-                                                        let cmd_fp =
-                                                            if tool_name == "execute_command" {
-                                                                Some(params_fingerprint.as_str())
-                                                            } else {
-                                                                None
-                                                            };
-                                                        mgr.auto_approve(tool, cmd_fp);
+                                                        mgr.auto_approve_command(
+                                                            &params_fingerprint,
+                                                            command_scopes.as_deref(),
+                                                        );
                                                     }
                                                     None
                                                 }
@@ -2891,6 +2910,8 @@ impl AgentLoop {
                                 // handler otherwise applies to an auto-approved command.
                                 let mut tool_context = (*tool_context).clone();
                                 tool_context.explicitly_approved = user_prompted;
+                                tool_context.session_command_scope_approved =
+                                    session_command_scope_approved;
                                 let tool_context = Arc::new(tool_context);
                                 let hook_manager = hook_manager_handle.clone();
                                 let config = config_handle.clone();
@@ -6466,6 +6487,84 @@ mod tests {
         } else {
             panic!("Expected UserBlocks with ToolResult in history");
         }
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_scope_approval_skips_noninteractive_prompt() {
+        use crate::core::approval::{ApprovalManager, command_approval_scopes};
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use crate::test_support::env_lock;
+
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
+
+        let params = serde_json::json!({"command": "cat Cargo.toml"});
+        let scopes = command_approval_scopes(&params).expect("cat should receive a reusable scope");
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(ApprovalManager::new()));
+        approval_manager
+            .lock()
+            .await
+            .auto_approve_command("cat Cargo.toml", Some(&scopes));
+
+        let config = AgentConfig {
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
+                crate::providers::mock::MockProvider::single_tool_call(
+                    "call_1",
+                    "execute_command",
+                    params,
+                ),
+            )))),
+            mode: AgentMode::Act,
+            task_id: "test".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: true,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: 3,
+            double_check_completion: true,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new()),
+        );
+
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_approval_manager(approval_manager);
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+
+        let history = agent.conversation_history.lock().await;
+        let Some(last) = history.last() else {
+            panic!("expected execute_command tool result");
+        };
+        let MessageContent::UserBlocks(blocks) = &last.content else {
+            panic!("expected a tool result message");
+        };
+        let Some(UserContentBlock::ToolResult(result)) = blocks.first() else {
+            panic!("expected execute_command tool result");
+        };
+        let ToolResultContent::Text(text) = &result.content else {
+            panic!("expected text tool result");
+        };
+        assert!(
+            text.contains("[package]"),
+            "scope reuse should execute cat: {text}"
+        );
+
+        unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
     }
 
     #[tokio::test]
