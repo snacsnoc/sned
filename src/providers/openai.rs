@@ -63,7 +63,6 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     provider_name: String,
     provider_sort: Option<String>,
-    send_reasoning_effort_none: bool,
 }
 
 impl OpenAiProvider {
@@ -83,17 +82,11 @@ impl OpenAiProvider {
             client,
             provider_name,
             provider_sort: None,
-            send_reasoning_effort_none: false,
         })
     }
 
     pub(super) fn with_provider_sort(mut self, provider_sort: Option<String>) -> Self {
         self.provider_sort = provider_sort;
-        self
-    }
-
-    pub(super) fn with_explicit_reasoning_effort_none(mut self) -> Self {
-        self.send_reasoning_effort_none = true;
         self
     }
 
@@ -287,9 +280,10 @@ impl OpenAiProvider {
             }
         }
 
-        if let Some(effort) = &self.config.reasoning_effort
-            && (effort != "none" || self.send_reasoning_effort_none)
-        {
+        // Always forward the user's explicit reasoning effort, including "none".
+        // The clap ValueEnum + per-provider rejection guarantees we only reach
+        // here for supported providers with a valid value.
+        if let Some(effort) = &self.config.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
         }
 

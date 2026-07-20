@@ -72,8 +72,7 @@ impl OpenRouterProvider {
         };
 
         let inner = OpenAiProvider::new(openai_config)?
-            .with_provider_sort(provider_sort)
-            .with_explicit_reasoning_effort_none();
+            .with_provider_sort(provider_sort);
         Ok(Self { inner })
     }
 
