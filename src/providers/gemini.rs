@@ -123,7 +123,18 @@ impl GeminiProvider {
 
     fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
         let model_id = &self.config.model_id;
-        let info = self.config.model_info.as_ref();
+        // Resolve model info: prefer explicit config, fall back to built-in lookup
+        // so that thinking config branches work even when model_info is None.
+        let fallback_model_info = self
+            .config
+            .model_info
+            .is_none()
+            .then(|| get_gemini_model_info(model_id));
+        let info = self
+            .config
+            .model_info
+            .as_ref()
+            .or(fallback_model_info.as_ref());
 
         // Convert messages to Gemini format
         let contents = gemini_format::convert_to_gemini_contents(&request.messages);
@@ -168,43 +179,48 @@ impl GeminiProvider {
             generation_config["maxOutputTokens"] = json!(capped);
         }
 
-        // Thinking config
-        if let Some(thinking_config) = info.and_then(|i| i.thinking_config.as_ref()) {
-            let thinking_budget = self.config.thinking_budget_tokens.unwrap_or(0);
-            // Gemini 3 Flash defaults to minimal, other Gemini 3 models default to high
-            let default_effort = if self.config.model_id.contains("gemini-3-flash") {
-                "minimal"
-            } else if self.config.model_id.contains("gemini-3") {
-                "high"
-            } else {
-                "low"
-            };
-            let reasoning_effort = self
-                .config
-                .reasoning_effort
-                .as_deref()
-                .unwrap_or(default_effort);
-
-            if thinking_config.supports_thinking_level.unwrap_or(false) {
-                // Gemini 3.x models use thinkingLevel
-                let level = map_reasoning_effort_to_thinking_level(reasoning_effort);
-                generation_config["thinkingConfig"] = json!({
-                    "thinkingLevel": level.as_str(),
-                    "includeThoughts": true,
-                });
-            } else if thinking_config.max_budget.unwrap_or(0) > 0 {
-                // Gemini 2.5 models use thinkingBudget
-                // 0 = disable thinking, -1 = dynamic (default), 128..32768 = specific budget
-                let budget: i32 = if thinking_budget == 0 {
-                    // User didn't set a budget, use dynamic (default behavior)
-                    -1
-                } else {
-                    thinking_budget.min(thinking_config.max_budget.unwrap_or(24576)) as i32
-                };
-                generation_config["thinkingConfig"] = json!({
-                    "thinkingBudget": budget,
-                    "includeThoughts": budget != 0,
-                });
+        // Thinking config — only send when the user explicitly set a flag.
+        // Omitted flags = use provider default; don't send any thinking parameter.
+        match (
+            self.config.thinking_budget_tokens,
+            &self.config.reasoning_effort,
+        ) {
+            // No flag set → don't send thinkingConfig (provider default)
+            (None, None) => {}
+            // --reasoning-effort set (Gemini 3.x path): send thinkingLevel
+            (None, Some(effort)) => {
+                if let Some(thinking_config) = info.and_then(|i| i.thinking_config.as_ref()) {
+                    if thinking_config.supports_thinking_level.unwrap_or(false) {
+                        let level = map_reasoning_effort_to_thinking_level(effort);
+                        generation_config["thinkingConfig"] = json!({
+                            "thinkingLevel": level.as_str(),
+                            "includeThoughts": true,
+                        });
+                    }
+                }
+            }
+            // --thinking set (Gemini 2.5 path): send thinkingBudget
+            (Some(budget), None) => {
+                if let Some(thinking_config) = info.and_then(|i| i.thinking_config.as_ref()) {
+                    if thinking_config.max_budget.unwrap_or(0) > 0 {
+                        let budget_val: i32 = if budget == 0 {
+                            // --thinking 0: explicitly disable
+                            0
+                        } else {
+                            budget.min(thinking_config.max_budget.unwrap_or(24576)) as i32
+                        };
+                        generation_config["thinkingConfig"] = json!({
+                            "thinkingBudget": budget_val,
+                            "includeThoughts": budget_val != 0,
+                        });
+                    }
+                }
+            }
+            // Both set — guarded by clap conflicts_with, but handle gracefully
+            (Some(_), Some(_)) => {
+                tracing::warn!(
+                    "Both --thinking and --reasoning-effort set for Gemini; ignoring"
+                );
             }
         }
 
@@ -800,7 +816,7 @@ impl Provider for GeminiProvider {
 }
 
 /// Get model info for Gemini models.
-fn get_gemini_model_info(model_id: &str) -> ModelInfo {
+pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
     // Default model info for unknown Gemini models
     let mut info = ModelInfo {
         name: Some(model_id.to_string()),
@@ -1023,6 +1039,116 @@ mod tests {
             body["systemInstruction"]["parts"][0]["text"],
             "You are a helpful assistant."
         );
+    }
+
+    #[test]
+    fn test_build_request_body_no_flags_omits_thinking_config() {
+        // No --thinking or --reasoning-effort → provider default, no thinkingConfig
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-2.5-pro".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+        let request = ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        let body = provider.build_request_body(&request).unwrap();
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "no flags should omit thinkingConfig, got: {:?}",
+            body["generationConfig"]
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_thinking_budget_creates_thinking_config() {
+        // --thinking 4096 on Gemini 2.5 → thinkingConfig.thinkingBudget
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-2.5-pro".to_string(),
+            model_info: None,
+            thinking_budget_tokens: Some(4096),
+            reasoning_effort: None,
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+        let request = ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        let body = provider.build_request_body(&request).unwrap();
+        let tc = &body["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 4096);
+        assert_eq!(tc["includeThoughts"], true);
+    }
+
+    #[test]
+    fn test_build_request_body_thinking_level_creates_thinking_config() {
+        // --reasoning-effort high on Gemini 3.x → thinkingConfig.thinkingLevel
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-3.1-pro".to_string(),
+            model_info: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: Some("high".to_string()),
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+        let request = ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        let body = provider.build_request_body(&request).unwrap();
+        let tc = &body["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingLevel"], "high");
+        assert_eq!(tc["includeThoughts"], true);
+    }
+
+    #[test]
+    fn test_build_request_body_thinking_zero_disables() {
+        // --thinking 0 on Gemini 2.5 → thinkingBudget 0 (explicitly disable)
+        let config = GeminiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gemini-2.5-pro".to_string(),
+            model_info: None,
+            thinking_budget_tokens: Some(0),
+            reasoning_effort: None,
+            search_enabled: false,
+        };
+        let provider = GeminiProvider::new(config).unwrap();
+        let request = ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        let body = provider.build_request_body(&request).unwrap();
+        let tc = &body["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 0);
+        assert_eq!(tc["includeThoughts"], false);
     }
 
     #[test]

@@ -40,7 +40,6 @@ pub struct MinimaxConfig {
     pub api_line: Option<String>,
     pub model_id: String,
     pub model_info: Option<ModelInfo>,
-    pub thinking_budget_tokens: Option<u32>,
 }
 
 impl std::fmt::Debug for MinimaxConfig {
@@ -53,7 +52,6 @@ impl std::fmt::Debug for MinimaxConfig {
             .field("api_line", &self.api_line)
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
-            .field("thinking_budget_tokens", &self.thinking_budget_tokens)
             .finish()
     }
 }
@@ -1441,7 +1439,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: Some(1024),
         };
         let provider = MinimaxProvider::new(config).unwrap();
         assert_eq!(provider.base_url(), "https://api.minimax.io/v1");
@@ -1454,7 +1451,7 @@ mod tests {
             api_line: Some("china".to_string()),
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
         assert_eq!(provider.base_url(), "https://api.minimaxi.com/v1");
@@ -1467,7 +1464,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1507,7 +1504,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1541,7 +1538,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1567,7 +1564,7 @@ mod tests {
             api_line: None,
             model_id: "some-unknown-model".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1599,7 +1596,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1635,7 +1632,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1691,7 +1688,7 @@ mod tests {
                 supports_tools: Some(true),
                 ..ModelInfo::default()
             }),
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1715,7 +1712,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1740,7 +1737,7 @@ mod tests {
             api_line: None,
             model_id: "minimax-m2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1818,7 +1815,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1905,7 +1902,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1967,7 +1964,7 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-            thinking_budget_tokens: None,
+
         };
         let provider = MinimaxProvider::new(config).unwrap();
 

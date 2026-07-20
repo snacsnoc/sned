@@ -182,6 +182,31 @@ fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
     }
 }
 
+// ── Reasoning effort enum ──────────────────────────────────────────────
+
+/// Provider-supported reasoning levels.
+#[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
+pub enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    /// The string value sent in API request bodies.
+    fn as_provider_str(&self) -> &'static str {
+        match self {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+        }
+    }
+}
+
 /// Options shared between `task`, the default prompt command, and `resume`.
 ///
 /// Source: `dirac/cli/src/index.ts` `TaskOptions` interface and the
@@ -237,13 +262,21 @@ pub struct TaskOptions {
     #[arg(long)]
     pub config: Option<String>,
 
-    /// Enable extended thinking (default: 1024 tokens)
-    #[arg(long)]
+    /// Set a provider-supported thinking token budget (Anthropic, Gemini 2.5).
+    /// Use `--thinking` (defaults to 1024) or `--thinking=4096` for an explicit budget.
+    /// Omit the flag to use the provider default.
+    #[arg(
+        long,
+        conflicts_with = "reasoning_effort",
+        require_equals = true,
+        default_missing_value = "1024",
+        action = clap::ArgAction::Set
+    )]
     pub thinking: Option<Option<String>>,
 
-    /// Reasoning effort: none|low|medium|high|xhigh
-    #[arg(long, value_name = "effort")]
-    pub reasoning_effort: Option<String>,
+    /// Set a provider-supported reasoning level (OpenAI-compatible, OpenRouter, Gemini 3).
+    #[arg(long, value_enum, conflicts_with = "thinking")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Maximum consecutive mistakes before halting in yolo mode
     #[arg(long, value_name = "count")]
@@ -872,23 +905,40 @@ pub(crate) fn create_provider(
         tracing::info!("Auto-detected provider: {}", provider_name);
     }
 
+    // Validate --thinking value if supplied (require_equals + default_missing_value
+    // guarantees the inner value is always present when the flag is set).
+    let thinking_budget = if let Some(Some(val)) = &task_opts.thinking {
+        if val.is_empty() || val.parse::<u32>().is_err() {
+            anyhow::bail!(
+                "--thinking value must be a non-negative integer token count, got: {val:?}"
+            );
+        }
+        val.parse::<u32>().ok()
+    } else {
+        None
+    };
+
     let model_id = task_opts.model.clone();
-    let thinking_budget = task_opts
-        .thinking
+
+    // Convert enum to provider string if set
+    let reasoning_effort_str = task_opts
+        .reasoning_effort
         .as_ref()
-        .and_then(|t| t.as_ref())
-        .and_then(|s| s.parse::<u32>().ok())
-        .or_else(|| {
-            if task_opts.thinking.is_some() {
-                Some(1024u32)
-            } else {
-                None
-            }
-        });
+        .map(ReasoningEffort::as_provider_str)
+        .map(String::from);
     let user_agent = task_opts.user_agent.clone();
+
+    // ── Per-provider flag support checks ──────────────────────────────
+    // Each provider rejects flags that have no effect on its API.
 
     let provider: Arc<crate::providers::Providers> = match provider_name.as_str() {
         "anthropic" => {
+            if task_opts.reasoning_effort.is_some() {
+                anyhow::bail!(
+                    "--reasoning-effort is not supported by Anthropic. \
+                     Use --thinking to set a thinking token budget."
+                );
+            }
             let api_key = api_key_from_sources(
                 task_opts,
                 state_manager,
@@ -919,6 +969,17 @@ pub(crate) fn create_provider(
             ))
         }
         "minimax" => {
+            if task_opts.thinking.is_some() {
+                anyhow::bail!(
+                    "--thinking is not supported by MiniMax. \
+                     The MiniMax API does not expose a thinking token budget."
+                );
+            }
+            if task_opts.reasoning_effort.is_some() {
+                anyhow::bail!(
+                    "--reasoning-effort is not supported by MiniMax."
+                );
+            }
             let default_model = model_id
                 .or_else(|| {
                     let state = crate::storage::global_state::load_global_state();
@@ -944,12 +1005,17 @@ pub(crate) fn create_provider(
                         api_line,
                         model_id: default_model,
                         model_info: None,
-                        thinking_budget_tokens: thinking_budget,
                     },
                 )?,
             ))
         }
         "openai" | "openai-native" => {
+            if task_opts.thinking.is_some() {
+                anyhow::bail!(
+                    "--thinking is not supported by OpenAI-compatible providers. \
+                     Use --reasoning-effort to set a reasoning level."
+                );
+            }
             let api_key = api_key_from_sources(
                 task_opts,
                 state_manager,
@@ -990,7 +1056,7 @@ pub(crate) fn create_provider(
                         api_key,
                         base_url,
                         model_info,
-                        reasoning_effort: task_opts.reasoning_effort.clone(),
+                        reasoning_effort: reasoning_effort_str,
                         custom_headers: user_agent.map(|ua| {
                             let mut headers = std::collections::HashMap::with_capacity(1);
                             headers.insert("User-Agent".to_string(), ua);
@@ -1029,21 +1095,62 @@ pub(crate) fn create_provider(
                     state.act_mode_api_model_id
                 })
                 .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+            let gemini_model_info =
+                crate::providers::gemini::get_gemini_model_info(&default_model);
+            // Reject flags that the selected Gemini generation cannot honour.
+            if task_opts.thinking.is_some() {
+                if gemini_model_info
+                    .thinking_config
+                    .as_ref()
+                    .and_then(|tc| tc.max_budget)
+                    .is_none()
+                {
+                    anyhow::bail!(
+                        "--thinking is not supported by Gemini model '{}'. \
+                         This model uses --reasoning-effort (thinking level), not a token budget.",
+                        default_model
+                    );
+                }
+            }
+            if task_opts.reasoning_effort.is_some() {
+                if !gemini_model_info
+                    .thinking_config
+                    .as_ref()
+                    .and_then(|tc| tc.supports_thinking_level)
+                    .unwrap_or(false)
+                {
+                    anyhow::bail!(
+                        "--reasoning-effort is not supported by Gemini model '{}'. \
+                         This model uses --thinking (token budget), not a thinking level.",
+                        default_model
+                    );
+                }
+            }
             Arc::new(crate::providers::Providers::Gemini(
                 crate::providers::gemini::GeminiProvider::new(
                     crate::providers::gemini::GeminiConfig {
                         model_id: default_model,
                         api_key,
                         base_url,
-                        model_info: None,
+                        model_info: Some(gemini_model_info),
                         thinking_budget_tokens: thinking_budget,
-                        reasoning_effort: task_opts.reasoning_effort.clone(),
+                        reasoning_effort: reasoning_effort_str,
                         search_enabled: false,
                     },
                 )?,
             ))
         }
         "deepseek" => {
+            if task_opts.reasoning_effort.is_some() {
+                anyhow::bail!(
+                    "--reasoning-effort is not supported by DeepSeek."
+                );
+            }
+            if task_opts.thinking.is_some() {
+                anyhow::bail!(
+                    "--thinking is not supported by DeepSeek."
+                );
+            }
             let api_key = api_key_from_sources(
                 task_opts,
                 state_manager,
@@ -1065,6 +1172,12 @@ pub(crate) fn create_provider(
             ))
         }
         "openrouter" => {
+            if task_opts.thinking.is_some() {
+                anyhow::bail!(
+                    "--thinking is not supported by OpenRouter. \
+                     Use --reasoning-effort to set a reasoning level."
+                );
+            }
             let api_key = api_key_from_sources(
                 task_opts,
                 state_manager,
@@ -1083,7 +1196,7 @@ pub(crate) fn create_provider(
                             &model_id_str,
                         )),
                         provider_sort: None,
-                        reasoning_effort: task_opts.reasoning_effort.clone(),
+                        reasoning_effort: reasoning_effort_str,
                         provider_name: None,
                     },
                 )?,
@@ -1856,9 +1969,6 @@ mod tests {
             "openai-native",
             "--json",
             "--auto-condense",
-            "--thinking",
-            "--reasoning-effort",
-            "high",
         ])
         .unwrap();
         assert!(cli.task_opts.act);
@@ -1866,8 +1976,65 @@ mod tests {
         assert_eq!(cli.task_opts.provider.as_deref(), Some("openai-native"));
         assert!(cli.task_opts.json);
         assert!(cli.task_opts.auto_condense);
-        assert!(cli.task_opts.thinking.is_some());
-        assert_eq!(cli.task_opts.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_thinking_flag() {
+        // Bare --thinking defaults to 1024 via default_missing_value
+        let cli = Cli::try_parse_from(["sned", "--thinking"]).unwrap();
+        assert_eq!(
+            cli.task_opts.thinking,
+            Some(Some("1024".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_thinking_flag_with_value() {
+        // --thinking=4096 uses require_equals syntax
+        let cli = Cli::try_parse_from(["sned", "--thinking=4096", "test"]).unwrap();
+        assert_eq!(
+            cli.task_opts.thinking,
+            Some(Some("4096".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_thinking_flag_rejects_space_separated_value() {
+        // --thinking 4096 (space-separated) is rejected by require_equals:
+        // the flag defaults to "1024" and "4096" becomes the positional prompt.
+        let cli = Cli::try_parse_from(["sned", "--thinking", "4096"]).unwrap();
+        assert_eq!(
+            cli.task_opts.thinking,
+            Some(Some("1024".to_string())),
+            "space-separated value should be ignored; flag defaults to 1024"
+        );
+    }
+
+    #[test]
+    fn parse_reasoning_effort_flag() {
+        let cli = Cli::try_parse_from(["sned", "--reasoning-effort", "high", "test"]).unwrap();
+        assert_eq!(
+            cli.task_opts.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn parse_reasoning_effort_rejects_invalid_value() {
+        let result = Cli::try_parse_from(["sned", "--reasoning-effort", "extreme", "test"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_thinking_and_reasoning_effort_are_mutually_exclusive() {
+        let result = Cli::try_parse_from([
+            "sned",
+            "--thinking",
+            "--reasoning-effort",
+            "high",
+            "test",
+        ]);
+        assert!(result.is_err(), "expected conflict error");
     }
 
     #[test]
@@ -2687,6 +2854,156 @@ mod tests {
         let body = openrouter.build_request_body_for_test(&request).unwrap();
 
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_create_provider_deepseek_rejects_thinking() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "deepseek",
+            "--api-key",
+            "test-key",
+            "--thinking",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--thinking is not supported by DeepSeek"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_provider_gemini3_rejects_thinking() {
+        // Gemini 3 uses thinking level (--reasoning-effort), not token budget (--thinking)
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "gemini",
+            "--api-key",
+            "test-key",
+            "--model",
+            "gemini-3.1-pro-preview",
+            "--thinking",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--thinking is not supported by Gemini model 'gemini-3.1-pro-preview'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_provider_gemini25_rejects_reasoning_effort() {
+        // Gemini 2.5 uses token budget (--thinking), not thinking level (--reasoning-effort)
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "gemini",
+            "--api-key",
+            "test-key",
+            "--model",
+            "gemini-2.5-flash",
+            "--reasoning-effort",
+            "high",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--reasoning-effort is not supported by Gemini model 'gemini-2.5-flash'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_provider_minimax_rejects_reasoning_effort() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "minimax",
+            "--api-key",
+            "test-key",
+            "--reasoning-effort",
+            "high",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--reasoning-effort is not supported by MiniMax"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_provider_openai_rejects_thinking() {
+        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "openai",
+            "--thinking",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--thinking is not supported by OpenAI"),
+            "got: {msg}"
+        );
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+    }
+
+    #[test]
+    fn test_create_provider_anthropic_rejects_reasoning_effort() {
+        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "anthropic",
+            "--reasoning-effort",
+            "high",
+            "test prompt",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--reasoning-effort is not supported by Anthropic"),
+            "got: {msg}"
+        );
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+    }
+
+    #[test]
+    fn test_create_provider_openai_accepts_reasoning_effort_none() {
+        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "openai",
+            "--model",
+            "o4-mini",
+            "--reasoning-effort",
+            "none",
+            "test prompt",
+        ])
+        .unwrap();
+        let result = create_provider(&cli.task_opts, None);
+        assert!(
+            result.is_ok(),
+            "openai should accept --reasoning-effort none: {:?}",
+            result.err()
+        );
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
     }
 
     #[test]
