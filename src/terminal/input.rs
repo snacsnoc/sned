@@ -12,15 +12,13 @@ use std::io::Write;
 const PANIC_TERMINAL_RESET_SEQUENCE: &[u8] =
     b"\x1b[?2004l\x1b[?1015l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[<1u\x1b[?1049l\x1b[?25h\x1b[0m";
 
-/// Captures mouse events so wheel scrolling works in the TUI.
-///
-/// Users can hold Shift while dragging to bypass capture for native selection.
+/// Captures wheel and left-button drag events for TUI scrolling and selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EnableSnedMouseCapture;
 
 impl Command for EnableSnedMouseCapture {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str("\x1b[?1000h\x1b[?1006h")
+        f.write_str("\x1b[?1002h\x1b[?1006h")
     }
 
     #[cfg(windows)]
@@ -72,11 +70,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sned_mouse_capture_avoids_drag_tracking() {
+    fn sned_mouse_capture_enables_drag_tracking() {
         let mut output = String::new();
         EnableSnedMouseCapture.write_ansi(&mut output).unwrap();
 
-        assert_eq!(output, "\x1b[?1000h\x1b[?1006h");
+        assert_eq!(output, "\x1b[?1002h\x1b[?1006h");
     }
 
     #[test]

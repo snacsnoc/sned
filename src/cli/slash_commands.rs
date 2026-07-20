@@ -1345,8 +1345,7 @@ pub fn format_help_text() -> String {
         "  Tab/Enter - Insert a selected picker item".to_string(),
         "  Esc - Close the active picker".to_string(),
         "  Ctrl+C - Cancel the current operation".to_string(),
-        "  Shift+drag - Select text; set SNED_DISABLE_MOUSE=1 for native mouse selection"
-            .to_string(),
+        "  Drag - Select transcript or completion text; mouse wheel scrolls".to_string(),
     ]);
     lines.join("\n")
 }
@@ -2099,7 +2098,7 @@ mod tests {
         assert!(text.contains("↑/↓"));
         assert!(text.contains("Enter"));
         assert!(text.contains("Esc"));
-        assert!(text.contains("Shift+drag"));
+        assert!(text.contains("Drag - Select transcript or completion text"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::terminal::input::EnableSnedMouseCapture;
 use futures::FutureExt;
 use ratatui::crossterm::event::{
     EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -667,9 +667,45 @@ fn write_clipboard<W: std::io::Write>(mut writer: W, text: &str) -> std::io::Res
     )
 }
 
-fn copy_completion_to_clipboard(text: &str) -> std::io::Result<()> {
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     // Keep terminal control output on the event-loop thread so it cannot interleave with redraws.
     write_clipboard(std::io::stdout(), text)
+}
+
+fn handle_text_selection_mouse_event(
+    app: &mut App,
+    mouse_event: MouseEvent,
+    mut copy: impl FnMut(&str) -> std::io::Result<()>,
+) -> bool {
+    match mouse_event.kind {
+        MouseEventKind::Down(MouseButton::Left) => app.begin_text_selection(
+            mouse_event.column,
+            mouse_event.row,
+            Instant::now(),
+        ),
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if !app.is_text_selection_dragging() {
+                return false;
+            }
+            app.extend_text_selection(mouse_event.column, mouse_event.row, Instant::now());
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if !app.is_text_selection_dragging() {
+                return false;
+            }
+            if let Some(text) = app.finish_text_selection(mouse_event.column, mouse_event.row)
+                && let Err(error) = copy(&text)
+            {
+                app.push_styled(
+                    format!("Failed to copy selection: {error}"),
+                    Style::default().fg(theme::ERROR_FG),
+                );
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 fn confirmation_is_approved(response: &str) -> bool {
@@ -1628,7 +1664,7 @@ async fn handle_cli_only_command(
             );
         }
         CliOnlyCommand::Copy => {
-            handle_copy_command(app, copy_completion_to_clipboard);
+            handle_copy_command(app, copy_to_clipboard);
         }
         CliOnlyCommand::History => {
             let last_n: Vec<String> = app
@@ -2861,6 +2897,7 @@ async fn run_main_loop(
         if has_event {
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {
+                    app.clear_text_selection();
                     app.needs_redraw = true;
                     if let Some(outcome) = handle_approval_key(app, &key) {
                         if let ApprovalKeyOutcome::Resolved { result, delivered } = outcome {
@@ -3152,6 +3189,7 @@ async fn run_main_loop(
                     }
                 }
                 Event::Paste(content) => {
+                    app.clear_text_selection();
                     app.needs_redraw = true;
                     let folded = handle_paste_event(app, &content);
                     if folded {
@@ -3165,14 +3203,21 @@ async fn run_main_loop(
                     }
                 }
                 Event::Resize(_, _) => {
+                    app.clear_text_selection();
                     app.has_resized = true;
                     app.needs_redraw = true;
                     // Ratatui handles resize automatically on next draw
                 }
                 Event::Mouse(mouse_event) => {
-                    app.needs_redraw = true;
+                    if handle_text_selection_mouse_event(app, mouse_event, copy_to_clipboard) {
+                        continue;
+                    }
+                    if app.is_text_selection_dragging() {
+                        continue;
+                    }
                     match mouse_event.kind {
-                        ratatui::crossterm::event::MouseEventKind::ScrollDown => {
+                        MouseEventKind::ScrollDown => {
+                            app.clear_text_selection();
                             if app.has_pending_approval() {
                                 app.scroll_pending_approval(-3);
                             } else if !app.scroll_completion_at(
@@ -3183,7 +3228,8 @@ async fn run_main_loop(
                                 app.scroll_lines(3);
                             }
                         }
-                        ratatui::crossterm::event::MouseEventKind::ScrollUp => {
+                        MouseEventKind::ScrollUp => {
+                            app.clear_text_selection();
                             if app.has_pending_approval() {
                                 app.scroll_pending_approval(3);
                             } else if !app.scroll_completion_at(
@@ -3383,7 +3429,7 @@ pub async fn run_interactive_shell_inner(
                 theme::dim_style(),
             );
             app.push_styled(
-                "hold Shift+drag to select text; set SNED_DISABLE_MOUSE=1 for native mouse selection",
+                "drag transcript or completion text to select and copy; mouse wheel scrolls",
                 theme::dim_style(),
             );
         }
@@ -4011,6 +4057,65 @@ mod tests {
         let sequence = String::from_utf8(output).unwrap();
         assert!(sequence.starts_with("\x1b]52;c;"));
         assert!(sequence.contains("cmF3ICoqbWFya2Rvd24qKg=="));
+    }
+
+    #[test]
+    fn test_mouse_drag_copies_transcript_selection() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = App::new();
+        app.push_plain("alpha beta");
+        let backend = TestBackend::new(48, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("selection frame should render");
+        let buffer = terminal.backend().buffer();
+        let (column, row) = (0..buffer.area.height)
+            .flat_map(|row| (0..buffer.area.width).map(move |column| (column, row)))
+            .find(|(column, row)| {
+                buffer
+                    .cell((*column, *row))
+                    .is_some_and(|cell| cell.symbol() == "a")
+            })
+            .expect("transcript text should render");
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let copied_for_callback = copied.clone();
+        let event = |kind| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(handle_text_selection_mouse_event(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left)),
+            |_| Ok(())
+        ));
+        assert!(handle_text_selection_mouse_event(
+            &mut app,
+            MouseEvent {
+                column: column + 4,
+                ..event(MouseEventKind::Drag(MouseButton::Left))
+            },
+            |_| Ok(())
+        ));
+        assert!(handle_text_selection_mouse_event(
+            &mut app,
+            MouseEvent {
+                column: column + 4,
+                ..event(MouseEventKind::Up(MouseButton::Left))
+            },
+            move |text| {
+                *copied_for_callback.borrow_mut() = Some(text.to_string());
+                Ok(())
+            }
+        ));
+
+        assert_eq!(copied.borrow().as_deref(), Some("alpha"));
     }
 
     #[tokio::test]

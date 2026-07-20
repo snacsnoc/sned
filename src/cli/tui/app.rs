@@ -6,6 +6,7 @@ use super::history::FileHistory;
 use super::theme;
 use crate::core::file_search::FileSearchResult;
 use ratatui::{
+    buffer::Buffer,
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
@@ -120,6 +121,41 @@ struct PendingApproval {
     scroll_from_bottom: usize,
     total_rows: usize,
     viewport_rows: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionPane {
+    Transcript,
+    Completion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionPoint {
+    column: u16,
+    row: u16,
+}
+
+#[derive(Debug, Clone)]
+struct TextSelection {
+    pane: SelectionPane,
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+    dragging: bool,
+    moved: bool,
+    last_drag_redraw: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct VisibleCell {
+    symbol: String,
+    continuation: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionSurface {
+    pane: SelectionPane,
+    content_area: Rect,
+    rows: Vec<Vec<VisibleCell>>,
 }
 
 enum ScrollbackCommand {
@@ -458,6 +494,10 @@ pub struct App {
     completion_scroll_offset: usize,
     completion_viewport_rows: usize,
     completion_area: Option<Rect>,
+    transcript_selection_area: Option<Rect>,
+    completion_selection_area: Option<Rect>,
+    text_selection: Option<TextSelection>,
+    selection_surfaces: Vec<SelectionSurface>,
     /// Error box lines rendered as a dedicated Block widget with red border.
     /// Takes priority over completion_lines when non-empty.
     pub error_lines: VecDeque<Line<'static>>,
@@ -562,6 +602,7 @@ impl App {
         self.slash_command_active = false;
         self.slash_command_help_active = false;
         self.model_picker_active = false;
+        self.clear_text_selection();
         self.needs_redraw = true;
         self.pin_approval_bottom();
         true
@@ -744,6 +785,10 @@ impl App {
             completion_scroll_offset: 0,
             completion_viewport_rows: 0,
             completion_area: None,
+            transcript_selection_area: None,
+            completion_selection_area: None,
+            text_selection: None,
+            selection_surfaces: Vec::new(),
             error_lines: VecDeque::new(),
             cached_error_rows: 0,
             cached_visible_window: None,
@@ -1172,8 +1217,289 @@ impl App {
         self.last_completion_text.as_deref()
     }
 
+    pub(crate) fn begin_text_selection(&mut self, column: u16, row: u16, now: Instant) -> bool {
+        let Some(surface) = self.selection_surface_at(column, row) else {
+            return false;
+        };
+        let point = Self::normalize_selection_point(surface, column, row);
+        self.text_selection = Some(TextSelection {
+            pane: surface.pane,
+            anchor: point,
+            focus: point,
+            dragging: true,
+            moved: false,
+            last_drag_redraw: now,
+        });
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Update the active selection. The caller can skip a redraw when this
+    /// returns false, but the focus still tracks every drag event.
+    pub(crate) fn extend_text_selection(
+        &mut self,
+        column: u16,
+        row: u16,
+        now: Instant,
+    ) -> bool {
+        let Some(selection) = self.text_selection.as_ref() else {
+            return false;
+        };
+        let Some(surface) = self.selection_surface(selection.pane) else {
+            self.text_selection = None;
+            return false;
+        };
+        let point = Self::normalize_selection_point(surface, column, row);
+        let selection = self
+            .text_selection
+            .as_mut()
+            .expect("selection must remain present while extending it");
+        selection.moved |= point != selection.anchor;
+        selection.focus = point;
+        if now.duration_since(selection.last_drag_redraw) < Duration::from_millis(16) {
+            return false;
+        }
+        selection.last_drag_redraw = now;
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Complete a drag selection and return the text from the last rendered
+    /// frame. The event loop cannot access a Frame, so this intentionally
+    /// copies exactly the content the user saw before releasing the mouse.
+    pub(crate) fn finish_text_selection(&mut self, column: u16, row: u16) -> Option<String> {
+        let Some(selection) = self.text_selection.as_ref() else {
+            return None;
+        };
+        let Some(surface) = self.selection_surface(selection.pane) else {
+            self.text_selection = None;
+            return None;
+        };
+        let point = Self::normalize_selection_point(surface, column, row);
+        let selection = self
+            .text_selection
+            .as_mut()
+            .expect("selection must remain present while finishing it");
+        selection.dragging = false;
+        selection.moved |= point != selection.anchor;
+        selection.focus = point;
+        if !selection.moved {
+            self.text_selection = None;
+            self.needs_redraw = true;
+            return None;
+        }
+        self.needs_redraw = true;
+        self.selected_text()
+    }
+
+    pub(crate) fn clear_text_selection(&mut self) {
+        if self.text_selection.take().is_some() {
+            self.needs_redraw = true;
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_text_selection_dragging(&self) -> bool {
+        self.text_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging)
+    }
+
+    fn selection_surface_at(&self, column: u16, row: u16) -> Option<&SelectionSurface> {
+        self.selection_surfaces
+            .iter()
+            .find(|surface| Self::selection_area_contains(surface.content_area, column, row))
+    }
+
+    fn selection_surface(&self, pane: SelectionPane) -> Option<&SelectionSurface> {
+        self.selection_surfaces
+            .iter()
+            .find(|surface| surface.pane == pane)
+    }
+
+    fn selection_area_contains(area: Rect, column: u16, row: u16) -> bool {
+        column >= area.x
+            && column < area.x.saturating_add(area.width)
+            && row >= area.y
+            && row < area.y.saturating_add(area.height)
+    }
+
+    fn normalize_selection_point(
+        surface: &SelectionSurface,
+        column: u16,
+        row: u16,
+    ) -> SelectionPoint {
+        let last_column = surface
+            .content_area
+            .x
+            .saturating_add(surface.content_area.width.saturating_sub(1));
+        let last_row = surface
+            .content_area
+            .y
+            .saturating_add(surface.content_area.height.saturating_sub(1));
+        let row = row.clamp(surface.content_area.y, last_row);
+        let mut column = column.clamp(surface.content_area.x, last_column);
+        let row_index = row.saturating_sub(surface.content_area.y) as usize;
+        let cells = &surface.rows[row_index];
+        let mut cell_index = column.saturating_sub(surface.content_area.x) as usize;
+        while cell_index > 0 && cells[cell_index].continuation {
+            cell_index -= 1;
+        }
+        column = surface.content_area.x.saturating_add(cell_index as u16);
+        SelectionPoint { column, row }
+    }
+
+    fn selection_columns_for_row(
+        &self,
+        surface: &SelectionSurface,
+        row: usize,
+    ) -> Option<(usize, usize)> {
+        let selection = self.text_selection.as_ref()?;
+        if selection.pane != surface.pane || row >= surface.rows.len() {
+            return None;
+        }
+        let (start, end) = if (selection.anchor.row, selection.anchor.column)
+            <= (selection.focus.row, selection.focus.column)
+        {
+            (selection.anchor, selection.focus)
+        } else {
+            (selection.focus, selection.anchor)
+        };
+        let absolute_row = surface.content_area.y.saturating_add(row as u16);
+        if absolute_row < start.row || absolute_row > end.row {
+            return None;
+        }
+        let cells = &surface.rows[row];
+        if cells.is_empty() {
+            return None;
+        }
+        let mut first = if absolute_row == start.row {
+            start.column.saturating_sub(surface.content_area.x) as usize
+        } else {
+            0
+        };
+        let mut last = if absolute_row == end.row {
+            end.column.saturating_sub(surface.content_area.x) as usize
+        } else {
+            cells.len().saturating_sub(1)
+        };
+        first = first.min(cells.len().saturating_sub(1));
+        last = last.min(cells.len().saturating_sub(1));
+        while first > 0 && cells[first].continuation {
+            first -= 1;
+        }
+        while last + 1 < cells.len() && cells[last + 1].continuation {
+            last += 1;
+        }
+        Some((first, last))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.text_selection.as_ref()?;
+        let surface = self.selection_surface(selection.pane)?;
+        let mut rows = Vec::new();
+        for row in 0..surface.rows.len() {
+            let Some((start, end)) = self.selection_columns_for_row(surface, row) else {
+                continue;
+            };
+            let mut text = String::new();
+            for cell in &surface.rows[row][start..=end] {
+                if !cell.continuation {
+                    text.push_str(&cell.symbol);
+                }
+            }
+            rows.push(text.trim_end_matches(char::is_whitespace).to_string());
+        }
+        let text = rows.join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    fn refresh_selection_surfaces(&mut self, buffer: &Buffer) {
+        let areas = [
+            (SelectionPane::Transcript, self.transcript_selection_area),
+            (SelectionPane::Completion, self.completion_selection_area),
+        ];
+        self.selection_surfaces = areas
+            .into_iter()
+            .filter_map(|(pane, area)| area.map(|area| Self::snapshot_selection_surface(buffer, pane, area)))
+            .collect();
+        if self.text_selection.as_ref().is_some_and(|selection| {
+            self.selection_surface(selection.pane).is_none()
+        }) {
+            self.text_selection = None;
+        }
+    }
+
+    fn snapshot_selection_surface(
+        buffer: &Buffer,
+        pane: SelectionPane,
+        content_area: Rect,
+    ) -> SelectionSurface {
+        let mut rows = Vec::with_capacity(content_area.height as usize);
+        for row in content_area.y..content_area.y.saturating_add(content_area.height) {
+            let mut cells = Vec::with_capacity(content_area.width as usize);
+            let mut continuation_cells = 0usize;
+            for column in content_area.x..content_area.x.saturating_add(content_area.width) {
+                let symbol = buffer
+                    .cell((column, row))
+                    .map_or_else(|| " ".to_string(), |cell| cell.symbol().to_string());
+                let continuation = continuation_cells > 0;
+                if continuation {
+                    continuation_cells -= 1;
+                } else {
+                    continuation_cells = UnicodeWidthStr::width(symbol.as_str()).saturating_sub(1);
+                }
+                cells.push(VisibleCell {
+                    symbol,
+                    continuation,
+                });
+            }
+            rows.push(cells);
+        }
+        SelectionSurface {
+            pane,
+            content_area,
+            rows,
+        }
+    }
+
+    fn apply_text_selection_overlay(&self, buffer: &mut Buffer) {
+        let Some(selection) = self.text_selection.as_ref() else {
+            return;
+        };
+        let Some(surface) = self.selection_surface(selection.pane) else {
+            return;
+        };
+        for row in 0..surface.rows.len() {
+            let Some((start, end)) = self.selection_columns_for_row(surface, row) else {
+                continue;
+            };
+            buffer.set_style(
+                Rect {
+                    x: surface.content_area.x.saturating_add(start as u16),
+                    y: surface.content_area.y.saturating_add(row as u16),
+                    width: end.saturating_sub(start).saturating_add(1) as u16,
+                    height: 1,
+                },
+                Style::default().add_modifier(Modifier::REVERSED),
+            );
+        }
+    }
+
+    fn selection_content_area(area: Rect, reserve_scrollbar: bool) -> Option<Rect> {
+        let mut content = area.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        if reserve_scrollbar {
+            content.width = content.width.saturating_sub(1);
+        }
+        (content.width > 0 && content.height > 0).then_some(content)
+    }
+
     /// Clear the completion box and invalidate cached layout for the next render.
     pub fn clear_completion_lines(&mut self) {
+        self.clear_text_selection();
         self.needs_redraw = true;
         self.completion_lines.clear();
         self.cached_completion_rows = 0;
@@ -1192,6 +1518,7 @@ impl App {
 
     /// Clear the error box and invalidate cached layout for the next render.
     pub fn clear_error_lines(&mut self) {
+        self.clear_text_selection();
         self.needs_redraw = true;
         self.error_lines.clear();
         self.cached_error_rows = 0;
@@ -1487,6 +1814,7 @@ impl App {
     /// Clear all output and reset the visual-row cache.
     pub fn clear_output(&mut self) -> io::Result<()> {
         let result = self.clear_scrollback_storage();
+        self.clear_text_selection();
         self.needs_redraw = true;
         self.output_lines.clear();
         self.output_line_kinds.clear();
@@ -1610,6 +1938,7 @@ impl App {
     }
 
     pub fn scroll_lines(&mut self, delta: isize) {
+        self.clear_text_selection();
         self.needs_redraw = true;
         let total_rows = self.output_visual_rows(self.last_wrap_width());
         if !self.enter_manual_mode(total_rows) {
@@ -1635,6 +1964,7 @@ impl App {
     }
 
     pub fn scroll_completion_lines(&mut self, delta: isize) -> bool {
+        self.clear_text_selection();
         if !self.error_lines.is_empty()
             || self.completion_lines.is_empty()
             || self.completion_viewport_rows == 0
@@ -2014,6 +2344,20 @@ impl App {
         if has_plan {
             self.render_plan_panel(frame, plan_area);
         }
+
+        let selection_blocked = self.has_blocking_prompt()
+            || self.picker_active
+            || self.slash_command_active
+            || self.model_picker_active;
+        if selection_blocked {
+            self.clear_text_selection();
+            self.selection_surfaces.clear();
+        } else {
+            // Selection must be based on the completed frame, after widgets have
+            // applied wrapping, scrolling, and markdown styling.
+            self.refresh_selection_surfaces(frame.buffer_mut());
+            self.apply_text_selection_overlay(frame.buffer_mut());
+        }
     }
 
     fn render_plan_panel(&self, frame: &mut Frame, area: Rect) {
@@ -2298,6 +2642,16 @@ impl App {
         let output_rows = total_rows
             .saturating_sub(self.cached_completion_rows)
             .saturating_sub(self.cached_error_rows);
+        self.transcript_selection_area =
+            Self::selection_content_area(main_output_area, output_rows > content_height);
+        let completion_max_scroll = self
+            .cached_completion_rows
+            .saturating_sub(self.completion_viewport_rows);
+        self.completion_selection_area = if has_completion && !has_error {
+            Self::selection_content_area(bottom_area, completion_max_scroll > 0)
+        } else {
+            None
+        };
         let scroll_y = self.resolved_output_scroll_y_for(wrap_width, output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y, content_height);
@@ -2351,9 +2705,7 @@ impl App {
             frame.render_widget(Clear, bottom_area);
             let completion_lines: Vec<Line<'static>> =
                 self.completion_lines.iter().cloned().collect();
-            let max_completion_scroll = self
-                .cached_completion_rows
-                .saturating_sub(self.completion_viewport_rows);
+            let max_completion_scroll = completion_max_scroll;
             let mut completion_block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::PROMPT_FG))
@@ -2800,6 +3152,129 @@ mod tests {
             .into_iter()
             .take(output_height)
             .collect()
+    }
+
+    fn render_for_selection(app: &mut App) {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("selection frame should render");
+    }
+
+    fn selection_text_position(
+        app: &App,
+        pane: SelectionPane,
+        text: &str,
+    ) -> (u16, u16) {
+        let surface = app
+            .selection_surface(pane)
+            .expect("render should create a selection surface");
+        for (row_index, row) in surface.rows.iter().enumerate() {
+            for (column_index, cell) in row.iter().enumerate() {
+                if cell.symbol == text {
+                    return (
+                        surface.content_area.x.saturating_add(column_index as u16),
+                        surface.content_area.y.saturating_add(row_index as u16),
+                    );
+                }
+            }
+        }
+        panic!("selection text {text:?} was not rendered");
+    }
+
+    #[test]
+    fn test_transcript_selection_copies_visible_cells() {
+        let mut app = App::new();
+        app.push_plain("alpha beta");
+        render_for_selection(&mut app);
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let now = Instant::now();
+
+        assert!(app.begin_text_selection(column, row, now));
+        assert!(app.extend_text_selection(column + 4, row, now + Duration::from_millis(16)));
+        assert_eq!(app.finish_text_selection(column + 4, row), Some("alpha".to_string()));
+    }
+
+    #[test]
+    fn test_completion_selection_copies_visible_cells() {
+        let mut app = App::new();
+        app.push_plain("transcript");
+        app.push_completion_line(Line::from("done now"));
+        render_for_selection(&mut app);
+        let (column, row) = selection_text_position(&app, SelectionPane::Completion, "d");
+        let now = Instant::now();
+
+        assert!(app.begin_text_selection(column, row, now));
+        assert!(app.extend_text_selection(column + 3, row, now + Duration::from_millis(16)));
+        assert_eq!(app.finish_text_selection(column + 3, row), Some("done".to_string()));
+    }
+
+    #[test]
+    fn test_selection_normalizes_wide_grapheme_endpoints() {
+        let mut app = App::new();
+        app.push_plain("A界B");
+        render_for_selection(&mut app);
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "界");
+
+        assert!(app.begin_text_selection(column + 1, row, Instant::now()));
+        assert_eq!(
+            app.text_selection.as_ref().map(|selection| selection.anchor.column),
+            Some(column)
+        );
+    }
+
+    #[test]
+    fn test_drag_selection_throttles_redraws() {
+        let mut app = App::new();
+        app.push_plain("alpha beta");
+        render_for_selection(&mut app);
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let now = Instant::now();
+
+        assert!(app.begin_text_selection(column, row, now));
+        app.needs_redraw = false;
+        assert!(!app.extend_text_selection(column + 1, row, now + Duration::from_millis(15)));
+        assert!(!app.needs_redraw);
+        assert!(app.extend_text_selection(column + 1, row, now + Duration::from_millis(16)));
+        assert!(app.needs_redraw);
+    }
+
+    #[test]
+    fn test_selection_overlay_marks_selected_cells_reversed() {
+        let mut app = App::new();
+        app.push_plain("alpha beta");
+        render_for_selection(&mut app);
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let now = Instant::now();
+
+        assert!(app.begin_text_selection(column, row, now));
+        assert!(app.extend_text_selection(column + 4, row, now + Duration::from_millis(16)));
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("selection overlay should render");
+        assert!(terminal
+            .backend()
+            .buffer()
+            .cell((column, row))
+            .expect("selected cell should exist")
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn test_slash_overlay_disables_selection() {
+        let mut app = App::new();
+        app.push_plain("transcript");
+        app.slash_command_active = true;
+        render_for_selection(&mut app);
+
+        assert!(app.selection_surfaces.is_empty());
+        assert!(!app.begin_text_selection(1, 1, Instant::now()));
     }
 
     #[test]
