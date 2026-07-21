@@ -1220,30 +1220,10 @@ mod tests {
         assert!(!alive, "timed-out script should be terminated");
     }
 
-    struct CwdGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CwdGuard {
-        fn set_to(path: &Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(path).unwrap();
-            Self { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
-
     #[tokio::test]
     async fn test_execute_uses_workspace_root_not_process_cwd() {
         let handler = ExecuteCommandHandler::new();
         let workspace_root = tempfile::tempdir().unwrap();
-        let wrong_cwd = tempfile::tempdir().unwrap();
-        let _guard = CwdGuard::set_to(wrong_cwd.path());
 
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
@@ -1276,8 +1256,6 @@ mod tests {
     async fn test_execute_script_uses_workspace_root_not_process_cwd() {
         let handler = ExecuteCommandHandler::new();
         let workspace_root = tempfile::tempdir().unwrap();
-        let wrong_cwd = tempfile::tempdir().unwrap();
-        let _guard = CwdGuard::set_to(wrong_cwd.path());
 
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(

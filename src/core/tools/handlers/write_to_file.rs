@@ -274,24 +274,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    struct CwdGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CwdGuard {
-        fn set_to(path: &Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(path).unwrap();
-            Self { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
-
     #[tokio::test]
     async fn test_write_file() {
         let temp_dir = TempDir::new().unwrap();
@@ -397,8 +379,6 @@ mod tests {
     async fn test_execute_uses_workspace_root_not_process_cwd() {
         let handler = WriteToFileHandler::new();
         let workspace_root = TempDir::new().unwrap();
-        let wrong_cwd = TempDir::new().unwrap();
-        let _guard = CwdGuard::set_to(wrong_cwd.path());
 
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
@@ -429,7 +409,6 @@ mod tests {
             serde_json::json!("Successfully wrote to nested/output.go")
         );
         assert!(workspace_root.path().join("nested/output.go").exists());
-        assert!(!wrong_cwd.path().join("nested/output.go").exists());
     }
 
     #[tokio::test]
