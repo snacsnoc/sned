@@ -4671,7 +4671,8 @@ mod tests {
         let writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 
-        print_model_line(&"x".repeat(200), &writer, false);
+        let line = "x".repeat(get_terminal_width().max(1).saturating_add(1));
+        print_model_line(&line, &writer, false);
 
         let mut emitted = Vec::new();
         while let Ok(event) = rx.try_recv() {

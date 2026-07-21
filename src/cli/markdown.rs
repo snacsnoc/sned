@@ -574,8 +574,9 @@ mod tests {
     /// terminal instead of wrapping.
     #[test]
     fn render_error_markdown_wraps_long_error_text() {
-        let long = "this is a very long error message that absolutely should be wrapped to fit the terminal width when rendered in the one-shot non-interactive output path";
-        let lines = render_error_markdown("✗ Error", long);
+        let term_width = crate::cli::text_utils::get_terminal_width().max(1);
+        let long = "error ".repeat(term_width.div_ceil("error ".len()) + 1);
+        let lines = render_error_markdown("✗ Error", &long);
         assert!(
             lines.len() > 1,
             "expected wrap into multiple lines, got {} line(s): {:?}",
@@ -584,7 +585,6 @@ mod tests {
         );
         // No emitted line should be wider than the terminal — wrapping
         // must have split the input before any row overflowed.
-        let term_width = crate::cli::text_utils::get_terminal_width();
         for (i, line) in lines.iter().enumerate() {
             let width: usize = line
                 .spans
