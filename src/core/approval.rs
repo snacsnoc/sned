@@ -1278,24 +1278,11 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
         "execute_command" => {
             let mut output = String::new();
 
-            // Handle all three parameter forms: "commands" (array), "command" (singular), "script"
-            if let Some(commands) = obj.get("commands").and_then(|v| v.as_array()) {
-                // Primary form: array of commands
-                let cmds: Vec<&str> = commands
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !cmds.is_empty() {
-                    output.push_str("\n    ");
-                    output.push_str(&cmds.join(" && "));
-                }
-            } else if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
-                // Legacy fallback: singular command string
+            let commands = crate::core::tools::coerce_string_array(params, "commands", "command");
+            if !commands.is_empty() {
                 output.push_str("\n    ");
-                output.push_str(cmd);
+                output.push_str(&commands.join(" && "));
             } else if let Some(script) = obj.get("script").and_then(|v| v.as_str()) {
-                // Alternative: script field
                 output.push_str("\n    ");
                 output.push_str(script);
             }
@@ -2617,6 +2604,13 @@ mod tests {
         let formatted = format_tool_parameters("execute_command", &params);
         assert!(formatted.contains("cd project && cargo build && cargo test"));
         assert!(!formatted.contains("cwd"));
+    }
+
+    #[test]
+    fn test_format_tool_parameters_execute_command_with_scalar_commands() {
+        let params = serde_json::json!({"commands": "git status --short"});
+        let formatted = format_tool_parameters("execute_command", &params);
+        assert!(formatted.contains("git status --short"));
     }
 
     #[test]
