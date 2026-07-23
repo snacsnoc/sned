@@ -161,6 +161,29 @@ impl MockProvider {
     }
 
     #[must_use]
+    pub fn scalar_command_approval_scenario() -> Self {
+        let execute_command = MockToolCall {
+            call_id: "scalar-command-approval-exec".to_string(),
+            name: "execute_command".to_string(),
+            arguments: serde_json::json!({
+                "commands": "git status --short"
+            }),
+        };
+        let attempt_completion = MockToolCall {
+            call_id: "scalar-command-approval-complete".to_string(),
+            name: "attempt_completion".to_string(),
+            arguments: serde_json::json!({
+                "result": "scalar command approval smoke test complete"
+            }),
+        };
+
+        Self::new_with_repeat(vec![
+            MockResponse::ToolCalls(vec![execute_command]),
+            MockResponse::ToolCalls(vec![attempt_completion]),
+        ])
+    }
+
+    #[must_use]
     pub fn approval_under_backpressure_scenario() -> Self {
         let mut events = Vec::new();
         for i in 1..=256 {

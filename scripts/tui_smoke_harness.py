@@ -317,6 +317,52 @@ def approval_scroll():
         )
 
 
+def approval_scalar_command():
+    command = "git status --short"
+    sent_prompt = False
+    command_visible_before_approval = False
+    sent_approve = False
+    sent_exit = False
+
+    def tick(session):
+        nonlocal sent_prompt, command_visible_before_approval, sent_approve, sent_exit
+        text = session.text
+        if "type a prompt" in text and not sent_prompt:
+            session.send(b"trigger scalar command approval\r")
+            sent_prompt = True
+        tail = visible_tail(clean_output(session.buf))
+        tool_index = tail.rfind("Tool: execute_command")
+        if tool_index >= 0:
+            command_index = tail.find(command, tool_index)
+            approval_index = tail.find("Execute this tool?", tool_index)
+            if 0 <= command_index < approval_index:
+                command_visible_before_approval = True
+        if command_visible_before_approval and not sent_approve:
+            session.send(b"y\r")
+            sent_approve = True
+        if sent_approve and "scalar command approval smoke test complete" in text and not sent_exit:
+            time.sleep(0.25)
+            session.send(b"/exit\r")
+            sent_exit = True
+
+    with PtySession(
+        "sned-approval-scalar-command.", {"SNED_MOCK_APPROVAL_SCALAR_COMMAND": "1"}
+    ) as session:
+        session.run(12, tick)
+        session.dump_if_verbose()
+        compact_text = re.sub(r"\s+", "", clean_output(session.buf))
+        report(
+            [
+                (sent_prompt, "initial user prompt was not sent"),
+                (command_visible_before_approval, "scalar command was not shown before the approval prompt in the approval panel"),
+                (sent_approve, "approval was sent before the scalar command became visible"),
+                ("scalarcommandapprovalsmoketestcomplete" in compact_text, "completion result did not appear after approval"),
+                (session.exit_code in (0, None), f"sned exited with {session.exit_code}"),
+            ],
+            "scalar command appeared before approval input",
+        )
+
+
 def approval_under_backpressure():
     command_marker = "/tmp/sned-approval-backpressure-smoke"
     blocked_probe = "BLOCKED_PROBE_555"
@@ -694,6 +740,7 @@ SCENARIOS = {
     "tui-user-echo": user_echo,
     "tui-turn-indicators": turn_indicators,
     "tui-approval-scroll": approval_scroll,
+    "tui-approval-scalar-command": approval_scalar_command,
     "tui-approval-under-backpressure": approval_under_backpressure,
     "tui-long-completion-navigation": long_completion_navigation,
     "tui-history-navigation": history_navigation,

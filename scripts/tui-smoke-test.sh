@@ -9,8 +9,8 @@ SNED_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-model-switch tui-busy-exit help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
-TOTAL_TESTS=16
+ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-scalar-command tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-model-switch tui-busy-exit help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
+TOTAL_TESTS=17
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -48,6 +48,7 @@ tui-startup-exit      Start ratatui in a pty, render banner, send /exit
 tui-user-echo         Type a prompt, verify ❯ prefix appears in transcript
 tui-turn-indicators   Type a prompt, verify ♦ and ─ turn markers appear
 tui-approval-scroll   Scroll away, then verify approval prompt stays visible
+tui-approval-scalar-command Verify scalar command appears before approval input
 tui-approval-under-backpressure Flood output, block input, then approve after render
 tui-long-completion-navigation Scroll completion and transcript at both boundaries
 tui-history-navigation Type prompts, press Up arrow, verify previous prompt appears
@@ -99,6 +100,7 @@ test_description() {
         tui-user-echo) echo "Type a prompt, verify ❯ prefix appears in transcript" ;;
         tui-turn-indicators) echo "Type a prompt, verify ✦ and ─ turn markers appear" ;;
         tui-approval-scroll) echo "Scroll away, then verify approval prompt stays visible" ;;
+        tui-approval-scalar-command) echo "Verify scalar command appears before approval input" ;;
         tui-approval-under-backpressure) echo "Flood output, block input, then approve after render" ;;
         tui-long-completion-navigation) echo "Scroll completion and transcript at both boundaries" ;;
         tui-history-navigation) echo "Type prompts, press Up arrow, verify previous prompt appears in input" ;;
@@ -121,6 +123,7 @@ test_source() {
         tui-user-echo) echo "src/cli/tui/app.rs push_user_message / src/cli/interactive.rs Enter handler" ;;
         tui-turn-indicators) echo "src/core/agent_loop.rs assistant turn indicator / src/cli/tui/app.rs push_turn_separator" ;;
         tui-approval-scroll) echo "src/cli/interactive.rs drain_output approval scroll path / src/core/approval.rs begin_approval_prompt" ;;
+        tui-approval-scalar-command) echo "src/core/approval.rs format_tool_parameters scalar commands / src/cli/interactive.rs approval rendering" ;;
         tui-approval-under-backpressure) echo "src/cli/output.rs priority delivery / src/cli/interactive.rs approval input routing" ;;
         tui-long-completion-navigation) echo "src/cli/tui/app.rs completion scroll boundaries / src/cli/interactive.rs navigation routing" ;;
         tui-history-navigation) echo "src/cli/interactive.rs handle_key_event Up/Down arrow history / src/cli/tui/history.rs FileHistory" ;;
@@ -214,9 +217,20 @@ test_yolo_help() {
     fi
 }
 
+run_test() {
+    case "$1" in
+        tui-*|json-no-prompt|ctrlc-quit-empty) test_pty_scenario "$1" ;;
+        help) test_help ;;
+        version) test_version ;;
+        invalid-flag) test_invalid_flag ;;
+        yolo-help) test_yolo_help ;;
+        *) echo "TUI_TEST_FAIL unknown test"; return 1 ;;
+    esac
+}
+
 run_one() {
     local name="$1"
-    local result reason
+    local result reason status
 
     if [ -n "$RUN_TEST" ] && [ "$RUN_TEST" != "$name" ]; then
         return 0
@@ -225,23 +239,26 @@ run_one() {
     printf "  [%d/%d] RUNNING %s\n" $((PASS_COUNT + FAIL_COUNT + 1)) "$TOTAL_TESTS" "$name"
     printf "         %s\n" "$(test_description "$name")"
 
-    case "$name" in
-        tui-*|json-no-prompt|ctrlc-quit-empty) result="$(test_pty_scenario "$name" 2>&1)" ;;
-        help) result="$(test_help 2>&1)" ;;
-        version) result="$(test_version 2>&1)" ;;
-        invalid-flag) result="$(test_invalid_flag 2>&1)" ;;
-        yolo-help) result="$(test_yolo_help 2>&1)" ;;
-        *) result="TUI_TEST_FAIL unknown test" ;;
-    esac
+    if result="$(run_test "$name" 2>&1)"; then
+        status=0
+    else
+        status=$?
+    fi
 
-    if printf '%s\n' "$result" | grep -q "TUI_TEST_PASS"; then
+    if [ "$status" -eq 0 ] && printf '%s\n' "$result" | grep -q "TUI_TEST_PASS"; then
         RESULTS="${RESULTS}PASS  ${name}
 "
         PASS_COUNT=$((PASS_COUNT + 1))
         printf "         -> PASS\n"
     else
-        reason="$(printf '%s\n' "$result" | grep "TUI_TEST_FAIL" | head -1 | cut -d' ' -f3-)"
-        [ -z "$reason" ] && reason="test failed"
+        reason="$(printf '%s\n' "$result" | awk '/TUI_TEST_FAIL/ { sub(/^TUI_TEST_FAIL /, ""); print; exit }')"
+        if [ -z "$reason" ]; then
+            if [ "$status" -ne 0 ]; then
+                reason="scenario exited with status $status"
+            else
+                reason="test failed"
+            fi
+        fi
         RESULTS="${RESULTS}FAIL  ${name} -- ${reason}
 "
         FAIL_NAMES="${FAIL_NAMES}${name}

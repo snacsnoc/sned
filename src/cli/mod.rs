@@ -1203,7 +1203,11 @@ pub(crate) fn create_provider(
             ))
         }
         "mock" => {
-            if std::env::var_os("SNED_MOCK_APPROVAL_BACKPRESSURE").is_some() {
+            if std::env::var_os("SNED_MOCK_APPROVAL_SCALAR_COMMAND").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::scalar_command_approval_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_APPROVAL_BACKPRESSURE").is_some() {
                 Arc::new(crate::providers::Providers::Mock(
                     crate::providers::mock::MockProvider::approval_under_backpressure_scenario(),
                 ))
