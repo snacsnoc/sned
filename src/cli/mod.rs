@@ -1242,13 +1242,42 @@ pub(crate) fn create_provider(
     Ok(provider)
 }
 
-fn load_skills() -> Vec<crate::core::context::SkillMetadata> {
+fn load_skills(workspace_root: &std::path::Path) -> Vec<crate::core::context::SkillMetadata> {
     use crate::core::context::{discover_skills, get_available_skills};
 
-    std::env::current_dir()
-        .ok()
-        .map(|cwd| get_available_skills(discover_skills(&cwd)))
-        .unwrap_or_default()
+    get_available_skills(discover_skills(workspace_root))
+}
+
+fn validate_workspace_root(
+    workspace_root: std::path::PathBuf,
+) -> anyhow::Result<(std::path::PathBuf, String)> {
+    if !workspace_root.is_absolute() {
+        anyhow::bail!(
+            "Unable to determine workspace root: expected an absolute path, got '{}'. Start sned from an existing directory or pass --cwd <valid-directory>.",
+            workspace_root.display()
+        );
+    }
+
+    let workspace_root_str = workspace_root
+        .to_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unable to determine workspace root: path is not valid UTF-8. Start sned from an existing directory or pass --cwd <valid-directory>."
+            )
+        })?
+        .to_string();
+
+    Ok((workspace_root, workspace_root_str))
+}
+
+fn current_workspace_root() -> anyhow::Result<(std::path::PathBuf, String)> {
+    let workspace_root = std::env::current_dir().map_err(|err| {
+        anyhow::anyhow!(
+            "Unable to determine workspace root: {err}. Start sned from an existing directory or pass --cwd <valid-directory>."
+        )
+    })?;
+
+    validate_workspace_root(workspace_root)
 }
 
 struct RulesContext {
@@ -1412,6 +1441,7 @@ async fn build_task_components(
     if let Some(ref cwd) = task_opts.cwd {
         std::env::set_current_dir(cwd)?;
     }
+    let (workspace_root, workspace_root_str) = current_workspace_root()?;
 
     let symbol_index_mode = symbol_index_mode_from_env()?;
 
@@ -1429,18 +1459,12 @@ async fn build_task_components(
     let task_id = if let Some(id) = root_opts.task_id.clone() {
         id
     } else if root_opts.continue_task {
-        let cwd = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .ok_or_else(|| {
-                anyhow::anyhow!("--continue requires a valid UTF-8 current directory")
-            })?;
         state_manager
-            .get_most_recent_task_for_workspace(&cwd)
+            .get_most_recent_task_for_workspace(&workspace_root_str)
             .map(|h| h.id)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "No previous task found for workspace '{cwd}'. \
+                    "No previous task found for workspace '{workspace_root_str}'. \
                      Start a new task without --continue, or use --taskId to specify one."
                 )
             })?
@@ -1506,32 +1530,24 @@ async fn build_task_components(
     let available_cores = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from));
 
-    let skills = load_skills();
+    let skills = load_skills(&workspace_root);
     let enable_parallel_tool_calling = state_manager
         .get_global_state_key::<bool>(
             crate::storage::state_manager::GlobalStateKey::EnableParallelToolCalling,
         )
         .unwrap_or(false);
 
-    let (agents_rules, cursor_rules_file, cursor_rules_dir, windsurf_rules) =
-        if let Ok(cwd_path) = std::env::current_dir() {
-            let rules = load_rules(&cwd_path, &state_manager);
-            (
-                rules.agents_rules,
-                rules.cursor_rules_file,
-                rules.cursor_rules_dir,
-                rules.windsurf_rules,
-            )
-        } else {
-            (None, None, None, None)
-        };
+    let rules = load_rules(&workspace_root, &state_manager);
+    let (agents_rules, cursor_rules_file, cursor_rules_dir, windsurf_rules) = (
+        rules.agents_rules,
+        rules.cursor_rules_file,
+        rules.cursor_rules_dir,
+        rules.windsurf_rules,
+    );
 
     let system_prompt_context = SystemPromptContext {
-        cwd,
+        cwd: Some(workspace_root_str.clone()),
         model_id: task_opts.model.clone(),
         active_shell_path: shell_path,
         active_shell_type: shell_type,
@@ -1547,27 +1563,23 @@ async fn build_task_components(
     };
 
     let task_storage = crate::storage::task_storage::TaskStorage::new(&task_id)?;
-    let cwd_str = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| ".".to_string());
     let is_new_task = !root_opts.continue_task && !has_task_id;
     if is_new_task {
-        let _ = task_storage.create_initial_metadata(&cwd_str, None);
+        let _ = task_storage.create_initial_metadata(&workspace_root_str, None);
     }
 
     let symbol_index_service = Arc::new(std::sync::Mutex::new(build_symbol_index_service(
-        cwd_str.clone(),
+        workspace_root_str.clone(),
         symbol_index_mode,
     )));
 
-    let context_loader = crate::core::context::ContextLoader::new(cwd_str.clone())
+    let context_loader = crate::core::context::ContextLoader::new(workspace_root_str.clone())
         .with_symbol_index_service(Arc::clone(&symbol_index_service));
     let approval_manager = Arc::new(tokio::sync::Mutex::new(
         crate::core::approval::ApprovalManager::new()
             .with_yolo(task_opts.yolo)
             .with_auto_approve_all(task_opts.auto_approve_all)
-            .with_workspace_root(cwd_str.clone()),
+            .with_workspace_root(workspace_root_str.clone()),
     ));
 
     let registry = build_tool_registry(
@@ -1580,7 +1592,7 @@ async fn build_task_components(
     let checkpoint_mgr = crate::core::checkpoints::TaskCheckpointManager::new(
         task_id,
         config.enable_checkpoints,
-        &cwd_str,
+        &workspace_root_str,
     );
 
     Ok(TaskComponents {
@@ -1765,6 +1777,14 @@ mod tests {
     use clap::Parser;
     use std::sync::Mutex;
     static PROVIDER_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_validate_workspace_root_rejects_relative_path() {
+        let err = validate_workspace_root(std::path::PathBuf::from("."))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unable to determine workspace root"));
+    }
 
     #[test]
     fn parse_task_subcommand() {

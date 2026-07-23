@@ -274,6 +274,13 @@ pub fn resolve_sanitized_path(
 ) -> Result<std::path::PathBuf, ToolError> {
     use std::path::{Component, Path};
 
+    if !workspace_root.is_absolute() {
+        return Err(ToolError::InvalidInput(format!(
+            "Workspace root must be an absolute path: {}",
+            workspace_root.display()
+        )));
+    }
+
     let path = Path::new(path);
 
     // Resolve against workspace root, allowing absolute paths within the workspace
@@ -529,6 +536,13 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Absolute paths outside workspace are not allowed"));
+    }
+
+    #[test]
+    fn test_resolve_sanitized_path_rejects_relative_workspace_root() {
+        let result = resolve_sanitized_path(std::path::Path::new("."), "AGENTS.md");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Workspace root must be an absolute path"));
     }
 
     #[test]
