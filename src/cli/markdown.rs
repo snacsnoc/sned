@@ -5,7 +5,7 @@
 //! converts that markdown into a sequence of styled lines suitable for
 //! the Task Completed box.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -163,16 +163,17 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                         }
                     }
                 }
-                Tag::Heading { level, .. } => {
-                    let prefix_marker = match level {
-                        HeadingLevel::H1 => "# ",
-                        HeadingLevel::H2 => "## ",
-                        HeadingLevel::H3 => "### ",
-                        HeadingLevel::H4 => "#### ",
-                        HeadingLevel::H5 => "##### ",
-                        HeadingLevel::H6 => "###### ",
-                    };
-                    pending_list_prefix = Some(prefix_marker.to_string());
+                Tag::Heading { level: _, .. } => {
+                    if !current_text.is_empty() || !current_spans.is_empty() {
+                        flush_line(
+                            &mut out,
+                            &mut current_text,
+                            &mut current_spans,
+                            *is_first_line,
+                            prefix,
+                        );
+                        *is_first_line = false;
+                    }
                     style_stack.push(style_stack.last().unwrap().add_modifier(Modifier::BOLD));
                 }
                 Tag::Strong => {
@@ -181,7 +182,7 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                 Tag::Emphasis => {
                     style_stack.push(style_stack.last().unwrap().add_modifier(Modifier::ITALIC));
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     flush_line(
                         &mut out,
                         &mut current_text,
@@ -191,6 +192,19 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                     );
                     *is_first_line = false;
                     in_code_block = true;
+                    let label = match kind {
+                        CodeBlockKind::Fenced(language) if !language.is_empty() => {
+                            format!(" {language} ")
+                        }
+                        CodeBlockKind::Fenced(_) | CodeBlockKind::Indented => " code ".to_string(),
+                    };
+                    out.push(Line::from(Span::styled(
+                        label,
+                        Style::default()
+                            .fg(crate::cli::tui::theme::PROMPT_FG)
+                            .add_modifier(Modifier::BOLD)
+                            .bg(crate::cli::tui::theme::BORDER_FG),
+                    )));
                 }
                 Tag::Item => {
                     // Flush any accumulated spans from the previous item.
@@ -252,6 +266,10 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
+                    out.push(Line::from(Span::styled(
+                        "─".repeat(60),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
                 }
                 TagEnd::Item | TagEnd::BlockQuote => {
                     pending_list_prefix = None;
@@ -264,7 +282,6 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
             Event::Text(t) => {
                 let piece = t.into_string();
                 if in_code_block {
-                    // Code block lines: emit each line as a dim, indented span.
                     flush_text(&mut out, &mut current_text, &mut current_spans);
                     for (i, line) in piece.split('\n').enumerate() {
                         if i > 0 {
@@ -277,11 +294,9 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                             );
                             *is_first_line = false;
                         }
-                        if !current_spans.is_empty() {
-                            // Continue building current line
-                        }
                         let style = Style::default().add_modifier(Modifier::DIM);
-                        current_spans.push(Span::styled(format!("    {line}"), style));
+                        current_spans.push(Span::styled("│   ", style));
+                        current_spans.push(Span::styled(line.to_string(), style));
                     }
                 } else if in_table {
                     // Strip pipe characters and alignment row markers.
@@ -337,7 +352,7 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                 );
                 *is_first_line = false;
                 out.push(Line::from(Span::styled(
-                    "─".repeat(40),
+                    "─ ◇ ─",
                     Style::default().add_modifier(Modifier::DIM),
                 )));
             }
@@ -432,13 +447,36 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_renders_as_indented_dim_lines() {
+    fn fenced_code_block_renders_as_labeled_dim_container() {
         let md = "```\nlet x = 1;\nlet y = 2;\n```";
         let lines = render_completion_markdown("🚀 ", md);
         let text = collect_text(&lines);
         assert!(text.contains("let x = 1;"), "got: {}", text);
         assert!(text.contains("let y = 2;"), "got: {}", text);
-        assert!(text.contains("    "), "expected indentation, got: {}", text);
+        assert!(text.contains(" code "), "expected code label, got: {}", text);
+        assert!(text.contains("│   "), "expected code border, got: {}", text);
+        assert!(text.contains(&"─".repeat(60)), "expected bottom border, got: {}", text);
+    }
+
+    #[test]
+    fn fenced_code_block_uses_language_label() {
+        let lines = render_completion_markdown("🚀 ", "```rust\nlet x = 1;\n```");
+        assert!(collect_text(&lines).contains(" rust "));
+    }
+
+    #[test]
+    fn headings_are_bold_standalone_lines_without_markers() {
+        let lines = render_completion_markdown("", "before\n\n## heading");
+        let heading_index = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content == "heading"))
+            .expect("heading line");
+        assert!(heading_index > 0, "heading must follow the paragraph: {lines:?}");
+        assert!(lines[heading_index]
+            .spans
+            .iter()
+            .any(|span| span.content == "heading" && span.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(!collect_text(&lines).contains("## heading"));
     }
 
     #[test]

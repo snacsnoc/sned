@@ -77,6 +77,20 @@ pub enum BlockKind {
     Separator,
 }
 
+/// Accent styling applied to each non-separator transcript row at render time.
+fn block_kind_accent_style(kind: BlockKind) -> Style {
+    match kind {
+        BlockKind::Model => Style::default().fg(theme::ACCENT),
+        BlockKind::ToolHeader => Style::default().fg(theme::TOOL_CALL_FG),
+        BlockKind::ToolOutput | BlockKind::CommandOutput => Style::default().fg(theme::STATUS_FG),
+        BlockKind::CommandHeader => Style::default().fg(theme::INFO_FG),
+        BlockKind::Reasoning => Style::default().fg(theme::ACCENT).add_modifier(Modifier::DIM),
+        BlockKind::UserPrompt => Style::default().fg(theme::PROMPT_FG),
+        BlockKind::BlockingPrompt => Style::default().fg(theme::WARNING_FG),
+        BlockKind::Separator => Style::default().fg(theme::BORDER_FG),
+    }
+}
+
 use crate::cli::colors::spinner_frame;
 use crate::cli::output::{OutputEvent, OutputWriterArc};
 
@@ -698,7 +712,7 @@ impl App {
         let detail_rows = pending
             .lines
             .iter()
-            .map(|line| Self::output_row_visual_rows(Some(line), wrap_width))
+            .map(|line| Self::line_visual_rows(line, wrap_width))
             .sum::<usize>()
             .clamp(1, APPROVAL_PANEL_MAX_DETAIL_ROWS);
         (detail_rows + 3).min(u16::MAX as usize) as u16
@@ -870,7 +884,11 @@ impl App {
         } else if self.cached_wrap_width == Some(wrap_width) {
             // Hot path: keep the cached row count in sync for simple appends
             // so the next render does not need to rescan the whole transcript.
-            let added_rows = Self::line_visual_rows(self.output_lines.back().unwrap(), wrap_width)
+            let added_rows = Self::output_row_visual_rows(
+                Some(self.output_lines.back().unwrap()),
+                kind,
+                wrap_width,
+            )
                 .saturating_add(
                     previous_kind.is_some_and(|prev| Self::should_insert_separator(prev, kind))
                         as usize,
@@ -974,7 +992,9 @@ impl App {
                 .iter()
                 .skip(tail_start)
                 .take(visual_line_count)
-                .map(|line| Self::line_visual_rows(line, wrap_width))
+                .zip(self.output_line_kinds.iter().skip(tail_start))
+                .take(visual_line_count)
+                .map(|(line, kind)| Self::output_row_visual_rows(Some(line), *kind, wrap_width))
                 .sum();
             if let Some(prev_kind) = tail_start
                 .checked_sub(1)
@@ -2067,8 +2087,8 @@ impl App {
         let mut rendered_rows = 0usize;
 
         self.for_each_output_row(|line, kind| {
-            rendered_rows =
-                rendered_rows.saturating_add(Self::output_row_visual_rows(line, wrap_width));
+            rendered_rows = rendered_rows
+                .saturating_add(Self::output_row_visual_rows(line, kind, wrap_width));
             if kind == BlockKind::BlockingPrompt {
                 tail_row = Some(rendered_rows);
             }
@@ -2091,6 +2111,14 @@ impl App {
     }
 
     fn line_visual_rows(line: &Line<'_>, wrap_width: usize) -> usize {
+        Self::line_visual_rows_with_extra_width(line, wrap_width, 0)
+    }
+
+    fn line_visual_rows_with_extra_width(
+        line: &Line<'_>,
+        wrap_width: usize,
+        extra_width: usize,
+    ) -> usize {
         if wrap_width == 0 {
             return 1;
         }
@@ -2103,7 +2131,8 @@ impl App {
             .spans
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum::<usize>();
+            .sum::<usize>()
+            .saturating_add(extra_width);
         width.max(1).div_ceil(wrap_width)
     }
 
@@ -2148,13 +2177,13 @@ impl App {
         let mut end_idx = 0usize;
 
         let mut done = false;
-        self.for_each_output_row(|line, _kind| {
+        self.for_each_output_row(|line, kind| {
             if done {
                 return;
             }
             let idx = expanded_len;
             expanded_len = expanded_len.saturating_add(1);
-            let rows = Self::output_row_visual_rows(line, wrap_width);
+            let rows = Self::output_row_visual_rows(line, kind, wrap_width);
             let rows_after = rows_before.saturating_add(rows);
 
             if start_idx == usize::MAX && rows_after > target_start {
@@ -2194,9 +2223,9 @@ impl App {
 
     fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
         let mut output_rows = 0usize;
-        self.for_each_output_row(|line, _| {
+        self.for_each_output_row(|line, kind| {
             output_rows =
-                output_rows.saturating_add(Self::output_row_visual_rows(line, wrap_width));
+                output_rows.saturating_add(Self::output_row_visual_rows(line, kind, wrap_width));
         });
         // Completion box uses the same wrap width (only borders, no gutter).
         let completion_rows: usize = self
@@ -2230,20 +2259,38 @@ impl App {
         }
     }
 
-    fn output_row_visual_rows(line: Option<&Line<'static>>, wrap_width: usize) -> usize {
+    fn output_row_visual_rows(
+        line: Option<&Line<'static>>,
+        kind: BlockKind,
+        wrap_width: usize,
+    ) -> usize {
         match line {
-            Some(line) => Self::line_visual_rows(line, wrap_width),
+            Some(line) => {
+                let accent_width = usize::from(kind != BlockKind::Separator);
+                Self::line_visual_rows_with_extra_width(line, wrap_width, accent_width)
+            }
             None => 1,
         }
+    }
+
+    fn output_row_for_render(line: Option<&Line<'static>>, kind: BlockKind) -> Line<'static> {
+        let mut line = line.cloned().unwrap_or_else(|| Line::from(""));
+        if kind != BlockKind::Separator {
+            line.spans.insert(
+                0,
+                Span::styled("│", block_kind_accent_style(kind)),
+            );
+        }
+        line
     }
 
     fn collect_output_rows_range(&self, start_idx: usize, take_count: usize) -> Vec<Line<'static>> {
         let end_idx = start_idx.saturating_add(take_count);
         let mut expanded_idx = 0usize;
         let mut visible_lines = Vec::with_capacity(take_count);
-        self.for_each_output_row(|line, _| {
+        self.for_each_output_row(|line, kind| {
             if expanded_idx >= start_idx && expanded_idx < end_idx {
-                visible_lines.push(line.cloned().unwrap_or_else(|| Line::from("")));
+                visible_lines.push(Self::output_row_for_render(line, kind));
             }
             expanded_idx = expanded_idx.saturating_add(1);
         });
@@ -2428,7 +2475,7 @@ impl App {
         let wrap_width = detail_area.width.max(1) as usize;
         let total_rows = lines
             .iter()
-            .map(|line| Self::output_row_visual_rows(Some(line), wrap_width))
+            .map(|line| Self::line_visual_rows(line, wrap_width))
             .sum::<usize>();
         let viewport_rows = detail_area.height as usize;
         let max_scroll = total_rows.saturating_sub(viewport_rows);
@@ -3131,6 +3178,49 @@ mod tests {
             app.push_plain(format!("line {}", index));
         }
         app
+    }
+
+    #[test]
+    fn collect_output_rows_range_keeps_accented_rows_aligned() {
+        let mut app = App::new();
+        app.push_output_with_kind(Line::from("model"), BlockKind::Model);
+        app.push_output_with_kind(Line::from("separator"), BlockKind::Separator);
+        app.push_output_with_kind(Line::from("tool"), BlockKind::ToolOutput);
+
+        let rows = app.collect_output_rows_range(0, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].spans[0].content, "│");
+        assert_eq!(rows[0].spans[0].style.fg, Some(theme::ACCENT));
+        assert_eq!(rows[1].spans[0].content, "separator");
+        assert_eq!(rows[2].spans[0].content, "│");
+        assert_eq!(rows[2].spans[0].style.fg, Some(theme::STATUS_FG));
+
+        let line = Line::from("1234567890");
+        assert_eq!(
+            App::output_row_visual_rows(Some(&line), BlockKind::Model, 10),
+            2
+        );
+    }
+
+    #[test]
+    fn block_kind_accent_styles_match_theme() {
+        assert_eq!(block_kind_accent_style(BlockKind::Model).fg, Some(theme::ACCENT));
+        assert_eq!(
+            block_kind_accent_style(BlockKind::ToolHeader).fg,
+            Some(theme::TOOL_CALL_FG)
+        );
+        assert_eq!(
+            block_kind_accent_style(BlockKind::CommandHeader).fg,
+            Some(theme::INFO_FG)
+        );
+        assert_eq!(
+            block_kind_accent_style(BlockKind::UserPrompt).fg,
+            Some(theme::PROMPT_FG)
+        );
+        assert_eq!(
+            block_kind_accent_style(BlockKind::BlockingPrompt).fg,
+            Some(theme::WARNING_FG)
+        );
     }
 
     fn rendered_rows(buffer: &Buffer) -> Vec<String> {
