@@ -390,6 +390,7 @@ pub(crate) enum CommandApprovalScope {
     GitSubcommand(String),
     SedReadOnly,
     FindReadOnly,
+    ReadOnlyPipeline(Vec<String>),
 }
 
 impl CommandApprovalScope {
@@ -399,6 +400,9 @@ impl CommandApprovalScope {
             Self::GitSubcommand(subcommand) => format!("git {subcommand}"),
             Self::SedReadOnly => "read-only sed".to_string(),
             Self::FindReadOnly => "read-only find".to_string(),
+            Self::ReadOnlyPipeline(stages) => {
+                format!("read-only {} pipeline", stages.join(" | "))
+            }
         }
     }
 }
@@ -410,6 +414,7 @@ impl std::fmt::Display for CommandApprovalScope {
             Self::GitSubcommand(subcommand) => write!(f, "git:{subcommand}"),
             Self::SedReadOnly => f.write_str("sed:read-only"),
             Self::FindReadOnly => f.write_str("find:read-only"),
+            Self::ReadOnlyPipeline(stages) => write!(f, "pipeline:{}", stages.join("|")),
         }
     }
 }
@@ -441,6 +446,10 @@ pub(crate) fn command_approval_scopes(
 }
 
 fn command_approval_scope(command: &str) -> Option<CommandApprovalScope> {
+    if let Some(scope) = read_only_pipeline_scope(command) {
+        return Some(scope);
+    }
+
     if !is_simple_scope_command(command) {
         return None;
     }
@@ -472,6 +481,91 @@ fn command_approval_scope(command: &str) -> Option<CommandApprovalScope> {
         "find" => Some(CommandApprovalScope::FindReadOnly),
         _ => Some(CommandApprovalScope::Binary(base)),
     }
+}
+
+fn read_only_pipeline_scope(command: &str) -> Option<CommandApprovalScope> {
+    let stages = split_read_only_pipeline(command)?;
+    if stages.len() < 2 {
+        return None;
+    }
+
+    let mut programs = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let program = stage.split_ascii_whitespace().next()?.to_ascii_lowercase();
+        if !is_bare_command_name(&program)
+            || !matches!(
+                program.as_str(),
+                "cat" | "grep" | "head" | "ls" | "tail" | "wc"
+            )
+        {
+            return None;
+        }
+        programs.push(program);
+    }
+
+    Some(CommandApprovalScope::ReadOnlyPipeline(programs))
+}
+
+fn split_read_only_pipeline(command: &str) -> Option<Vec<&str>> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+
+    let mut stages = Vec::new();
+    let mut stage_start = 0;
+    let mut quote = None;
+    let bytes = command.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(b'\'') => {
+                if byte == b'\'' {
+                    quote = None;
+                }
+            }
+            Some(b'"') => match byte {
+                b'"' => quote = None,
+                b'$' | b'`' | b'\n' | b'\r' => return None,
+                b'\\' => {
+                    index += 1;
+                    if index == bytes.len() || matches!(bytes[index], b'\n' | b'\r') {
+                        return None;
+                    }
+                }
+                _ => {}
+            },
+            Some(_) => return None,
+            None => match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'|' => {
+                    let stage = command[stage_start..index].trim();
+                    if stage.is_empty() {
+                        return None;
+                    }
+                    stages.push(stage);
+                    stage_start = index + 1;
+                }
+                b'&' | b';' | b'<' | b'>' | b'$' | b'`' | b'\\' | b'\n' | b'\r' | b'(' | b')'
+                | b'{' | b'}' | b'*' | b'?' => return None,
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+
+    let stage = command[stage_start..].trim();
+    if stage.is_empty() {
+        return None;
+    }
+    stages.push(stage);
+    Some(stages)
 }
 
 fn is_simple_scope_command(command: &str) -> bool {
@@ -1990,6 +2084,35 @@ mod tests {
     }
 
     #[test]
+    fn test_command_approval_scopes_reuse_read_only_pipelines() {
+        let grep_head_one = "grep -n 'def load_postgres_config\\|class PostgresConfig' postgres_analytics.py | head -50";
+        let grep_head_two =
+            "grep -n '^__all__\\|from dataclasses' postgres_analytics.py | head -20";
+        let ls_head = "ls clawbot_forensics/.venv/bin/ | head -30";
+
+        let grep_head_scope = command_approval_scopes(&serde_json::json!({
+            "command": grep_head_one
+        }))
+        .expect("read-only grep pipeline should derive a reusable scope");
+        let grep_head_scope_with_new_arguments = command_approval_scopes(&serde_json::json!({
+            "command": grep_head_two
+        }))
+        .expect("read-only grep pipeline should derive a reusable scope");
+        let ls_head_scope = command_approval_scopes(&serde_json::json!({
+            "command": ls_head
+        }))
+        .expect("read-only ls pipeline should derive a reusable scope");
+
+        assert_eq!(grep_head_scope, grep_head_scope_with_new_arguments);
+        assert_ne!(grep_head_scope, ls_head_scope);
+
+        let mut manager = ApprovalManager::new();
+        manager.auto_approve_command(grep_head_one, Some(&grep_head_scope));
+        assert!(manager.command_scopes_are_approved(&grep_head_scope_with_new_arguments));
+        assert!(!manager.command_scopes_are_approved(&ls_head_scope));
+    }
+
+    #[test]
     fn test_command_approval_scopes_keep_argument_sensitive_commands_distinct() {
         assert_eq!(
             command_approval_scopes(&serde_json::json!({"command": "git status --short"})),
@@ -2030,12 +2153,14 @@ mod tests {
     #[test]
     fn test_command_approval_scopes_reject_complex_shell_and_scripts() {
         for command in [
-            "cat file1 | cat",
             "cat file1 > output.txt",
+            "cat file1 | tee output.txt",
+            "cat file1 | head -1 && rm output.txt",
             "cat $(pwd)",
             "sh -c cat file1",
             "/bin/cat file1",
             "cat 'file one'",
+            "PYTHONPATH=. python -c \"print('ok')\" | tail -10",
         ] {
             assert!(command_approval_scopes(&serde_json::json!({"command": command})).is_none());
         }
@@ -2081,11 +2206,20 @@ mod tests {
 
         let exact_choices = approval_choices_for_tool(
             "execute_command",
-            &serde_json::json!({"command": "cat file1 | cat"}),
+            &serde_json::json!({"command": "cat file1 > output.txt"}),
         );
         assert_eq!(
             exact_choices[2].label(),
             "Always approve this exact command this session"
+        );
+
+        let pipeline_choices = approval_choices_for_tool(
+            "execute_command",
+            &serde_json::json!({"command": "grep -n 'pattern' file | head -20"}),
+        );
+        assert_eq!(
+            pipeline_choices[2].label(),
+            "Always approve safe read-only grep | head pipeline commands this session"
         );
     }
 

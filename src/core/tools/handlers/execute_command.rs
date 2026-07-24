@@ -132,11 +132,12 @@ impl ExecuteCommandHandler {
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         if session_command_scope_approved {
-            for command in &commands {
-                if let Err(e) = self.safety_checker.is_structurally_safe_for_scope(command) {
-                    tracing::warn!(command = %command, reason = %e, "command rejected by scoped approval safety checker");
-                    return Err(anyhow::anyhow!("{e}"));
-                }
+            let scope_params = serde_json::json!({"commands": &commands});
+            if crate::core::approval::command_approval_scopes(&scope_params).is_none() {
+                tracing::warn!(commands = ?commands, "command rejected by scoped approval safety checker");
+                return Err(anyhow::anyhow!(
+                    "command no longer qualifies for scoped approval"
+                ));
             }
         }
 
@@ -1093,7 +1094,11 @@ mod tests {
             )
             .await;
         let error = result.expect_err("scoped approval must retain structural safety checks");
-        assert!(error.to_string().contains("permanently denied"));
+        assert!(
+            error
+                .to_string()
+                .contains("no longer qualifies for scoped approval")
+        );
     }
 
     #[tokio::test]

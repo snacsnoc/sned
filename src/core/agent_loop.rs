@@ -6491,7 +6491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_command_scope_approval_skips_noninteractive_prompt() {
+    async fn test_execute_command_pipeline_scope_approval_skips_noninteractive_prompt() {
         use crate::core::approval::{ApprovalManager, command_approval_scopes};
         use crate::core::tools::ToolRegistry;
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
@@ -6500,13 +6500,14 @@ mod tests {
         let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
 
-        let params = serde_json::json!({"command": "cat Cargo.toml"});
-        let scopes = command_approval_scopes(&params).expect("cat should receive a reusable scope");
+        let params = serde_json::json!({"command": "cat Cargo.toml | head -1"});
+        let scopes =
+            command_approval_scopes(&params).expect("pipeline should receive a reusable scope");
         let approval_manager = Arc::new(tokio::sync::Mutex::new(ApprovalManager::new()));
         approval_manager
             .lock()
             .await
-            .auto_approve_command("cat Cargo.toml", Some(&scopes));
+            .auto_approve_command("cat Cargo.toml | head -1", Some(&scopes));
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
@@ -6562,7 +6563,7 @@ mod tests {
         };
         assert!(
             text.contains("[package]"),
-            "scope reuse should execute cat: {text}"
+            "scope reuse should execute the pipeline: {text}"
         );
 
         unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
