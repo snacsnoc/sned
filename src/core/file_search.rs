@@ -1,8 +1,9 @@
 use ignore::WalkBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock};
 
 /// Cache entry with timestamp for TTL-based invalidation
 #[derive(Debug, Clone)]
@@ -16,13 +17,20 @@ struct FileSearchCacheEntry {
 static FILE_SEARCH_CACHE: LazyLock<Arc<RwLock<HashMap<String, FileSearchCacheEntry>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::with_capacity(4))));
 
-const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Workspace indexes currently being refreshed. A slow walk must not trigger a
+/// second full traversal for every keystroke while the first one is still running.
+static FILE_SEARCH_REFRESHING: LazyLock<Arc<Mutex<HashSet<String>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(HashSet::new())));
+
+const CACHE_TTL: Duration = Duration::from_secs(5);
+const WORKSPACE_INDEX_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Clear the file search cache - used for testing
 #[cfg(test)]
 pub async fn clear_file_search_cache() {
     let mut cache = FILE_SEARCH_CACHE.write().await;
     cache.clear();
+    FILE_SEARCH_REFRESHING.lock().await.clear();
 }
 
 #[derive(Debug, Clone)]
@@ -147,89 +155,73 @@ fn dirs_to_results(dir_set: &std::collections::HashSet<String>) -> Vec<FileSearc
         .collect()
 }
 
-pub async fn list_workspace_files(
-    workspace_path: &str,
-    limit: usize,
-) -> std::io::Result<Vec<FileSearchResult>> {
-    let workspace_path_str = workspace_path.to_string();
+fn collect_workspace_file_index(workspace: PathBuf) -> Vec<FileSearchResult> {
+    let mut files = Vec::new();
+    let mut dir_set = HashSet::new();
 
-    // Check cache first
-    if let Some(entry) = FILE_SEARCH_CACHE.read().await.get(&workspace_path_str)
-        && entry.timestamp.elapsed() < CACHE_TTL
-    {
-        // Cache hit - return cached results (filtered by limit)
-        return Ok(entry.results.iter().take(limit).cloned().collect());
+    let walker = WalkBuilder::new(&workspace)
+        .hidden(false)
+        .follow_links(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            if name.starts_with('.') && !name.starts_with(".sned") {
+                return false;
+            }
+            if e.file_type().is_some_and(|t| t.is_dir()) {
+                return !is_excluded_dir(&name);
+            }
+            // Filter out database files
+            if name.ends_with(".db") || name.ends_with(".sqlite") || name.ends_with(".sqlite3") {
+                return false;
+            }
+            true
+        })
+        .build();
+
+    for entry in walker.flatten() {
+        let file_type = if entry.file_type().is_some_and(|t| t.is_dir()) {
+            FileType::Folder
+        } else {
+            FileType::File
+        };
+
+        let relative = entry.path().strip_prefix(&workspace).map_or_else(
+            |_| entry.path().to_string_lossy().to_string(),
+            |p: &std::path::Path| p.to_string_lossy().to_string(),
+        );
+
+        if file_type == FileType::File {
+            let label = Path::new(&relative)
+                .file_name()
+                .map_or_else(|| relative.clone(), |n| n.to_string_lossy().to_string());
+            files.push(FileSearchResult {
+                path: relative.clone(),
+                file_type: FileType::File,
+                label,
+            });
+            add_parent_dirs(&relative, &mut dir_set);
+        } else {
+            dir_set.insert(relative);
+        }
     }
 
-    // Cache miss or expired - run blocking WalkBuilder iteration
-    let workspace = PathBuf::from(workspace_path);
-    let results = tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
-        let mut dir_set = std::collections::HashSet::new();
+    let mut all_results = files;
+    all_results.extend(dirs_to_results(&dir_set));
+    all_results
+}
 
-        let walker = WalkBuilder::new(&workspace)
-            .hidden(false)
-            .follow_links(false)
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                if name.starts_with('.') && !name.starts_with(".sned") {
-                    return false;
-                }
-                if e.file_type().is_some_and(|t| t.is_dir()) {
-                    return !is_excluded_dir(&name);
-                }
-                // Filter out database files
-                if name.ends_with(".db") || name.ends_with(".sqlite") || name.ends_with(".sqlite3")
-                {
-                    return false;
-                }
-                true
-            })
-            .build();
+async fn refresh_workspace_file_index(
+    workspace_path: String,
+    workspace: PathBuf,
+) -> std::io::Result<Vec<FileSearchResult>> {
+    let results = tokio::task::spawn_blocking(move || collect_workspace_file_index(workspace))
+        .await
+        .map_err(std::io::Error::other);
 
-        for entry in walker.flatten() {
-            if files.len() >= limit {
-                break;
-            }
-
-            let file_type = if entry.file_type().is_some_and(|t| t.is_dir()) {
-                FileType::Folder
-            } else {
-                FileType::File
-            };
-
-            let relative = entry.path().strip_prefix(&workspace).map_or_else(
-                |_| entry.path().to_string_lossy().to_string(),
-                |p: &std::path::Path| p.to_string_lossy().to_string(),
-            );
-
-            if file_type == FileType::File {
-                let label = Path::new(&relative)
-                    .file_name()
-                    .map_or_else(|| relative.clone(), |n| n.to_string_lossy().to_string());
-                files.push(FileSearchResult {
-                    path: relative.clone(),
-                    file_type: FileType::File,
-                    label,
-                });
-                add_parent_dirs(&relative, &mut dir_set);
-            } else {
-                dir_set.insert(relative);
-            }
-        }
-
-        let mut all_results = files;
-        all_results.extend(dirs_to_results(&dir_set));
-        all_results
-    })
-    .await
-    .map_err(std::io::Error::other)?;
-
-    // Update cache with full results (before limit applied)
-    {
+    if let Ok(results) = &results {
         let mut cache = FILE_SEARCH_CACHE.write().await;
         cache.insert(
-            workspace_path_str,
+            workspace_path.clone(),
             FileSearchCacheEntry {
                 results: results.clone(),
                 timestamp: std::time::Instant::now(),
@@ -237,7 +229,53 @@ pub async fn list_workspace_files(
         );
     }
 
-    Ok(results.into_iter().take(limit).collect())
+    FILE_SEARCH_REFRESHING.lock().await.remove(&workspace_path);
+    results
+}
+
+async fn workspace_file_index(workspace_path: &str) -> std::io::Result<Vec<FileSearchResult>> {
+    let workspace_path = workspace_path.to_string();
+    let cached = FILE_SEARCH_CACHE.read().await.get(&workspace_path).cloned();
+    if cached
+        .as_ref()
+        .is_some_and(|entry| entry.timestamp.elapsed() < CACHE_TTL)
+    {
+        return Ok(cached.expect("fresh cache entry").results);
+    }
+
+    let stale_results = cached.map(|entry| entry.results);
+    if !FILE_SEARCH_REFRESHING
+        .lock()
+        .await
+        .insert(workspace_path.clone())
+    {
+        return Ok(stale_results.unwrap_or_default());
+    }
+
+    let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+    let refresh_path = workspace_path.clone();
+    tokio::spawn(async move {
+        let results =
+            refresh_workspace_file_index(refresh_path, PathBuf::from(&workspace_path)).await;
+        let _ = complete_tx.send(results);
+    });
+
+    match tokio::time::timeout(WORKSPACE_INDEX_TIMEOUT, complete_rx).await {
+        Ok(Ok(results)) => results,
+        Ok(Err(_)) => Ok(stale_results.unwrap_or_default()),
+        Err(_) => Ok(stale_results.unwrap_or_default()),
+    }
+}
+
+pub async fn list_workspace_files(
+    workspace_path: &str,
+    limit: usize,
+) -> std::io::Result<Vec<FileSearchResult>> {
+    Ok(workspace_file_index(workspace_path)
+        .await?
+        .into_iter()
+        .take(limit)
+        .collect())
 }
 
 #[cfg(test)]
@@ -310,7 +348,7 @@ pub async fn search_workspace_files(
     workspace_path: &str,
     limit: usize,
 ) -> Vec<FileSearchResult> {
-    let Ok(items) = list_workspace_files(workspace_path, 5000).await else {
+    let Ok(items) = workspace_file_index(workspace_path).await else {
         return Vec::new();
     };
 
@@ -338,38 +376,45 @@ pub async fn search_workspace_files(
 
 #[must_use]
 pub fn extract_mention_query(text: &str) -> MentionQuery {
-    let Some(last_at) = text.rfind('@') else {
-        return MentionQuery {
-            in_mention_mode: false,
-            query: String::new(),
-            at_index: -1,
-        };
-    };
+    extract_mention_query_at_cursor(text, text.len())
+}
 
-    if last_at > 0 {
-        let prev = text.as_bytes()[last_at - 1];
-        if !char::from_u32(prev as u32).is_some_and(char::is_whitespace) {
-            return MentionQuery {
-                in_mention_mode: false,
-                query: String::new(),
-                at_index: -1,
-            };
-        }
+#[must_use]
+pub fn extract_mention_query_at_cursor(text: &str, cursor_byte_offset: usize) -> MentionQuery {
+    let mut cursor = cursor_byte_offset.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
     }
 
-    let after_at = &text[last_at + 1..];
-    if after_at.contains(' ') {
-        return MentionQuery {
-            in_mention_mode: false,
-            query: String::new(),
-            at_index: -1,
-        };
+    let Some(last_at) = text[..cursor].rfind('@') else {
+        return inactive_mention_query();
+    };
+
+    if text[..last_at]
+        .chars()
+        .next_back()
+        .is_some_and(|previous| !previous.is_whitespace())
+    {
+        return inactive_mention_query();
+    }
+
+    let query = &text[last_at + 1..cursor];
+    if query.chars().any(char::is_whitespace) {
+        return inactive_mention_query();
     }
 
     MentionQuery {
         in_mention_mode: true,
-        query: after_at.to_string(),
+        query: query.to_string(),
         at_index: last_at as isize,
+    }
+}
+
+fn inactive_mention_query() -> MentionQuery {
+    MentionQuery {
+        in_mention_mode: false,
+        query: String::new(),
+        at_index: -1,
     }
 }
 
@@ -387,8 +432,10 @@ pub fn insert_mention(
     file_path: &str,
     file_type: FileType,
 ) -> (String, usize) {
-    let after_at = text[at_index..].find(' ');
-    let end = after_at.map_or(text.len(), |i| at_index + i);
+    let end = text[at_index..]
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(at_index + index))
+        .unwrap_or(text.len());
 
     let mut normalized = if file_path.starts_with('/') {
         file_path.to_string()
@@ -455,6 +502,18 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_mention_query_at_cursor_ignores_trailing_text() {
+        let text = "@file blahblah text";
+        let r = extract_mention_query_at_cursor(text, "@file".len());
+        assert!(r.in_mention_mode);
+        assert_eq!(r.query, "file");
+        assert_eq!(r.at_index, 0);
+
+        let r = extract_mention_query_at_cursor(text, text.len());
+        assert!(!r.in_mention_mode);
+    }
+
+    #[test]
     fn test_insert_mention_simple() {
         let (result, cursor_pos) = insert_mention("hello @", 6, "src/main.rs", FileType::File);
         assert_eq!(result, "hello @/src/main.rs ");
@@ -466,6 +525,12 @@ mod tests {
         let (result, cursor_pos) = insert_mention("hello @", 6, "/src/my file.rs", FileType::File);
         assert_eq!(result, "hello @\"/src/my file.rs\" ");
         assert_eq!(cursor_pos, 25); // after "@/src/my file.rs "
+    }
+
+    #[test]
+    fn test_insert_mention_preserves_text_after_tab_delimiter() {
+        let (result, _) = insert_mention("@file\ttrailing", 0, "src/main.rs", FileType::File);
+        assert_eq!(result, "@/src/main.rs trailing");
     }
 
     #[test]
@@ -725,6 +790,36 @@ mod tests {
 
         let results = search_workspace_files("", workspace.to_str().unwrap(), 5).await;
         assert_eq!(results.len(), 5, "Should respect limit");
+    }
+
+    #[tokio::test]
+    async fn test_search_workspace_files_indexes_paths_beyond_previous_cap() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        clear_file_search_cache().await;
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        for index in 0..5_001 {
+            fs::write(workspace.join(format!("file-{index:04}.rs")), "").unwrap();
+        }
+        fs::create_dir(workspace.join("clawbot_forensics_fast")).unwrap();
+
+        let preview = list_workspace_files(workspace.to_str().unwrap(), 5)
+            .await
+            .unwrap();
+        assert_eq!(preview.len(), 5);
+
+        let results =
+            search_workspace_files("clawbot_forensics_fast", workspace.to_str().unwrap(), 10)
+                .await;
+        assert!(
+            results.iter().any(|result| {
+                result.path == "clawbot_forensics_fast" && result.file_type == FileType::Folder
+            }),
+            "expected the directory in results: {results:?}"
+        );
     }
 
     #[tokio::test]

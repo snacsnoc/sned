@@ -497,6 +497,21 @@ fn clear_mention_search(app: &mut App, clear_results: bool) {
     }
 }
 
+fn textarea_cursor_byte_offset(lines: &[String], cursor: (usize, usize)) -> usize {
+    let (row, column) = cursor;
+    let preceding_lines = lines
+        .iter()
+        .take(row)
+        .map(|line| line.len().saturating_add(1))
+        .sum::<usize>();
+    let current_line = lines.get(row).map_or("", String::as_str);
+    let column_offset = current_line
+        .char_indices()
+        .nth(column)
+        .map_or(current_line.len(), |(index, _)| index);
+    preceding_lines.saturating_add(column_offset)
+}
+
 fn spawn_mention_search(app: &mut App, query: String) {
     let Some(tx) = app.mention_search_tx.clone() else {
         return;
@@ -1231,7 +1246,8 @@ async fn handle_key_event(
         && (key.code == KeyCode::Tab || key.code == KeyCode::Enter)
     {
         let text = app.input.lines().join("\n");
-        let mq = crate::core::file_search::extract_mention_query(&text);
+        let cursor = textarea_cursor_byte_offset(app.input.lines(), app.input.cursor());
+        let mq = crate::core::file_search::extract_mention_query_at_cursor(&text, cursor);
         if mq.in_mention_mode {
             let result = &app.picker_results[app.picker_index];
             let (new_text, cursor_pos) = crate::core::file_search::insert_mention(
@@ -1550,7 +1566,8 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    let mq = crate::core::file_search::extract_mention_query(&input_text);
+    let cursor = textarea_cursor_byte_offset(app.input.lines(), app.input.cursor());
+    let mq = crate::core::file_search::extract_mention_query_at_cursor(&input_text, cursor);
     if mq.in_mention_mode && !app.cwd.is_empty() {
         let query = mq.query;
         if !app.mention_search_active {
@@ -5200,6 +5217,56 @@ mod tests {
         assert_eq!(update.query, "");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_reopens_mention_picker_before_trailing_text()
+    -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        app.set_input_text_and_cursor("@file blahblah text", "@file".len());
+
+        for _ in 0..5 {
+            let action = handle_key_event(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+                &mut app,
+                &output_writer,
+                &state_handle,
+                "task-1",
+            )
+            .await?;
+            assert!(action.is_none());
+        }
+
+        for ch in "@next".chars() {
+            let action = handle_key_event(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+                &mut app,
+                &output_writer,
+                &state_handle,
+                "task-1",
+            )
+            .await?;
+            assert!(action.is_none());
+        }
+
+        assert!(
+            app.picker_active,
+            "picker should reopen for the new mention"
+        );
+        assert!(
+            app.mention_search_active,
+            "mention search should reactivate"
+        );
+        assert_eq!(app.mention_search_query, "next");
+        assert_eq!(app.input.lines().join("\n"), "@next blahblah text");
+
         Ok(())
     }
 
