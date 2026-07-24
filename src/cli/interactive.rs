@@ -2261,8 +2261,21 @@ async fn handle_cli_only_command(
             app.push_plain("Plan prompt should be handled by the main loop.");
         }
         CliOnlyCommand::PlanAbort => {
-            let sess = session.lock().await;
-            let sh = sess.agent_loop().await.state_handle();
+            if agent_busy.load(Ordering::Relaxed) {
+                app.push_styled(
+                    "Agent is busy. Cancel it before aborting the plan.",
+                    Style::default().fg(theme::WARNING_FG),
+                );
+                return Ok(false);
+            }
+
+            let Some(sh) = state_handle.lock().await.clone() else {
+                app.push_styled(
+                    "Plan state is unavailable. Try again.",
+                    Style::default().fg(theme::WARNING_FG),
+                );
+                return Ok(false);
+            };
             let mut state = sh.lock().await;
             // Plan mode can be entered via `/plan <prompt>` (or `--plan`)
             // before any plan_state is created, so the abort path must
@@ -2275,7 +2288,10 @@ async fn handle_cli_only_command(
             state.last_injected_plan_state_hash = None;
             state.strict_plan_mode_enabled = true;
             drop(state);
-            sess.agent_loop()
+            session
+                .lock()
+                .await
+                .agent_loop()
                 .await
                 .set_mode(crate::core::agent_types::AgentMode::Act);
             app.mode = "ACT".to_string();
@@ -2293,8 +2309,40 @@ async fn handle_cli_only_command(
         | CliOnlyCommand::PlanComplete
         | CliOnlyCommand::PlanFail => {
             use crate::cli::slash_commands::PlanSubcommand;
-            let sess = session.lock().await;
-            let sh = sess.agent_loop().await.state_handle();
+
+            if matches!(cli_cmd, CliOnlyCommand::PlanApprove) && agent_busy.load(Ordering::Relaxed) {
+                app.push_styled(
+                    "Agent is busy. Wait for it to finish before approving the plan.",
+                    Style::default().fg(theme::WARNING_FG),
+                );
+                return Ok(false);
+            }
+
+            if agent_busy.load(Ordering::Relaxed)
+                && matches!(
+                    &cli_cmd,
+                    CliOnlyCommand::Plan(
+                        PlanSubcommand::Edit(_, _)
+                            | PlanSubcommand::Add(_, _)
+                            | PlanSubcommand::Remove(_)
+                            | PlanSubcommand::Replace(_)
+                    ) | CliOnlyCommand::PlanComplete
+                )
+            {
+                app.push_styled(
+                    "Agent is busy. Wait for it to finish or cancel it before changing the plan.",
+                    Style::default().fg(theme::WARNING_FG),
+                );
+                return Ok(false);
+            }
+
+            let Some(sh) = state_handle.lock().await.clone() else {
+                app.push_styled(
+                    "Plan state is unavailable. Try again.",
+                    Style::default().fg(theme::WARNING_FG),
+                );
+                return Ok(false);
+            };
             let mut state = sh.lock().await;
             if let Some(plan) = &mut state.plan_state {
                 match cli_cmd {
@@ -2444,18 +2492,16 @@ async fn handle_cli_only_command(
                                 app.push_plain(format!("Cannot approve plan: {e}"));
                                 return Ok(false);
                             }
+                            state.strict_plan_mode_enabled = false;
                             drop(state);
-                            {
-                                let state_handle = sess.agent_loop().await.state_handle();
-                                let mut state = state_handle.lock().await;
-                                state.strict_plan_mode_enabled = false;
-                            }
-                            sess.agent_loop()
+                            session
+                                .lock()
+                                .await
+                                .agent_loop()
                                 .await
                                 .set_mode(crate::core::agent_types::AgentMode::Act);
                             app.mode = "ACT".to_string();
                             app.update_placeholder();
-                            drop(sess);
                             app.push_plain(format!(
                                 "Plan approved. Starting from step {}/{}: {}",
                                 start_index + 1,
@@ -2520,24 +2566,25 @@ async fn handle_cli_only_command(
                                 .ok();
                             }
                             drop(state);
-                            drop(sess);
                             app.push_plain(format!(
                                 "Plan resumed at step {step_num}/{step_total}: {step_desc}"
                             ));
-                            // Spawn agent to resume plan execution
-                            let prompt =
-                                format!("Execute step {step_num}/{step_total}: {step_desc}");
-                            spawn_agent_task(
-                                session,
-                                &prompt,
-                                agent_busy,
-                                agent_done,
-                                agent_start_time,
-                                agent_task,
-                                output_writer.clone(),
-                            )
-                            .await?;
-                            app.agent_busy = true;
+                            if !agent_busy.load(Ordering::Relaxed) {
+                                // The agent is idle, so resume requires a new task.
+                                let prompt =
+                                    format!("Execute step {step_num}/{step_total}: {step_desc}");
+                                spawn_agent_task(
+                                    session,
+                                    &prompt,
+                                    agent_busy,
+                                    agent_done,
+                                    agent_start_time,
+                                    agent_task,
+                                    output_writer.clone(),
+                                )
+                                .await?;
+                                app.agent_busy = true;
+                            }
                         }
                     }
                     CliOnlyCommand::PlanComplete => {
@@ -3027,6 +3074,14 @@ async fn run_main_loop(
                                         ref prompt_text,
                                     ) = cli_cmd
                                     {
+                                        if agent_busy.load(Ordering::Relaxed) {
+                                            app.push_styled(
+                                                "Agent is busy. Wait for it to finish before starting a new plan.",
+                                                Style::default().fg(theme::WARNING_FG),
+                                            );
+                                            continue;
+                                        }
+
                                         // Clear old plan state and restore strict plan mode restrictions
                                         {
                                             let state_arc = state_handle.lock().await;
@@ -3047,27 +3102,19 @@ async fn run_main_loop(
                                         app.push_plain("Entering plan mode...");
                                         app.mode = "PLAN".to_string();
                                         app.update_placeholder();
-                                        // Spawn agent with the prompt
-                                        if agent_busy.load(Ordering::Relaxed) {
-                                            if let Some(qh) = queue_handle.lock().await.as_ref() {
-                                                qh.enqueue_text_message(prompt_text.clone()).await;
-                                                app.push_plain(
-                                                    "Agent is busy. Plan prompt queued.",
-                                                );
-                                            }
-                                        } else {
-                                            spawn_agent_task(
-                                                &session,
-                                                prompt_text,
-                                                &agent_busy,
-                                                &agent_done,
-                                                &agent_start_time,
-                                                &agent_task,
-                                                output_writer.clone(),
-                                            )
-                                            .await?;
-                                            app.agent_busy = true;
-                                        }
+                                        // The busy check above guarantees this will not wait on
+                                        // an AgentLoop currently held by another run.
+                                        spawn_agent_task(
+                                            &session,
+                                            prompt_text,
+                                            &agent_busy,
+                                            &agent_done,
+                                            &agent_start_time,
+                                            &agent_task,
+                                            output_writer.clone(),
+                                        )
+                                        .await?;
+                                        app.agent_busy = true;
                                         continue;
                                     }
 
@@ -5737,7 +5784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plan_replace_is_rejected_while_plan_is_running() -> anyhow::Result<()> {
+    async fn test_plan_replace_is_rejected_while_agent_is_busy() -> anyhow::Result<()> {
         use crate::cli::slash_commands::{CliOnlyCommand, PlanSubcommand};
         use crate::core::plan_state::{PlanState, PlanStepStatus};
 
@@ -5789,17 +5836,20 @@ mod tests {
             let mut plan =
                 PlanState::create_plan(vec!["Initial step".to_string(), "Second step".to_string()]);
             plan.approved = true;
+            // The worker has observed a pause, but its in-flight turn has not
+            // finished yet, so replacing steps would race its bookkeeping.
+            plan.paused = true;
             plan.current_step_index = 0;
             plan.steps[0].status = PlanStepStatus::Running;
             state.plan_state = Some(plan);
         }
 
         let mut app = App::new();
-        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_busy = Arc::new(AtomicBool::new(true));
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
-        let state_handle_slot = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(Arc::clone(&state_handle))));
         let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
@@ -5831,17 +5881,161 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
-                .contains("Cannot replace plan while plan is running")
+                .contains("Agent is busy. Wait for it to finish or cancel it before changing the plan.")
         }));
 
         let state = state_handle.lock().await;
         let plan = state.plan_state.as_ref().expect("plan should remain");
         assert!(plan.approved);
+        assert!(plan.paused);
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(plan.current_step_index, 0);
         assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
         assert_eq!(plan.steps[0].description, "Initial step");
         assert_eq!(plan.steps[1].description, "Second step");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_complete_is_rejected_while_agent_is_busy() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        use crate::core::plan_state::{PlanState, PlanStepStatus};
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let state_handle = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.state_handle()
+        };
+        {
+            let mut state = state_handle.lock().await;
+            let mut plan =
+                PlanState::create_plan(vec!["Initial step".to_string(), "Second step".to_string()]);
+            plan.approved = true;
+            plan.current_step_index = 0;
+            plan.steps[0].status = PlanStepStatus::Running;
+            state.plan_state = Some(plan);
+        }
+
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(Arc::clone(&state_handle))));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::PlanComplete,
+            "/plan complete",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Agent is busy. Wait for it to finish or cancel it before changing the plan.")
+        }));
+
+        let state = state_handle.lock().await;
+        let plan = state.plan_state.as_ref().expect("plan should remain");
+        assert!(!plan.complete);
+        assert_eq!(plan.current_step_index, 0);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_status_does_not_wait_for_running_agent_loop() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::{CliOnlyCommand, PlanSubcommand};
+        use tokio::time::{Duration, timeout};
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let (agent_loop, task_id, task_state) = {
+            let sess = session.lock().await;
+            let task_id = sess.agent_loop().await.task_id().to_string();
+            let task_state = sess.state_handle().await;
+            (Arc::clone(&sess.agent_loop), task_id, task_state)
+        };
+        let _running_agent = agent_loop.lock().await;
+
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(task_state)));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+
+        let should_exit = timeout(
+            Duration::from_millis(100),
+            handle_cli_only_command(
+                CliOnlyCommand::Plan(PlanSubcommand::Status),
+                "/plan",
+                &mut app,
+                &output_writer,
+                &session,
+                &task_id,
+                &agent_busy,
+                &agent_done,
+                &agent_start_time,
+                &agent_task,
+                &state_handle_slot,
+                &task_opts,
+                false,
+            ),
+        )
+        .await
+        .expect("/plan status must not wait for a running agent loop")?;
+
+        assert!(!should_exit);
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("No active plan.")
+        }));
         Ok(())
     }
 
@@ -5914,7 +6108,7 @@ mod tests {
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
-        let state_handle_slot = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(Arc::clone(&state_handle))));
         let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
@@ -6047,7 +6241,7 @@ mod tests {
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
-        let state_handle_slot = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(Arc::clone(&state_handle))));
         let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
@@ -6170,7 +6364,7 @@ mod tests {
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
-        let state_handle_slot = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(Arc::clone(&state_handle))));
         let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
@@ -6297,7 +6491,7 @@ mod tests {
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
-        let state_handle_slot = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(Arc::clone(&state_handle))));
         let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
@@ -6415,7 +6609,7 @@ mod tests {
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
-        let state_handle_slot = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(Arc::clone(&state_handle))));
         let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
@@ -6544,7 +6738,7 @@ mod tests {
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
-        let state_handle_slot = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(Arc::clone(&state_handle))));
         let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
         let task_id = {
             let sess = session.lock().await;
