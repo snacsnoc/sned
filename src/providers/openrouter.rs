@@ -19,6 +19,7 @@ pub struct OpenRouterConfig {
     pub model_info: Option<OpenAiCompatibleModelInfo>,
     pub provider_sort: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     /// Provider name for error messages (defaults to "openrouter" if not set).
     pub provider_name: Option<String>,
 }
@@ -34,6 +35,7 @@ impl std::fmt::Debug for OpenRouterConfig {
             .field("model_info", &self.model_info)
             .field("provider_sort", &self.provider_sort)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("extra_body", &self.extra_body)
             .field("provider_name", &self.provider_name)
             .finish()
     }
@@ -62,6 +64,7 @@ impl OpenRouterProvider {
             model_id: config.model_id,
             model_info: config.model_info,
             reasoning_effort: config.reasoning_effort,
+            extra_body: config.extra_body,
             custom_headers: Some(custom_headers),
             endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: Some(
@@ -344,6 +347,7 @@ mod tests {
             model_info: None,
             provider_sort: None,
             reasoning_effort: None,
+            extra_body: None,
             provider_name: None,
         };
         let provider = OpenRouterProvider::new(config).unwrap();
@@ -359,6 +363,10 @@ mod tests {
                 model_info: None,
                 provider_sort: Some("throughput".to_string()),
                 reasoning_effort: Some(reasoning_effort.to_string()),
+                extra_body: Some(serde_json::Map::from_iter([(
+                    "chat_template_kwargs".to_string(),
+                    serde_json::json!({"enable_thinking": true}),
+                )])),
                 provider_name: None,
             })
             .unwrap();
@@ -369,6 +377,7 @@ mod tests {
 
             assert_eq!(body["provider"]["sort"], "throughput");
             assert_eq!(body["reasoning_effort"], reasoning_effort);
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
         }
     }
 
@@ -380,6 +389,7 @@ mod tests {
             model_info: None,
             provider_sort: None,
             reasoning_effort: None,
+            extra_body: None,
             provider_name: None,
         };
         let provider = OpenRouterProvider::new(config).unwrap();
@@ -394,6 +404,7 @@ mod tests {
             model_info: None,
             provider_sort: None,
             reasoning_effort: None,
+            extra_body: None,
             provider_name: Some("custom-openrouter".to_string()),
         };
         let provider = OpenRouterProvider::new(config).unwrap();

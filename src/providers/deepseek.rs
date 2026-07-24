@@ -15,6 +15,7 @@ pub struct DeepSeekConfig {
     pub api_key: String,
     pub model_id: String,
     pub model_info: Option<OpenAiCompatibleModelInfo>,
+    pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl std::fmt::Debug for DeepSeekConfig {
@@ -26,6 +27,7 @@ impl std::fmt::Debug for DeepSeekConfig {
             )
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
+            .field("extra_body", &self.extra_body)
             .finish()
     }
 }
@@ -44,6 +46,7 @@ impl DeepSeekProvider {
             model_id: config.model_id,
             model_info: config.model_info,
             reasoning_effort: None,
+            extra_body: config.extra_body,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: Some("deepseek".to_string()),
@@ -137,6 +140,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model_id: "deepseek-chat".to_string(),
             model_info: None,
+            extra_body: None,
         };
         let provider = DeepSeekProvider::new(config).unwrap();
         assert_eq!(provider.name(), "deepseek");
@@ -180,6 +184,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model_id: "deepseek-chat".to_string(),
             model_info: None,
+            extra_body: None,
         };
         let provider = DeepSeekProvider::new(config).unwrap();
         assert_eq!(provider.name(), "deepseek");
@@ -194,6 +199,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model_id: "deepseek-chat".to_string(),
             model_info: None,
+            extra_body: None,
         };
         let provider = DeepSeekProvider::new(config).unwrap();
         // Access inner provider's base_url for verification

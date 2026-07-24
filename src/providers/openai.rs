@@ -31,6 +31,7 @@ pub struct OpenAiConfig {
     pub model_id: String,
     pub model_info: Option<OpenAiCompatibleModelInfo>,
     pub reasoning_effort: Option<String>,
+    pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     pub custom_headers: Option<std::collections::HashMap<String, String>>,
     pub endpoint_kind: OpenAiEndpointKind,
     /// Provider name for error messages (defaults to "OpenAI" if not set).
@@ -49,6 +50,7 @@ impl std::fmt::Debug for OpenAiConfig {
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("extra_body", &self.extra_body)
             .field("custom_headers", &self.custom_headers)
             .field("endpoint_kind", &self.endpoint_kind)
             .field("provider_name", &self.provider_name)
@@ -317,6 +319,18 @@ impl OpenAiProvider {
                     json!({"type": "function", "function": {"name": name}})
                 }
             };
+        }
+
+        if let Some(extra_body) = &self.config.extra_body {
+            for (key, value) in extra_body {
+                if matches!(
+                    key.as_str(),
+                    "model" | "messages" | "stream" | "stream_options" | "tools" | "tool_choice"
+                ) {
+                    continue;
+                }
+                body[key] = value.clone();
+            }
         }
 
         Ok(body)
@@ -1293,6 +1307,7 @@ mod tests {
             model_id: "gpt-4".to_string(),
             model_info: None,
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1309,6 +1324,7 @@ mod tests {
             model_id: "gpt-4".to_string(),
             model_info: None,
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: None,
@@ -1325,6 +1341,7 @@ mod tests {
             model_id: "gpt-4".to_string(),
             model_info: None,
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: None,
@@ -1341,6 +1358,7 @@ mod tests {
             model_id: "gpt-4".to_string(),
             model_info: None,
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1367,6 +1385,47 @@ mod tests {
         assert_eq!(body["model"], "gpt-4");
         assert_eq!(body["stream"], true);
         assert!(body["messages"].as_array().unwrap().len() >= 2);
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn test_build_request_body_merges_extra_body_without_overriding_core_fields() {
+        let provider = OpenAiProvider::new(OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some("https://custom.example.com/v1".to_string()),
+            model_id: "qwen3-coder".to_string(),
+            model_info: None,
+            reasoning_effort: None,
+            extra_body: Some(serde_json::Map::from_iter([
+                (
+                    "chat_template_kwargs".to_string(),
+                    json!({"enable_thinking": true, "preserve_thinking": true}),
+                ),
+                ("top_k".to_string(), json!(20)),
+                ("model".to_string(), json!("different-model")),
+            ])),
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            provider_name: None,
+        })
+        .unwrap();
+        let request = ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["preserve_thinking"], true);
+        assert_eq!(body["top_k"], 20);
+        assert_eq!(body["model"], "qwen3-coder");
+        assert_eq!(body["stream"], true);
+        assert!(body["messages"].is_array());
     }
 
     #[test]
@@ -1377,6 +1436,7 @@ mod tests {
             model_id: "gpt-4".to_string(),
             model_info: None,
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1428,6 +1488,7 @@ mod tests {
                 supports_streaming: None,
             }),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1580,6 +1641,7 @@ mod tests {
                 supports_streaming: None,
             }),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1615,6 +1677,7 @@ mod tests {
             model_id: "gpt-5.4".to_string(),
             model_info: Some(get_openai_model_info("gpt-5.4")),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: Some("openai-compatible".to_string()),
@@ -1648,6 +1711,7 @@ mod tests {
             model_id: model_id.to_string(),
             model_info: Some(model_info),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: Some("openai-compatible".to_string()),
@@ -1704,6 +1768,7 @@ mod tests {
                 supports_streaming: None,
             }),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1765,6 +1830,7 @@ mod tests {
                 supports_streaming: None,
             }),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1801,6 +1867,7 @@ mod tests {
             model_id: "gpt-4o".to_string(),
             model_info: None,
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1833,6 +1900,7 @@ mod tests {
                 "deepseek-chat",
             )),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
             provider_name: None,
@@ -1890,6 +1958,7 @@ mod tests {
                 supports_streaming: None,
             }),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -1947,6 +2016,7 @@ mod tests {
                 supports_streaming: None,
             }),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -2050,6 +2120,7 @@ mod tests {
             model_id: "gpt-4o".to_string(),
             model_info: None,
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -2099,6 +2170,7 @@ mod tests {
             model_id: "gpt-4o".to_string(),
             model_info: Some(custom_info.clone()),
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: None,
@@ -2123,6 +2195,7 @@ mod tests {
             model_id: "gpt-4o".to_string(),
             model_info: None,
             reasoning_effort: None,
+            extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
             provider_name: Some("openai".to_string()),

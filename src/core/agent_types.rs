@@ -234,6 +234,7 @@ impl Default for AgentConfig {
                             model_id: String::new(),
                             model_info: None,
                             reasoning_effort: None,
+                            extra_body: None,
                             custom_headers: None,
                             endpoint_kind:
                                 crate::providers::openai::OpenAiEndpointKind::Official,

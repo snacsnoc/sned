@@ -250,6 +250,10 @@ pub struct TaskOptions {
     #[arg(long)]
     pub api_key: Option<String>,
 
+    /// Additional JSON object fields for OpenAI-compatible chat-completions requests
+    #[arg(long, value_name = "JSON")]
+    pub extra_body: Option<String>,
+
     /// Show verbose output
     #[arg(short = 'v', long)]
     pub verbose: bool,
@@ -769,6 +773,29 @@ fn openai_endpoint_kind(
     }
 }
 
+fn parse_extra_body(
+    extra_body: Option<&str>,
+) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>>
+{
+    let Some(extra_body) = extra_body else {
+        return Ok(None);
+    };
+
+    let value: serde_json::Value = serde_json::from_str(extra_body).map_err(|err| {
+        anyhow::anyhow!(
+            "--extra-body must be valid JSON object, for example: \
+             '{{\"chat_template_kwargs\":{{\"enable_thinking\":true}}}}': {err}"
+        )
+    })?;
+
+    value.as_object().cloned().map(Some).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--extra-body must be a JSON object, for example: \
+             '{{\"chat_template_kwargs\":{{\"enable_thinking\":true}}}}'"
+        )
+    })
+}
+
 fn runtime_provider_secret_key(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         "anthropic" => Some("apiKey"),
@@ -927,6 +954,16 @@ pub(crate) fn create_provider(
         .map(ReasoningEffort::as_provider_str)
         .map(String::from);
     let user_agent = task_opts.user_agent.clone();
+    let extra_body = parse_extra_body(task_opts.extra_body.as_deref())?;
+
+    if extra_body.is_some()
+        && !matches!(
+            provider_name.as_str(),
+            "openai" | "openai-native" | "openrouter" | "deepseek"
+        )
+    {
+        anyhow::bail!("--extra-body is only supported by OpenAI-compatible providers.");
+    }
 
     // ── Per-provider flag support checks ──────────────────────────────
     // Each provider rejects flags that have no effect on its API.
@@ -1041,6 +1078,13 @@ pub(crate) fn create_provider(
                     })
                 });
             let endpoint_kind = openai_endpoint_kind(&provider_name, base_url.as_deref());
+            if extra_body.is_some()
+                && endpoint_kind == crate::providers::openai::OpenAiEndpointKind::Official
+            {
+                anyhow::bail!(
+                    "--extra-body is only supported by OpenAI-compatible endpoints, not the official OpenAI API."
+                );
+            }
             let default_model = model_id
                 .or_else(|| {
                     let state = crate::storage::global_state::load_global_state();
@@ -1057,6 +1101,7 @@ pub(crate) fn create_provider(
                         base_url,
                         model_info,
                         reasoning_effort: reasoning_effort_str,
+                        extra_body: extra_body.clone(),
                         custom_headers: user_agent.map(|ua| {
                             let mut headers = std::collections::HashMap::with_capacity(1);
                             headers.insert("User-Agent".to_string(), ua);
@@ -1167,6 +1212,7 @@ pub(crate) fn create_provider(
                         model_info: Some(crate::providers::deepseek::get_deepseek_model_info(
                             &model_id_str,
                         )),
+                        extra_body: extra_body.clone(),
                     },
                 )?,
             ))
@@ -1197,6 +1243,7 @@ pub(crate) fn create_provider(
                         )),
                         provider_sort: None,
                         reasoning_effort: reasoning_effort_str,
+                        extra_body: extra_body.clone(),
                         provider_name: None,
                     },
                 )?,
@@ -2003,6 +2050,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_extra_body_flag() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--extra-body",
+            r#"{"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true}}"#,
+            "test",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.task_opts.extra_body.as_deref(),
+            Some(r#"{"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true}}"#)
+        );
+    }
+
+    #[test]
+    fn parse_extra_body_requires_json_object() {
+        let err = parse_extra_body(Some("[]")).unwrap_err();
+        assert!(err.to_string().contains("must be a JSON object"));
+
+        let err = parse_extra_body(Some("{not-json}")).unwrap_err();
+        assert!(err.to_string().contains("must be valid JSON object"));
+    }
+
+    #[test]
     fn parse_thinking_flag() {
         // Bare --thinking defaults to 1024 via default_missing_value
         let cli = Cli::try_parse_from(["sned", "--thinking"]).unwrap();
@@ -2577,6 +2649,7 @@ mod tests {
                 provider: None,
                 base_url: None,
                 api_key: None,
+                extra_body: None,
                 verbose: false,
                 cwd: None,
                 config: None,
@@ -2645,6 +2718,7 @@ mod tests {
                 provider: Some("anthropic".to_string()),
                 base_url: None,
                 api_key: None,
+                extra_body: None,
                 verbose: false,
                 cwd: None,
                 config: None,
@@ -2731,6 +2805,7 @@ mod tests {
                 provider: Some("deepseek".to_string()),
                 base_url: None,
                 api_key: Some("deepseek-key".to_string()),
+                extra_body: None,
                 verbose: false,
                 cwd: None,
                 config: None,
@@ -2982,6 +3057,43 @@ mod tests {
             "got: {msg}"
         );
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
+    }
+
+    #[test]
+    fn test_create_provider_rejects_extra_body_for_non_compatible_provider() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "mock",
+            "--extra-body",
+            "{}",
+            "test",
+        ])
+        .unwrap();
+
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--extra-body is only supported by OpenAI-compatible providers")
+        );
+    }
+
+    #[test]
+    fn test_create_provider_rejects_extra_body_for_official_openai() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "openai-native",
+            "--api-key",
+            "test-key",
+            "--extra-body",
+            "{}",
+            "test",
+        ])
+        .unwrap();
+
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        assert!(err.to_string().contains("not the official OpenAI API"));
     }
 
     #[test]

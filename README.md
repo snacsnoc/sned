@@ -77,6 +77,16 @@ Other useful flags:
 --verbose                # surface internal events to the TUI/log
 --no-token-display       # suppress the 50/80/95% context-window warnings
 --thinking <budget>      # ask the model to spend up to <budget> tokens thinking first
+--extra-body <JSON>      # pass additional fields to an OpenAI-compatible endpoint
+```
+
+For OpenAI-compatible endpoints, `--extra-body` forwards provider-specific request fields:
+
+```bash
+sned "fix the bug" \
+  --base-url https://example.com/v1 \
+  --model qwen3-coder \
+  --extra-body '{"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true}}'
 ```
 
 ## Overview
