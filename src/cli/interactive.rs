@@ -1281,6 +1281,26 @@ async fn cancel_agent(
     Ok(())
 }
 
+fn handle_idle_ctrl_c(app: &mut App) {
+    if !app.completion_lines.is_empty() && app.error_lines.is_empty() {
+        // A visible completion is the most recent turn's transient artifact.
+        // Dismiss it without inserting a transcript line between the output
+        // and the completion box.
+        app.clear_completion_lines();
+    } else {
+        app.push_styled(
+            "Press Ctrl+C again to quit.",
+            Style::default().fg(theme::WARNING_FG),
+        );
+    }
+
+    if !app.input.lines().join("\n").is_empty() {
+        app.push_plain("^C");
+        app.input = App::new_textarea(Vec::new());
+        app.clear_pastes();
+    }
+}
+
 /// Handle key events in ratatui loop (non-Ctrl+C keys).
 async fn handle_key_event(
     key: KeyEvent,
@@ -3238,16 +3258,8 @@ async fn run_main_loop(
                             continue;
                         }
 
-                        // Not busy: clear input or hint about quitting
-                        if !app.input.lines().join("\n").is_empty() {
-                            app.push_plain("^C");
-                            app.input = App::new_textarea(Vec::new());
-                            app.clear_pastes();
-                        }
-                        app.push_styled(
-                            "Press Ctrl+C again to quit.",
-                            Style::default().fg(theme::WARNING_FG),
-                        );
+                        // Not busy: dismiss a completion or hint about quitting.
+                        handle_idle_ctrl_c(app);
                         continue;
                     }
 
@@ -4304,6 +4316,54 @@ mod tests {
             "❯ queued message"
         );
         assert_eq!(app.output_line_kinds.back(), Some(&BlockKind::UserPrompt));
+    }
+
+    #[test]
+    fn test_idle_ctrl_c_dismisses_completion_without_transcript_hint() {
+        let mut app = App::new();
+        app.push_plain("previous transcript line");
+        app.push_completion_line(ratatui::text::Line::from("Task Completed"));
+
+        handle_idle_ctrl_c(&mut app);
+
+        assert!(app.completion_lines.is_empty());
+        assert_eq!(
+            app.output_lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["previous transcript line"],
+            "dismissing a completion must not insert a quit hint into the transcript"
+        );
+    }
+
+    #[test]
+    fn test_idle_ctrl_c_keeps_hidden_completion_and_shows_quit_hint_for_error() {
+        use crate::cli::output::OutputEvent;
+
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.try_send(OutputEvent::Completion("completed work".to_string()))
+            .unwrap();
+        tx.try_send(OutputEvent::ErrorBox("Task failed".to_string()))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        handle_idle_ctrl_c(&mut app);
+
+        assert!(
+            !app.completion_lines.is_empty(),
+            "the error panel hides completion, so Ctrl+C must not dismiss it"
+        );
+        assert!(
+            !app.error_lines.is_empty(),
+            "the visible error panel must remain visible"
+        );
+        assert_eq!(
+            app.output_lines.back().map(ToString::to_string).as_deref(),
+            Some("Press Ctrl+C again to quit.")
+        );
     }
 
     #[test]
