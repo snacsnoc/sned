@@ -172,7 +172,7 @@ pub fn provider_error(error_text: &str) -> ActionableError {
             .to_string()
     } else if lower.contains("404") || lower.contains("not found") {
         "The model or endpoint was not found. Check the model name with \
-         `/models` or verify the provider configuration."
+         `/model` or verify the provider configuration."
             .to_string()
     } else if lower.contains("500")
         || lower.contains("502")
@@ -357,6 +357,14 @@ mod tests {
     fn test_provider_rate_limit() {
         let err = provider_error("429 Rate limit exceeded");
         assert!(err.suggestion.as_ref().unwrap().contains("rate limit"));
+    }
+
+    #[test]
+    fn test_provider_not_found_error_recommends_model_picker() {
+        let err = provider_error("404 Model not found");
+        let suggestion = err.suggestion.as_ref().unwrap();
+        assert!(suggestion.contains("`/model`"));
+        assert!(!suggestion.contains("`/models`"));
     }
 
     #[test]
