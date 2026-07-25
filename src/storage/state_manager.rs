@@ -1729,7 +1729,7 @@ fn workspace_paths_match(history_path: &str, workspace_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn with_temp_data_dir<T>(f: impl FnOnce() -> T) -> T {
@@ -1741,18 +1741,32 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().join("data");
+        let sned_dir = temp_dir.path().join("sned");
         fs::create_dir_all(&data_dir).unwrap();
 
-        // SAFETY: single-threaded test helper; env mutation scoped to this closure
+        let previous_data_dir = std::env::var_os("SNED_DATA_DIR");
+        let previous_sned_dir = std::env::var_os("SNED_DIR");
+
+        // SAFETY: single-threaded test helper; env mutation scoped to this closure.
         unsafe {
             std::env::set_var("SNED_DATA_DIR", &data_dir);
+            std::env::set_var("SNED_DIR", &sned_dir);
         }
 
         let result = f();
 
-        // SAFETY: single-threaded test helper; restoring env after test
+        // SAFETY: single-threaded test helper; restoring env after test.
         unsafe {
-            std::env::remove_var("SNED_DATA_DIR");
+            if let Some(previous_data_dir) = previous_data_dir {
+                std::env::set_var("SNED_DATA_DIR", previous_data_dir);
+            } else {
+                std::env::remove_var("SNED_DATA_DIR");
+            }
+            if let Some(previous_sned_dir) = previous_sned_dir {
+                std::env::set_var("SNED_DIR", previous_sned_dir);
+            } else {
+                std::env::remove_var("SNED_DIR");
+            }
         }
 
         result
@@ -1990,6 +2004,24 @@ mod tests {
 
             let history = manager2.get_task_history();
             assert!(history.iter().any(|h| h.id == "persist-test"));
+        });
+    }
+
+    #[test]
+    fn test_set_secret_persist_makes_it_available_to_a_new_manager() {
+        with_temp_data_dir(|| {
+            let manager = Arc::new(StateManager::new().unwrap());
+            manager.set_secret("apiKey", "persisted-test-key".to_string());
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(StateManager::persist_async(Arc::clone(&manager)))
+                .unwrap();
+
+            let reloaded = StateManager::new().unwrap();
+            assert_eq!(
+                reloaded.get_secret("apiKey").as_deref(),
+                Some("persisted-test-key")
+            );
         });
     }
 

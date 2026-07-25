@@ -796,7 +796,7 @@ fn parse_extra_body(
     })
 }
 
-fn runtime_provider_secret_key(provider_name: &str) -> Option<&'static str> {
+pub(crate) fn runtime_provider_secret_key(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         "anthropic" => Some("apiKey"),
         "openai" | "openai-native" => Some("openAiApiKey"),
@@ -806,6 +806,40 @@ fn runtime_provider_secret_key(provider_name: &str) -> Option<&'static str> {
         "deepseek" => Some("deepSeekApiKey"),
         _ => None,
     }
+}
+
+/// Whether a supported provider has a key available to the running process.
+///
+/// This matches the environment and secure-store sources used by
+/// `create_provider`, while allowing interactive model switching to request a
+/// missing key before constructing a provider with empty credentials.
+pub(crate) fn runtime_provider_api_key_available(
+    provider_name: &str,
+    explicit_api_key: Option<&str>,
+    state_manager: &crate::storage::state_manager::StateManager,
+) -> Option<bool> {
+    let env_vars = match provider_name {
+        "anthropic" => &["ANTHROPIC_API_KEY"][..],
+        "openai" | "openai-native" => &["OPENAI_API_KEY"][..],
+        "openrouter" => &["OPENROUTER_API_KEY"][..],
+        "gemini" => &["GEMINI_API_KEY"][..],
+        "minimax" => &["MINIMAX_CN_API_KEY", "MINIMAX_API_KEY"][..],
+        "deepseek" => &["DEEPSEEK_API_KEY"][..],
+        _ => return None,
+    };
+    let secret_key = runtime_provider_secret_key(provider_name)?;
+
+    Some(
+        explicit_api_key.is_some_and(|key| !key.is_empty())
+            || env_vars.iter().any(|env_var| {
+                std::env::var(env_var)
+                    .ok()
+                    .is_some_and(|key| !key.is_empty())
+            })
+            || state_manager
+                .get_secret(secret_key)
+                .is_some_and(|key| !key.is_empty()),
+    )
 }
 
 fn api_key_from_sources(

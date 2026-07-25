@@ -15,7 +15,6 @@ enum SlashCommandId {
     Skills,
     Help,
     Settings,
-    Models,
     ResetCompact,
     Stats,
     Undo,
@@ -203,17 +202,6 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
-        id: SlashCommandId::Models,
-        name: "models",
-        aliases: &[],
-        description: "List configured model examples",
-        usage: "/models",
-        detail: "Shows provider and model examples accepted by the model switch command.",
-        category: SlashCommandCategory::Local,
-        requires_args: false,
-        requirement: CommandRequirement::Always,
-    },
-    SlashCommandSpec {
         id: SlashCommandId::ResetCompact,
         name: "resetcompact",
         aliases: &["clearcompact"],
@@ -351,7 +339,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         description: "Switch the active provider and model",
         usage: "/model [provider/model_id]",
-        detail: "Opens the model picker without an argument, or switches directly to a provider/model_id pair.",
+        detail: "Opens the model picker without an argument, or switches directly to a provider/model_id pair. Prompts for a missing provider key and saves it in Sned's secret store without restarting.",
         category: SlashCommandCategory::Local,
         requires_args: false,
         requirement: CommandRequirement::Always,
@@ -579,7 +567,6 @@ pub enum CliOnlyCommand {
     Skills,
     Help,
     Settings,
-    Models,
     ResetCompact,
     Stats,
     Undo,
@@ -746,7 +733,6 @@ impl CliOnlyCommand {
                 | Self::Help
                 | Self::HelpOption(_)
                 | Self::Settings
-                | Self::Models
                 | Self::ResetCompact
                 | Self::Stats
                 | Self::Changes
@@ -870,7 +856,6 @@ fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCom
             }
         }
         SlashCommandId::Settings => Some(CliOnlyCommand::Settings),
-        SlashCommandId::Models => Some(CliOnlyCommand::Models),
         SlashCommandId::ResetCompact => Some(CliOnlyCommand::ResetCompact),
         SlashCommandId::Stats => Some(CliOnlyCommand::Stats),
         SlashCommandId::Undo => Some(CliOnlyCommand::Undo),
@@ -1494,44 +1479,6 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
     ]
 }
 
-/// Format available models text for /models command.
-#[must_use] 
-pub fn format_models_text() -> String {
-    let entries = build_model_picker_entries();
-    let mut s = String::new();
-    s.push_str("Available Models:\n");
-    let mut current_provider: Option<&str> = None;
-    for entry in &entries {
-        if Some(entry.provider) != current_provider {
-            current_provider = Some(entry.provider);
-            s.push_str(&format!("\n{}:\n", to_title_case(entry.provider)));
-        }
-        s.push_str(&format!("  {}\n", entry.label));
-    }
-    s
-}
-
-fn to_title_case(s: &str) -> String {
-    // Special cases for provider names
-    match s {
-        "openai" => "OpenAI".to_string(),
-        "minimax" => "MiniMax".to_string(),
-        "deepseek" => "DeepSeek".to_string(),
-        "openrouter" => "OpenRouter".to_string(),
-        _ => {
-            let mut c = s.chars();
-            match c.next() {
-                None => String::new(),
-                Some(first) => {
-                    let mut result = first.to_uppercase().collect::<String>();
-                    result.extend(c.flat_map(char::to_lowercase));
-                    result
-                }
-            }
-        }
-    }
-}
-
 #[must_use] 
 pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String {
     if let Some(ref api_req_info) = state.last_api_req_info {
@@ -1920,15 +1867,16 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cli_only_settings() {
-        let result = get_cli_only_command("/settings");
-        assert_eq!(result, Some(CliOnlyCommand::Settings));
+    fn test_format_help_for_command_model_describes_missing_key_prompt() {
+        let text = format_help_for_command("model");
+        assert!(text.contains("Prompts for a missing provider key"));
+        assert!(text.contains("Sned's secret store"));
     }
 
     #[test]
-    fn test_parse_cli_only_models() {
-        let result = get_cli_only_command("/models");
-        assert_eq!(result, Some(CliOnlyCommand::Models));
+    fn test_parse_cli_only_settings() {
+        let result = get_cli_only_command("/settings");
+        assert_eq!(result, Some(CliOnlyCommand::Settings));
     }
 
     #[test]
@@ -1942,13 +1890,14 @@ mod tests {
         assert!(SlashCommand::parse("explain-changes").is_none());
         assert!(SlashCommand::parse("newtask").is_none());
         assert!(get_cli_only_command("/expand 1").is_none());
+        assert!(get_cli_only_command("/models").is_none());
         assert!(SlashCommand::parse_with_skills("some-workflow", &[]).is_none());
 
         let entries = build_slash_command_entries(&[]);
         assert!(entries.iter().all(|entry| {
             !matches!(
                 entry.name.as_str(),
-                "explain-changes" | "expand" | "newtask"
+                "explain-changes" | "expand" | "models" | "newtask"
             )
         }));
     }
@@ -2161,15 +2110,6 @@ mod tests {
         assert!(text.contains("claude-3-5-sonnet"));
         assert!(text.contains("act"));
         assert!(text.contains("disabled"));
-    }
-
-    #[test]
-    fn test_format_models_text_contains_providers() {
-        let text = format_models_text();
-        assert!(text.contains("Anthropic"));
-        assert!(text.contains("OpenAI"));
-        assert!(text.contains("claude-"));
-        assert!(text.contains("gpt-"));
     }
 
     #[test]
@@ -2725,24 +2665,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_format_models_text_has_all_providers() {
-        let text = format_models_text();
-        assert!(text.contains("Anthropic"));
-        assert!(text.contains("OpenAI"));
-        assert!(text.contains("MiniMax"));
-        assert!(text.contains("Gemini"));
-        assert!(text.contains("DeepSeek"));
-        assert!(text.contains("OpenRouter"));
-    }
-
-    #[test]
-    fn test_format_models_text_has_models() {
-        let text = format_models_text();
-        assert!(text.contains("claude-"));
-        assert!(text.contains("gpt-"));
-        assert!(text.contains("minimax-"));
-        assert!(text.contains("gemini-"));
-        assert!(text.contains("deepseek-"));
-    }
 }

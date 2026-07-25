@@ -51,6 +51,13 @@ pub enum StreamKind {
     ToolOutput,
 }
 
+/// Model switch awaiting an API key entered through the masked TUI prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingModelSwitch {
+    pub provider: String,
+    pub model_id: String,
+}
+
 /// Visual category for an output line.  Drives render-time structural
 /// grouping (blank-line separators between different kinds, no
 /// separators within a block).  Mirrors `output_lines` length-for-length
@@ -500,6 +507,8 @@ pub struct App {
     pub model_picker_results: Vec<crate::cli::slash_commands::ModelPickerEntry>,
     /// Currently selected index in model picker.
     pub model_picker_selected: usize,
+    /// Model switch awaiting an API key for a provider not configured in this process.
+    pub pending_model_switch: Option<PendingModelSwitch>,
     /// Completion box lines rendered as a dedicated Block widget.
     pub completion_lines: VecDeque<Line<'static>>,
     last_completion_text: Option<String>,
@@ -720,7 +729,10 @@ impl App {
 
     /// Update the textarea placeholder based on current mode.
     pub fn update_placeholder(&mut self) {
-        if self.mode == "PLAN" {
+        if self.pending_model_switch.is_some() {
+            self.input
+                .set_placeholder_text("Enter API key · Enter saves and switches · Esc cancels");
+        } else if self.mode == "PLAN" {
             self.input.set_placeholder_text("❯ [PLAN] ");
         } else if self.mode == "ACT" {
             self.input.set_placeholder_text("❯ [ACT] ");
@@ -793,6 +805,7 @@ impl App {
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
+            pending_model_switch: None,
             completion_lines: VecDeque::new(),
             last_completion_text: None,
             cached_completion_rows: 0,
@@ -2395,7 +2408,8 @@ impl App {
         let selection_blocked = self.has_blocking_prompt()
             || self.picker_active
             || self.slash_command_active
-            || self.model_picker_active;
+            || self.model_picker_active
+            || self.pending_model_switch.is_some();
         if selection_blocked {
             self.clear_text_selection();
             self.selection_surfaces.clear();
@@ -2419,7 +2433,9 @@ impl App {
             return;
         }
 
-        let input_title = if self.slash_command_help_active {
+        let input_title = if let Some(pending) = self.pending_model_switch.as_ref() {
+            format!(" API key for {} ", pending.provider)
+        } else if self.slash_command_help_active {
             " Help search ".to_string()
         } else if crate::core::approval::is_any_followup_question_active() {
             " Follow-up reply ".to_string()

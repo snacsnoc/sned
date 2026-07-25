@@ -4,6 +4,7 @@
 //! file picker, input queuing, and agent lifecycle.
 
 use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
+use crate::cli::tui::app::PendingModelSwitch;
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
@@ -18,6 +19,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::style::Style;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -111,10 +113,17 @@ fn strip_active_slash_command(text: &str) -> Option<String> {
     ))
 }
 
+fn provider_credential_key(provider: &str) -> String {
+    crate::cli::runtime_provider_secret_key(provider)
+        .unwrap_or(provider)
+        .to_string()
+}
+
 pub struct InteractiveSession {
     agent_loop: Arc<tokio::sync::Mutex<crate::core::agent_loop::AgentLoop>>,
     hook_manager: Arc<crate::core::hooks::HookManager>,
     state_manager: Arc<crate::storage::state_manager::StateManager>,
+    provider_api_keys: HashMap<String, String>,
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
 }
@@ -175,6 +184,19 @@ impl InteractiveSession {
             .with_checkpoint_manager(components.checkpoint_mgr)
             .with_yolo(task_opts.yolo);
 
+        let provider_api_keys = task_opts
+            .api_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| {
+                (
+                    provider_credential_key(agent_loop.get_provider().name()),
+                    key.clone(),
+                )
+            })
+            .into_iter()
+            .collect();
+
         let agent_loop = Arc::new(tokio::sync::Mutex::new(agent_loop));
         crate::core::cancellation::setup_ctrl_c_handler(agent_loop.lock().await.state_handle())
             .await;
@@ -183,6 +205,7 @@ impl InteractiveSession {
             agent_loop,
             hook_manager: components.hook_manager,
             state_manager: components.state_manager,
+            provider_api_keys,
             task_opts,
             root_opts,
         })
@@ -222,6 +245,17 @@ impl InteractiveSession {
 
     async fn clear_compacted_summary(&self) -> bool {
         self.agent_loop.lock().await.clear_compacted_summary().await
+    }
+
+    fn provider_api_key(&self, provider: &str) -> Option<String> {
+        self.provider_api_keys
+            .get(&provider_credential_key(provider))
+            .cloned()
+    }
+
+    fn remember_provider_api_key(&mut self, provider: &str, api_key: String) {
+        self.provider_api_keys
+            .insert(provider_credential_key(provider), api_key);
     }
 
     /// Get startup info line showing provider, model, task ID, mode, and context window.
@@ -417,6 +451,105 @@ impl InteractiveSession {
 /// Action returned by key event handler.
 enum Action {
     Submit(String),
+    ModelSwitch(PendingModelSwitch),
+    ModelApiKeySubmitted(PendingModelSwitch, String),
+}
+
+async fn activate_model_switch(
+    request: &PendingModelSwitch,
+    explicit_api_key: Option<String>,
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    task_opts: &TaskOptions,
+    state_manager: &crate::storage::state_manager::StateManager,
+) {
+    let mut temp_opts = task_opts.clone();
+    temp_opts.provider = Some(request.provider.clone());
+    temp_opts.model = Some(request.model_id.clone());
+    temp_opts.api_key = explicit_api_key;
+
+    match crate::cli::create_provider(&temp_opts, Some(state_manager)) {
+        Ok(new_provider) => {
+            let mut sess = session.lock().await;
+            {
+                let mut agent = sess.agent_loop().await;
+                agent.set_provider(new_provider);
+            }
+            if let Some(api_key) = temp_opts.api_key.clone() {
+                sess.remember_provider_api_key(&request.provider, api_key);
+            }
+            sess.task_opts.provider = Some(request.provider.clone());
+            sess.task_opts.model = Some(request.model_id.clone());
+            sess.task_opts.api_key = temp_opts.api_key;
+
+            app.provider_name = request.provider.clone();
+            app.model_name = request.model_id.clone();
+            app.needs_redraw = true;
+            app.push_plain(format!(
+                "Model switched to {}/{}",
+                request.provider, request.model_id
+            ));
+        }
+        Err(error) => {
+            app.push_plain(format!("Failed to create provider: {error}"));
+        }
+    }
+}
+
+async fn request_model_switch(
+    request: PendingModelSwitch,
+    supplied_api_key: Option<String>,
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    task_opts: &TaskOptions,
+    agent_busy: &Arc<AtomicBool>,
+) {
+    if agent_busy.load(Ordering::Relaxed) {
+        app.push_styled(
+            "Agent is busy. Wait for it to finish before switching models.",
+            Style::default().fg(theme::WARNING_FG),
+        );
+        return;
+    }
+
+    let (state_manager, remembered_api_key) = {
+        let sess = session.lock().await;
+        (
+            Arc::clone(&sess.state_manager),
+            sess.provider_api_key(&request.provider),
+        )
+    };
+    let explicit_api_key = supplied_api_key.or(remembered_api_key);
+
+    if explicit_api_key.is_none()
+        && matches!(
+            crate::cli::runtime_provider_api_key_available(
+                &request.provider,
+                None,
+                state_manager.as_ref(),
+            ),
+            Some(false)
+        )
+    {
+        app.pending_model_switch = Some(request);
+        app.set_input_text("");
+        app.input.set_mask_char('\u{2022}');
+        app.update_placeholder();
+        app.push_plain(
+            "No API key is configured for the selected provider. Enter one below to save it in Sned's secret store and switch without restarting.",
+        );
+        return;
+    }
+
+    activate_model_switch(
+        &request,
+        explicit_api_key,
+        app,
+        session,
+        task_opts,
+        state_manager.as_ref(),
+    )
+    .await;
 }
 
 async fn refresh_slash_command_entries(
@@ -1158,6 +1291,41 @@ async fn handle_key_event(
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
 
+    if app.pending_model_switch.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.pending_model_switch = None;
+                app.set_input_text("");
+                app.update_placeholder();
+                app.push_plain("Model switch cancelled.");
+                return Ok(None);
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let api_key = app.input.lines().join("\n").trim().to_string();
+                if api_key.is_empty() {
+                    app.push_styled(
+                        "API key cannot be empty. Enter a key or press Esc to cancel.",
+                        Style::default().fg(theme::WARNING_FG),
+                    );
+                    return Ok(None);
+                }
+                let request = app
+                    .pending_model_switch
+                    .take()
+                    .expect("model key submission requires a pending switch");
+                app.set_input_text("");
+                app.clear_pastes();
+                app.update_placeholder();
+                return Ok(Some(Action::ModelApiKeySubmitted(request, api_key)));
+            }
+            _ => {
+                use tui_textarea::Input;
+                app.input.input(Input::from(key));
+                return Ok(None);
+            }
+        }
+    }
+
     fn accept_slash_completion(app: &mut App) -> bool {
         if app.slash_command_results.is_empty() {
             return false;
@@ -1224,20 +1392,21 @@ async fn handle_key_event(
         }
     }
 
-    // Tab or Enter with active model picker -> insert model spec into textarea
+    // Tab or Enter with active model picker -> switch to the selected model.
     if app.model_picker_active
         && !app.model_picker_results.is_empty()
         && (key.code == KeyCode::Tab
             || (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT)))
     {
         let entry = &app.model_picker_results[app.model_picker_selected];
-        let model_spec = format!("{}/{}", entry.provider, entry.model_id);
-        app.set_input_text(&model_spec);
-        app.input.move_cursor(tui_textarea::CursorMove::End);
+        let request = PendingModelSwitch {
+            provider: entry.provider.to_string(),
+            model_id: entry.model_id.to_string(),
+        };
         app.model_picker_active = false;
         app.model_picker_results.clear();
         app.model_picker_selected = 0;
-        return Ok(None);
+        return Ok(Some(Action::ModelSwitch(request)));
     }
 
     // Tab or Enter with active file picker -> insert selection (must come before Enter handler)
@@ -1669,6 +1838,16 @@ async fn handle_cli_only_command(
         return Ok(false);
     }
 
+    if agent_busy.load(Ordering::Relaxed)
+        && matches!(&cli_cmd, CliOnlyCommand::ModelSwitch(_))
+    {
+        app.push_styled(
+            "Agent is busy. Wait for it to finish before switching models.",
+            Style::default().fg(theme::WARNING_FG),
+        );
+        return Ok(false);
+    }
+
     match cli_cmd {
         CliOnlyCommand::Exit | CliOnlyCommand::Quit => {
             return Ok(true);
@@ -1730,10 +1909,23 @@ async fn handle_cli_only_command(
             open_slash_command_help(app, &cmd);
         }
         CliOnlyCommand::Settings => {
-            let provider = task_opts.provider.as_deref().unwrap_or("anthropic");
-            let model = task_opts.model.as_deref().unwrap_or("claude-3-5-sonnet");
-            let mode = if task_opts.plan { "plan" } else { "act" };
-            let settings_text = format_settings_text(provider, model, mode, auto_approve);
+            let (provider, model, mode) = {
+                let sess = session.lock().await;
+                (
+                    sess.task_opts
+                        .provider
+                        .as_deref()
+                        .unwrap_or("anthropic")
+                        .to_string(),
+                    sess.task_opts
+                        .model
+                        .as_deref()
+                        .unwrap_or("claude-3-5-sonnet")
+                        .to_string(),
+                    if sess.task_opts.plan { "plan" } else { "act" },
+                )
+            };
+            let settings_text = format_settings_text(&provider, &model, mode, auto_approve);
             for line in ansi_to_ratatui_lines(&settings_text) {
                 app.push_output(line);
             }
@@ -1754,32 +1946,19 @@ async fn handle_cli_only_command(
                 );
                 return Ok(false);
             }
-
-            let provider_name = parts[0];
-            let model_id = parts[1];
-
-            let mut temp_opts = task_opts.clone();
-            temp_opts.provider = Some(provider_name.to_string());
-            temp_opts.model = Some(model_id.to_string());
-            let state_manager = session.lock().await.state_manager.clone();
-
-            match crate::cli::create_provider(&temp_opts, Some(&state_manager)) {
-                Ok(new_provider) => {
-                    let sess = session.lock().await;
-                    sess.agent_loop().await.set_provider(new_provider);
-                    app.push_plain(format!("Model switched to {provider_name}/{model_id}"));
-                }
-                Err(e) => {
-                    app.push_plain(format!("Failed to create provider: {e}"));
-                }
-            }
+            request_model_switch(
+                PendingModelSwitch {
+                    provider: parts[0].to_string(),
+                    model_id: parts[1].to_string(),
+                },
+                None,
+                app,
+                session,
+                task_opts,
+                agent_busy,
+            )
+            .await;
             return Ok(false);
-        }
-        CliOnlyCommand::Models => {
-            let models_text = crate::cli::slash_commands::format_models_text();
-            for line in ansi_to_ratatui_lines(&models_text) {
-                app.push_output(line);
-            }
         }
         CliOnlyCommand::ResetCompact => {
             let sess = session.lock().await;
@@ -3000,6 +3179,14 @@ async fn run_main_loop(
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
+                        if app.pending_model_switch.is_some() {
+                            app.pending_model_switch = None;
+                            app.set_input_text("");
+                            app.update_placeholder();
+                            app.push_plain("Model switch cancelled.");
+                            continue;
+                        }
+
                         let now = std::time::Instant::now();
                         let is_double_tap = {
                             let last = last_ctrlc.lock().unwrap();
@@ -3068,6 +3255,64 @@ async fn run_main_loop(
                         handle_key_event(key, app, &output_writer, &state_handle, &task_id).await?
                     {
                         match action {
+                            Action::ModelSwitch(request) => {
+                                request_model_switch(
+                                    request,
+                                    None,
+                                    app,
+                                    &session,
+                                    task_opts,
+                                    &agent_busy,
+                                )
+                                .await;
+                                continue;
+                            }
+                            Action::ModelApiKeySubmitted(request, api_key) => {
+                                let state_manager = {
+                                    let sess = session.lock().await;
+                                    Arc::clone(&sess.state_manager)
+                                };
+                                let Some(secret_key) =
+                                    crate::cli::runtime_provider_secret_key(&request.provider)
+                                else {
+                                    app.push_plain(format!(
+                                        "Unsupported provider: {}",
+                                        request.provider
+                                    ));
+                                    continue;
+                                };
+                                state_manager.set_secret(secret_key, api_key.clone());
+                                match crate::storage::state_manager::StateManager::persist_async(
+                                    Arc::clone(&state_manager),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        app.push_plain(format!(
+                                            "API key saved for {}.",
+                                            request.provider
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        app.push_styled(
+                                            format!(
+                                                "Failed to save API key: {error}. It will only be used for this switch."
+                                            ),
+                                            Style::default().fg(theme::WARNING_FG),
+                                        );
+                                    }
+                                }
+                                request_model_switch(
+                                    request,
+                                    Some(api_key),
+                                    app,
+                                    &session,
+                                    task_opts,
+                                    &agent_busy,
+                                )
+                                .await;
+                                continue;
+                            }
                             Action::Submit(text) => {
                                 // Make the echoed submit visible before any
                                 // command bookkeeping or agent startup work.
@@ -3255,15 +3500,19 @@ async fn run_main_loop(
                 Event::Paste(content) => {
                     app.clear_text_selection();
                     app.needs_redraw = true;
-                    let folded = handle_paste_event(app, &content);
-                    if folded {
-                        app.push_styled(
-                            format!(
-                                "Large paste folded ({} chars) - will expand on submit",
-                                content.len()
-                            ),
-                            theme::dim_style(),
-                        );
+                    if app.pending_model_switch.is_some() {
+                        app.input.insert_str(&content);
+                    } else {
+                        let folded = handle_paste_event(app, &content);
+                        if folded {
+                            app.push_styled(
+                                format!(
+                                    "Large paste folded ({} chars) - will expand on submit",
+                                    content.len()
+                                ),
+                                theme::dim_style(),
+                            );
+                        }
                     }
                 }
                 Event::Resize(_, _) => {
@@ -4964,6 +5213,75 @@ mod tests {
         assert!(resolved.ends_with("inspect src"));
     }
 
+    #[tokio::test]
+    async fn test_model_picker_selection_requests_an_immediate_switch() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.model_picker_active = true;
+        app.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(matches!(
+            action,
+            Some(Action::ModelSwitch(PendingModelSwitch { provider, model_id }))
+                if provider == "anthropic" && model_id == "claude-sonnet-4-20250514"
+        ));
+        assert!(!app.model_picker_active);
+        assert!(app.input.lines().join("\n").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_api_key_submission_is_masked_and_not_echoed() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.pending_model_switch = Some(PendingModelSwitch {
+            provider: "gemini".to_string(),
+            model_id: "gemini-3.1-pro-preview".to_string(),
+        });
+        app.set_input_text("secret-key");
+        app.input.set_mask_char('\u{2022}');
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(matches!(
+            action,
+            Some(Action::ModelApiKeySubmitted(
+                PendingModelSwitch { provider, model_id },
+                api_key
+            )) if provider == "gemini"
+                && model_id == "gemini-3.1-pro-preview"
+                && api_key == "secret-key"
+        ));
+        assert!(app.pending_model_switch.is_none());
+        assert!(app.input.lines().join("\n").is_empty());
+        assert_eq!(app.input.mask_char(), None);
+        Ok(())
+    }
+
     /// Reproduces the user-reported bug: tab completion for `/plan` does
     /// not dismiss the popup when the completed input is still a valid
     /// slash command. The fix should keep the popup hidden until the user
@@ -5715,6 +6033,111 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_provider_credential_key_normalizes_openai_aliases() {
+        assert_eq!(
+            provider_credential_key("openai"),
+            provider_credential_key("openai-native")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_retains_cli_key_per_provider() -> anyhow::Result<()> {
+        let mut task_opts = retry_test_task_opts();
+        task_opts.api_key = Some("cli-mock-key".to_string());
+        let session = InteractiveSession::build_with_writer(
+            task_opts,
+            RootOnlyOptions {
+                task_id: None,
+                continue_task: false,
+            },
+            None,
+        )
+        .await?;
+
+        let mut session = session;
+        assert_eq!(
+            session.provider_api_key("mock").as_deref(),
+            Some("cli-mock-key")
+        );
+
+        session.remember_provider_api_key("gemini", "gemini-key".to_string());
+        session.task_opts.provider = Some("gemini".to_string());
+        session.task_opts.api_key = Some("gemini-key".to_string());
+
+        assert_eq!(
+            session.provider_api_key("mock").as_deref(),
+            Some("cli-mock-key")
+        );
+        assert_eq!(
+            session.provider_api_key("gemini").as_deref(),
+            Some("gemini-key")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_settings_uses_active_session_model() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        {
+            let mut sess = session.lock().await;
+            sess.task_opts.provider = Some("gemini".to_string());
+            sess.task_opts.model = Some("gemini-test-model".to_string());
+        }
+
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        handle_cli_only_command(
+            CliOnlyCommand::Settings,
+            "/settings",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle,
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        let settings = app
+            .output_lines
+            .iter()
+            .map(ratatui::text::Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(settings.contains("Provider:     gemini"));
+        assert!(settings.contains("Model:        gemini-test-model"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_retry_command_reports_when_no_failed_request_exists() -> anyhow::Result<()> {
         use crate::cli::slash_commands::CliOnlyCommand;
@@ -6104,6 +6527,72 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
                 .contains("No active plan.")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_picker_is_rejected_while_agent_is_busy() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        use tokio::time::{Duration, timeout};
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let (agent_loop, task_id, task_state) = {
+            let sess = session.lock().await;
+            let task_id = sess.agent_loop().await.task_id().to_string();
+            let task_state = sess.state_handle().await;
+            (Arc::clone(&sess.agent_loop), task_id, task_state)
+        };
+        let _running_agent = agent_loop.lock().await;
+
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(task_state)));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+
+        let should_exit = timeout(
+            Duration::from_millis(100),
+            handle_cli_only_command(
+                CliOnlyCommand::ModelSwitch(String::new()),
+                "/model",
+                &mut app,
+                &output_writer,
+                &session,
+                &task_id,
+                &agent_busy,
+                &agent_done,
+                &agent_start_time,
+                &agent_task,
+                &state_handle_slot,
+                &task_opts,
+                false,
+            ),
+        )
+        .await
+        .expect("/model must not wait for a running agent loop")?;
+
+        assert!(!should_exit);
+        assert!(!app.model_picker_active);
+        assert!(app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Agent is busy. Wait for it to finish before switching models.")
         }));
         Ok(())
     }
