@@ -1635,8 +1635,8 @@ pub fn clear_followup_prompt_scroll() {
     FOLLOWUP_PROMPT_SCROLL.store(false, Ordering::SeqCst);
 }
 
-/// Return the timeout used by followup prompts such as ask_followup_question
-/// and condense. The timeout can be overridden with
+/// Return the timeout used by followup prompts such as ask_followup_question.
+/// The timeout can be overridden with
 /// `SNED_FOLLOWUP_TIMEOUT_SECS`.
 pub(crate) fn followup_timeout_secs() -> u64 {
     std::env::var("SNED_FOLLOWUP_TIMEOUT_SECS")

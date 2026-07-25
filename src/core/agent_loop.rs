@@ -6045,7 +6045,6 @@ mod tests {
                 "condense",
                 serde_json::json!({
                     "context": "Updated summary",
-                    "auto_accept": true,
                 }),
             ),
         ));

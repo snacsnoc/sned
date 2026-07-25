@@ -1590,13 +1590,12 @@ pub fn format_changes_text(state: &crate::core::agent_types::TaskState) -> Strin
 const CONDENSE_INSTRUCTION: &str = r#"<explicit_instructions type="condense">
 The user has explicitly asked you to create a detailed summary of the conversation so far, which will be used to compact the current context window while retaining key information. The user may have provided instructions or additional information for you to consider when summarizing the conversation.
 Irrespective of whether additional information or instructions are given, you are only allowed to respond to this message by calling the condense tool.
-Set the auto_accept parameter to true, because the user explicitly requested compaction and no extra confirmation is needed.
+The tool stores the summary and compacts the context immediately. Do not ask the user to confirm or preview the summary.
 
 The condense tool is defined below:
 
 Description:
 Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing with the conversation and supporting any continuing tasks.
-The user will be presented with a preview of your generated summary and can choose to use it to compact their context window or keep chatting in the current conversation.
 Users may refer to this tool as 'compact' as well. You should consider these to be equivalent to 'condense' when used in a similar context.
 
 Your summary MUST use the following structured Markdown format:
@@ -1744,7 +1743,9 @@ mod tests {
     fn test_process_compact_command() {
         let result = process_slash_command("/compact now");
         assert!(result.contains("<explicit_instructions type=\"condense\">"));
-        assert!(result.contains("Set the auto_accept parameter to true"));
+        assert!(result.contains("compacts the context immediately"));
+        assert!(!result.contains("auto_accept"));
+        assert!(!result.contains("preview of your generated summary"));
         assert!(result.contains("now"));
     }
 

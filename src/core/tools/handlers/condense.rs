@@ -19,12 +19,7 @@ impl CondenseHandler {
         Self
     }
 
-    /// Execute condense with PreCompact hook support and interactive user approval.
-    ///
-    /// 1. Show condensation summary to user
-    /// 2. Wait for user response
-    /// 3. Empty response = accept and compact
-    /// 4. Non-empty response = user feedback, do NOT compact
+    /// Execute condense with PreCompact hook support.
     pub async fn execute(
         &self,
         ctx: &ToolContext,
@@ -36,11 +31,6 @@ impl CondenseHandler {
             .ok_or_else(|| {
                 ToolError::InvalidInput("Missing required parameter: context".to_string())
             })?;
-        let auto_accept = params
-            .get("auto_accept")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         // Validate summary is non-empty
         if context.trim().is_empty() {
             return Err(ToolError::InvalidInput(
@@ -90,64 +80,6 @@ impl CondenseHandler {
         } else {
             context.to_string()
         };
-
-        // INTERACTIVE APPROVAL: Show summary and wait for user response
-        if !ctx.json_output && !auto_accept {
-            use crate::cli::output::OutputEvent;
-            use ratatui::style::{Modifier, Style};
-            let timeout_secs = crate::core::approval::followup_timeout().as_secs();
-            use crate::cli::tui::theme::{ACCENT, WARNING_FG};
-            ctx.output_writer.emit(OutputEvent::tool_output_line(
-                "\n[Sned wants to condense the conversation]",
-                Style::default().fg(WARNING_FG),
-            ));
-            ctx.output_writer.emit(OutputEvent::tool_output_line(
-                format!("{final_summary}\n"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            ctx.output_writer.emit(OutputEvent::tool_output_line(
-                "Press Enter to accept, or provide feedback: ",
-                Style::default().fg(ACCENT),
-            ));
-            ctx.output_writer.emit(OutputEvent::tool_output_line(
-                format!("(waiting up to {timeout_secs}s for your response)"),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-            ctx.output_writer.flush();
-
-            // Use channel-based input to avoid blocking tokio worker and fighting TUI stdin
-            // Same pattern as ask_followup_question and prompt_for_approval
-            let (sender, receiver) = std::sync::mpsc::channel();
-            crate::core::approval::set_followup_question_active(ctx.task_id.as_str(), true);
-            crate::core::approval::set_followup_sender(ctx.task_id.as_str(), sender);
-
-            // Use recv_timeout to avoid blocking the TUI event loop indefinitely.
-            // Same pattern as ask_followup_question and other followup prompts.
-            let response_result = tokio::task::spawn_blocking(move || {
-                receiver.recv_timeout(crate::core::approval::followup_timeout())
-            })
-            .await;
-
-            // Clean up followup state regardless of outcome
-            crate::core::approval::clear_followup_sender(ctx.task_id.as_str());
-            crate::core::approval::set_followup_question_active(ctx.task_id.as_str(), false);
-
-            let user_response = match response_result {
-                Ok(Ok(r)) => r.trim().to_string(),
-                Ok(Err(_)) | Err(_) => String::new(), // Timeout or channel closed = no response
-            };
-
-            // If user provided feedback, do NOT compact - return feedback as result
-            if !user_response.is_empty() {
-                tracing::info!("User provided feedback on condensation instead of accepting");
-                return Ok(format!(
-                    "User provided feedback on the condensed conversation summary:\n<feedback>\n{user_response}\n</feedback>"
-                ));
-            }
-            // Empty response = user accepted, proceed with compaction
-        } else if ctx.json_output {
-            tracing::warn!("Condense tool auto-accepted in JSON mode (cannot read stdin)");
-        }
 
         // Now acquire state lock for validation and storage
         let mut state = ctx.state.lock().await;
@@ -769,14 +701,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_condense_json_mode_auto_accepts() {
+    async fn test_condense_json_mode_proceeds_without_interactive_approval() {
         use crate::core::tools::ToolContext;
         use std::sync::Arc;
 
         let handler = CondenseHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
 
-        // JSON mode = true, should auto-accept without stdin
+        // JSON mode must compact without an interactive prompt.
         let ctx = ToolContext::new(
             state.clone(),
             None,
@@ -804,12 +736,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_condense_auto_accept_skips_prompt() {
+    async fn test_condense_non_json_proceeds_without_interactive_approval() {
         use crate::core::tools::ToolContext;
         use std::sync::Arc;
+        use std::time::Duration;
 
         let handler = CondenseHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let task_id = "condense-no-prompt";
 
         let ctx = ToolContext::new(
             state.clone(),
@@ -817,21 +751,18 @@ mod tests {
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
             false,
-            "test-task".to_string(),
+            task_id.to_string(),
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
 
-        let result = handler
-            .execute(
-                &ctx,
-                serde_json::json!({
-                    "context": "Test summary",
-                    "auto_accept": true,
-                }),
-            )
-            .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            handler.execute(&ctx, serde_json::json!({"context": "Test summary"})),
+        )
+        .await
+        .expect("non-JSON condense must not wait for interactive approval");
 
         assert!(result.is_ok());
         let text = result.unwrap();
@@ -840,6 +771,7 @@ mod tests {
 
         let state_guard = state.lock().await;
         assert!(state_guard.compacted_summary.is_some());
+        assert!(!crate::core::approval::is_followup_question_active(task_id));
     }
 
     #[cfg(unix)]
@@ -881,13 +813,7 @@ mod tests {
         );
 
         let result = CondenseHandler::new()
-            .execute(
-                &ctx,
-                serde_json::json!({
-                    "context": "Condensed summary",
-                    "auto_accept": true,
-                }),
-            )
+            .execute(&ctx, serde_json::json!({"context": "Condensed summary"}))
             .await;
 
         assert!(matches!(

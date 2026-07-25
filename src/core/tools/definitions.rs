@@ -621,24 +621,14 @@ pub fn condense_schema() -> ToolSchema {
     ToolSchema {
         name: "condense",
         description: "Create a detailed summary of the conversation so far, which will be used to compact the context window while retaining key information.",
-        parameters: vec![
-            ToolParameter {
-                name: "context",
-                required: true,
-                param_type: "string",
-                description: "Detailed summary of the conversation so far, including current work, technical concepts, modified files, problems solved, and exact pending next steps. If applicable based on the current task, this should include previous conversation, current work, key technical concepts, relevant files and code, problem solving, and pending tasks.",
-                items: None,
-                extra: None,
-            },
-            ToolParameter {
-                name: "auto_accept",
-                required: false,
-                param_type: "boolean",
-                description: "When true, skip the interactive approval prompt and proceed with compaction immediately. The model MUST set this to true when responding to a user-initiated `/compact` slash command, since the user has already approved.",
-                items: None,
-                extra: Some(serde_json::json!({"default": false})),
-            },
-        ],
+        parameters: vec![ToolParameter {
+            name: "context",
+            required: true,
+            param_type: "string",
+            description: "Detailed summary of the conversation so far, including current work, technical concepts, modified files, problems solved, and exact pending next steps. If applicable based on the current task, this should include previous conversation, current work, key technical concepts, relevant files and code, problem solving, and pending tasks.",
+            items: None,
+            extra: None,
+        }],
     }
 }
 
@@ -1051,18 +1041,15 @@ mod tests {
     }
 
     #[test]
-    fn test_condense_schema_exposes_auto_accept_default() {
+    fn test_condense_schema_omits_interactive_approval_parameter() {
         let schema = condense_schema();
-        let auto_accept = schema
-            .parameters
-            .iter()
-            .find(|param| param.name == "auto_accept")
-            .expect("condense schema should expose auto_accept");
-
-        assert_eq!(auto_accept.param_type, "boolean");
-        assert_eq!(
-            auto_accept.extra.as_ref(),
-            Some(&serde_json::json!({"default": false}))
+        assert_eq!(schema.parameters.len(), 1);
+        assert_eq!(schema.parameters[0].name, "context");
+        assert!(
+            schema
+                .parameters
+                .iter()
+                .all(|parameter| parameter.name != "auto_accept")
         );
     }
 
