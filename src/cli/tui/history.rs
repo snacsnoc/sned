@@ -5,6 +5,8 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const HISTORY_RECORD_PREFIX: &str = "v1\t";
@@ -67,10 +69,13 @@ fn append_command_to_history(history_path: &Path, command: &str) -> io::Result<(
     let dir = history_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(history_path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(history_path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let encoded = serde_json::to_string(command).map_err(io::Error::other)?;
     writeln!(file, "{HISTORY_RECORD_PREFIX}{encoded}")?;
     Ok(())
@@ -183,6 +188,27 @@ mod tests {
 
         let content = std::fs::read_to_string(&history_path).unwrap();
         assert_eq!(content, "v1\t\"first\"\nv1\t\"second\"\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_append_command_to_history_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let history_path = temp_dir.path().join("cli_history");
+        std::fs::write(&history_path, "existing command\n").unwrap();
+
+        append_command_to_history(&history_path, "next command").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&history_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]
