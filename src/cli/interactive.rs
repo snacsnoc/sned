@@ -1630,25 +1630,34 @@ async fn handle_key_event(
         }
     }
 
-    // Up/Down for command history navigation (only when picker is not active)
-    // Always allow history navigation regardless of cursor position
-    if key.code == KeyCode::Up && !app.picker_active {
+    let cursor_row = app.input.cursor().0;
+    let on_first_input_line = cursor_row == 0;
+    let on_last_input_line = cursor_row.saturating_add(1) >= app.input.lines().len();
+    let can_navigate_history = key.modifiers.is_empty()
+        && !app.picker_active
+        && !app.model_picker_active;
+
+    if key.code == KeyCode::Up && can_navigate_history && on_first_input_line {
         if !app.history.is_navigating() {
             app.history_draft = Some(app.input.lines().join("\n"));
         }
         if let Some(entry) = app.history.navigate_up() {
             let entry = entry.to_string();
-            app.set_input_text(&entry);
+            app.set_input_text_and_cursor(&entry, entry.len());
         }
         return Ok(None);
     }
-    if key.code == KeyCode::Down && !app.picker_active && app.history.is_navigating() {
+    if key.code == KeyCode::Down
+        && can_navigate_history
+        && on_last_input_line
+        && app.history.is_navigating()
+    {
         if let Some(entry) = app.history.navigate_down() {
             let entry = entry.to_string();
-            app.set_input_text(&entry);
+            app.set_input_text_and_cursor(&entry, entry.len());
         } else {
             let draft = app.history_draft.take().unwrap_or_default();
-            app.set_input_text(&draft);
+            app.set_input_text_and_cursor(&draft, draft.len());
         }
         return Ok(None);
     }
@@ -6013,6 +6022,158 @@ mod tests {
         .await?;
         assert!(action.is_none());
         assert_eq!(app.input.lines().join("\n"), "first command");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_history_recall_places_multiline_entries_and_drafts_at_end() -> anyhow::Result<()>
+    {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.history.push("first history entry".to_string());
+        app.history.push("second\nhistory entry".to_string());
+        app.set_input_text_and_cursor("draft\nmessage", "draft".len());
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.input.lines(), ["second", "history entry"]);
+        assert_eq!(app.input.cursor(), (1, "history entry".chars().count()));
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.input.cursor(), (0, "second".chars().count()));
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        handle_key_event(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.input.lines(), ["second", "history entry"]);
+        assert_eq!(app.input.cursor(), (1, "history entry".chars().count()));
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.input.lines(), ["draft", "message"]);
+        assert_eq!(app.input.cursor(), (1, "message".chars().count()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multiline_input_arrows_move_cursor_before_history() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.history.push("history entry".to_string());
+        let input = "first line\nsecond line\nthird line";
+        app.set_input_text_and_cursor(input, "first line\nsecond".len());
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.input.lines().join("\n"), input);
+        assert_eq!(app.input.cursor(), (0, "second".chars().count()));
+        assert!(!app.history.is_navigating());
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.input.cursor(), (1, "second".chars().count()));
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.input.lines().join("\n"), input);
+        assert!(!app.history.is_navigating());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_picker_arrows_take_precedence_over_history() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.history.push("history entry".to_string());
+        app.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
+        app.model_picker_active = true;
+        app.model_picker_selected = 1;
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.model_picker_selected, 0);
+        assert!(!app.history.is_navigating());
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert_eq!(app.model_picker_selected, 1);
 
         Ok(())
     }
