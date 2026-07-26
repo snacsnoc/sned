@@ -698,27 +698,6 @@ pub fn get_active_tool_definitions() -> Vec<ToolDefinition> {
     get_tool_definitions_for_profile(ToolProfile::Full)
 }
 
-/// Returns ToolDefinitions for read-only tools only.
-#[must_use]
-pub fn get_read_only_tool_definitions() -> Vec<ToolDefinition> {
-    let read_only_tools = [
-        SnedTool::ReadFile,
-        SnedTool::ListFiles,
-        SnedTool::SearchFiles,
-        SnedTool::AskFollowupQuestion,
-        SnedTool::GetFunction,
-        SnedTool::GetFileSkeleton,
-        SnedTool::FindSymbolReferences,
-        SnedTool::ListSkills,
-        SnedTool::DiagnosticsScan,
-    ];
-
-    read_only_tools
-        .iter()
-        .map(|&t| get_tool_schema(t).to_tool_definition())
-        .collect()
-}
-
 // ============================================================================
 // Tool Profiles — Adaptive tool sets for request shaping
 // ============================================================================
@@ -1118,12 +1097,6 @@ mod tests {
             "  Tool schemas as % of prompt:    {:5.1}%",
             (total as f64 / (total + sys_prompt_approx) as f64) * 100.0
         );
-    }
-
-    #[test]
-    fn test_read_only_tools_count() {
-        let defs = get_read_only_tool_definitions();
-        assert_eq!(defs.len(), 9);
     }
 
     #[test]

@@ -128,28 +128,6 @@ impl FileWatcher {
         Ok(())
     }
 
-    pub fn unwatch(&mut self, path: &Path) -> Result<(), notify::Error> {
-        let path_buf = path.to_path_buf();
-
-        // Get the actual watched path for this target
-        let watched_path = self.watch_targets.remove(&path_buf);
-        if let Ok(mut mtimes) = self.watched_mtimes.lock() {
-            mtimes.remove(&path_buf);
-        }
-
-        if let Some(watched) = watched_path {
-            // Only unwatch if no other target is using this watched path
-            if !self.watch_targets.values().any(|p| p == &watched) {
-                self.watched_paths.remove(&watched);
-                self.inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .unwatch(&watched)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Check if a path has been modified externally and clear its flag.
     /// Uses canonical path comparison to handle symlinks (e.g., /var vs /private/var on macOS).
     #[must_use]
@@ -202,16 +180,6 @@ impl FileWatcher {
             false
         } else {
             false
-        }
-    }
-
-    /// Get all externally modified paths and clear them.
-    #[must_use]
-    pub fn drain_modified(&self) -> HashSet<PathBuf> {
-        if let Ok(mut set) = self.externally_modified.lock() {
-            std::mem::take(&mut *set)
-        } else {
-            HashSet::new()
         }
     }
 
