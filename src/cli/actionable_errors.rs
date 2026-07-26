@@ -153,44 +153,49 @@ pub fn search_no_results(pattern: &str) -> ActionableError {
 
 /// Add an actionable suggestion to a provider API error.
 #[must_use]
-pub fn provider_error(error_text: &str) -> ActionableError {
-    let lower = error_text.to_lowercase();
-    let suggestion = if lower.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("authentication")
-    {
-        "Check your API key with `sned auth --provider <name>` or set the appropriate environment variable \
-         (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY)."
-            .to_string()
-    } else if lower.contains("429") || lower.contains("rate limit") || lower.contains("quota") {
-        "You've hit a rate limit or quota. Wait a moment and retry, or check your \
-         provider dashboard for usage limits."
-            .to_string()
-    } else if lower.contains("403") || lower.contains("forbidden") {
-        "Your API key does not have access to this model or endpoint. \
-         Check your provider plan and API key permissions."
-            .to_string()
-    } else if lower.contains("404") || lower.contains("not found") {
-        "The model or endpoint was not found. Check the model name with \
-         `/model` or verify the provider configuration."
-            .to_string()
-    } else if lower.contains("500")
-        || lower.contains("502")
-        || lower.contains("503")
-        || lower.contains("internal")
-    {
-        "The provider is experiencing issues. Wait a moment and retry. \
-         If persistent, check the provider status page."
-            .to_string()
-    } else if lower.contains("connection") || lower.contains("timeout") || lower.contains("network")
-    {
-        "Network error — check your internet connection and any proxy/VPN settings. \
-         If the error persists, the provider endpoint may be temporarily unavailable."
-            .to_string()
-    } else {
-        "Check your provider configuration with `sned config --validate`.".to_string()
+pub fn provider_error(error: &crate::providers::ProviderError) -> ActionableError {
+    use crate::providers::ProviderError;
+
+    let suggestion = match error {
+        ProviderError::AuthenticationError(_) => {
+            "Check your API key with `sned auth --provider <name>` or set the appropriate environment variable \
+             (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY)."
+                .to_string()
+        }
+        ProviderError::RateLimitError {
+            retry_delay_ms: Some(delay_ms),
+            ..
+        } => format!(
+            "You've hit a rate limit or quota. The provider requested a retry after {} seconds. \
+             Wait before retrying, or check your provider dashboard for usage limits.",
+            *delay_ms as f64 / 1_000.0
+        ),
+        ProviderError::RateLimitError {
+            retry_delay_ms: None,
+            ..
+        } => "You've hit a rate limit or quota. Wait a moment and retry, or check your \
+              provider dashboard for usage limits."
+            .to_string(),
+        ProviderError::InvalidRequest(_) => {
+            "The provider rejected this request. Check the model name with `/model` or verify \
+             the provider configuration."
+                .to_string()
+        }
+        ProviderError::ApiError(_) => {
+            "The provider is experiencing issues. Wait a moment and retry. \
+             If persistent, check the provider status page."
+                .to_string()
+        }
+        ProviderError::NetworkError(_) => {
+            "Network error — check your internet connection and any proxy/VPN settings. \
+             If the error persists, the provider endpoint may be temporarily unavailable."
+                .to_string()
+        }
+        ProviderError::UnexpectedError(_) => {
+            "Check your provider configuration with `sned config --validate`.".to_string()
+        }
     };
-    ActionableError::with_suggestion(format!("Provider error: {error_text}"), suggestion)
+    ActionableError::with_suggestion(format!("Provider error: {error}"), suggestion)
 }
 
 /// Add an actionable suggestion to an edit anchor mismatch error.
@@ -349,7 +354,9 @@ mod tests {
 
     #[test]
     fn test_provider_auth_error() {
-        let err = provider_error("401 Unauthorized");
+        let err = provider_error(&crate::providers::ProviderError::AuthenticationError(
+            "token rejected".to_string(),
+        ));
         let suggestion = err.suggestion.as_ref().unwrap();
         assert!(suggestion.contains("API key"));
         assert!(suggestion.contains("`sned auth --provider <name>`"));
@@ -357,13 +364,19 @@ mod tests {
 
     #[test]
     fn test_provider_rate_limit() {
-        let err = provider_error("429 Rate limit exceeded");
+        let err = provider_error(&crate::providers::ProviderError::RateLimitError {
+            message: "429 Rate limit exceeded".to_string(),
+            retry_delay_ms: Some(5_000),
+        });
         assert!(err.suggestion.as_ref().unwrap().contains("rate limit"));
+        assert!(err.suggestion.as_ref().unwrap().contains("5 seconds"));
     }
 
     #[test]
     fn test_provider_not_found_error_recommends_model_picker() {
-        let err = provider_error("404 Model not found");
+        let err = provider_error(&crate::providers::ProviderError::InvalidRequest(
+            "404 Model not found".to_string(),
+        ));
         let suggestion = err.suggestion.as_ref().unwrap();
         assert!(suggestion.contains("`/model`"));
         assert!(!suggestion.contains("`/models`"));
@@ -371,7 +384,9 @@ mod tests {
 
     #[test]
     fn test_provider_network_error() {
-        let err = provider_error("Connection timeout");
+        let err = provider_error(&crate::providers::ProviderError::NetworkError(
+            "Connection timeout".to_string(),
+        ));
         assert!(
             err.suggestion
                 .as_ref()

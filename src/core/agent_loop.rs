@@ -31,7 +31,7 @@ use crate::core::tools::{
     ToolContext, ToolFailureClass, ToolFailureMetadata, ToolRegistry, ToolRequiredNextStep,
     coerce_string_array, tool_result_to_text,
 };
-use crate::providers::Providers;
+use crate::providers::{ProviderError, Providers};
 use crate::providers::{
     ApiStreamChunk, ApiStreamToolCall, AssistantContentBlock, MessageContent, MessageRole,
     Provider, ProviderRequest, RedactedThinkingBlock, SharedContentFields, StorageMessage,
@@ -1811,7 +1811,7 @@ impl AgentLoop {
                         let mut state = self.state.lock().await;
                         state.retryable_failed_request = Some(retry_message.clone());
                     }
-                    let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
+                    let actionable = crate::cli::actionable_errors::provider_error(&e);
                     let consecutive_failures = {
                         let state = self.state.lock().await;
                         state.consecutive_provider_failures
@@ -2477,7 +2477,8 @@ impl AgentLoop {
 
             // Wait for stream to complete
             if let Err(e) = stream_handle.await {
-                let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
+                let error = ProviderError::UnexpectedError(e.to_string());
+                let actionable = crate::cli::actionable_errors::provider_error(&error);
                 return TurnResult::Error(actionable.display());
             }
 
@@ -2492,7 +2493,8 @@ impl AgentLoop {
                         error = %err,
                         "stream retry cap exceeded; surfacing error to user"
                     );
-                    let actionable = crate::cli::actionable_errors::provider_error(&err);
+                    let error = ProviderError::NetworkError(err);
+                    let actionable = crate::cli::actionable_errors::provider_error(&error);
                     return TurnResult::Error(format!(
                         "Provider stream failed after {} attempts: {}",
                         stream_retry_attempt + 1,
