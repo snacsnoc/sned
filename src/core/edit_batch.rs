@@ -6,6 +6,34 @@ use crate::core::file_editor::{
     AppliedEdit, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit, split_content_lines,
 };
 use crate::core::hash_utils::format_line_with_hash;
+use std::path::Path;
+
+fn syntax_language_for_path(path: &str) -> &str {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+}
+
+fn highlight_diff_content(content: &str, language: &str, colored: bool) -> String {
+    if colored {
+        crate::cli::syntax_highlight::highlight_code(content, language)
+    } else {
+        content.to_string()
+    }
+}
+
+fn highlighted_line_with_hash(
+    content: &str,
+    hash: &str,
+    language: &str,
+    colored: bool,
+) -> String {
+    format_line_with_hash(
+        &highlight_diff_content(content, language, colored),
+        hash,
+    )
+}
 
 // ============================================================================
 // Batch Types
@@ -257,7 +285,9 @@ impl BatchProcessor {
     #[must_use]
     pub fn generate_diff(&self, display_path: &str, prepared: &PreparedEdits) -> String {
         let mut diff = String::new();
-        if !crate::cli::colors::stdout_colors_disabled() {
+        let colored = !crate::cli::colors::stdout_colors_disabled();
+        let language = syntax_language_for_path(display_path);
+        if colored {
             diff.push_str(&format!(
                 "{}{} Update File: {}{}\n\n",
                 crate::cli::colors::style::BOLD,
@@ -296,7 +326,6 @@ impl BatchProcessor {
                 };
             }
 
-            let colored = !crate::cli::colors::stdout_colors_disabled();
             if colored {
                 diff.push_str(&format!(
                     "{}<<<<<<< SEARCH{}\n",
@@ -307,7 +336,9 @@ impl BatchProcessor {
                 diff.push_str("<<<<<<< SEARCH\n");
             }
             for line in &search_lines {
-                diff.push_str(&crate::cli::colors::diff_removal(line));
+                diff.push_str(&crate::cli::colors::diff_removal(&highlight_diff_content(
+                    line, language, colored,
+                )));
                 diff.push('\n');
             }
             if colored {
@@ -316,7 +347,9 @@ impl BatchProcessor {
                 diff.push_str("=======\n");
             }
             for line in &replace_lines {
-                diff.push_str(&crate::cli::colors::diff_addition(line));
+                diff.push_str(&crate::cli::colors::diff_addition(&highlight_diff_content(
+                    line, language, colored,
+                )));
                 diff.push('\n');
             }
             if colored {
@@ -338,11 +371,14 @@ impl BatchProcessor {
     #[must_use]
     pub fn format_result(
         &self,
+        display_path: &str,
         prepared: &PreparedEdits,
         final_lines: &[String],
         final_hashes: &[String],
         diagnostics: Option<&DiagnosticsResult>,
     ) -> String {
+        let colored = !crate::cli::colors::stdout_colors_disabled();
+        let language = syntax_language_for_path(display_path);
         let mut total_added = 0;
         let mut total_removed = 0;
         let mut applied_diffs: Vec<String> = Vec::new();
@@ -356,9 +392,23 @@ impl BatchProcessor {
             total_removed += removed;
 
             let diff_block = if self.diff_mode == DiffMode::AdditionsOnly {
-                self.get_addition_only_diff_block(prepared, final_lines, final_hashes, applied)
+                self.get_addition_only_diff_block(
+                    prepared,
+                    final_lines,
+                    final_hashes,
+                    applied,
+                    language,
+                    colored,
+                )
             } else {
-                self.get_diff_block(prepared, final_lines, final_hashes, applied)
+                self.get_diff_block(
+                    prepared,
+                    final_lines,
+                    final_hashes,
+                    applied,
+                    language,
+                    colored,
+                )
             };
             applied_diffs.push(diff_block);
         }
@@ -375,7 +425,9 @@ impl BatchProcessor {
                 final_lines
                     .iter()
                     .zip(final_hashes.iter())
-                    .map(|(line, hash)| format_line_with_hash(line, hash))
+                    .map(|(line, hash)| {
+                        highlighted_line_with_hash(line, hash, language, colored)
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             ));
@@ -437,6 +489,8 @@ impl BatchProcessor {
         final_lines: &[String],
         final_hashes: &[String],
         applied: &AppliedEdit,
+        language: &str,
+        colored: bool,
     ) -> String {
         let context_count = 3;
         let mut res: Vec<String> = Vec::new();
@@ -451,7 +505,12 @@ impl BatchProcessor {
         for i in before_start..applied.original_start_idx {
             res.push(format!(
                 " {}",
-                format_line_with_hash(&prepared.lines[i], &prepared.line_hashes[i])
+                highlighted_line_with_hash(
+                    &prepared.lines[i],
+                    &prepared.line_hashes[i],
+                    language,
+                    colored,
+                )
             ));
         }
 
@@ -503,7 +562,7 @@ impl BatchProcessor {
                 res.push(format!(
                     "{}{}",
                     prefix,
-                    format_line_with_hash(&final_lines[i], hash)
+                    highlighted_line_with_hash(&final_lines[i], hash, language, colored)
                 ));
             }
         }
@@ -516,7 +575,12 @@ impl BatchProcessor {
                 for i in after_start..=after_end {
                     res.push(format!(
                         " {}",
-                        format_line_with_hash(&final_lines[i], &final_hashes[i])
+                        highlighted_line_with_hash(
+                            &final_lines[i],
+                            &final_hashes[i],
+                            language,
+                            colored,
+                        )
                     ));
                 }
             }
@@ -532,6 +596,8 @@ impl BatchProcessor {
         final_lines: &[String],
         final_hashes: &[String],
         applied: &AppliedEdit,
+        language: &str,
+        colored: bool,
     ) -> String {
         let context_before_count = 3;
         let context_after_count = 3;
@@ -546,10 +612,14 @@ impl BatchProcessor {
             .original_start_idx
             .saturating_sub(context_before_count);
         for i in before_start..applied.original_start_idx {
-            res.push(crate::cli::colors::diff_context(&format_line_with_hash(
-                &prepared.lines[i],
-                &prepared.line_hashes[i],
-            )));
+            res.push(crate::cli::colors::diff_context(
+                &highlighted_line_with_hash(
+                    &prepared.lines[i],
+                    &prepared.line_hashes[i],
+                    language,
+                    colored,
+                ),
+            ));
         }
 
         let final_hashes_set: std::collections::HashSet<&String> = final_range_end
@@ -557,10 +627,14 @@ impl BatchProcessor {
             .unwrap_or_default();
         for i in applied.original_start_idx..=applied.original_end_idx {
             if !final_hashes_set.contains(&prepared.line_hashes[i]) {
-                res.push(crate::cli::colors::diff_removal(&format_line_with_hash(
-                    &prepared.lines[i],
-                    &prepared.line_hashes[i],
-                )));
+                res.push(crate::cli::colors::diff_removal(
+                    &highlighted_line_with_hash(
+                        &prepared.lines[i],
+                        &prepared.line_hashes[i],
+                        language,
+                        colored,
+                    ),
+                ));
             }
         }
 
@@ -571,7 +645,8 @@ impl BatchProcessor {
         if let Some(end) = final_range_end {
             for i in applied.start_idx..=end {
                 let hash = &final_hashes[i];
-                let line = format_line_with_hash(&final_lines[i], hash);
+                let line =
+                    highlighted_line_with_hash(&final_lines[i], hash, language, colored);
                 if original_hashes_set.contains(hash) {
                     res.push(crate::cli::colors::diff_context(&line));
                 } else {
@@ -585,10 +660,14 @@ impl BatchProcessor {
             let after_end = last_idx.min(applied.end_idx.saturating_add(context_after_count));
             if after_start <= after_end {
                 for i in after_start..=after_end {
-                    res.push(crate::cli::colors::diff_context(&format_line_with_hash(
-                        &final_lines[i],
-                        &final_hashes[i],
-                    )));
+                    res.push(crate::cli::colors::diff_context(
+                        &highlighted_line_with_hash(
+                            &final_lines[i],
+                            &final_hashes[i],
+                            language,
+                            colored,
+                        ),
+                    ));
                 }
             }
         }
@@ -901,7 +980,8 @@ mod tests {
         let final_lines = prepared.final_lines.clone();
         let final_hashes = anchor_mgr.reconcile("/tmp/format.rs", &final_lines, Some(task_id));
 
-        let formatted = processor.format_result(&prepared, &final_lines, &final_hashes, None);
+        let formatted =
+            processor.format_result("format.rs", &prepared, &final_lines, &final_hashes, None);
 
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
         assert!(formatted.contains("NOTE the UPDATED anchors below"));
@@ -941,6 +1021,7 @@ mod tests {
         };
         let processor = BatchProcessor::new(DiffMode::Full);
         let formatted = processor.format_result(
+            "duplicate.rs",
             &prepared,
             &prepared.final_lines,
             &["duplicate".to_string()],
@@ -983,7 +1064,13 @@ mod tests {
         let final_lines = prepared.final_lines.clone();
         let final_hashes = anchor_mgr.reconcile("/tmp/additions.rs", &final_lines, Some(task_id));
 
-        let formatted = processor.format_result(&prepared, &final_lines, &final_hashes, None);
+        let formatted = processor.format_result(
+            "additions.rs",
+            &prepared,
+            &final_lines,
+            &final_hashes,
+            None,
+        );
 
         // In additions-only mode, deleted lines should show as "X lines have been deleted"
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
@@ -1023,8 +1110,13 @@ mod tests {
                     .to_string(),
         };
 
-        let formatted =
-            processor.format_result(&prepared, &final_lines, &final_hashes, Some(&diagnostics));
+        let formatted = processor.format_result(
+            "diag.rs",
+            &prepared,
+            &final_lines,
+            &final_hashes,
+            Some(&diagnostics),
+        );
 
         assert!(formatted.contains("Fixed 2 linter error(s)."));
         assert!(formatted.contains("New problems detected after saving the file:"));
@@ -1091,6 +1183,27 @@ mod tests {
 
         // Note: ANSI color codes won't be present in non-TTY test environment
         // This is correct behavior - colors respect NO_COLOR and TTY detection
+    }
+
+    #[cfg(feature = "lang-rust")]
+    #[test]
+    fn test_diff_content_uses_file_language_for_highlighting() {
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let previous = std::env::var_os("NO_COLOR");
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+        }
+        let highlighted = highlight_diff_content("let value: i32 = 1;", "rs", true);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("NO_COLOR", value),
+                None => std::env::remove_var("NO_COLOR"),
+            }
+        }
+
+        assert!(highlighted.contains("\x1b["));
+        assert!(highlighted.contains("let"));
+        assert!(highlighted.contains("i32"));
     }
 
     #[test]

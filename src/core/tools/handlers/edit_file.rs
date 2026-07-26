@@ -12,7 +12,10 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
 use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits};
-use crate::core::file_editor::{AnchorStateManager, Edit, FileEditGuard, FileEditorError};
+use crate::core::file_editor::{
+    AnchorStateManager, Edit, FileEditGuard, FileEditorError, FileTextFormat,
+    normalize_file_content, restore_file_content,
+};
 use crate::core::hash_utils::{ANCHOR_DELIMITER, split_anchor, strip_hashes};
 use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
 use crate::core::tools::handlers::error_guidance;
@@ -343,7 +346,7 @@ impl EditFileHandler {
                 }
             };
             if let Ok(resolved) = self.resolve_path(workspace_root, path) {
-                affected_paths.push(resolved);
+                affected_paths.push(resolved.clone());
             }
 
             let edits: &[serde_json::Value] = file
@@ -586,6 +589,20 @@ impl EditFileHandler {
             .map(|(path, _)| Ok((path.clone(), self.resolve_path(workspace_root, path)?)))
             .collect();
         let resolved_paths = resolved_paths?;
+        let mut missing_paths: Vec<&str> = resolved_paths
+            .iter()
+            .filter_map(|(display_path, absolute_path)| {
+                (!Path::new(absolute_path).exists()).then_some(display_path.as_str())
+            })
+            .collect();
+        if !missing_paths.is_empty() {
+            missing_paths.sort_unstable();
+            missing_paths.dedup();
+            return Err(ToolError::InvalidInput(format!(
+                "edit_file only edits existing files and cannot create new files. Missing target(s): {}. Use write_to_file to create new files.",
+                missing_paths.join(", ")
+            )));
+        }
 
         let batches =
             processor.group_edits_by_path(&parsed, &|path| resolved_paths.get(path).cloned());
@@ -600,6 +617,7 @@ impl EditFileHandler {
         let mut diff_previews: Vec<String> = Vec::new();
         let mut prepared_batches: Vec<(crate::core::edit_batch::FileEditBatch, PreparedEdits)> =
             Vec::new();
+        let mut file_text_formats: HashMap<String, FileTextFormat> = HashMap::new();
 
         // Phase 1: Prepare all batches and collect diff previews
         for batch in batches {
@@ -666,16 +684,15 @@ impl EditFileHandler {
                 }
             }
 
-            let (content, initial_mtime) = match tokio::fs::metadata(&batch.absolute_path).await {
+            let (raw_content, initial_mtime) = match tokio::fs::metadata(&batch.absolute_path).await
+            {
                 Ok(metadata) => {
                     let mtime = metadata.modified().ok();
                     match tokio::fs::read_to_string(&batch.absolute_path).await {
                         Ok(content) => (content, mtime),
                         Err(e) => {
-                            all_results.push(format!(
-                                "Error reading file {}: {}",
-                                batch.display_path, e
-                            ));
+                            all_results
+                                .push(format!("Error reading file {}: {}", batch.display_path, e));
                             total_failed += 1;
                             continue;
                         }
@@ -684,10 +701,8 @@ impl EditFileHandler {
                 Err(_) => match tokio::fs::read_to_string(&batch.absolute_path).await {
                     Ok(content) => (content, None),
                     Err(e) => {
-                        all_results.push(format!(
-                            "Error reading file {}: {}",
-                            batch.display_path, e
-                        ));
+                        all_results
+                            .push(format!("Error reading file {}: {}", batch.display_path, e));
                         total_failed += 1;
                         continue;
                     }
@@ -696,7 +711,7 @@ impl EditFileHandler {
 
             if expected_content
                 .as_ref()
-                .is_some_and(|expected| expected != &content)
+                .is_some_and(|expected| expected != &raw_content)
             {
                 Self::mark_must_reread(state, &batch.absolute_path);
                 return Err(Self::external_modification_error(
@@ -704,6 +719,9 @@ impl EditFileHandler {
                     &batch.absolute_path,
                 ));
             }
+
+            let (content, text_format) = normalize_file_content(&raw_content);
+            file_text_formats.insert(batch.absolute_path.clone(), text_format);
 
             // Track file read for stale context detection
             state
@@ -828,7 +846,9 @@ impl EditFileHandler {
                         // Proceed with edits
                     }
                     Err(e) => {
-                        return Err(ToolError::ExecutionFailed(format!("Approval error: {e}")));
+                        return Err(ToolError::ExecutionFailed(
+                            crate::core::approval::format_approval_error(None, &e),
+                        ));
                     }
                 }
             }
@@ -939,10 +959,14 @@ impl EditFileHandler {
             if result.success && result.resolved_count > 0 {
                 // Collect for write phase (Phase 4b)
                 if let Some(ref final_content) = result.final_content {
+                    let text_format = file_text_formats
+                        .get(&batch.absolute_path)
+                        .copied()
+                        .unwrap_or_default();
                     write_items.push(WriteItem {
                         absolute_path: batch.absolute_path.clone(),
                         display_path: batch.display_path.clone(),
-                        final_content: final_content.clone(),
+                        final_content: restore_file_content(final_content, text_format),
                         initial_mtime: prepared.initial_mtime,
                     });
                 }
@@ -1280,6 +1304,7 @@ impl EditFileHandler {
             };
 
             let formatted = processor.format_result(
+                &file_result.batch_display_path,
                 &file_result.prepared,
                 &file_result.final_lines,
                 &file_result.final_hashes,
@@ -1969,12 +1994,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_file_validates_anchors_before_processing() {
+        let temp = tempfile::TempDir::new().expect("temp directory should be created");
+        std::fs::write(temp.path().join("test.rs"), "fn main() {}\n")
+            .expect("test file should be written");
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
             state,
             None,
-            std::env::current_dir().unwrap(),
+            temp.path().to_path_buf(),
             AnchorStateManager::new(),
             false,
             "test-task".to_string(),
@@ -2008,13 +2036,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_file_validates_end_anchor() {
+    async fn test_edit_file_missing_target_directs_creation_to_write_to_file() {
+        let temp = tempfile::TempDir::new().expect("temp directory should be created");
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
             state,
             None,
-            std::env::current_dir().unwrap(),
+            temp.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": [{
+                "path": "new.rs",
+                "edits": [{
+                    "anchor": "Main§fn main() {}",
+                    "text": "fn main() {}"
+                }]
+            }]
+        });
+
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("edit_file should reject a missing target");
+
+        assert!(error.to_string().contains("write_to_file"));
+        assert!(!temp.path().join("new.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_validates_end_anchor() {
+        let temp = tempfile::TempDir::new().expect("temp directory should be created");
+        std::fs::write(temp.path().join("test.rs"), "fn main() {}\n")
+            .expect("test file should be written");
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            temp.path().to_path_buf(),
             AnchorStateManager::new(),
             false,
             "test-task".to_string(),
@@ -2426,6 +2491,61 @@ mod tests {
         assert_eq!(final_content, "alpha\ngamma\n");
 
         let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_preserves_bom_and_crlf_while_using_normalized_anchors() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("windows.txt");
+        let raw_content = "\u{feff}alpha\r\nbeta\r\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let handler = EditFileHandler::new();
+        let read_handler = crate::core::tools::handlers::read_file::ReadFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "windows-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let read_output = ToolHandler::execute(
+            &read_handler,
+            &ctx,
+            serde_json::json!({"paths": ["windows.txt"]}),
+        )
+        .await
+        .expect("read_file should read the CRLF file");
+        let beta_anchor = read_output
+            .as_str()
+            .and_then(|output| output.lines().find(|line| line.ends_with("§beta")))
+            .expect("read_file should emit a normalized beta anchor")
+            .to_string();
+        let params = serde_json::json!({
+            "files": [{
+                "path": "windows.txt",
+                "edits": [{
+                    "anchor": beta_anchor,
+                    "edit_type": "replace",
+                    "text": "gamma"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "\u{feff}alpha\r\ngamma\r\n"
+        );
     }
 
     #[tokio::test]
@@ -3253,8 +3373,8 @@ edition = "2021"
 
             let result = ToolHandler::execute(&handler, &ctx, params).await;
             assert!(
-                result.is_ok() || result.unwrap_err().to_string().contains("file not found"),
-                "edit_type '{}' should be accepted (file not found error is expected)",
+                result.is_ok() || result.unwrap_err().to_string().contains("write_to_file"),
+                "edit_type '{}' should be accepted (missing-target guidance is expected)",
                 edit_type
             );
         }

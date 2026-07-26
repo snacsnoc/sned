@@ -10,7 +10,7 @@
 //! - Handle errors gracefully
 
 use crate::core::agent_loop::TaskState;
-use crate::core::file_editor::{AnchorStateManager, split_content_lines};
+use crate::core::file_editor::{AnchorStateManager, normalize_file_content, split_content_lines};
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use futures::StreamExt;
@@ -462,6 +462,8 @@ impl ReadFileHandler {
         if all_lines.is_empty() || ended_with_newline {
             all_lines.push(String::new());
         }
+        let (normalized_content, _) = normalize_file_content(&all_lines.join("\n"));
+        all_lines = split_content_lines(&normalized_content);
         let total_lines = all_lines.len();
 
         let original_start = start_line.unwrap_or(1);
@@ -531,6 +533,7 @@ impl ReadFileHandler {
             }
         };
 
+        let (content, _) = normalize_file_content(&content);
         let lines = split_content_lines(&content);
 
         Ok((content, lines))
@@ -600,6 +603,7 @@ impl ReadFileHandler {
             }
         };
 
+        let (content, _) = normalize_file_content(&content);
         let lines: Vec<String> = split_content_lines(&content);
         Ok((content, lines))
     }
@@ -1186,19 +1190,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_lines_range_preserves_split_content_semantics() {
+    async fn test_read_lines_range_normalizes_bom_and_crlf() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(b"first\r\nsecond\n").unwrap();
+        temp_file
+            .write_all(b"\xEF\xBB\xBFfirst\r\nsecond\r\n")
+            .unwrap();
 
         let (_, sliced_lines, _, full_lines, range_start, range_end) = ReadFileHandler::new()
             .read_lines_range(temp_file.path().to_str().unwrap(), Some(1), Some(3), 1024)
             .await
             .unwrap();
 
-        let expected = vec!["first\r".to_string(), "second".to_string(), String::new()];
+        let expected = vec!["first".to_string(), "second".to_string(), String::new()];
         assert_eq!(sliced_lines, expected);
         assert_eq!(full_lines.unwrap(), expected);
         assert_eq!((range_start, range_end), (0, 3));
+    }
+
+    #[tokio::test]
+    async fn test_read_full_file_normalizes_bom_and_crlf() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"\xEF\xBB\xBFfirst\r\nsecond\r\n")
+            .unwrap();
+
+        let (content, lines) = ReadFileHandler::new()
+            .read_full_file(temp_file.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(content, "first\nsecond\n");
+        assert_eq!(
+            lines,
+            vec!["first".to_string(), "second".to_string(), String::new()]
+        );
     }
 
     #[tokio::test]

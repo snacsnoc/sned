@@ -215,7 +215,7 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit one or more files by replacing, inserting after, or inserting before specific lines. CRITICAL: You MUST read files first using read_file to get the current hash-anchored lines. Use the EXACT anchor strings from read_file output (format: Word§line content). Each file contains an array of edits. EDIT TYPES: 1. replace (default): Replaces an inclusive range of lines from anchor to end_anchor. If end_anchor is omitted, defaults to anchor (single-line replace). 2. insert_after: Inserts the provided text immediately after the line specified by anchor. 3. insert_before: Inserts the provided text immediately before the line specified by anchor.",
+        description: "Edit one or more existing files by replacing, inserting after, or inserting before specific lines. edit_file does not create files; use write_to_file for a new file. CRITICAL: You MUST read files first using read_file to get the current hash-anchored lines. Use the EXACT anchor strings from read_file output (format: Word§line content). Each file contains an array of edits. EDIT TYPES: 1. replace (default): Replaces an inclusive range of lines from anchor to end_anchor. If end_anchor is omitted, defaults to anchor (single-line replace). 2. insert_after: Inserts the provided text immediately after the line specified by anchor. 3. insert_before: Inserts the provided text immediately before the line specified by anchor.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
@@ -226,7 +226,7 @@ pub fn edit_file_schema() -> ToolSchema {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "The path of the file to edit (relative to the current working directory)."
+                        "description": "The path of an existing file to edit (relative to the workspace root). Use write_to_file when creating a new file."
                     },
                     "edits": {
                         "type": "array",
@@ -993,7 +993,25 @@ mod tests {
 
     #[test]
     fn test_edit_file_definition() {
-        let def = edit_file_schema().to_tool_definition();
+        let schema = edit_file_schema();
+        assert!(schema.description.contains("does not create files"));
+        assert!(schema.description.contains("write_to_file"));
+
+        let files = schema
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "files")
+            .expect("edit_file should expose files");
+        let path_description = files
+            .items
+            .as_ref()
+            .and_then(|items| items.pointer("/properties/path/description"))
+            .and_then(serde_json::Value::as_str)
+            .expect("edit_file file entries should describe path");
+        assert!(path_description.contains("existing file"));
+        assert!(path_description.contains("write_to_file"));
+
+        let def = schema.to_tool_definition();
         assert_eq!(def.function.name, "edit_file");
 
         let params = def.function.parameters.as_object().unwrap();

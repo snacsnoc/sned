@@ -31,6 +31,78 @@ pub fn split_content_lines(content: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileLineEnding {
+    Lf,
+    CrLf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileTextFormat {
+    pub line_ending: FileLineEnding,
+    pub has_utf8_bom: bool,
+}
+
+impl Default for FileTextFormat {
+    fn default() -> Self {
+        Self {
+            line_ending: FileLineEnding::Lf,
+            has_utf8_bom: false,
+        }
+    }
+}
+
+pub(crate) fn normalize_file_content(content: &str) -> (String, FileTextFormat) {
+    let has_utf8_bom = content.starts_with('\u{feff}');
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let line_ending = content
+        .as_bytes()
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(FileLineEnding::Lf, |index| {
+            if index > 0 && content.as_bytes()[index - 1] == b'\r' {
+                FileLineEnding::CrLf
+            } else {
+                FileLineEnding::Lf
+            }
+        });
+    let normalized = if content.contains("\r\n") {
+        content.replace("\r\n", "\n")
+    } else {
+        content.to_string()
+    };
+    (
+        normalized,
+        FileTextFormat {
+            line_ending,
+            has_utf8_bom,
+        },
+    )
+}
+
+pub(crate) fn restore_file_content(content: &str, format: FileTextFormat) -> String {
+    let content = match format.line_ending {
+        FileLineEnding::Lf => content.to_string(),
+        FileLineEnding::CrLf => {
+            let mut restored = String::with_capacity(content.len());
+            let mut previous_was_cr = false;
+            for character in content.chars() {
+                if character == '\n' && !previous_was_cr {
+                    restored.push('\r');
+                }
+                restored.push(character);
+                previous_was_cr = character == '\r';
+            }
+            restored
+        }
+    };
+    if format.has_utf8_bom {
+        format!("\u{feff}{content}")
+    } else {
+        content
+    }
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -1123,6 +1195,41 @@ impl FileEditor {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_file_content_normalization_preserves_original_text_format() {
+        let raw = "\u{feff}first\r\nsecond\r\n";
+
+        let (normalized, format) = normalize_file_content(raw);
+
+        assert_eq!(normalized, "first\nsecond\n");
+        assert_eq!(format.line_ending, FileLineEnding::CrLf);
+        assert!(format.has_utf8_bom);
+        assert_eq!(restore_file_content(&normalized, format), raw);
+    }
+
+    #[test]
+    fn test_file_content_normalization_keeps_replacement_text_out_of_scope() {
+        let replacement = "literal\rvalue";
+
+        assert_eq!(
+            split_content_lines(replacement),
+            vec!["literal\rvalue".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_crlf_restoration_does_not_double_existing_carriage_returns() {
+        let format = FileTextFormat {
+            line_ending: FileLineEnding::CrLf,
+            has_utf8_bom: false,
+        };
+
+        assert_eq!(
+            restore_file_content("first\r\nsecond\nliteral\rvalue", format),
+            "first\r\nsecond\r\nliteral\rvalue"
+        );
+    }
 
     #[test]
     fn test_anchor_state_manager_first_read() {
