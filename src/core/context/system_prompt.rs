@@ -14,7 +14,6 @@ pub struct SystemPromptContext {
     pub cwd: Option<String>,
     pub ide: String,
     pub supports_browser_use: bool,
-    pub yolo_mode_toggled: bool,
     pub sned_web_tools_enabled: bool,
     pub provider_info: ProviderInfo,
     pub preferred_language_instructions: Option<String>,
@@ -156,12 +155,6 @@ QWEN MODEL GUIDANCE
              - Do not delete, reset, overwrite user work, expose secrets, or run destructive commands unless the user explicitly requested it and tool approvals allow it.\n\
              - If required information is missing and available tools cannot get it, ask one focused follow-up question.\n",
         );
-
-        if self.context.yolo_mode_toggled {
-            prompt.push_str(
-                "- You are running in fully autonomous mode. Keep CPU and RAM usage reasonable when using `execute_command`.\n",
-            );
-        }
 
         prompt.push_str(
             "\nOUTPUT FORMAT\n\
@@ -411,19 +404,6 @@ mod tests {
                 "expected {marker} to be emitted once"
             );
         }
-    }
-
-    #[test]
-    fn test_prompt_builder_yolo_mode() {
-        let context = SystemPromptContext {
-            yolo_mode_toggled: true,
-            ..Default::default()
-        };
-
-        let builder = PromptBuilder::new(context);
-        let prompt = builder.build();
-
-        assert!(prompt.contains("fully autonomous mode"));
     }
 
     #[test]

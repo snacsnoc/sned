@@ -580,14 +580,6 @@ pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -
         lines.push("  Enabled:   false".to_string());
     }
     lines.push(format!(
-        "  Yolo Mode: {}",
-        if state.yolo_mode_toggled {
-            "true"
-        } else {
-            "false"
-        }
-    ));
-    lines.push(format!(
         "  Auto-Approve-All: {}",
         if state.auto_approve_all_toggled {
             "true"

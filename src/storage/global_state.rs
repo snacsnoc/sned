@@ -73,8 +73,6 @@ pub struct GlobalState {
     #[serde(default = "default_true")]
     pub hooks_enabled: bool,
     #[serde(default)]
-    pub yolo_mode_toggled: bool,
-    #[serde(default)]
     pub auto_approve_all_toggled: bool,
     #[serde(default = "default_true")]
     pub use_auto_condense: bool,
