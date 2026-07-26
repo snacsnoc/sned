@@ -159,7 +159,7 @@ pub fn provider_error(error_text: &str) -> ActionableError {
         || lower.contains("unauthorized")
         || lower.contains("authentication")
     {
-        "Check your API key with `sned config` or set the appropriate environment variable \
+        "Check your API key with `sned auth --provider <name>` or set the appropriate environment variable \
          (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY)."
             .to_string()
     } else if lower.contains("429") || lower.contains("rate limit") || lower.contains("quota") {
@@ -350,7 +350,9 @@ mod tests {
     #[test]
     fn test_provider_auth_error() {
         let err = provider_error("401 Unauthorized");
-        assert!(err.suggestion.as_ref().unwrap().contains("API key"));
+        let suggestion = err.suggestion.as_ref().unwrap();
+        assert!(suggestion.contains("API key"));
+        assert!(suggestion.contains("`sned auth --provider <name>`"));
     }
 
     #[test]

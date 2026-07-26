@@ -1215,6 +1215,11 @@ impl AgentLoop {
                 let state = self.state.lock().await;
                 if state.is_cancelled {
                     drop(state);
+                    if !self.config.json_output {
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::info("Cancelled. Type /retry to resend."));
+                    }
                     // Execute full abort sequence: TaskCancel hook, state save, resource cleanup
                     let cancellation_handler =
                         crate::core::cancellation::CancellationHandler::new(self.state.clone());
@@ -1479,6 +1484,11 @@ impl AgentLoop {
                 }
                 TurnResult::Cancelled => {
                     self.current_turn_retry_candidate = None;
+                    if !self.config.json_output {
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::info("Cancelled. Type /retry to resend."));
+                    }
                     // Force-save conversation history immediately on cancellation (W4 fix)
                     // Bypass the 5-turn debounce to prevent data loss
                     if let Some(ref storage) = self.deps.task_storage {
@@ -1521,8 +1531,7 @@ impl AgentLoop {
                 }
                 TurnResult::Error(e) => {
                     self.current_turn_retry_candidate = None;
-                    // Emit error to output (visible in TUI and logged)
-                    self.config.output_writer.emit(OutputEvent::error(&e));
+                    self.config.output_writer.emit(OutputEvent::error_box(&e));
 
                     // Rollback the user message that was never processed by the model.
                     // Only rollback for context-window errors to prevent compounding failure.
@@ -2410,10 +2419,9 @@ impl AgentLoop {
                             );
                             emitted_output_this_attempt = true;
                         } else {
-                            // Emit to output_writer so TUI users see the error in the output pane
                             self.config
                                 .output_writer
-                                .emit(OutputEvent::plain(format!("Error: {err}")));
+                                .emit(OutputEvent::error(format!("Provider stream error: {err}")));
                             emitted_output_this_attempt = true;
                         }
                     }
@@ -5455,17 +5463,19 @@ mod tests {
             }
             other => panic!("expected stream error, got {:?}", other),
         }
-        let rendered = drain_rendered_output(&mut rx);
-        assert!(rendered.iter().any(|line| line.contains("partial output")));
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(
+            |event| matches!(event, OutputEvent::Line(line) if line.to_string().contains("partial output"))
+        ));
         assert!(
-            rendered
+            events
                 .iter()
-                .any(|line| line.contains("error decoding response body"))
+                .any(|event| matches!(event, OutputEvent::Line(line) if line.to_string().contains("[sned] ERROR: Provider stream error: OpenAI SSE stream error: error decoding response body (retryable)")))
         );
         assert!(
-            !rendered
+            !events
                 .iter()
-                .any(|line| line.contains("should not be used"))
+                .any(|event| matches!(event, OutputEvent::Line(line) if line.to_string().contains("should not be used")))
         );
         assert!(
             !agent
@@ -5628,7 +5638,10 @@ mod tests {
         let provider = Arc::new(Providers::Mock(
             crate::providers::mock::MockProvider::single_text_response("should not run"),
         ));
-        let mut agent = AgentLoop::new(test_agent_config(provider, "test-run-pending-cancel"));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut config = test_agent_config(provider, "test-run-pending-cancel");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
         {
             let mut state = agent.state.lock().await;
             state.is_cancelled = true;
@@ -5641,6 +5654,10 @@ mod tests {
         let result = agent.run(vec![], state_manager).await;
         assert!(result.is_ok(), "pending cancellation should exit cleanly");
         assert!(agent.state.lock().await.is_cancelled);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(OutputEvent::Line(line)) if line.to_string() == "[sned] Cancelled. Type /retry to resend."
+        ));
 
         // SAFETY: restore the process environment for later tests.
         unsafe {

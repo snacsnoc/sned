@@ -1434,6 +1434,7 @@ async fn run_agent_task(
 /// forever, since the queue is consumed by the agent's `run()` loop,
 /// which is no longer running.
 async fn cancel_agent(
+    app: &mut App,
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _agent_done: &Arc<tokio::sync::Notify>,
@@ -1463,6 +1464,8 @@ async fn cancel_agent(
     if let Some(task) = task_opt {
         task.abort();
     }
+
+    app.push_plain("Cancelled. Type /retry to resend.");
 
     // Reset unconditionally: covers both abort (epilogue never runs) and
     // natural completion (epilogue may have run before abort, setting the
@@ -3294,8 +3297,14 @@ async fn run_main_loop(
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 app.force_bottom();
-                                cancel_agent(&state_handle, &agent_task, &agent_done, &agent_busy)
-                                    .await?;
+                                cancel_agent(
+                                    app,
+                                    &state_handle,
+                                    &agent_task,
+                                    &agent_done,
+                                    &agent_busy,
+                                )
+                                .await?;
                                 app.push_plain("^C");
                                 app.agent_busy = false;
                             }
@@ -3356,10 +3365,15 @@ async fn run_main_loop(
 
                         // If agent is busy, cancel it
                         if agent_busy.load(Ordering::Relaxed) {
-                            cancel_agent(&state_handle, &agent_task, &agent_done, &agent_busy)
-                                .await?;
+                            cancel_agent(
+                                app,
+                                &state_handle,
+                                &agent_task,
+                                &agent_done,
+                                &agent_busy,
+                            )
+                            .await?;
                             app.agent_busy = false;
-                            app.push_styled("^C cancelled", Style::default().fg(theme::WARNING_FG));
                             app.push_styled(
                                 "Press Ctrl+C again to quit.",
                                 Style::default().fg(theme::WARNING_FG),
@@ -3737,13 +3751,6 @@ async fn run_main_loop(
             agent_busy.store(false, Ordering::Relaxed);
             app.agent_busy = false;
             app.needs_redraw = true;
-            // Check if task was cancelled — if so, allow user to exit
-            let task_was_cancelled = if let Some(state_arc) = state_handle.lock().await.as_ref() {
-                let state = state_arc.lock().await;
-                state.is_cancelled
-            } else {
-                false
-            };
             let start_opt = agent_start_time.lock().await.take();
             if let Some(start) = start_opt {
                 let elapsed = start.elapsed();
@@ -3754,13 +3761,6 @@ async fn run_main_loop(
                 );
                 // Turn separator after agent completion
                 app.push_turn_separator();
-            }
-            // If task was cancelled, show message and allow immediate exit via /exit or Ctrl+C
-            if task_was_cancelled {
-                app.push_styled(
-                    "Task cancelled. Type /exit to quit.",
-                    Style::default().fg(theme::WARNING_FG),
-                );
             }
         }
 
@@ -8051,11 +8051,12 @@ mod tests {
 
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_busy = Arc::new(AtomicBool::new(true));
+        let mut app = App::new();
         // None state_handle skips the `running_command_pids` block.
         let state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>> =
             Arc::new(Mutex::new(None));
 
-        cancel_agent(&state_handle, &task_slot, &agent_done, &agent_busy)
+        cancel_agent(&mut app, &state_handle, &task_slot, &agent_done, &agent_busy)
             .await
             .unwrap();
 
@@ -8063,6 +8064,10 @@ mod tests {
             !agent_busy.load(Ordering::Relaxed),
             "agent_busy atomic must be reset to false after cancel_agent, \
              otherwise subsequent prompts are enqueued forever"
+        );
+        assert_eq!(
+            app.output_lines.back().map(App::line_to_string).as_deref(),
+            Some("Cancelled. Type /retry to resend.")
         );
     }
 
@@ -8078,12 +8083,13 @@ mod tests {
 
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_busy = Arc::new(AtomicBool::new(true));
+        let mut app = App::new();
         let state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>> =
             Arc::new(Mutex::new(None));
 
         tokio::time::timeout(
             Duration::from_millis(200),
-            cancel_agent(&state_handle, &task_slot, &agent_done, &agent_busy),
+            cancel_agent(&mut app, &state_handle, &task_slot, &agent_done, &agent_busy),
         )
         .await
         .expect("cancel_agent should not wait for agent_done notification")

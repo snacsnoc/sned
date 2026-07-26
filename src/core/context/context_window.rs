@@ -117,7 +117,7 @@ pub fn validate_context_window(
 
     if estimated_tokens > max_allowed {
         return Err(format!(
-            "Request size ({estimated_tokens}) exceeds provider context limit ({context_window} / {max_allowed} max_allowed)"
+            "Request size ({estimated_tokens}) exceeds provider context limit ({context_window} / {max_allowed} max_allowed). Use /compact to free context before retrying."
         ));
     }
 
@@ -216,6 +216,23 @@ mod tests {
         assert_eq!(info.context_window, 64_000);
         let expected = f64::max(64_000.0 - 40_000.0, 64_000.0 * 0.8) as u64;
         assert_eq!(info.max_allowed_size, expected);
+    }
+
+    #[test]
+    fn test_context_overflow_recommends_compact() {
+        let provider = make_mock_provider(Some(64_000));
+        let request = ProviderRequest {
+            system_prompt: "x".repeat(300_000),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let error = validate_context_window(&request, &provider).unwrap_err();
+
+        assert!(error.contains("/compact"));
     }
 
     #[test]
