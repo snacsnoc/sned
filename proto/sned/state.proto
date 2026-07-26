@@ -223,7 +223,7 @@ message Settings {
   optional int32 terminal_output_line_limit = 138;
   optional int32 max_consecutive_mistakes = 139;
   optional bool strict_plan_mode_enabled = 141;
-  optional bool yolo_mode_toggled = 142;
+  reserved 142; // was yolo_mode_toggled
   optional bool use_auto_condense = 143;
   optional bool sned_web_tools_enabled = 144;
   optional string preferred_language = 145;
@@ -375,7 +375,7 @@ message UpdateSettingsRequest {
   optional string custom_prompt = 19;
   optional BrowserSettingsUpdate browser_settings = 20;
   optional string default_terminal_profile = 21;
-  optional bool yolo_mode_toggled = 22;
+  reserved 22; // was yolo_mode_toggled
   optional bool multi_root_enabled = 25;
   optional bool hooks_enabled = 26;
   optional string vscode_terminal_execution_mode = 27;
