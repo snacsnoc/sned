@@ -101,6 +101,7 @@ impl MinimaxProvider {
 
     fn canonical_model_id(&self) -> String {
         match self.config.model_id.trim() {
+            "minimax-m3" | "MiniMax-M3" => "MiniMax-M3".to_string(),
             "minimax-m2.7" | "MiniMax-M2.7" => "MiniMax-M2.7".to_string(),
             "minimax-m2.7-highspeed" | "MiniMax-M2.7-highspeed" => {
                 "MiniMax-M2.7-highspeed".to_string()
@@ -203,6 +204,51 @@ impl MinimaxProvider {
         let model_id = self.canonical_model_id();
 
         match model_id.as_str() {
+            "MiniMax-M3" => ModelInfo {
+                name: Some("MiniMax-M3".to_string()),
+                max_tokens: Some(128_000),
+                context_window: Some(1_048_576),
+                supports_images: Some(false),
+                supports_prompt_cache: true,
+                supports_reasoning: Some(true),
+                input_price: Some(0.3),
+                output_price: Some(1.2),
+                image_output_price: None,
+                thinking_config: Some(crate::providers::ThinkingConfig {
+                    max_budget: Some(1024),
+                    output_price: None,
+                    output_price_tiers: None,
+                    gemini_thinking_level: None,
+                    supports_thinking_level: None,
+                }),
+                supports_global_endpoint: None,
+                cache_writes_price: Some(0.375),
+                cache_reads_price: Some(0.06),
+                description: Some(
+                    "MiniMax M3 is an agentic model for coding and tool use.".to_string(),
+                ),
+                tiers: Some(vec![
+                    crate::providers::ModelTier {
+                        context_window: 512_000,
+                        input_price: Some(0.3),
+                        output_price: Some(1.2),
+                        cache_writes_price: Some(0.375),
+                        cache_reads_price: Some(0.06),
+                    },
+                    crate::providers::ModelTier {
+                        context_window: u64::MAX,
+                        input_price: Some(0.6),
+                        output_price: Some(2.4),
+                        cache_writes_price: Some(0.75),
+                        cache_reads_price: Some(0.12),
+                    },
+                ]),
+                temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(40),
+                supports_tools: Some(true),
+                api_format: None,
+            },
             "MiniMax-M2.7" => ModelInfo {
                 name: Some("MiniMax-M2.7".to_string()),
                 max_tokens: Some(128_000),
@@ -1442,6 +1488,25 @@ mod tests {
         };
         let provider = MinimaxProvider::new(config).unwrap();
         assert_eq!(provider.base_url(), "https://api.minimax.io/v1");
+    }
+
+    #[test]
+    fn test_minimax_m3_profile_and_canonical_id() {
+        let provider = MinimaxProvider::new(MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "minimax-m3".to_string(),
+            model_info: None,
+        })
+        .unwrap();
+
+        let model = provider.get_model();
+        assert_eq!(model.id, "MiniMax-M3");
+        assert_eq!(model.info.context_window, Some(1_048_576));
+        assert_eq!(model.info.max_tokens, Some(128_000));
+        assert_eq!(model.info.input_price, Some(0.3));
+        assert_eq!(model.info.output_price, Some(1.2));
+        assert_eq!(model.info.tiers.as_ref().map(Vec::len), Some(2));
     }
 
     #[test]

@@ -139,27 +139,29 @@ impl GeminiProvider {
         // Convert messages to Gemini format
         let contents = gemini_format::convert_to_gemini_contents(&request.messages);
 
-        // Build generation config
-        let mut generation_config = json!({
-            "temperature": info.and_then(|i| i.temperature).unwrap_or_else(|| {
-                // Default temperatures for Gemini models
-                // Per gemini-3.md:497: "For all Gemini 3 models, we strongly recommend
-                // keeping the temperature parameter at its default value of 1.0"
-                if model_id.contains("gemini-3") {
-                    1.0
-                } else {
-                    0.7
-                }
-            }),
-        });
+        // Gemini 3.5 and later reject deprecated sampling parameters.
+        let omits_sampling_parameters =
+            model_id.contains("gemini-3.5") || model_id.contains("gemini-3.6");
+        let mut generation_config = json!({});
+
+        if !omits_sampling_parameters {
+            generation_config["temperature"] =
+                json!(info.and_then(|i| i.temperature).unwrap_or_else(|| {
+                    if model_id.contains("gemini-3") {
+                        1.0
+                    } else {
+                        0.7
+                    }
+                }));
+        }
 
         // topP: only send if explicitly set in ModelInfo; otherwise let the API use its default
-        if let Some(top_p) = info.and_then(|i| i.top_p) {
+        if !omits_sampling_parameters && let Some(top_p) = info.and_then(|i| i.top_p) {
             generation_config["topP"] = json!(top_p);
         }
 
         // topK: only send if explicitly set in ModelInfo
-        if let Some(top_k) = info.and_then(|i| i.top_k) {
+        if !omits_sampling_parameters && let Some(top_k) = info.and_then(|i| i.top_k) {
             generation_config["topK"] = json!(top_k);
         }
 
@@ -887,7 +889,43 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
     };
 
     // Model-specific overrides - most-specific-first ordering
-    if model_id.contains("gemini-3.1-flash-image") {
+    if model_id.contains("gemini-3.6-flash") {
+        info.input_price = Some(1.5);
+        info.output_price = Some(7.5);
+        info.cache_writes_price = Some(1.5);
+        info.cache_reads_price = Some(0.15);
+        info.thinking_config = Some(ThinkingConfig {
+            max_budget: None,
+            output_price: None,
+            output_price_tiers: None,
+            gemini_thinking_level: Some("medium".to_string()),
+            supports_thinking_level: Some(true),
+        });
+    } else if model_id.contains("gemini-3.5-flash-lite") {
+        info.input_price = Some(0.3);
+        info.output_price = Some(2.5);
+        info.cache_writes_price = Some(0.3);
+        info.cache_reads_price = Some(0.03);
+        info.thinking_config = Some(ThinkingConfig {
+            max_budget: None,
+            output_price: None,
+            output_price_tiers: None,
+            gemini_thinking_level: Some("minimal".to_string()),
+            supports_thinking_level: Some(true),
+        });
+    } else if model_id.contains("gemini-3.5-flash") {
+        info.input_price = Some(1.5);
+        info.output_price = Some(9.0);
+        info.cache_writes_price = Some(1.5);
+        info.cache_reads_price = Some(0.15);
+        info.thinking_config = Some(ThinkingConfig {
+            max_budget: None,
+            output_price: None,
+            output_price_tiers: None,
+            gemini_thinking_level: Some("medium".to_string()),
+            supports_thinking_level: Some(true),
+        });
+    } else if model_id.contains("gemini-3.1-flash-image") {
         // 128k context, $0.25 input, $0.067/image output
         info.context_window = Some(128_000);
         info.input_price = Some(0.25);
@@ -1478,6 +1516,48 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_body_omits_sampling_for_latest_gemini_models() {
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: crate::providers::MessageContent::Text("Hello".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        for model_id in [
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+        ] {
+            let provider = GeminiProvider::new(GeminiConfig {
+                api_key: "test-key".to_string(),
+                base_url: None,
+                model_id: model_id.to_string(),
+                model_info: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                search_enabled: false,
+            })
+            .unwrap();
+            let generation_config =
+                &provider.build_request_body(&request).unwrap()["generationConfig"];
+
+            assert!(generation_config.get("temperature").is_none(), "{model_id}");
+            assert!(generation_config.get("topP").is_none(), "{model_id}");
+            assert!(generation_config.get("topK").is_none(), "{model_id}");
+        }
+    }
+
+    #[test]
     fn test_map_reasoning_effort() {
         assert_eq!(
             map_reasoning_effort_to_thinking_level("low").as_str(),
@@ -1550,6 +1630,30 @@ mod tests {
         assert_eq!(info.context_window, Some(128_000));
         assert_eq!(info.input_price, Some(0.25));
         assert_eq!(info.output_price, Some(0.067));
+    }
+
+    #[test]
+    fn test_gemini_model_pricing_latest_flash_models() {
+        let cases = [
+            ("gemini-3.6-flash", 1.5, 7.5, 0.15, "medium"),
+            ("gemini-3.5-flash", 1.5, 9.0, 0.15, "medium"),
+            ("gemini-3.5-flash-lite", 0.3, 2.5, 0.03, "minimal"),
+        ];
+
+        for (model_id, input_price, output_price, cache_read_price, thinking_level) in cases {
+            let info = get_gemini_model_info(model_id);
+            assert_eq!(info.context_window, Some(1_048_576));
+            assert_eq!(info.max_tokens, Some(65_536));
+            assert_eq!(info.input_price, Some(input_price));
+            assert_eq!(info.output_price, Some(output_price));
+            assert_eq!(info.cache_reads_price, Some(cache_read_price));
+            assert_eq!(
+                info.thinking_config
+                    .as_ref()
+                    .and_then(|config| config.gemini_thinking_level.as_deref()),
+                Some(thinking_level),
+            );
+        }
     }
 
     #[test]

@@ -677,7 +677,76 @@ pub struct AnthropicToolCallState {
 /// Logs a warning if the channel is full and drops the chunk.
 fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
     // Model-specific defaults based on Anthropic's pricing and specs
-    if model_id.contains("opus") {
+    if model_id.contains("claude-fable-5") {
+        ModelInfo {
+            name: Some("claude-fable-5".to_string()),
+            max_tokens: Some(128_000),
+            context_window: Some(1_000_000),
+            supports_images: Some(true),
+            supports_prompt_cache: true,
+            supports_reasoning: Some(true),
+            input_price: Some(10.0),
+            output_price: Some(50.0),
+            image_output_price: None,
+            thinking_config: None,
+            supports_global_endpoint: None,
+            cache_writes_price: Some(12.5),
+            cache_reads_price: Some(1.0),
+            description: None,
+            tiers: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            supports_tools: Some(true),
+            api_format: None,
+        }
+    } else if model_id.contains("claude-opus-5") {
+        ModelInfo {
+            name: Some("claude-opus-5".to_string()),
+            max_tokens: Some(128_000),
+            context_window: Some(1_000_000),
+            supports_images: Some(true),
+            supports_prompt_cache: true,
+            supports_reasoning: Some(true),
+            input_price: Some(5.0),
+            output_price: Some(25.0),
+            image_output_price: None,
+            thinking_config: None,
+            supports_global_endpoint: None,
+            cache_writes_price: Some(6.25),
+            cache_reads_price: Some(0.5),
+            description: None,
+            tiers: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            supports_tools: Some(true),
+            api_format: None,
+        }
+    } else if model_id.contains("claude-sonnet-5") {
+        ModelInfo {
+            name: Some("claude-sonnet-5".to_string()),
+            max_tokens: Some(128_000),
+            context_window: Some(1_000_000),
+            supports_images: Some(true),
+            supports_prompt_cache: true,
+            supports_reasoning: Some(true),
+            input_price: Some(3.0),
+            output_price: Some(15.0),
+            image_output_price: None,
+            thinking_config: None,
+            supports_global_endpoint: None,
+            cache_writes_price: Some(3.75),
+            cache_reads_price: Some(0.3),
+            description: None,
+            tiers: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            supports_tools: Some(true),
+            api_format: None,
+        }
+    } else if model_id.contains("opus") {
         ModelInfo {
             name: Some("claude-opus-4-6".to_string()),
             max_tokens: Some(128_000),
@@ -1307,6 +1376,24 @@ mod tests {
         let body = provider.build_request_body(&request).unwrap();
         // tools field should not be present when tools is None
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_current_anthropic_model_profiles() {
+        let cases = [
+            ("claude-fable-5", 1_000_000, 128_000, 10.0, 50.0),
+            ("claude-opus-5", 1_000_000, 128_000, 5.0, 25.0),
+            ("claude-sonnet-5", 1_000_000, 128_000, 3.0, 15.0),
+        ];
+
+        for (model_id, context_window, max_tokens, input_price, output_price) in cases {
+            let info = get_anthropic_model_info(model_id);
+            assert_eq!(info.name.as_deref(), Some(model_id));
+            assert_eq!(info.context_window, Some(context_window));
+            assert_eq!(info.max_tokens, Some(max_tokens));
+            assert_eq!(info.input_price, Some(input_price));
+            assert_eq!(info.output_price, Some(output_price));
+        }
     }
 
     #[tokio::test]

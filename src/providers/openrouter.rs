@@ -149,7 +149,34 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         info.supports_prompt_cache = true;
         info.temperature = Some(0.7);
 
-        if model_id.contains("claude-sonnet-4.5") || model_id.contains("claude-4.5-sonnet") {
+        if model_id.contains("claude-fable-5") {
+            info.max_tokens = Some(128_000);
+            info.context_window = Some(1_000_000);
+            info.input_price = Some(10.0);
+            info.output_price = Some(50.0);
+            info.cache_writes_price = Some(12.5);
+            info.cache_reads_price = Some(1.0);
+            info.supports_reasoning = Some(true);
+            info.temperature = None;
+        } else if model_id.contains("claude-opus-5") {
+            info.max_tokens = Some(128_000);
+            info.context_window = Some(1_000_000);
+            info.input_price = Some(5.0);
+            info.output_price = Some(25.0);
+            info.cache_writes_price = Some(6.25);
+            info.cache_reads_price = Some(0.5);
+            info.supports_reasoning = Some(true);
+            info.temperature = None;
+        } else if model_id.contains("claude-sonnet-5") {
+            info.max_tokens = Some(128_000);
+            info.context_window = Some(1_000_000);
+            info.input_price = Some(2.0);
+            info.output_price = Some(10.0);
+            info.cache_writes_price = Some(2.5);
+            info.cache_reads_price = Some(0.2);
+            info.supports_reasoning = Some(true);
+            info.temperature = None;
+        } else if model_id.contains("claude-sonnet-4.5") || model_id.contains("claude-4.5-sonnet") {
             info.max_tokens = Some(64_000);
             info.context_window = Some(200_000);
             info.input_price = Some(3.0);
@@ -215,7 +242,34 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         info.supports_images = Some(true);
         info.temperature = Some(0.7);
 
-        if model_id.contains("gpt-4o") {
+        if model_id.contains("gpt-5.6-terra") {
+            info.max_tokens = Some(128_000);
+            info.context_window = Some(1_050_000);
+            info.input_price = Some(2.5);
+            info.output_price = Some(15.0);
+            info.cache_writes_price = Some(3.125);
+            info.cache_reads_price = Some(0.25);
+            info.supports_reasoning = Some(true);
+            info.temperature = None;
+        } else if model_id.contains("gpt-5.6-luna") {
+            info.max_tokens = Some(128_000);
+            info.context_window = Some(1_050_000);
+            info.input_price = Some(1.0);
+            info.output_price = Some(6.0);
+            info.cache_writes_price = Some(1.25);
+            info.cache_reads_price = Some(0.1);
+            info.supports_reasoning = Some(true);
+            info.temperature = None;
+        } else if model_id.contains("gpt-5.6") {
+            info.max_tokens = Some(128_000);
+            info.context_window = Some(1_050_000);
+            info.input_price = Some(5.0);
+            info.output_price = Some(30.0);
+            info.cache_writes_price = Some(6.25);
+            info.cache_reads_price = Some(0.5);
+            info.supports_reasoning = Some(true);
+            info.temperature = None;
+        } else if model_id.contains("gpt-4o") {
             info.max_tokens = Some(16_384);
             info.context_window = Some(128_000);
             info.input_price = Some(2.5);
@@ -245,7 +299,16 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
         info.supports_images = Some(true);
         info.temperature = Some(0.7);
 
-        if model_id.contains("gemini-2.5-pro") {
+        if model_id.contains("gemini-3.6-flash") {
+            info.max_tokens = Some(65_536);
+            info.context_window = Some(1_048_576);
+            info.input_price = Some(1.5);
+            info.output_price = Some(7.5);
+            info.cache_writes_price = Some(0.083_333_333_333_333_34);
+            info.cache_reads_price = Some(0.15);
+            info.supports_reasoning = Some(true);
+            info.temperature = None;
+        } else if model_id.contains("gemini-2.5-pro") {
             info.max_tokens = Some(65_536);
             info.context_window = Some(2_097_152);
             info.input_price = Some(2.5);
@@ -255,6 +318,21 @@ pub fn get_openrouter_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
             info.context_window = Some(1_048_576);
             info.input_price = Some(0.1);
             info.output_price = Some(0.4);
+        }
+    }
+    // MiniMax models
+    else if model_id.starts_with("minimax/") {
+        info.supports_images = Some(true);
+
+        if model_id.contains("minimax-m3") {
+            info.max_tokens = Some(512_000);
+            info.context_window = Some(1_048_576);
+            info.input_price = Some(0.3);
+            info.output_price = Some(1.2);
+            info.cache_reads_price = Some(0.06);
+            info.supports_reasoning = Some(true);
+            info.temperature = Some(1.0);
+            info.top_p = Some(0.95);
         }
     }
     // Meta Llama models
@@ -422,6 +500,26 @@ mod tests {
         assert_eq!(info.base.output_price, Some(15.0));
         assert_eq!(info.base.cache_writes_price, Some(3.75));
         assert_eq!(info.base.cache_reads_price, Some(0.3));
+    }
+
+    #[test]
+    fn test_openrouter_model_info_current_models() {
+        let cases = [
+            ("anthropic/claude-fable-5", 1_000_000, 128_000, 10.0, 50.0),
+            ("anthropic/claude-opus-5", 1_000_000, 128_000, 5.0, 25.0),
+            ("anthropic/claude-sonnet-5", 1_000_000, 128_000, 2.0, 10.0),
+            ("openai/gpt-5.6-sol", 1_050_000, 128_000, 5.0, 30.0),
+            ("google/gemini-3.6-flash", 1_048_576, 65_536, 1.5, 7.5),
+            ("minimax/minimax-m3", 1_048_576, 512_000, 0.3, 1.2),
+        ];
+
+        for (model_id, context_window, max_tokens, input_price, output_price) in cases {
+            let info = get_openrouter_model_info(model_id);
+            assert_eq!(info.base.context_window, Some(context_window));
+            assert_eq!(info.base.max_tokens, Some(max_tokens));
+            assert_eq!(info.base.input_price, Some(input_price));
+            assert_eq!(info.base.output_price, Some(output_price));
+        }
     }
 
     #[test]
