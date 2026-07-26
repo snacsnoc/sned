@@ -66,6 +66,7 @@ fn bench_provider_creation(c: &mut Criterion) {
                 base_url: None,
                 model_info: None,
                 reasoning_effort: None,
+                extra_body: None,
                 custom_headers: None,
                 endpoint_kind: sned::providers::openai::OpenAiEndpointKind::Official,
                 provider_name: None,
