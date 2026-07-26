@@ -304,6 +304,18 @@ pub fn extract_edit_stats_detailed(result: &str) -> (String, i32, i32) {
 
 #[must_use]
 pub fn format_heat_map(edit_files: &[(String, i32, i32)]) -> String {
+    format_heat_map_with_paths(edit_files, crate::cli::colors::hyperlink_path)
+}
+
+#[must_use]
+pub fn format_heat_map_plain(edit_files: &[(String, i32, i32)]) -> String {
+    format_heat_map_with_paths(edit_files, str::to_string)
+}
+
+fn format_heat_map_with_paths(
+    edit_files: &[(String, i32, i32)],
+    format_path: impl Fn(&str) -> String,
+) -> String {
     if edit_files.is_empty() {
         return String::new();
     }
@@ -324,8 +336,7 @@ pub fn format_heat_map(edit_files: &[(String, i32, i32)]) -> String {
     let files_str: Vec<String> = display
         .iter()
         .map(|(path, added, removed)| {
-            let hyperlinked = crate::cli::colors::hyperlink_path(path);
-            format!("{hyperlinked} (+{added}, -{removed})")
+            format!("{} (+{added}, -{removed})", format_path(path))
         })
         .collect();
 
@@ -484,6 +495,14 @@ mod tests {
         let params = serde_json::json!({});
         let summary = format_tool_summary("unknown_tool", &params);
         assert_eq!(summary, "unknown_tool");
+    }
+
+    #[test]
+    fn test_format_heat_map_plain_has_no_terminal_escapes() {
+        let heat_map = format_heat_map_plain(&[("src/lib.rs".to_string(), 3, 1)]);
+
+        assert_eq!(heat_map, "🔥 1 file: src/lib.rs (+3, -1)");
+        assert!(!heat_map.contains('\x1b'));
     }
 
     #[test]

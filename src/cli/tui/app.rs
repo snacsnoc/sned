@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -33,6 +33,8 @@ const MAX_SCROLLBACK_LOAD_LINES: usize = 10_000;
 const MAX_PASTED_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FOLDED_PASTE_CHUNKS: usize = 256;
 const STATUS_NOTIFICATION_DURATION: Duration = Duration::from_secs(4);
+const OSC8_PREFIX: &str = "\x1b]8;;";
+const HYPERLINK_MARKER_RED: u8 = 0xFE;
 static NEXT_PASTE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Async @-mention search result delivered back to the interactive loop.
@@ -197,6 +199,7 @@ struct TextSelection {
     pane: SelectionPane,
     anchor: SelectionPoint,
     focus: SelectionPoint,
+    click_target: Option<PathBuf>,
     dragging: bool,
     moved: bool,
     last_drag_redraw: Instant,
@@ -206,6 +209,7 @@ struct TextSelection {
 struct VisibleCell {
     symbol: String,
     continuation: bool,
+    hyperlink: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -588,6 +592,7 @@ pub struct App {
     completion_selection_area: Option<Rect>,
     text_selection: Option<TextSelection>,
     selection_surfaces: Vec<SelectionSurface>,
+    rendered_hyperlink_targets: Vec<PathBuf>,
     /// Error box lines rendered as a dedicated Block widget with red border.
     /// Takes priority over completion_lines when non-empty.
     pub error_lines: VecDeque<Line<'static>>,
@@ -923,6 +928,7 @@ impl App {
             completion_selection_area: None,
             text_selection: None,
             selection_surfaces: Vec::new(),
+            rendered_hyperlink_targets: Vec::new(),
             error_lines: VecDeque::new(),
             cached_error_rows: 0,
             cached_visible_window: None,
@@ -954,6 +960,7 @@ impl App {
     /// every pushed piece shares the same `kind`.
     pub fn push_output_with_kind(&mut self, line: Line<'static>, kind: BlockKind) {
         let wrap_width = self.last_wrap_width();
+        let contains_hyperlink = Self::line_contains_osc8(&line);
 
         // Pre-wrap: if the line's total width exceeds wrap_width, split it
         let total_width: usize = line
@@ -962,16 +969,17 @@ impl App {
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum();
 
-        let lines_to_push: Vec<Line<'static>> = if total_width > wrap_width && wrap_width > 0 {
-            let mut full_text = String::new();
-            for span in &line.spans {
-                full_text.push_str(span.content.as_ref());
-            }
-            let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
-            wrapped.lines().map(|l| Line::from(l.to_string())).collect()
-        } else {
-            vec![line]
-        };
+        let lines_to_push: Vec<Line<'static>> =
+            if !contains_hyperlink && total_width > wrap_width && wrap_width > 0 {
+                let mut full_text = String::new();
+                for span in &line.spans {
+                    full_text.push_str(span.content.as_ref());
+                }
+                let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
+                wrapped.lines().map(|l| Line::from(l.to_string())).collect()
+            } else {
+                vec![line]
+            };
 
         for l in lines_to_push {
             self._push_output_line(l, kind, wrap_width);
@@ -1513,10 +1521,12 @@ impl App {
             return false;
         };
         let point = Self::normalize_selection_point(surface, column, row);
+        let click_target = Self::surface_hyperlink_at(surface, point);
         self.text_selection = Some(TextSelection {
             pane: surface.pane,
             anchor: point,
             focus: point,
+            click_target,
             dragging: true,
             moved: false,
             last_drag_redraw: now,
@@ -1591,6 +1601,19 @@ impl App {
             .is_some_and(|selection| selection.dragging)
     }
 
+    pub(crate) fn text_selection_click_target(&self, column: u16, row: u16) -> Option<PathBuf> {
+        let selection = self.text_selection.as_ref()?;
+        if selection.moved {
+            return None;
+        }
+        let surface = self.selection_surface(selection.pane)?;
+        let point = Self::normalize_selection_point(surface, column, row);
+        (point == selection.anchor)
+            .then(|| Self::surface_hyperlink_at(surface, point))
+            .flatten()
+            .filter(|target| selection.click_target.as_ref() == Some(target))
+    }
+
     fn selection_surface_at(&self, column: u16, row: u16) -> Option<&SelectionSurface> {
         self.selection_surfaces
             .iter()
@@ -1608,6 +1631,12 @@ impl App {
             && column < area.x.saturating_add(area.width)
             && row >= area.y
             && row < area.y.saturating_add(area.height)
+    }
+
+    fn surface_hyperlink_at(surface: &SelectionSurface, point: SelectionPoint) -> Option<PathBuf> {
+        let row = point.row.saturating_sub(surface.content_area.y) as usize;
+        let column = point.column.saturating_sub(surface.content_area.x) as usize;
+        surface.rows.get(row)?.get(column)?.hyperlink.clone()
     }
 
     fn normalize_selection_point(
@@ -1705,12 +1734,13 @@ impl App {
             (SelectionPane::Transcript, self.transcript_selection_area),
             (SelectionPane::Completion, self.completion_selection_area),
         ];
-        self.selection_surfaces = areas
+        let selection_surfaces = areas
             .into_iter()
             .filter_map(|(pane, area)| {
-                area.map(|area| Self::snapshot_selection_surface(buffer, pane, area))
+                area.map(|area| self.snapshot_selection_surface(buffer, pane, area))
             })
             .collect();
+        self.selection_surfaces = selection_surfaces;
         if self
             .text_selection
             .as_ref()
@@ -1721,6 +1751,7 @@ impl App {
     }
 
     fn snapshot_selection_surface(
+        &self,
         buffer: &Buffer,
         pane: SelectionPane,
         content_area: Rect,
@@ -1730,9 +1761,13 @@ impl App {
             let mut cells = Vec::with_capacity(content_area.width as usize);
             let mut continuation_cells = 0usize;
             for column in content_area.x..content_area.x.saturating_add(content_area.width) {
-                let symbol = buffer
-                    .cell((column, row))
-                    .map_or_else(|| " ".to_string(), |cell| cell.symbol().to_string());
+                let cell = buffer.cell((column, row));
+                let symbol = cell.map_or_else(|| " ".to_string(), |cell| cell.symbol().to_string());
+                let hyperlink = cell.and_then(|cell| {
+                    Self::hyperlink_marker_index(cell.underline_color)
+                        .and_then(|index| self.rendered_hyperlink_targets.get(index))
+                        .cloned()
+                });
                 let continuation = continuation_cells > 0;
                 if continuation {
                     continuation_cells -= 1;
@@ -1742,6 +1777,7 @@ impl App {
                 cells.push(VisibleCell {
                     symbol,
                     continuation,
+                    hyperlink,
                 });
             }
             rows.push(cells);
@@ -1750,6 +1786,16 @@ impl App {
             pane,
             content_area,
             rows,
+        }
+    }
+
+    fn normalize_hyperlink_markers(&self, buffer: &mut Buffer) {
+        for cell in &mut buffer.content {
+            if Self::hyperlink_marker_index(cell.underline_color)
+                .is_some_and(|index| index < self.rendered_hyperlink_targets.len())
+            {
+                cell.underline_color = cell.fg;
+            }
         }
     }
 
@@ -1827,13 +1873,14 @@ impl App {
 
     fn prewrap_stream_line(&self, line: Line<'static>) -> Vec<Line<'static>> {
         let wrap_width = self.last_wrap_width();
+        let contains_hyperlink = Self::line_contains_osc8(&line);
         let total_width: usize = line
             .spans
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum();
 
-        if total_width > wrap_width && wrap_width > 0 {
+        if !contains_hyperlink && total_width > wrap_width && wrap_width > 0 {
             let mut full_text = String::new();
             for span in &line.spans {
                 full_text.push_str(span.content.as_ref());
@@ -2402,6 +2449,20 @@ impl App {
             return 1;
         }
 
+        if Self::line_contains_osc8(line) {
+            let mut hyperlink_targets = Vec::new();
+            let mut rendered = Self::parse_osc8_line(line, &mut hyperlink_targets);
+            if extra_width > 0 {
+                rendered
+                    .spans
+                    .insert(0, Span::raw("│".repeat(extra_width)));
+            }
+            return Paragraph::new(rendered)
+                .wrap(Wrap { trim: false })
+                .line_count(wrap_width.min(u16::MAX as usize) as u16)
+                .max(1);
+        }
+
         // Bottom pinning must be computed in rendered rows, not logical lines.
         // A single long prompt line can wrap into multiple terminal rows; if we
         // count only logical lines, the actionable tail of the prompt can land
@@ -2409,7 +2470,7 @@ impl App {
         let width = line
             .spans
             .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .map(|span| Self::osc8_display_width(span.content.as_ref()))
             .sum::<usize>()
             .saturating_add(extra_width);
         width.max(1).div_ceil(wrap_width)
@@ -2552,13 +2613,122 @@ impl App {
         }
     }
 
-    fn output_row_for_render(line: Option<&Line<'static>>, kind: BlockKind) -> Line<'static> {
-        let mut line = line.cloned().unwrap_or_else(|| Line::from(""));
+    fn output_row_for_render(
+        line: Option<&Line<'static>>,
+        kind: BlockKind,
+        hyperlink_targets: &mut Vec<PathBuf>,
+    ) -> Line<'static> {
+        let mut line = line.map_or_else(
+            || Line::from(""),
+            |line| Self::parse_osc8_line(line, hyperlink_targets),
+        );
         if kind != BlockKind::Separator {
             line.spans
                 .insert(0, Span::styled("│", block_kind_accent_style(kind)));
         }
         line
+    }
+
+    fn line_contains_osc8(line: &Line<'_>) -> bool {
+        line.spans
+            .iter()
+            .any(|span| span.content.contains(OSC8_PREFIX))
+    }
+
+    fn parse_osc8_line(
+        line: &Line<'_>,
+        hyperlink_targets: &mut Vec<PathBuf>,
+    ) -> Line<'static> {
+        let mut spans = Vec::new();
+        for span in &line.spans {
+            let mut remaining = span.content.as_ref();
+            let mut marker = None;
+            while !remaining.is_empty() {
+                if let Some(payload) = remaining.strip_prefix(OSC8_PREFIX) {
+                    let Some((terminator_at, terminator_len)) = Self::osc_terminator(payload)
+                    else {
+                        break;
+                    };
+                    let uri = &payload[..terminator_at];
+                    marker = uri
+                        .strip_prefix("file://")
+                        .filter(|path| !path.is_empty())
+                        .and_then(|path| {
+                            let index = hyperlink_targets.len();
+                            let marker = Self::hyperlink_marker(index)?;
+                            hyperlink_targets.push(PathBuf::from(path));
+                            Some(marker)
+                        });
+                    remaining = &payload[terminator_at + terminator_len..];
+                    continue;
+                }
+
+                let next_control = remaining.find(OSC8_PREFIX).unwrap_or(remaining.len());
+                let text = &remaining[..next_control];
+                if !text.is_empty() {
+                    let style = marker.map_or(span.style, |marker| {
+                        span.style
+                            .add_modifier(Modifier::UNDERLINED)
+                            .underline_color(marker)
+                    });
+                    spans.push(Span::styled(text.to_string(), style));
+                }
+                remaining = &remaining[next_control..];
+            }
+        }
+        Line {
+            style: line.style,
+            alignment: line.alignment,
+            spans,
+        }
+    }
+
+    fn osc_terminator(text: &str) -> Option<(usize, usize)> {
+        let string_terminator = text.find("\x1b\\").map(|index| (index, 2));
+        let bell_terminator = text.find('\x07').map(|index| (index, 1));
+        match (string_terminator, bell_terminator) {
+            (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+            (Some(terminator), None) | (None, Some(terminator)) => Some(terminator),
+            (None, None) => None,
+        }
+    }
+
+    fn osc8_display_width(text: &str) -> usize {
+        if !text.contains(OSC8_PREFIX) {
+            return UnicodeWidthStr::width(text);
+        }
+        let mut remaining = text;
+        let mut width = 0usize;
+        while !remaining.is_empty() {
+            if let Some(payload) = remaining.strip_prefix(OSC8_PREFIX) {
+                let Some((terminator_at, terminator_len)) = Self::osc_terminator(payload) else {
+                    break;
+                };
+                remaining = &payload[terminator_at + terminator_len..];
+                continue;
+            }
+            let next_control = remaining.find(OSC8_PREFIX).unwrap_or(remaining.len());
+            width = width.saturating_add(UnicodeWidthStr::width(&remaining[..next_control]));
+            remaining = &remaining[next_control..];
+        }
+        width
+    }
+
+    fn hyperlink_marker(index: usize) -> Option<Color> {
+        let encoded = u16::try_from(index.checked_add(1)?).ok()?;
+        Some(Color::Rgb(
+            HYPERLINK_MARKER_RED,
+            (encoded >> 8) as u8,
+            encoded as u8,
+        ))
+    }
+
+    fn hyperlink_marker_index(color: Color) -> Option<usize> {
+        let Color::Rgb(HYPERLINK_MARKER_RED, high, low) = color else {
+            return None;
+        };
+        let encoded = u16::from(high) << 8 | u16::from(low);
+        usize::from(encoded).checked_sub(1)
     }
 
     fn normalize_viewport_anchor_text(text: &str) -> String {
@@ -2694,16 +2864,26 @@ impl App {
         }
     }
 
-    fn collect_output_rows_range(&self, start_idx: usize, take_count: usize) -> Vec<Line<'static>> {
+    fn collect_output_rows_range(
+        &mut self,
+        start_idx: usize,
+        take_count: usize,
+    ) -> Vec<Line<'static>> {
         let end_idx = start_idx.saturating_add(take_count);
         let mut expanded_idx = 0usize;
         let mut visible_lines = Vec::with_capacity(take_count);
+        let mut hyperlink_targets = Vec::new();
         self.for_each_output_row(|line, kind| {
             if expanded_idx >= start_idx && expanded_idx < end_idx {
-                visible_lines.push(Self::output_row_for_render(line, kind));
+                visible_lines.push(Self::output_row_for_render(
+                    line,
+                    kind,
+                    &mut hyperlink_targets,
+                ));
             }
             expanded_idx = expanded_idx.saturating_add(1);
         });
+        self.rendered_hyperlink_targets = hyperlink_targets;
         visible_lines
     }
 
@@ -2813,6 +2993,9 @@ impl App {
             // Selection must be based on the completed frame, after widgets have
             // applied wrapping, scrolling, and markdown styling.
             self.refresh_selection_surfaces(frame.buffer_mut());
+        }
+        self.normalize_hyperlink_markers(frame.buffer_mut());
+        if !selection_blocked {
             self.apply_text_selection_overlay(frame.buffer_mut());
         }
     }
@@ -3750,6 +3933,122 @@ mod tests {
             app.finish_text_selection(column + 4, row),
             Some("alpha".to_string())
         );
+    }
+
+    #[test]
+    fn test_osc8_path_survives_tui_render_as_click_target() {
+        let mut app = App::new();
+        app.push_output(Line::from(format!(
+            "  ▶ read \x1b]8;;file:///tmp/example.rs\x1b\\/tmp/example.rs\x1b]8;;\x1b\\"
+        )));
+        let backend = TestBackend::new(48, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("hyperlink frame should render");
+
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "x");
+        assert!(app.begin_text_selection(column, row, Instant::now()));
+        assert_eq!(
+            app.text_selection_click_target(column, row),
+            Some(PathBuf::from("/tmp/example.rs"))
+        );
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| !cell.symbol().contains('\x1b'))
+        );
+        let cell = buffer
+            .cell((column, row))
+            .expect("linked cell should exist");
+        assert!(cell.modifier.contains(Modifier::UNDERLINED));
+        assert!(App::hyperlink_marker_index(cell.underline_color).is_none());
+    }
+
+    #[test]
+    fn test_osc8_click_requires_same_target_on_release() {
+        let mut app = App::new();
+        app.push_output(Line::from(
+            "\x1b]8;;file:///tmp/pressed.rs\x1b\\/tmp/pressed.rs\x1b]8;;\x1b\\",
+        ));
+        render_for_selection(&mut app);
+
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "p");
+        assert!(app.begin_text_selection(column, row, Instant::now()));
+
+        app.clear_output().expect("output should clear");
+        app.push_output(Line::from(
+            "\x1b]8;;file:///tmp/released.rs\x1b\\/tmp/released.rs\x1b]8;;\x1b\\",
+        ));
+        render_for_selection(&mut app);
+
+        assert_eq!(app.text_selection_click_target(column, row), None);
+    }
+
+    #[test]
+    fn test_wrapped_osc8_path_keeps_click_target() {
+        let target = "/tmp/a/very/long/path/to/wrapped-target-Z";
+        let mut app = App::new();
+        app.push_output(Line::from(format!(
+            "  ▶ read \x1b]8;;file://{target}\x1b\\{target}\x1b]8;;\x1b\\"
+        )));
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("wrapped hyperlink frame should render");
+
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "Z");
+        assert!(app.begin_text_selection(column, row, Instant::now()));
+        assert_eq!(
+            app.text_selection_click_target(column, row),
+            Some(PathBuf::from(target))
+        );
+    }
+
+    #[test]
+    fn test_osc8_row_count_matches_ratatui_word_wrapping() {
+        let visible = "x xxxxxxxx xxxxxxxx";
+        let line = Line::from(format!(
+            "\x1b]8;;file:///tmp/word-wrapped\x1b\\{visible}\x1b]8;;\x1b\\"
+        ));
+        let wrap_width = 10usize;
+        let mut targets = Vec::new();
+        let rendered =
+            App::output_row_for_render(Some(&line), BlockKind::ToolOutput, &mut targets);
+        let expected = Paragraph::new(rendered)
+            .wrap(Wrap { trim: false })
+            .line_count(wrap_width as u16);
+        let naive = (UnicodeWidthStr::width(visible) + 1).div_ceil(wrap_width);
+
+        assert!(expected > naive, "fixture must wrap at word boundaries");
+        assert_eq!(
+            App::output_row_visual_rows(Some(&line), BlockKind::ToolOutput, wrap_width),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_multiple_osc8_paths_keep_distinct_click_targets() {
+        let mut app = App::new();
+        app.push_output(Line::from(
+            "\x1b]8;;file:///tmp/alpha-A\x1b\\/tmp/alpha-A\x1b]8;;\x1b\\  \
+             \x1b]8;;file:///tmp/bravo-B\x1b\\/tmp/bravo-B\x1b]8;;\x1b\\",
+        ));
+        render_for_selection(&mut app);
+
+        for (symbol, target) in [("A", "/tmp/alpha-A"), ("B", "/tmp/bravo-B")] {
+            let (column, row) = selection_text_position(&app, SelectionPane::Transcript, symbol);
+            assert!(app.begin_text_selection(column, row, Instant::now()));
+            assert_eq!(
+                app.text_selection_click_target(column, row),
+                Some(PathBuf::from(target))
+            );
+            assert_eq!(app.finish_text_selection(column, row), None);
+        }
     }
 
     #[test]

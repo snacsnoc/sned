@@ -20,6 +20,9 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::style::Style;
 use std::collections::HashMap;
+use std::path::Path;
+#[cfg(any(target_os = "macos", target_os = "windows", unix))]
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -844,10 +847,89 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     write_clipboard(std::io::stdout(), text)
 }
 
+struct PathOpenFailure {
+    path: std::path::PathBuf,
+    error: String,
+}
+
+fn open_path_in_default_app(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} does not exist", path.display()),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = ProcessCommand::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = ProcessCommand::new("explorer.exe");
+        command.arg(path);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = ProcessCommand::new("xdg-open");
+        command.arg(path);
+        command
+    };
+    #[cfg(any(target_os = "macos", target_os = "windows", unix))]
+    {
+        let status = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("opener exited with {status}")))
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening paths is not supported on this platform",
+    ))
+}
+
+fn open_path_in_background(
+    path: std::path::PathBuf,
+    failure_tx: mpsc::UnboundedSender<PathOpenFailure>,
+) {
+    std::thread::spawn(move || {
+        if let Err(error) = open_path_in_default_app(&path) {
+            let _ = failure_tx.send(PathOpenFailure {
+                path,
+                error: error.to_string(),
+            });
+        }
+    });
+}
+
+fn drain_path_open_failures(
+    app: &mut App,
+    failure_rx: &mut mpsc::UnboundedReceiver<PathOpenFailure>,
+) {
+    while let Ok(failure) = failure_rx.try_recv() {
+        app.show_notification(
+            format!("Failed to open {}: {}", failure.path.display(), failure.error),
+            NotificationKind::Error,
+        );
+    }
+}
+
 fn handle_text_selection_mouse_event(
     app: &mut App,
     mouse_event: MouseEvent,
     mut copy: impl FnMut(&str) -> std::io::Result<()>,
+    mut open: impl FnMut(std::path::PathBuf),
 ) -> bool {
     match mouse_event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -864,6 +946,7 @@ fn handle_text_selection_mouse_event(
             if !app.is_text_selection_dragging() {
                 return false;
             }
+            let click_target = app.text_selection_click_target(mouse_event.column, mouse_event.row);
             if let Some(text) = app.finish_text_selection(mouse_event.column, mouse_event.row)
                 && let Err(error) = copy(&text)
             {
@@ -871,6 +954,8 @@ fn handle_text_selection_mouse_event(
                     format!("Failed to copy selection: {error}"),
                     Style::default().fg(theme::ERROR_FG),
                 );
+            } else if let Some(path) = click_target {
+                open(path);
             }
             true
         }
@@ -3016,6 +3101,7 @@ async fn run_main_loop(
     const BUSY_POLL_INTERVAL: Duration = BUSY_REDRAW_INTERVAL;
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
     let mouse_scroll_lines = mouse_scroll_lines();
+    let (path_open_failure_tx, mut path_open_failure_rx) = mpsc::unbounded_channel();
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
     let mut last_draw_at: Option<std::time::Instant> = None;
     let mut timing = TimingSummary {
@@ -3075,6 +3161,7 @@ async fn run_main_loop(
                 app.needs_redraw = true;
             }
         }
+        drain_path_open_failures(app, &mut path_open_failure_rx);
 
         // Track output lines peak
         let len = app.output_lines.len();
@@ -3590,7 +3677,12 @@ async fn run_main_loop(
                     // Ratatui handles resize automatically on next draw
                 }
                 Event::Mouse(mouse_event) => {
-                    if handle_text_selection_mouse_event(app, mouse_event, copy_to_clipboard) {
+                    if handle_text_selection_mouse_event(
+                        app,
+                        mouse_event,
+                        copy_to_clipboard,
+                        |path| open_path_in_background(path, path_open_failure_tx.clone()),
+                    ) {
                         continue;
                     }
                     if app.is_text_selection_dragging() {
@@ -4557,7 +4649,8 @@ mod tests {
         assert!(handle_text_selection_mouse_event(
             &mut app,
             event(MouseEventKind::Down(MouseButton::Left)),
-            |_| Ok(())
+            |_| Ok(()),
+            |_| {}
         ));
         assert!(handle_text_selection_mouse_event(
             &mut app,
@@ -4565,7 +4658,8 @@ mod tests {
                 column: column + 4,
                 ..event(MouseEventKind::Drag(MouseButton::Left))
             },
-            |_| Ok(())
+            |_| Ok(()),
+            |_| {}
         ));
         assert!(handle_text_selection_mouse_event(
             &mut app,
@@ -4576,10 +4670,84 @@ mod tests {
             move |text| {
                 *copied_for_callback.borrow_mut() = Some(text.to_string());
                 Ok(())
-            }
+            },
+            |_| panic!("drag selection must not open a path")
         ));
 
         assert_eq!(copied.borrow().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn test_mouse_click_opens_tui_path_link_without_copying() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = App::new();
+        app.push_output(ratatui::text::Line::from(
+            "  ▶ read \x1b]8;;file:///tmp/example.rs\x1b\\/tmp/example.rs\x1b]8;;\x1b\\",
+        ));
+        let backend = TestBackend::new(48, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("hyperlink frame should render");
+        let buffer = terminal.backend().buffer();
+        let (column, row) = (0..buffer.area.height)
+            .flat_map(|row| (0..buffer.area.width).map(move |column| (column, row)))
+            .find(|(column, row)| {
+                buffer
+                    .cell((*column, *row))
+                    .is_some_and(|cell| cell.symbol() == "x")
+            })
+            .expect("linked path should render");
+        let event = |kind| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let opened_for_callback = opened.clone();
+
+        assert!(handle_text_selection_mouse_event(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left)),
+            |_| panic!("a click must not copy text"),
+            |_| {}
+        ));
+        assert!(handle_text_selection_mouse_event(
+            &mut app,
+            event(MouseEventKind::Up(MouseButton::Left)),
+            |_| panic!("a click must not copy text"),
+            move |path| {
+                *opened_for_callback.borrow_mut() = Some(path);
+            }
+        ));
+
+        assert_eq!(
+            opened.borrow().as_deref(),
+            Some(Path::new("/tmp/example.rs"))
+        );
+    }
+
+    #[test]
+    fn test_path_open_failure_surfaces_status_notification() {
+        let mut app = App::new();
+        let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
+        failure_tx
+            .send(PathOpenFailure {
+                path: std::path::PathBuf::from("/tmp/missing.rs"),
+                error: "opener exited with status 1".to_string(),
+            })
+            .expect("failure receiver should be open");
+
+        drain_path_open_failures(&mut app, &mut failure_rx);
+
+        assert_eq!(
+            app.notification_message(),
+            Some("Failed to open /tmp/missing.rs: opener exited with status 1")
+        );
     }
 
     #[tokio::test]

@@ -67,7 +67,8 @@ const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
 use crate::core::tool_output::{
-    extract_edit_stats_detailed, format_heat_map, format_tool_result, format_tool_summary,
+    extract_edit_stats_detailed, format_heat_map, format_heat_map_plain, format_tool_result,
+    format_tool_summary,
     path_from_read_file_header, summarize_matching_sections,
 };
 
@@ -3575,7 +3576,7 @@ impl AgentLoop {
                     && has_actual_changes
                     && let Ok(workspace_root) = std::env::current_dir()
                 {
-                    let message = format!("[sned] turn: {}", format_heat_map(&edit_files));
+                    let message = format!("[sned] turn: {}", format_heat_map_plain(&edit_files));
                     // Run synchronous git operations in spawn_blocking to avoid blocking runtime
                     let result = tokio::task::spawn_blocking(move || {
                         crate::core::shadow_git::commit_turn(&workspace_root, &message)
