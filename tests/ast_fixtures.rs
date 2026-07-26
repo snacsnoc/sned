@@ -144,7 +144,7 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                         expected_path.display()
                     )
                 });
-                let handler = sned::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler;
+                let handler = sned::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler::new();
                 let state = Arc::new(TokioMutex::new(sned::core::agent_loop::TaskState::default()));
                 let tool_context = ToolContext::new(
                     state,

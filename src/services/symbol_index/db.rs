@@ -141,6 +141,39 @@ impl SymbolIndexDatabase {
         Ok(())
     }
 
+    pub fn indexed_file_count(&self) -> usize {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap_or(0)
+    }
+
+    pub fn latest_file_mtime(&self) -> Option<u64> {
+        self.conn
+            .query_row("SELECT MAX(mtime) FROM files", [], |row| row.get(0))
+            .ok()
+            .flatten()
+    }
+
+    pub fn file_metadata(&self, rel_path: &str) -> Option<(u64, u64)> {
+        self.conn
+            .query_row(
+                "SELECT mtime, size FROM files WHERE path = ?1",
+                params![rel_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()
+    }
+
+    pub fn file_has_symbols(&self, rel_path: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM symbols WHERE file_path = ?1)",
+                params![rel_path],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
     pub fn get_symbols_by_name(
         &self,
         name: &str,

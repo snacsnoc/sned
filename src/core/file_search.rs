@@ -64,7 +64,7 @@ pub fn truncated_display_path(path: &str) -> String {
 
 /// Check if a directory name should be excluded from search.
 /// Uses patterns from workspace::DEFAULT_IGNORE_PATTERNS for consistency.
-fn is_excluded_dir(name: &str) -> bool {
+pub(crate) fn is_excluded_dir(name: &str) -> bool {
     // Directory patterns from workspace::DEFAULT_IGNORE_PATTERNS
     // (excluding glob patterns like *.zip)
     matches!(

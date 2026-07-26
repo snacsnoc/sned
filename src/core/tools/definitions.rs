@@ -419,14 +419,22 @@ pub fn get_file_skeleton_schema() -> ToolSchema {
 pub fn find_symbol_references_schema() -> ToolSchema {
     ToolSchema {
         name: "find_symbol_references",
-        description: "Find all references to a symbol (function, class, variable) across the codebase.",
+        description: "Find symbol definitions and references. Supply path or paths for direct parsing, or omit both to search a ready workspace symbol index.",
         parameters: vec![
             ToolParameter {
                 name: "path",
-                required: true,
+                required: false,
                 param_type: "string",
-                description: "The path of the file containing the symbol definition.",
+                description: "Optional path to search directly. Omit only when the workspace symbol index is ready and enabled.",
                 items: None,
+                extra: None,
+            },
+            ToolParameter {
+                name: "paths",
+                required: false,
+                param_type: "array",
+                description: "Optional relative paths to parse directly. Merged with indexed workspace hits when the symbol index is enabled.",
+                items: Some(serde_json::json!({"type": "string"})),
                 extra: None,
             },
             ToolParameter {

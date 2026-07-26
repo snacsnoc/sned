@@ -6,12 +6,16 @@ use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
 };
+use crate::services::symbol_index::SymbolIndexService;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
-pub struct WriteToFileHandler;
+pub struct WriteToFileHandler {
+    symbol_index_service: Option<Arc<std::sync::Mutex<SymbolIndexService>>>,
+}
 
 impl WriteToFileHandler {
     fn format_missing_content_error(path: &str, consecutive_failures: u32) -> String {
@@ -113,6 +117,11 @@ impl WriteToFileHandler {
         Ok(format!("Successfully wrote to {path}"))
     }
 
+    pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
+        self.symbol_index_service = Some(service);
+        self
+    }
+
     async fn execute_with_workspace(
         &self,
         params: serde_json::Value,
@@ -156,7 +165,9 @@ impl WriteToFileHandler {
     }
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            symbol_index_service: None,
+        }
     }
 }
 
@@ -216,29 +227,40 @@ impl ToolHandler for WriteToFileHandler {
                 .await;
             match result {
                 Ok(_) => {
-                    let mut state = ctx.state.lock().await;
-                    state.consecutive_mistakes = 0;
-                    // Track newly created file to suppress "not read this session" warning on subsequent edits
-                    state
-                        .file_context_tracker
-                        .track_file_context(
-                            &resolved_path.to_string_lossy(),
-                            crate::core::context::trackers::FileRecordSource::SnedEdited,
+                    {
+                        let mut state = ctx.state.lock().await;
+                        state.consecutive_mistakes = 0;
+                        // Track newly created file to suppress "not read this session" warning on subsequent edits
+                        state
+                            .file_context_tracker
+                            .track_file_context(
+                                &resolved_path.to_string_lossy(),
+                                crate::core::context::trackers::FileRecordSource::SnedEdited,
+                            )
+                            .await;
+                        // Mark file as edited by Sned to suppress stale mtime detection
+                        state
+                            .file_context_tracker
+                            .mark_file_as_edited_by_sned(&resolved_path);
+                        let entry = state
+                            .session_file_changes
+                            .entry(resolved_path.to_string_lossy().to_string())
+                            .or_insert_with(|| crate::core::agent_types::FileChangeStats {
+                                lines_added: 0,
+                                lines_removed: 0,
+                                action: "created".to_string(),
+                            });
+                        entry.lines_added = entry.lines_added.saturating_add(lines_added);
+                    }
+                    if let Some(symbol_index_service) = &handler.symbol_index_service {
+                        crate::services::symbol_index::index_file_after_write(
+                            Arc::clone(symbol_index_service),
+                            ctx.workspace_root.as_path(),
+                            &display_path,
+                            &content,
                         )
                         .await;
-                    // Mark file as edited by Sned to suppress stale mtime detection
-                    state
-                        .file_context_tracker
-                        .mark_file_as_edited_by_sned(&resolved_path);
-                    let entry = state
-                        .session_file_changes
-                        .entry(resolved_path.to_string_lossy().to_string())
-                        .or_insert_with(|| crate::core::agent_types::FileChangeStats {
-                            lines_added: 0,
-                            lines_removed: 0,
-                            action: "created".to_string(),
-                        });
-                    entry.lines_added = entry.lines_added.saturating_add(lines_added);
+                    }
                     Ok(serde_json::Value::String(format!(
                         "Successfully wrote to {display_path}"
                     )))
@@ -273,6 +295,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn test_write_file() {
@@ -409,6 +432,46 @@ mod tests {
             serde_json::json!("Successfully wrote to nested/output.go")
         );
         assert!(workspace_root.path().join("nested/output.go").exists());
+    }
+
+    #[tokio::test]
+    async fn test_execute_refreshes_symbol_index() {
+        let workspace_root = TempDir::new().unwrap();
+        let index = Arc::new(std::sync::Mutex::new(SymbolIndexService::new(
+            workspace_root.path().to_string_lossy().into_owned(),
+        )));
+        let handler = WriteToFileHandler::new().with_symbol_index(Arc::clone(&index));
+        let ctx = ToolContext::new(
+            Arc::new(Mutex::new(TaskState::default())),
+            None,
+            workspace_root.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        handler
+            .execute(
+                &ctx,
+                serde_json::json!({
+                    "path": "indexed.rs",
+                    "content": "fn write_indexed_symbol() {}\n",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index
+                .lock()
+                .unwrap()
+                .get_definitions("write_indexed_symbol", None)
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -1409,7 +1409,10 @@ fn build_tool_registry(
     );
     registry.register(
         crate::core::tools::SnedTool::WriteToFile,
-        Arc::new(crate::core::tools::handlers::write_to_file::WriteToFileHandler::new()),
+        Arc::new(
+            crate::core::tools::handlers::write_to_file::WriteToFileHandler::new()
+                .with_symbol_index(Arc::clone(&symbol_index_service)),
+        ),
     );
     registry.register(
         crate::core::tools::SnedTool::ReadFile,
@@ -1427,7 +1430,8 @@ fn build_tool_registry(
         crate::core::tools::SnedTool::EditFile,
         Arc::new(
             crate::core::tools::handlers::edit_file::EditFileHandler::new()
-                .with_approval_manager(approval_manager),
+                .with_approval_manager(approval_manager)
+                .with_symbol_index(Arc::clone(&symbol_index_service)),
         ),
     );
     registry.register(
@@ -1454,7 +1458,10 @@ fn build_tool_registry(
     );
     registry.register(
         crate::core::tools::SnedTool::FindSymbolReferences,
-        Arc::new(crate::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler),
+        Arc::new(
+            crate::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler::new()
+                .with_symbol_index(Arc::clone(&symbol_index_service)),
+        ),
     );
     registry.register(
         crate::core::tools::SnedTool::ReplaceSymbol,
@@ -1653,6 +1660,7 @@ async fn build_task_components(
         workspace_root_str.clone(),
         symbol_index_mode,
     )));
+    crate::services::symbol_index::start_initial_walk(Arc::clone(&symbol_index_service));
 
     let context_loader = crate::core::context::ContextLoader::new(workspace_root_str.clone())
         .with_symbol_index_service(Arc::clone(&symbol_index_service));

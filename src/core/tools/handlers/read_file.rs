@@ -18,7 +18,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
-fn max_file_read_size() -> usize {
+pub(crate) fn max_file_read_size() -> usize {
     use std::sync::OnceLock;
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {

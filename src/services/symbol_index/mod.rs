@@ -4,7 +4,12 @@
 
 pub mod db;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use ignore::WalkBuilder;
 
 /// A symbol location in a file.
 #[derive(Debug, Clone)]
@@ -34,6 +39,43 @@ pub struct FileIndexEntry {
     pub symbols: Vec<SymbolLocation>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SymbolIndexStatus {
+    pub indexed_file_count: usize,
+    pub workspace_file_count: usize,
+    pub initial_walk_complete: bool,
+    pub last_indexed_at: Option<SystemTime>,
+    pub high_water_mtime: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IndexCandidate {
+    absolute_path: PathBuf,
+    relative_path: String,
+    mtime: u64,
+    size: u64,
+}
+
+static SYMBOL_INDEX_REFRESHING: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+const INDEX_BATCH_SIZE: usize = 64;
+const INDEX_PREFLIGHT_MIN_FILES: usize = 100;
+const INDEX_PREFLIGHT_SAMPLE_SIZE: usize = 128;
+
+struct SymbolIndexRefreshGuard {
+    project_root: String,
+}
+
+impl Drop for SymbolIndexRefreshGuard {
+    fn drop(&mut self) {
+        SYMBOL_INDEX_REFRESHING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.project_root);
+    }
+}
+
 /// Symbol index service with optional SQLite persistence.
 #[derive(Debug)]
 pub struct SymbolIndexService {
@@ -45,6 +87,7 @@ pub struct SymbolIndexService {
     index_root: Option<String>,
     db: Option<db::SymbolIndexDatabase>,
     disabled: bool,
+    status: SymbolIndexStatus,
 }
 
 pub const INDEX_DIR: &str = ".sned-symbol-index";
@@ -59,6 +102,7 @@ impl SymbolIndexService {
             index_root: None,
             db: None,
             disabled: false,
+            status: SymbolIndexStatus::default(),
         }
     }
 
@@ -66,6 +110,7 @@ impl SymbolIndexService {
         self.disabled = true;
         self.db = None;
         self.files.clear();
+        self.status.initial_walk_complete = true;
         self
     }
 
@@ -113,6 +158,8 @@ impl SymbolIndexService {
 
         let db_path = db_dir.join(DB_FILENAME);
         let database = db::SymbolIndexDatabase::open(&db_path)?;
+        self.status.indexed_file_count = database.indexed_file_count();
+        self.status.high_water_mtime = database.latest_file_mtime().unwrap_or(0);
         self.db = Some(database);
         Ok(self)
     }
@@ -137,9 +184,56 @@ impl SymbolIndexService {
             },
         );
 
-        if let Some(ref mut db) = self.db {
-            let _ = db.update_file_symbols(&rel_path, mtime, size, &symbols);
+        if let Some(ref mut db) = self.db
+            && let Err(error) = db.update_file_symbols(&rel_path, mtime, size, &symbols)
+        {
+            tracing::warn!(path = %rel_path, %error, "symbol index update failed");
         }
+        self.record_index_update(mtime);
+    }
+
+    pub fn index_file_safe(
+        &mut self,
+        rel_path: String,
+        mtime: u64,
+        size: u64,
+        symbols: Vec<SymbolLocation>,
+    ) {
+        if self.disabled {
+            return;
+        }
+
+        if symbols.is_empty() && self.has_symbols_with_metadata(&rel_path, mtime, size) {
+            return;
+        }
+
+        self.index_file(rel_path, mtime, size, symbols);
+    }
+
+    pub fn index_files_batch(&mut self, entries: Vec<(String, u64, u64, Vec<SymbolLocation>)>) {
+        if self.disabled || entries.is_empty() {
+            return;
+        }
+
+        let mut high_water_mtime = self.status.high_water_mtime;
+        for (rel_path, mtime, size, symbols) in &entries {
+            high_water_mtime = high_water_mtime.max(*mtime);
+            self.files.insert(
+                rel_path.clone(),
+                FileIndexEntry {
+                    mtime: *mtime,
+                    size: *size,
+                    symbols: symbols.clone(),
+                },
+            );
+        }
+
+        if let Some(ref mut db) = self.db
+            && let Err(error) = db.update_files_symbols_batch(&entries)
+        {
+            tracing::warn!(%error, "symbol index batch update failed");
+        }
+        self.record_index_update(high_water_mtime);
     }
 
     pub fn get_symbols(
@@ -195,6 +289,307 @@ impl SymbolIndexService {
     pub fn get_project_root(&self) -> &str {
         &self.project_root
     }
+
+    #[must_use]
+    pub fn status(&self) -> SymbolIndexStatus {
+        self.status.clone()
+    }
+
+    fn record_index_update(&mut self, mtime: u64) {
+        self.status.indexed_file_count = self
+            .db
+            .as_ref()
+            .map_or(self.files.len(), db::SymbolIndexDatabase::indexed_file_count);
+        self.status.high_water_mtime = self.status.high_water_mtime.max(mtime);
+        self.status.last_indexed_at = Some(SystemTime::now());
+    }
+
+    fn has_symbols_with_metadata(&self, rel_path: &str, mtime: u64, size: u64) -> bool {
+        if let Some(entry) = self.files.get(rel_path)
+            && entry.mtime == mtime
+            && entry.size == size
+            && !entry.symbols.is_empty()
+        {
+            return true;
+        }
+
+        self.db.as_ref().is_some_and(|db| {
+            db.file_metadata(rel_path) == Some((mtime, size)) && db.file_has_symbols(rel_path)
+        })
+    }
+
+    fn has_matching_metadata(&self, rel_path: &str, mtime: u64, size: u64) -> bool {
+        self.files
+            .get(rel_path)
+            .is_some_and(|entry| entry.mtime == mtime && entry.size == size)
+            || self
+                .db
+                .as_ref()
+                .is_some_and(|db| db.file_metadata(rel_path) == Some((mtime, size)))
+    }
+
+    fn should_skip_initial_walk(&self, sampled_latest_mtime: u64) -> bool {
+        self.db.as_ref().is_some_and(|db| {
+            db.indexed_file_count() > INDEX_PREFLIGHT_MIN_FILES
+                && db.latest_file_mtime().unwrap_or(0) >= sampled_latest_mtime
+        })
+    }
+
+    fn begin_initial_walk(&mut self, workspace_file_count: usize) {
+        self.status.workspace_file_count = workspace_file_count;
+        self.status.indexed_file_count = 0;
+        self.status.initial_walk_complete = false;
+    }
+
+    pub(crate) fn finish_initial_walk(&mut self, workspace_file_count: usize) {
+        self.status.workspace_file_count = workspace_file_count;
+        self.status.indexed_file_count = workspace_file_count;
+        self.status.initial_walk_complete = true;
+        self.status.last_indexed_at = Some(SystemTime::now());
+    }
+}
+
+pub fn start_initial_walk(service: Arc<Mutex<SymbolIndexService>>) {
+    let project_root = {
+        let service = service.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if service.is_disabled() {
+            return;
+        }
+        service.get_project_root().to_string()
+    };
+
+    if !SYMBOL_INDEX_REFRESHING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(project_root.clone())
+    {
+        return;
+    }
+
+    let refresh_guard = SymbolIndexRefreshGuard {
+        project_root: project_root.clone(),
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(move || {
+                let _refresh_guard = refresh_guard;
+                let started = Instant::now();
+                let result = run_initial_walk(&service, Path::new(&project_root));
+                if let Err(error) = result {
+                    tracing::warn!(root = %project_root, %error, "symbol index initial walk failed");
+                }
+                let files = service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .status()
+                    .indexed_file_count;
+                tracing::info!(root = %project_root, files, elapsed_ms = started.elapsed().as_millis(), "symbol index initial walk indexed files");
+            });
+        }
+        Err(error) => {
+            drop(refresh_guard);
+            tracing::warn!(%error, "symbol index walk was not started outside a Tokio runtime");
+        }
+    }
+}
+
+pub async fn index_file_after_write(
+    service: Arc<Mutex<SymbolIndexService>>,
+    project_root: &Path,
+    rel_path: &str,
+    content: &str,
+) {
+    let project_root = project_root.to_path_buf();
+    let rel_path = rel_path.to_string();
+    let content = content.to_string();
+    let indexed = tokio::task::spawn_blocking(move || {
+        prepare_index_entry(&project_root, &rel_path, &content)
+    })
+    .await;
+
+    match indexed {
+        Ok(Ok(Some((rel_path, mtime, size, symbols)))) => {
+            service
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .index_file_safe(rel_path, mtime, size, symbols);
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "symbol index post-write refresh failed"),
+        Err(error) => tracing::warn!(%error, "symbol index post-write task failed"),
+    }
+}
+
+fn run_initial_walk(service: &Arc<Mutex<SymbolIndexService>>, project_root: &Path) -> anyhow::Result<()> {
+    if !is_git_worktree(project_root) {
+        service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finish_initial_walk(0);
+        return Ok(());
+    }
+
+    let candidates = collect_index_candidates(project_root);
+    let sampled_latest_mtime = candidates
+        .iter()
+        .take(INDEX_PREFLIGHT_SAMPLE_SIZE)
+        .map(|candidate| candidate.mtime)
+        .max()
+        .unwrap_or(0);
+
+    {
+        let mut index = service.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if index.should_skip_initial_walk(sampled_latest_mtime) {
+            index.finish_initial_walk(candidates.len());
+            return Ok(());
+        }
+        index.begin_initial_walk(candidates.len());
+    }
+
+    let mut pending = Vec::with_capacity(INDEX_BATCH_SIZE);
+    let mut processed = 0usize;
+    for candidate in candidates.iter() {
+        let unchanged = service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_matching_metadata(&candidate.relative_path, candidate.mtime, candidate.size);
+
+        if !unchanged {
+            match std::fs::read_to_string(&candidate.absolute_path) {
+                Ok(content) => match parse_symbols(&candidate.absolute_path, &content) {
+                    Ok(Some(symbols)) => {
+                        pending.push((
+                            candidate.relative_path.clone(),
+                            candidate.mtime,
+                            candidate.size,
+                            symbols,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unparsable file"),
+                },
+                Err(error) => tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unreadable file"),
+            }
+        }
+
+        processed += 1;
+        if pending.len() == INDEX_BATCH_SIZE {
+            flush_initial_batch(service, &mut pending);
+        }
+        service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status
+            .indexed_file_count = processed;
+    }
+    flush_initial_batch(service, &mut pending);
+    service
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish_initial_walk(candidates.len());
+    Ok(())
+}
+
+fn flush_initial_batch(
+    service: &Arc<Mutex<SymbolIndexService>>,
+    entries: &mut Vec<(String, u64, u64, Vec<SymbolLocation>)>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let entries = std::mem::take(entries);
+    service
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .index_files_batch(entries);
+}
+
+fn is_git_worktree(project_root: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(project_root)
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
+        .unwrap_or(false)
+}
+
+fn collect_index_candidates(project_root: &Path) -> Vec<IndexCandidate> {
+    WalkBuilder::new(project_root)
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if name.starts_with('.') {
+                return false;
+            }
+            !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir() && crate::core::file_search::is_excluded_dir(&name))
+        })
+        .build()
+        .flatten()
+        .filter_map(|entry| {
+            if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if metadata.len() > crate::core::tools::handlers::read_file::max_file_read_size() as u64 {
+                return None;
+            }
+            let path = entry.into_path();
+            let _ = load_parser_for_path(&path)?;
+            let relative_path = path.strip_prefix(project_root).ok()?.to_string_lossy().into_owned();
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs());
+            Some(IndexCandidate {
+                absolute_path: path,
+                relative_path,
+                mtime,
+                size: metadata.len(),
+            })
+        })
+        .collect()
+}
+
+fn prepare_index_entry(
+    project_root: &Path,
+    rel_path: &str,
+    content: &str,
+) -> anyhow::Result<Option<(String, u64, u64, Vec<SymbolLocation>)>> {
+    let absolute_path = project_root.join(rel_path);
+    let metadata = std::fs::metadata(&absolute_path)?;
+    if metadata.len() > crate::core::tools::handlers::read_file::max_file_read_size() as u64 {
+        return Ok(None);
+    }
+    let Some(symbols) = parse_symbols(&absolute_path, content)? else {
+        return Ok(None);
+    };
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_secs());
+    Ok(Some((rel_path.to_string(), mtime, metadata.len(), symbols)))
+}
+
+fn load_parser_for_path(path: &Path) -> Option<crate::services::tree_sitter::LanguageParserMap> {
+    crate::services::tree_sitter::load_required_language_parsers(&[path.to_string_lossy().as_ref()])
+        .ok()
+}
+
+fn parse_symbols(path: &Path, content: &str) -> anyhow::Result<Option<Vec<SymbolLocation>>> {
+    let Some(parsers) = load_parser_for_path(path) else {
+        return Ok(None);
+    };
+    extract_symbols_for_indexing(path.to_string_lossy().as_ref(), content, &parsers).map(Some)
 }
 
 /// Extract symbols from file content for indexing.
@@ -359,6 +754,107 @@ mod tests {
 
         let limited = service.get_symbols("repeated", None, Some(3));
         assert_eq!(limited.len(), 3);
+    }
+
+    #[test]
+    fn test_safe_indexing_preserves_matching_known_symbols() {
+        let mut service = SymbolIndexService::new("/tmp/test".to_string());
+        service.index_file(
+            "src/lib.rs".to_string(),
+            10,
+            20,
+            vec![make_symbol("stable_symbol", 1, SymbolType::Definition)],
+        );
+
+        service.index_file_safe("src/lib.rs".to_string(), 10, 20, Vec::new());
+
+        assert_eq!(service.get_definitions("stable_symbol", None).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_index_file_after_write_refreshes_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lib.rs");
+        let content = "fn refreshed_symbol() {}\n";
+        std::fs::write(&path, content).unwrap();
+        let service = Arc::new(Mutex::new(SymbolIndexService::new(
+            temp.path().to_string_lossy().into_owned(),
+        )));
+
+        index_file_after_write(Arc::clone(&service), temp.path(), "lib.rs", content).await;
+
+        assert_eq!(
+            service
+                .lock()
+                .unwrap()
+                .get_definitions("refreshed_symbol", None)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_initial_walk_indexes_supported_files_only() {
+        let temp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::create_dir_all(temp.path().join("target")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "fn indexed_symbol() {}\n").unwrap();
+        std::fs::write(temp.path().join("target/ignored.rs"), "fn ignored_symbol() {}\n").unwrap();
+        std::fs::write(temp.path().join(".hidden.rs"), "fn hidden_symbol() {}\n").unwrap();
+
+        let service = Arc::new(Mutex::new(SymbolIndexService::new(
+            temp.path().to_string_lossy().into_owned(),
+        )));
+        run_initial_walk(&service, temp.path()).unwrap();
+
+        let service = service.lock().unwrap();
+        assert_eq!(service.get_definitions("indexed_symbol", None).len(), 1);
+        assert!(service.get_definitions("ignored_symbol", None).is_empty());
+        assert!(service.get_definitions("hidden_symbol", None).is_empty());
+        assert!(service.status().initial_walk_complete);
+        assert_eq!(service.status().workspace_file_count, 1);
+    }
+
+    #[test]
+    fn test_non_git_root_finishes_without_walking() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = Arc::new(Mutex::new(SymbolIndexService::new(
+            temp.path().to_string_lossy().into_owned(),
+        )));
+
+        run_initial_walk(&service, temp.path()).unwrap();
+
+        let status = service.lock().unwrap().status();
+        assert!(status.initial_walk_complete);
+        assert_eq!(status.workspace_file_count, 0);
+    }
+
+    #[test]
+    fn test_persisted_preflight_skips_recent_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = SymbolIndexService::new(temp.path().to_string_lossy().into_owned())
+            .with_index_root(temp.path().join("index").to_string_lossy().into_owned())
+            .with_persistence()
+            .unwrap();
+        let entries = (0..=INDEX_PREFLIGHT_MIN_FILES)
+            .map(|index| {
+                (
+                    format!("src/{index}.rs"),
+                    100,
+                    10,
+                    vec![make_symbol("persisted_symbol", index, SymbolType::Definition)],
+                )
+            })
+            .collect();
+        service.index_files_batch(entries);
+
+        assert!(service.should_skip_initial_walk(100));
+        assert!(!service.should_skip_initial_walk(101));
     }
 
     #[test]

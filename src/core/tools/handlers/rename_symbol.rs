@@ -201,24 +201,22 @@ impl RenameSymbolHandler {
                 all_locs.sort_by_key(|a| a.start_line);
 
                 let mut file_locs = Vec::new();
-                let mut fallback_to_treesitter = false;
 
                 for loc in all_locs {
-                    if let Some(loc_path) = &loc.path {
-                        let abs_loc_path = std::path::Path::new(&project_root).join(loc_path);
-                        if abs_loc_path.to_string_lossy() == *abs_path {
-                            file_locs.push(SymbolOccurrence {
-                                start_line: loc.start_line,
-                                start_column: loc.start_column,
-                                end_column: loc.end_column,
-                            });
-                        }
-                    } else {
-                        fallback_to_treesitter = true;
+                    let Some(loc_path) = &loc.path else {
+                        continue;
+                    };
+                    let abs_loc_path = std::path::Path::new(&project_root).join(loc_path);
+                    if abs_loc_path.to_string_lossy() == *abs_path {
+                        file_locs.push(SymbolOccurrence {
+                            start_line: loc.start_line,
+                            start_column: loc.start_column,
+                            end_column: loc.end_column,
+                        });
                     }
                 }
 
-                if fallback_to_treesitter {
+                if file_locs.is_empty() {
                     collect_symbol_occurrences(
                         abs_path,
                         existing_symbol,
@@ -301,6 +299,21 @@ impl RenameSymbolHandler {
                         state
                             .file_context_tracker
                             .mark_file_as_edited_by_sned(std::path::Path::new(&abs_path));
+                        if let Some(symbol_index_service) = &self.symbol_index_service
+                        {
+                            let index_root = tokio::fs::canonicalize(workspace_root)
+                                .await
+                                .unwrap_or_else(|_| workspace_root.to_path_buf());
+                            if let Ok(rel_path) = Path::new(&abs_path).strip_prefix(&index_root) {
+                                crate::services::symbol_index::index_file_after_write(
+                                    Arc::clone(symbol_index_service),
+                                    &index_root,
+                                    &rel_path.to_string_lossy(),
+                                    &final_content,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Err(e) => {
                         state.consecutive_mistakes += 1;

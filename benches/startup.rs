@@ -164,7 +164,9 @@ fn bench_tool_registry_creation(c: &mut Criterion) {
             );
             registry.register(
                 sned::core::tools::SnedTool::FindSymbolReferences,
-                Arc::new(sned::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler),
+                Arc::new(
+                    sned::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler::new(),
+                ),
             );
             registry.register(
                 sned::core::tools::SnedTool::ReplaceSymbol,

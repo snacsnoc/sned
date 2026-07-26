@@ -1,19 +1,25 @@
 use crate::core::hash_utils::format_line_with_hash;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use crate::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
 use crate::services::tree_sitter::load_required_language_parsers;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use streaming_iterator::StreamingIterator;
 use tokio::fs;
 
 /// Handler for find_symbol_references tool.
-pub struct FindSymbolReferencesHandler;
+pub struct FindSymbolReferencesHandler {
+    symbol_index_service: Option<Arc<std::sync::Mutex<SymbolIndexService>>>,
+}
 
 #[derive(Debug, Clone)]
 struct Hit {
     line_index: usize,
     symbol: String,
+    is_definition: bool,
 }
 
 /// Stores file lines and parsed hits to avoid re-reading during formatting.
@@ -24,6 +30,18 @@ struct FileData {
 }
 
 impl FindSymbolReferencesHandler {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            symbol_index_service: None,
+        }
+    }
+
+    pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
+        self.symbol_index_service = Some(service);
+        self
+    }
+
     pub async fn run(
         &self,
         ctx: &ToolContext,
@@ -37,11 +55,6 @@ impl FindSymbolReferencesHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("both");
 
-        if paths.is_empty() {
-            return Err(ToolError::InvalidInput(
-                "Missing required parameter: paths".to_string(),
-            ));
-        }
         if symbols.is_empty() {
             return Err(ToolError::InvalidInput(
                 "Missing required parameter: names".to_string(),
@@ -50,6 +63,7 @@ impl FindSymbolReferencesHandler {
 
         let mut file_data: BTreeMap<String, FileData> = BTreeMap::new();
         let mut any_error = None;
+        let mut index_warnings = Vec::new();
 
         for path in &paths {
             let abs_path = resolve_sanitized_path(&ctx.workspace_root, path)?;
@@ -70,7 +84,12 @@ impl FindSymbolReferencesHandler {
                     ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
                 })?;
 
-            let hits = collect_hits_for_file(path, &symbols, find_type, &content, &parsers)
+            let display_path = abs_path
+                .strip_prefix(&ctx.workspace_root)
+                .unwrap_or(&abs_path)
+                .to_string_lossy()
+                .into_owned();
+            let hits = collect_hits_for_file(&display_path, &symbols, find_type, &content, &parsers)
                 .map_err(|e| {
                     ToolError::ExecutionFailed(format!("Error finding references: {e}"))
                 })?;
@@ -79,11 +98,31 @@ impl FindSymbolReferencesHandler {
                 .lines()
                 .map(std::string::ToString::to_string)
                 .collect();
-            file_data.insert(path.clone(), FileData { lines, hits });
+            file_data.insert(display_path, FileData { lines, hits });
         }
 
         if let Some(err) = any_error {
             return Err(err);
+        }
+
+        let (index_status, indexed_locations, project_root) =
+            self.index_locations(&symbols, find_type, paths.is_empty())?;
+        if !indexed_locations.is_empty() {
+            merge_index_locations(
+                &mut file_data,
+                &ctx.workspace_root,
+                &project_root,
+                indexed_locations,
+                &mut index_warnings,
+            )
+            .await;
+        }
+
+        for data in file_data.values_mut() {
+            let mut seen = HashSet::new();
+            data.hits.retain(|hit| {
+                seen.insert((hit.line_index, hit.symbol.clone(), hit.is_definition))
+            });
         }
 
         let total_hits = file_data
@@ -96,11 +135,24 @@ impl FindSymbolReferencesHandler {
             } else {
                 format!("{find_type}s")
             };
-            return Ok(format!(
+            let mut output = Vec::new();
+            if let Some(status) = index_status {
+                if status.initial_walk_complete {
+                    output.push(format!(
+                        "Index had 0 hits (workspace scanned {} files).",
+                        status.workspace_file_count
+                    ));
+                } else {
+                    output.push(index_status_line(&status));
+                }
+            }
+            output.push(format!(
                 "No {} found for symbols: {}.",
                 kind,
                 symbols.join(", ")
             ));
+            output.extend(index_warnings);
+            return Ok(output.join("\n"));
         }
 
         let mut sections = Vec::new();
@@ -137,7 +189,69 @@ impl FindSymbolReferencesHandler {
             }
         }
 
-        Ok(sections.join("\n\n"))
+        let mut output = Vec::new();
+        if let Some(status) = index_status
+            && !status.initial_walk_complete
+        {
+            output.push(index_status_line(&status));
+        }
+        output.extend(index_warnings);
+        output.push(sections.join("\n\n"));
+        Ok(output.join("\n\n"))
+    }
+
+    fn index_locations(
+        &self,
+        symbols: &[String],
+        find_type: &str,
+        paths_are_empty: bool,
+    ) -> Result<(Option<crate::services::symbol_index::SymbolIndexStatus>, Vec<SymbolLocation>, String), ToolError> {
+        let Some(symbol_index_service) = &self.symbol_index_service else {
+            if paths_are_empty {
+                return Err(ToolError::InvalidInput(
+                    "find_symbol_references requires paths when the symbol index is disabled or still warming.".to_string(),
+                ));
+            }
+            return Ok((None, Vec::new(), String::new()));
+        };
+
+        let service = symbol_index_service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if service.is_disabled() {
+            if paths_are_empty {
+                return Err(ToolError::InvalidInput(
+                    "find_symbol_references requires paths when the symbol index is disabled or still warming.".to_string(),
+                ));
+            }
+            return Ok((None, Vec::new(), service.get_project_root().to_string()));
+        }
+
+        let status = service.status();
+        if paths_are_empty && !status.initial_walk_complete {
+            return Err(ToolError::InvalidInput(
+                "find_symbol_references requires paths when the symbol index is disabled or still warming.".to_string(),
+            ));
+        }
+
+        let mut locations = Vec::new();
+        for symbol in symbols {
+            match find_type {
+                "definition" => locations.extend(service.get_definitions(symbol, None)),
+                "reference" => locations.extend(service.get_references(symbol, None)),
+                _ => {
+                    locations.extend(service.get_definitions(symbol, None));
+                    locations.extend(service.get_references(symbol, None));
+                }
+            }
+        }
+        Ok((Some(status), locations, service.get_project_root().to_string()))
+    }
+}
+
+impl Default for FindSymbolReferencesHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -159,6 +273,74 @@ impl ToolHandler for FindSymbolReferencesHandler {
     fn description(&self, _params: &serde_json::Value) -> String {
         "[find_symbol_references]".to_string()
     }
+}
+
+async fn merge_index_locations(
+    file_data: &mut BTreeMap<String, FileData>,
+    workspace_root: &Path,
+    project_root: &str,
+    locations: Vec<SymbolLocation>,
+    warnings: &mut Vec<String>,
+) {
+    let canonical_workspace = match fs::canonicalize(workspace_root).await {
+        Ok(path) => path,
+        Err(error) => {
+            warnings.push(format!("Unable to resolve workspace for index results: {error}"));
+            return;
+        }
+    };
+
+    for location in locations {
+        let Some(rel_path) = location.path.as_deref() else {
+            continue;
+        };
+        let absolute_path = Path::new(project_root).join(rel_path);
+        let resolved_path = match fs::canonicalize(&absolute_path).await {
+            Ok(path) => path,
+            Err(error) => {
+                warnings.push(format!("Index entry skipped for {rel_path}: {error}"));
+                continue;
+            }
+        };
+        if !resolved_path.starts_with(&canonical_workspace) {
+            warnings.push(format!("Index entry skipped outside workspace: {rel_path}"));
+            continue;
+        }
+        let display_path = rel_path.to_string();
+        if !file_data.contains_key(&display_path) {
+            let content = match fs::read_to_string(&resolved_path).await {
+                Ok(content) => content,
+                Err(error) => {
+                    warnings.push(format!("Index entry skipped for {display_path}: {error}"));
+                    continue;
+                }
+            };
+            file_data.insert(
+                display_path.clone(),
+                FileData {
+                    lines: content
+                        .lines()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
+                    hits: Vec::new(),
+                },
+            );
+        }
+        if let Some(data) = file_data.get_mut(&display_path) {
+            data.hits.push(Hit {
+                line_index: location.start_line,
+                symbol: location.name,
+                is_definition: location.symbol_type == SymbolType::Definition,
+            });
+        }
+    }
+}
+
+fn index_status_line(status: &crate::services::symbol_index::SymbolIndexStatus) -> String {
+    format!(
+        "[Index: {}/{} files indexed, walk in progress]",
+        status.indexed_file_count, status.workspace_file_count
+    )
 }
 
 fn read_string_list(
@@ -226,7 +408,7 @@ fn collect_hits_for_file(
     };
 
     let mut hits = Vec::new();
-    let mut seen_hits: HashSet<(usize, String)> = HashSet::new();
+    let mut seen_hits: HashSet<(usize, String, bool)> = HashSet::new();
     let mut query_cursor2 = tree_sitter::QueryCursor::new();
     let mut captures2 = query_cursor2.captures(&entry.query, root_node, content.as_bytes());
 
@@ -252,11 +434,17 @@ fn collect_hits_for_file(
             if symbol_matches(&normalized_full_name, &normalized_requested)
                 || symbol_matches(&normalized_name, &normalized_requested)
             {
-                let key = (capture.node.start_position().row, symbol.clone());
+                let is_definition = capture_name.starts_with("name.definition");
+                let key = (
+                    capture.node.start_position().row,
+                    symbol.clone(),
+                    is_definition,
+                );
                 if seen_hits.insert(key) {
                     hits.push(Hit {
                         line_index: capture.node.start_position().row,
                         symbol: symbol.clone(),
+                        is_definition,
                     });
                 }
             }
@@ -320,7 +508,7 @@ mod tests {
         let file_content = "fn foo() {}\nfn bar() { foo(); }\n";
         std::fs::write(workspace_root.join("test.rs"), file_content).unwrap();
 
-        let handler = FindSymbolReferencesHandler;
+        let handler = FindSymbolReferencesHandler::new();
         let state = Arc::new(Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
         let ctx = ToolContext::new(
@@ -347,5 +535,139 @@ mod tests {
         let result_str = result.as_str().unwrap();
         assert!(result_str.contains("test.rs"));
         assert!(result_str.contains("fn foo()"));
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_uses_ready_index_without_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_root = temp_dir.path();
+        std::fs::write(workspace_root.join("indexed.rs"), "fn indexed_symbol() {}\n").unwrap();
+
+        let symbol_index = Arc::new(std::sync::Mutex::new(SymbolIndexService::new(
+            workspace_root.to_string_lossy().into_owned(),
+        )));
+        {
+            let mut service = symbol_index.lock().unwrap();
+            service.index_file(
+                "indexed.rs".to_string(),
+                1,
+                1,
+                vec![SymbolLocation {
+                    path: None,
+                    name: "indexed_symbol".to_string(),
+                    start_line: 0,
+                    start_column: 3,
+                    end_line: 0,
+                    end_column: 17,
+                    symbol_type: SymbolType::Definition,
+                    kind: None,
+                }],
+            );
+            service.finish_initial_walk(1);
+        }
+
+        let ctx = ToolContext::new(
+            Arc::new(Mutex::new(TaskState::default())),
+            None,
+            workspace_root.to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let handler = FindSymbolReferencesHandler::new().with_symbol_index(symbol_index);
+
+        let result = handler
+            .execute(&ctx, serde_json::json!({ "name": "indexed_symbol" }))
+            .await
+            .unwrap();
+
+        let result = result.as_str().unwrap();
+        assert!(result.contains("indexed.rs"));
+        assert!(result.contains("fn indexed_symbol"));
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_requires_paths_while_index_warms() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(Mutex::new(TaskState::default())),
+            None,
+            temp_dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let handler = FindSymbolReferencesHandler::new().with_symbol_index(Arc::new(
+            std::sync::Mutex::new(SymbolIndexService::new(
+                temp_dir.path().to_string_lossy().into_owned(),
+            )),
+        ));
+
+        let error = handler
+            .execute(&ctx, serde_json::json!({ "name": "missing_symbol" }))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("requires paths"));
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_merges_paths_with_index_hits() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_root = temp_dir.path();
+        std::fs::write(workspace_root.join("parsed.rs"), "fn shared_symbol() {}\n").unwrap();
+        std::fs::write(workspace_root.join("indexed.rs"), "fn shared_symbol() {}\n").unwrap();
+        let symbol_index = Arc::new(std::sync::Mutex::new(SymbolIndexService::new(
+            workspace_root.to_string_lossy().into_owned(),
+        )));
+        {
+            let mut service = symbol_index.lock().unwrap();
+            service.index_file(
+                "indexed.rs".to_string(),
+                1,
+                1,
+                vec![SymbolLocation {
+                    path: None,
+                    name: "shared_symbol".to_string(),
+                    start_line: 0,
+                    start_column: 3,
+                    end_line: 0,
+                    end_column: 16,
+                    symbol_type: SymbolType::Definition,
+                    kind: None,
+                }],
+            );
+            service.finish_initial_walk(2);
+        }
+        let ctx = ToolContext::new(
+            Arc::new(Mutex::new(TaskState::default())),
+            None,
+            workspace_root.to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let handler = FindSymbolReferencesHandler::new().with_symbol_index(symbol_index);
+
+        let result = handler
+            .execute(
+                &ctx,
+                serde_json::json!({ "path": "parsed.rs", "name": "shared_symbol" }),
+            )
+            .await
+            .unwrap();
+
+        let result = result.as_str().unwrap();
+        assert!(result.contains("parsed.rs"));
+        assert!(result.contains("indexed.rs"));
     }
 }

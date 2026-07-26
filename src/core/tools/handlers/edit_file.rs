@@ -1187,6 +1187,26 @@ impl EditFileHandler {
             state.consecutive_reads.remove(&item.absolute_path);
         }
 
+        if write_failed_paths.is_empty()
+            && let Some(symbol_index_service) = &self.symbol_index_service
+        {
+            let index_root = tokio::fs::canonicalize(workspace_root)
+                .await
+                .unwrap_or_else(|_| workspace_root.to_path_buf());
+            for item in &write_items {
+                let absolute_path = Path::new(&item.absolute_path);
+                if let Ok(rel_path) = absolute_path.strip_prefix(&index_root) {
+                    crate::services::symbol_index::index_file_after_write(
+                        Arc::clone(symbol_index_service),
+                        &index_root,
+                        &rel_path.to_string_lossy(),
+                        &item.final_content,
+                    )
+                    .await;
+                }
+            }
+        }
+
         // Phase 5: Run post-save diagnostics in batch for all successfully edited files
         // This is more efficient than per-file diagnostics when any_pre_errors is true
         let mut post_diagnostics_by_file: std::collections::HashMap<
@@ -1588,6 +1608,62 @@ mod tests {
         );
         let updated = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(updated, "replaced\nline 2\nline 3\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_refreshes_symbol_index_after_write() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("indexed.rs");
+        let raw_content = "fn before_indexed_symbol() {}\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let symbol_index = Arc::new(std::sync::Mutex::new(SymbolIndexService::new(
+            dir.path().to_string_lossy().into_owned(),
+        )));
+        let handler = EditFileHandler::new().with_symbol_index(Arc::clone(&symbol_index));
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &[raw_content.trim_end().to_string()],
+            Some("test-task"),
+        );
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": [{
+                "path": "indexed.rs",
+                "edits": [{
+                    "anchor": format!("{}§fn before_indexed_symbol() {{}}", anchors[0]),
+                    "end_anchor": format!("{}§fn before_indexed_symbol() {{}}", anchors[0]),
+                    "text": "fn after_indexed_symbol() {}",
+                }]
+            }]
+        });
+
+        ToolHandler::execute(&handler, &ctx, params).await.unwrap();
+        assert!(std::fs::read_to_string(&file_path)
+            .unwrap()
+            .contains("after_indexed_symbol"));
+
+        assert_eq!(
+            symbol_index
+                .lock()
+                .unwrap()
+                .get_definitions("after_indexed_symbol", None)
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
