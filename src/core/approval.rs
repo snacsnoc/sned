@@ -3058,12 +3058,22 @@ mod tests {
 
         let formatted =
             format_tool_parameters_in_workspace("write_to_file", &params, Some(temp.path()));
+        let visible_text = crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&formatted)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(formatted.contains("overwriting existing file"));
-        assert!(formatted.contains("- let old_0 = 0;"));
-        assert!(formatted.contains("+ let new_0 = 0;"));
-        assert!(formatted.contains("more diff lines"));
-        assert!(!formatted.contains("│ let new_0"));
+        assert!(visible_text.contains("overwriting existing file"));
+        assert!(visible_text.contains("- let old_0 = 0;"));
+        assert!(visible_text.contains("+ let new_0 = 0;"));
+        assert!(visible_text.contains("more diff lines"));
+        assert!(!visible_text.contains("│ let new_0"));
     }
 
     #[test]
