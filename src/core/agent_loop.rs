@@ -326,6 +326,29 @@ fn stream_error_is_retryable(error: &str) -> bool {
     error.contains("(retryable)")
 }
 
+fn report_shadow_commit_result(
+    output_writer: &crate::cli::output::OutputWriterArc,
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+) {
+    let error = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.to_string(),
+        Err(error) => format!("background task failed: {error}"),
+    };
+    let detail = error
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    output_writer.emit(OutputEvent::tool_output_line(
+        format!(
+            "Change tracking failed; /diff and /log will not include this turn: {detail}"
+        ),
+        Style::default().fg(ERROR_FG),
+    ));
+}
+
 fn sanitize_model_text_for_display(line: &str) -> Cow<'_, str> {
     if line.chars().all(|ch| !ch.is_control() && ch != '\t') {
         Cow::Borrowed(line)
@@ -1865,6 +1888,7 @@ impl AgentLoop {
 
             let mut stream_errored = false;
             let mut retryable_stream_error_before_output: Option<String> = None;
+            let mut non_retryable_stream_error: Option<String> = None;
             let mut in_thinking_tag = false;
             let mut emitted_output_this_attempt = false;
             let mut partial_line_displayed = false;
@@ -2347,10 +2371,29 @@ impl AgentLoop {
                     }
                     ApiStreamChunk::Error(err) => {
                         tracing::error!(error = %err, "received error chunk from provider stream");
-                        if !first_chunk_received
-                            && !emitted_output_this_attempt
-                            && stream_error_is_retryable(&err)
-                        {
+                        let retryable = stream_error_is_retryable(&err);
+                        if !retryable {
+                            stream_errored = true;
+                            if non_retryable_stream_error.is_none() {
+                                if self.config.json_output {
+                                    tracing::info!(
+                                        target: "json_output",
+                                        "{}",
+                                        serde_json::json!({
+                                            "type": "error",
+                                            "error": err
+                                        })
+                                    );
+                                    emitted_output_this_attempt = true;
+                                }
+                                non_retryable_stream_error = Some(err);
+                            }
+                            continue;
+                        }
+                        if non_retryable_stream_error.is_some() {
+                            continue;
+                        }
+                        if !first_chunk_received && !emitted_output_this_attempt {
                             retryable_stream_error_before_output = Some(err);
                             break;
                         }
@@ -2427,6 +2470,10 @@ impl AgentLoop {
             if let Err(e) = stream_handle.await {
                 let actionable = crate::cli::actionable_errors::provider_error(&e.to_string());
                 return TurnResult::Error(actionable.display());
+            }
+
+            if let Some(err) = non_retryable_stream_error {
+                return TurnResult::Error(err);
             }
 
             if let Some(err) = retryable_stream_error_before_output {
@@ -2809,10 +2856,11 @@ impl AgentLoop {
                                 if needs_prompt {
                                     drop(mgr); // Drop lock before async call
                                     user_prompted = true;
-                                    match crate::core::approval::prompt_for_approval_async(
+                                    match crate::core::approval::prompt_for_approval_async_in_workspace(
                                         &tool_name,
                                         &tool_params,
                                         self.config.output_writer.clone(),
+                                        Some(tool_context.workspace_root.clone()),
                                     )
                                     .await
                                     {
@@ -2856,7 +2904,10 @@ impl AgentLoop {
                                             None // Proceed to execute
                                         }
                                         Err(e) => Some(ToolExecutionOutput::error(
-                                            format!("Approval error for tool '{tool_name}': {e}"),
+                                            crate::core::approval::format_approval_error(
+                                                Some(&tool_name),
+                                                &e,
+                                            ),
                                             None,
                                         )),
                                     }
@@ -2915,10 +2966,11 @@ impl AgentLoop {
                                         } else {
                                             drop(mgr);
                                             user_prompted = true;
-                                            match crate::core::approval::prompt_for_approval_async(
+                                            match crate::core::approval::prompt_for_approval_async_in_workspace(
                                                 &tool_name,
                                                 &tool_params,
                                                 self.config.output_writer.clone(),
+                                                Some(tool_context.workspace_root.clone()),
                                             )
                                             .await
                                             {
@@ -2964,8 +3016,9 @@ impl AgentLoop {
                                                     crate::core::approval::ApprovalResult::Approved,
                                                 ) => None,
                                                 Err(e) => Some(ToolExecutionOutput::error(
-                                                    format!(
-                                                        "Approval error for tool '{tool_name}': {e}"
+                                                    crate::core::approval::format_approval_error(
+                                                        Some(&tool_name),
+                                                        &e,
                                                     ),
                                                     None,
                                                 )),
@@ -3524,10 +3577,11 @@ impl AgentLoop {
                 {
                     let message = format!("[sned] turn: {}", format_heat_map(&edit_files));
                     // Run synchronous git operations in spawn_blocking to avoid blocking runtime
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let result = tokio::task::spawn_blocking(move || {
                         crate::core::shadow_git::commit_turn(&workspace_root, &message)
                     })
                     .await;
+                    report_shadow_commit_result(&self.config.output_writer, result);
                 }
             }
 
@@ -4572,6 +4626,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_shadow_commit_failure_is_visible() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        report_shadow_commit_result(
+            &writer,
+            Ok(Err(anyhow::anyhow!(
+                "git commit failed:\nAuthor identity unknown"
+            ))),
+        );
+
+        let rendered = drain_rendered_output(&mut rx);
+        assert_eq!(
+            rendered,
+            vec![
+                "Change tracking failed; /diff and /log will not include this turn: git commit failed: Author identity unknown"
+            ]
+        );
+    }
+
+    #[derive(Clone)]
+    struct CapturedTraceWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedTraceWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct ConcurrencyProbeHandler {
         active: Arc<std::sync::atomic::AtomicUsize>,
         max_active: Arc<std::sync::atomic::AtomicUsize>,
@@ -4641,6 +4734,25 @@ mod tests {
 
         assert_eq!(line.to_string(), "+ new line");
         assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::Green));
+    }
+
+    #[test]
+    fn test_strip_edit_diff_anchors_preserves_syntax_spans() {
+        let mut line = crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(
+            "\x1b[92m+ AddedHash§\x1b[0m\x1b[96mlet\x1b[0m value = 1;",
+        )
+        .pop()
+        .unwrap();
+
+        strip_edit_diff_anchors(&mut line);
+
+        assert_eq!(line.to_string(), "+ let value = 1;");
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.content == "let"
+                    && span.style.fg == Some(ratatui::style::Color::Cyan))
+        );
     }
 
     #[tokio::test]
@@ -4754,6 +4866,132 @@ mod tests {
             1,
             "disabled parallel tool calling must keep tool execution sequential"
         );
+    }
+
+    #[tokio::test]
+    async fn test_approval_timeout_does_not_skip_remaining_batch_calls() {
+        use crate::core::approval::{ApprovalManager, ApprovalResult};
+        use crate::core::tools::ToolRegistry;
+        use crate::test_support::env_lock;
+        use tokio::time::{Duration, timeout};
+
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let _input_override = crate::core::approval::override_approval_input_for_test();
+        let _timeout_override = crate::core::approval::override_approval_timeout_for_test(
+            Duration::from_millis(25),
+        );
+
+        let responses = vec![vec![
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_1".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("write_to_file".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"path": "first.txt", "content": "first"})
+                                .to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_2".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("write_to_file".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"path": "second.txt", "content": "second"})
+                                .to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, _rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        let mut config = test_agent_config(provider, "test-approval-timeout-batch");
+        config.output_writer = writer;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::WriteToFile,
+            Arc::new(StaticResultHandler("write completed")),
+        );
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(ApprovalManager::new()));
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_approval_manager(approval_manager);
+
+        let turn = tokio::spawn(async move {
+            let result = agent.execute_turn().await;
+            (agent, result)
+        });
+
+        let first_request = loop {
+            let event = timeout(Duration::from_secs(2), priority_rx.recv())
+                .await
+                .expect("first approval prompt should arrive")
+                .expect("priority output should stay open");
+            if let OutputEvent::ApprovalRequested(request) = event {
+                break request;
+            }
+        };
+
+        let second_request = loop {
+            let event = timeout(Duration::from_secs(2), priority_rx.recv())
+                .await
+                .expect("second approval prompt should arrive after timeout")
+                .expect("priority output should stay open");
+            if let OutputEvent::ApprovalRequested(request) = event {
+                break request;
+            }
+        };
+        assert_ne!(first_request.id(), second_request.id());
+        assert!(second_request.respond(ApprovalResult::Approved));
+        drop(first_request);
+
+        let (agent, result) = timeout(Duration::from_secs(2), turn)
+            .await
+            .expect("tool batch should finish")
+            .expect("agent task should not panic");
+        assert!(matches!(result, TurnResult::Continue));
+
+        let history = agent.conversation_history.lock().await;
+        let tool_results = history
+            .last()
+            .and_then(|message| match &message.content {
+                MessageContent::UserBlocks(blocks) => Some(blocks),
+                _ => None,
+            })
+            .expect("tool result message should be recorded")
+            .iter()
+            .filter_map(|block| match block {
+                UserContentBlock::ToolResult(result) => match &result.content {
+                    ToolResultContent::Text(text) => Some(text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 2);
+        assert!(tool_results[0].contains("didn't respond within 5 minutes"));
+        assert_eq!(tool_results[1], "write completed");
     }
 
     fn drain_rendered_output(
@@ -5235,6 +5473,125 @@ mod tests {
                 .await
                 .did_automatically_retry_failed_api_request
         );
+    }
+
+    #[tokio::test]
+    async fn test_non_retryable_stream_error_preserves_message_without_retry_state() {
+        let error = "Gemini blocked the response (finish reason: SAFETY). Rephrase the request and try again.";
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![crate::providers::mock::MockResponse::Stream(vec![
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                    error.to_string(),
+                )),
+            ])],
+        )));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-non-retryable-stream-error");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("blocked request".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+
+        let result = agent.execute_turn().await;
+
+        match result {
+            TurnResult::Error(message) => assert_eq!(message, error),
+            other => panic!("expected non-retryable stream error, got {other:?}"),
+        }
+        assert!(
+            drain_rendered_output(&mut rx)
+                .iter()
+                .all(|line| !line.contains(error))
+        );
+        assert!(agent.state.lock().await.retryable_failed_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_non_retryable_stream_error_precedes_later_retryable_error() {
+        let policy_error = "Gemini blocked the response (finish reason: SAFETY). Rephrase the request and try again.";
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![
+                crate::providers::mock::MockResponse::Stream(vec![
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                        policy_error.to_string(),
+                    )),
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                        "Gemini SSE stream error: connection reset (retryable)".to_string(),
+                    )),
+                ]),
+                crate::providers::mock::MockResponse::Text(
+                    "blocked request must not be retried\n".to_string(),
+                ),
+            ],
+        )));
+        let mut agent = AgentLoop::new(test_agent_config(
+            provider,
+            "test-non-retryable-error-precedence",
+        ));
+
+        let result = agent.execute_turn().await;
+
+        match result {
+            TurnResult::Error(message) => assert_eq!(message, policy_error),
+            other => panic!("expected policy error, got {other:?}"),
+        }
+        assert!(
+            !agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_non_retryable_stream_error_is_emitted_in_json_mode() {
+        let policy_error = "Gemini blocked the prompt (reason: SAFETY). Rephrase the prompt and try again.";
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![crate::providers::mock::MockResponse::Stream(vec![
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                    policy_error.to_string(),
+                )),
+            ])],
+        )));
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedTraceWriter(writer.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut config = test_agent_config(provider, "test-json-non-retryable-error");
+        config.json_output = true;
+        let mut agent = AgentLoop::new(config);
+
+        let result = agent.execute_turn().await;
+
+        match result {
+            TurnResult::Error(message) => assert_eq!(message, policy_error),
+            other => panic!("expected policy error, got {other:?}"),
+        }
+        let output = String::from_utf8(
+            captured
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+        )
+        .unwrap();
+        assert!(output.contains("json_output"));
+        assert!(output.contains("\"type\":\"error\""));
+        assert!(output.contains(policy_error));
     }
 
     /// Regression test for the MAX_STREAM_RETRY_ATTEMPTS cap added in

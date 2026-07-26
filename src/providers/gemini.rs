@@ -323,9 +323,18 @@ struct GeminiStreamChunk {
     #[serde(default)]
     candidates: Vec<GeminiCandidate>,
     #[serde(default)]
+    prompt_feedback: Option<GeminiPromptFeedback>,
+    #[serde(default)]
     usage_metadata: Option<GeminiUsageMetadata>,
     #[serde(default)]
     response_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPromptFeedback {
+    #[serde(default)]
+    block_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -380,6 +389,14 @@ struct GeminiUsageMetadata {
     cached_content_token_count: Option<u32>,
 }
 
+fn gemini_candidate_block_error(finish_reason: &str) -> Option<String> {
+    matches!(finish_reason, "SAFETY" | "RECITATION" | "BLOCKED").then(|| {
+        format!(
+            "Gemini blocked the response (finish reason: {finish_reason}). Rephrase the request and try again."
+        )
+    })
+}
+
 fn try_send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
@@ -394,6 +411,7 @@ fn process_gemini_sse_line(
     accumulated_tool_calls: &mut HashMap<String, (String, String, String, Option<String>)>,
     completed_tool_call_ids: &mut HashSet<String>,
     last_stop_reason: &mut Option<String>,
+    response_blocked: &mut bool,
     last_grounding_metadata: &mut Option<serde_json::Value>,
     model_info: &Option<crate::providers::ModelInfo>,
 ) {
@@ -418,6 +436,23 @@ fn process_gemini_sse_line(
         .response_id
         .clone()
         .unwrap_or_else(|| "gemini-response".to_string());
+
+    if let Some(block_reason) = chunk
+        .prompt_feedback
+        .and_then(|feedback| feedback.block_reason)
+    {
+        *last_stop_reason = Some(block_reason.clone());
+        if !*response_blocked {
+            try_send_chunk(
+                tx,
+                ApiStreamChunk::Error(format!(
+                    "Gemini blocked the prompt (reason: {block_reason}). Rephrase the prompt and try again."
+                )),
+                "blocked_prompt",
+            );
+        }
+        *response_blocked = true;
+    }
 
     // Process candidates
     for candidate in chunk.candidates {
@@ -532,7 +567,13 @@ fn process_gemini_sse_line(
 
         // Track finish reason
         if let Some(finish) = candidate.finish_reason {
-            *last_stop_reason = Some(finish.clone());
+            if !*response_blocked {
+                *last_stop_reason = Some(finish.clone());
+                if let Some(error) = gemini_candidate_block_error(&finish) {
+                    try_send_chunk(tx, ApiStreamChunk::Error(error), "blocked_response");
+                    *response_blocked = true;
+                }
+            }
         }
 
         // Track grounding metadata
@@ -542,9 +583,7 @@ fn process_gemini_sse_line(
     }
 
     // Emit tool calls when we have finish_reason or at stream end
-    if let Some(finish) = last_stop_reason.as_ref()
-        && !matches!(finish.as_str(), "RECITATION" | "BLOCKED")
-    {
+    if last_stop_reason.is_some() && !*response_blocked {
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
             if !completed_tool_call_ids.contains(call_id)
                 && let Some(validated_args) =
@@ -633,12 +672,10 @@ fn finish_gemini_sse_to_chunks(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &HashMap<String, (String, String, String, Option<String>)>,
     completed_tool_call_ids: &mut HashSet<String>,
-    last_stop_reason: &Option<String>,
+    response_blocked: bool,
     last_grounding_metadata: &mut Option<serde_json::Value>,
 ) {
-    // Do not flush tool calls if the model was blocked or only emitted
-    // recitation content. Those states are explicit terminal responses.
-    if !matches!(last_stop_reason.as_deref(), Some("RECITATION" | "BLOCKED")) {
+    if !response_blocked {
         // Flush accumulated tool calls on stream end.
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls {
             if !completed_tool_call_ids.contains(call_id)
@@ -739,6 +776,7 @@ impl Provider for GeminiProvider {
             > = HashMap::with_capacity(4);
             let mut completed_tool_call_ids: HashSet<String> = HashSet::new();
             let mut last_stop_reason: Option<String> = None;
+            let mut response_blocked = false;
             let mut stream_errored = false;
             let mut last_grounding_metadata: Option<serde_json::Value> = None;
 
@@ -755,6 +793,7 @@ impl Provider for GeminiProvider {
                                 &mut accumulated_tool_calls,
                                 &mut completed_tool_call_ids,
                                 &mut last_stop_reason,
+                                &mut response_blocked,
                                 &mut last_grounding_metadata,
                                 &model_info,
                             );
@@ -787,7 +826,7 @@ impl Provider for GeminiProvider {
                     &tx,
                     &accumulated_tool_calls,
                     &mut completed_tool_call_ids,
-                    &last_stop_reason,
+                    response_blocked,
                     &mut last_grounding_metadata,
                 );
             }
@@ -1655,51 +1694,159 @@ mod tests {
 
     #[test]
     fn test_finish_reason_allows_tool_calls() {
-        // Test which finish reasons allow tool call emission
-        // Per Gemini docs: emit on all reasons except RECITATION and BLOCKED
         let allowed = [
             "STOP",
             "MAX_TOKENS",
-            "SAFETY",
             "OTHER",
             "MALFORMED_FUNCTION_CALL",
             "LANGUAGE",
             "FAILURE",
         ];
-        let blocked = ["RECITATION", "BLOCKED"];
+        let blocked = ["SAFETY", "RECITATION", "BLOCKED"];
 
         for reason in allowed.iter() {
-            let should_emit = !matches!(*reason, "RECITATION" | "BLOCKED");
-            assert!(should_emit, "{} should allow tool call emission", reason);
+            assert!(
+                gemini_candidate_block_error(reason).is_none(),
+                "{reason} should allow tool call emission"
+            );
         }
 
         for reason in blocked.iter() {
-            let should_emit = !matches!(*reason, "RECITATION" | "BLOCKED");
-            assert!(!should_emit, "{} should block tool call emission", reason);
+            assert!(
+                gemini_candidate_block_error(reason).is_some(),
+                "{reason} should block tool call emission"
+            );
         }
     }
 
     #[test]
     fn test_finish_reason_handling_enum_coverage() {
-        // Ensure all known Gemini finish reasons are accounted for
-        // This test documents the complete set of finish reasons
-        let all_known_reasons = vec![
-            "STOP",
-            "MAX_TOKENS",
-            "SAFETY",
-            "RECITATION",
-            "LANGUAGE",
-            "OTHER",
-            "BLOCKED",
-            "FAILURE",
-            "MALFORMED_FUNCTION_CALL",
+        let known_reasons = [
+            ("STOP", false),
+            ("MAX_TOKENS", false),
+            ("SAFETY", true),
+            ("RECITATION", true),
+            ("LANGUAGE", false),
+            ("OTHER", false),
+            ("BLOCKED", true),
+            ("FAILURE", false),
+            ("MALFORMED_FUNCTION_CALL", false),
         ];
 
-        for reason in all_known_reasons {
-            let should_emit = !matches!(reason, "RECITATION" | "BLOCKED");
-            // Just verify the logic runs without panic
-            let _ = should_emit;
+        for (reason, blocked) in known_reasons {
+            assert_eq!(
+                gemini_candidate_block_error(reason).is_some(),
+                blocked,
+                "unexpected block classification for {reason}"
+            );
         }
+    }
+
+    #[test]
+    fn test_candidate_safety_and_recitation_emit_errors_without_tool_calls() {
+        for finish_reason in ["SAFETY", "RECITATION"] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(8);
+            let mut accumulated_tool_calls = HashMap::new();
+            let mut completed_tool_call_ids = HashSet::new();
+            let mut last_stop_reason = None;
+            let mut response_blocked = false;
+            let mut last_grounding_metadata = None;
+            let line = format!(
+                r#"data: {{"candidates":[{{"content":{{"parts":[{{"functionCall":{{"name":"read_file","args":{{"path":"src/main.rs"}}}}}}]}},"finishReason":"{finish_reason}"}}],"responseId":"response-1"}}"#
+            );
+
+            process_gemini_sse_line(
+                &line,
+                &tx,
+                &mut accumulated_tool_calls,
+                &mut completed_tool_call_ids,
+                &mut last_stop_reason,
+                &mut response_blocked,
+                &mut last_grounding_metadata,
+                &None,
+            );
+
+            let ApiStreamChunk::Error(error) = rx
+                .try_recv()
+                .expect("blocked response should emit an error")
+            else {
+                panic!("blocked response emitted a non-error chunk");
+            };
+            assert!(error.contains(finish_reason));
+            assert!(!error.contains("(retryable)"));
+            assert!(rx.try_recv().is_err());
+            assert!(response_blocked);
+            assert_eq!(last_stop_reason.as_deref(), Some(finish_reason));
+            assert_eq!(accumulated_tool_calls.len(), 1);
+            assert!(completed_tool_call_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_prompt_safety_block_emits_error_without_candidates() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(4);
+        let mut accumulated_tool_calls = HashMap::new();
+        let mut completed_tool_call_ids = HashSet::new();
+        let mut last_stop_reason = None;
+        let mut response_blocked = false;
+        let mut last_grounding_metadata = None;
+        let line = r#"data: {"candidates":[],"promptFeedback":{"blockReason":"SAFETY"},"responseId":"response-1"}"#;
+
+        process_gemini_sse_line(
+            line,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_ids,
+            &mut last_stop_reason,
+            &mut response_blocked,
+            &mut last_grounding_metadata,
+            &None,
+        );
+
+        let ApiStreamChunk::Error(error) =
+            rx.try_recv().expect("blocked prompt should emit an error")
+        else {
+            panic!("blocked prompt emitted a non-error chunk");
+        };
+        assert!(error.contains("blocked the prompt"));
+        assert!(error.contains("SAFETY"));
+        assert!(!error.contains("(retryable)"));
+        assert!(response_blocked);
+        assert_eq!(last_stop_reason.as_deref(), Some("SAFETY"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_later_candidate_does_not_overwrite_blocked_stop_reason() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(4);
+        let mut accumulated_tool_calls = HashMap::new();
+        let mut completed_tool_call_ids = HashSet::new();
+        let mut last_stop_reason = None;
+        let mut response_blocked = false;
+        let mut last_grounding_metadata = None;
+        let line = r#"data: {"candidates":[{"finishReason":"SAFETY"},{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10},"responseId":"response-1"}"#;
+
+        process_gemini_sse_line(
+            line,
+            &tx,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_ids,
+            &mut last_stop_reason,
+            &mut response_blocked,
+            &mut last_grounding_metadata,
+            &None,
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(ApiStreamChunk::Error(_))));
+        let ApiStreamChunk::Usage(usage) = rx
+            .try_recv()
+            .expect("blocked response should preserve usage")
+        else {
+            panic!("blocked response emitted a non-usage chunk");
+        };
+        assert_eq!(usage.stop_reason.as_deref(), Some("SAFETY"));
+        assert_eq!(last_stop_reason.as_deref(), Some("SAFETY"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1717,14 +1864,13 @@ mod tests {
             ),
         )]);
         let mut completed_tool_call_ids = HashSet::new();
-        let last_stop_reason = Some("BLOCKED".to_string());
         let mut last_grounding_metadata = None;
 
         finish_gemini_sse_to_chunks(
             &tx,
             &accumulated_tool_calls,
             &mut completed_tool_call_ids,
-            &last_stop_reason,
+            true,
             &mut last_grounding_metadata,
         );
 

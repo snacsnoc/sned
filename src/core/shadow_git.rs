@@ -17,6 +17,8 @@ use std::path::Path;
 use std::process::Command;
 
 const SHADOW_GIT_DIR: &str = ".sned/.git-agent";
+const SHADOW_GIT_AUTHOR_NAME: &str = "Sned";
+const SHADOW_GIT_AUTHOR_EMAIL: &str = "sned@localhost";
 
 /// Initialize the shadow git repository if it doesn't exist.
 pub fn init_shadow_repo(workspace_root: &Path) -> Result<()> {
@@ -153,7 +155,11 @@ fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Re
         .arg(message)
         .current_dir(workspace_root)
         .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root);
+        .env("GIT_WORK_TREE", workspace_root)
+        .env("GIT_AUTHOR_NAME", SHADOW_GIT_AUTHOR_NAME)
+        .env("GIT_AUTHOR_EMAIL", SHADOW_GIT_AUTHOR_EMAIL)
+        .env("GIT_COMMITTER_NAME", SHADOW_GIT_AUTHOR_NAME)
+        .env("GIT_COMMITTER_EMAIL", SHADOW_GIT_AUTHOR_EMAIL);
 
     if force {
         commit_cmd.arg("--allow-empty");
@@ -609,6 +615,28 @@ mod tests {
         fs::write(temp.path().join("test.txt"), "hello").unwrap();
         commit_turn(temp.path(), "test commit").unwrap();
         assert_eq!(turn_count(temp.path()), 2);
+    }
+
+    #[test]
+    fn test_shadow_commits_use_internal_identity() {
+        let temp = TempDir::new().unwrap();
+        init_shadow_repo(temp.path()).unwrap();
+
+        fs::write(temp.path().join("test.txt"), "hello").unwrap();
+        commit_turn(temp.path(), "test commit").unwrap();
+
+        let output = Command::new("git")
+            .args(["log", "-1", "--format=%an <%ae>|%cn <%ce>"])
+            .current_dir(temp.path())
+            .env("GIT_DIR", temp.path().join(SHADOW_GIT_DIR))
+            .env("GIT_WORK_TREE", temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "Sned <sned@localhost>|Sned <sned@localhost>"
+        );
     }
 
     #[test]
