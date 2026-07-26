@@ -1629,20 +1629,14 @@ impl App {
     /// frame. The event loop cannot access a Frame, so this intentionally
     /// copies exactly the content the user saw before releasing the mouse.
     pub(crate) fn finish_text_selection(&mut self, column: u16, row: u16) -> Option<String> {
-        let Some(selection) = self.text_selection.as_ref() else {
-            return None;
-        };
+        let selection = self.text_selection.as_ref()?;
         let Some(surface) = self.selection_surface(selection.pane) else {
             self.text_selection = None;
             return None;
         };
-        let Some((row_index, column_index)) = Self::normalize_surface_point(surface, column, row)
-        else {
-            return None;
-        };
-        let Some(point) = Self::selection_point(surface, row_index, column_index) else {
-            return None;
-        };
+        let (row_index, column_index) =
+            Self::normalize_surface_point(surface, column, row)?;
+        let point = Self::selection_point(surface, row_index, column_index)?;
         let selection = self
             .text_selection
             .as_mut()
@@ -3550,10 +3544,11 @@ impl App {
                 )
             })
             .unwrap_or_default();
-        if !self.in_scrollback && self.scrollback_count > 0 {
-            if let Some(source) = self.transcript_selection_row_sources.last_mut() {
-                *source = None;
-            }
+        if !self.in_scrollback
+            && self.scrollback_count > 0
+            && let Some(source) = self.transcript_selection_row_sources.last_mut()
+        {
+            *source = None;
         }
         self.completion_selection_row_sources = self
             .completion_selection_area

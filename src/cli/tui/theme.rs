@@ -111,12 +111,6 @@ pub fn bold_style() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
 }
 
-/// Style for the spinner character.
-#[must_use]
-pub fn spinner_style() -> Style {
-    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-}
-
 /// Style for selected file picker row.
 #[must_use]
 pub fn picker_selected_style() -> Style {
