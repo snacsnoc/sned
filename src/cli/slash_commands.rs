@@ -1391,51 +1391,51 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
     vec![
         ModelPickerEntry {
             provider: "anthropic",
-            model_id: "claude-sonnet-4-20250514",
-            label: "claude-sonnet-4-20250514",
-            description: "Claude Sonnet 4",
+            model_id: "claude-fable-5",
+            label: "claude-fable-5",
+            description: "Claude Fable 5",
         },
         ModelPickerEntry {
             provider: "anthropic",
-            model_id: "claude-opus-4-20250514",
-            label: "claude-opus-4-20250514",
-            description: "Claude Opus 4",
+            model_id: "claude-opus-5",
+            label: "claude-opus-5",
+            description: "Claude Opus 5",
         },
         ModelPickerEntry {
             provider: "anthropic",
-            model_id: "claude-3-5-sonnet-20241022",
-            label: "claude-3-5-sonnet-20241022",
-            description: "Claude 3.5 Sonnet",
+            model_id: "claude-sonnet-5",
+            label: "claude-sonnet-5",
+            description: "Claude Sonnet 5",
         },
         ModelPickerEntry {
             provider: "anthropic",
-            model_id: "claude-3-5-haiku-20241022",
-            label: "claude-3-5-haiku-20241022",
-            description: "Claude 3.5 Haiku",
+            model_id: "claude-haiku-4-5-20251001",
+            label: "claude-haiku-4-5-20251001",
+            description: "Claude Haiku 4.5",
         },
         ModelPickerEntry {
             provider: "openai",
-            model_id: "gpt-4o",
-            label: "gpt-4o",
-            description: "GPT-4o",
+            model_id: "gpt-5.6-sol",
+            label: "gpt-5.6-sol",
+            description: "GPT-5.6 Sol",
         },
         ModelPickerEntry {
             provider: "openai",
-            model_id: "gpt-4o-mini",
-            label: "gpt-4o-mini",
-            description: "GPT-4o Mini",
+            model_id: "gpt-5.6-terra",
+            label: "gpt-5.6-terra",
+            description: "GPT-5.6 Terra",
         },
         ModelPickerEntry {
             provider: "openai",
-            model_id: "o1-preview",
-            label: "o1-preview",
-            description: "O1 Preview",
+            model_id: "gpt-5.6-luna",
+            label: "gpt-5.6-luna",
+            description: "GPT-5.6 Luna",
         },
         ModelPickerEntry {
-            provider: "openai",
-            model_id: "o1-mini",
-            label: "o1-mini",
-            description: "O1 Mini",
+            provider: "minimax",
+            model_id: "minimax-m3",
+            label: "minimax-m3",
+            description: "MiniMax M3",
         },
         ModelPickerEntry {
             provider: "minimax",
@@ -1445,9 +1445,21 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
         },
         ModelPickerEntry {
             provider: "gemini",
-            model_id: "gemini-3.1-pro-preview",
-            label: "gemini-3.1-pro-preview",
-            description: "Gemini 3.1 Pro",
+            model_id: "gemini-3.6-flash",
+            label: "gemini-3.6-flash",
+            description: "Gemini 3.6 Flash",
+        },
+        ModelPickerEntry {
+            provider: "gemini",
+            model_id: "gemini-3.5-flash",
+            label: "gemini-3.5-flash",
+            description: "Gemini 3.5 Flash",
+        },
+        ModelPickerEntry {
+            provider: "gemini",
+            model_id: "gemini-3.5-flash-lite",
+            label: "gemini-3.5-flash-lite",
+            description: "Gemini 3.5 Flash-Lite",
         },
         ModelPickerEntry {
             provider: "deepseek",
@@ -1457,9 +1469,27 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
         },
         ModelPickerEntry {
             provider: "openrouter",
-            model_id: "anthropic/claude-sonnet-4.5",
-            label: "anthropic/claude-sonnet-4.5",
-            description: "OpenRouter - Claude Sonnet 4.5",
+            model_id: "anthropic/claude-sonnet-5",
+            label: "anthropic/claude-sonnet-5",
+            description: "OpenRouter - Claude Sonnet 5",
+        },
+        ModelPickerEntry {
+            provider: "openrouter",
+            model_id: "openai/gpt-5.6-sol",
+            label: "openai/gpt-5.6-sol",
+            description: "OpenRouter - GPT-5.6 Sol",
+        },
+        ModelPickerEntry {
+            provider: "openrouter",
+            model_id: "google/gemini-3.6-flash",
+            label: "google/gemini-3.6-flash",
+            description: "OpenRouter - Gemini 3.6 Flash",
+        },
+        ModelPickerEntry {
+            provider: "openrouter",
+            model_id: "minimax/minimax-m3",
+            label: "minimax/minimax-m3",
+            description: "OpenRouter - MiniMax M3",
         },
     ]
 }
@@ -2610,7 +2640,7 @@ mod tests {
     #[test]
     fn test_model_picker_entries_contains_providers() {
         let entries = build_model_picker_entries();
-        assert!(entries.len() >= 12);
+        assert!(entries.len() >= 17);
 
         let providers: Vec<&str> = entries.iter().map(|e| e.provider).collect();
         assert!(providers.contains(&"anthropic"));
@@ -2619,6 +2649,30 @@ mod tests {
         assert!(providers.contains(&"gemini"));
         assert!(providers.contains(&"deepseek"));
         assert!(providers.contains(&"openrouter"));
+    }
+
+    #[test]
+    fn test_model_picker_uses_current_catalog_without_mythos() {
+        let model_ids: std::collections::HashSet<&str> = build_model_picker_entries()
+            .iter()
+            .map(|entry| entry.model_id)
+            .collect();
+
+        for model_id in [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "gpt-5.6-sol",
+            "minimax-m3",
+            "gemini-3.6-flash",
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-5.6-sol",
+            "google/gemini-3.6-flash",
+            "minimax/minimax-m3",
+        ] {
+            assert!(model_ids.contains(model_id), "missing {model_id}");
+        }
+        assert!(!model_ids.iter().any(|model_id| model_id.contains("mythos")));
     }
 
     #[test]
@@ -2634,5 +2688,4 @@ mod tests {
             );
         }
     }
-
 }

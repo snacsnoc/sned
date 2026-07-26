@@ -5809,7 +5809,7 @@ mod tests {
         assert!(matches!(
             action,
             Some(Action::ModelSwitch(PendingModelSwitch { provider, model_id }))
-                if provider == "anthropic" && model_id == "claude-sonnet-4-20250514"
+                if provider == "anthropic" && model_id == "claude-fable-5"
         ));
         assert!(!app.model_picker_active);
         assert!(app.input.lines().join("\n").is_empty());
