@@ -149,13 +149,6 @@ impl InteractiveSession {
         Self::build_with_mode(task_opts, root_opts, false).await
     }
 
-    pub async fn build_interactive(
-        task_opts: TaskOptions,
-        root_opts: RootOnlyOptions,
-    ) -> anyhow::Result<Self> {
-        Self::build_with_mode(task_opts, root_opts, true).await
-    }
-
     pub async fn build_with_writer(
         task_opts: TaskOptions,
         root_opts: RootOnlyOptions,
@@ -1162,7 +1155,7 @@ fn handle_approval_key(app: &mut App, key: &KeyEvent) -> Option<ApprovalKeyOutco
     let Some(result) = approval_result_for_key(app, key) else {
         return Some(ApprovalKeyOutcome::Consumed);
     };
-    let Some(delivered) = app.resolve_pending_approval(result.clone()) else {
+    let Some(delivered) = app.resolve_pending_approval(result) else {
         return Some(ApprovalKeyOutcome::Consumed);
     };
     Some(ApprovalKeyOutcome::Resolved { result, delivered })
@@ -3137,16 +3130,13 @@ async fn run_main_loop(
                 app.needs_redraw = true;
             }
             // Poll queue count from AgentLoop so the TUI can show it in the status bar.
+            if let Ok(qh) = queue_handle.try_lock()
+                && let Some(handle) = qh.as_ref()
+                && let Some(new_count) = handle.try_queued_message_count()
+                && new_count != app.queued_message_count
             {
-                if let Ok(qh) = queue_handle.try_lock()
-                    && let Some(handle) = qh.as_ref()
-                    && let Some(new_count) = handle.try_queued_message_count()
-                {
-                    if new_count != app.queued_message_count {
-                        app.queued_message_count = new_count;
-                        app.needs_redraw = true;
-                    }
-                }
+                app.queued_message_count = new_count;
+                app.needs_redraw = true;
             }
             let us = t.elapsed().as_micros() as u64;
             timing.drain_total_us += us;
