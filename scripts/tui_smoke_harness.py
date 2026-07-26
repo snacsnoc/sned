@@ -58,6 +58,9 @@ class PtySession:
             {
                 "SNED_DIR": self.tmp,
                 "SNED_DATA_DIR": os.path.join(self.tmp, "data"),
+                "TMPDIR": self.tmp,
+                "TMP": self.tmp,
+                "TEMP": self.tmp,
             }
         )
         if use_wrapper:
@@ -364,7 +367,6 @@ def approval_scalar_command():
 
 
 def approval_under_backpressure():
-    command_marker = "/tmp/sned-approval-backpressure-smoke"
     blocked_probe = "BLOCKED_PROBE_555"
     sent_prompt = False
     sent_blocked_input = False
@@ -376,11 +378,14 @@ def approval_under_backpressure():
     completion_visible = False
     blocked_input_sent_at = None
     approve_offset = None
+    command_marker = None
 
     def tick(session):
         nonlocal sent_prompt, sent_blocked_input, sent_approve, sent_exit
         nonlocal prompt_visible, overflow_visible, reasoning_tail_visible
-        nonlocal completion_visible, blocked_input_sent_at, approve_offset
+        nonlocal completion_visible, blocked_input_sent_at, approve_offset, command_marker
+        if command_marker is None:
+            command_marker = os.path.join(session.tmp, "approval-backpressure-smoke")
         clean = clean_output(session.buf)
         tail = visible_tail(clean)
         if "type a prompt" in clean and not sent_prompt:
@@ -390,7 +395,7 @@ def approval_under_backpressure():
             overflow_visible = True
         if "APPROVAL_BACKPRESSURE_REASONING_TAIL" in clean:
             reasoning_tail_visible = True
-        if "Execute this tool?" in tail and not sent_blocked_input:
+        if ("[y] Approve" in tail or "[n/Esc]" in tail or "Execute this tool?" in tail) and not sent_blocked_input:
             prompt_visible = True
             session.send(blocked_probe.encode())
             sent_blocked_input = True
@@ -436,10 +441,11 @@ def approval_under_backpressure():
                 "approval remained actionable under output backpressure",
             )
     finally:
-        try:
-            os.unlink(command_marker)
-        except FileNotFoundError:
-            pass
+        if command_marker is not None:
+            try:
+                os.unlink(command_marker)
+            except FileNotFoundError:
+                pass
 
 
 def long_completion_navigation():
@@ -735,6 +741,118 @@ def model_switch():
         )
 
 
+def cancel_agent_notice():
+    sent_prompt = False
+    sent_cancel = False
+    sent_exit = False
+
+    def tick(session):
+        nonlocal sent_prompt, sent_cancel, sent_exit
+        text = clean_output(session.buf)
+        if "type a prompt" in text and not sent_prompt:
+            session.send(b"keep streaming for cancel\r")
+            sent_prompt = True
+        if "busy stream chunk 005" in text and not sent_cancel:
+            session.send(b"\x03")
+            sent_cancel = True
+        if sent_cancel and ("Cancelled" in text or "cancelled" in text.lower()) and not sent_exit:
+            time.sleep(0.3)
+            try:
+                session.send(b"/exit\r")
+            except OSError:
+                pass
+            sent_exit = True
+
+    with PtySession(
+        "sned-cancel-notice.", {"SNED_MOCK_BUSY_STREAM": "1"}
+    ) as session:
+        session.run(10, tick)
+        session.dump_if_verbose()
+        clean = clean_output(session.buf)
+        report(
+            [
+                (sent_prompt, "busy-stream prompt was not sent"),
+                (sent_cancel, "Ctrl+C was not sent while provider was busy streaming"),
+                ("Cancelled" in clean or "cancelled" in clean.lower(), "cancellation notice missing from TUI transcript"),
+                (sent_exit, "/exit was not sent after cancellation"),
+                (session.exit_code == 0, f"sned exited with {session.exit_code}"),
+            ],
+            "Ctrl+C during streaming emitted cancellation notice into transcript",
+        )
+
+
+def approval_rejection():
+    sent_prompt = False
+    sent_reject = False
+    sent_exit = False
+
+    def tick(session):
+        nonlocal sent_prompt, sent_reject, sent_exit
+        text = clean_output(session.buf)
+        tail = visible_tail(text)
+        if "type a prompt" in text and not sent_prompt:
+            session.send(b"trigger approval rejection\r")
+            sent_prompt = True
+        if ("[y] Approve" in tail or "[n/Esc]" in tail or "Execute this tool?" in tail) and not sent_reject:
+            session.send(b"n\r")
+            sent_reject = True
+        if sent_reject and ("denied by user" in text or "rejected or cancelled" in text or "type a prompt" in tail) and not sent_exit:
+            time.sleep(0.2)
+            try:
+                session.send(b"/exit\r")
+            except OSError:
+                pass
+            sent_exit = True
+
+    with PtySession(
+        "sned-approval-rejection.", {"SNED_MOCK_APPROVAL_REJECTION": "1"}
+    ) as session:
+        session.run(12, tick)
+        session.dump_if_verbose()
+        marker = os.path.join(session.tmp, "approval-rejection-should-not-exist")
+        report(
+            [
+                (sent_prompt, "initial user prompt was not sent"),
+                (sent_reject, "rejection input 'n' was not sent"),
+                (not os.path.exists(marker), f"rejected tool command executed despite 'n' input (marker created at {marker})"),
+                (sent_exit, "/exit was not sent after rejection"),
+                (session.exit_code == 0, f"sned exited with {session.exit_code}"),
+            ],
+            "tool rejection via 'n' strictly prevented command execution",
+        )
+
+
+def provider_error_box():
+    sent_prompt = False
+    sent_exit = False
+
+    def tick(session):
+        nonlocal sent_prompt, sent_exit
+        text = clean_output(session.buf)
+        if "type a prompt" in text and not sent_prompt:
+            session.send(b"trigger provider error\r")
+            sent_prompt = True
+        if sent_prompt and ("rate limit exceeded" in text or "Error" in text) and not sent_exit:
+            time.sleep(0.2)
+            session.send(b"/exit\r")
+            sent_exit = True
+
+    with PtySession(
+        "sned-provider-error.", {"SNED_MOCK_PROVIDER_ERROR": "1"}
+    ) as session:
+        session.run(10, tick)
+        session.dump_if_verbose()
+        clean = clean_output(session.buf)
+        report(
+            [
+                (sent_prompt, "initial prompt was not sent"),
+                ("rate limit exceeded" in clean or "Error" in clean, "ErrorBox missing provider error text in transcript"),
+                (session.exit_code in (0, None), f"sned exited with {session.exit_code}"),
+            ],
+            "provider streaming error rendered ErrorBox in transcript",
+        )
+
+
 SCENARIOS = {
     "tui-startup-exit": startup_exit,
     "tui-user-echo": user_echo,
@@ -747,6 +865,9 @@ SCENARIOS = {
     "tui-slash-commands": slash_commands,
     "tui-model-switch": model_switch,
     "tui-busy-exit": busy_exit,
+    "tui-cancel-agent-notice": cancel_agent_notice,
+    "tui-approval-rejection": approval_rejection,
+    "tui-provider-error-box": provider_error_box,
     "json-no-prompt": json_no_prompt,
     "ctrlc-quit-empty": ctrlc_quit_empty,
 }
