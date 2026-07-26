@@ -913,13 +913,6 @@ impl AgentLoop {
         self.deps.checkpoint_manager.as_ref()
     }
 
-    /// Get a mutable reference to the checkpoint manager, if configured.
-    pub fn checkpoint_manager_mut(
-        &mut self,
-    ) -> Option<&mut crate::core::checkpoints::TaskCheckpointManager> {
-        self.deps.checkpoint_manager.as_mut()
-    }
-
     /// Get a reference to the output writer.
     pub fn output_writer(&self) -> &crate::cli::output::OutputWriterArc {
         &self.config.output_writer

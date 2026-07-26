@@ -126,6 +126,11 @@ pub fn picker_selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+#[must_use]
+pub fn selection_style() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED)
+}
+
 /// Style for scrollbar track.
 #[must_use]
 pub fn scrollbar_style() -> Style {

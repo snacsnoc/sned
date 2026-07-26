@@ -190,8 +190,15 @@ enum SelectionPane {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SelectionPoint {
-    column: u16,
-    row: u16,
+    output_line_index: usize,
+    row_in_line: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionRowSource {
+    output_line_index: usize,
+    row_in_line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +224,7 @@ struct SelectionSurface {
     pane: SelectionPane,
     content_area: Rect,
     rows: Vec<Vec<VisibleCell>>,
+    row_sources: Vec<Option<SelectionRowSource>>,
 }
 
 enum ScrollbackCommand {
@@ -373,7 +381,29 @@ fn write_scrollback_pending(path: &Path, pending: &mut Vec<u8>) -> io::Result<()
         }
     }
     pending.clear();
-    Ok(())
+    rotate_scrollback_file(path)
+}
+
+fn rotate_scrollback_file(path: &Path) -> io::Result<()> {
+    let file_len = path.metadata()?.len();
+    let Some(content) = read_scrollback_tail(path)? else {
+        return Ok(());
+    };
+    let line_count = content.lines().count();
+    if file_len <= MAX_SCROLLBACK_LOAD_BYTES && line_count <= MAX_SCROLLBACK_LOAD_LINES {
+        return Ok(());
+    }
+
+    let first_retained_line = line_count.saturating_sub(MAX_SCROLLBACK_LOAD_LINES);
+    let mut retained = content
+        .lines()
+        .skip(first_retained_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !retained.is_empty() {
+        retained.push('\n');
+    }
+    std::fs::write(path, retained)
 }
 
 fn read_scrollback_tail(path: &Path) -> io::Result<Option<String>> {
@@ -591,6 +621,8 @@ pub struct App {
     completion_area: Option<Rect>,
     transcript_selection_area: Option<Rect>,
     completion_selection_area: Option<Rect>,
+    transcript_selection_row_sources: Vec<Option<SelectionRowSource>>,
+    completion_selection_row_sources: Vec<Option<SelectionRowSource>>,
     text_selection: Option<TextSelection>,
     selection_surfaces: Vec<SelectionSurface>,
     rendered_hyperlink_targets: Vec<PathBuf>,
@@ -928,6 +960,8 @@ impl App {
             completion_area: None,
             transcript_selection_area: None,
             completion_selection_area: None,
+            transcript_selection_row_sources: Vec::new(),
+            completion_selection_row_sources: Vec::new(),
             text_selection: None,
             selection_surfaces: Vec::new(),
             rendered_hyperlink_targets: Vec::new(),
@@ -1021,10 +1055,27 @@ impl App {
                 self.scrollback_pending.push_str(&text);
                 self.scrollback_pending.push('\n');
                 self.scrollback_pending_lines = self.scrollback_pending_lines.saturating_add(1);
-                self.scrollback_count = self.scrollback_count.saturating_add(1);
+                self.scrollback_count = self
+                    .scrollback_count
+                    .saturating_add(1)
+                    .min(MAX_SCROLLBACK_LOAD_LINES as u64);
             }
             self.output_lines.pop_front();
             self.output_line_kinds.pop_front();
+            if self.text_selection.as_ref().is_some_and(|selection| {
+                selection.pane == SelectionPane::Transcript
+                    && (selection.anchor.output_line_index == 0
+                        || selection.focus.output_line_index == 0)
+            }) {
+                self.clear_text_selection();
+            } else if let Some(selection) = self
+                .text_selection
+                .as_mut()
+                .filter(|selection| selection.pane == SelectionPane::Transcript)
+            {
+                selection.anchor.output_line_index -= 1;
+                selection.focus.output_line_index -= 1;
+            }
             // The manual offset is measured from the transcript front. Keep
             // the viewport anchored to the same surviving visual row.
             if self.scroll_mode == ScrollMode::Manual {
@@ -1522,8 +1573,14 @@ impl App {
         let Some(surface) = self.selection_surface_at(column, row) else {
             return false;
         };
-        let point = Self::normalize_selection_point(surface, column, row);
-        let click_target = Self::surface_hyperlink_at(surface, point);
+        let Some((row_index, column_index)) = Self::normalize_surface_point(surface, column, row)
+        else {
+            return false;
+        };
+        let Some(point) = Self::selection_point(surface, row_index, column_index) else {
+            return false;
+        };
+        let click_target = Self::surface_hyperlink_at(surface, row_index, column_index);
         self.text_selection = Some(TextSelection {
             pane: surface.pane,
             anchor: point,
@@ -1547,7 +1604,13 @@ impl App {
             self.text_selection = None;
             return false;
         };
-        let point = Self::normalize_selection_point(surface, column, row);
+        let Some((row_index, column_index)) = Self::normalize_surface_point(surface, column, row)
+        else {
+            return false;
+        };
+        let Some(point) = Self::selection_point(surface, row_index, column_index) else {
+            return false;
+        };
         let selection = self
             .text_selection
             .as_mut()
@@ -1573,7 +1636,13 @@ impl App {
             self.text_selection = None;
             return None;
         };
-        let point = Self::normalize_selection_point(surface, column, row);
+        let Some((row_index, column_index)) = Self::normalize_surface_point(surface, column, row)
+        else {
+            return None;
+        };
+        let Some(point) = Self::selection_point(surface, row_index, column_index) else {
+            return None;
+        };
         let selection = self
             .text_selection
             .as_mut()
@@ -1609,9 +1678,10 @@ impl App {
             return None;
         }
         let surface = self.selection_surface(selection.pane)?;
-        let point = Self::normalize_selection_point(surface, column, row);
+        let (row_index, column_index) = Self::normalize_surface_point(surface, column, row)?;
+        let point = Self::selection_point(surface, row_index, column_index)?;
         (point == selection.anchor)
-            .then(|| Self::surface_hyperlink_at(surface, point))
+            .then(|| Self::surface_hyperlink_at(surface, row_index, column_index))
             .flatten()
             .filter(|target| selection.click_target.as_ref() == Some(target))
     }
@@ -1635,17 +1705,24 @@ impl App {
             && row < area.y.saturating_add(area.height)
     }
 
-    fn surface_hyperlink_at(surface: &SelectionSurface, point: SelectionPoint) -> Option<PathBuf> {
-        let row = point.row.saturating_sub(surface.content_area.y) as usize;
-        let column = point.column.saturating_sub(surface.content_area.x) as usize;
-        surface.rows.get(row)?.get(column)?.hyperlink.clone()
+    fn surface_hyperlink_at(
+        surface: &SelectionSurface,
+        row_index: usize,
+        column_index: usize,
+    ) -> Option<PathBuf> {
+        surface
+            .rows
+            .get(row_index)?
+            .get(column_index)?
+            .hyperlink
+            .clone()
     }
 
-    fn normalize_selection_point(
+    fn normalize_surface_point(
         surface: &SelectionSurface,
         column: u16,
         row: u16,
-    ) -> SelectionPoint {
+    ) -> Option<(usize, usize)> {
         let last_column = surface
             .content_area
             .x
@@ -1655,15 +1732,27 @@ impl App {
             .y
             .saturating_add(surface.content_area.height.saturating_sub(1));
         let row = row.clamp(surface.content_area.y, last_row);
-        let mut column = column.clamp(surface.content_area.x, last_column);
+        let column = column.clamp(surface.content_area.x, last_column);
         let row_index = row.saturating_sub(surface.content_area.y) as usize;
         let cells = &surface.rows[row_index];
         let mut cell_index = column.saturating_sub(surface.content_area.x) as usize;
         while cell_index > 0 && cells[cell_index].continuation {
             cell_index -= 1;
         }
-        column = surface.content_area.x.saturating_add(cell_index as u16);
-        SelectionPoint { column, row }
+        Some((row_index, cell_index))
+    }
+
+    fn selection_point(
+        surface: &SelectionSurface,
+        row_index: usize,
+        column: usize,
+    ) -> Option<SelectionPoint> {
+        let source = surface.row_sources.get(row_index).copied().flatten()?;
+        Some(SelectionPoint {
+            output_line_index: source.output_line_index,
+            row_in_line: source.row_in_line,
+            column,
+        })
     }
 
     fn selection_columns_for_row(
@@ -1675,28 +1764,37 @@ impl App {
         if selection.pane != surface.pane || row >= surface.rows.len() {
             return None;
         }
-        let (start, end) = if (selection.anchor.row, selection.anchor.column)
-            <= (selection.focus.row, selection.focus.column)
-        {
+        let (start, end) = if (
+            selection.anchor.output_line_index,
+            selection.anchor.row_in_line,
+            selection.anchor.column,
+        ) <= (
+            selection.focus.output_line_index,
+            selection.focus.row_in_line,
+            selection.focus.column,
+        ) {
             (selection.anchor, selection.focus)
         } else {
             (selection.focus, selection.anchor)
         };
-        let absolute_row = surface.content_area.y.saturating_add(row as u16);
-        if absolute_row < start.row || absolute_row > end.row {
+        let source = surface.row_sources.get(row).copied().flatten()?;
+        let source_key = (source.output_line_index, source.row_in_line);
+        let start_key = (start.output_line_index, start.row_in_line);
+        let end_key = (end.output_line_index, end.row_in_line);
+        if source_key < start_key || source_key > end_key {
             return None;
         }
         let cells = &surface.rows[row];
         if cells.is_empty() {
             return None;
         }
-        let mut first = if absolute_row == start.row {
-            start.column.saturating_sub(surface.content_area.x) as usize
+        let mut first = if source_key == start_key {
+            start.column
         } else {
             0
         };
-        let mut last = if absolute_row == end.row {
-            end.column.saturating_sub(surface.content_area.x) as usize
+        let mut last = if source_key == end_key {
+            end.column
         } else {
             cells.len().saturating_sub(1)
         };
@@ -1733,21 +1831,31 @@ impl App {
 
     fn refresh_selection_surfaces(&mut self, buffer: &Buffer) {
         let areas = [
-            (SelectionPane::Transcript, self.transcript_selection_area),
-            (SelectionPane::Completion, self.completion_selection_area),
+            (
+                SelectionPane::Transcript,
+                self.transcript_selection_area,
+                self.transcript_selection_row_sources.as_slice(),
+            ),
+            (
+                SelectionPane::Completion,
+                self.completion_selection_area,
+                self.completion_selection_row_sources.as_slice(),
+            ),
         ];
         let selection_surfaces = areas
             .into_iter()
-            .filter_map(|(pane, area)| {
-                area.map(|area| self.snapshot_selection_surface(buffer, pane, area))
+            .filter_map(|(pane, area, row_sources)| {
+                area.map(|area| self.snapshot_selection_surface(buffer, pane, area, row_sources))
             })
             .collect();
         self.selection_surfaces = selection_surfaces;
-        if self
-            .text_selection
-            .as_ref()
-            .is_some_and(|selection| self.selection_surface(selection.pane).is_none())
-        {
+        if self.text_selection.as_ref().is_some_and(|selection| {
+            let Some(surface) = self.selection_surface(selection.pane) else {
+                return true;
+            };
+            !Self::surface_contains_selection_point(surface, selection.anchor)
+                || !Self::surface_contains_selection_point(surface, selection.focus)
+        }) {
             self.text_selection = None;
         }
     }
@@ -1757,6 +1865,7 @@ impl App {
         buffer: &Buffer,
         pane: SelectionPane,
         content_area: Rect,
+        row_sources: &[Option<SelectionRowSource>],
     ) -> SelectionSurface {
         let mut rows = Vec::with_capacity(content_area.height as usize);
         for row in content_area.y..content_area.y.saturating_add(content_area.height) {
@@ -1788,7 +1897,25 @@ impl App {
             pane,
             content_area,
             rows,
+            row_sources: row_sources.to_vec(),
         }
+    }
+
+    fn surface_contains_selection_point(surface: &SelectionSurface, point: SelectionPoint) -> bool {
+        surface
+            .row_sources
+            .iter()
+            .enumerate()
+            .any(|(row_index, source)| {
+                source.is_some_and(|source| {
+                    source.output_line_index == point.output_line_index
+                        && source.row_in_line == point.row_in_line
+                        && surface
+                            .rows
+                            .get(row_index)
+                            .is_some_and(|cells| point.column < cells.len())
+                })
+            })
     }
 
     fn normalize_hyperlink_markers(&self, buffer: &mut Buffer) {
@@ -1819,7 +1946,7 @@ impl App {
                     width: end.saturating_sub(start).saturating_add(1) as u16,
                     height: 1,
                 },
-                Style::default().add_modifier(Modifier::REVERSED),
+                theme::selection_style(),
             );
         }
     }
@@ -2589,14 +2716,26 @@ impl App {
     }
 
     fn for_each_output_row(&self, mut visitor: impl FnMut(Option<&Line<'static>>, BlockKind)) {
+        self.for_each_output_row_with_index(|line, kind, _| visitor(line, kind));
+    }
+
+    fn for_each_output_row_with_index(
+        &self,
+        mut visitor: impl FnMut(Option<&Line<'static>>, BlockKind, Option<usize>),
+    ) {
         let mut prev: Option<BlockKind> = None;
-        for (line, kind) in self.output_lines.iter().zip(self.output_line_kinds.iter()) {
+        for (index, (line, kind)) in self
+            .output_lines
+            .iter()
+            .zip(self.output_line_kinds.iter())
+            .enumerate()
+        {
             if let Some(p) = prev
                 && Self::should_insert_separator(p, *kind)
             {
-                visitor(None, BlockKind::Separator);
+                visitor(None, BlockKind::Separator, None);
             }
-            visitor(Some(line), *kind);
+            visitor(Some(line), *kind, Some(index));
             prev = Some(*kind);
         }
     }
@@ -2887,6 +3026,64 @@ impl App {
         });
         self.rendered_hyperlink_targets = hyperlink_targets;
         visible_lines
+    }
+
+    fn build_transcript_selection_row_sources(
+        &self,
+        start_idx: usize,
+        take_count: usize,
+        visible_scroll_y: usize,
+        content_height: usize,
+        wrap_width: usize,
+    ) -> Vec<Option<SelectionRowSource>> {
+        let end_idx = start_idx.saturating_add(take_count);
+        let mut expanded_idx = 0usize;
+        let mut skipped_rows = visible_scroll_y;
+        let mut row_sources = Vec::with_capacity(content_height);
+        self.for_each_output_row_with_index(|line, kind, output_line_index| {
+            if expanded_idx >= start_idx && expanded_idx < end_idx {
+                let row_count = Self::output_row_visual_rows(line, kind, wrap_width);
+                for row_in_line in 0..row_count {
+                    if skipped_rows > 0 {
+                        skipped_rows -= 1;
+                    } else if row_sources.len() < content_height {
+                        row_sources.push(output_line_index.map(|output_line_index| {
+                            SelectionRowSource {
+                                output_line_index,
+                                row_in_line,
+                            }
+                        }));
+                    }
+                }
+            }
+            expanded_idx = expanded_idx.saturating_add(1);
+        });
+        row_sources.resize(content_height, None);
+        row_sources
+    }
+
+    fn build_completion_selection_row_sources(
+        &self,
+        content_height: usize,
+    ) -> Vec<Option<SelectionRowSource>> {
+        let wrap_width = self.last_wrap_width();
+        let mut skipped_rows = self.completion_scroll_offset;
+        let mut row_sources = Vec::with_capacity(content_height);
+        for (output_line_index, line) in self.completion_lines.iter().enumerate() {
+            let row_count = Self::line_visual_rows(line, wrap_width);
+            for row_in_line in 0..row_count {
+                if skipped_rows > 0 {
+                    skipped_rows -= 1;
+                } else if row_sources.len() < content_height {
+                    row_sources.push(Some(SelectionRowSource {
+                        output_line_index,
+                        row_in_line,
+                    }));
+                }
+            }
+        }
+        row_sources.resize(content_height, None);
+        row_sources
     }
 
     /// Predicate for whether a blank-line separator should be drawn
@@ -3341,6 +3538,27 @@ impl App {
         let scroll_y = self.resolved_output_scroll_y_for(wrap_width, output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y, content_height);
+        self.transcript_selection_row_sources = self
+            .transcript_selection_area
+            .map(|area| {
+                self.build_transcript_selection_row_sources(
+                    start_idx,
+                    visible_count,
+                    visible_scroll_y,
+                    area.height as usize,
+                    wrap_width,
+                )
+            })
+            .unwrap_or_default();
+        if !self.in_scrollback && self.scrollback_count > 0 {
+            if let Some(source) = self.transcript_selection_row_sources.last_mut() {
+                *source = None;
+            }
+        }
+        self.completion_selection_row_sources = self
+            .completion_selection_area
+            .map(|area| self.build_completion_selection_row_sources(area.height as usize))
+            .unwrap_or_default();
 
         {
             frame.render_widget(Clear, main_output_area);
@@ -3454,7 +3672,7 @@ impl App {
     /// Render file picker overlay as a floating Table widget.
     #[allow(dead_code)]
     fn render_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
-        let max_height = 10.min(self.picker_results.len() as u16);
+        let max_height = 10.min(self.picker_results.len() as u16).max(1);
         let width = 50.min(output_area.width);
 
         // Position picker at bottom of output area, just above status bar
@@ -3485,17 +3703,21 @@ impl App {
             })
             .collect();
 
-        let rows: Vec<Line> = labels
-            .into_iter()
-            .enumerate()
-            .map(|(i, label)| {
-                if i == self.picker_index {
-                    Line::from(Span::styled(label, theme::picker_selected_style()))
-                } else {
-                    Line::from(label)
-                }
-            })
-            .collect();
+        let rows: Vec<Line> = if labels.is_empty() {
+            vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
+        } else {
+            labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    if i == self.picker_index {
+                        Line::from(Span::styled(label, theme::picker_selected_style()))
+                    } else {
+                        Line::from(label)
+                    }
+                })
+                .collect()
+        };
 
         let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
             " Files ({}) ",
@@ -3513,7 +3735,7 @@ impl App {
             return;
         }
 
-        let max_height = 10.min(self.slash_command_results.len() as u16);
+        let max_height = 10.min(self.slash_command_results.len() as u16).max(1);
         let width = 50.min(output_area.width);
 
         let overlay_area = Rect {
@@ -3525,25 +3747,29 @@ impl App {
             height: max_height + 2,
         };
 
-        let rows: Vec<Line> = self
-            .slash_command_results
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let category_marker = match entry.category {
-                    crate::cli::slash_commands::SlashCommandCategory::Agent => "▶ ",
-                    crate::cli::slash_commands::SlashCommandCategory::Local => "● ",
-                    crate::cli::slash_commands::SlashCommandCategory::Plan => "◆ ",
-                    crate::cli::slash_commands::SlashCommandCategory::Skill => "★ ",
-                };
-                let label = format!("{} {} - {}", category_marker, entry.name, entry.description);
-                if i == self.slash_command_selected {
-                    Line::from(Span::styled(label, theme::picker_selected_style()))
-                } else {
-                    Line::from(label)
-                }
-            })
-            .collect();
+        let rows: Vec<Line> = if self.slash_command_results.is_empty() {
+            vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
+        } else {
+            self.slash_command_results
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let category_marker = match entry.category {
+                        crate::cli::slash_commands::SlashCommandCategory::Agent => "▶ ",
+                        crate::cli::slash_commands::SlashCommandCategory::Local => "● ",
+                        crate::cli::slash_commands::SlashCommandCategory::Plan => "◆ ",
+                        crate::cli::slash_commands::SlashCommandCategory::Skill => "★ ",
+                    };
+                    let label =
+                        format!("{} {} - {}", category_marker, entry.name, entry.description);
+                    if i == self.slash_command_selected {
+                        Line::from(Span::styled(label, theme::picker_selected_style()))
+                    } else {
+                        Line::from(label)
+                    }
+                })
+                .collect()
+        };
 
         let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
             " Slash Commands ({}) ",
@@ -3659,7 +3885,7 @@ impl App {
 
     /// Render model picker overlay as a floating widget.
     fn render_model_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
-        let max_height = 10.min(self.model_picker_results.len() as u16);
+        let max_height = 10.min(self.model_picker_results.len() as u16).max(1);
         let width = 50.min(output_area.width);
 
         let overlay_area = Rect {
@@ -3671,22 +3897,25 @@ impl App {
             height: max_height + 2,
         };
 
-        let rows: Vec<Line> = self
-            .model_picker_results
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let label = format!(
-                    "[{}] {} - {}",
-                    entry.provider, entry.label, entry.description
-                );
-                if i == self.model_picker_selected {
-                    Line::from(Span::styled(label, theme::picker_selected_style()))
-                } else {
-                    Line::from(label)
-                }
-            })
-            .collect();
+        let rows: Vec<Line> = if self.model_picker_results.is_empty() {
+            vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
+        } else {
+            self.model_picker_results
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let label = format!(
+                        "[{}] {} - {}",
+                        entry.provider, entry.label, entry.description
+                    );
+                    if i == self.model_picker_selected {
+                        Line::from(Span::styled(label, theme::picker_selected_style()))
+                    } else {
+                        Line::from(label)
+                    }
+                })
+                .collect()
+        };
 
         let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
             " Models ({}) ",
@@ -4141,13 +4370,64 @@ mod tests {
         app.push_plain("A界B");
         render_for_selection(&mut app);
         let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "界");
+        let selection_column = column.saturating_sub(
+            app.selection_surface(SelectionPane::Transcript)
+                .expect("render should create a transcript selection surface")
+                .content_area
+                .x,
+        ) as usize;
 
         assert!(app.begin_text_selection(column + 1, row, Instant::now()));
         assert_eq!(
             app.text_selection
                 .as_ref()
                 .map(|selection| selection.anchor.column),
-            Some(column)
+            Some(selection_column)
+        );
+    }
+
+    #[test]
+    fn test_transcript_selection_tracks_output_lines_during_streaming() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        for index in 0..20 {
+            if index == 17 {
+                app.push_plain("TARGET");
+            } else {
+                app.push_plain(format!("line {index}"));
+            }
+        }
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial selection frame should render");
+
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "T");
+        let now = Instant::now();
+        assert!(app.begin_text_selection(column, row, now));
+        assert!(app.extend_text_selection(column + 5, row, now + Duration::from_millis(16)));
+
+        app.push_stream_line(Line::from("stream update"), StreamKind::Model);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("streamed selection frame should render");
+
+        let (updated_column, updated_row) =
+            selection_text_position(&app, SelectionPane::Transcript, "T");
+        assert_ne!(updated_row, row);
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((updated_column, updated_row))
+                .expect("tracked selection cell should exist")
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(
+            app.finish_text_selection(updated_column + 5, updated_row),
+            Some("TARGET".to_string())
         );
     }
 
@@ -4867,6 +5147,36 @@ mod tests {
 
         assert!(rendered.contains("Files (1)"));
         assert!(rendered.contains("main.rs"));
+    }
+
+    #[test]
+    fn test_empty_picker_overlays_show_no_matches() {
+        let render = |app: &mut App| {
+            let backend = TestBackend::new(80, 12);
+            let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("render should succeed");
+            rendered_rows(terminal.backend().buffer()).join("\n")
+        };
+
+        let mut file_picker = App::new();
+        file_picker.picker_active = true;
+        let rendered = render(&mut file_picker);
+        assert!(rendered.contains("Files (0)"));
+        assert!(rendered.contains("No matches"));
+
+        let mut slash_picker = App::new();
+        slash_picker.slash_command_active = true;
+        let rendered = render(&mut slash_picker);
+        assert!(rendered.contains("Slash Commands (0)"));
+        assert!(rendered.contains("No matches"));
+
+        let mut model_picker = App::new();
+        model_picker.model_picker_active = true;
+        let rendered = render(&mut model_picker);
+        assert!(rendered.contains("Models (0)"));
+        assert!(rendered.contains("No matches"));
     }
 
     #[test]
@@ -6954,6 +7264,37 @@ mod tests {
             content,
             format!("{}last\n", "first\n".repeat(SCROLLBACK_FLUSH_LINE_BATCH))
         );
+    }
+
+    #[test]
+    fn test_scrollback_writer_rotates_to_line_cap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let mut pending = (0..MAX_SCROLLBACK_LOAD_LINES + 3)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>()
+            .into_bytes();
+
+        write_scrollback_pending(&file_path, &mut pending).unwrap();
+
+        let content = std::fs::read_to_string(file_path).unwrap();
+        assert_eq!(content.lines().count(), MAX_SCROLLBACK_LOAD_LINES);
+        assert_eq!(content.lines().next(), Some("line 3"));
+        let last_line = format!("line {}", MAX_SCROLLBACK_LOAD_LINES + 2);
+        assert_eq!(content.lines().last(), Some(last_line.as_str()));
+    }
+
+    #[test]
+    fn test_scrollback_writer_rotates_to_byte_cap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let oversized = "x".repeat(MAX_SCROLLBACK_LOAD_BYTES as usize + 1);
+        std::fs::write(&file_path, format!("{oversized}\n")).unwrap();
+        let mut pending = b"retained\n".to_vec();
+
+        write_scrollback_pending(&file_path, &mut pending).unwrap();
+
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "retained\n");
     }
 
     #[test]
