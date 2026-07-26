@@ -124,7 +124,7 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
     if !plan.approved && !plan.complete {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Type /plan approve to begin execution",
+            "Press y or type /plan approve to begin execution",
             theme::dim_style(),
         )));
     }
@@ -164,5 +164,26 @@ mod tests {
 
         assert!(rendered_status.contains("error: current step index 99 is out of range"));
         assert!(!rendered_status.contains("100 / 2"));
+    }
+
+    #[test]
+    fn test_build_plan_lines_shows_approval_shortcuts() {
+        let plan = PlanState::create_plan(vec!["First step".to_string()]);
+        let text = build_plan_lines(
+            &plan,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 10,
+            },
+        )
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .map(|span| span.content.into_owned())
+        .collect::<String>();
+
+        assert!(text.contains("Press y"));
+        assert!(text.contains("/plan approve"));
     }
 }

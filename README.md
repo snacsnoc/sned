@@ -254,6 +254,7 @@ export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
 | `SNED_ALLOW_ENV` | Comma-separated env vars to pass through sandbox | none |
 | `SNED_SAFE_COMMANDS` | Comma-separated commands to auto-approve | none |
 | `SNED_STREAM_OUTPUT_LINES` | Live streaming output line limit | `20` |
+| `SNED_MOUSE_SCROLL_LINES` | Lines scrolled per mouse-wheel step | `3` |
 | `SNED_COMMAND_OUTPUT_LIMIT` | Command output truncation limit in bytes | `10240` |
 | `SNED_SEARCH_TIMEOUT_SECS` | File search timeout | `30` |
 | `SNED_FETCH_TIMEOUT_SECS` | Web fetch timeout | `30` |

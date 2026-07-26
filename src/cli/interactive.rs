@@ -4,7 +4,7 @@
 //! file picker, input queuing, and agent lifecycle.
 
 use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
-use crate::cli::tui::app::PendingModelSwitch;
+use crate::cli::tui::app::{NotificationKind, PasteOutcome, PendingModelSwitch};
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
@@ -47,6 +47,8 @@ fn format_context_window(tokens: u64) -> String {
 }
 
 const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 262_144;
+const DEFAULT_MOUSE_SCROLL_LINES: isize = 3;
+const MAX_MOUSE_SCROLL_LINES: isize = 100;
 
 fn parse_output_channel_capacity(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.parse::<usize>().ok())
@@ -57,6 +59,19 @@ fn parse_output_channel_capacity(raw: Option<&str>) -> usize {
 fn output_channel_capacity() -> usize {
     let raw = std::env::var("SNED_OUTPUT_CHANNEL_CAPACITY").ok();
     parse_output_channel_capacity(raw.as_deref())
+}
+
+fn parse_mouse_scroll_lines(raw: Option<&str>) -> isize {
+    raw.and_then(|value| value.parse::<isize>().ok())
+        .filter(|value| *value > 0)
+        .map_or(DEFAULT_MOUSE_SCROLL_LINES, |value| {
+            value.min(MAX_MOUSE_SCROLL_LINES)
+        })
+}
+
+fn mouse_scroll_lines() -> isize {
+    let raw = std::env::var("SNED_MOUSE_SCROLL_LINES").ok();
+    parse_mouse_scroll_lines(raw.as_deref())
 }
 
 fn build_user_message_content(
@@ -121,6 +136,7 @@ fn provider_credential_key(provider: &str) -> String {
 
 pub struct InteractiveSession {
     agent_loop: Arc<tokio::sync::Mutex<crate::core::agent_loop::AgentLoop>>,
+    approval_manager: Arc<tokio::sync::Mutex<crate::core::approval::ApprovalManager>>,
     hook_manager: Arc<crate::core::hooks::HookManager>,
     state_manager: Arc<crate::storage::state_manager::StateManager>,
     provider_api_keys: HashMap<String, String>,
@@ -179,7 +195,7 @@ impl InteractiveSession {
             .with_tools(components.registry)
             .with_task_storage(components.task_storage)
             .with_context_loader(components.context_loader)
-            .with_approval_manager(components.approval_manager)
+            .with_approval_manager(Arc::clone(&components.approval_manager))
             .with_hooks(components.hook_manager.clone())
             .with_checkpoint_manager(components.checkpoint_mgr)
             .with_yolo(task_opts.yolo);
@@ -203,6 +219,7 @@ impl InteractiveSession {
 
         Ok(Self {
             agent_loop,
+            approval_manager: components.approval_manager,
             hook_manager: components.hook_manager,
             state_manager: components.state_manager,
             provider_api_keys,
@@ -453,6 +470,7 @@ enum Action {
     Submit(String),
     ModelSwitch(PendingModelSwitch),
     ModelApiKeySubmitted(PendingModelSwitch, String),
+    PlanApprove,
 }
 
 async fn activate_model_switch(
@@ -485,13 +503,19 @@ async fn activate_model_switch(
             app.provider_name = request.provider.clone();
             app.model_name = request.model_id.clone();
             app.needs_redraw = true;
-            app.push_plain(format!(
-                "Model switched to {}/{}",
-                request.provider, request.model_id
-            ));
+            app.show_notification(
+                format!(
+                    "Model switched to {}/{}",
+                    request.provider, request.model_id
+                ),
+                NotificationKind::Success,
+            );
         }
         Err(error) => {
-            app.push_plain(format!("Failed to create provider: {error}"));
+            app.show_notification(
+                format!("Failed to create provider: {error}"),
+                NotificationKind::Error,
+            );
         }
     }
 }
@@ -505,9 +529,9 @@ async fn request_model_switch(
     agent_busy: &Arc<AtomicBool>,
 ) {
     if agent_busy.load(Ordering::Relaxed) {
-        app.push_styled(
+        app.show_notification(
             "Agent is busy. Wait for it to finish before switching models.",
-            Style::default().fg(theme::WARNING_FG),
+            NotificationKind::Warning,
         );
         return;
     }
@@ -592,7 +616,7 @@ fn open_slash_command_help(app: &mut App, query: &str) {
     app.slash_command_completed_text = None;
 }
 
-fn close_slash_command_help(app: &mut App) {
+fn close_slash_command_mode(app: &mut App) {
     app.slash_command_active = false;
     app.slash_command_help_active = false;
     app.slash_command_results.clear();
@@ -826,11 +850,9 @@ fn handle_text_selection_mouse_event(
     mut copy: impl FnMut(&str) -> std::io::Result<()>,
 ) -> bool {
     match mouse_event.kind {
-        MouseEventKind::Down(MouseButton::Left) => app.begin_text_selection(
-            mouse_event.column,
-            mouse_event.row,
-            Instant::now(),
-        ),
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.begin_text_selection(mouse_event.column, mouse_event.row, Instant::now())
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             if !app.is_text_selection_dragging() {
                 return false;
@@ -1070,11 +1092,96 @@ fn handle_approval_key(app: &mut App, key: &KeyEvent) -> Option<ApprovalKeyOutco
     Some(ApprovalKeyOutcome::Resolved { result, delivered })
 }
 
-fn handle_paste_event(app: &mut App, content: &str) -> bool {
+fn handle_paste_event(app: &mut App, content: &str) -> Option<PasteOutcome> {
     if app.has_pending_approval() {
-        return false;
+        return None;
     }
-    app.handle_paste(content)
+    Some(app.handle_paste(content, app.pending_model_switch.is_none()))
+}
+
+async fn refresh_input_completions(
+    app: &mut App,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+) {
+    let input_text = app.input.lines().join("\n");
+    if app.slash_command_help_active {
+        app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
+            &app.slash_command_all_entries,
+            input_text.trim(),
+        );
+        app.slash_command_selected = app
+            .slash_command_selected
+            .min(app.slash_command_results.len().saturating_sub(1));
+        return;
+    }
+
+    let cursor = textarea_cursor_byte_offset(app.input.lines(), app.input.cursor());
+    let mq = crate::core::file_search::extract_mention_query_at_cursor(&input_text, cursor);
+    if mq.in_mention_mode && !app.cwd.is_empty() {
+        let query = mq.query;
+        if !app.mention_search_active {
+            app.mention_search_active = true;
+            app.picker_active = true;
+            app.mention_search_query = query.clone();
+            invalidate_mention_search(app);
+            schedule_immediate_mention_search(app, query);
+        } else if query != app.mention_search_query {
+            app.mention_search_query = query;
+            app.picker_active = true;
+            invalidate_mention_search(app);
+            app.mention_search_deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(150);
+        }
+    } else {
+        clear_mention_search(app, true);
+    }
+
+    if let Some(query) = crate::cli::slash_commands::extract_slash_query(&input_text) {
+        let still_completed = app
+            .slash_command_completed_text
+            .as_deref()
+            .is_some_and(|completed| completed == input_text);
+        if still_completed {
+            app.slash_command_completed_text = None;
+        } else if !app.slash_command_active {
+            refresh_slash_command_entries(app, state_handle).await;
+            app.slash_command_active = true;
+            app.slash_command_help_active = false;
+            app.slash_command_selected = 0;
+            app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
+                &app.slash_command_all_entries,
+                &query,
+            );
+            app.slash_command_completed_text = None;
+        } else {
+            app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
+                &app.slash_command_all_entries,
+                &query,
+            );
+            app.slash_command_completed_text = None;
+        }
+    } else if app.slash_command_active {
+        close_slash_command_mode(app);
+    } else {
+        app.slash_command_completed_text = None;
+    }
+}
+
+async fn apply_paste_event(
+    app: &mut App,
+    content: &str,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+) -> Option<PasteOutcome> {
+    let outcome = handle_paste_event(app, content);
+    if app.pending_model_switch.is_none()
+        && matches!(
+            outcome,
+            Some(PasteOutcome::Inserted | PasteOutcome::Folded { .. })
+        )
+    {
+        refresh_input_completions(app, state_handle).await;
+    }
+    outcome
 }
 
 /// Spawn agent task with proper state management.
@@ -1360,15 +1467,7 @@ async fn handle_key_event(
             crate::cli::slash_commands::apply_slash_completion(&text, &selected)
         {
             app.set_input_text_and_cursor(&new_text, cursor_pos);
-            app.slash_command_active = false;
-            app.slash_command_help_active = false;
-            app.slash_command_results.clear();
-            app.slash_command_selected = 0;
-            // Record the post-completion text so the post-text-input
-            // re-evaluation keeps the picker dismissed while the user is
-            // still browsing the completed command (e.g. arrow keys).
-            // The picker re-opens once the user starts a new query
-            // (separator, typed character, or backspace).
+            close_slash_command_mode(app);
             app.slash_command_completed_text = Some(new_text);
             return true;
         }
@@ -1397,14 +1496,14 @@ async fn handle_key_event(
                 {
                     let suffix = if entry.requires_args { " " } else { "" };
                     let command = format!("/{}{}", entry.name, suffix);
-                    close_slash_command_help(app);
+                    close_slash_command_mode(app);
                     app.set_input_text(&command);
                     app.input.move_cursor(tui_textarea::CursorMove::End);
                 }
                 return Ok(None);
             }
             KeyCode::Esc => {
-                close_slash_command_help(app);
+                close_slash_command_mode(app);
                 app.set_input_text("");
                 return Ok(None);
             }
@@ -1496,13 +1595,7 @@ async fn handle_key_event(
                     );
                 }
                 app.input = App::new_textarea(Vec::new());
-                // Same early-return issue: slash mode evaluation at end of
-                // handle_key_event() never runs for followup entries.
-                app.slash_command_active = false;
-                app.slash_command_help_active = false;
-                app.slash_command_results.clear();
-                app.slash_command_selected = 0;
-                app.slash_command_completed_text = None;
+                close_slash_command_mode(app);
             }
             return Ok(None);
         }
@@ -1515,11 +1608,7 @@ async fn handle_key_event(
                     "Approval pending. Type y, n, or a first.",
                     Style::default().fg(theme::WARNING_FG),
                 );
-                app.slash_command_active = false;
-                app.slash_command_help_active = false;
-                app.slash_command_results.clear();
-                app.slash_command_selected = 0;
-                app.slash_command_completed_text = None;
+                close_slash_command_mode(app);
                 return Ok(None);
             }
 
@@ -1528,13 +1617,7 @@ async fn handle_key_event(
             if is_shutdown_submit(&text) {
                 app.input = App::new_textarea(Vec::new());
                 app.clear_pastes();
-                // Same early-return issue as main submit: slash mode evaluation
-                // at end of handle_key_event() never runs.
-                app.slash_command_active = false;
-                app.slash_command_help_active = false;
-                app.slash_command_results.clear();
-                app.slash_command_selected = 0;
-                app.slash_command_completed_text = None;
+                close_slash_command_mode(app);
                 return Ok(Some(Action::Submit(text)));
             }
 
@@ -1550,18 +1633,9 @@ async fn handle_key_event(
                 app.push_turn_separator();
             }
             app.push_user_message(&text, output_writer);
-            // Clear textarea and paste tracking
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
-            // Clear slash command picker state — Enter handler returns early so
-            // the slash mode evaluation at the end of handle_key_event() never
-            // runs for Enter submissions, leaving slash_command_active=true.
-            app.slash_command_active = false;
-            app.slash_command_help_active = false;
-            app.slash_command_results.clear();
-            app.slash_command_selected = 0;
-            app.slash_command_completed_text = None;
-            // Submit to agent
+            close_slash_command_mode(app);
             return Ok(Some(Action::Submit(text)));
         }
         return Ok(None);
@@ -1606,6 +1680,23 @@ async fn handle_key_event(
         return Ok(None);
     }
 
+    if key.code == KeyCode::Char('y')
+        && key.modifiers.is_empty()
+        && app.input.lines().join("\n").is_empty()
+        && !app.has_pending_approval()
+        && !app.picker_active
+        && !app.slash_command_active
+        && !app.slash_command_help_active
+        && !app.model_picker_active
+        && !is_followup_question_active(task_id)
+        && app
+            .plan_state_cache
+            .as_ref()
+            .is_some_and(|plan| !plan.approved && !plan.complete && !plan.steps.is_empty())
+    {
+        return Ok(Some(Action::PlanApprove));
+    }
+
     // Shift+Up/Down for manual scroll
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         if key.code == KeyCode::Up {
@@ -1633,9 +1724,8 @@ async fn handle_key_event(
     let cursor_row = app.input.cursor().0;
     let on_first_input_line = cursor_row == 0;
     let on_last_input_line = cursor_row.saturating_add(1) >= app.input.lines().len();
-    let can_navigate_history = key.modifiers.is_empty()
-        && !app.picker_active
-        && !app.model_picker_active;
+    let can_navigate_history =
+        key.modifiers.is_empty() && !app.picker_active && !app.model_picker_active;
 
     if key.code == KeyCode::Up && can_navigate_history && on_first_input_line {
         if !app.history.is_navigating() {
@@ -1703,10 +1793,7 @@ async fn handle_key_event(
 
     // Escape key - dismiss slash command picker
     if key.code == KeyCode::Esc && app.slash_command_active {
-        app.slash_command_active = false;
-        app.slash_command_help_active = false;
-        app.slash_command_results.clear();
-        app.slash_command_selected = 0;
+        close_slash_command_mode(app);
         let text = app.input.lines().join("\n");
         if let Some(new_text) = strip_active_slash_command(&text) {
             app.set_input_text(&new_text);
@@ -1716,6 +1803,7 @@ async fn handle_key_event(
 
     // Ctrl+L - clear output screen (with confirmation)
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.clear_text_selection();
         app.pending_clear = Some("ctrl_l".to_string());
         app.push_styled(
             "Clear display? (y to confirm, any other key to cancel): ",
@@ -1750,89 +1838,7 @@ async fn handle_key_event(
     // All other keys go to textarea
     use tui_textarea::Input;
     app.input.input(Input::from(key));
-
-    // Check for @ mention mode - show file picker overlay (debounced)
-    let input_text = app.input.lines().join("\n");
-    if app.slash_command_help_active {
-        app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
-            &app.slash_command_all_entries,
-            input_text.trim(),
-        );
-        app.slash_command_selected = app
-            .slash_command_selected
-            .min(app.slash_command_results.len().saturating_sub(1));
-        return Ok(None);
-    }
-
-    let cursor = textarea_cursor_byte_offset(app.input.lines(), app.input.cursor());
-    let mq = crate::core::file_search::extract_mention_query_at_cursor(&input_text, cursor);
-    if mq.in_mention_mode && !app.cwd.is_empty() {
-        let query = mq.query;
-        if !app.mention_search_active {
-            // First entry into mention mode — activate picker immediately
-            // and run the search in the background.
-            app.mention_search_active = true;
-            app.picker_active = true;
-            app.mention_search_query = query.clone();
-            invalidate_mention_search(app);
-            schedule_immediate_mention_search(app, query);
-        } else if query != app.mention_search_query {
-            // Query changed — reset debounce timer, keep stale results visible
-            // while any older background search results are discarded.
-            app.mention_search_query = query;
-            app.picker_active = true;
-            invalidate_mention_search(app);
-            app.mention_search_deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(150);
-        }
-    } else {
-        clear_mention_search(app, true);
-    }
-
-    // Check for slash command mode activation / update
-    //
-    // The completed-text guard prevents the picker from re-opening after
-    // a Tab/Enter completion: as long as the input still matches the
-    // completed text, the user is just browsing (arrow keys, escape,
-    // etc.) and the picker should stay hidden. The picker re-opens as
-    // soon as the user starts a new query — a typed character, a
-    // separator (space), or a backspace.
-    if let Some(query) = crate::cli::slash_commands::extract_slash_query(&input_text) {
-        let still_completed = app
-            .slash_command_completed_text
-            .as_deref()
-            .is_some_and(|completed| completed == input_text);
-        if still_completed {
-            // Picker stays dismissed; clear the completed marker so the
-            // next genuinely-new input can re-enable the picker.
-            app.slash_command_completed_text = None;
-        } else if !app.slash_command_active {
-            refresh_slash_command_entries(app, state_handle).await;
-            app.slash_command_active = true;
-            app.slash_command_help_active = false;
-            app.slash_command_selected = 0;
-            app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
-                &app.slash_command_all_entries,
-                &query,
-            );
-            app.slash_command_completed_text = None;
-        } else {
-            app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
-                &app.slash_command_all_entries,
-                &query,
-            );
-            app.slash_command_completed_text = None;
-        }
-    } else if app.slash_command_active {
-        app.slash_command_active = false;
-        app.slash_command_help_active = false;
-        app.slash_command_results.clear();
-        app.slash_command_selected = 0;
-        app.slash_command_completed_text = None;
-    } else {
-        // Input is no longer a slash command — drop the completed marker.
-        app.slash_command_completed_text = None;
-    }
+    refresh_input_completions(app, state_handle).await;
 
     Ok(None)
 }
@@ -1867,12 +1873,10 @@ async fn handle_cli_only_command(
         return Ok(false);
     }
 
-    if agent_busy.load(Ordering::Relaxed)
-        && matches!(&cli_cmd, CliOnlyCommand::ModelSwitch(_))
-    {
-        app.push_styled(
+    if agent_busy.load(Ordering::Relaxed) && matches!(&cli_cmd, CliOnlyCommand::ModelSwitch(_)) {
+        app.show_notification(
             "Agent is busy. Wait for it to finish before switching models.",
-            Style::default().fg(theme::WARNING_FG),
+            NotificationKind::Warning,
         );
         return Ok(false);
     }
@@ -2049,22 +2053,26 @@ async fn handle_cli_only_command(
             };
 
             let Some(retry_message) = retry_message else {
-                app.push_plain("No safe failed request is available to retry.");
+                app.show_notification(
+                    "No safe failed request is available to retry.",
+                    NotificationKind::Warning,
+                );
                 return Ok(false);
             };
 
             if agent_busy.load(Ordering::Relaxed) {
                 let sess = session.lock().await;
                 if !sess.prepend_retryable_failed_request(retry_message).await {
-                    app.push_plain(
+                    app.show_notification(
                         "The last failed request includes non-text content. Wait for idle, then run /retry again.",
+                        NotificationKind::Error,
                     );
                     return Ok(false);
                 }
                 let count = sess.queue_handle().await.queued_message_count().await;
-                app.push_styled(
+                app.show_notification(
                     format!("Retry queued to run next ({count} in queue)."),
-                    theme::dim_style(),
+                    NotificationKind::Info,
                 );
             } else {
                 spawn_agent_task_from_message(
@@ -2078,7 +2086,10 @@ async fn handle_cli_only_command(
                 )
                 .await?;
                 app.agent_busy = true;
-                app.push_styled("Retrying last failed request verbatim.", theme::dim_style());
+                app.show_notification(
+                    "Retrying last failed request verbatim.",
+                    NotificationKind::Info,
+                );
             }
             app.force_bottom();
             return Ok(false);
@@ -2535,7 +2546,8 @@ async fn handle_cli_only_command(
         | CliOnlyCommand::PlanFail => {
             use crate::cli::slash_commands::PlanSubcommand;
 
-            if matches!(cli_cmd, CliOnlyCommand::PlanApprove) && agent_busy.load(Ordering::Relaxed) {
+            if matches!(cli_cmd, CliOnlyCommand::PlanApprove) && agent_busy.load(Ordering::Relaxed)
+            {
                 app.push_styled(
                     "Agent is busy. Wait for it to finish before approving the plan.",
                     Style::default().fg(theme::WARNING_FG),
@@ -3003,6 +3015,7 @@ async fn run_main_loop(
     const BUSY_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
     const BUSY_POLL_INTERVAL: Duration = BUSY_REDRAW_INTERVAL;
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    let mouse_scroll_lines = mouse_scroll_lines();
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
     let mut last_draw_at: Option<std::time::Instant> = None;
     let mut timing = TimingSummary {
@@ -3169,7 +3182,6 @@ async fn run_main_loop(
         if has_event {
             match ratatui::crossterm::event::read()? {
                 Event::Key(key) => {
-                    app.clear_text_selection();
                     app.needs_redraw = true;
                     if let Some(outcome) = handle_approval_key(app, &key) {
                         if let ApprovalKeyOutcome::Resolved { result, delivered } = outcome {
@@ -3208,6 +3220,7 @@ async fn run_main_loop(
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
+                        app.clear_text_selection();
                         if app.pending_model_switch.is_some() {
                             app.pending_model_switch = None;
                             app.set_input_text("");
@@ -3275,6 +3288,7 @@ async fn run_main_loop(
                     if let Some(action) =
                         handle_key_event(key, app, &output_writer, &state_handle, &task_id).await?
                     {
+                        app.clear_text_selection();
                         match action {
                             Action::ModelSwitch(request) => {
                                 request_model_switch(
@@ -3332,6 +3346,25 @@ async fn run_main_loop(
                                     &agent_busy,
                                 )
                                 .await;
+                                continue;
+                            }
+                            Action::PlanApprove => {
+                                handle_cli_only_command(
+                                    crate::cli::slash_commands::CliOnlyCommand::PlanApprove,
+                                    "y",
+                                    app,
+                                    &output_writer,
+                                    &session,
+                                    &task_id,
+                                    &agent_busy,
+                                    &agent_done,
+                                    &agent_start_time,
+                                    &agent_task,
+                                    &state_handle,
+                                    task_opts,
+                                    auto_approve,
+                                )
+                                .await?;
                                 continue;
                             }
                             Action::Submit(text) => {
@@ -3521,19 +3554,33 @@ async fn run_main_loop(
                 Event::Paste(content) => {
                     app.clear_text_selection();
                     app.needs_redraw = true;
-                    if app.pending_model_switch.is_some() {
-                        app.input.insert_str(&content);
-                    } else {
-                        let folded = handle_paste_event(app, &content);
-                        if folded {
+                    match apply_paste_event(app, &content, &state_handle).await {
+                        Some(PasteOutcome::Folded { char_count }) => {
                             app.push_styled(
                                 format!(
-                                    "Large paste folded ({} chars) - will expand on submit",
-                                    content.len()
+                                    "Large paste folded ({char_count} chars) - will expand on submit"
                                 ),
                                 theme::dim_style(),
                             );
                         }
+                        Some(PasteOutcome::RejectedTooLarge { max_bytes }) => {
+                            app.push_styled(
+                                format!(
+                                    "Paste rejected: input would exceed the {} MiB paste limit.",
+                                    max_bytes / (1024 * 1024)
+                                ),
+                                Style::default().fg(theme::WARNING_FG),
+                            );
+                        }
+                        Some(PasteOutcome::RejectedTooManyChunks { max_chunks }) => {
+                            app.push_styled(
+                                format!(
+                                    "Paste rejected: input already contains {max_chunks} folded pastes."
+                                ),
+                                Style::default().fg(theme::WARNING_FG),
+                            );
+                        }
+                        Some(PasteOutcome::Inserted) | None => {}
                     }
                 }
                 Event::Resize(_, _) => {
@@ -3553,25 +3600,25 @@ async fn run_main_loop(
                         MouseEventKind::ScrollDown => {
                             app.clear_text_selection();
                             if app.has_pending_approval() {
-                                app.scroll_pending_approval(-3);
+                                app.scroll_pending_approval(-mouse_scroll_lines);
                             } else if !app.scroll_completion_at(
                                 mouse_event.column,
                                 mouse_event.row,
-                                3,
+                                mouse_scroll_lines,
                             ) {
-                                app.scroll_lines(3);
+                                app.scroll_lines(mouse_scroll_lines);
                             }
                         }
                         MouseEventKind::ScrollUp => {
                             app.clear_text_selection();
                             if app.has_pending_approval() {
-                                app.scroll_pending_approval(3);
+                                app.scroll_pending_approval(mouse_scroll_lines);
                             } else if !app.scroll_completion_at(
                                 mouse_event.column,
                                 mouse_event.row,
-                                -3,
+                                -mouse_scroll_lines,
                             ) {
-                                app.scroll_lines(-3);
+                                app.scroll_lines(-mouse_scroll_lines);
                             }
                         }
                         _ => {}
@@ -3646,6 +3693,9 @@ async fn run_main_loop(
 
         // 6. Tick spinner
         if app.tick_spinner() {
+            app.needs_redraw = true;
+        }
+        if app.tick_notification(Instant::now()) {
             app.needs_redraw = true;
         }
     }
@@ -3743,6 +3793,9 @@ pub async fn run_interactive_shell_inner(
             .to_string();
         app.task_id = task_id.clone();
         app.mode = if sess.task_opts.plan { "PLAN" } else { "ACT" }.to_string();
+        let approval_manager = sess.approval_manager.lock().await;
+        app.yolo_mode = approval_manager.is_yolo_mode();
+        app.auto_approve_all = approval_manager.is_auto_approve_all();
         app.start_time = Some(Instant::now());
     }
 
@@ -4151,6 +4204,32 @@ mod tests {
         assert_eq!(
             parse_output_channel_capacity(Some("invalid")),
             DEFAULT_OUTPUT_CHANNEL_CAPACITY
+        );
+    }
+
+    #[test]
+    fn test_parse_mouse_scroll_lines_accepts_and_clamps_override() {
+        assert_eq!(parse_mouse_scroll_lines(Some("8")), 8);
+        assert_eq!(
+            parse_mouse_scroll_lines(Some("1000")),
+            MAX_MOUSE_SCROLL_LINES
+        );
+    }
+
+    #[test]
+    fn test_parse_mouse_scroll_lines_falls_back_for_invalid_values() {
+        assert_eq!(parse_mouse_scroll_lines(None), DEFAULT_MOUSE_SCROLL_LINES);
+        assert_eq!(
+            parse_mouse_scroll_lines(Some("0")),
+            DEFAULT_MOUSE_SCROLL_LINES
+        );
+        assert_eq!(
+            parse_mouse_scroll_lines(Some("-1")),
+            DEFAULT_MOUSE_SCROLL_LINES
+        );
+        assert_eq!(
+            parse_mouse_scroll_lines(Some("invalid")),
+            DEFAULT_MOUSE_SCROLL_LINES
         );
     }
 
@@ -4804,12 +4883,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         tx.try_send(OutputEvent::TurnIndicator(Line::from("♦")))
             .unwrap();
-        tx.try_send(OutputEvent::model_output("before code")).unwrap();
+        tx.try_send(OutputEvent::model_output("before code"))
+            .unwrap();
         tx.try_send(OutputEvent::model_output("```rust")).unwrap();
         tx.try_send(OutputEvent::model_output("  let value = 1;"))
             .unwrap();
         tx.try_send(OutputEvent::model_output("```")).unwrap();
-        tx.try_send(OutputEvent::model_output("after code")).unwrap();
+        tx.try_send(OutputEvent::model_output("after code"))
+            .unwrap();
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: code_turn.to_string(),
         })
@@ -5223,8 +5304,42 @@ mod tests {
         );
         assert!(app.set_pending_approval(request));
 
-        assert!(!handle_paste_event(&mut app, "pasted command"));
+        assert!(handle_paste_event(&mut app, "pasted command").is_none());
         assert_eq!(app.input.lines().join("\n"), "draft");
+    }
+
+    #[tokio::test]
+    async fn test_paste_refreshes_slash_command_completion() {
+        let mut app = App::new();
+        let state_handle = Arc::new(Mutex::new(None));
+
+        assert_eq!(
+            apply_paste_event(&mut app, "/pl", &state_handle).await,
+            Some(PasteOutcome::Inserted)
+        );
+
+        assert!(app.slash_command_active);
+        assert!(
+            app.slash_command_results
+                .iter()
+                .any(|entry| entry.name == "plan")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paste_refreshes_file_mention_completion() {
+        let mut app = App::new();
+        app.cwd = "/tmp".to_string();
+        let state_handle = Arc::new(Mutex::new(None));
+
+        assert_eq!(
+            apply_paste_event(&mut app, "@src", &state_handle).await,
+            Some(PasteOutcome::Inserted)
+        );
+
+        assert!(app.mention_search_active);
+        assert!(app.picker_active);
+        assert_eq!(app.mention_search_query, "src");
     }
 
     #[test]
@@ -5763,6 +5878,67 @@ mod tests {
         assert_eq!(app.mention_search_query, "next");
         assert_eq!(app.input.lines().join("\n"), "@next blahblah text");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_y_approves_pending_plan_with_empty_input() -> anyhow::Result<()>
+    {
+        use crate::core::plan_state::PlanState;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let plan = PlanState::create_plan(vec!["First step".to_string()]);
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
+        assert!(matches!(action, Some(Action::PlanApprove)));
+        assert!(app.input.lines().join("\n").is_empty());
+        reset_prompt_state();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_y_remains_text_when_plan_input_is_non_empty()
+    -> anyhow::Result<()> {
+        use crate::core::plan_state::PlanState;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let plan = PlanState::create_plan(vec!["First step".to_string()]);
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+        app.set_input_text_and_cursor("sa", 2);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "say");
+        reset_prompt_state();
         Ok(())
     }
 
@@ -6514,13 +6690,10 @@ mod tests {
         .await?;
 
         assert!(!should_exit);
-        assert!(app.output_lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-                .contains("No safe failed request is available to retry")
-        }));
+        assert_eq!(
+            app.notification_message(),
+            Some("No safe failed request is available to retry.")
+        );
         Ok(())
     }
 
@@ -6600,6 +6773,10 @@ mod tests {
         assert_eq!(
             queued,
             vec!["retry me".to_string(), "older queued message".to_string()]
+        );
+        assert_eq!(
+            app.notification_message(),
+            Some("Retry queued to run next (2 in queue).")
         );
         Ok(())
     }
@@ -6703,7 +6880,9 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
-                .contains("Agent is busy. Wait for it to finish or cancel it before changing the plan.")
+                .contains(
+                    "Agent is busy. Wait for it to finish or cancel it before changing the plan.",
+                )
         }));
 
         let state = state_handle.lock().await;
@@ -6784,7 +6963,9 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
-                .contains("Agent is busy. Wait for it to finish or cancel it before changing the plan.")
+                .contains(
+                    "Agent is busy. Wait for it to finish or cancel it before changing the plan.",
+                )
         }));
 
         let state = state_handle.lock().await;
@@ -6917,13 +7098,10 @@ mod tests {
 
         assert!(!should_exit);
         assert!(!app.model_picker_active);
-        assert!(app.output_lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-                .contains("Agent is busy. Wait for it to finish before switching models.")
-        }));
+        assert_eq!(
+            app.notification_message(),
+            Some("Agent is busy. Wait for it to finish before switching models.")
+        );
         Ok(())
     }
 

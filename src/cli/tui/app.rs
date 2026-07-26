@@ -6,8 +6,8 @@ use super::history::FileHistory;
 use super::theme;
 use crate::core::file_search::FileSearchResult;
 use ratatui::{
-    buffer::Buffer,
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
     text::{Line, Span},
@@ -30,6 +30,10 @@ const APPROVAL_PANEL_MAX_DETAIL_ROWS: usize = 10;
 const SCROLLBACK_FLUSH_LINE_BATCH: usize = 128;
 const MAX_SCROLLBACK_LOAD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SCROLLBACK_LOAD_LINES: usize = 10_000;
+const MAX_PASTED_INPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FOLDED_PASTE_CHUNKS: usize = 256;
+const STATUS_NOTIFICATION_DURATION: Duration = Duration::from_secs(4);
+static NEXT_PASTE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Async @-mention search result delivered back to the interactive loop.
 #[derive(Debug, Clone)]
@@ -93,7 +97,9 @@ fn block_kind_accent_style(kind: BlockKind) -> Style {
         BlockKind::ToolHeader => Style::default().fg(theme::TOOL_CALL_FG),
         BlockKind::ToolOutput | BlockKind::CommandOutput => Style::default().fg(theme::STATUS_FG),
         BlockKind::CommandHeader => Style::default().fg(theme::INFO_FG),
-        BlockKind::Reasoning => Style::default().fg(theme::ACCENT).add_modifier(Modifier::DIM),
+        BlockKind::Reasoning => Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::DIM),
         BlockKind::UserPrompt => Style::default().fg(theme::PROMPT_FG),
         BlockKind::BlockingPrompt => Style::default().fg(theme::WARNING_FG),
         BlockKind::Separator => Style::default().fg(theme::BORDER_FG),
@@ -136,17 +142,33 @@ struct ManualViewportAnchor {
     scroll_y: usize,
 }
 
-/// Tracks a pasted chunk of text that was folded into a marker.
 #[derive(Debug, Clone)]
 pub struct PasteChunk {
-    /// The marker text shown in the textarea (e.g., "[pasted 1,234 chars]")
     pub marker: String,
-    /// The original pasted content
     pub content: String,
-    /// Start position in the textarea (line, column)
-    pub start_line: usize,
-    /// Whether this paste has been expanded by the user
-    pub expanded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteOutcome {
+    Inserted,
+    Folded { char_count: usize },
+    RejectedTooLarge { max_bytes: usize },
+    RejectedTooManyChunks { max_chunks: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct StatusNotification {
+    message: String,
+    kind: NotificationKind,
+    expires_at: Instant,
 }
 
 struct PendingApproval {
@@ -432,6 +454,9 @@ pub struct App {
     pub task_id: String,
     /// Mode (PLAN/ACT) for status bar
     pub mode: String,
+    pub yolo_mode: bool,
+    pub auto_approve_all: bool,
+    status_notification: Option<StatusNotification>,
     /// True when the output channel has overflowed and events were
     /// dropped. The status bar surfaces this so the user knows output
     /// (including approval prompts) may be missing.
@@ -490,7 +515,7 @@ pub struct App {
     /// Rebuilt only when the underlying fields change.
     pub cached_status_left: String,
     /// Fingerprint of the fields used to build cached_status_left.
-    pub status_left_fingerprint: (String, String, String, String),
+    pub status_left_fingerprint: (String, String, String, String, bool, bool),
     /// Cached status bar right segment (elapsed timer). Rebuilt when seconds change.
     pub cached_status_right: String,
     /// Last known context usage percentage from the API.
@@ -626,6 +651,34 @@ impl App {
 
     pub fn input_height(&self) -> u16 {
         (self.input.lines().len().clamp(1, INPUT_MAX_VISIBLE_LINES) as u16) + 2
+    }
+
+    pub fn show_notification(&mut self, message: impl Into<String>, kind: NotificationKind) {
+        self.status_notification = Some(StatusNotification {
+            message: message.into(),
+            kind,
+            expires_at: Instant::now() + STATUS_NOTIFICATION_DURATION,
+        });
+        self.needs_redraw = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notification_message(&self) -> Option<&str> {
+        self.status_notification
+            .as_ref()
+            .map(|notification| notification.message.as_str())
+    }
+
+    pub fn tick_notification(&mut self, now: Instant) -> bool {
+        if self
+            .status_notification
+            .as_ref()
+            .is_some_and(|notification| now >= notification.expires_at)
+        {
+            self.status_notification = None;
+            return true;
+        }
+        false
     }
 
     pub fn set_pending_approval(
@@ -814,6 +867,9 @@ impl App {
             model_name: String::new(),
             task_id: String::new(),
             mode: String::new(),
+            yolo_mode: false,
+            auto_approve_all: false,
+            status_notification: None,
             elapsed: None,
             scrollbar_state: ScrollbarState::new(0),
             last_content_height: 0,
@@ -829,7 +885,14 @@ impl App {
             mention_search_query: String::new(),
             mention_search_deadline: Instant::now(),
             cached_status_left: String::new(),
-            status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
+            status_left_fingerprint: (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                false,
+                false,
+            ),
             cached_status_right: String::new(),
             cached_status_right_secs: (u64::MAX, None, false, 0, 0, 0, ScrollMode::Auto),
             context_pct: None,
@@ -935,15 +998,10 @@ impl App {
                     .output_line_kinds
                     .get(1)
                     .copied()
-                    .is_some_and(|next_kind| {
-                        Self::should_insert_separator(evicted_kind, next_kind)
-                    }) as usize;
-                Self::output_row_visual_rows(
-                    self.output_lines.front(),
-                    evicted_kind,
-                    wrap_width,
-                )
-                .saturating_add(separator_rows)
+                    .is_some_and(|next_kind| Self::should_insert_separator(evicted_kind, next_kind))
+                    as usize;
+                Self::output_row_visual_rows(self.output_lines.front(), evicted_kind, wrap_width)
+                    .saturating_add(separator_rows)
             } else {
                 0
             };
@@ -972,10 +1030,10 @@ impl App {
                 kind,
                 wrap_width,
             )
-                .saturating_add(
-                    previous_kind.is_some_and(|prev| Self::should_insert_separator(prev, kind))
-                        as usize,
-                );
+            .saturating_add(
+                previous_kind.is_some_and(|prev| Self::should_insert_separator(prev, kind))
+                    as usize,
+            );
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
         match self.scroll_mode {
@@ -1243,9 +1301,9 @@ impl App {
         }
 
         let insert_at = *model_entry_indices.iter().min().unwrap();
-        let anchor_in_replaced_model = manual_anchor.as_ref().is_some_and(|anchor| {
-            model_entry_indices.contains(&anchor.output_index)
-        });
+        let anchor_in_replaced_model = manual_anchor
+            .as_ref()
+            .is_some_and(|anchor| model_entry_indices.contains(&anchor.output_index));
         let old_model_start = if anchor_in_replaced_model {
             let mut anchor = manual_anchor.clone().expect("manual anchor must exist");
             anchor.output_index = insert_at;
@@ -1376,8 +1434,8 @@ impl App {
         let old_model_relative = old_model_start
             .map(|start| anchor.scroll_y.saturating_sub(start))
             .unwrap_or_default();
-        let matching_candidates: Vec<(usize, usize, usize)> =
-            (insert_at..insert_at.saturating_add(rendered_len))
+        let matching_candidates: Vec<(usize, usize, usize)> = (insert_at
+            ..insert_at.saturating_add(rendered_len))
             .filter_map(|index| {
                 let text = Self::line_to_string(&self.output_lines[index]);
                 let exact_match = text == anchor.text;
@@ -1469,12 +1527,7 @@ impl App {
 
     /// Update the active selection. The caller can skip a redraw when this
     /// returns false, but the focus still tracks every drag event.
-    pub(crate) fn extend_text_selection(
-        &mut self,
-        column: u16,
-        row: u16,
-        now: Instant,
-    ) -> bool {
+    pub(crate) fn extend_text_selection(&mut self, column: u16, row: u16, now: Instant) -> bool {
         let Some(selection) = self.text_selection.as_ref() else {
             return false;
         };
@@ -1654,11 +1707,15 @@ impl App {
         ];
         self.selection_surfaces = areas
             .into_iter()
-            .filter_map(|(pane, area)| area.map(|area| Self::snapshot_selection_surface(buffer, pane, area)))
+            .filter_map(|(pane, area)| {
+                area.map(|area| Self::snapshot_selection_surface(buffer, pane, area))
+            })
             .collect();
-        if self.text_selection.as_ref().is_some_and(|selection| {
-            self.selection_surface(selection.pane).is_none()
-        }) {
+        if self
+            .text_selection
+            .as_ref()
+            .is_some_and(|selection| self.selection_surface(selection.pane).is_none())
+        {
             self.text_selection = None;
         }
     }
@@ -1976,6 +2033,7 @@ impl App {
     /// we reconstruct Line objects and prepend them to output_lines.
     pub fn enter_scrollback(&mut self) -> io::Result<()> {
         self.flush_scrollback_pending()?;
+        self.clear_text_selection();
 
         let scrollback_content = match self.scrollback_file.as_ref() {
             Some(file_path) => read_scrollback_tail(file_path)?,
@@ -2024,6 +2082,7 @@ impl App {
     /// the original session content, and return to bottom.
     pub fn exit_scrollback(&mut self) -> io::Result<()> {
         let result = self.clear_scrollback_storage();
+        self.clear_text_selection();
         self.in_scrollback = false;
         self.needs_redraw = true;
         self.scrollback_count = 0;
@@ -2307,8 +2366,8 @@ impl App {
         let mut rendered_rows = 0usize;
 
         self.for_each_output_row(|line, kind| {
-            rendered_rows = rendered_rows
-                .saturating_add(Self::output_row_visual_rows(line, kind, wrap_width));
+            rendered_rows =
+                rendered_rows.saturating_add(Self::output_row_visual_rows(line, kind, wrap_width));
             if kind == BlockKind::BlockingPrompt {
                 tail_row = Some(rendered_rows);
             }
@@ -2496,10 +2555,8 @@ impl App {
     fn output_row_for_render(line: Option<&Line<'static>>, kind: BlockKind) -> Line<'static> {
         let mut line = line.cloned().unwrap_or_else(|| Line::from(""));
         if kind != BlockKind::Separator {
-            line.spans.insert(
-                0,
-                Span::styled("│", block_kind_accent_style(kind)),
-            );
+            line.spans
+                .insert(0, Span::styled("│", block_kind_accent_style(kind)));
         }
         line
     }
@@ -2587,11 +2644,9 @@ impl App {
                 }
                 let line_start = rows_before.saturating_add(separator_before as usize);
                 let line_rows = Self::output_row_visual_rows(Some(line), *kind, wrap_width);
-                return Some(line_start.saturating_add(
-                    anchor
-                        .row_offset
-                        .min(line_rows.saturating_sub(1)),
-                ));
+                return Some(
+                    line_start.saturating_add(anchor.row_offset.min(line_rows.saturating_sub(1))),
+                );
             }
             rows_before = rows_before.saturating_add(separator_before as usize);
             rows_before = rows_before.saturating_add(Self::output_row_visual_rows(
@@ -2747,8 +2802,7 @@ impl App {
             self.render_plan_panel(frame, plan_area);
         }
 
-        let selection_blocked = self.has_blocking_prompt()
-            || self.picker_active
+        let selection_blocked = self.picker_active
             || self.slash_command_active
             || self.model_picker_active
             || self.pending_model_switch.is_some();
@@ -2903,20 +2957,46 @@ impl App {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect) {
+        if let Some(notification) = self.status_notification.as_ref() {
+            let (marker, color) = match notification.kind {
+                NotificationKind::Info => ("i", theme::ACCENT),
+                NotificationKind::Success => ("✓", theme::PROMPT_FG),
+                NotificationKind::Warning => ("!", theme::WARNING_FG),
+                NotificationKind::Error => ("×", theme::ERROR_FG),
+            };
+            let approval_badge = self.approval_mode_badge();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        " {approval_badge}{} · {marker} {} ",
+                        self.mode, notification.message
+                    ),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ))),
+                status_area,
+            );
+            return;
+        }
+
         if self.status_left_fingerprint.0 != self.provider_name
             || self.status_left_fingerprint.1 != self.model_name
             || self.status_left_fingerprint.2 != self.task_id
             || self.status_left_fingerprint.3 != self.mode
+            || self.status_left_fingerprint.4 != self.yolo_mode
+            || self.status_left_fingerprint.5 != self.auto_approve_all
         {
+            let approval_badge = self.approval_mode_badge();
             self.cached_status_left = format!(
-                " {} / {} | {} | {} ",
-                self.provider_name, self.model_name, self.task_id, self.mode
+                " {}{} / {} | {} | {} ",
+                approval_badge, self.provider_name, self.model_name, self.task_id, self.mode
             );
             self.status_left_fingerprint = (
                 self.provider_name.clone(),
                 self.model_name.clone(),
                 self.task_id.clone(),
                 self.mode.clone(),
+                self.yolo_mode,
+                self.auto_approve_all,
             );
         }
         let elapsed_secs = self.elapsed.map_or(u64::MAX, |e| e.as_secs());
@@ -2975,6 +3055,16 @@ impl App {
         ]);
         let status = Paragraph::new(status_line);
         frame.render_widget(status, status_area);
+    }
+
+    fn approval_mode_badge(&self) -> &'static str {
+        if self.yolo_mode {
+            "[YOLO] "
+        } else if self.auto_approve_all {
+            "[AUTO-APPROVE] "
+        } else {
+            ""
+        }
     }
 
     fn render_output(&mut self, frame: &mut Frame, output_area: Rect) {
@@ -3080,10 +3170,7 @@ impl App {
             frame.render_widget(output, main_output_area);
         }
 
-        // Scrollback overflow indicator: shown at bottom when there's
-        // scrollback history available and user is at the bottom.
-        if !self.in_scrollback && self.scrollback_count > 0 && self.scroll_mode == ScrollMode::Auto
-        {
+        if !self.in_scrollback && self.scrollback_count > 0 && main_output_area.height > 0 {
             let indicator = Paragraph::new(Line::from(format!(
                 "↓ {} lines of scrollback — press Shift+S to view",
                 self.scrollback_count,
@@ -3154,28 +3241,29 @@ impl App {
             }
         }
 
-        // Scrollbar on output pane (render inside the border).
         // Use output_rows (not total_rows) so the scrollbar thumb
         // reflects only the output pane content — completion rows are
         // rendered separately and must not affect scroll geometry.
-        self.scrollbar_state = self
-            .scrollbar_state
-            .content_length(output_rows)
-            .viewport_content_length(content_height.max(1).min(output_rows))
-            .position(scroll_y.min(output_rows));
-        frame.render_stateful_widget(
-            Scrollbar::default()
-                .orientation(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("↑"))
-                .end_symbol(Some("↓"))
-                .style(theme::scrollbar_style())
-                .thumb_style(theme::scrollbar_thumb_style()),
-            main_output_area.inner(ratatui::layout::Margin {
-                horizontal: 0,
-                vertical: 1,
-            }),
-            &mut self.scrollbar_state,
-        );
+        if output_rows > content_height {
+            self.scrollbar_state = self
+                .scrollbar_state
+                .content_length(output_rows)
+                .viewport_content_length(content_height.max(1))
+                .position(scroll_y.min(output_rows));
+            frame.render_stateful_widget(
+                Scrollbar::default()
+                    .orientation(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("↑"))
+                    .end_symbol(Some("↓"))
+                    .style(theme::scrollbar_style())
+                    .thumb_style(theme::scrollbar_thumb_style()),
+                main_output_area.inner(ratatui::layout::Margin {
+                    horizontal: 0,
+                    vertical: 1,
+                }),
+                &mut self.scrollbar_state,
+            );
+        }
     }
 
     /// Render file picker overlay as a floating Table widget.
@@ -3424,42 +3512,37 @@ impl App {
         frame.render_widget(picker, overlay_area);
     }
 
-    /// Handle a paste event, folding large pastes into markers.
-    /// Returns true if the paste was folded, false if inserted directly.
-    pub fn handle_paste(&mut self, content: &str) -> bool {
+    pub fn handle_paste(&mut self, content: &str, fold_large: bool) -> PasteOutcome {
+        self.prune_detached_pastes();
+        if self.expanded_input_byte_len().saturating_add(content.len()) > MAX_PASTED_INPUT_BYTES {
+            return PasteOutcome::RejectedTooLarge {
+                max_bytes: MAX_PASTED_INPUT_BYTES,
+            };
+        }
+
         let char_count = content.chars().count();
-        let folded = char_count > self.paste_fold_threshold;
-
-        if folded {
-            // Create a unique, non-user-inputtable marker for the folded paste.
-            // Index-based format prevents collisions with user-typed text and
-            // handles duplicate pastes correctly (each paste gets a distinct marker).
-            let marker = format!("\x00SNED_PASTE_{}", self.paste_chunks.len());
-
-            // Insert the marker at cursor position
+        if fold_large && char_count > self.paste_fold_threshold {
+            if self.paste_chunks.len() >= MAX_FOLDED_PASTE_CHUNKS {
+                return PasteOutcome::RejectedTooManyChunks {
+                    max_chunks: MAX_FOLDED_PASTE_CHUNKS,
+                };
+            }
+            let paste_id = NEXT_PASTE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let marker = format!("⟦pasted {char_count} chars #{paste_id}⟧");
             self.input.insert_str(&marker);
-
-            // Track this paste chunk (store globally, expand on submit)
             self.paste_chunks.push(PasteChunk {
                 marker,
                 content: content.to_string(),
-                start_line: 0, // Simplified: track globally, not per-line
-                expanded: false,
             });
+            PasteOutcome::Folded { char_count }
         } else {
-            // Insert small pastes directly
             self.input.insert_str(content);
+            PasteOutcome::Inserted
         }
-
-        folded
     }
 
-    /// Get the final input text, expanding all paste markers.
     pub fn get_input_with_expanded_pastes(&mut self) -> String {
-        // Get current textarea content
         let mut text = self.input.lines().join("\n");
-
-        // Replace all markers with original content
         for paste in self.paste_chunks.drain(..) {
             if let Some(pos) = text.find(&paste.marker) {
                 text.replace_range(pos..pos + paste.marker.len(), &paste.content);
@@ -3469,9 +3552,26 @@ impl App {
         text
     }
 
-    /// Clear all paste chunks.
     pub fn clear_pastes(&mut self) {
         self.paste_chunks.clear();
+    }
+
+    fn prune_detached_pastes(&mut self) {
+        let text = self.input.lines().join("\n");
+        self.paste_chunks
+            .retain(|paste| text.contains(&paste.marker));
+    }
+
+    fn expanded_input_byte_len(&self) -> usize {
+        let text = self.input.lines().join("\n");
+        self.paste_chunks.iter().fold(text.len(), |len, paste| {
+            if text.contains(&paste.marker) {
+                len.saturating_sub(paste.marker.len())
+                    .saturating_add(paste.content.len())
+            } else {
+                len
+            }
+        })
     }
 
     /// Increment spinner frame at a human-scale cadence instead of every loop
@@ -3568,7 +3668,10 @@ mod tests {
 
     #[test]
     fn block_kind_accent_styles_match_theme() {
-        assert_eq!(block_kind_accent_style(BlockKind::Model).fg, Some(theme::ACCENT));
+        assert_eq!(
+            block_kind_accent_style(BlockKind::Model).fg,
+            Some(theme::ACCENT)
+        );
         assert_eq!(
             block_kind_accent_style(BlockKind::ToolHeader).fg,
             Some(theme::TOOL_CALL_FG)
@@ -3616,11 +3719,7 @@ mod tests {
             .expect("selection frame should render");
     }
 
-    fn selection_text_position(
-        app: &App,
-        pane: SelectionPane,
-        text: &str,
-    ) -> (u16, u16) {
+    fn selection_text_position(app: &App, pane: SelectionPane, text: &str) -> (u16, u16) {
         let surface = app
             .selection_surface(pane)
             .expect("render should create a selection surface");
@@ -3647,7 +3746,75 @@ mod tests {
 
         assert!(app.begin_text_selection(column, row, now));
         assert!(app.extend_text_selection(column + 4, row, now + Duration::from_millis(16)));
-        assert_eq!(app.finish_text_selection(column + 4, row), Some("alpha".to_string()));
+        assert_eq!(
+            app.finish_text_selection(column + 4, row),
+            Some("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn test_transcript_selection_survives_input_edits() {
+        let mut app = App::new();
+        app.push_plain("alpha beta");
+        render_for_selection(&mut app);
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let now = Instant::now();
+
+        assert!(app.begin_text_selection(column, row, now));
+        assert!(app.extend_text_selection(column + 4, row, now + Duration::from_millis(16)));
+        assert_eq!(
+            app.finish_text_selection(column + 4, row),
+            Some("alpha".to_string())
+        );
+
+        app.set_input_text("draft");
+        render_for_selection(&mut app);
+
+        assert_eq!(
+            app.finish_text_selection(column + 4, row),
+            Some("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn test_transcript_selection_remains_available_during_approval() {
+        let mut app = App::new();
+        app.push_plain("alpha beta");
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            60,
+            "Approval required · edit_file",
+            "Approve these edits?",
+        );
+        assert!(app.set_pending_approval(request));
+        render_for_selection(&mut app);
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let now = Instant::now();
+
+        assert!(app.begin_text_selection(column, row, now));
+        assert!(app.extend_text_selection(column + 4, row, now + Duration::from_millis(16)));
+        assert_eq!(
+            app.finish_text_selection(column + 4, row),
+            Some("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn test_transcript_selection_remains_available_with_plan_panel() {
+        let mut app = App::new();
+        app.push_plain("alpha beta");
+        app.plan_state_cache = Some(crate::core::plan_state::PlanState::create_plan(vec![
+            "Inspect the current behavior".to_string(),
+        ]));
+        render_for_selection(&mut app);
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let now = Instant::now();
+
+        assert!(app.begin_text_selection(column, row, now));
+        assert!(app.extend_text_selection(column + 4, row, now + Duration::from_millis(16)));
+        assert_eq!(
+            app.finish_text_selection(column + 4, row),
+            Some("alpha".to_string())
+        );
     }
 
     #[test]
@@ -3661,7 +3828,10 @@ mod tests {
 
         assert!(app.begin_text_selection(column, row, now));
         assert!(app.extend_text_selection(column + 3, row, now + Duration::from_millis(16)));
-        assert_eq!(app.finish_text_selection(column + 3, row), Some("done".to_string()));
+        assert_eq!(
+            app.finish_text_selection(column + 3, row),
+            Some("done".to_string())
+        );
     }
 
     #[test]
@@ -3673,7 +3843,9 @@ mod tests {
 
         assert!(app.begin_text_selection(column + 1, row, Instant::now()));
         assert_eq!(
-            app.text_selection.as_ref().map(|selection| selection.anchor.column),
+            app.text_selection
+                .as_ref()
+                .map(|selection| selection.anchor.column),
             Some(column)
         );
     }
@@ -3710,14 +3882,16 @@ mod tests {
         terminal
             .draw(|frame| app.render(frame))
             .expect("selection overlay should render");
-        assert!(terminal
-            .backend()
-            .buffer()
-            .cell((column, row))
-            .expect("selected cell should exist")
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((column, row))
+                .expect("selected cell should exist")
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -3803,7 +3977,8 @@ mod tests {
         let wrap_width = app.last_wrap_width();
         let total_rows = app.total_visual_rows(wrap_width);
         let scroll_y = app.resolved_scroll_y_for(total_rows, app.last_content_height);
-        let (start, _, _) = app.visible_output_window(wrap_width, scroll_y, app.last_content_height);
+        let (start, _, _) =
+            app.visible_output_window(wrap_width, scroll_y, app.last_content_height);
         let first_visible = app
             .collect_output_rows_range(start, 1)
             .into_iter()
@@ -4119,6 +4294,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
         app.agent_busy = true;
+        app.auto_approve_all = true;
         app.set_input_text("draft that must remain untouched");
         app.force_bottom();
         app.push_plain("line 1");
@@ -4166,6 +4342,7 @@ mod tests {
         assert!(rendered.contains("[y] Run once"));
         assert!(rendered.contains("[n/Esc] Stop"));
         assert!(rendered.contains("[a] Trust session"));
+        assert!(rendered.contains("[AUTO-APPROVE]"));
         assert!(!rendered.contains("Agent processing..."));
         assert!(!rendered.contains("draft that must remain untouched"));
         assert!(app.approval_accepts_input());
@@ -4484,13 +4661,102 @@ mod tests {
     }
 
     #[test]
+    fn test_status_notification_replaces_status_until_expiry() {
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.provider_name = "openai".to_string();
+        app.model_name = "gpt-4".to_string();
+        app.task_id = "task-1".to_string();
+        app.mode = "ACT".to_string();
+        app.yolo_mode = true;
+        app.show_notification(
+            "Model switched to openai/gpt-4",
+            NotificationKind::Success,
+        );
+        let expires_at = app
+            .status_notification
+            .as_ref()
+            .expect("notification should be active")
+            .expires_at;
+        let status_area = Rect::new(0, 0, 80, 1);
+
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("notification render should succeed");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Model switched to openai/gpt-4"));
+        assert!(rendered.contains("[YOLO] ACT"));
+
+        assert!(app.tick_notification(expires_at));
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("normal status render should succeed");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("Model switched"));
+        assert!(rendered.contains("openai / gpt-4"));
+    }
+
+    #[test]
+    fn test_render_status_bar_shows_approval_mode() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(48, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.provider_name = "openai".to_string();
+        app.model_name = "long-model-name".to_string();
+        app.task_id = "01KY7V7M0PVJYG0Y06WW8DGSRY".to_string();
+        app.mode = "ACT".to_string();
+
+        let status_area = ratatui::layout::Rect::new(0, 0, 48, 1);
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("standard render should succeed");
+        assert!(!app.cached_status_left.contains("YOLO"));
+        assert!(!app.cached_status_left.contains("AUTO-APPROVE"));
+
+        app.auto_approve_all = true;
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("auto-approve render should succeed");
+        assert!(app.cached_status_left.starts_with(" [AUTO-APPROVE] "));
+
+        app.yolo_mode = true;
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("yolo render should succeed");
+        assert!(app.cached_status_left.starts_with(" [YOLO] "));
+        assert!(!app.cached_status_left.contains("AUTO-APPROVE"));
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[YOLO]"));
+    }
+
+    #[test]
     fn test_clear_pastes_empties_paste_chunks() {
         let mut app = App::new();
         app.paste_chunks.push(PasteChunk {
             marker: "[pasted 10 chars]".to_string(),
             content: "0123456789".to_string(),
-            start_line: 0,
-            expanded: false,
         });
         assert_eq!(app.paste_chunks.len(), 1);
 
@@ -4504,23 +4770,18 @@ mod tests {
 
         // Simulate two separate pastes (same content, different markers)
         app.paste_chunks.push(PasteChunk {
-            marker: "\x00SNED_PASTE_0".to_string(),
+            marker: "⟦pasted 19 chars #1⟧".to_string(),
             content: "first paste content".to_string(),
-            start_line: 0,
-            expanded: false,
         });
         app.paste_chunks.push(PasteChunk {
-            marker: "\x00SNED_PASTE_1".to_string(),
+            marker: "⟦pasted 19 chars #2⟧".to_string(),
             content: "first paste content".to_string(),
-            start_line: 0,
-            expanded: false,
         });
 
-        // Simulate textarea with both markers (same content pasted twice)
         app.input = App::new_textarea(vec![
-            "\x00SNED_PASTE_0".to_string(),
+            "⟦pasted 19 chars #1⟧".to_string(),
             "some text".to_string(),
-            "\x00SNED_PASTE_1".to_string(),
+            "⟦pasted 19 chars #2⟧".to_string(),
         ]);
 
         let result = app.get_input_with_expanded_pastes();
@@ -4533,11 +4794,98 @@ mod tests {
             "paste_chunks should be drained after expansion"
         );
 
-        // Verify user-typed literal marker is NOT expanded when no paste chunk exists
         let mut app2 = App::new();
         app2.input = App::new_textarea(vec!["[pasted 500 chars]".to_string()]);
         let result2 = app2.get_input_with_expanded_pastes();
         assert_eq!(result2, "[pasted 500 chars]");
+    }
+
+    #[test]
+    fn test_handle_paste_uses_unique_visible_markers_and_expands() {
+        let mut app = App::new();
+        let char_count = app.paste_fold_threshold + 1;
+        let content = "🙂".repeat(char_count);
+
+        assert_eq!(
+            app.handle_paste(&content, true),
+            PasteOutcome::Folded { char_count }
+        );
+        let first_marker = app.input.lines().join("\n");
+        assert!(first_marker.contains(&format!("pasted {char_count} chars")));
+        assert!(!first_marker.contains('\0'));
+
+        app.input.insert_str("\n");
+        assert_eq!(
+            app.handle_paste(&content, true),
+            PasteOutcome::Folded { char_count }
+        );
+        let markers = app
+            .paste_chunks
+            .iter()
+            .map(|paste| paste.marker.as_str())
+            .collect::<Vec<_>>();
+        assert_ne!(markers[0], markers[1]);
+
+        assert_eq!(
+            app.get_input_with_expanded_pastes(),
+            format!("{content}\n{content}")
+        );
+    }
+
+    #[test]
+    fn test_handle_paste_rejects_input_over_limit() {
+        let mut app = App::new();
+        let content = "x".repeat(MAX_PASTED_INPUT_BYTES + 1);
+
+        assert_eq!(
+            app.handle_paste(&content, true),
+            PasteOutcome::RejectedTooLarge {
+                max_bytes: MAX_PASTED_INPUT_BYTES
+            }
+        );
+        assert_eq!(app.input.lines().join("\n"), "");
+        assert!(app.paste_chunks.is_empty());
+    }
+
+    #[test]
+    fn test_handle_paste_prunes_detached_payloads_before_enforcing_limit() {
+        let mut app = App::new();
+        let content = "x".repeat(MAX_PASTED_INPUT_BYTES);
+        assert!(matches!(
+            app.handle_paste(&content, true),
+            PasteOutcome::Folded { .. }
+        ));
+
+        app.set_input_text("");
+        assert_eq!(
+            app.handle_paste("replacement", true),
+            PasteOutcome::Inserted
+        );
+        assert!(app.paste_chunks.is_empty());
+        assert_eq!(app.input.lines().join("\n"), "replacement");
+    }
+
+    #[test]
+    fn test_handle_paste_limits_retained_folded_chunks() {
+        let mut app = App::new();
+        let mut markers = Vec::new();
+        for index in 0..MAX_FOLDED_PASTE_CHUNKS {
+            let marker = format!("⟦paste #{index}⟧");
+            markers.push(marker.clone());
+            app.paste_chunks.push(PasteChunk {
+                marker,
+                content: "x".repeat(app.paste_fold_threshold + 1),
+            });
+        }
+        app.set_input_text(&markers.join("\n"));
+        let content = "x".repeat(app.paste_fold_threshold + 1);
+
+        assert_eq!(
+            app.handle_paste(&content, true),
+            PasteOutcome::RejectedTooManyChunks {
+                max_chunks: MAX_FOLDED_PASTE_CHUNKS
+            }
+        );
     }
 
     #[test]
@@ -4622,6 +4970,45 @@ mod tests {
             .draw(|frame| app.render_status_bar(frame, status_area))
             .expect("auto-follow status bar should render");
         assert!(!app.cached_status_right.contains("new"));
+    }
+
+    #[test]
+    fn test_output_scrollbar_is_hidden_when_content_fits() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.push_plain("short output");
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("output should render");
+
+        let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert!(!rendered.contains('↑'));
+        assert!(!rendered.contains('↓'));
+    }
+
+    #[test]
+    fn test_scrollback_indicator_remains_visible_while_manually_scrolled() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        for index in 0..30 {
+            app.push_plain(format!("line {index}"));
+        }
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial output should render");
+        app.scroll_lines(-1);
+        app.scrollback_count = 42;
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("manual output should render");
+
+        let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert!(rendered.contains("42 lines of scrollback"));
     }
 
     #[test]

@@ -59,12 +59,6 @@ impl PlanModeRespondHandler {
             )
         })?;
 
-        if steps.len() < 2 {
-            return Err(ToolError::InvalidInput(
-                "Plan must have at least 2 steps. If you need more exploration, set needs_more_exploration=true instead of sending a partial plan.".to_string(),
-            ));
-        }
-
         // Create PlanState with the parsed steps
         let plan = crate::core::plan_state::PlanState::create_plan(steps);
 
@@ -208,13 +202,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plan_mode_respond_rejects_single_step() {
+    async fn test_plan_mode_respond_accepts_single_step() {
         let handler = PlanModeRespondHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(
             crate::core::agent_loop::TaskState::default(),
         ));
         let ctx = ToolContext::new(
-            state,
+            state.clone(),
             None,
             std::env::current_dir().unwrap(),
             crate::core::file_editor::AnchorStateManager::new(),
@@ -227,9 +221,11 @@ mod tests {
         let result = handler
             .execute(&ctx, serde_json::json!({"response": "1. only one step"}))
             .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("at least 2 steps"));
-        assert!(err.contains("needs_more_exploration=true"));
+        assert!(result.is_ok());
+
+        let state = state.lock().await;
+        let plan = state.plan_state.as_ref().expect("plan should be stored");
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].description, "only one step");
     }
 }

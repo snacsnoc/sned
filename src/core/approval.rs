@@ -1363,7 +1363,16 @@ pub fn format_denial_message(tool_name: &str) -> String {
 ///
 /// Returns a multi-line string with human-readable parameter formatting
 /// based on the tool type.
+#[cfg(test)]
 fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String {
+    format_tool_parameters_in_workspace(tool_name, params, None)
+}
+
+fn format_tool_parameters_in_workspace(
+    tool_name: &str,
+    params: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> String {
     let Some(obj) = params.as_object() else {
         return params.to_string();
     };
@@ -1390,10 +1399,37 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
         }
         "write_to_file" => {
             let mut output = String::new();
-            if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+            let path = obj.get("path").and_then(|v| v.as_str());
+            if let Some(path) = path {
                 output.push_str(&format!(" {path}"));
             }
             if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
+                let existing_path = workspace_root
+                    .zip(path)
+                    .and_then(|(root, path)| {
+                        crate::core::tools::resolve_sanitized_path(root, path).ok()
+                    })
+                    .filter(|resolved| resolved.is_file());
+                if let (Some(path), Some(existing_path)) = (path, existing_path)
+                    && let Ok(metadata) = std::fs::metadata(&existing_path)
+                {
+                    if metadata.len() <= MAX_WRITE_DIFF_SOURCE_BYTES
+                        && let Ok(existing_content) = std::fs::read_to_string(existing_path)
+                    {
+                        output.push_str(&format_write_overwrite_preview(
+                            path,
+                            &existing_content,
+                            content,
+                        ));
+                        return output;
+                    }
+                    if metadata.len() > MAX_WRITE_DIFF_SOURCE_BYTES {
+                        output.push_str(
+                            "\n    [overwriting existing file; current file is too large for a diff preview]\n",
+                        );
+                    }
+                }
+
                 let lines: Vec<&str> = content.lines().collect();
                 let total = lines.len();
                 let preview_lines = std::cmp::min(20, total);
@@ -1440,7 +1476,18 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
                 let total_edits: usize = file_edit_counts.values().sum();
                 let summary: Vec<String> = file_edit_counts
                     .iter()
-                    .map(|(f, c)| format!("{f} ({c})"))
+                    .map(|(f, c)| {
+                        let missing_target = workspace_root
+                            .and_then(|root| {
+                                crate::core::tools::resolve_sanitized_path(root, f).ok()
+                            })
+                            .is_some_and(|resolved| !resolved.exists());
+                        if missing_target {
+                            format!("{f} ({c}; missing target, use write_to_file)")
+                        } else {
+                            format!("{f} ({c})")
+                        }
+                    })
                     .collect();
                 let _ = write!(
                     output,
@@ -1511,6 +1558,103 @@ fn format_tool_parameters(tool_name: &str, params: &serde_json::Value) -> String
     }
 }
 
+const WRITE_DIFF_PREVIEW_MAX_LINES: usize = 60;
+const MAX_WRITE_DIFF_SOURCE_BYTES: u64 = 1024 * 1024;
+
+fn format_write_overwrite_preview(path: &str, old_content: &str, new_content: &str) -> String {
+    let old_lines = old_content.lines().count();
+    let new_lines = new_content.lines().count();
+    let diff = similar::TextDiff::from_lines(old_content, new_content)
+        .unified_diff()
+        .context_radius(3)
+        .header(path, path)
+        .to_string();
+    let diff_lines = diff.lines().collect::<Vec<_>>();
+    let language = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+
+    let mut output = format!(
+        "\n    [overwriting existing file: {old_lines} → {new_lines} lines]\n"
+    );
+    let selected_ranges = if diff_lines.len() <= WRITE_DIFF_PREVIEW_MAX_LINES {
+        vec![(0, diff_lines.len())]
+    } else {
+        let first_end = WRITE_DIFF_PREVIEW_MAX_LINES / 2;
+        let second_len = WRITE_DIFF_PREVIEW_MAX_LINES - first_end - 1;
+        let first_addition = diff_lines
+            .iter()
+            .enumerate()
+            .skip(first_end)
+            .find_map(|(index, line)| {
+                (line.starts_with('+') && !line.starts_with("+++")).then_some(index)
+            })
+            .unwrap_or_else(|| diff_lines.len().saturating_sub(second_len));
+        let second_start = first_addition.max(first_end);
+        vec![
+            (0, first_end),
+            (
+                second_start,
+                second_start.saturating_add(second_len).min(diff_lines.len()),
+            ),
+        ]
+    };
+
+    let mut rendered_count = 0usize;
+    for (range_index, (start, end)) in selected_ranges.into_iter().enumerate() {
+        if range_index > 0 && start > rendered_count {
+            output.push_str(&format!(
+                "    … ({} diff lines omitted)\n",
+                start - rendered_count
+            ));
+        }
+        for line in &diff_lines[start..end] {
+            output.push_str("    ");
+            output.push_str(&format_write_diff_line(line, language));
+            output.push('\n');
+        }
+        rendered_count = end;
+    }
+    if rendered_count < diff_lines.len() {
+        output.push_str(&format!(
+            "    … ({} more diff lines)\n",
+            diff_lines.len() - rendered_count
+        ));
+    }
+    output
+}
+
+fn format_write_diff_line(line: &str, language: &str) -> String {
+    if let Some(content) = line.strip_prefix('+') {
+        if line.starts_with("+++") {
+            return line.to_string();
+        }
+        let highlighted = highlight_write_diff_content(content, language);
+        return crate::cli::colors::diff_addition(&highlighted);
+    }
+    if let Some(content) = line.strip_prefix('-') {
+        if line.starts_with("---") {
+            return line.to_string();
+        }
+        let highlighted = highlight_write_diff_content(content, language);
+        return crate::cli::colors::diff_removal(&highlighted);
+    }
+    if let Some(content) = line.strip_prefix(' ') {
+        let highlighted = highlight_write_diff_content(content, language);
+        return crate::cli::colors::diff_context(&highlighted);
+    }
+    line.to_string()
+}
+
+fn highlight_write_diff_content(content: &str, language: &str) -> String {
+    if crate::cli::colors::stdout_colors_disabled() {
+        content.to_string()
+    } else {
+        crate::cli::syntax_highlight::highlight_code(content, language)
+    }
+}
+
 /// Tying slot release to stack lifetime prevents error and timeout paths from
 /// deadlocking every later approval request.
 struct ApprovalPromptGuard;
@@ -1555,18 +1699,47 @@ fn begin_approval_prompt(
 fn receive_approval_response(
     receiver: &std::sync::mpsc::Receiver<ApprovalResponse>,
 ) -> io::Result<ApprovalResult> {
-    match receiver.recv_timeout(std::time::Duration::from_secs(300)) {
+    #[cfg(test)]
+    let timeout = {
+        let millis = APPROVAL_TIMEOUT_OVERRIDE_MILLIS.load(Ordering::SeqCst);
+        if millis > 0 {
+            std::time::Duration::from_millis(millis)
+        } else {
+            std::time::Duration::from_secs(300)
+        }
+    };
+    #[cfg(not(test))]
+    let timeout = std::time::Duration::from_secs(300);
+
+    match receiver.recv_timeout(timeout) {
         Ok(ApprovalResponse::Decision(result)) => Ok(result),
         Ok(ApprovalResponse::Unavailable(reason)) => {
             Err(io::Error::other(format!("approval unavailable: {reason}")))
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(io::Error::other("approval prompt timed out (5 minutes)"))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::other("approval channel closed"))
+        Err(error) => Err(approval_response_error(error)),
+    }
+}
+
+fn approval_response_error(error: std::sync::mpsc::RecvTimeoutError) -> io::Error {
+    match error {
+        std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::new(
+            io::ErrorKind::TimedOut,
+            "You didn't respond within 5 minutes, so the action was not approved.",
+        ),
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            io::Error::other("approval channel closed")
         }
     }
+}
+
+pub(crate) fn format_approval_error(tool_name: Option<&str>, error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::TimedOut {
+        return error.to_string();
+    }
+    tool_name.map_or_else(
+        || format!("Approval error: {error}"),
+        |tool_name| format!("Approval error for tool '{tool_name}': {error}"),
+    )
 }
 
 /// Prompt the user for approval of a tool execution.
@@ -1576,14 +1749,26 @@ pub fn prompt_for_approval(
     params: &serde_json::Value,
     output_writer: &OutputWriterArc,
 ) -> io::Result<ApprovalResult> {
+    prompt_for_approval_in_workspace(tool_name, params, output_writer, None)
+}
+
+fn prompt_for_approval_in_workspace(
+    tool_name: &str,
+    params: &serde_json::Value,
+    output_writer: &OutputWriterArc,
+    workspace_root: Option<&Path>,
+) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
-    // SECURITY (F-01): Non-interactive stdin DENIES by default to prevent
-    // piped input attacks. Require explicit --yolo or --auto-approve-all flag.
-    if std::env::var("SNED_APPROVAL_DENY").is_ok() || !stdin.is_terminal() {
+    #[cfg(test)]
+    let input_available =
+        stdin.is_terminal() || APPROVAL_INPUT_AVAILABLE_OVERRIDE.load(Ordering::SeqCst);
+    #[cfg(not(test))]
+    let input_available = stdin.is_terminal();
+    if std::env::var("SNED_APPROVAL_DENY").is_ok() || !input_available {
         return Ok(ApprovalResult::Denied);
     }
 
-    let params_str = format_tool_parameters(tool_name, params);
+    let params_str = format_tool_parameters_in_workspace(tool_name, params, workspace_root);
 
     let details = build_tool_approval_prompt(
         &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
@@ -1612,6 +1797,51 @@ pub fn prompt_for_approval(
 static APPROVAL_SLOT_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 static NEXT_APPROVAL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+static APPROVAL_TIMEOUT_OVERRIDE_MILLIS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static APPROVAL_INPUT_AVAILABLE_OVERRIDE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) struct ApprovalTimeoutOverride {
+    previous_millis: u64,
+}
+
+#[cfg(test)]
+impl Drop for ApprovalTimeoutOverride {
+    fn drop(&mut self) {
+        APPROVAL_TIMEOUT_OVERRIDE_MILLIS.store(self.previous_millis, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn override_approval_timeout_for_test(
+    timeout: std::time::Duration,
+) -> ApprovalTimeoutOverride {
+    let millis = timeout.as_millis().max(1).min(u64::MAX as u128) as u64;
+    let previous_millis = APPROVAL_TIMEOUT_OVERRIDE_MILLIS.swap(millis, Ordering::SeqCst);
+    ApprovalTimeoutOverride { previous_millis }
+}
+
+#[cfg(test)]
+pub(crate) struct ApprovalInputOverride {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for ApprovalInputOverride {
+    fn drop(&mut self) {
+        APPROVAL_INPUT_AVAILABLE_OVERRIDE.store(self.previous, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn override_approval_input_for_test() -> ApprovalInputOverride {
+    let previous = APPROVAL_INPUT_AVAILABLE_OVERRIDE.swap(true, Ordering::SeqCst);
+    ApprovalInputOverride { previous }
+}
 
 /// Flag indicating if a followup prompt was just emitted and needs a forced scroll.
 /// This covers tool-driven prompts like ask_followup_question and slash-command confirmations.
@@ -1712,11 +1942,25 @@ pub async fn prompt_for_approval_async(
     params: &serde_json::Value,
     output_writer: OutputWriterArc,
 ) -> io::Result<ApprovalResult> {
+    prompt_for_approval_async_in_workspace(tool_name, params, output_writer, None).await
+}
+
+pub async fn prompt_for_approval_async_in_workspace(
+    tool_name: &str,
+    params: &serde_json::Value,
+    output_writer: OutputWriterArc,
+    workspace_root: Option<std::path::PathBuf>,
+) -> io::Result<ApprovalResult> {
     let tool_name = tool_name.to_string();
     let params_owned = params.clone();
 
     tokio::task::spawn_blocking(move || {
-        prompt_for_approval(&tool_name, &params_owned, &output_writer)
+        prompt_for_approval_in_workspace(
+            &tool_name,
+            &params_owned,
+            &output_writer,
+            workspace_root.as_deref(),
+        )
     })
     .await
     .map_err(|e| io::Error::other(format!("spawn_blocking failed: {e}")))?
@@ -2228,6 +2472,31 @@ mod tests {
         assert_eq!(ApprovalResult::Approved, ApprovalResult::Approved);
         assert_ne!(ApprovalResult::Approved, ApprovalResult::Denied);
         assert_ne!(ApprovalResult::Denied, ApprovalResult::Always);
+    }
+
+    #[test]
+    fn test_approval_timeout_explains_that_the_user_did_not_respond() {
+        let error = approval_response_error(std::sync::mpsc::RecvTimeoutError::Timeout);
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            format_approval_error(Some("edit_file"), &error),
+            "You didn't respond within 5 minutes, so the action was not approved."
+        );
+    }
+
+    #[test]
+    fn test_non_timeout_approval_error_keeps_tool_context() {
+        let error = io::Error::other("approval channel closed");
+
+        assert_eq!(
+            format_approval_error(Some("execute_command"), &error),
+            "Approval error for tool 'execute_command': approval channel closed"
+        );
+        assert_eq!(
+            format_approval_error(None, &error),
+            "Approval error: approval channel closed"
+        );
     }
 
     #[test]
@@ -2770,6 +3039,73 @@ mod tests {
     }
 
     #[test]
+    fn test_write_to_file_existing_path_shows_bounded_diff() {
+        let temp = tempfile::TempDir::new().expect("temp directory should be created");
+        let path = temp.path().join("example.rs");
+        let old_content = (0..80)
+            .map(|index| format!("let old_{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_content = (0..80)
+            .map(|index| format!("let new_{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &old_content).expect("existing file should be written");
+        let params = serde_json::json!({
+            "path": "example.rs",
+            "content": new_content,
+        });
+
+        let formatted =
+            format_tool_parameters_in_workspace("write_to_file", &params, Some(temp.path()));
+
+        assert!(formatted.contains("overwriting existing file"));
+        assert!(formatted.contains("- let old_0 = 0;"));
+        assert!(formatted.contains("+ let new_0 = 0;"));
+        assert!(formatted.contains("more diff lines"));
+        assert!(!formatted.contains("│ let new_0"));
+    }
+
+    #[test]
+    fn test_write_to_file_preview_does_not_read_outside_workspace() {
+        let temp = tempfile::TempDir::new().expect("temp directory should be created");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace should be created");
+        std::fs::write(temp.path().join("secret.txt"), "outside secret")
+            .expect("external file should be written");
+        let params = serde_json::json!({
+            "path": "../secret.txt",
+            "content": "replacement",
+        });
+
+        let formatted =
+            format_tool_parameters_in_workspace("write_to_file", &params, Some(&workspace));
+
+        assert!(!formatted.contains("outside secret"));
+        assert!(!formatted.contains("overwriting existing file"));
+        assert!(formatted.contains("1 │ replacement"));
+    }
+
+    #[test]
+    fn test_write_to_file_large_existing_path_skips_unbounded_diff() {
+        let temp = tempfile::TempDir::new().expect("temp directory should be created");
+        let path = temp.path().join("large.txt");
+        let file = std::fs::File::create(&path).expect("large file should be created");
+        file.set_len(MAX_WRITE_DIFF_SOURCE_BYTES + 1)
+            .expect("large file should be extended");
+        let params = serde_json::json!({
+            "path": "large.txt",
+            "content": "replacement",
+        });
+
+        let formatted =
+            format_tool_parameters_in_workspace("write_to_file", &params, Some(temp.path()));
+
+        assert!(formatted.contains("too large for a diff preview"));
+        assert!(formatted.contains("1 │ replacement"));
+    }
+
+    #[test]
     fn test_format_tool_parameters_read_file() {
         let params = serde_json::json!({
             "paths": ["src/main.rs", "src/lib.rs"],
@@ -2865,6 +3201,22 @@ mod tests {
 
         assert!(format_tool_parameters("edit_file", &top_level_params).contains("main.rs (1)"));
         assert!(format_tool_parameters("edit_file", &per_edit_params).contains("lib.rs (1)"));
+    }
+
+    #[test]
+    fn test_edit_file_approval_identifies_missing_creation_target() {
+        let temp = tempfile::TempDir::new().expect("temp directory should be created");
+        let params = serde_json::json!({
+            "files": [{
+                "path": "new.rs",
+                "edits": [{"anchor": "Main§fn main() {}", "text": "fn main() {}"}]
+            }]
+        });
+
+        let formatted =
+            format_tool_parameters_in_workspace("edit_file", &params, Some(temp.path()));
+
+        assert!(formatted.contains("new.rs (1; missing target, use write_to_file)"));
     }
 
     #[test]
