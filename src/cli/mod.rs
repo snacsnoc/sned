@@ -1178,33 +1178,31 @@ pub(crate) fn create_provider(
             let gemini_model_info =
                 crate::providers::gemini::get_gemini_model_info(&default_model);
             // Reject flags that the selected Gemini generation cannot honour.
-            if task_opts.thinking.is_some() {
-                if gemini_model_info
+            if task_opts.thinking.is_some()
+                && gemini_model_info
                     .thinking_config
                     .as_ref()
                     .and_then(|tc| tc.max_budget)
                     .is_none()
-                {
-                    anyhow::bail!(
-                        "--thinking is not supported by Gemini model '{}'. \
-                         This model uses --reasoning-effort (thinking level), not a token budget.",
-                        default_model
-                    );
-                }
+            {
+                anyhow::bail!(
+                    "--thinking is not supported by Gemini model '{}'. \
+                     This model uses --reasoning-effort (thinking level), not a token budget.",
+                    default_model
+                );
             }
-            if task_opts.reasoning_effort.is_some() {
-                if !gemini_model_info
+            if task_opts.reasoning_effort.is_some()
+                && !gemini_model_info
                     .thinking_config
                     .as_ref()
                     .and_then(|tc| tc.supports_thinking_level)
                     .unwrap_or(false)
-                {
-                    anyhow::bail!(
-                        "--reasoning-effort is not supported by Gemini model '{}'. \
-                         This model uses --thinking (token budget), not a thinking level.",
-                        default_model
-                    );
-                }
+            {
+                anyhow::bail!(
+                    "--reasoning-effort is not supported by Gemini model '{}'. \
+                     This model uses --thinking (token budget), not a thinking level.",
+                    default_model
+                );
             }
             Arc::new(crate::providers::Providers::Gemini(
                 crate::providers::gemini::GeminiProvider::new(

@@ -191,31 +191,31 @@ impl GeminiProvider {
             (None, None) => {}
             // --reasoning-effort set (Gemini 3.x path): send thinkingLevel
             (None, Some(effort)) => {
-                if let Some(thinking_config) = info.and_then(|i| i.thinking_config.as_ref()) {
-                    if thinking_config.supports_thinking_level.unwrap_or(false) {
-                        let level = map_reasoning_effort_to_thinking_level(effort);
-                        generation_config["thinkingConfig"] = json!({
-                            "thinkingLevel": level.as_str(),
-                            "includeThoughts": true,
-                        });
-                    }
+                if let Some(thinking_config) = info.and_then(|i| i.thinking_config.as_ref())
+                    && thinking_config.supports_thinking_level.unwrap_or(false)
+                {
+                    let level = map_reasoning_effort_to_thinking_level(effort);
+                    generation_config["thinkingConfig"] = json!({
+                        "thinkingLevel": level.as_str(),
+                        "includeThoughts": true,
+                    });
                 }
             }
             // --thinking set (Gemini 2.5 path): send thinkingBudget
             (Some(budget), None) => {
-                if let Some(thinking_config) = info.and_then(|i| i.thinking_config.as_ref()) {
-                    if thinking_config.max_budget.unwrap_or(0) > 0 {
-                        let budget_val: i32 = if budget == 0 {
-                            // --thinking 0: explicitly disable
-                            0
-                        } else {
-                            budget.min(thinking_config.max_budget.unwrap_or(24576)) as i32
-                        };
-                        generation_config["thinkingConfig"] = json!({
-                            "thinkingBudget": budget_val,
-                            "includeThoughts": budget_val != 0,
-                        });
-                    }
+                if let Some(thinking_config) = info.and_then(|i| i.thinking_config.as_ref())
+                    && thinking_config.max_budget.unwrap_or(0) > 0
+                {
+                    let budget_val: i32 = if budget == 0 {
+                        // --thinking 0: explicitly disable
+                        0
+                    } else {
+                        budget.min(thinking_config.max_budget.unwrap_or(24576)) as i32
+                    };
+                    generation_config["thinkingConfig"] = json!({
+                        "thinkingBudget": budget_val,
+                        "includeThoughts": budget_val != 0,
+                    });
                 }
             }
             // Both set — guarded by clap conflicts_with, but handle gracefully
@@ -568,13 +568,13 @@ fn process_gemini_sse_line(
         }
 
         // Track finish reason
-        if let Some(finish) = candidate.finish_reason {
-            if !*response_blocked {
-                *last_stop_reason = Some(finish.clone());
-                if let Some(error) = gemini_candidate_block_error(&finish) {
-                    try_send_chunk(tx, ApiStreamChunk::Error(error), "blocked_response");
-                    *response_blocked = true;
-                }
+        if let Some(finish) = candidate.finish_reason
+            && !*response_blocked
+        {
+            *last_stop_reason = Some(finish.clone());
+            if let Some(error) = gemini_candidate_block_error(&finish) {
+                try_send_chunk(tx, ApiStreamChunk::Error(error), "blocked_response");
+                *response_blocked = true;
             }
         }
 
