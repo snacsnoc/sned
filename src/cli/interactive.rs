@@ -121,16 +121,6 @@ fn build_user_message_content(
     }
 }
 
-fn strip_active_slash_command(text: &str) -> Option<String> {
-    let query = crate::cli::slash_commands::extract_slash_query(text)?;
-    let start = text.rfind(&format!("/{query}"))?;
-    Some(format!(
-        "{}{}",
-        &text[..start],
-        &text[start + query.len() + 1..]
-    ))
-}
-
 fn provider_credential_key(provider: &str) -> String {
     crate::cli::runtime_provider_secret_key(provider)
         .unwrap_or(provider)
@@ -654,6 +644,7 @@ fn clear_mention_search(app: &mut App, clear_results: bool) {
         app.picker_active = false;
         app.picker_results.clear();
         app.picker_index = 0;
+        app.picker_selection_explicit = false;
     }
 }
 
@@ -1207,12 +1198,14 @@ async fn refresh_input_completions(
         if !app.mention_search_active {
             app.mention_search_active = true;
             app.picker_active = true;
+            app.picker_selection_explicit = false;
             app.mention_search_query = query.clone();
             invalidate_mention_search(app);
             schedule_immediate_mention_search(app, query);
         } else if query != app.mention_search_query {
             app.mention_search_query = query;
             app.picker_active = true;
+            app.picker_selection_explicit = false;
             invalidate_mention_search(app);
             app.mention_search_deadline =
                 std::time::Instant::now() + std::time::Duration::from_millis(150);
@@ -1591,8 +1584,9 @@ async fn handle_key_event(
                 return Ok(None);
             }
             KeyCode::Esc => {
+                let text = app.input.lines().join("\n");
                 close_slash_command_mode(app);
-                app.set_input_text("");
+                app.slash_command_completed_text = Some(text);
                 return Ok(None);
             }
             _ => {}
@@ -1616,29 +1610,35 @@ async fn handle_key_event(
         return Ok(Some(Action::ModelSwitch(request)));
     }
 
-    // Tab or Enter with active file picker -> insert selection (must come before Enter handler)
-    if app.picker_active
-        && !app.picker_results.is_empty()
-        && (key.code == KeyCode::Tab || key.code == KeyCode::Enter)
-    {
+    if app.picker_active && !app.picker_results.is_empty() {
         let text = app.input.lines().join("\n");
         let cursor = textarea_cursor_byte_offset(app.input.lines(), app.input.cursor());
         let mq = crate::core::file_search::extract_mention_query_at_cursor(&text, cursor);
         if mq.in_mention_mode {
-            let result = &app.picker_results[app.picker_index];
-            let (new_text, cursor_pos) = crate::core::file_search::insert_mention(
-                &text,
-                mq.at_index as usize,
-                &result.path,
-                result.file_type,
-            );
-            app.set_input_text_and_cursor(&new_text, cursor_pos);
+            if key.code == KeyCode::Tab
+                || (key.code == KeyCode::Enter
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && app.picker_selection_explicit)
+            {
+                let result = &app.picker_results[app.picker_index];
+                let (new_text, cursor_pos) = crate::core::file_search::insert_mention(
+                    &text,
+                    mq.at_index as usize,
+                    &result.path,
+                    result.file_type,
+                );
+                app.set_input_text_and_cursor(&new_text, cursor_pos);
+                clear_mention_search(app, true);
+                return Ok(None);
+            }
+            if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+                return Ok(None);
+            }
+        } else if key.code == KeyCode::Tab
+            || (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT))
+        {
             clear_mention_search(app, true);
-            return Ok(None);
         }
-        // Picker active but mention mode lost — dismiss picker and fall through
-        clear_mention_search(app, true);
-        // Fall through to normal Enter/Tab handling
     }
 
     // Slash command mode - Tab/Enter accept the current entry into the input box.
@@ -1768,8 +1768,8 @@ async fn handle_key_event(
         return Ok(None);
     }
 
-    if key.code == KeyCode::Char('y')
-        && key.modifiers.is_empty()
+    if matches!(key.code, KeyCode::Char('y' | 'Y'))
+        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
         && app.input.lines().join("\n").is_empty()
         && !app.has_pending_approval()
         && !app.picker_active
@@ -1844,10 +1844,12 @@ async fn handle_key_event(
     if app.picker_active && !app.picker_results.is_empty() {
         if key.code == KeyCode::Up {
             app.picker_index = app.picker_index.saturating_sub(1);
+            app.picker_selection_explicit = true;
             return Ok(None);
         }
         if key.code == KeyCode::Down {
             app.picker_index = (app.picker_index + 1).min(app.picker_results.len() - 1);
+            app.picker_selection_explicit = true;
             return Ok(None);
         }
     }
@@ -1881,11 +1883,9 @@ async fn handle_key_event(
 
     // Escape key - dismiss slash command picker
     if key.code == KeyCode::Esc && app.slash_command_active {
-        close_slash_command_mode(app);
         let text = app.input.lines().join("\n");
-        if let Some(new_text) = strip_active_slash_command(&text) {
-            app.set_input_text(&new_text);
-        }
+        close_slash_command_mode(app);
+        app.slash_command_completed_text = Some(text);
         return Ok(None);
     }
 
@@ -3161,6 +3161,7 @@ async fn run_main_loop(
                 app.picker_active = true;
                 app.picker_results = update.results;
                 app.picker_index = 0;
+                app.picker_selection_explicit = false;
                 app.needs_redraw = true;
             }
         }
@@ -5355,12 +5356,6 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_active_slash_command_only_accepts_input_start() {
-        assert_eq!(strip_active_slash_command("/baz").as_deref(), Some(""));
-        assert!(strip_active_slash_command("foo/bar /baz").is_none());
-    }
-
-    #[test]
     fn test_approval_result_for_key_only_accepts_prompt_shortcuts() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -5534,6 +5529,25 @@ mod tests {
         app
     }
 
+    fn file_picker_test_app() -> App {
+        let mut app = App::new();
+        app.set_input_text_and_cursor("@", 1);
+        app.picker_active = true;
+        app.picker_results = vec![
+            crate::core::file_search::FileSearchResult {
+                path: "src/main.rs".to_string(),
+                file_type: crate::core::file_search::FileType::File,
+                label: "main.rs".to_string(),
+            },
+            crate::core::file_search::FileSearchResult {
+                path: "src/lib.rs".to_string(),
+                file_type: crate::core::file_search::FileType::File,
+                label: "lib.rs".to_string(),
+            },
+        ];
+        app
+    }
+
     #[tokio::test]
     async fn test_help_overlay_filters_and_inserts_without_submitting() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -5577,7 +5591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_help_overlay_escape_closes_and_clears_query() -> anyhow::Result<()> {
+    async fn test_help_overlay_escape_keeps_query() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (tx, _rx) = mpsc::channel(4);
@@ -5598,7 +5612,105 @@ mod tests {
         .await?;
         assert!(action.is_none());
         assert!(!app.slash_command_help_active);
-        assert!(app.input.lines().join("\n").is_empty());
+        assert_eq!(app.input.lines().join("\n"), "plan");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slash_picker_escape_keeps_command_text() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = slash_completion_test_app();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(!app.slash_command_active);
+        assert_eq!(app.input.lines().join("\n"), "/pl");
+        assert_eq!(app.slash_command_completed_text.as_deref(), Some("/pl"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_picker_enter_requires_explicit_navigation() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = file_picker_test_app();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.picker_active);
+        assert_eq!(app.input.lines().join("\n"), "@");
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "@/src/main.rs ");
+        assert!(!app.picker_active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_picker_enter_accepts_explicit_navigation() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = file_picker_test_app();
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(app.picker_selection_explicit);
+        assert_eq!(app.picker_index, 1);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert_eq!(app.input.lines().join("\n"), "@/src/lib.rs ");
+        assert!(!app.picker_active);
         Ok(())
     }
 
@@ -6066,6 +6178,36 @@ mod tests {
 
         let action = handle_key_event(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
+        assert!(matches!(action, Some(Action::PlanApprove)));
+        assert!(app.input.lines().join("\n").is_empty());
+        reset_prompt_state();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_uppercase_y_approves_pending_plan_with_empty_input()
+    -> anyhow::Result<()> {
+        use crate::core::plan_state::PlanState;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let plan = PlanState::create_plan(vec!["First step".to_string()]);
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
             &mut app,
             &output_writer,
             &state_handle,

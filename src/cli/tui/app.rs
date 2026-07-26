@@ -444,6 +444,7 @@ pub struct App {
     pub picker_results: Vec<FileSearchResult>,
     /// Selected index in picker results
     pub picker_index: usize,
+    pub picker_selection_explicit: bool,
     /// File-backed command history with navigation state
     pub history: FileHistory,
     /// Folded paste chunks (marker -> original content)
@@ -865,6 +866,7 @@ impl App {
             picker_active: false,
             picker_results: Vec::new(),
             picker_index: 0,
+            picker_selection_explicit: false,
             history: FileHistory::load(),
             paste_chunks: Vec::new(),
             paste_fold_threshold: 500, // Fold pastes > 500 chars
