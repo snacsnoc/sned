@@ -7,7 +7,6 @@ const SLASH_COMMAND_REGEX: &str = r"(^|\s)\/([a-zA-Z0-9_.:@?-]+)";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlashCommandId {
     Compact,
-    NewRule,
     Exit,
     Clear,
     Copy,
@@ -111,17 +110,6 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         detail: "Condenses the active model context while preserving the information needed to continue the task.",
         category: SlashCommandCategory::Agent,
         requires_args: false,
-        requirement: CommandRequirement::Always,
-    },
-    SlashCommandSpec {
-        id: SlashCommandId::NewRule,
-        name: "newrule",
-        aliases: &["nr"],
-        description: "Draft a rule from the current conversation",
-        usage: "/newrule <rule request>",
-        detail: "Asks the model to turn the current conversation into a concise project rule.",
-        category: SlashCommandCategory::Agent,
-        requires_args: true,
         requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
@@ -470,7 +458,6 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Compact,
-    NewRule,
     SkillCommand { name: String },
 }
 
@@ -480,7 +467,6 @@ impl SlashCommand {
         let spec = command_spec_for_name(s)?;
         match spec.id {
             SlashCommandId::Compact => Some(Self::Compact),
-            SlashCommandId::NewRule => Some(Self::NewRule),
             _ => None,
         }
     }
@@ -520,7 +506,6 @@ impl SlashCommand {
     pub fn instruction_block(&self) -> &'static str {
         match self {
             Self::Compact => CONDENSE_INSTRUCTION,
-            Self::NewRule => NEW_RULE_INSTRUCTION,
             Self::SkillCommand { .. } => "",
         }
     }
@@ -836,7 +821,7 @@ fn match_static_command(input: &str) -> Option<StaticCommandMatch<'_>> {
 fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCommand> {
     let args = matched.args;
     match matched.spec.id {
-        SlashCommandId::Compact | SlashCommandId::NewRule => None,
+        SlashCommandId::Compact => None,
         SlashCommandId::Exit => {
             if matched.matched_name.eq_ignore_ascii_case("exit") {
                 Some(CliOnlyCommand::Exit)
@@ -1634,20 +1619,6 @@ Below is the user's input when they indicated that they wanted to compact their 
 </explicit_instructions>
 "#;
 
-const NEW_RULE_INSTRUCTION: &str = r#"<explicit_instructions type="new_rule">
-The user has explicitly asked you to help them create a new project rule file inside the .agents directory based on the conversation up to this point in time. The user may have provided instructions or additional information for you to consider when creating the new rule.
-When creating a new project rule file, you should NOT overwrite or alter an existing rule file. To create the new rule file you MUST use the new_rule tool. The new_rule tool can be used in either of the PLAN or ACT modes.
-
-The new_rule tool is defined below:
-
-Description:
-Your task is to create a new project rule file which includes guidelines on how to approach developing code in tandem with the user, which can be either project specific or cover more global rules. This includes but is not limited to: desired conversational style, favorite project dependencies, coding styles, naming conventions, architectural choices, ui/ux preferences, etc.
-The project rule file must be formatted as markdown and be a '.md' file. The name of the file you generate must be as succinct as possible and be encompassing the main overarching concept of the rules you added to the file (e.g., 'memory-bank.md' or 'project-overview.md').
-
-Below is the user's input when they indicated that they wanted to create a new project rule file.
-</explicit_instructions>
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1747,12 +1718,6 @@ mod tests {
         assert!(!result.contains("auto_accept"));
         assert!(!result.contains("preview of your generated summary"));
         assert!(result.contains("now"));
-    }
-
-    #[test]
-    fn test_process_newrule_command() {
-        let result = process_slash_command("/newrule");
-        assert!(result.contains("<explicit_instructions type=\"new_rule\">"));
     }
 
     #[test]
@@ -1889,16 +1854,20 @@ mod tests {
     #[test]
     fn test_removed_commands_are_not_available() {
         assert!(SlashCommand::parse("explain-changes").is_none());
+        assert!(SlashCommand::parse("newrule").is_none());
+        assert!(SlashCommand::parse("nr").is_none());
         assert!(SlashCommand::parse("newtask").is_none());
         assert!(get_cli_only_command("/expand 1").is_none());
         assert!(get_cli_only_command("/models").is_none());
+        assert!(get_cli_only_command("/newrule").is_none());
+        assert!(get_cli_only_command("/nr").is_none());
         assert!(SlashCommand::parse_with_skills("some-workflow", &[]).is_none());
 
         let entries = build_slash_command_entries(&[]);
         assert!(entries.iter().all(|entry| {
             !matches!(
                 entry.name.as_str(),
-                "explain-changes" | "expand" | "models" | "newtask"
+                "explain-changes" | "expand" | "models" | "newrule" | "newtask"
             )
         }));
     }
@@ -1909,7 +1878,7 @@ mod tests {
             for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
                 let invocation = format!("/{name}");
                 let parsed = match spec.id {
-                    SlashCommandId::Compact | SlashCommandId::NewRule => {
+                    SlashCommandId::Compact => {
                         SlashCommand::parse(name).is_some()
                     }
                     _ => get_cli_only_command(&invocation).is_some(),
