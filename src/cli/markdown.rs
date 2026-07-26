@@ -110,8 +110,8 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
     let mut style_stack: Vec<Style> = vec![Style::default()];
     // Are we currently inside a fenced code block?
     let mut in_code_block = false;
-    // Are we currently inside a table?
-    let mut in_table = false;
+    let mut table_row_open = false;
+    let mut table_cell_count = 0usize;
     // Pending list-item prefix to emit at the start of the next text run.
     let mut pending_list_prefix: Option<String> = None;
 
@@ -230,8 +230,15 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                     *is_first_line = false;
                     pending_list_prefix = Some("• ".to_string());
                 }
-                Tag::Table(_) => {
-                    in_table = true;
+                Tag::TableHead | Tag::TableRow => {
+                    table_row_open = true;
+                    table_cell_count = 0;
+                }
+                Tag::TableCell => {
+                    if table_cell_count > 0 {
+                        current_spans.push(Span::raw(" │ "));
+                    }
+                    table_cell_count += 1;
                 }
                 Tag::BlockQuote => {
                     pending_list_prefix = Some("│ ".to_string());
@@ -271,11 +278,34 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                         Style::default().add_modifier(Modifier::DIM),
                     )));
                 }
-                TagEnd::Item | TagEnd::BlockQuote => {
+                TagEnd::Item => {
+                    if !current_text.is_empty() || !current_spans.is_empty() {
+                        flush_line(
+                            &mut out,
+                            &mut current_text,
+                            &mut current_spans,
+                            *is_first_line,
+                            prefix,
+                        );
+                        *is_first_line = false;
+                    }
                     pending_list_prefix = None;
                 }
-                TagEnd::Table => {
-                    in_table = false;
+                TagEnd::BlockQuote => {
+                    pending_list_prefix = None;
+                }
+                TagEnd::TableHead | TagEnd::TableRow => {
+                    if table_row_open {
+                        flush_line(
+                            &mut out,
+                            &mut current_text,
+                            &mut current_spans,
+                            *is_first_line,
+                            prefix,
+                        );
+                        *is_first_line = false;
+                        table_row_open = false;
+                    }
                 }
                 _ => {}
             },
@@ -297,21 +327,6 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                         let style = Style::default().add_modifier(Modifier::DIM);
                         current_spans.push(Span::styled("│   ", style));
                         current_spans.push(Span::styled(line.to_string(), style));
-                    }
-                } else if in_table {
-                    // Strip pipe characters and alignment row markers.
-                    let cleaned = piece.replace('|', "  ").trim().to_string();
-                    // Skip separator rows like "--- | --- | ---"
-                    if cleaned.chars().all(|c| c == '-' || c.is_whitespace())
-                        && cleaned.contains('-')
-                    {
-                        continue;
-                    }
-                    if !cleaned.is_empty() {
-                        if let Some(p) = pending_list_prefix.take() {
-                            current_spans.push(Span::raw(p));
-                        }
-                        current_spans.push(Span::raw(cleaned));
                     }
                 } else {
                     if let Some(p) = pending_list_prefix.take() {
@@ -480,25 +495,40 @@ mod tests {
     }
 
     #[test]
-    fn markdown_table_renders_as_readable_rows_without_pipes() {
+    fn markdown_table_renders_as_separate_rows_with_cell_separators() {
         let md = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
         let lines = render_completion_markdown("🚀 ", md);
-        let text = collect_text(&lines);
-        assert!(text.contains("a"), "got: {}", text);
-        assert!(text.contains("b"), "got: {}", text);
-        assert!(text.contains("1"), "got: {}", text);
-        assert!(text.contains("3"), "got: {}", text);
-        // Pipes should be stripped (replaced with two spaces, then trimmed).
-        assert!(
-            !text.contains('|'),
-            "expected no pipe characters, got: {}",
-            text
-        );
-        // Separator row should be dropped.
-        assert!(
-            !text.contains("---"),
-            "expected separator row to be dropped, got: {}",
-            text
+        let rows = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["🚀 a │ b", "1 │ 2", "3 │ 4"]);
+    }
+
+    #[test]
+    fn markdown_table_preserves_whitespace_around_inline_code() {
+        let md = "| Feature | Why |\n|---|---|\n| GPS | Uses `CLLocation.distance(from:)` with a check |";
+        let lines = render_markdown(None, md);
+        let rows = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "Feature │ Why",
+                "GPS │ Uses `CLLocation.distance(from:)` with a check",
+            ]
         );
     }
 
@@ -576,6 +606,21 @@ mod tests {
         assert!(collect_text(&lines).contains("one"));
         assert!(collect_text(&lines).contains("two"));
         assert!(collect_text(&lines).contains("three"));
+    }
+
+    #[test]
+    fn paragraph_after_list_does_not_join_the_final_item() {
+        let lines = render_markdown(None, "* first\n* final\n\nAfterward.");
+        let rows = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["• first", "• final", "Afterward."]);
     }
 
     #[test]

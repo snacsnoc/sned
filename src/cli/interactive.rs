@@ -950,12 +950,12 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
 }
 
 fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    app.capture_manual_viewport_for_reflow();
     let terminal_size = terminal.size()?;
     let terminal_height = terminal_size.height;
     let content_height = terminal_height.saturating_sub(6) as usize;
     app.set_content_width(terminal_size.width as usize);
     app.set_content_height(content_height);
-    app.clamp_to_content();
     app.has_resized = false;
     Ok(())
 }
@@ -3903,7 +3903,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_output_resets_to_auto_on_new_output() {
+    fn test_drain_output_preserves_manual_scroll_on_new_output() {
         use crate::cli::output::OutputEvent;
         use crate::cli::tui::app::ScrollMode;
 
@@ -3924,14 +3924,15 @@ mod tests {
 
         drain_output(&mut rx, &mut app);
 
-        assert_eq!(app.scroll_mode, ScrollMode::Auto);
-        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 7);
+        assert_eq!(app.unseen_output_count, 1);
 
         reset_prompt_state();
     }
 
     #[test]
-    fn test_drain_output_reenables_auto_follow_at_bottom() {
+    fn test_returning_to_bottom_reenables_auto_follow_for_new_output() {
         use crate::cli::output::OutputEvent;
         use crate::cli::tui::app::ScrollMode;
 
@@ -3948,14 +3949,16 @@ mod tests {
         for index in 0..20 {
             app.push_plain(format!("line {}", index));
         }
-        app.scroll_mode = ScrollMode::Manual;
-        // 20 lines + 1 new = 21 lines, content_height=5 → max_offset=16.
-        // At exact bottom (offset=16), distance_from_bottom==0 → snaps to Auto.
-        app.scroll_offset = 16;
+        app.scroll_lines(-1);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        app.scroll_lines(isize::MAX);
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
 
         drain_output(&mut rx, &mut app);
 
         assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.unseen_output_count, 0);
 
         reset_prompt_state();
     }
@@ -4777,6 +4780,58 @@ mod tests {
 
         // The recorded indices buffer is cleared after finalize.
         assert!(app.turn_stream_entries.is_empty());
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_preserves_table_and_list_boundaries_on_turn_end() {
+        use crate::cli::output::OutputEvent;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let markdown = "| Feature | Why |\n|---|---|\n| GPS | Uses `CLLocation.distance(from:)` with a check |\n\n* first\n* final\n\nAfterward.";
+        let (tx, mut rx) = mpsc::channel(16);
+        for line in markdown.lines() {
+            tx.try_send(OutputEvent::model_output(line)).unwrap();
+        }
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: markdown.to_string(),
+        })
+        .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let rendered = app
+            .output_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.contains(&"Feature │ Why".to_string()),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"GPS │ Uses `CLLocation.distance(from:)` with a check".to_string()),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains(&"• first".to_string()), "{rendered:?}");
+        assert!(rendered.contains(&"• final".to_string()), "{rendered:?}");
+        assert!(rendered.contains(&"Afterward.".to_string()), "{rendered:?}");
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("• finalAfterward.")),
+            "{rendered:?}"
+        );
 
         reset_prompt_state();
     }

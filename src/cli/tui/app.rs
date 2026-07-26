@@ -122,6 +122,18 @@ pub enum ScrollMode {
     ApprovalPinned,
 }
 
+/// `scroll_offset` is a visual-row coordinate, so it becomes invalid when a
+/// resize changes wrapping or a streamed block is re-rendered as Markdown.
+#[derive(Debug, Clone)]
+struct ManualViewportAnchor {
+    output_index: usize,
+    row_offset: usize,
+    separator_before: bool,
+    text: String,
+    normalized_text: String,
+    scroll_y: usize,
+}
+
 /// Tracks a pasted chunk of text that was folded into a marker.
 #[derive(Debug, Clone)]
 pub struct PasteChunk {
@@ -357,6 +369,8 @@ pub struct App {
     pub scroll_offset: usize,
     /// Current output scroll behavior
     pub scroll_mode: ScrollMode,
+    pub unseen_output_count: usize,
+    pending_manual_viewport_anchor: Option<ManualViewportAnchor>,
     /// Whether the next draw should re-sync layout from the terminal size.
     pub has_resized: bool,
     /// Whether the next draw should render (dirty flag for render optimization).
@@ -450,10 +464,9 @@ pub struct App {
     pub status_left_fingerprint: (String, String, String, String),
     /// Cached status bar right segment (elapsed timer). Rebuilt when seconds change.
     pub cached_status_right: String,
-    /// Seconds value the cached right segment was built for.
     /// Last known context usage percentage from the API.
     pub context_pct: Option<f64>,
-    pub cached_status_right_secs: (u64, Option<f64>, bool, u64, usize),
+    pub cached_status_right_secs: (u64, Option<f64>, bool, u64, usize, usize, ScrollMode),
     /// Cached spacer string for the status bar.
     pub cached_spacer: String,
     /// Length the cached spacer was built for.
@@ -754,6 +767,8 @@ impl App {
             reasoning_partial_line: String::new(),
             scroll_offset: 0,
             scroll_mode: ScrollMode::Auto,
+            unseen_output_count: 0,
+            pending_manual_viewport_anchor: None,
             has_resized: true,
             needs_redraw: true,
             start_time: None,
@@ -787,7 +802,7 @@ impl App {
             cached_status_left: String::new(),
             status_left_fingerprint: (String::new(), String::new(), String::new(), String::new()),
             cached_status_right: String::new(),
-            cached_status_right_secs: (u64::MAX, None, false, 0, 0),
+            cached_status_right_secs: (u64::MAX, None, false, 0, 0, 0, ScrollMode::Auto),
             context_pct: None,
             cached_spacer: String::new(),
             cached_spacer_len: 0,
@@ -882,6 +897,27 @@ impl App {
         self.output_line_kinds.push_back(kind);
         self.cached_visible_window = None;
         if self.output_lines.len() > 10_000 {
+            let evicted_rows = if self.scroll_mode == ScrollMode::Manual {
+                let evicted_kind = *self
+                    .output_line_kinds
+                    .front()
+                    .expect("output line kinds must match output lines");
+                let separator_rows = self
+                    .output_line_kinds
+                    .get(1)
+                    .copied()
+                    .is_some_and(|next_kind| {
+                        Self::should_insert_separator(evicted_kind, next_kind)
+                    }) as usize;
+                Self::output_row_visual_rows(
+                    self.output_lines.front(),
+                    evicted_kind,
+                    wrap_width,
+                )
+                .saturating_add(separator_rows)
+            } else {
+                0
+            };
             // Evict front line and buffer it for batched scrollback append.
             if let Some(line) = self.output_lines.front() {
                 let text = Self::line_to_string(line);
@@ -892,6 +928,11 @@ impl App {
             }
             self.output_lines.pop_front();
             self.output_line_kinds.pop_front();
+            // The manual offset is measured from the transcript front. Keep
+            // the viewport anchored to the same surviving visual row.
+            if self.scroll_mode == ScrollMode::Manual {
+                self.scroll_offset = self.scroll_offset.saturating_sub(evicted_rows);
+            }
             self.cached_wrap_width = None;
             self.cached_visible_window = None;
         } else if self.cached_wrap_width == Some(wrap_width) {
@@ -908,9 +949,14 @@ impl App {
                 );
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
-        if !matches!(self.scroll_mode, ScrollMode::ApprovalPinned) {
-            self.force_bottom();
+        match self.scroll_mode {
+            ScrollMode::Auto => self.force_bottom(),
+            ScrollMode::Manual => {
+                self.unseen_output_count = self.unseen_output_count.saturating_add(1);
+            }
+            ScrollMode::ApprovalPinned => {}
         }
+        self.refresh_pending_manual_viewport_anchor(wrap_width);
     }
 
     /// Push a line and record its index for turn-end markdown
@@ -1027,8 +1073,11 @@ impl App {
             self.turn_stream_entries.pop();
         }
 
+        let unseen_output_count = self.unseen_output_count;
         let lines_to_push = self.prewrap_stream_line(line);
         self.push_stream_group(lines_to_push, kind);
+        // Replacing a partial stream line is a repaint, not new output.
+        self.unseen_output_count = unseen_output_count;
     }
 
     /// Store a turn-indicator line (e.g. "♦") for later re-insertion at
@@ -1095,6 +1144,7 @@ impl App {
                 self.needs_redraw = true;
                 self.cached_wrap_width = None;
                 self.rebuild_visual_row_cache(self.last_wrap_width());
+                self.refresh_pending_manual_viewport_anchor(self.last_wrap_width());
             }
             return;
         }
@@ -1102,6 +1152,8 @@ impl App {
         // Extract just the Model indices for the no-op-reinsert check
         // and for popping/insertion.
         let model_entry_indices: Vec<usize> = model_indices.iter().map(|(idx, _)| *idx).collect();
+        let wrap_width = self.last_wrap_width();
+        let manual_anchor = self.manual_viewport_anchor(wrap_width);
 
         // No-op-reinsert optimization: if the rendered line count equals
         // the popped Model line count and every rendered line has the same
@@ -1142,7 +1194,11 @@ impl App {
             }
             self.needs_redraw = true;
             self.cached_wrap_width = None;
-            self.rebuild_visual_row_cache(self.last_wrap_width());
+            self.rebuild_visual_row_cache(wrap_width);
+            if let Some(anchor) = manual_anchor.as_ref() {
+                self.restore_manual_viewport_anchor(anchor, wrap_width);
+            }
+            self.refresh_pending_manual_viewport_anchor(wrap_width);
             return;
         }
 
@@ -1156,6 +1212,37 @@ impl App {
             self.turn_indicator = None;
             return;
         }
+
+        let insert_at = *model_entry_indices.iter().min().unwrap();
+        let anchor_in_replaced_model = manual_anchor.as_ref().is_some_and(|anchor| {
+            model_entry_indices.contains(&anchor.output_index)
+        });
+        let old_model_start = if anchor_in_replaced_model {
+            let mut anchor = manual_anchor.clone().expect("manual anchor must exist");
+            anchor.output_index = insert_at;
+            anchor.row_offset = 0;
+            anchor.separator_before = false;
+            self.scroll_offset_for_manual_anchor(&anchor, wrap_width)
+        } else {
+            None
+        };
+        let anchor_match_ordinal = manual_anchor
+            .as_ref()
+            .filter(|_| anchor_in_replaced_model)
+            .map(|anchor| {
+                model_entry_indices
+                    .iter()
+                    .filter(|index| **index <= anchor.output_index)
+                    .filter(|index| {
+                        let text = Self::line_to_string(&self.output_lines[**index]);
+                        text == anchor.text
+                            || (!anchor.normalized_text.is_empty()
+                                && Self::normalize_viewport_anchor_text(&text)
+                                    == anchor.normalized_text)
+                    })
+                    .count()
+                    .saturating_sub(1)
+            });
 
         // Pop only the Model entries from highest index to lowest to
         // preserve the relative order of entries that come before.
@@ -1182,8 +1269,6 @@ impl App {
         // or ToolOutput lines were interleaved inside the streamed text,
         // but matches what the user would have seen — code blocks were
         // emitted immediately when the model streamed them.
-        let insert_at = *model_entry_indices.iter().min().unwrap();
-
         // Render the markdown text first, then prepend the turn indicator
         // as a styled span to the first rendered line. Prepending the
         // indicator to the markdown string would make `render_markdown`
@@ -1202,6 +1287,7 @@ impl App {
             new_spans.extend(first.spans.iter().cloned());
             first.spans = new_spans;
         }
+        let rendered_len = rendered.len();
         for line in rendered.into_iter().rev() {
             self.output_lines.insert(insert_at, line);
             self.output_line_kinds.insert(insert_at, BlockKind::Model);
@@ -1225,7 +1311,92 @@ impl App {
         // Invalidate the visual-row cache: the line count and content
         // changed, so the cached row count is stale.
         self.cached_wrap_width = None;
-        self.rebuild_visual_row_cache(self.last_wrap_width());
+        self.rebuild_visual_row_cache(wrap_width);
+
+        let Some(mut anchor) = manual_anchor else {
+            self.refresh_pending_manual_viewport_anchor(wrap_width);
+            return;
+        };
+        if !anchor_in_replaced_model {
+            let removed_before = model_entry_indices
+                .iter()
+                .filter(|index| **index < anchor.output_index)
+                .count();
+            anchor.output_index = anchor.output_index.saturating_sub(removed_before);
+            if anchor.output_index >= insert_at.saturating_sub(removed_before) {
+                anchor.output_index = anchor.output_index.saturating_add(rendered_len);
+            }
+            self.restore_manual_viewport_anchor(&anchor, wrap_width);
+            self.refresh_pending_manual_viewport_anchor(wrap_width);
+            return;
+        }
+
+        let mut model_anchor = anchor.clone();
+        model_anchor.output_index = insert_at;
+        model_anchor.row_offset = 0;
+        model_anchor.separator_before = false;
+        let new_model_start = self.scroll_offset_for_manual_anchor(&model_anchor, wrap_width);
+        let new_model_rows: usize = self
+            .output_lines
+            .iter()
+            .skip(insert_at)
+            .take(rendered_len)
+            .zip(self.output_line_kinds.iter().skip(insert_at))
+            .map(|(line, kind)| Self::output_row_visual_rows(Some(line), *kind, wrap_width))
+            .sum();
+        let old_model_relative = old_model_start
+            .map(|start| anchor.scroll_y.saturating_sub(start))
+            .unwrap_or_default();
+        let matching_candidates: Vec<(usize, usize, usize)> =
+            (insert_at..insert_at.saturating_add(rendered_len))
+            .filter_map(|index| {
+                let text = Self::line_to_string(&self.output_lines[index]);
+                let exact_match = text == anchor.text;
+                let normalized_match = !anchor.normalized_text.is_empty()
+                    && Self::normalize_viewport_anchor_text(&text) == anchor.normalized_text;
+                if !exact_match && !normalized_match {
+                    return None;
+                }
+
+                let mut candidate = anchor.clone();
+                candidate.output_index = index;
+                let candidate_relative = self
+                    .scroll_offset_for_manual_anchor(&candidate, wrap_width)
+                    .zip(new_model_start)
+                    .map(|(offset, start)| offset.saturating_sub(start))
+                    .unwrap_or(usize::MAX);
+                Some((
+                    index,
+                    usize::from(!exact_match),
+                    candidate_relative.abs_diff(old_model_relative),
+                ))
+            })
+            .collect();
+        let matching_index = anchor_match_ordinal
+            .and_then(|ordinal| matching_candidates.get(ordinal).map(|(index, _, _)| *index))
+            .or_else(|| {
+                matching_candidates
+                    .iter()
+                    .min_by_key(|(_, match_kind, distance)| (*match_kind, *distance))
+                    .map(|(index, _, _)| *index)
+            });
+        if let Some(index) = matching_index {
+            anchor.output_index = index;
+            self.restore_manual_viewport_anchor(&anchor, wrap_width);
+            self.refresh_pending_manual_viewport_anchor(wrap_width);
+            return;
+        }
+
+        if let (Some(old_start), Some(new_start)) = (old_model_start, new_model_start) {
+            self.scroll_offset = new_start.saturating_add(
+                anchor
+                    .scroll_y
+                    .saturating_sub(old_start)
+                    .min(new_model_rows.saturating_sub(1)),
+            );
+            self.clamp_to_content();
+        }
+        self.refresh_pending_manual_viewport_anchor(wrap_width);
     }
 
     /// Push a completion line to the completion buffer.
@@ -1675,6 +1846,8 @@ impl App {
         self.needs_redraw = true;
         self.scroll_mode = ScrollMode::Auto;
         self.scroll_offset = 0;
+        self.unseen_output_count = 0;
+        self.pending_manual_viewport_anchor = None;
     }
 
     pub fn start_scrollback_writer(&mut self) -> io::Result<()> {
@@ -1818,6 +1991,8 @@ impl App {
         }
         self.scroll_mode = ScrollMode::Auto;
         self.scroll_offset = 0;
+        self.unseen_output_count = 0;
+        self.pending_manual_viewport_anchor = None;
         Ok(())
     }
 
@@ -1832,6 +2007,8 @@ impl App {
         self.cached_visible_window = None;
         self.scroll_mode = ScrollMode::Auto;
         self.scroll_offset = 0;
+        self.unseen_output_count = 0;
+        self.pending_manual_viewport_anchor = None;
         result
     }
 
@@ -1869,6 +2046,8 @@ impl App {
         self.cached_visible_window = None;
         self.in_scrollback = false;
         self.scrollback_count = 0;
+        self.unseen_output_count = 0;
+        self.pending_manual_viewport_anchor = None;
         result
     }
 
@@ -1887,12 +2066,15 @@ impl App {
         // which can alter render-time separator insertion.
         self.cached_wrap_width = None;
         self.cached_visible_window = None;
+        self.refresh_pending_manual_viewport_anchor(self.last_wrap_width());
     }
 
     pub fn pin_approval_bottom(&mut self) {
         self.needs_redraw = true;
         self.scroll_mode = ScrollMode::ApprovalPinned;
         self.scroll_offset = 0;
+        self.unseen_output_count = 0;
+        self.pending_manual_viewport_anchor = None;
     }
 
     pub fn clear_approval_pin(&mut self) {
@@ -2082,6 +2264,7 @@ impl App {
                 self.scroll_mode = ScrollMode::Manual;
                 self.scroll_offset =
                     Self::max_scroll_offset_for(total_rows, self.last_content_height);
+                self.unseen_output_count = 0;
                 true
             }
         }
@@ -2295,6 +2478,141 @@ impl App {
             );
         }
         line
+    }
+
+    fn normalize_viewport_anchor_text(text: &str) -> String {
+        text.chars()
+            .filter(|ch| !matches!(ch, '*' | '_' | '`' | '#'))
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn manual_viewport_anchor(&mut self, wrap_width: usize) -> Option<ManualViewportAnchor> {
+        if self.scroll_mode != ScrollMode::Manual || self.output_lines.is_empty() {
+            return None;
+        }
+
+        let total_rows = self.output_visual_rows(wrap_width);
+        let scroll_y = self.resolved_scroll_y_for(total_rows, self.last_content_height);
+        let mut rows_before = 0usize;
+        let mut previous_kind = None;
+
+        for (index, (line, kind)) in self
+            .output_lines
+            .iter()
+            .zip(self.output_line_kinds.iter())
+            .enumerate()
+        {
+            let separator_before = previous_kind
+                .is_some_and(|previous| Self::should_insert_separator(previous, *kind));
+            if separator_before {
+                if scroll_y == rows_before {
+                    let text = Self::line_to_string(line);
+                    return Some(ManualViewportAnchor {
+                        output_index: index,
+                        row_offset: 0,
+                        separator_before: true,
+                        normalized_text: Self::normalize_viewport_anchor_text(&text),
+                        text,
+                        scroll_y,
+                    });
+                }
+                rows_before = rows_before.saturating_add(1);
+            }
+
+            let row_count = Self::output_row_visual_rows(Some(line), *kind, wrap_width);
+            if scroll_y < rows_before.saturating_add(row_count) {
+                let text = Self::line_to_string(line);
+                return Some(ManualViewportAnchor {
+                    output_index: index,
+                    row_offset: scroll_y.saturating_sub(rows_before),
+                    separator_before: false,
+                    normalized_text: Self::normalize_viewport_anchor_text(&text),
+                    text,
+                    scroll_y,
+                });
+            }
+            rows_before = rows_before.saturating_add(row_count);
+            previous_kind = Some(*kind);
+        }
+
+        None
+    }
+
+    fn scroll_offset_for_manual_anchor(
+        &self,
+        anchor: &ManualViewportAnchor,
+        wrap_width: usize,
+    ) -> Option<usize> {
+        let mut rows_before = 0usize;
+        let mut previous_kind = None;
+
+        for (index, (line, kind)) in self
+            .output_lines
+            .iter()
+            .zip(self.output_line_kinds.iter())
+            .enumerate()
+        {
+            let separator_before = previous_kind
+                .is_some_and(|previous| Self::should_insert_separator(previous, *kind));
+            if index == anchor.output_index {
+                if anchor.separator_before && separator_before {
+                    return Some(rows_before);
+                }
+                let line_start = rows_before.saturating_add(separator_before as usize);
+                let line_rows = Self::output_row_visual_rows(Some(line), *kind, wrap_width);
+                return Some(line_start.saturating_add(
+                    anchor
+                        .row_offset
+                        .min(line_rows.saturating_sub(1)),
+                ));
+            }
+            rows_before = rows_before.saturating_add(separator_before as usize);
+            rows_before = rows_before.saturating_add(Self::output_row_visual_rows(
+                Some(line),
+                *kind,
+                wrap_width,
+            ));
+            previous_kind = Some(*kind);
+        }
+
+        None
+    }
+
+    fn restore_manual_viewport_anchor(
+        &mut self,
+        anchor: &ManualViewportAnchor,
+        wrap_width: usize,
+    ) -> bool {
+        if self.scroll_mode != ScrollMode::Manual {
+            return false;
+        }
+        let Some(offset) = self.scroll_offset_for_manual_anchor(anchor, wrap_width) else {
+            return false;
+        };
+        self.scroll_offset = offset;
+        self.clamp_to_content();
+        true
+    }
+
+    /// Refresh a resize anchor after transcript mutation so it cannot restore
+    /// a stale buffer index when the next frame reflows the viewport.
+    fn refresh_pending_manual_viewport_anchor(&mut self, wrap_width: usize) {
+        if self.pending_manual_viewport_anchor.is_some() {
+            self.pending_manual_viewport_anchor = self.manual_viewport_anchor(wrap_width);
+        }
+    }
+
+    pub fn capture_manual_viewport_for_reflow(&mut self) {
+        self.pending_manual_viewport_anchor = self.manual_viewport_anchor(self.last_wrap_width());
+    }
+
+    fn restore_pending_manual_viewport_after_reflow(&mut self, wrap_width: usize) {
+        if let Some(anchor) = self.pending_manual_viewport_anchor.take() {
+            self.restore_manual_viewport_anchor(&anchor, wrap_width);
+        }
     }
 
     fn collect_output_rows_range(&self, start_idx: usize, take_count: usize) -> Vec<Line<'static>> {
@@ -2584,9 +2902,14 @@ impl App {
             self.output_overflow,
             self.output_overflow_count,
             self.queued_message_count,
+            self.unseen_output_count,
+            self.scroll_mode,
         );
         if context_key != self.cached_status_right_secs {
             let mut status = String::new();
+            if self.scroll_mode == ScrollMode::Manual && self.unseen_output_count > 0 {
+                status.push_str(&format!("↑ {} new · ", self.unseen_output_count));
+            }
             if self.output_overflow {
                 let summary = if self.output_overflow_summary.is_empty() {
                     String::new()
@@ -2697,6 +3020,7 @@ impl App {
         let content_height = visible_height.saturating_sub(2);
         self.last_content_width = main_output_area.width as usize;
         self.last_content_height = content_height;
+        self.restore_pending_manual_viewport_after_reflow(wrap_width);
         let total_rows = self.total_visual_rows(wrap_width);
         // The output Paragraph only renders output_lines; completion_lines are
         // drawn as a separate Block below the main output. Scroll math must
@@ -3392,6 +3716,146 @@ mod tests {
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
         assert_eq!(app.scroll_offset, 12);
         assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 12);
+    }
+
+    #[test]
+    fn test_manual_scroll_preserves_viewport_while_output_appends() {
+        let mut app = make_scrolling_app(20, 5);
+
+        app.scroll_lines(-3);
+        app.push_plain("new streamed output");
+
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 12);
+        assert_eq!(app.unseen_output_count, 1);
+        assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 12);
+    }
+
+    #[test]
+    fn test_resize_reflow_preserves_manual_viewport_anchor() {
+        let mut app = App::new();
+        app.set_content_height(5);
+        app.set_content_width(80);
+        for index in 0..30 {
+            app.push_plain(format!("row {index}: {}", "x".repeat(48)));
+        }
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 8;
+
+        app.capture_manual_viewport_for_reflow();
+        app.set_content_width(20);
+        app.restore_pending_manual_viewport_after_reflow(app.last_wrap_width());
+
+        let anchor = app
+            .manual_viewport_anchor(app.last_wrap_width())
+            .expect("manual viewport should retain an anchor after reflow");
+        assert_eq!(anchor.output_index, 8);
+        assert!(anchor.text.starts_with("row 8:"));
+    }
+
+    #[test]
+    fn test_transcript_eviction_preserves_manual_viewport() {
+        let mut app = App::new();
+        app.set_content_height(5);
+        app.set_content_width(80);
+        app.push_output_with_kind(Line::from("x".repeat(60)), BlockKind::Model);
+        for index in 1..10_000 {
+            app.push_plain(format!("line {index}"));
+        }
+
+        // The evicted model row now takes eight rows, plus its separator.
+        app.set_content_width(10);
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 50;
+        app.capture_manual_viewport_for_reflow();
+        app.push_plain("new");
+        app.restore_pending_manual_viewport_after_reflow(app.last_wrap_width());
+
+        assert_eq!(app.output_lines.len(), 10_000);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 41);
+        assert_eq!(app.unseen_output_count, 1);
+
+        let wrap_width = app.last_wrap_width();
+        let total_rows = app.total_visual_rows(wrap_width);
+        let scroll_y = app.resolved_scroll_y_for(total_rows, app.last_content_height);
+        let (start, _, _) = app.visible_output_window(wrap_width, scroll_y, app.last_content_height);
+        let first_visible = app
+            .collect_output_rows_range(start, 1)
+            .into_iter()
+            .next()
+            .expect("manual viewport should contain a transcript row");
+        assert!(App::line_to_string(&first_visible).contains("line 42"));
+    }
+
+    #[test]
+    fn test_finalize_turn_stream_preserves_manual_model_anchor() {
+        let mut app = App::new();
+        app.set_content_height(1);
+        app.set_content_width(80);
+        for index in 0..5 {
+            app.push_plain(format!("history {index}"));
+        }
+        app.push_stream_line(Line::from("intro"), StreamKind::Model);
+        app.push_stream_line(Line::from("**target marker**"), StreamKind::Model);
+        app.push_stream_line(Line::from("outro"), StreamKind::Model);
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 7;
+
+        app.finalize_turn_stream("intro\n\n**target marker**\n\noutro");
+
+        let anchor = app
+            .manual_viewport_anchor(app.last_wrap_width())
+            .expect("manual viewport should retain a model anchor after finalization");
+        assert_eq!(anchor.text, "target marker");
+    }
+
+    #[test]
+    fn test_finalize_turn_stream_preserves_separator_before_model_anchor() {
+        let mut app = App::new();
+        app.set_content_height(1);
+        app.set_content_width(80);
+        for index in 0..5 {
+            app.push_plain(format!("history {index}"));
+        }
+        app.push_stream_line(Line::from("intro"), StreamKind::Model);
+        app.push_stream_line(Line::from("outro"), StreamKind::Model);
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 5;
+
+        app.finalize_turn_stream("intro\n\noutro");
+
+        let anchor = app
+            .manual_viewport_anchor(app.last_wrap_width())
+            .expect("manual viewport should remain on the model separator");
+        assert!(anchor.separator_before);
+        assert_eq!(anchor.text, "intro");
+    }
+
+    #[test]
+    fn test_finalize_turn_stream_preserves_duplicate_model_line_occurrence() {
+        let mut app = App::new();
+        app.set_content_height(1);
+        app.set_content_width(80);
+        for index in 0..5 {
+            app.push_plain(format!("history {index}"));
+        }
+        for _ in 0..3 {
+            app.push_stream_line(Line::from("**repeat**"), StreamKind::Model);
+        }
+        // Keep a later row below the anchor so preserving it does not
+        // legitimately snap Manual mode back into tail-following mode.
+        app.push_plain("later output");
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 8;
+
+        app.finalize_turn_stream("**repeat**\n\n**repeat**\n\n**repeat**");
+
+        let anchor = app
+            .manual_viewport_anchor(app.last_wrap_width())
+            .expect("manual viewport should retain a duplicate model line anchor");
+        assert_eq!(anchor.text, "repeat");
+        assert_eq!(anchor.output_index, 7);
     }
 
     #[test]
@@ -4116,6 +4580,27 @@ mod tests {
     }
 
     #[test]
+    fn test_status_bar_shows_unseen_output_only_while_manually_scrolled() {
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = make_scrolling_app(20, 5);
+        app.scroll_lines(-1);
+        app.push_plain("new output");
+
+        let status_area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("manual status bar should render");
+        assert!(app.cached_status_right.contains("↑ 1 new"));
+
+        app.force_bottom();
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("auto-follow status bar should render");
+        assert!(!app.cached_status_right.contains("new"));
+    }
+
+    #[test]
     fn test_slash_command_fields_initialized() {
         let app = App::new();
         assert!(!app.slash_command_active);
@@ -4289,6 +4774,22 @@ mod tests {
                 .all(|(offset, (idx, kind))| { *kind == StreamKind::Model && *idx == offset + 1 }),
             "tail indices should be rewritten to the replacement group"
         );
+    }
+
+    #[test]
+    fn test_stream_line_replacements_do_not_increment_unseen_output() {
+        let mut app = make_scrolling_app(20, 5);
+        app.scroll_lines(-3);
+
+        app.push_stream_line(Line::from("partial"), StreamKind::Model);
+        assert_eq!(app.unseen_output_count, 1);
+
+        app.replace_last_stream_line(Line::from("partial update"), StreamKind::Model);
+        app.replace_last_stream_line(Line::from("partial update again"), StreamKind::Model);
+
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 12);
+        assert_eq!(app.unseen_output_count, 1);
     }
 
     #[test]
@@ -5960,12 +6461,12 @@ mod tests {
 
         let content_height = 5;
         let mut app = make_scrolling_app(20, content_height);
+        app.push_plain("line 20");
 
-        // Sanity: state says we should be at the bottom (20 - 5 = 15).
         assert_eq!(app.scroll_mode, ScrollMode::Auto);
         assert_eq!(
             app.resolved_scroll_y_for(app.output_lines.len(), content_height),
-            15
+            16
         );
 
         let backend = TestBackend::new(80, 12);
@@ -5983,8 +6484,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // The last 5 lines (15..20) must be visible in the rendered buffer.
-        for index in 15..20 {
+        for index in 16..21 {
             assert!(
                 rendered.contains(&format!("line {index}")),
                 "line {index} should be visible at the bottom of the rendered viewport"
