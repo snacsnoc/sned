@@ -1025,7 +1025,7 @@ pub(crate) fn create_provider(
             let state = crate::storage::global_state::load_global_state();
             let default_model = model_id
                 .or_else(|| state.act_mode_api_model_id.clone())
-                .unwrap_or_else(|| "claude-3-5-sonnet-20240620".to_string());
+                .unwrap_or_else(|| "claude-sonnet-5".to_string());
             let base_url = state.anthropic_base_url.filter(|u| !u.is_empty());
             Arc::new(crate::providers::Providers::Anthropic(
                 crate::providers::anthropic::AnthropicProvider::new(
@@ -1033,7 +1033,7 @@ pub(crate) fn create_provider(
                         api_key,
                         base_url,
                         model_id: default_model,
-                        model_info: Some(crate::providers::ModelInfo::default()),
+                        model_info: None,
                         thinking_budget_tokens: thinking_budget,
                     },
                 )?,
@@ -1056,7 +1056,7 @@ pub(crate) fn create_provider(
                     let state = crate::storage::global_state::load_global_state();
                     state.act_mode_api_model_id
                 })
-                .unwrap_or_else(|| "MiniMax-M2.7".to_string());
+                .unwrap_or_else(|| "MiniMax-M3".to_string());
             let api_line = if std::env::var("MINIMAX_CN_API_KEY").is_ok() {
                 Some("china".to_string())
             } else {
@@ -1124,9 +1124,10 @@ pub(crate) fn create_provider(
                     let state = crate::storage::global_state::load_global_state();
                     state.act_mode_api_model_id
                 })
-                .unwrap_or_else(|| "gpt-4o".to_string());
-            let model_info = crate::core::context::is_qwen_model(&default_model)
-                .then(|| crate::providers::openai::get_openai_model_info(&default_model));
+                .unwrap_or_else(|| "gpt-5.6".to_string());
+            let model_info = Some(crate::providers::openai::get_openai_model_info(
+                &default_model,
+            ));
             Arc::new(crate::providers::Providers::OpenAi(
                 crate::providers::openai::OpenAiProvider::new(
                     crate::providers::openai::OpenAiConfig {
@@ -1173,7 +1174,7 @@ pub(crate) fn create_provider(
                     let state = crate::storage::global_state::load_global_state();
                     state.act_mode_api_model_id
                 })
-                .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+                .unwrap_or_else(|| "gemini-3.6-flash".to_string());
             let gemini_model_info =
                 crate::providers::gemini::get_gemini_model_info(&default_model);
             // Reject flags that the selected Gemini generation cannot honour.
@@ -1266,7 +1267,7 @@ pub(crate) fn create_provider(
             )
             .unwrap_or_default();
             let model_id_str =
-                model_id.unwrap_or_else(|| "anthropic/claude-sonnet-4.5".to_string());
+                model_id.unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
             Arc::new(crate::providers::Providers::OpenRouter(
                 crate::providers::openrouter::OpenRouterProvider::new(
                     crate::providers::openrouter::OpenRouterConfig {
@@ -1303,6 +1304,14 @@ pub(crate) fn create_provider(
             } else if std::env::var_os("SNED_MOCK_BUSY_STREAM").is_some() {
                 Arc::new(crate::providers::Providers::Mock(
                     crate::providers::mock::MockProvider::busy_stream_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_APPROVAL_REJECTION").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::approval_rejection_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_PROVIDER_ERROR").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::provider_error_scenario(),
                 ))
             } else {
                 Arc::new(crate::providers::Providers::Mock(

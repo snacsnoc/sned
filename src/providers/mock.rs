@@ -185,6 +185,10 @@ impl MockProvider {
 
     #[must_use]
     pub fn approval_under_backpressure_scenario() -> Self {
+        let marker_path = std::env::var("SNED_DIR")
+            .map(|d| format!("{d}/approval-backpressure-smoke"))
+            .unwrap_or_else(|_| "/tmp/sned-approval-backpressure-smoke".to_string());
+
         let mut events = Vec::new();
         for i in 1..=256 {
             events.push(MockStreamEvent::Chunk(ApiStreamChunk::Text(
@@ -220,7 +224,7 @@ impl MockProvider {
                         name: Some("execute_command".to_string()),
                         arguments: Some(
                             serde_json::json!({
-                                "commands": ["touch /tmp/sned-approval-backpressure-smoke"]
+                                "commands": [format!("touch {marker_path}")]
                             })
                             .to_string(),
                         ),
@@ -310,6 +314,33 @@ impl MockProvider {
         }
 
         Self::new_with_repeat(vec![MockResponse::Stream(events)])
+    }
+
+    #[must_use]
+    pub fn approval_rejection_scenario() -> Self {
+        let marker_path = std::env::var("SNED_DIR")
+            .map(|d| format!("{d}/approval-rejection-should-not-exist"))
+            .unwrap_or_else(|_| "/tmp/sned-approval-rejection-should-not-exist".to_string());
+
+        let execute_command = MockToolCall {
+            call_id: "approval-rejection-exec".to_string(),
+            name: "execute_command".to_string(),
+            arguments: serde_json::json!({
+                "commands": [format!("touch {marker_path}")]
+            }),
+        };
+
+        Self::new_with_repeat(vec![
+            MockResponse::ToolCalls(vec![execute_command]),
+            MockResponse::Text("Tool execution was rejected or cancelled.".to_string()),
+        ])
+    }
+
+    #[must_use]
+    pub fn provider_error_scenario() -> Self {
+        Self::new(vec![MockResponse::Error(
+            "Mock API error - rate limit exceeded".to_string(),
+        )])
     }
 }
 
