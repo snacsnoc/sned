@@ -16,7 +16,7 @@ use ratatui::{
     },
 };
 use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
@@ -28,6 +28,8 @@ const INPUT_MAX_VISIBLE_LINES: usize = 6;
 const BLOCKING_PROMPT_INPUT_VISIBLE_LINES: usize = 1;
 const APPROVAL_PANEL_MAX_DETAIL_ROWS: usize = 10;
 const SCROLLBACK_FLUSH_LINE_BATCH: usize = 128;
+const MAX_SCROLLBACK_LOAD_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_SCROLLBACK_LOAD_LINES: usize = 10_000;
 
 /// Async @-mention search result delivered back to the interactive loop.
 #[derive(Debug, Clone)]
@@ -346,6 +348,33 @@ fn write_scrollback_pending(path: &Path, pending: &mut Vec<u8>) -> io::Result<()
     }
     pending.clear();
     Ok(())
+}
+
+fn read_scrollback_tail(path: &Path) -> io::Result<Option<String>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let file_len = file.metadata()?.len();
+    let offset = file_len.saturating_sub(MAX_SCROLLBACK_LOAD_BYTES);
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))?;
+    }
+
+    let mut bytes = Vec::with_capacity((file_len - offset) as usize);
+    file.read_to_end(&mut bytes)?;
+    if offset > 0 {
+        let retained_start = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |position| position + 1);
+        bytes.drain(..retained_start);
+    }
+
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Application state for the ratatui TUI.
@@ -1136,7 +1165,7 @@ impl App {
                     markdown_text.to_string()
                 };
                 let rendered: Vec<Line<'static>> =
-                    crate::cli::markdown::render_markdown(None, &prefixed_markdown);
+                    crate::cli::markdown::render_streamed_markdown(&prefixed_markdown);
                 for line in rendered {
                     self.output_lines.push_back(line);
                     self.output_line_kinds.push_back(BlockKind::Model);
@@ -1162,7 +1191,7 @@ impl App {
         // text vanishes for a frame while render_markdown runs, then
         // reappears styled.
         let mut rendered: Vec<Line<'static>> =
-            crate::cli::markdown::render_markdown(None, markdown_text);
+            crate::cli::markdown::render_streamed_markdown(markdown_text);
         let can_skip_reinsert = rendered.len() == model_entry_indices.len()
             && rendered.iter().zip(model_entry_indices.iter()).all(
                 |(rendered_line, popped_idx)| {
@@ -1277,7 +1306,7 @@ impl App {
         // the start of the response.
         let have_indicator = self.turn_indicator.take().is_some();
         let mut rendered: Vec<Line<'static>> =
-            crate::cli::markdown::render_markdown(None, markdown_text);
+            crate::cli::markdown::render_streamed_markdown(markdown_text);
         if have_indicator && let Some(first) = rendered.first_mut() {
             let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
             new_spans.push(Span::styled(
@@ -1949,11 +1978,7 @@ impl App {
         self.flush_scrollback_pending()?;
 
         let scrollback_content = match self.scrollback_file.as_ref() {
-            Some(file_path) => match std::fs::read_to_string(file_path) {
-                Ok(content) => Some(content),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-                Err(err) => return Err(err),
-            },
+            Some(file_path) => read_scrollback_tail(file_path)?,
             None => None,
         };
 
@@ -1961,16 +1986,15 @@ impl App {
         self.needs_redraw = true;
 
         if let Some(content) = scrollback_content {
-            let mut scrollback_lines: VecDeque<Line<'static>> = VecDeque::new();
-            let mut scrollback_kinds: VecDeque<BlockKind> = VecDeque::new();
-            for line in content.lines() {
-                scrollback_lines.push_back(Line::from(line.to_string()));
-                scrollback_kinds.push_back(BlockKind::ToolOutput);
-            }
             let mut new_lines: VecDeque<Line<'static>> = VecDeque::new();
             let mut new_kinds: VecDeque<BlockKind> = VecDeque::new();
-            for line in &scrollback_lines {
-                new_lines.push_back(line.clone());
+            let scrollback_lines: Vec<&str> = content
+                .lines()
+                .rev()
+                .take(MAX_SCROLLBACK_LOAD_LINES)
+                .collect();
+            for line in scrollback_lines.into_iter().rev() {
+                new_lines.push_back(Line::from(line.to_string()));
                 new_kinds.push_back(BlockKind::ToolOutput);
             }
             if !self.output_lines.is_empty() {
@@ -6358,6 +6382,44 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(&file_path);
         let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn test_enter_scrollback_limits_loaded_lines() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let mut content = String::new();
+        for line in 0..MAX_SCROLLBACK_LOAD_LINES + 3 {
+            content.push_str(&format!("line {line}\n"));
+        }
+        std::fs::write(&file_path, content).unwrap();
+
+        let mut app = App::new();
+        app.scrollback_file = Some(file_path);
+        app.enter_scrollback().unwrap();
+
+        assert_eq!(app.output_lines.len(), MAX_SCROLLBACK_LOAD_LINES);
+        assert_eq!(app.output_lines.front().unwrap().to_string(), "line 3");
+        assert_eq!(
+            app.output_lines.back().unwrap().to_string(),
+            format!("line {}", MAX_SCROLLBACK_LOAD_LINES + 2)
+        );
+    }
+
+    #[test]
+    fn test_read_scrollback_tail_skips_partial_first_line() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let content = format!(
+            "{}\nretained\n",
+            "x".repeat(MAX_SCROLLBACK_LOAD_BYTES as usize)
+        );
+        std::fs::write(&file_path, content).unwrap();
+
+        assert_eq!(
+            read_scrollback_tail(&file_path).unwrap(),
+            Some("retained\n".to_string())
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 /// is applied as `Span` styling.
 #[must_use]
 pub fn render_completion_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
-    render_markdown(Some(prefix), text)
+    render_markdown_with_code_limit(Some(prefix), text, None)
 }
 
 /// Render an error message as terminal-friendly lines with error styling.
@@ -90,6 +90,23 @@ pub fn render_error_markdown(prefix: &str, text: &str) -> Vec<Line<'static>> {
 /// agent output after a turn completes.
 #[must_use]
 pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
+    render_markdown_with_code_limit(prefix, text, None)
+}
+
+#[must_use]
+pub fn render_streamed_markdown(text: &str) -> Vec<Line<'static>> {
+    render_markdown_with_code_limit(
+        None,
+        text,
+        Some(crate::core::agent_types::MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE),
+    )
+}
+
+fn render_markdown_with_code_limit(
+    prefix: Option<&str>,
+    text: &str,
+    code_line_limit: Option<usize>,
+) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
         let banner = prefix.unwrap_or("");
         return vec![Line::from(Span::styled(
@@ -110,6 +127,8 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
     let mut style_stack: Vec<Style> = vec![Style::default()];
     // Are we currently inside a fenced code block?
     let mut in_code_block = false;
+    let mut code_block_language = String::new();
+    let mut code_block_text = String::new();
     let mut table_row_open = false;
     let mut table_cell_count = 0usize;
     // Pending list-item prefix to emit at the start of the next text run.
@@ -192,6 +211,10 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                     );
                     *is_first_line = false;
                     in_code_block = true;
+                    code_block_language = match &kind {
+                        CodeBlockKind::Fenced(language) => language.to_string(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
                     let label = match kind {
                         CodeBlockKind::Fenced(language) if !language.is_empty() => {
                             format!(" {language} ")
@@ -272,6 +295,45 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
                     style_stack.pop();
                 }
                 TagEnd::CodeBlock => {
+                    if let Some(limit) = code_line_limit {
+                        let code = code_block_text
+                            .strip_suffix('\n')
+                            .unwrap_or(&code_block_text);
+                        let code_lines: Vec<&str> = if code.is_empty() {
+                            Vec::new()
+                        } else {
+                            code.split('\n').collect()
+                        };
+                        let displayed = code_lines
+                            .iter()
+                            .take(limit)
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let highlighted = crate::cli::syntax_highlight::highlight_code(
+                            &displayed,
+                            &code_block_language,
+                        );
+                        for line in
+                            crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&highlighted)
+                        {
+                            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                            spans.push(Span::styled(
+                                "│   ",
+                                Style::default().add_modifier(Modifier::DIM),
+                            ));
+                            spans.extend(line.spans);
+                            out.push(Line::from(spans));
+                        }
+                        if code_lines.len() > limit {
+                            out.push(Line::from(Span::styled(
+                                "│   ... [snipped from streamed display]",
+                                Style::default().add_modifier(Modifier::DIM),
+                            )));
+                        }
+                        code_block_text.clear();
+                        code_block_language.clear();
+                    }
                     in_code_block = false;
                     out.push(Line::from(Span::styled(
                         "─".repeat(60),
@@ -312,21 +374,25 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
             Event::Text(t) => {
                 let piece = t.into_string();
                 if in_code_block {
-                    flush_text(&mut out, &mut current_text, &mut current_spans);
-                    for (i, line) in piece.split('\n').enumerate() {
-                        if i > 0 {
-                            flush_line(
-                                &mut out,
-                                &mut current_text,
-                                &mut current_spans,
-                                *is_first_line,
-                                prefix,
-                            );
-                            *is_first_line = false;
+                    if code_line_limit.is_some() {
+                        code_block_text.push_str(&piece);
+                    } else {
+                        flush_text(&mut out, &mut current_text, &mut current_spans);
+                        for (i, line) in piece.split('\n').enumerate() {
+                            if i > 0 {
+                                flush_line(
+                                    &mut out,
+                                    &mut current_text,
+                                    &mut current_spans,
+                                    *is_first_line,
+                                    prefix,
+                                );
+                                *is_first_line = false;
+                            }
+                            let style = Style::default().add_modifier(Modifier::DIM);
+                            current_spans.push(Span::styled("│   ", style));
+                            current_spans.push(Span::styled(line.to_string(), style));
                         }
-                        let style = Style::default().add_modifier(Modifier::DIM);
-                        current_spans.push(Span::styled("│   ", style));
-                        current_spans.push(Span::styled(line.to_string(), style));
                     }
                 } else {
                     if let Some(p) = pending_list_prefix.take() {
@@ -477,6 +543,24 @@ mod tests {
     fn fenced_code_block_uses_language_label() {
         let lines = render_completion_markdown("🚀 ", "```rust\nlet x = 1;\n```");
         assert!(collect_text(&lines).contains(" rust "));
+    }
+
+    #[test]
+    fn streamed_fenced_code_is_capped_without_literal_fences() {
+        let mut markdown = String::from("```rust\n");
+        for line in 1..=20 {
+            markdown.push_str(&format!("fn line_{line}() {{}}\n"));
+        }
+        markdown.push_str("```");
+
+        let rendered = render_streamed_markdown(&markdown);
+        let text = collect_text(&rendered);
+
+        assert!(text.contains(" rust "));
+        assert!(text.contains("fn line_15()"));
+        assert!(!text.contains("fn line_16()"));
+        assert!(text.contains("[snipped from streamed display]"));
+        assert!(!text.contains("```"));
     }
 
     #[test]

@@ -73,6 +73,7 @@ use crate::core::tool_output::{
 
 const MAX_TOOL_RESULT_DISPLAY_LINES: usize = 5;
 const MAX_COMMAND_RESULT_DISPLAY_LINES: usize = 8;
+const MAX_EDIT_RESULT_DISPLAY_LINES: usize = 10;
 /// Default concurrency limit for parallel non-grouped tool execution.
 /// Prevents I/O contention when many tools run simultaneously.
 const DEFAULT_TOOL_CONCURRENCY: usize = 12;
@@ -150,6 +151,49 @@ fn code_fence_language(line: &str) -> &str {
         .split_whitespace()
         .next()
         .unwrap_or("")
+}
+
+fn edit_result_diff_previews(result: &str) -> Vec<String> {
+    let mut sections = result.split("\n\n");
+    sections.next();
+    let mut previews = Vec::new();
+    while let Some(summary) = sections.next() {
+        if summary.starts_with("Applied ") && summary.contains("edit(s) successfully") {
+            let mut preview_section = sections.next().unwrap_or_default();
+            if preview_section.starts_with("Because the changes were extensive") {
+                preview_section = sections.next().unwrap_or_default();
+            }
+            let preview = format_tool_result(preview_section, MAX_EDIT_RESULT_DISPLAY_LINES);
+            if !preview.is_empty() {
+                previews.push(preview);
+            }
+        }
+    }
+    previews
+}
+
+fn strip_edit_diff_anchor(line: &str) -> String {
+    let (prefix, anchored_line) = ["+ ", "- ", "  "]
+        .into_iter()
+        .find_map(|prefix| line.strip_prefix(prefix).map(|rest| (prefix, rest)))
+        .unwrap_or(("", line));
+    let Some((anchor, content)) = anchored_line.split_once('§') else {
+        return line.to_string();
+    };
+    if anchor.is_empty() || anchor.contains(char::is_whitespace) {
+        return line.to_string();
+    }
+    format!("{prefix}{content}")
+}
+
+fn strip_edit_diff_anchors(line: &mut ratatui::text::Line<'static>) {
+    for span in &mut line.spans {
+        let text = span.content.to_string();
+        let stripped = strip_edit_diff_anchor(&text);
+        if stripped != text {
+            span.content = stripped.into();
+        }
+    }
 }
 
 // Cached terminal width to avoid repeated syscalls during streaming output.
@@ -306,6 +350,7 @@ fn print_code_block(
     lines: &[String],
     lang: &str,
     output_writer: &crate::cli::output::OutputWriterArc,
+    interactive_mode: bool,
 ) {
     use crate::cli::output::OutputEvent;
     if lines.is_empty() {
@@ -314,10 +359,32 @@ fn print_code_block(
 
     let code = lines.join("\n");
     let highlighted = crate::cli::syntax_highlight::highlight_code(&code, lang);
-    output_writer.emit(OutputEvent::RawAnsi(format!(
+    let rendered = format!(
         "  {}\n",
         highlighted.replace('\n', "\n  ")
-    )));
+    );
+    if interactive_mode {
+        for line in crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&rendered) {
+            output_writer.emit(OutputEvent::Line(line));
+        }
+    } else {
+        output_writer.emit(OutputEvent::RawAnsi(rendered));
+    }
+}
+
+fn emit_turn_end(
+    output_writer: &crate::cli::output::OutputWriterArc,
+    json_output: bool,
+    markdown_text: &str,
+) {
+    if json_output {
+        return;
+    }
+
+    let accumulated_text = crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
+    if !accumulated_text.is_empty() {
+        output_writer.emit(OutputEvent::TurnEnd { accumulated_text });
+    }
 }
 
 fn code_block_display_limit(interactive_mode: bool) -> usize {
@@ -1802,6 +1869,7 @@ impl AgentLoop {
             let mut emitted_output_this_attempt = false;
             let mut partial_line_displayed = false;
             let mut last_partial_flush_at: Option<std::time::Instant> = None;
+            let mut stream_usage: Option<ApiReqInfo> = None;
 
             // Turn indicator is prepended to the first output line, not emitted separately,
             // so it appears on the same line as the start of the response.
@@ -1901,6 +1969,7 @@ impl AgentLoop {
                                                 &code_block_buffer,
                                                 &code_block_lang,
                                                 &self.config.output_writer,
+                                                self.config.interactive_mode,
                                             );
                                             if code_block_snipped {
                                                 self.config.output_writer.emit(OutputEvent::dim(
@@ -2052,14 +2121,19 @@ impl AgentLoop {
                                 .to_string()
                             );
                         }
-                        // Store ApiReqInfo for context management in next turn.
-                        // Merge with previous info: some providers (Anthropic) send
-                        // usage in two chunks (input tokens in message_start, output
-                        // tokens in message_delta). The second chunk hardcodes
-                        // input_tokens=0, so we preserve the first chunk's values
-                        // when the new chunk sends 0.
+                        let is_synthetic_empty_usage = usage_chunk.input_tokens == 0
+                            && usage_chunk.output_tokens == 0
+                            && usage_chunk.cache_write_tokens == Some(0)
+                            && usage_chunk.cache_read_tokens.is_none()
+                            && usage_chunk.reasoning_tokens.is_none()
+                            && usage_chunk.total_cost.is_none()
+                            && usage_chunk.id.is_none();
                         let mut state = self.state.lock().await;
-                        let prev_info = state.last_api_req_info.as_ref();
+                        if is_synthetic_empty_usage && stream_usage.is_none() {
+                            state.last_api_req_info = None;
+                            continue;
+                        }
+                        let prev_info = stream_usage.as_ref();
                         let context_window_info = crate::core::context::get_context_window_info(
                             self.config.provider.lock().unwrap().as_ref(),
                         );
@@ -2067,15 +2141,6 @@ impl AgentLoop {
                         let guard = self.config.provider.lock().unwrap();
                         let provider_name = guard.name().to_string();
                         drop(guard);
-                        let context_usage_pct =
-                        crate::core::context::context_window::calculate_context_usage_percentage(
-                            usage_chunk.input_tokens,
-                            usage_chunk.output_tokens,
-                            usage_chunk.cache_write_tokens,
-                            usage_chunk.cache_read_tokens,
-                            context_window,
-                            &provider_name,
-                        );
                         let tokens_in = if usage_chunk.input_tokens > 0 {
                             usage_chunk.input_tokens
                         } else {
@@ -2086,23 +2151,36 @@ impl AgentLoop {
                         } else {
                             prev_info.and_then(|r| r.tokens_out).unwrap_or(0)
                         };
-                        state.last_api_req_info = Some(ApiReqInfo {
+                        let cache_writes = usage_chunk
+                            .cache_write_tokens
+                            .or(prev_info.and_then(|r| r.cache_writes));
+                        let cache_reads = usage_chunk
+                            .cache_read_tokens
+                            .or(prev_info.and_then(|r| r.cache_reads));
+                        let context_usage_pct =
+                            crate::core::context::context_window::calculate_context_usage_percentage(
+                                tokens_in,
+                                tokens_out,
+                                cache_writes,
+                                cache_reads,
+                                context_window,
+                                &provider_name,
+                            );
+                        let usage = ApiReqInfo {
                             request: None,
                             tokens_in: Some(tokens_in),
                             tokens_out: Some(tokens_out),
-                            cache_writes: usage_chunk
-                                .cache_write_tokens
-                                .or(prev_info.and_then(|r| r.cache_writes)),
-                            cache_reads: usage_chunk
-                                .cache_read_tokens
-                                .or(prev_info.and_then(|r| r.cache_reads)),
+                            cache_writes,
+                            cache_reads,
                             reasoning_tokens: usage_chunk
                                 .reasoning_tokens
                                 .or(prev_info.and_then(|r| r.reasoning_tokens)),
                             cost: usage_chunk.total_cost.or(prev_info.and_then(|r| r.cost)),
                             context_window: Some(context_window),
                             context_usage_percentage: Some(context_usage_pct),
-                        });
+                        };
+                        stream_usage = Some(usage.clone());
+                        state.last_api_req_info = Some(usage);
                         if usage_chunk.input_tokens > 0 {
                             state.cumulative_tokens_in = state
                                 .cumulative_tokens_in
@@ -2313,6 +2391,7 @@ impl AgentLoop {
                     &code_block_buffer,
                     &code_block_lang,
                     &self.config.output_writer,
+                    self.config.interactive_mode,
                 );
                 if code_block_snipped {
                     self.config
@@ -3151,6 +3230,18 @@ impl AgentLoop {
                                 format!("  {status} {stats}"),
                                 Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
                             ));
+                        if !is_error {
+                            for preview in edit_result_diff_previews(&result_output.text) {
+                                for mut line in
+                                    crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&preview)
+                                {
+                                    strip_edit_diff_anchors(&mut line);
+                                    self.config
+                                        .output_writer
+                                        .emit(OutputEvent::ToolOutputLine(line));
+                                }
+                            }
+                        }
                     } else if tool_name == "execute_command" {
                         let max_lines = MAX_COMMAND_RESULT_DISPLAY_LINES;
                         let displayed = format_tool_result(&result_output.text, max_lines);
@@ -3584,17 +3675,11 @@ impl AgentLoop {
             // thinking tags which pulldown_cmark treats as raw HTML and
             // emits as raw text, defeating the markdown render.
             let markdown_text = response_text.as_deref().unwrap_or("");
-            if !self.config.json_output && !markdown_text.is_empty() {
-                // Strip tool-call status lines that were already rendered as
-                // separate OutputEvent::Line/RawAnsi events. Including them in
-                // the TurnEnd payload causes duplicate rendering in the TUI.
-                let stripped = crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
-                if !stripped.is_empty() {
-                    self.config.output_writer.emit(OutputEvent::TurnEnd {
-                        accumulated_text: stripped,
-                    });
-                }
-            }
+            emit_turn_end(
+                &self.config.output_writer,
+                self.config.json_output,
+                markdown_text,
+            );
             if !self.config.interactive_mode
                 && !self.config.json_output
                 && crate::cli::output::timing_enabled()
@@ -3619,14 +3704,11 @@ impl AgentLoop {
         } else {
             // Same turn-end signal for the "more turns coming" branch.
             let markdown_text = response_text.as_deref().unwrap_or("");
-            if !self.config.json_output && !markdown_text.is_empty() {
-                let stripped = crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
-                if !stripped.is_empty() {
-                    self.config.output_writer.emit(OutputEvent::TurnEnd {
-                        accumulated_text: stripped,
-                    });
-                }
-            }
+            emit_turn_end(
+                &self.config.output_writer,
+                self.config.json_output,
+                markdown_text,
+            );
             TurnResult::Continue
         }
     }
@@ -4524,6 +4606,95 @@ mod tests {
         }
     }
 
+    struct StaticResultHandler(&'static str);
+
+    impl crate::core::tools::ToolHandler for StaticResultHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move { Ok(serde_json::Value::String(self.0.to_string())) })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "static result".to_string()
+        }
+    }
+
+    #[test]
+    fn test_strip_edit_diff_anchors_preserves_prefix_and_style() {
+        let mut line = crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(
+            "\x1b[92m+ AddedHash§new line\x1b[0m",
+        )
+        .pop()
+        .unwrap();
+
+        strip_edit_diff_anchors(&mut line);
+
+        assert_eq!(line.to_string(), "+ new line");
+        assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::Green));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_result_displays_anchor_free_diff_previews_for_every_file() {
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_edit".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("edit_file".to_string()),
+                    arguments: Some(
+                        serde_json::json!({
+                            "files": [{"path": "Cargo.toml", "edits": []}],
+                        })
+                        .to_string(),
+                    ),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-edit-diff-output");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::EditFile,
+            Arc::new(StaticResultHandler(
+                "Edited 3 file(s): 3 edit(s) applied, 0 edit(s) failed.\n\nApplied 1 edit(s) successfully (+1, -1 lines). NOTE the UPDATED anchors below.\n\n- FirstOldHash§first old line\n+ FirstNewHash§first new line\n\n---\n\nApplied 1 edit(s) successfully (+1, -1 lines). NOTE the UPDATED anchors below.\n\n- SecondOldHash§second old line\n+ SecondNewHash§second new line\n\n---\n\nApplied 1 edit(s) successfully (+2, -1 lines). NOTE the UPDATED anchors below.\n\nBecause the changes were extensive, the full updated file content with anchors is provided below to ensure clarity:\n\nFullFirstHash§full first line\nFullSecondHash§full second line",
+            )),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+
+        let output = drain_rendered_output(&mut rx);
+        assert!(output.iter().any(|line| line == "- first old line"));
+        assert!(output.iter().any(|line| line == "+ first new line"));
+        assert!(output.iter().any(|line| line == "- second old line"));
+        assert!(output.iter().any(|line| line == "+ second new line"));
+        assert!(output.iter().any(|line| line == "full first line"));
+        assert!(output.iter().any(|line| line == "full second line"));
+        assert!(
+            output.iter().all(|line| !line.contains('§')),
+            "edit diff preview leaked hash anchors: {output:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_disabled_parallel_tool_calling_serializes_tools() {
         let responses = vec![vec![
@@ -5158,9 +5329,18 @@ mod tests {
         let result = agent.execute_turn().await;
         assert!(matches!(result, TurnResult::Continue));
 
-        let rendered = drain_rendered_output(&mut rx).join("\n");
-        assert!(rendered.contains("[snipped from streamed display]"));
-        assert!(!rendered.contains("/expand"));
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| {
+            matches!(event, OutputEvent::Line(line) if line.to_string().contains("[snipped from streamed display]"))
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                OutputEvent::TurnEnd { accumulated_text }
+                    if accumulated_text.contains("```rust")
+                        && accumulated_text.contains("fn line_25()")
+            )
+        }));
     }
 
     #[tokio::test]
@@ -7931,6 +8111,118 @@ mod tests {
                 api_info.context_usage_percentage
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_context_percentage_preserves_input_across_output_only_usage_chunk() {
+        use crate::providers::ApiStreamUsageChunk;
+
+        let responses = vec![vec![
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Response".to_string(),
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                input_tokens: 2_000,
+                output_tokens: 0,
+                cache_write_tokens: Some(1_000),
+                cache_read_tokens: Some(500),
+                reasoning_tokens: None,
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: None,
+                id: None,
+            }),
+            ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                input_tokens: 0,
+                output_tokens: 250,
+                cache_write_tokens: None,
+                cache_read_tokens: None,
+                reasoning_tokens: None,
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: Some("stop".to_string()),
+                id: None,
+            }),
+        ]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-split-usage-context"));
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+
+        let state = agent.state.lock().await;
+        let usage = state.last_api_req_info.as_ref().unwrap();
+        assert_eq!(usage.tokens_in, Some(2_000));
+        assert_eq!(usage.tokens_out, Some(250));
+        assert_eq!(usage.cache_writes, Some(1_000));
+        assert_eq!(usage.cache_reads, Some(500));
+        let expected = (3_750.0 / 8_192.0) * 100.0;
+        assert!(
+            (usage.context_usage_percentage.unwrap() - expected).abs() < f64::EPSILON,
+            "expected {expected}, got {:?}",
+            usage.context_usage_percentage
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synthetic_empty_usage_does_not_reuse_prior_request_context() {
+        use crate::providers::ApiStreamUsageChunk;
+
+        let responses = vec![
+            vec![ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                input_tokens: 7_500,
+                output_tokens: 100,
+                cache_write_tokens: None,
+                cache_read_tokens: None,
+                reasoning_tokens: None,
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: Some("stop".to_string()),
+                id: Some("metered".to_string()),
+            })],
+            vec![ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_write_tokens: Some(0),
+                cache_read_tokens: None,
+                reasoning_tokens: None,
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: Some("stop".to_string()),
+                id: None,
+            })],
+        ];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-synthetic-usage"));
+
+        let _ = agent.execute_turn().await;
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .last_api_req_info
+                .is_some(),
+            "metered request should record usage"
+        );
+
+        let _ = agent.execute_turn().await;
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .last_api_req_info
+                .is_none(),
+            "synthetic empty usage must not retain the prior request's context percentage"
+        );
     }
 
     #[tokio::test]

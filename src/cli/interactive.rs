@@ -4794,6 +4794,60 @@ mod tests {
     }
 
     #[test]
+    fn test_fenced_turn_finalizes_before_next_markdown_turn() {
+        use crate::cli::output::OutputEvent;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let code_turn = "before code\n\n```rust\nlet value = 1;\n```\n\nafter code";
+        let (tx, mut rx) = mpsc::channel(10);
+        tx.try_send(OutputEvent::TurnIndicator(Line::from("♦")))
+            .unwrap();
+        tx.try_send(OutputEvent::model_output("before code")).unwrap();
+        tx.try_send(OutputEvent::model_output("```rust")).unwrap();
+        tx.try_send(OutputEvent::model_output("  let value = 1;"))
+            .unwrap();
+        tx.try_send(OutputEvent::model_output("```")).unwrap();
+        tx.try_send(OutputEvent::model_output("after code")).unwrap();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: code_turn.to_string(),
+        })
+        .unwrap();
+        tx.try_send(OutputEvent::model_output("**next turn**"))
+            .unwrap();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: "**next turn**".to_string(),
+        })
+        .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let rendered = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>();
+        assert!(rendered.iter().any(|line| line.contains("before code")));
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("let value = 1;"))
+                .count(),
+            1
+        );
+        assert!(rendered.iter().any(|line| line.contains("after code")));
+        assert!(rendered.iter().any(|line| line.contains("next turn")));
+        assert!(rendered.iter().all(|line| !line.contains("```")));
+        assert!(rendered.first().is_some_and(|line| line.contains('♦')));
+        assert!(app.turn_stream_entries.is_empty());
+        assert!(app.turn_indicator.is_none());
+
+        reset_prompt_state();
+    }
+
+    #[test]
     fn test_drain_output_preserves_table_and_list_boundaries_on_turn_end() {
         use crate::cli::output::OutputEvent;
 
