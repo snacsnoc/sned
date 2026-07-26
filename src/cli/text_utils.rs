@@ -2,7 +2,6 @@
 //!
 //! Provides word-wrapping and text formatting that respects terminal width.
 
-use std::io::{self, IsTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Get the current terminal width, or a sensible default.
@@ -11,12 +10,6 @@ pub fn get_terminal_width() -> usize {
     crossterm::terminal::size()
         .map(|(cols, _)| cols as usize)
         .unwrap_or(80)
-}
-
-/// Check if stderr is a TTY.
-#[must_use]
-pub fn stderr_is_tty() -> bool {
-    io::stderr().is_terminal()
 }
 
 /// Draw a framed box around error text.

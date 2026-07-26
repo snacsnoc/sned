@@ -54,18 +54,6 @@ pub fn file_not_found(path: &str, original_error: &str) -> ActionableError {
     ActionableError::with_suggestion(format!("Error reading file: {original_error}"), suggestion)
 }
 
-/// Add an actionable suggestion to a file-too-large error.
-#[must_use]
-pub fn file_too_large(size_kb: u64, max_kb: u64) -> ActionableError {
-    ActionableError::with_suggestion(
-        format!(
-            "The file size is {size_kb}KB, which exceeds the {max_kb}KB limit for full file reads."
-        ),
-        "Use start_line and end_line parameters to read only the relevant section, \
-         or use search_files to find specific content within the file.",
-    )
-}
-
 /// Add an actionable suggestion to a permission-denied error.
 #[must_use]
 pub fn permission_denied(path: &str, operation: &str) -> ActionableError {
@@ -198,16 +186,6 @@ pub fn provider_error(error: &crate::providers::ProviderError) -> ActionableErro
     ActionableError::with_suggestion(format!("Provider error: {error}"), suggestion)
 }
 
-/// Add an actionable suggestion to an edit anchor mismatch error.
-#[must_use]
-pub fn edit_anchor_mismatch(path: &str, anchor: &str) -> ActionableError {
-    ActionableError::with_suggestion(
-        format!("Anchor not found in {path}: {anchor}"),
-        "The file may have changed since it was last read. Re-read the file \
-         to get updated anchors, then retry the edit with the correct line content.",
-    )
-}
-
 /// Add an actionable suggestion for an unsupported language error.
 #[must_use]
 pub fn unsupported_language(language: &str) -> ActionableError {
@@ -225,64 +203,6 @@ pub fn invalid_regex(pattern: &str, error: &str) -> ActionableError {
         format!("Invalid regex pattern '{pattern}': {error}"),
         "Common fixes: escape special characters with \\ (e.g., \\., \\*, \\[, \\( ), \
          or use simpler patterns. Test your regex at regex101.com.",
-    )
-}
-
-/// Add an actionable suggestion for a git operation error.
-#[must_use]
-pub fn git_operation_failed(operation: &str, error: &str) -> ActionableError {
-    let lower = error.to_lowercase();
-    let suggestion = if lower.contains("not a git repository") || lower.contains("git repository") {
-        "This directory is not a Git repository. Run `git init` to initialize one, \
-         or navigate to a Git repository directory."
-            .to_string()
-    } else if lower.contains("nothing to commit") || lower.contains("working tree clean") {
-        "No changes to commit. Use `git status` to see the current state, \
-         or make some file changes before committing."
-            .to_string()
-    } else if lower.contains("permission denied") || lower.contains("could not lock") {
-        "Git cannot acquire a lock on the repository. Ensure no other Git process \
-         is running, or remove .git/index.lock if it exists."
-            .to_string()
-    } else if lower.contains("conflict") || lower.contains("merge conflict") {
-        "Resolve merge conflicts before committing. Use `git status` to see \
-         conflicting files, then edit and `git add` them."
-            .to_string()
-    } else if lower.contains("certificate") || lower.contains("ssl") || lower.contains("tls") {
-        "SSL/certificate error. Check your network connection, or configure \
-         Git's SSL settings with `git config http.sslVerify false` for testing."
-            .to_string()
-    } else {
-        "Run `git status` to see the repository state. Check that Git is \
-         properly configured and you have the necessary permissions."
-            .to_string()
-    };
-    ActionableError::with_suggestion(format!("Git {operation} failed: {error}"), suggestion)
-}
-
-/// Add an actionable suggestion for a checkpoint operation error.
-#[must_use]
-pub fn checkpoint_operation_failed(operation: &str, error: &str) -> ActionableError {
-    let lower = error.to_lowercase();
-    let suggestion = if lower.contains("not found") || lower.contains("does not exist") {
-        "The checkpoint does not exist. Use `/checkpoint list` to see available checkpoints."
-            .to_string()
-    } else if lower.contains("corrupt") || lower.contains("invalid") {
-        "The checkpoint data may be corrupted. Try listing checkpoints with \
-         `/checkpoint list` to see if others are available."
-            .to_string()
-    } else if lower.contains("permission") || lower.contains("access") {
-        "Permission denied accessing checkpoint storage. Check file permissions \
-         in the .sned directory."
-            .to_string()
-    } else {
-        "Use `/checkpoint list` to verify available checkpoints. Check the \
-         .sned directory for storage issues."
-            .to_string()
-    };
-    ActionableError::with_suggestion(
-        format!("Checkpoint {operation} failed: {error}"),
-        suggestion,
     )
 }
 
@@ -396,12 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn test_edit_anchor_mismatch() {
-        let err = edit_anchor_mismatch("src/main.rs", "fn main§hash1234");
-        assert!(err.suggestion.as_ref().unwrap().contains("Re-read"));
-    }
-
-    #[test]
     fn test_no_suggestion() {
         let err = ActionableError::new("Something went wrong");
         assert!(err.suggestion.is_none());
@@ -415,60 +329,4 @@ mod tests {
         assert!(display.contains("Suggestion: Try again"));
     }
 
-    #[test]
-    fn test_git_operation_failed_not_a_repo() {
-        let err = git_operation_failed("diff", "fatal: not a git repository");
-        assert!(err.suggestion.as_ref().unwrap().contains("git init"));
-    }
-
-    #[test]
-    fn test_git_operation_failed_nothing_to_commit() {
-        let err = git_operation_failed("commit", "nothing to commit, working tree clean");
-        assert!(
-            err.suggestion
-                .as_ref()
-                .unwrap()
-                .contains("No changes to commit")
-        );
-    }
-
-    #[test]
-    fn test_git_operation_failed_permission_denied() {
-        let err = git_operation_failed("push", "Permission denied");
-        assert!(err.suggestion.as_ref().unwrap().contains("lock"));
-    }
-
-    #[test]
-    fn test_git_operation_failed_merge_conflict() {
-        let err = git_operation_failed("merge", "merge conflict");
-        assert!(
-            err.suggestion
-                .as_ref()
-                .unwrap()
-                .contains("Resolve merge conflicts")
-        );
-    }
-
-    #[test]
-    fn test_checkpoint_operation_failed_not_found() {
-        let err = checkpoint_operation_failed("restore", "checkpoint not found");
-        assert!(
-            err.suggestion
-                .as_ref()
-                .unwrap()
-                .contains("/checkpoint list")
-        );
-    }
-
-    #[test]
-    fn test_checkpoint_operation_failed_corrupt() {
-        let err = checkpoint_operation_failed("restore", "data is corrupt");
-        assert!(err.suggestion.as_ref().unwrap().contains("corrupted"));
-    }
-
-    #[test]
-    fn test_checkpoint_operation_failed_permission() {
-        let err = checkpoint_operation_failed("list", "permission denied");
-        assert!(err.suggestion.as_ref().unwrap().contains(".sned directory"));
-    }
 }
