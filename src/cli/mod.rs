@@ -198,11 +198,11 @@ impl ReasoningEffort {
     /// The string value sent in API request bodies.
     fn as_provider_str(&self) -> &'static str {
         match self {
-            ReasoningEffort::None => "none",
-            ReasoningEffort::Low => "low",
-            ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
-            ReasoningEffort::Xhigh => "xhigh",
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
         }
     }
 }
@@ -775,8 +775,7 @@ fn openai_endpoint_kind(
 
 fn parse_extra_body(
     extra_body: Option<&str>,
-) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>>
-{
+) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
     let Some(extra_body) = extra_body else {
         return Ok(None);
     };
@@ -853,11 +852,9 @@ fn api_key_from_sources(
         .clone()
         .filter(|key| !key.is_empty())
         .or_else(|| {
-            env_vars.iter().find_map(|env_var| {
-                std::env::var(env_var)
-                    .ok()
-                    .filter(|key| !key.is_empty())
-            })
+            env_vars
+                .iter()
+                .find_map(|env_var| std::env::var(env_var).ok().filter(|key| !key.is_empty()))
         })
         .or_else(|| {
             state_manager
@@ -882,9 +879,7 @@ fn provider_from_state(
         return Some(provider);
     }
 
-    for (provider, secret_key) in
-        [("anthropic", "apiKey"), ("openrouter", "openRouterApiKey")]
-    {
+    for (provider, secret_key) in [("anthropic", "apiKey"), ("openrouter", "openRouterApiKey")] {
         if state_manager
             .get_secret(secret_key)
             .is_some_and(|key| !key.is_empty())
@@ -1047,9 +1042,7 @@ pub(crate) fn create_provider(
                 );
             }
             if task_opts.reasoning_effort.is_some() {
-                anyhow::bail!(
-                    "--reasoning-effort is not supported by MiniMax."
-                );
+                anyhow::bail!("--reasoning-effort is not supported by MiniMax.");
             }
             let default_model = model_id
                 .or_else(|| {
@@ -1141,7 +1134,7 @@ pub(crate) fn create_provider(
                         base_url,
                         model_info,
                         reasoning_effort: reasoning_effort_str,
-                        extra_body: extra_body.clone(),
+                        extra_body,
                         custom_headers: user_agent.map(|ua| {
                             let mut headers = std::collections::HashMap::with_capacity(1);
                             headers.insert("User-Agent".to_string(), ua);
@@ -1185,8 +1178,7 @@ pub(crate) fn create_provider(
                     state.act_mode_api_model_id
                 })
                 .unwrap_or_else(|| "gemini-3.6-flash".to_string());
-            let gemini_model_info =
-                crate::providers::gemini::get_gemini_model_info(&default_model);
+            let gemini_model_info = crate::providers::gemini::get_gemini_model_info(&default_model);
             // Reject flags that the selected Gemini generation cannot honour.
             if task_opts.thinking.is_some()
                 && gemini_model_info
@@ -1230,14 +1222,10 @@ pub(crate) fn create_provider(
         }
         "deepseek" => {
             if task_opts.reasoning_effort.is_some() {
-                anyhow::bail!(
-                    "--reasoning-effort is not supported by DeepSeek."
-                );
+                anyhow::bail!("--reasoning-effort is not supported by DeepSeek.");
             }
             if task_opts.thinking.is_some() {
-                anyhow::bail!(
-                    "--thinking is not supported by DeepSeek."
-                );
+                anyhow::bail!("--thinking is not supported by DeepSeek.");
             }
             let api_key = api_key_from_sources(
                 task_opts,
@@ -1260,7 +1248,7 @@ pub(crate) fn create_provider(
                         model_info: Some(crate::providers::deepseek::get_deepseek_model_info(
                             &model_id_str,
                         )),
-                        extra_body: extra_body.clone(),
+                        extra_body,
                     },
                 )?,
             ))
@@ -1284,8 +1272,7 @@ pub(crate) fn create_provider(
                      Set the environment variable, use --api-key, or run sned auth --provider openrouter."
                 )
             })?;
-            let model_id_str =
-                model_id.unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
+            let model_id_str = model_id.unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
             Arc::new(crate::providers::Providers::OpenRouter(
                 crate::providers::openrouter::OpenRouterProvider::new(
                     crate::providers::openrouter::OpenRouterConfig {
@@ -1296,7 +1283,7 @@ pub(crate) fn create_provider(
                         )),
                         provider_sort: None,
                         reasoning_effort: reasoning_effort_str,
-                        extra_body: extra_body.clone(),
+                        extra_body,
                         provider_name: None,
                     },
                 )?,
@@ -1486,8 +1473,9 @@ fn build_tool_registry(
     registry.register(
         crate::core::tools::SnedTool::FindSymbolReferences,
         Arc::new(
-            crate::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler::new()
-                .with_symbol_index(Arc::clone(&symbol_index_service)),
+            crate::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler::new(
+            )
+            .with_symbol_index(Arc::clone(&symbol_index_service)),
         ),
     );
     registry.register(
@@ -1802,7 +1790,7 @@ pub fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Task { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),
-        Some(Command::History { opts }) => run_history(opts),
+        Some(Command::History { opts }) => run_history(&opts),
         Some(Command::Config { opts }) => run_config(opts),
         Some(Command::Auth { opts }) => run_auth(opts),
         Some(Command::Version) => {
@@ -2147,20 +2135,14 @@ mod tests {
     fn parse_thinking_flag() {
         // Bare --thinking defaults to 1024 via default_missing_value
         let cli = Cli::try_parse_from(["sned", "--thinking"]).unwrap();
-        assert_eq!(
-            cli.task_opts.thinking,
-            Some(Some("1024".to_string()))
-        );
+        assert_eq!(cli.task_opts.thinking, Some(Some("1024".to_string())));
     }
 
     #[test]
     fn parse_thinking_flag_with_value() {
         // --thinking=4096 uses require_equals syntax
         let cli = Cli::try_parse_from(["sned", "--thinking=4096", "test"]).unwrap();
-        assert_eq!(
-            cli.task_opts.thinking,
-            Some(Some("4096".to_string()))
-        );
+        assert_eq!(cli.task_opts.thinking, Some(Some("4096".to_string())));
     }
 
     #[test]
@@ -2178,10 +2160,7 @@ mod tests {
     #[test]
     fn parse_reasoning_effort_flag() {
         let cli = Cli::try_parse_from(["sned", "--reasoning-effort", "high", "test"]).unwrap();
-        assert_eq!(
-            cli.task_opts.reasoning_effort,
-            Some(ReasoningEffort::High)
-        );
+        assert_eq!(cli.task_opts.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]
@@ -2192,13 +2171,8 @@ mod tests {
 
     #[test]
     fn parse_thinking_and_reasoning_effort_are_mutually_exclusive() {
-        let result = Cli::try_parse_from([
-            "sned",
-            "--thinking",
-            "--reasoning-effort",
-            "high",
-            "test",
-        ]);
+        let result =
+            Cli::try_parse_from(["sned", "--thinking", "--reasoning-effort", "high", "test"]);
         assert!(result.is_err(), "expected conflict error");
     }
 
@@ -2844,8 +2818,7 @@ mod tests {
             ("openrouter", "OPENROUTER_API_KEY"),
             ("minimax", "MINIMAX_API_KEY"),
         ] {
-            let cli = Cli::try_parse_from(["sned", "--provider", provider, "test prompt"])
-                .unwrap();
+            let cli = Cli::try_parse_from(["sned", "--provider", provider, "test prompt"]).unwrap();
             let error = create_provider(&cli.task_opts, None).unwrap_err();
             let message = error.to_string();
             assert!(
@@ -3147,13 +3120,7 @@ mod tests {
     fn test_create_provider_openai_rejects_thinking() {
         let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
-        let cli = Cli::try_parse_from([
-            "sned",
-            "--provider",
-            "openai",
-            "--thinking",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["sned", "--provider", "openai", "--thinking"]).unwrap();
         let err = create_provider(&cli.task_opts, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -3165,15 +3132,8 @@ mod tests {
 
     #[test]
     fn test_create_provider_rejects_extra_body_for_non_compatible_provider() {
-        let cli = Cli::try_parse_from([
-            "sned",
-            "--provider",
-            "mock",
-            "--extra-body",
-            "{}",
-            "test",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["sned", "--provider", "mock", "--extra-body", "{}", "test"])
+            .unwrap();
 
         let err = create_provider(&cli.task_opts, None).unwrap_err();
         assert!(

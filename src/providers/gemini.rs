@@ -220,9 +220,7 @@ impl GeminiProvider {
             }
             // Both set — guarded by clap conflicts_with, but handle gracefully
             (Some(_), Some(_)) => {
-                tracing::warn!(
-                    "Both --thinking and --reasoning-effort set for Gemini; ignoring"
-                );
+                tracing::warn!("Both --thinking and --reasoning-effort set for Gemini; ignoring");
             }
         }
 
@@ -415,7 +413,7 @@ fn process_gemini_sse_line(
     last_stop_reason: &mut Option<String>,
     response_blocked: &mut bool,
     last_grounding_metadata: &mut Option<serde_json::Value>,
-    model_info: &Option<crate::providers::ModelInfo>,
+    model_info: Option<&crate::providers::ModelInfo>,
 ) {
     let line = line.trim();
     if line.is_empty() || line == "data: [DONE]" {
@@ -621,7 +619,7 @@ fn process_gemini_sse_line(
         let thoughts_tokens = usage.thoughts_token_count.unwrap_or(0);
 
         // Calculate cost using model pricing
-        let total_cost = model_info.as_ref().and_then(|info| {
+        let total_cost = model_info.and_then(|info| {
             let mut input_price = info.input_price?;
             let mut output_price = info.output_price?;
             let mut cache_reads_price = info.cache_reads_price.unwrap_or(0.0);
@@ -797,7 +795,7 @@ impl Provider for GeminiProvider {
                                 &mut last_stop_reason,
                                 &mut response_blocked,
                                 &mut last_grounding_metadata,
-                                &model_info,
+                                model_info.as_ref(),
                             );
                         }
                         if let Some(err) = sse_buffer.take_error() {
@@ -1867,7 +1865,7 @@ mod tests {
                 &mut last_stop_reason,
                 &mut response_blocked,
                 &mut last_grounding_metadata,
-                &None,
+                None,
             );
 
             let ApiStreamChunk::Error(error) = rx
@@ -1904,7 +1902,7 @@ mod tests {
             &mut last_stop_reason,
             &mut response_blocked,
             &mut last_grounding_metadata,
-            &None,
+            None,
         );
 
         let ApiStreamChunk::Error(error) =
@@ -1938,7 +1936,7 @@ mod tests {
             &mut last_stop_reason,
             &mut response_blocked,
             &mut last_grounding_metadata,
-            &None,
+            None,
         );
 
         assert!(matches!(rx.try_recv(), Ok(ApiStreamChunk::Error(_))));

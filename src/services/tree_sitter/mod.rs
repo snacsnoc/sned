@@ -41,9 +41,8 @@ pub fn parse_file(
         .set_language(&entry.language)
         .map_err(|e| LanguageParserError::ParserCreation(e.to_string()))?;
 
-    let tree = match parser.parse(file_content, None) {
-        Some(t) => t,
-        None => return Ok(None),
+    let Some(tree) = parser.parse(file_content, None) else {
+        return Ok(None);
     };
 
     let mut definitions: Vec<ParsedDefinition> = Vec::new();

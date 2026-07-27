@@ -1345,13 +1345,13 @@ impl StateManager {
 
     /// Get a secret
     pub fn get_secret(&self, key: &str) -> Option<String> {
-        if let Some(secret) = self
+        let cached_secret = self
             .secrets
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
-            .cloned()
-        {
+            .cloned();
+        if let Some(secret) = cached_secret {
             return Some(secret);
         }
 

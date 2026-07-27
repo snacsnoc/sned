@@ -121,7 +121,7 @@ impl ReplaceSymbolHandler {
                     let symbol_list = fr
                         .symbols
                         .iter()
-                        .map(|s| format!("'{}'", s))
+                        .map(|s| format!("'{s}'"))
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!(
@@ -169,7 +169,7 @@ impl ReplaceSymbolHandler {
         let summaries: Vec<String> = file_results
             .into_iter()
             .map(|fr| {
-                let symbol_list = fr.symbols.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ");
+                let symbol_list = fr.symbols.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ");
                 let mut summary = format!("Successfully replaced symbols {} in {}. Any existing hash anchors for these symbols are now stale.", symbol_list, fr.display_path);
                 if !fr.new_problems_message.is_empty() {
                     summary.push_str(&format!("\n\nNew problems detected after saving the file:\n{}", fr.new_problems_message));
@@ -187,7 +187,7 @@ impl ReplaceSymbolHandler {
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
         let workspace_root = std::env::current_dir().map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to get current directory: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to get current directory: {e}"))
         })?;
         self.execute_with_workspace_root(state, params, &workspace_root)
             .await
@@ -325,9 +325,7 @@ async fn process_batch(
         })?;
 
     let language_parsers = load_required_language_parsers(&[batch.absolute_path.as_str()])
-        .map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to load language parsers: {}", e))
-        })?;
+        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}")))?;
 
     let mut resolved_replacements: Vec<(Replacement, SymbolRange)> = Vec::new();
 
@@ -472,7 +470,7 @@ async fn process_batch(
 
     crate::storage::disk::atomic_write_file_async(&batch.absolute_path, &current_content)
         .await
-        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write file: {}", e)))?;
+        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write file: {e}")))?;
 
     Ok(FileResult {
         display_path: batch.display_path.clone(),
@@ -498,8 +496,7 @@ fn find_symbol_via_tree_sitter(
     ) {
         Ok(range) => Ok(range),
         Err(e) => Err(ToolError::ExecutionFailed(format!(
-            "Error finding symbol: {}",
-            e
+            "Error finding symbol: {e}"
         ))),
     }
 }

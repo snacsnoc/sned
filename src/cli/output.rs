@@ -363,16 +363,16 @@ impl DropCounters {
         let o = self.other.load(std::sync::atomic::Ordering::Relaxed);
         let mut parts = Vec::new();
         if m > 0 {
-            parts.push(format!("{} model", m));
+            parts.push(format!("{m} model"));
         }
         if t > 0 {
-            parts.push(format!("{} tools", t));
+            parts.push(format!("{t} tools"));
         }
         if a > 0 {
-            parts.push(format!("{} approvals", a));
+            parts.push(format!("{a} approvals"));
         }
         if o > 0 {
-            parts.push(format!("{} other", o));
+            parts.push(format!("{o} other"));
         }
         if parts.is_empty() {
             "none".to_string()

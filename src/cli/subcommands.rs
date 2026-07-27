@@ -86,7 +86,11 @@ where
             }
             KeyCode::Backspace => {
                 if key.pop().is_some() {
-                    write!(output, "\r\x1b[K{prompt}{}", "*".repeat(key.chars().count()))?;
+                    write!(
+                        output,
+                        "\r\x1b[K{prompt}{}",
+                        "*".repeat(key.chars().count())
+                    )?;
                     output.flush()?;
                 }
             }
@@ -107,9 +111,7 @@ fn is_literal_environment_variable(value: &str) -> bool {
             && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
     };
     let value = value.trim();
-    value
-        .strip_prefix('$')
-        .is_some_and(is_name)
+    value.strip_prefix('$').is_some_and(is_name)
         || value
             .strip_prefix('%')
             .and_then(|name| name.strip_suffix('%'))
@@ -135,6 +137,17 @@ fn auth_environment_variable(provider: &str) -> &'static str {
         "minimax" => "MINIMAX_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
         _ => "API_KEY",
+    }
+}
+
+#[must_use]
+fn base_url_state_key(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "anthropic_base_url",
+        "openrouter" => "open_router_base_url",
+        "gemini" => "gemini_base_url",
+        "lite_llm" => "lite_llm_base_url",
+        _ => "open_ai_base_url",
     }
 }
 
@@ -177,7 +190,7 @@ fn read_interactive_api_key(provider: &str) -> anyhow::Result<Option<String>> {
     }
 }
 
-pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
+pub fn run_history(opts: &HistoryOptions) -> anyhow::Result<()> {
     use crate::storage::state_manager::StateManager;
     use crate::storage::state_manager::{list_tasks, sort_by_timestamp, total_pages};
     use chrono::{DateTime, Local};
@@ -885,14 +898,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
     }
 
     if let Some(base_url) = &opts.baseurl {
-        let base_url_key = match provider.as_str() {
-            "anthropic" => "anthropic_base_url",
-            "openai" | "openai-native" => "open_ai_base_url",
-            "openrouter" => "open_router_base_url",
-            "gemini" => "gemini_base_url",
-            "lite_llm" => "lite_llm_base_url",
-            _ => "open_ai_base_url",
-        };
+        let base_url_key = base_url_state_key(&provider);
         state_manager.set_global_state_string_field(base_url_key, base_url.clone())?;
     }
 
@@ -1122,7 +1128,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, MaskedApiKeyInput::Submitted("sk-pasted".to_string()));
+        assert_eq!(
+            result,
+            MaskedApiKeyInput::Submitted("sk-pasted".to_string())
+        );
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Enter API key: *********\n"
@@ -1170,7 +1179,10 @@ mod tests {
     #[test]
     fn test_validate_api_key_rejects_empty_and_literal_environment_variables() {
         for value in ["", "  ", "$API_KEY", "%API_KEY%"] {
-            assert!(validate_api_key(value).is_err(), "expected {value:?} to fail");
+            assert!(
+                validate_api_key(value).is_err(),
+                "expected {value:?} to fail"
+            );
         }
         assert!(validate_api_key("sk-test-key").is_ok());
     }
@@ -1183,6 +1195,17 @@ mod tests {
             "sned auth requires --apikey when stdin is not a terminal\n\nFor scripts:\n  sned auth --provider anthropic --apikey \"$ANTHROPIC_API_KEY\"\n\nFor interactive use, run sned auth from your shell (no pipe)."
         );
         assert!(require_auth_stdin_terminal(true, "anthropic").is_ok());
+    }
+
+    #[test]
+    fn test_base_url_state_key_preserves_openai_compatible_fallback() {
+        assert_eq!(base_url_state_key("anthropic"), "anthropic_base_url");
+        assert_eq!(base_url_state_key("openrouter"), "open_router_base_url");
+        assert_eq!(base_url_state_key("gemini"), "gemini_base_url");
+        assert_eq!(base_url_state_key("lite_llm"), "lite_llm_base_url");
+        for provider in ["openai", "openai-native", "deepseek", "minimax"] {
+            assert_eq!(base_url_state_key(provider), "open_ai_base_url");
+        }
     }
 
     #[test]
@@ -1221,7 +1244,10 @@ mod tests {
 
         let reloaded = crate::storage::state_manager::StateManager::new().unwrap();
         reloaded.initialize().unwrap();
-        assert_eq!(reloaded.get_secret("apiKey").as_deref(), Some("test-api-key"));
+        assert_eq!(
+            reloaded.get_secret("apiKey").as_deref(),
+            Some("test-api-key")
+        );
         assert_eq!(
             reloaded
                 .get_config_value("act_mode_api_provider")

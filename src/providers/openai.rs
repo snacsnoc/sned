@@ -591,7 +591,7 @@ async fn process_openai_sse_line(
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
-    model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
+    model_info: Option<&crate::providers::OpenAiCompatibleModelInfo>,
     usage_sent: &mut bool,
 ) {
     let line = line.trim();
@@ -759,7 +759,7 @@ async fn process_openai_sse_line(
             let uncached_input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
 
             // Calculate total cost using model pricing
-            let total_cost = model_info.as_ref().and_then(|info| {
+            let total_cost = model_info.and_then(|info| {
                 let input_price = info.base.input_price?;
                 let output_price = info.base.output_price?;
                 let cache_reads_price = info.base.cache_reads_price.unwrap_or(0.0);
@@ -815,7 +815,7 @@ pub async fn parse_openai_sse_to_chunks(
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
-    model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
+    model_info: Option<&crate::providers::OpenAiCompatibleModelInfo>,
     usage_sent: &mut bool,
 ) {
     for line in buffer.push_chunk(chunk) {
@@ -843,7 +843,7 @@ pub async fn finish_openai_sse_to_chunks(
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
     completed_tool_call_indices: &mut std::collections::HashSet<usize>,
     last_stop_reason: &mut Option<String>,
-    model_info: &Option<crate::providers::OpenAiCompatibleModelInfo>,
+    model_info: Option<&crate::providers::OpenAiCompatibleModelInfo>,
     usage_sent: &mut bool,
 ) {
     if let Some(line) = buffer.finish() {
@@ -1014,7 +1014,7 @@ impl Provider for OpenAiProvider {
                             &mut accumulated_tool_calls,
                             &mut completed_tool_call_indices,
                             &mut last_stop_reason,
-                            &model_info,
+                            model_info.as_ref(),
                             &mut usage_sent,
                         )
                         .await;
@@ -1055,7 +1055,7 @@ impl Provider for OpenAiProvider {
                     &mut accumulated_tool_calls,
                     &mut completed_tool_call_indices,
                     &mut last_stop_reason,
-                    &model_info,
+                    model_info.as_ref(),
                     &mut usage_sent,
                 )
                 .await;
@@ -1555,7 +1555,7 @@ mod tests {
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
-            &model_info,
+            model_info.as_ref(),
             &mut usage_sent,
         )
         .await;
@@ -1588,7 +1588,7 @@ mod tests {
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
-            &model_info,
+            model_info.as_ref(),
             &mut usage_sent,
         )
         .await;
@@ -2283,7 +2283,7 @@ mod tests {
                 &mut accumulated_tool_calls,
                 &mut completed_tool_call_indices,
                 &mut last_stop_reason,
-                &model_info,
+                model_info.as_ref(),
                 &mut usage_sent,
             )
             .await;
@@ -2334,7 +2334,7 @@ data: [DONE]
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
-            &model_info,
+            model_info.as_ref(),
             &mut usage_sent,
         )
         .await;
@@ -2345,7 +2345,7 @@ data: [DONE]
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
-            &model_info,
+            model_info.as_ref(),
             &mut usage_sent,
         )
         .await;
@@ -2413,7 +2413,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
-            &model_info,
+            model_info.as_ref(),
             &mut usage_sent,
         )
         .await;
@@ -2424,7 +2424,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190
             &mut accumulated_tool_calls,
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
-            &model_info,
+            model_info.as_ref(),
             &mut usage_sent,
         )
         .await;

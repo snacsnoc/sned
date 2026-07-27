@@ -196,32 +196,32 @@ pub fn plan_dry_run_migration(
     let destination_root = destination_root.as_ref().to_path_buf();
 
     let endpoints = compare_json_object_file(
-        source_root.join("endpoints.json"),
-        destination_root.join("endpoints.json"),
+        &source_root.join("endpoints.json"),
+        &destination_root.join("endpoints.json"),
         PathBuf::from("endpoints.json"),
     )?;
 
     let global_settings = compare_json_object_file(
-        source_root.join("data/settings/global_settings.json"),
-        destination_root.join("data/settings/global_settings.json"),
+        &source_root.join("data/settings/global_settings.json"),
+        &destination_root.join("data/settings/global_settings.json"),
         PathBuf::from("data/settings/global_settings.json"),
     )?;
 
     let secrets = compare_json_object_file(
-        source_root.join(".secrets.json"),
-        destination_root.join(".secrets.json"),
+        &source_root.join(".secrets.json"),
+        &destination_root.join(".secrets.json"),
         PathBuf::from(".secrets.json"),
     )?;
 
     let task_history = compare_task_history(
-        source_root.join("data/state/taskHistory.json"),
-        destination_root.join("data/state/taskHistory.json"),
+        &source_root.join("data/state/taskHistory.json"),
+        &destination_root.join("data/state/taskHistory.json"),
         PathBuf::from("data/state/taskHistory.json"),
     )?;
 
     let tasks = compare_task_directories(
-        source_root.join("data/tasks"),
-        destination_root.join("data/tasks"),
+        &source_root.join("data/tasks"),
+        &destination_root.join("data/tasks"),
     )?;
 
     Ok(DryRunMigrationReport {
@@ -971,8 +971,8 @@ impl MigrationEngine {
 }
 
 fn compare_json_object_file(
-    source_path: PathBuf,
-    destination_path: PathBuf,
+    source_path: &Path,
+    destination_path: &Path,
     relative_path: PathBuf,
 ) -> Result<Option<JsonObjectMigration>, MigrationError> {
     let source_exists = source_path.exists();
@@ -983,18 +983,18 @@ fn compare_json_object_file(
     }
 
     let source = if source_exists {
-        read_json_value(&source_path)?
+        read_json_value(source_path)?
     } else {
         Value::Object(Default::default())
     };
     let destination = if destination_exists {
-        read_json_value(&destination_path)?
+        read_json_value(destination_path)?
     } else {
         Value::Object(Default::default())
     };
 
-    let source_obj = as_object(&source, &source_path)?;
-    let destination_obj = as_object(&destination, &destination_path)?;
+    let source_obj = as_object(&source, source_path)?;
+    let destination_obj = as_object(&destination, destination_path)?;
 
     let source_keys: BTreeSet<String> = source_obj.keys().cloned().collect();
     let destination_keys: BTreeSet<String> = destination_obj.keys().cloned().collect();
@@ -1030,8 +1030,8 @@ fn compare_json_object_file(
 }
 
 fn compare_task_history(
-    source_path: PathBuf,
-    destination_path: PathBuf,
+    source_path: &Path,
+    destination_path: &Path,
     relative_path: PathBuf,
 ) -> Result<Option<TaskHistoryMigration>, MigrationError> {
     let source_exists = source_path.exists();
@@ -1042,18 +1042,18 @@ fn compare_task_history(
     }
 
     let source = if source_exists {
-        read_json_value(&source_path)?
+        read_json_value(source_path)?
     } else {
         Value::Array(Vec::new())
     };
     let destination = if destination_exists {
-        read_json_value(&destination_path)?
+        read_json_value(destination_path)?
     } else {
         Value::Array(Vec::new())
     };
 
-    let source_items = as_array(&source, &source_path)?;
-    let destination_items = as_array(&destination, &destination_path)?;
+    let source_items = as_array(&source, source_path)?;
+    let destination_items = as_array(&destination, destination_path)?;
 
     let mut destination_by_id = BTreeMap::new();
     for item in destination_items {
@@ -1097,8 +1097,8 @@ fn compare_task_history(
 }
 
 fn compare_task_directories(
-    source_dir: PathBuf,
-    destination_dir: PathBuf,
+    source_dir: &Path,
+    destination_dir: &Path,
 ) -> Result<Vec<TaskDirectoryMigration>, MigrationError> {
     if !source_dir.exists() {
         return Ok(Vec::new());
@@ -1107,12 +1107,12 @@ fn compare_task_directories(
     let mut task_ids = BTreeSet::new();
 
     if source_dir.exists() {
-        for entry in fs::read_dir(&source_dir).map_err(|source| MigrationError::Io {
-            path: source_dir.clone(),
+        for entry in fs::read_dir(source_dir).map_err(|source| MigrationError::Io {
+            path: source_dir.to_path_buf(),
             source,
         })? {
             let entry = entry.map_err(|source| MigrationError::Io {
-                path: source_dir.clone(),
+                path: source_dir.to_path_buf(),
                 source,
             })?;
             if entry
@@ -1129,12 +1129,12 @@ fn compare_task_directories(
     }
 
     if destination_dir.exists() {
-        for entry in fs::read_dir(&destination_dir).map_err(|source| MigrationError::Io {
-            path: destination_dir.clone(),
+        for entry in fs::read_dir(destination_dir).map_err(|source| MigrationError::Io {
+            path: destination_dir.to_path_buf(),
             source,
         })? {
             let entry = entry.map_err(|source| MigrationError::Io {
-                path: destination_dir.clone(),
+                path: destination_dir.to_path_buf(),
                 source,
             })?;
             if entry

@@ -79,8 +79,8 @@ fn mouse_scroll_lines() -> isize {
 
 fn build_user_message_content(
     clean_prompt: String,
-    image_paths: Vec<String>,
-    model_info: crate::providers::ModelInfo,
+    image_paths: &[String],
+    model_info: &crate::providers::ModelInfo,
     output_writer: &OutputWriterArc,
     show_image_warnings: bool,
 ) -> crate::providers::MessageContent {
@@ -95,7 +95,7 @@ fn build_user_message_content(
         }
         Vec::new()
     } else {
-        crate::cli::image_input::load_images_to_content_blocks(&image_paths)
+        crate::cli::image_input::load_images_to_content_blocks(image_paths)
     };
 
     if image_blocks.is_empty() {
@@ -410,8 +410,8 @@ impl InteractiveSession {
             };
             let user_content = build_user_message_content(
                 clean_prompt,
-                all_image_paths,
-                model_info,
+                &all_image_paths,
+                &model_info,
                 &output_writer,
                 !self.task_opts.json,
             );
@@ -872,7 +872,9 @@ fn open_path_in_default_app(path: &Path) -> std::io::Result<()> {
         if status.success() {
             Ok(())
         } else {
-            Err(std::io::Error::other(format!("opener exited with {status}")))
+            Err(std::io::Error::other(format!(
+                "opener exited with {status}"
+            )))
         }
     }
 
@@ -903,7 +905,11 @@ fn drain_path_open_failures(
 ) {
     while let Ok(failure) = failure_rx.try_recv() {
         app.show_notification(
-            format!("Failed to open {}: {}", failure.path.display(), failure.error),
+            format!(
+                "Failed to open {}: {}",
+                failure.path.display(),
+                failure.error
+            ),
             NotificationKind::Error,
         );
     }
@@ -934,7 +940,8 @@ fn handle_text_selection_mouse_event(
             if let Some(path) = click_target {
                 app.clear_text_selection();
                 open(path);
-            } else if let Some(text) = app.finish_text_selection(mouse_event.column, mouse_event.row)
+            } else if let Some(text) =
+                app.finish_text_selection(mouse_event.column, mouse_event.row)
                 && let Err(error) = copy(&text)
             {
                 app.push_styled(
@@ -1349,8 +1356,8 @@ async fn build_initial_message_from_prompt(
         let model_info = agent_loop.lock().await.get_provider().get_model().info;
         build_user_message_content(
             clean_prompt,
-            parsed_image_paths,
-            model_info,
+            &parsed_image_paths,
+            &model_info,
             output_writer,
             true,
         )
@@ -3357,14 +3364,8 @@ async fn run_main_loop(
 
                         // If agent is busy, cancel it
                         if agent_busy.load(Ordering::Relaxed) {
-                            cancel_agent(
-                                app,
-                                &state_handle,
-                                &agent_task,
-                                &agent_done,
-                                &agent_busy,
-                            )
-                            .await?;
+                            cancel_agent(app, &state_handle, &agent_task, &agent_done, &agent_busy)
+                                .await?;
                             app.agent_busy = false;
                             app.push_styled(
                                 "Press Ctrl+C again to quit.",
@@ -5179,8 +5180,8 @@ mod tests {
 
         let content = build_user_message_content(
             "hello".to_string(),
-            vec![tmp_path.to_string_lossy().into_owned()],
-            model_info,
+            &[tmp_path.to_string_lossy().into_owned()],
+            &model_info,
             &writer,
             true,
         );
@@ -5244,8 +5245,8 @@ mod tests {
 
         let content = build_user_message_content(
             "hello".to_string(),
-            vec![tmp_path.to_string_lossy().into_owned()],
-            model_info,
+            &[tmp_path.to_string_lossy().into_owned()],
+            &model_info,
             &writer_arc,
             true,
         );
@@ -8197,9 +8198,15 @@ mod tests {
         let state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>> =
             Arc::new(Mutex::new(None));
 
-        cancel_agent(&mut app, &state_handle, &task_slot, &agent_done, &agent_busy)
-            .await
-            .unwrap();
+        cancel_agent(
+            &mut app,
+            &state_handle,
+            &task_slot,
+            &agent_done,
+            &agent_busy,
+        )
+        .await
+        .unwrap();
 
         assert!(
             !agent_busy.load(Ordering::Relaxed),
@@ -8230,7 +8237,13 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_millis(200),
-            cancel_agent(&mut app, &state_handle, &task_slot, &agent_done, &agent_busy),
+            cancel_agent(
+                &mut app,
+                &state_handle,
+                &task_slot,
+                &agent_done,
+                &agent_busy,
+            ),
         )
         .await
         .expect("cancel_agent should not wait for agent_done notification")

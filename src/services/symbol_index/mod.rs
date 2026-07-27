@@ -105,6 +105,7 @@ impl SymbolIndexService {
         }
     }
 
+    #[must_use]
     pub fn disabled(mut self) -> Self {
         self.disabled = true;
         self.db = None;
@@ -117,6 +118,7 @@ impl SymbolIndexService {
     /// database is stored at `{index_root}/{INDEX_DIR}` instead of
     /// `{project_root}/{INDEX_DIR}`. The git exclude entry is skipped because
     /// the DB no longer lives inside the project tree.
+    #[must_use]
     pub fn with_index_root(mut self, root: String) -> Self {
         self.index_root = Some(root);
         self
@@ -295,10 +297,10 @@ impl SymbolIndexService {
     }
 
     fn record_index_update(&mut self, mtime: u64) {
-        self.status.indexed_file_count = self
-            .db
-            .as_ref()
-            .map_or(self.files.len(), db::SymbolIndexDatabase::indexed_file_count);
+        self.status.indexed_file_count = self.db.as_ref().map_or(
+            self.files.len(),
+            db::SymbolIndexDatabase::indexed_file_count,
+        );
         self.status.high_water_mtime = self.status.high_water_mtime.max(mtime);
         self.status.last_indexed_at = Some(SystemTime::now());
     }
@@ -350,7 +352,9 @@ impl SymbolIndexService {
 
 pub fn start_initial_walk(service: Arc<Mutex<SymbolIndexService>>) {
     let project_root = {
-        let service = service.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let service = service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if service.is_disabled() {
             return;
         }
@@ -419,7 +423,10 @@ pub async fn index_file_after_write(
     }
 }
 
-fn run_initial_walk(service: &Arc<Mutex<SymbolIndexService>>, project_root: &Path) -> anyhow::Result<()> {
+fn run_initial_walk(
+    service: &Arc<Mutex<SymbolIndexService>>,
+    project_root: &Path,
+) -> anyhow::Result<()> {
     if !is_git_worktree(project_root) {
         service
             .lock()
@@ -432,7 +439,9 @@ fn run_initial_walk(service: &Arc<Mutex<SymbolIndexService>>, project_root: &Pat
     let latest_candidate_mtime = latest_candidate_mtime(&candidates);
 
     {
-        let mut index = service.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut index = service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if index.should_skip_initial_walk(latest_candidate_mtime) {
             index.finish_initial_walk(candidates.len());
             return Ok(());
@@ -460,9 +469,13 @@ fn run_initial_walk(service: &Arc<Mutex<SymbolIndexService>>, project_root: &Pat
                         ));
                     }
                     Ok(None) => {}
-                    Err(error) => tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unparsable file"),
+                    Err(error) => {
+                        tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unparsable file")
+                    }
                 },
-                Err(error) => tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unreadable file"),
+                Err(error) => {
+                    tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unreadable file")
+                }
             }
         }
 
@@ -529,23 +542,31 @@ fn collect_index_candidates(project_root: &Path) -> Vec<IndexCandidate> {
             if name.starts_with('.') {
                 return false;
             }
-            !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_dir() && crate::core::file_search::is_excluded_dir(&name))
+            !entry.file_type().is_some_and(|file_type| {
+                file_type.is_dir() && crate::core::file_search::is_excluded_dir(&name)
+            })
         })
         .build()
         .flatten()
         .filter_map(|entry| {
-            if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
                 return None;
             }
             let metadata = entry.metadata().ok()?;
-            if metadata.len() > crate::core::tools::handlers::read_file::max_file_read_size() as u64 {
+            if metadata.len() > crate::core::tools::handlers::read_file::max_file_read_size() as u64
+            {
                 return None;
             }
             let path = entry.into_path();
             let _ = load_parser_for_path(&path)?;
-            let relative_path = path.strip_prefix(project_root).ok()?.to_string_lossy().into_owned();
+            let relative_path = path
+                .strip_prefix(project_root)
+                .ok()?
+                .to_string_lossy()
+                .into_owned();
             let mtime = metadata
                 .modified()
                 .ok()
@@ -806,7 +827,11 @@ mod tests {
         std::fs::create_dir_all(temp.path().join("src")).unwrap();
         std::fs::create_dir_all(temp.path().join("target")).unwrap();
         std::fs::write(temp.path().join("src/lib.rs"), "fn indexed_symbol() {}\n").unwrap();
-        std::fs::write(temp.path().join("target/ignored.rs"), "fn ignored_symbol() {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("target/ignored.rs"),
+            "fn ignored_symbol() {}\n",
+        )
+        .unwrap();
         std::fs::write(temp.path().join(".hidden.rs"), "fn hidden_symbol() {}\n").unwrap();
 
         let service = Arc::new(Mutex::new(SymbolIndexService::new(
@@ -849,7 +874,11 @@ mod tests {
                     format!("src/{index}.rs"),
                     100,
                     10,
-                    vec![make_symbol("persisted_symbol", index, SymbolType::Definition)],
+                    vec![make_symbol(
+                        "persisted_symbol",
+                        index,
+                        SymbolType::Definition,
+                    )],
                 )
             })
             .collect();

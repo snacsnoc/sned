@@ -249,7 +249,7 @@ impl ScrollbackWriter {
         let worker_path = path.clone();
         let handle = std::thread::Builder::new()
             .name("sned-scrollback-writer".to_string())
-            .spawn(move || scrollback_writer_loop(&worker_path, receiver, &error_sender))?;
+            .spawn(move || scrollback_writer_loop(&worker_path, &receiver, &error_sender))?;
         Ok(Self {
             path,
             sender,
@@ -320,7 +320,7 @@ impl ScrollbackWriter {
 
 fn scrollback_writer_loop(
     path: &Path,
-    receiver: std_mpsc::Receiver<ScrollbackCommand>,
+    receiver: &std_mpsc::Receiver<ScrollbackCommand>,
     error_sender: &std_mpsc::Sender<String>,
 ) {
     let mut pending = Vec::new();
@@ -1635,8 +1635,7 @@ impl App {
             self.text_selection = None;
             return None;
         };
-        let (row_index, column_index) =
-            Self::normalize_surface_point(surface, column, row)?;
+        let (row_index, column_index) = Self::normalize_surface_point(surface, column, row)?;
         let point = Self::selection_point(surface, row_index, column_index)?;
         let selection = self
             .text_selection
@@ -2574,9 +2573,7 @@ impl App {
             let mut hyperlink_targets = Vec::new();
             let mut rendered = Self::parse_osc8_line(line, &mut hyperlink_targets);
             if extra_width > 0 {
-                rendered
-                    .spans
-                    .insert(0, Span::raw("│".repeat(extra_width)));
+                rendered.spans.insert(0, Span::raw("│".repeat(extra_width)));
             }
             return Paragraph::new(rendered)
                 .wrap(Wrap { trim: false })
@@ -2768,10 +2765,7 @@ impl App {
             .any(|span| span.content.contains(OSC8_PREFIX))
     }
 
-    fn parse_osc8_line(
-        line: &Line<'_>,
-        hyperlink_targets: &mut Vec<PathBuf>,
-    ) -> Line<'static> {
+    fn parse_osc8_line(line: &Line<'_>, hyperlink_targets: &mut Vec<PathBuf>) -> Line<'static> {
         let mut spans = Vec::new();
         for span in &line.spans {
             let mut remaining = span.content.as_ref();
@@ -3565,8 +3559,7 @@ impl App {
                 .wrap(Wrap { trim: false })
                 .scroll((Self::terminal_scroll_offset(visible_scroll_y), 0))
                 .block(
-                    theme::border_block(title)
-                        .padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
+                    theme::border_block(title).padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
                 );
             frame.render_widget(output, main_output_area);
         }
@@ -3737,11 +3730,7 @@ impl App {
         item_count > visible_rows
     }
 
-    fn picker_scrollbar_position(
-        selected: usize,
-        item_count: usize,
-        visible_rows: usize,
-    ) -> usize {
+    fn picker_scrollbar_position(selected: usize, item_count: usize, visible_rows: usize) -> usize {
         Self::picker_viewport_start(selected, item_count, visible_rows)
     }
 
@@ -3766,18 +3755,15 @@ impl App {
                 )
             })
             .collect();
-        let has_results = !labels.is_empty();
+        let result_count = labels.len();
 
         let selected = self
             .picker_index
             .min(self.picker_results.len().saturating_sub(1));
-        let first_visible = Self::picker_viewport_start(
-            selected,
-            self.picker_results.len(),
-            visible_rows,
-        );
+        let first_visible =
+            Self::picker_viewport_start(selected, self.picker_results.len(), visible_rows);
         let query = self.mention_search_query.trim_start_matches('@');
-        let rows: Vec<Line> = if !has_results {
+        let rows: Vec<Line> = if result_count == 0 {
             let message = if query.is_empty() {
                 " No matches".to_string()
             } else {
@@ -3801,14 +3787,14 @@ impl App {
         };
 
         frame.render_widget(Clear, overlay_area);
-        let title = if !has_results {
+        let title = if result_count == 0 {
             if query.is_empty() {
                 " Files ".to_string()
             } else {
                 format!(" Files · @{query} ")
             }
         } else {
-            format!(" Files ({}) · @{query} ", self.picker_results.len())
+            format!(" Files ({result_count}) · @{query} ")
         };
         let block = theme::overlay_block(title);
         let inner = block.inner(overlay_area);
@@ -3844,11 +3830,8 @@ impl App {
         let selected = self
             .slash_command_selected
             .min(self.slash_command_results.len().saturating_sub(1));
-        let first_visible = Self::picker_viewport_start(
-            selected,
-            self.slash_command_results.len(),
-            visible_rows,
-        );
+        let first_visible =
+            Self::picker_viewport_start(selected, self.slash_command_results.len(), visible_rows);
 
         let rows: Vec<Line> = if self.slash_command_results.is_empty() {
             vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
@@ -4020,11 +4003,8 @@ impl App {
         let selected = self
             .model_picker_selected
             .min(self.model_picker_results.len().saturating_sub(1));
-        let first_visible = Self::picker_viewport_start(
-            selected,
-            self.model_picker_results.len(),
-            visible_rows,
-        );
+        let first_visible =
+            Self::picker_viewport_start(selected, self.model_picker_results.len(), visible_rows);
 
         let rows: Vec<Line> = if self.model_picker_results.is_empty() {
             vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
@@ -4406,8 +4386,7 @@ mod tests {
         ));
         let wrap_width = 10usize;
         let mut targets = Vec::new();
-        let rendered =
-            App::output_row_for_render(Some(&line), BlockKind::ToolOutput, &mut targets);
+        let rendered = App::output_row_for_render(Some(&line), BlockKind::ToolOutput, &mut targets);
         let expected = Paragraph::new(rendered)
             .wrap(Wrap { trim: false })
             .line_count(wrap_width as u16);
@@ -5396,11 +5375,15 @@ mod tests {
 
         let mut model_picker = App::new();
         model_picker.model_picker_active = true;
-        model_picker.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
+        model_picker.model_picker_results =
+            crate::cli::slash_commands::build_model_picker_entries();
         model_picker.model_picker_selected = model_picker.model_picker_results.len() - 1;
         let selected_model = model_picker.model_picker_results.last().unwrap().label;
         let rendered = render(&mut model_picker);
-        assert!(rendered.contains(&format!("Models ({})", model_picker.model_picker_results.len())));
+        assert!(rendered.contains(&format!(
+            "Models ({})",
+            model_picker.model_picker_results.len()
+        )));
         assert!(rendered.contains(selected_model));
         assert!(rendered.contains("Tab/Enter switch"));
     }
@@ -5529,10 +5512,7 @@ mod tests {
         app.task_id = "task-1".to_string();
         app.mode = "ACT".to_string();
         app.yolo_mode = true;
-        app.show_notification(
-            "Model switched to openai/gpt-4",
-            NotificationKind::Success,
-        );
+        app.show_notification("Model switched to openai/gpt-4", NotificationKind::Success);
         let expires_at = app
             .status_notification
             .as_ref()
