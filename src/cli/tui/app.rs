@@ -33,6 +33,7 @@ const MAX_SCROLLBACK_LOAD_LINES: usize = 10_000;
 const MAX_PASTED_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FOLDED_PASTE_CHUNKS: usize = 256;
 const STATUS_NOTIFICATION_DURATION: Duration = Duration::from_secs(4);
+const PICKER_MAX_VISIBLE_ROWS: usize = 8;
 const OSC8_PREFIX: &str = "\x1b]8;;";
 const HYPERLINK_MARKER_RED: u8 = 0xFE;
 static NEXT_PASTE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -3555,11 +3556,16 @@ impl App {
         {
             frame.render_widget(Clear, main_output_area);
             let visible_lines = self.collect_output_rows_range(start_idx, visible_count);
+            let title = if self.in_scrollback {
+                " sned (scrollback) "
+            } else {
+                " sned "
+            };
             let output = Paragraph::new(visible_lines)
                 .wrap(Wrap { trim: false })
                 .scroll((Self::terminal_scroll_offset(visible_scroll_y), 0))
                 .block(
-                    theme::border_block(" sned ")
+                    theme::border_block(title)
                         .padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
                 );
             frame.render_widget(output, main_output_area);
@@ -3661,24 +3667,90 @@ impl App {
         }
     }
 
-    /// Render file picker overlay as a floating Table widget.
-    #[allow(dead_code)]
+    fn picker_overlay_area(output_area: Rect, item_count: usize) -> Option<(Rect, usize)> {
+        if output_area.width < 4 || output_area.height < 4 {
+            return None;
+        }
+
+        let horizontal_margin = output_area.width.saturating_sub(4).min(2);
+        let width = output_area.width.saturating_sub(horizontal_margin).min(50);
+        if width < 4 {
+            return None;
+        }
+
+        let visible_rows = item_count
+            .max(1)
+            .min(usize::from(output_area.height.saturating_sub(3)))
+            .min(PICKER_MAX_VISIBLE_ROWS);
+        let height = visible_rows as u16 + 3;
+        Some((
+            Rect {
+                x: output_area.x + horizontal_margin,
+                y: output_area
+                    .y
+                    .saturating_add(output_area.height.saturating_sub(height)),
+                width,
+                height,
+            },
+            visible_rows,
+        ))
+    }
+
+    fn picker_viewport_start(selected: usize, item_count: usize, visible_rows: usize) -> usize {
+        if item_count <= visible_rows {
+            return 0;
+        }
+        selected
+            .min(item_count.saturating_sub(1))
+            .saturating_sub(visible_rows / 2)
+            .min(item_count.saturating_sub(visible_rows))
+    }
+
+    fn render_picker_scrollbar(
+        frame: &mut Frame,
+        list_area: Rect,
+        item_count: usize,
+        selected: usize,
+        visible_rows: usize,
+    ) {
+        if !Self::picker_has_scrollbar(item_count, visible_rows) {
+            return;
+        }
+
+        let mut state = ScrollbarState::new(item_count)
+            .viewport_content_length(visible_rows)
+            .position(Self::picker_scrollbar_position(
+                selected,
+                item_count,
+                visible_rows,
+            ));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .style(theme::scrollbar_style())
+                .thumb_style(theme::scrollbar_thumb_style()),
+            list_area,
+            &mut state,
+        );
+    }
+
+    fn picker_has_scrollbar(item_count: usize, visible_rows: usize) -> bool {
+        item_count > visible_rows
+    }
+
+    fn picker_scrollbar_position(
+        selected: usize,
+        item_count: usize,
+        visible_rows: usize,
+    ) -> usize {
+        Self::picker_viewport_start(selected, item_count, visible_rows)
+    }
+
     fn render_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
-        let max_height = 10.min(self.picker_results.len() as u16).max(1);
-        let width = 50.min(output_area.width);
-
-        // Position picker at bottom of output area, just above status bar
-        let overlay_area = Rect {
-            x: output_area.x + 2,
-            y: output_area
-                .y
-                .saturating_add(output_area.height.saturating_sub(max_height + 4)),
-            width,
-            height: max_height + 2, // +2 for border
+        let Some((overlay_area, visible_rows)) =
+            Self::picker_overlay_area(output_area, self.picker_results.len())
+        else {
+            return;
         };
-
-        // Pre-compute display labels once per frame so the inner
-        // closure only does the per-row span/line construction.
         let labels: Vec<String> = self
             .picker_results
             .iter()
@@ -3694,15 +3766,32 @@ impl App {
                 )
             })
             .collect();
+        let has_results = !labels.is_empty();
 
-        let rows: Vec<Line> = if labels.is_empty() {
-            vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
+        let selected = self
+            .picker_index
+            .min(self.picker_results.len().saturating_sub(1));
+        let first_visible = Self::picker_viewport_start(
+            selected,
+            self.picker_results.len(),
+            visible_rows,
+        );
+        let query = self.mention_search_query.trim_start_matches('@');
+        let rows: Vec<Line> = if !has_results {
+            let message = if query.is_empty() {
+                " No matches".to_string()
+            } else {
+                format!(" No matches for @{query}")
+            };
+            vec![Line::from(Span::styled(message, theme::dim_style()))]
         } else {
             labels
                 .into_iter()
                 .enumerate()
+                .skip(first_visible)
+                .take(visible_rows)
                 .map(|(i, label)| {
-                    if i == self.picker_index {
+                    if i == selected {
                         Line::from(Span::styled(label, theme::picker_selected_style()))
                     } else {
                         Line::from(label)
@@ -3711,33 +3800,55 @@ impl App {
                 .collect()
         };
 
-        let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
-            " Files ({}) ",
-            self.picker_results.len()
-        )));
-
         frame.render_widget(Clear, overlay_area);
-        frame.render_widget(picker, overlay_area);
+        let title = if !has_results {
+            if query.is_empty() {
+                " Files ".to_string()
+            } else {
+                format!(" Files · @{query} ")
+            }
+        } else {
+            format!(" Files ({}) · @{query} ", self.picker_results.len())
+        };
+        let block = theme::overlay_block(title);
+        let inner = block.inner(overlay_area);
+        frame.render_widget(block, overlay_area);
+        let [list_area, footer_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        frame.render_widget(Paragraph::new(rows), list_area);
+        frame.render_widget(
+            Paragraph::new("Tab select · ↑/↓ choose · Enter insert · Esc close")
+                .style(theme::dim_style()),
+            footer_area,
+        );
+        Self::render_picker_scrollbar(
+            frame,
+            list_area,
+            self.picker_results.len(),
+            selected,
+            visible_rows,
+        );
     }
 
-    /// Render slash command picker overlay as a floating Table widget.
     fn render_slash_command_overlay(&self, frame: &mut Frame, output_area: Rect) {
         if self.slash_command_help_active {
             self.render_slash_command_help_overlay(frame, output_area);
             return;
         }
 
-        let max_height = 10.min(self.slash_command_results.len() as u16).max(1);
-        let width = 50.min(output_area.width);
-
-        let overlay_area = Rect {
-            x: output_area.x + 2,
-            y: output_area
-                .y
-                .saturating_add(output_area.height.saturating_sub(max_height + 4)),
-            width,
-            height: max_height + 2,
+        let Some((overlay_area, visible_rows)) =
+            Self::picker_overlay_area(output_area, self.slash_command_results.len())
+        else {
+            return;
         };
+        let selected = self
+            .slash_command_selected
+            .min(self.slash_command_results.len().saturating_sub(1));
+        let first_visible = Self::picker_viewport_start(
+            selected,
+            self.slash_command_results.len(),
+            visible_rows,
+        );
 
         let rows: Vec<Line> = if self.slash_command_results.is_empty() {
             vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
@@ -3745,6 +3856,8 @@ impl App {
             self.slash_command_results
                 .iter()
                 .enumerate()
+                .skip(first_visible)
+                .take(visible_rows)
                 .map(|(i, entry)| {
                     let category_marker = match entry.category {
                         crate::cli::slash_commands::SlashCommandCategory::Agent => "▶ ",
@@ -3754,7 +3867,7 @@ impl App {
                     };
                     let label =
                         format!("{} {} - {}", category_marker, entry.name, entry.description);
-                    if i == self.slash_command_selected {
+                    if i == selected {
                         Line::from(Span::styled(label, theme::picker_selected_style()))
                     } else {
                         Line::from(label)
@@ -3763,13 +3876,36 @@ impl App {
                 .collect()
         };
 
-        let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
-            " Slash Commands ({}) ",
-            self.slash_command_results.len()
-        )));
-
         frame.render_widget(Clear, overlay_area);
-        frame.render_widget(picker, overlay_area);
+        let input_text = self.input.lines().join("\n");
+        let query = crate::cli::slash_commands::extract_slash_query(&input_text)
+            .unwrap_or_else(|| input_text.trim().trim_start_matches('/').to_string());
+        let title = if query.is_empty() {
+            format!(" Slash Commands ({}) ", self.slash_command_results.len())
+        } else {
+            format!(
+                " Slash Commands ({}) · /{query} ",
+                self.slash_command_results.len()
+            )
+        };
+        let block = theme::overlay_block(title);
+        let inner = block.inner(overlay_area);
+        frame.render_widget(block, overlay_area);
+        let [list_area, footer_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        frame.render_widget(Paragraph::new(rows), list_area);
+        frame.render_widget(
+            Paragraph::new("Tab complete · Enter submit · ↑/↓ select · Esc close")
+                .style(theme::dim_style()),
+            footer_area,
+        );
+        Self::render_picker_scrollbar(
+            frame,
+            list_area,
+            self.slash_command_results.len(),
+            selected,
+            visible_rows,
+        );
     }
 
     fn render_slash_command_help_overlay(&self, frame: &mut Frame, output_area: Rect) {
@@ -3875,19 +4011,20 @@ impl App {
         );
     }
 
-    /// Render model picker overlay as a floating widget.
     fn render_model_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
-        let max_height = 10.min(self.model_picker_results.len() as u16).max(1);
-        let width = 50.min(output_area.width);
-
-        let overlay_area = Rect {
-            x: output_area.x + 2,
-            y: output_area
-                .y
-                .saturating_add(output_area.height.saturating_sub(max_height + 4)),
-            width,
-            height: max_height + 2,
+        let Some((overlay_area, visible_rows)) =
+            Self::picker_overlay_area(output_area, self.model_picker_results.len())
+        else {
+            return;
         };
+        let selected = self
+            .model_picker_selected
+            .min(self.model_picker_results.len().saturating_sub(1));
+        let first_visible = Self::picker_viewport_start(
+            selected,
+            self.model_picker_results.len(),
+            visible_rows,
+        );
 
         let rows: Vec<Line> = if self.model_picker_results.is_empty() {
             vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
@@ -3895,12 +4032,14 @@ impl App {
             self.model_picker_results
                 .iter()
                 .enumerate()
+                .skip(first_visible)
+                .take(visible_rows)
                 .map(|(i, entry)| {
                     let label = format!(
                         "[{}] {} - {}",
                         entry.provider, entry.label, entry.description
                     );
-                    if i == self.model_picker_selected {
+                    if i == selected {
                         Line::from(Span::styled(label, theme::picker_selected_style()))
                     } else {
                         Line::from(label)
@@ -3909,13 +4048,24 @@ impl App {
                 .collect()
         };
 
-        let picker = Paragraph::new(rows).block(theme::overlay_block(format!(
-            " Models ({}) ",
-            self.model_picker_results.len()
-        )));
-
         frame.render_widget(Clear, overlay_area);
-        frame.render_widget(picker, overlay_area);
+        let block = theme::overlay_block(format!(" Models ({}) ", self.model_picker_results.len()));
+        let inner = block.inner(overlay_area);
+        frame.render_widget(block, overlay_area);
+        let [list_area, footer_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        frame.render_widget(Paragraph::new(rows), list_area);
+        frame.render_widget(
+            Paragraph::new("Tab/Enter switch · ↑/↓ select · Esc close").style(theme::dim_style()),
+            footer_area,
+        );
+        Self::render_picker_scrollbar(
+            frame,
+            list_area,
+            self.model_picker_results.len(),
+            selected,
+            visible_rows,
+        );
     }
 
     pub fn handle_paste(&mut self, content: &str, fold_large: bool) -> PasteOutcome {
@@ -5155,6 +5305,7 @@ mod tests {
 
         assert!(rendered.contains("Files (1)"));
         assert!(rendered.contains("main.rs"));
+        assert!(rendered.contains("Tab select"));
     }
 
     #[test]
@@ -5170,9 +5321,10 @@ mod tests {
 
         let mut file_picker = App::new();
         file_picker.picker_active = true;
+        file_picker.mention_search_query = "zzz".to_string();
         let rendered = render(&mut file_picker);
-        assert!(rendered.contains("Files (0)"));
-        assert!(rendered.contains("No matches"));
+        assert!(rendered.contains("Files · @zzz"));
+        assert!(rendered.contains("No matches for @zzz"));
 
         let mut slash_picker = App::new();
         slash_picker.slash_command_active = true;
@@ -5185,6 +5337,94 @@ mod tests {
         let rendered = render(&mut model_picker);
         assert!(rendered.contains("Models (0)"));
         assert!(rendered.contains("No matches"));
+    }
+
+    #[test]
+    fn test_picker_viewport_centers_selected_result_and_only_scrolls_when_needed() {
+        assert_eq!(App::picker_viewport_start(0, 12, 8), 0);
+        assert_eq!(App::picker_viewport_start(6, 12, 8), 2);
+        assert_eq!(App::picker_viewport_start(11, 12, 8), 4);
+        assert_eq!(App::picker_scrollbar_position(11, 12, 8), 4);
+        assert!(!App::picker_has_scrollbar(8, 8));
+        assert!(App::picker_has_scrollbar(9, 8));
+    }
+
+    #[test]
+    fn test_picker_overlays_show_active_query_hints_and_selected_viewport() {
+        let render = |app: &mut App| {
+            let backend = TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("render should succeed");
+            rendered_rows(terminal.backend().buffer()).join("\n")
+        };
+
+        let mut file_picker = App::new();
+        file_picker.picker_active = true;
+        file_picker.mention_search_query = "src".to_string();
+        file_picker.picker_results = (0..12)
+            .map(|index| crate::core::file_search::FileSearchResult {
+                path: format!("src/file{index}.rs"),
+                file_type: crate::core::file_search::FileType::File,
+                label: format!("file{index}.rs"),
+            })
+            .collect();
+        file_picker.picker_index = 11;
+        let rendered = render(&mut file_picker);
+        assert!(rendered.contains("Files (12) · @src"));
+        assert!(rendered.contains("file11.rs"));
+        assert!(rendered.contains("Enter insert"));
+
+        let mut slash_picker = App::new();
+        slash_picker.slash_command_active = true;
+        slash_picker.set_input_text("/command");
+        slash_picker.slash_command_results = (0..12)
+            .map(|index| crate::cli::slash_commands::SlashCommandEntry {
+                name: format!("command{index}"),
+                description: format!("Command {index}"),
+                aliases: Vec::new(),
+                category: crate::cli::slash_commands::SlashCommandCategory::Local,
+                requires_args: false,
+            })
+            .collect();
+        slash_picker.slash_command_selected = 11;
+        let rendered = render(&mut slash_picker);
+        assert!(rendered.contains("Slash Commands (12) · /command"));
+        assert!(rendered.contains("command11"));
+        assert!(rendered.contains("Tab complete"));
+
+        let mut model_picker = App::new();
+        model_picker.model_picker_active = true;
+        model_picker.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
+        model_picker.model_picker_selected = model_picker.model_picker_results.len() - 1;
+        let selected_model = model_picker.model_picker_results.last().unwrap().label;
+        let rendered = render(&mut model_picker);
+        assert!(rendered.contains(&format!("Models ({})", model_picker.model_picker_results.len())));
+        assert!(rendered.contains(selected_model));
+        assert!(rendered.contains("Tab/Enter switch"));
+    }
+
+    #[test]
+    fn test_output_title_marks_scrollback_mode_and_reverts_after_exit() {
+        let render = |app: &mut App| {
+            let backend = TestBackend::new(80, 12);
+            let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("render should succeed");
+            rendered_rows(terminal.backend().buffer()).join("\n")
+        };
+
+        let mut app = App::new();
+        assert!(render(&mut app).contains("sned"));
+        assert!(!render(&mut app).contains("sned (scrollback)"));
+
+        app.in_scrollback = true;
+        assert!(render(&mut app).contains("sned (scrollback)"));
+
+        app.in_scrollback = false;
+        assert!(!render(&mut app).contains("sned (scrollback)"));
     }
 
     #[test]
