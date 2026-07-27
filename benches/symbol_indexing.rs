@@ -97,10 +97,10 @@ fn bench_extract_symbols_rust(c: &mut Criterion) {
     c.bench_function("symbol_index_rust", |b| {
         b.iter(|| {
             service.index_file(
-                "test.rs".to_string(),
+                "test.rs",
                 0,
                 RUST_SAMPLE.len() as u64,
-                vec![], // symbols will be extracted internally
+                &[], // symbols will be extracted internally
             );
             black_box(service.get_project_root());
         })
@@ -112,7 +112,7 @@ fn bench_extract_symbols_typescript(c: &mut Criterion) {
 
     c.bench_function("symbol_index_typescript", |b| {
         b.iter(|| {
-            service.index_file("test.ts".to_string(), 0, TS_SAMPLE.len() as u64, vec![]);
+            service.index_file("test.ts", 0, TS_SAMPLE.len() as u64, &[]);
             black_box(service.get_project_root());
         })
     });
@@ -165,7 +165,7 @@ fn bench_symbol_lookup(c: &mut Criterion) {
         },
     ];
 
-    service.index_file("test.rs".to_string(), 0, 1000, symbols);
+    service.index_file("test.rs", 0, 1000, &symbols);
 
     c.bench_function("symbol_lookup_by_name", |b| {
         b.iter(|| {

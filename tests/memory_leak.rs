@@ -104,10 +104,10 @@ async fn test_symbol_index_db_connections_closed() {
 
         // Add a test symbol
         index.index_file(
-            "test.rs".to_string(),
+            "test.rs",
             1234567890,
             100,
-            vec![SymbolLocation {
+            &[SymbolLocation {
                 path: None,
                 name: "test_func".to_string(),
                 start_line: 10,

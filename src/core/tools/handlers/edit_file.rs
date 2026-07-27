@@ -58,12 +58,14 @@ impl Default for EditFileHandler {
 
 impl EditFileHandler {
     /// Set the approval manager for combined approval checks.
+    #[must_use]
     pub fn with_approval_manager(mut self, approval_manager: Arc<Mutex<ApprovalManager>>) -> Self {
         self.approval_manager = Some(approval_manager);
         self
     }
 
     /// Set the symbol index service for cache refresh after edits.
+    #[must_use]
     pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
         self.symbol_index_service = Some(service);
         self
@@ -364,18 +366,7 @@ impl EditFileHandler {
                     }
                 };
 
-                if !anchor.contains(ANCHOR_DELIMITER) {
-                    invalid_anchors.push(format!(
-                        "  - File '{}': anchor '{}' is missing the '{}' delimiter",
-                        path,
-                        if anchor.chars().count() > 50 {
-                            format!("{}...", anchor.chars().take(50).collect::<String>())
-                        } else {
-                            anchor.clone()
-                        },
-                        ANCHOR_DELIMITER
-                    ));
-                } else {
+                if anchor.contains(ANCHOR_DELIMITER) {
                     let (anchor_name, _) = split_anchor(&anchor);
                     if anchor_name.is_empty() || anchor_name.chars().all(|c| c.is_ascii_digit()) {
                         invalid_anchors.push(format!(
@@ -389,6 +380,17 @@ impl EditFileHandler {
                             ANCHOR_DELIMITER
                         ));
                     }
+                } else {
+                    invalid_anchors.push(format!(
+                        "  - File '{}': anchor '{}' is missing the '{}' delimiter",
+                        path,
+                        if anchor.chars().count() > 50 {
+                            format!("{}...", anchor.chars().take(50).collect::<String>())
+                        } else {
+                            anchor.clone()
+                        },
+                        ANCHOR_DELIMITER
+                    ));
                 }
 
                 if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a: &serde_json::Value| a.as_str()) {
@@ -400,18 +402,7 @@ impl EditFileHandler {
                                 continue;
                             }
                         };
-                    if !end_anchor.contains(ANCHOR_DELIMITER) {
-                        invalid_anchors.push(format!(
-                            "  - File '{}': end_anchor '{}' is missing the '{}' delimiter",
-                            path,
-                            if end_anchor.chars().count() > 50 {
-                                format!("{}...", end_anchor.chars().take(50).collect::<String>())
-                            } else {
-                                end_anchor.clone()
-                            },
-                            ANCHOR_DELIMITER
-                        ));
-                    } else {
+                    if end_anchor.contains(ANCHOR_DELIMITER) {
                         let (end_anchor_name, _) = split_anchor(&end_anchor);
                         if end_anchor_name.is_empty()
                             || end_anchor_name.chars().all(|c| c.is_ascii_digit())
@@ -427,6 +418,17 @@ impl EditFileHandler {
                                 ANCHOR_DELIMITER
                             ));
                         }
+                    } else {
+                        invalid_anchors.push(format!(
+                            "  - File '{}': end_anchor '{}' is missing the '{}' delimiter",
+                            path,
+                            if end_anchor.chars().count() > 50 {
+                                format!("{}...", end_anchor.chars().take(50).collect::<String>())
+                            } else {
+                                end_anchor.clone()
+                            },
+                            ANCHOR_DELIMITER
+                        ));
                     }
                 }
             }
@@ -872,7 +874,7 @@ impl EditFileHandler {
             )
             .unwrap_or_else(|| {
                 path.parent()
-                    .map_or(PathBuf::from("."), std::path::Path::to_path_buf)
+                    .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
             });
             files_by_project
                 .entry((project_root, project_type))
@@ -1233,7 +1235,7 @@ impl EditFileHandler {
                 )
                 .unwrap_or_else(|| {
                     path.parent()
-                        .map_or(PathBuf::from("."), std::path::Path::to_path_buf)
+                        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
                 });
                 files_by_project
                     .entry((project_root, project_type))

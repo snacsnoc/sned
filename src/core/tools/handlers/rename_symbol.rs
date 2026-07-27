@@ -23,6 +23,7 @@ impl RenameSymbolHandler {
         }
     }
 
+    #[must_use]
     pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
         self.symbol_index_service = Some(service);
         self
@@ -169,7 +170,7 @@ impl RenameSymbolHandler {
                             .ok()
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                             .map_or(0, |d| d.as_secs());
-                        index_service.index_file(rel_str.to_string(), mtime, meta.len(), symbols);
+                        index_service.index_file(rel_str, mtime, meta.len(), &symbols);
                     }
                 }
             }
@@ -624,10 +625,10 @@ mod tests {
 
         let mut service = SymbolIndexService::new(workspace_root.to_str().unwrap().to_string());
         service.index_file(
-            "src/lib.rs".to_string(),
+            "src/lib.rs",
             1,
             1,
-            vec![crate::services::symbol_index::SymbolLocation {
+            &[crate::services::symbol_index::SymbolLocation {
                 path: Some("src/lib.rs".to_string()),
                 name: "old_name".to_string(),
                 start_line: 0,
@@ -673,10 +674,10 @@ mod tests {
 
         let mut service = SymbolIndexService::new(workspace_root.to_string_lossy().to_string());
         service.index_file(
-            "src/lib.rs".to_string(),
+            "src/lib.rs",
             1,
             1,
-            vec![
+            &[
                 crate::services::symbol_index::SymbolLocation {
                     path: Some("src/lib.rs".to_string()),
                     name: "renamed_now".to_string(),

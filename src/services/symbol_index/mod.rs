@@ -167,26 +167,26 @@ impl SymbolIndexService {
 
     pub fn index_file(
         &mut self,
-        rel_path: String,
+        rel_path: &str,
         mtime: u64,
         size: u64,
-        symbols: Vec<SymbolLocation>,
+        symbols: &[SymbolLocation],
     ) {
         if self.disabled {
             return;
         }
 
         self.files.insert(
-            rel_path.clone(),
+            rel_path.to_string(),
             FileIndexEntry {
                 mtime,
                 size,
-                symbols: symbols.clone(),
+                symbols: symbols.to_vec(),
             },
         );
 
         if let Some(ref mut db) = self.db
-            && let Err(error) = db.update_file_symbols(&rel_path, mtime, size, &symbols)
+            && let Err(error) = db.update_file_symbols(rel_path, mtime, size, symbols)
         {
             tracing::warn!(path = %rel_path, %error, "symbol index update failed");
         }
@@ -195,29 +195,29 @@ impl SymbolIndexService {
 
     pub fn index_file_safe(
         &mut self,
-        rel_path: String,
+        rel_path: &str,
         mtime: u64,
         size: u64,
-        symbols: Vec<SymbolLocation>,
+        symbols: &[SymbolLocation],
     ) {
         if self.disabled {
             return;
         }
 
-        if symbols.is_empty() && self.has_symbols_with_metadata(&rel_path, mtime, size) {
+        if symbols.is_empty() && self.has_symbols_with_metadata(rel_path, mtime, size) {
             return;
         }
 
         self.index_file(rel_path, mtime, size, symbols);
     }
 
-    pub fn index_files_batch(&mut self, entries: Vec<(String, u64, u64, Vec<SymbolLocation>)>) {
+    pub fn index_files_batch(&mut self, entries: &[(String, u64, u64, Vec<SymbolLocation>)]) {
         if self.disabled || entries.is_empty() {
             return;
         }
 
         let mut high_water_mtime = self.status.high_water_mtime;
-        for (rel_path, mtime, size, symbols) in &entries {
+        for (rel_path, mtime, size, symbols) in entries {
             high_water_mtime = high_water_mtime.max(*mtime);
             self.files.insert(
                 rel_path.clone(),
@@ -230,7 +230,7 @@ impl SymbolIndexService {
         }
 
         if let Some(ref mut db) = self.db
-            && let Err(error) = db.update_files_symbols_batch(&entries)
+            && let Err(error) = db.update_files_symbols_batch(entries)
         {
             tracing::warn!(%error, "symbol index batch update failed");
         }
@@ -415,7 +415,7 @@ pub async fn index_file_after_write(
             service
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .index_file_safe(rel_path, mtime, size, symbols);
+                .index_file_safe(&rel_path, mtime, size, &symbols);
         }
         Ok(Ok(None)) => {}
         Ok(Err(error)) => tracing::warn!(%error, "symbol index post-write refresh failed"),
@@ -451,7 +451,7 @@ fn run_initial_walk(
 
     let mut pending = Vec::with_capacity(INDEX_BATCH_SIZE);
     let mut processed = 0usize;
-    for candidate in candidates.iter() {
+    for candidate in &candidates {
         let unchanged = service
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -470,11 +470,11 @@ fn run_initial_walk(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unparsable file")
+                        tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unparsable file");
                     }
                 },
                 Err(error) => {
-                    tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unreadable file")
+                    tracing::warn!(path = %candidate.absolute_path.display(), %error, "symbol index skipped unreadable file");
                 }
             }
         }
@@ -516,7 +516,7 @@ fn flush_initial_batch(
     service
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .index_files_batch(entries);
+        .index_files_batch(&entries);
 }
 
 fn is_git_worktree(project_root: &Path) -> bool {
@@ -707,7 +707,7 @@ mod tests {
     fn test_symbol_index_basic() {
         let mut service = SymbolIndexService::new("/tmp/test".to_string());
         let symbols = vec![make_symbol("test_func", 10, SymbolType::Definition)];
-        service.index_file("src/main.rs".to_string(), 1234567890, 1024, symbols);
+        service.index_file("src/main.rs", 1234567890, 1024, &symbols);
         let defs = service.get_definitions("test_func", None);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].start_line, 10);
@@ -721,7 +721,7 @@ mod tests {
             make_symbol("foobar", 2, SymbolType::Definition),
             make_symbol("foo", 3, SymbolType::Reference),
         ];
-        service.index_file("src/main.rs".to_string(), 1234567890, 1024, symbols);
+        service.index_file("src/main.rs", 1234567890, 1024, &symbols);
 
         let foo_results = service.get_symbols("foo", None, None);
         assert_eq!(foo_results.len(), 2);
@@ -744,7 +744,7 @@ mod tests {
             make_symbol("my_symbol", 1, SymbolType::Definition),
             make_symbol("my_symbol", 5, SymbolType::Reference),
         ];
-        service.index_file("src/lib.rs".to_string(), 1234567890, 1024, symbols);
+        service.index_file("src/lib.rs", 1234567890, 1024, &symbols);
 
         let defs = service.get_definitions("my_symbol", None);
         assert_eq!(defs.len(), 1);
@@ -770,7 +770,7 @@ mod tests {
                 kind: None,
             })
             .collect();
-        service.index_file("src/main.rs".to_string(), 1234567890, 1024, symbols);
+        service.index_file("src/main.rs", 1234567890, 1024, &symbols);
 
         let all = service.get_symbols("repeated", None, None);
         assert_eq!(all.len(), 10);
@@ -783,13 +783,13 @@ mod tests {
     fn test_safe_indexing_preserves_matching_known_symbols() {
         let mut service = SymbolIndexService::new("/tmp/test".to_string());
         service.index_file(
-            "src/lib.rs".to_string(),
+            "src/lib.rs",
             10,
             20,
-            vec![make_symbol("stable_symbol", 1, SymbolType::Definition)],
+            &[make_symbol("stable_symbol", 1, SymbolType::Definition)],
         );
 
-        service.index_file_safe("src/lib.rs".to_string(), 10, 20, Vec::new());
+        service.index_file_safe("src/lib.rs", 10, 20, &[]);
 
         assert_eq!(service.get_definitions("stable_symbol", None).len(), 1);
     }
@@ -881,8 +881,8 @@ mod tests {
                     )],
                 )
             })
-            .collect();
-        service.index_files_batch(entries);
+            .collect::<Vec<_>>();
+        service.index_files_batch(&entries);
 
         assert!(service.should_skip_initial_walk(100));
         assert!(!service.should_skip_initial_walk(101));
@@ -912,16 +912,16 @@ mod tests {
     fn test_get_symbols_across_multiple_files() {
         let mut service = SymbolIndexService::new("/tmp/test".to_string());
         service.index_file(
-            "src/a.rs".to_string(),
+            "src/a.rs",
             1234567890,
             100,
-            vec![make_symbol("shared", 1, SymbolType::Definition)],
+            &[make_symbol("shared", 1, SymbolType::Definition)],
         );
         service.index_file(
-            "src/b.rs".to_string(),
+            "src/b.rs",
             1234567891,
             100,
-            vec![make_symbol("shared", 10, SymbolType::Reference)],
+            &[make_symbol("shared", 10, SymbolType::Reference)],
         );
 
         let results = service.get_symbols("shared", None, None);
@@ -939,16 +939,16 @@ mod tests {
         let mut service = SymbolIndexService::new(root).with_persistence().unwrap();
 
         service.index_file(
-            "src/a.rs".to_string(),
+            "src/a.rs",
             100,
             50,
-            vec![make_symbol("sym_a", 5, SymbolType::Definition)],
+            &[make_symbol("sym_a", 5, SymbolType::Definition)],
         );
         service.index_file(
-            "src/b.rs".to_string(),
+            "src/b.rs",
             200,
             60,
-            vec![make_symbol("sym_a", 10, SymbolType::Reference)],
+            &[make_symbol("sym_a", 10, SymbolType::Reference)],
         );
 
         let results = service.get_symbols("sym_a", None, None);
@@ -980,10 +980,10 @@ mod tests {
         {
             let mut svc = service.lock();
             svc.index_file(
-                "src/existing.rs".to_string(),
+                "src/existing.rs",
                 1234567890,
                 1024,
-                vec![make_symbol("existing_sym", 10, SymbolType::Definition)],
+                &[make_symbol("existing_sym", 10, SymbolType::Definition)],
             );
         }
 
@@ -991,10 +991,10 @@ mod tests {
         let _ = std::thread::spawn(move || {
             let mut svc = service_clone.lock();
             svc.index_file(
-                "src/panic.rs".to_string(),
+                "src/panic.rs",
                 0,
                 0,
-                vec![make_symbol("during_panic", 1, SymbolType::Definition)],
+                &[make_symbol("during_panic", 1, SymbolType::Definition)],
             );
             panic!("simulated panic during index update");
         })
@@ -1006,10 +1006,10 @@ mod tests {
         assert_eq!(defs[0].start_line, 10);
 
         svc.index_file(
-            "src/post_panic.rs".to_string(),
+            "src/post_panic.rs",
             1234567891,
             256,
-            vec![make_symbol("post_panic_sym", 5, SymbolType::Definition)],
+            &[make_symbol("post_panic_sym", 5, SymbolType::Definition)],
         );
         drop(svc);
 

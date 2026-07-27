@@ -37,6 +37,7 @@ impl FindSymbolReferencesHandler {
         }
     }
 
+    #[must_use]
     pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
         self.symbol_index_service = Some(service);
         self
@@ -549,10 +550,10 @@ mod tests {
         {
             let mut service = symbol_index.lock().unwrap();
             service.index_file(
-                "indexed.rs".to_string(),
+                "indexed.rs",
                 1,
                 1,
-                vec![SymbolLocation {
+                &[SymbolLocation {
                     path: None,
                     name: "indexed_symbol".to_string(),
                     start_line: 0,
@@ -629,10 +630,10 @@ mod tests {
         {
             let mut service = symbol_index.lock().unwrap();
             service.index_file(
-                "indexed.rs".to_string(),
+                "indexed.rs",
                 1,
                 1,
-                vec![SymbolLocation {
+                &[SymbolLocation {
                     path: None,
                     name: "shared_symbol".to_string(),
                     start_line: 0,

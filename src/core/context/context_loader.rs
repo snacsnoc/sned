@@ -540,10 +540,10 @@ mod tests {
 
         let mut service = SymbolIndexService::new(root.to_string_lossy().to_string());
         service.index_file(
-            "src/lib.rs".to_string(),
+            "src/lib.rs",
             1,
             1,
-            vec![SymbolLocation {
+            &[SymbolLocation {
                 path: Some("src/lib.rs".to_string()),
                 name: "fooBar".to_string(),
                 start_line: 0,
@@ -590,10 +590,10 @@ mod tests {
         let mut service = SymbolIndexService::new(root.to_string_lossy().to_string());
         // Index both files
         service.index_file(
-            "src/lib.rs".to_string(),
+            "src/lib.rs",
             1,
             1,
-            vec![
+            &[
                 SymbolLocation {
                     path: Some("src/lib.rs".to_string()),
                     name: "fooBar".to_string(),
@@ -617,10 +617,10 @@ mod tests {
             ],
         );
         service.index_file(
-            "src/utils.rs".to_string(),
+            "src/utils.rs",
             1,
             1,
-            vec![SymbolLocation {
+            &[SymbolLocation {
                 path: Some("src/utils.rs".to_string()),
                 name: "helper".to_string(),
                 start_line: 0,
