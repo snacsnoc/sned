@@ -461,6 +461,8 @@ pub enum SlashCommand {
     SkillCommand { name: String },
 }
 
+pub const COMPACTING_CONTEXT_ACKNOWLEDGEMENT: &str = "Compacting context…";
+
 impl SlashCommand {
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
@@ -1022,6 +1024,11 @@ pub fn is_compact_command(text: &str) -> bool {
         return slash_cmd.is_compact();
     }
     false
+}
+
+#[must_use]
+pub fn compact_acknowledgement(text: &str) -> Option<&'static str> {
+    is_compact_command(text).then_some(COMPACTING_CONTEXT_ACKNOWLEDGEMENT)
 }
 
 #[must_use]
@@ -1821,6 +1828,9 @@ mod tests {
     #[test]
     fn test_is_compact_command_compact() {
         assert!(is_compact_command("/compact"));
+        assert_eq!(COMPACTING_CONTEXT_ACKNOWLEDGEMENT, "Compacting context…");
+        assert_eq!(compact_acknowledgement("/compact"), Some("Compacting context…"));
+        assert_eq!(compact_acknowledgement("/help"), None);
     }
 
     #[test]

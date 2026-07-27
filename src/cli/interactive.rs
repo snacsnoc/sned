@@ -3628,6 +3628,11 @@ async fn run_main_loop(
                                         theme::dim_style(),
                                     );
                                 } else {
+                                    if let Some(acknowledgement) =
+                                        crate::cli::slash_commands::compact_acknowledgement(&text)
+                                    {
+                                        app.push_plain(acknowledgement);
+                                    }
                                     spawn_agent_task(
                                         &session,
                                         &processed,
