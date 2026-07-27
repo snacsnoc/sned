@@ -17,6 +17,11 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
+const OPENAI_CLIENT_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+const OPENAI_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENAI_SSE_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(90);
+const OPENAI_SSE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiEndpointKind {
     Official,
@@ -70,7 +75,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(OPENAI_CLIENT_TOTAL_TIMEOUT)
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
             .pool_max_idle_per_host(10)
@@ -344,8 +349,18 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn format_stream_error_diagnostics(headers: &HeaderMap, elapsed: Duration) -> String {
+fn format_stream_error_diagnostics(
+    headers: &HeaderMap,
+    elapsed: Duration,
+    first_byte_elapsed: Option<Duration>,
+) -> String {
     let mut parts = vec![format!("elapsed={}ms", elapsed.as_millis())];
+    match first_byte_elapsed {
+        Some(first_byte_elapsed) => {
+            parts.push(format!("first_byte={}ms", first_byte_elapsed.as_millis()));
+        }
+        None => parts.push("first_byte=pending".to_string()),
+    }
     for name in [
         "content-encoding",
         "content-type",
@@ -361,6 +376,48 @@ fn format_stream_error_diagnostics(headers: &HeaderMap, elapsed: Duration) -> St
         }
     }
     parts.join(", ")
+}
+
+async fn next_stream_item_with_timeout<S>(
+    stream: &mut S,
+    timeout: Duration,
+) -> Result<Option<S::Item>, ()>
+where
+    S: futures::Stream + Unpin,
+{
+    tokio::time::timeout(timeout, stream.next())
+        .await
+        .map_err(|_| ())
+}
+
+fn stream_timeout_from_env(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+fn response_headers_timeout() -> Duration {
+    stream_timeout_from_env(
+        "SNED_RESPONSE_HEADERS_TIMEOUT_SECS",
+        OPENAI_RESPONSE_HEADERS_TIMEOUT,
+    )
+}
+
+async fn next_stream_item_until_receiver_closed<S>(
+    stream: &mut S,
+    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    timeout: Duration,
+) -> Option<Result<Option<S::Item>, ()>>
+where
+    S: futures::Stream + Unpin,
+{
+    tokio::select! {
+        _ = tx.closed() => None,
+        item = next_stream_item_with_timeout(stream, timeout) => Some(item),
+    }
 }
 
 fn convert_user_blocks(
@@ -923,22 +980,42 @@ impl Provider for OpenAiProvider {
         let body = self.build_request_body(&request)?;
         let headers = self.build_headers()?;
 
-        tracing::debug!(
-            method = "POST",
-            provider = "openai",
-            url = %url,
-            message_count = request.messages.len(),
-            "sending provider request"
-        );
-        tracing::debug!(request_body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "request body");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let request_bytes = serde_json::to_vec(&body).map_or(0, |body| body.len());
+            tracing::debug!(
+                method = "POST",
+                provider = "openai",
+                url = %url,
+                model = %self.config.model_id,
+                message_count = request.messages.len(),
+                tool_count = request.tools.as_ref().map_or(0, Vec::len),
+                request_bytes,
+                "sending provider request"
+            );
+        }
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        let request_started_at = Instant::now();
+        let headers_timeout = response_headers_timeout();
+        let response = match tokio::time::timeout(
+            headers_timeout,
+            self.client.post(&url).headers(headers).json(&body).send(),
+        )
+        .await
+        {
+            Ok(response) => response?,
+            Err(_) => {
+                return Err(ProviderError::NetworkError(format!(
+                    "OpenAI response headers timed out after {}s",
+                    headers_timeout.as_secs()
+                )));
+            }
+        };
+
+        tracing::debug!(
+            response_status = %response.status(),
+            headers_elapsed_ms = request_started_at.elapsed().as_millis(),
+            "OpenAI response headers received"
+        );
 
         if !response.status().is_success() {
             let status = response.status();
@@ -980,6 +1057,14 @@ impl Provider for OpenAiProvider {
         let response_headers = response.headers().clone();
         let stream_started_at = Instant::now();
         let stream = response.bytes_stream();
+        let first_byte_timeout = stream_timeout_from_env(
+            "SNED_SSE_FIRST_BYTE_TIMEOUT_SECS",
+            OPENAI_SSE_FIRST_BYTE_TIMEOUT,
+        );
+        let inactivity_timeout = stream_timeout_from_env(
+            "SNED_SSE_INACTIVITY_TIMEOUT_SECS",
+            OPENAI_SSE_INACTIVITY_TIMEOUT,
+        );
         // Use large buffer (10_000) to match agent_loop channel and prevent backpressure deadlocks
         // when the consumer is slow (same pattern as agent_loop.rs:726)
         let (tx, rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(10_000);
@@ -1000,13 +1085,65 @@ impl Provider for OpenAiProvider {
             let mut last_stop_reason: Option<String> = None;
             let mut usage_sent = false;
             let mut stream_errored = false;
+            let mut first_byte_elapsed: Option<Duration> = None;
 
-            while let Some(result) = stream.next().await {
+            loop {
                 if tx.is_closed() {
                     break;
                 }
+                let timeout = if first_byte_elapsed.is_some() {
+                    inactivity_timeout
+                } else {
+                    first_byte_timeout
+                };
+                let Some(result) =
+                    next_stream_item_until_receiver_closed(&mut stream, &tx, timeout).await
+                else {
+                    break;
+                };
+                let result = match result {
+                    Ok(Some(result)) => result,
+                    Ok(None) => break,
+                    Err(()) => {
+                        let phase = if first_byte_elapsed.is_some() {
+                            "inactivity"
+                        } else {
+                            "first byte"
+                        };
+                        let diagnostics = format_stream_error_diagnostics(
+                            &response_headers,
+                            stream_started_at.elapsed(),
+                            first_byte_elapsed,
+                        );
+                        tracing::error!(
+                            phase,
+                            timeout_ms = timeout.as_millis(),
+                            diagnostics = %diagnostics,
+                            "OpenAI SSE stream timeout"
+                        );
+                        try_send_chunk(
+                            &tx,
+                            ApiStreamChunk::Error(format!(
+                                "OpenAI SSE {phase} timeout after {}ms; diagnostics: {} (retryable)",
+                                timeout.as_millis(),
+                                diagnostics,
+                            )),
+                            "timeout",
+                        );
+                        stream_errored = true;
+                        break;
+                    }
+                };
                 match result {
                     Ok(bytes) => {
+                        if !bytes.is_empty() && first_byte_elapsed.is_none() {
+                            let elapsed = stream_started_at.elapsed();
+                            tracing::debug!(
+                                first_byte_elapsed_ms = elapsed.as_millis(),
+                                "OpenAI SSE first response bytes received"
+                            );
+                            first_byte_elapsed = Some(elapsed);
+                        }
                         parse_openai_sse_to_chunks(
                             bytes.as_ref(),
                             &mut sse_buffer,
@@ -1024,6 +1161,7 @@ impl Provider for OpenAiProvider {
                         let diagnostics = format_stream_error_diagnostics(
                             &response_headers,
                             stream_started_at.elapsed(),
+                            first_byte_elapsed,
                         );
                         let error_text = e.to_string();
                         let is_retryable = is_retryable_stream_transport_error(&error_text);
@@ -2217,12 +2355,26 @@ mod tests {
         );
         headers.insert("cf-ray", HeaderValue::from_static("abc123"));
 
-        let diagnostics = format_stream_error_diagnostics(&headers, Duration::from_millis(1532));
+        let diagnostics = format_stream_error_diagnostics(
+            &headers,
+            Duration::from_millis(1532),
+            Some(Duration::from_millis(12)),
+        );
 
         assert!(diagnostics.contains("elapsed=1532ms"));
+        assert!(diagnostics.contains("first_byte=12ms"));
         assert!(diagnostics.contains("content-encoding=gzip"));
         assert!(diagnostics.contains("content-type=text/event-stream"));
         assert!(diagnostics.contains("cf-ray=abc123"));
+    }
+
+    #[test]
+    fn test_format_stream_error_diagnostics_marks_pending_first_byte() {
+        let diagnostics =
+            format_stream_error_diagnostics(&HeaderMap::new(), Duration::from_millis(1532), None);
+
+        assert!(diagnostics.contains("elapsed=1532ms"));
+        assert!(diagnostics.contains("first_byte=pending"));
     }
 
     #[test]
@@ -2234,6 +2386,40 @@ mod tests {
         assert!(!is_retryable_stream_transport_error(
             "invalid request payload"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_next_stream_item_with_timeout_returns_ready_item() {
+        let mut stream = futures::stream::iter(["chunk"]);
+
+        let item = next_stream_item_with_timeout(&mut stream, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(item, Some("chunk"));
+    }
+
+    #[tokio::test]
+    async fn test_next_stream_item_with_timeout_returns_timeout() {
+        let mut stream = futures::stream::pending::<usize>();
+
+        assert!(
+            next_stream_item_with_timeout(&mut stream, Duration::ZERO)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_stream_item_until_receiver_closed_stops_pending_read() {
+        let mut stream = futures::stream::pending::<usize>();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        let result =
+            next_stream_item_until_receiver_closed(&mut stream, &tx, Duration::from_secs(1)).await;
+
+        assert!(result.is_none());
     }
 
     #[test]

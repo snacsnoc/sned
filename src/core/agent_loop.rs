@@ -85,6 +85,8 @@ const DEFAULT_TOOL_CONCURRENCY: usize = 12;
 /// DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES so the user-facing
 /// behavior matches the request-level cap.
 const MAX_STREAM_RETRY_ATTEMPTS: usize = DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES as usize;
+const MAX_PREOUTPUT_STREAM_RETRY_DURATION: std::time::Duration =
+    std::time::Duration::from_secs(180);
 const PARTIAL_MODEL_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
@@ -100,6 +102,10 @@ struct ToolExecutionOutput {
 struct FileActionPath {
     normalized: String,
     display: String,
+}
+
+fn stream_retry_delay(retry_attempt: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(1_u64 << retry_attempt.saturating_sub(1).min(2))
 }
 
 impl ToolExecutionOutput {
@@ -794,6 +800,38 @@ impl AgentLoop {
             return;
         }
         update(&mut state);
+    }
+
+    async fn reset_stream_attempt_timing(&self) {
+        self.first_output_emit_recorded
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.first_reasoning_chunk_recorded
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.first_displayable_text_recorded
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        let mut state = self.state.lock().await;
+        state.request_sent_time =
+            crate::cli::output::timing_enabled().then(std::time::Instant::now);
+        state.first_provider_chunk_time = None;
+        state.first_reasoning_chunk_time = None;
+        state.first_displayable_text_time = None;
+        state.first_output_emit_time = None;
+    }
+
+    async fn wait_for_stream_retry_delay(&self, delay: std::time::Duration) -> bool {
+        let poll_interval = std::time::Duration::from_millis(100);
+        let mut elapsed = std::time::Duration::ZERO;
+        while elapsed < delay {
+            if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
+            let remaining = delay.saturating_sub(elapsed);
+            let sleep_for = poll_interval.min(remaining);
+            tokio::time::sleep(sleep_for).await;
+            elapsed += sleep_for;
+        }
+        !self.cancelled.load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn record_first_output_emit_time(&self) {
@@ -1756,12 +1794,6 @@ impl AgentLoop {
         let history_clone = self.conversation_history.clone();
         let provider = self.config.provider.lock().unwrap().clone();
 
-        tracing::debug!(
-            message_count = request.messages.len(),
-            tool_count = request.tools.as_ref().map_or(0, std::vec::Vec::len),
-            "starting provider stream"
-        );
-
         let retry_config = if provider.name() == "gemini" {
             RetryConfig {
                 max_retries: 4,
@@ -1772,14 +1804,9 @@ impl AgentLoop {
             RetryConfig::default()
         };
 
-        if crate::cli::output::timing_enabled() {
-            let mut state = self.state.lock().await;
-            if state.request_sent_time.is_none() {
-                state.request_sent_time = Some(std::time::Instant::now());
-            }
-        }
-
         let mut stream_retry_attempt = 0usize;
+        let preoutput_retry_started_at = std::time::Instant::now();
+        let mut preoutput_elapsed_at_first_chunk: Option<std::time::Duration> = None;
         let (
             accumulated_text,
             accumulated_reasoning,
@@ -1789,24 +1816,50 @@ impl AgentLoop {
             mut tool_calls_map,
             tool_call_order,
         ) = 'provider_stream_attempt: loop {
+            self.reset_stream_attempt_timing().await;
+            tracing::debug!(
+                stream_attempt = stream_retry_attempt + 1,
+                message_count = request.messages.len(),
+                tool_count = request.tools.as_ref().map_or(0, std::vec::Vec::len),
+                preoutput_elapsed_ms = preoutput_retry_started_at.elapsed().as_millis(),
+                "starting provider stream"
+            );
             // Create channel for stream chunks with large buffer to prevent
             // backpressure deadlocks when the provider emits faster than the
             // consumer processes (e.g. during very long responses).
             let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(10_000);
 
-            let stream = match create_message_with_retry(
-                provider.clone(),
-                request.clone(),
-                state_clone.clone(),
-                retry_config,
-                self.config.json_output,
-                Some(self.config.output_writer.clone()),
-                Some(self.cancelled.clone()),
+            let Some(remaining_preoutput_budget) = MAX_PREOUTPUT_STREAM_RETRY_DURATION
+                .checked_sub(preoutput_retry_started_at.elapsed())
+            else {
+                let error = ProviderError::NetworkError(format!(
+                    "provider stream produced no output within {}s",
+                    MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs()
+                ));
+                let actionable = crate::cli::actionable_errors::provider_error(&error);
+                return TurnResult::Error(format!(
+                    "Provider request did not begin streaming within {}s: {}",
+                    MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs(),
+                    actionable.display()
+                ));
+            };
+
+            let stream = match tokio::time::timeout(
+                remaining_preoutput_budget,
+                create_message_with_retry(
+                    provider.clone(),
+                    request.clone(),
+                    state_clone.clone(),
+                    retry_config,
+                    self.config.json_output,
+                    Some(self.config.output_writer.clone()),
+                    Some(self.cancelled.clone()),
+                ),
             )
             .await
             {
-                Ok(stream) => stream,
-                Err(e) => {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
                     error!(error = %e, "provider request failed");
                     if let Some(ref retry_message) = self.current_turn_retry_candidate {
                         let mut state = self.state.lock().await;
@@ -1829,6 +1882,18 @@ impl AgentLoop {
                         actionable.display()
                     };
                     return TurnResult::Error(message);
+                }
+                Err(_) => {
+                    let error = ProviderError::NetworkError(format!(
+                        "provider request did not begin streaming within {}s",
+                        MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs()
+                    ));
+                    let actionable = crate::cli::actionable_errors::provider_error(&error);
+                    return TurnResult::Error(format!(
+                        "Provider request did not begin streaming within {}s: {}",
+                        MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs(),
+                        actionable.display()
+                    ));
                 }
             };
 
@@ -1905,12 +1970,41 @@ impl AgentLoop {
             let mut partial_line_displayed = false;
             let mut last_partial_flush_at: Option<std::time::Instant> = None;
             let mut stream_usage: Option<ApiReqInfo> = None;
+            let mut preoutput_deadline_exceeded = false;
 
             // Turn indicator is prepended to the first output line, not emitted separately,
             // so it appears on the same line as the start of the response.
             let mut turn_indicator_pending = true;
 
-            while let Some(chunk) = rx.recv().await {
+            loop {
+                let next_chunk = if first_chunk_received {
+                    rx.recv().await
+                } else {
+                    let Some(remaining) = MAX_PREOUTPUT_STREAM_RETRY_DURATION
+                        .checked_sub(preoutput_retry_started_at.elapsed())
+                    else {
+                        preoutput_deadline_exceeded = true;
+                        retryable_stream_error_before_output = Some(format!(
+                            "provider stream produced no output within {}s",
+                            MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs()
+                        ));
+                        break;
+                    };
+                    match tokio::time::timeout(remaining, rx.recv()).await {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            preoutput_deadline_exceeded = true;
+                            retryable_stream_error_before_output = Some(format!(
+                                "provider stream produced no output within {}s",
+                                MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs()
+                            ));
+                            break;
+                        }
+                    }
+                };
+                let Some(chunk) = next_chunk else {
+                    break;
+                };
                 // Check for cancellation during stream processing so Ctrl+C
                 // takes effect promptly instead of waiting for the full stream.
                 // Uses lock-free AtomicBool to avoid mutex contention on every chunk.
@@ -1920,6 +2014,8 @@ impl AgentLoop {
                 }
 
                 if !first_chunk_received && !matches!(&chunk, ApiStreamChunk::Error(_)) {
+                    preoutput_elapsed_at_first_chunk
+                        .get_or_insert_with(|| preoutput_retry_started_at.elapsed());
                     if crate::cli::output::timing_enabled() {
                         let mut state = self.state.lock().await;
                         if state.first_provider_chunk_time.is_none() {
@@ -2477,7 +2573,12 @@ impl AgentLoop {
             }
 
             // Wait for stream to complete
-            if let Err(e) = stream_handle.await {
+            if preoutput_deadline_exceeded {
+                stream_handle.abort();
+            }
+            if let Err(e) = stream_handle.await
+                && !preoutput_deadline_exceeded
+            {
                 let error = ProviderError::UnexpectedError(e.to_string());
                 let actionable = crate::cli::actionable_errors::provider_error(&error);
                 return TurnResult::Error(actionable.display());
@@ -2488,9 +2589,11 @@ impl AgentLoop {
             }
 
             if let Some(err) = retryable_stream_error_before_output {
-                if stream_retry_attempt >= MAX_STREAM_RETRY_ATTEMPTS {
+                if preoutput_deadline_exceeded || stream_retry_attempt >= MAX_STREAM_RETRY_ATTEMPTS
+                {
                     tracing::error!(
                         attempts = stream_retry_attempt + 1,
+                        preoutput_elapsed_ms = preoutput_retry_started_at.elapsed().as_millis(),
                         error = %err,
                         "stream retry cap exceeded; surfacing error to user"
                     );
@@ -2507,11 +2610,34 @@ impl AgentLoop {
                     state.did_automatically_retry_failed_api_request = true;
                 }
                 stream_retry_attempt += 1;
+                let remaining_preoutput_budget = MAX_PREOUTPUT_STREAM_RETRY_DURATION
+                    .checked_sub(preoutput_retry_started_at.elapsed())
+                    .unwrap_or_default();
+                let delay =
+                    stream_retry_delay(stream_retry_attempt).min(remaining_preoutput_budget);
                 tracing::warn!(
                     attempt = stream_retry_attempt,
+                    next_delay_ms = delay.as_millis(),
+                    preoutput_elapsed_ms = preoutput_retry_started_at.elapsed().as_millis(),
                     error = %err,
                     "retrying provider stream after pre-output transport failure"
                 );
+                if !self.config.json_output {
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::tool_output_line(
+                            format!(
+                                "Provider stream stalled before output; retrying attempt {}/{} in {}s.",
+                                stream_retry_attempt + 1,
+                                MAX_STREAM_RETRY_ATTEMPTS + 1,
+                                delay.as_secs(),
+                            ),
+                            Style::default().fg(crate::cli::tui::theme::WARNING_FG),
+                        ));
+                }
+                if !self.wait_for_stream_retry_delay(delay).await {
+                    return TurnResult::Cancelled;
+                }
                 continue 'provider_stream_attempt;
             }
 
@@ -3752,7 +3878,14 @@ impl AgentLoop {
             {
                 let state = self.state.lock().await;
                 if let Some(start) = state.session_start_time {
-                    for line in crate::cli::output::format_timing_phases(
+                    let retry_info = (stream_retry_attempt > 0).then(|| {
+                        (
+                            stream_retry_attempt + 1,
+                            preoutput_elapsed_at_first_chunk
+                                .unwrap_or_else(|| preoutput_retry_started_at.elapsed()),
+                        )
+                    });
+                    for line in crate::cli::output::format_timing_phases_with_retries(
                         start,
                         state.request_sent_time,
                         state.first_provider_chunk_time,
@@ -3760,6 +3893,7 @@ impl AgentLoop {
                         state.first_displayable_text_time,
                         state.first_output_emit_time,
                         None,
+                        retry_info,
                     ) {
                         self.config.output_writer.emit(OutputEvent::dim(line));
                     }
@@ -5423,6 +5557,43 @@ mod tests {
             !rendered
                 .iter()
                 .any(|line| line.contains("error decoding response body"))
+        );
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retryable_stream_error_before_output_is_quiet_in_json_mode() {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![
+                crate::providers::mock::MockResponse::Stream(vec![
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                        "OpenAI SSE stream error: error decoding response body (retryable)"
+                            .to_string(),
+                    )),
+                ]),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+            ],
+        )));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-json-stream-retry-before-output");
+        config.json_output = true;
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        let result = agent.execute_turn().await;
+
+        assert!(matches!(result, TurnResult::Continue));
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Provider stream stalled before output"))
         );
         assert!(
             agent
@@ -9759,6 +9930,66 @@ mod tests {
                 "atomic fast-path must skip the state write after the first claim"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_reset_stream_attempt_timing_clears_phase_state_and_flags() {
+        use crate::providers::mock::{MockProvider, MockResponse};
+        let provider: Arc<Providers> = Arc::new(Providers::Mock(MockProvider::new(vec![
+            MockResponse::Stream(vec![]),
+        ])));
+        let agent = AgentLoop::new(test_agent_config(provider, "test-stream-attempt-timing"));
+        let now = std::time::Instant::now();
+
+        agent
+            .first_output_emit_recorded
+            .store(true, std::sync::atomic::Ordering::Release);
+        agent
+            .first_reasoning_chunk_recorded
+            .store(true, std::sync::atomic::Ordering::Release);
+        agent
+            .first_displayable_text_recorded
+            .store(true, std::sync::atomic::Ordering::Release);
+        {
+            let mut state = agent.state.lock().await;
+            state.request_sent_time = Some(now);
+            state.first_provider_chunk_time = Some(now);
+            state.first_reasoning_chunk_time = Some(now);
+            state.first_displayable_text_time = Some(now);
+            state.first_output_emit_time = Some(now);
+        }
+
+        agent.reset_stream_attempt_timing().await;
+
+        assert!(
+            !agent
+                .first_output_emit_recorded
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            !agent
+                .first_reasoning_chunk_recorded
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            !agent
+                .first_displayable_text_recorded
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let state = agent.state.lock().await;
+        assert!(state.request_sent_time.is_none());
+        assert!(state.first_provider_chunk_time.is_none());
+        assert!(state.first_reasoning_chunk_time.is_none());
+        assert!(state.first_displayable_text_time.is_none());
+        assert!(state.first_output_emit_time.is_none());
+    }
+
+    #[test]
+    fn test_stream_retry_delay_is_bounded_exponential() {
+        assert_eq!(stream_retry_delay(1), std::time::Duration::from_secs(1));
+        assert_eq!(stream_retry_delay(2), std::time::Duration::from_secs(2));
+        assert_eq!(stream_retry_delay(3), std::time::Duration::from_secs(4));
+        assert_eq!(stream_retry_delay(20), std::time::Duration::from_secs(4));
     }
 
     /// Same contract for the reasoning-chunk timing helper.
