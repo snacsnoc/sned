@@ -963,8 +963,8 @@ async fn process_anthropic_event(
                 );
             }
             AnthropicContentBlock::ToolUse { id, name } => {
-                last_tool_call.id = id.clone();
-                last_tool_call.name = name.clone();
+                last_tool_call.id.clone_from(&id);
+                last_tool_call.name.clone_from(&name);
                 last_tool_call.arguments.clear();
                 last_tool_call.last_was_text = false;
 

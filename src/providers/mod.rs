@@ -104,7 +104,7 @@ pub enum ToolResultContent {
 }
 
 /// Individual block inside a tool result.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ToolResultContentBlock {
     #[serde(rename = "text")]
@@ -114,7 +114,7 @@ pub enum ToolResultContentBlock {
 }
 
 /// An image content block.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageContentBlock {
     pub source: ImageSource,
     #[serde(flatten)]
@@ -161,7 +161,7 @@ pub struct RedactedThinkingBlock {
 }
 
 /// A document content block.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DocumentContentBlock {
     pub source: DocumentSource,
     #[serde(flatten)]
@@ -354,7 +354,7 @@ pub struct ApiStreamToolCallsChunk {
 }
 
 /// Individual tool call in a chunk.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiStreamToolCall {
     pub call_id: Option<String>,
     pub function: ApiStreamToolCallFunction,
@@ -604,7 +604,7 @@ impl ProviderHttpError {
 }
 
 /// A tool definition for provider-native tool calling.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolDefinition {
     #[serde(rename = "type")]
     pub tool_type: String,

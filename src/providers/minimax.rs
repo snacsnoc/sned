@@ -1155,18 +1155,18 @@ fn process_minimax_sse_line(
                     let entry = accumulated_tool_calls
                         .entry(idx)
                         .or_insert_with(|| (id.clone(), String::new(), String::new()));
-                    if entry.0 != id.clone() && !entry.0.is_empty() {
+                    if entry.0 != *id && !entry.0.is_empty() {
                         tracing::warn!(
                             tool_index = idx,
                             old_id = %entry.0,
                             new_id = %id,
                             "MiniMax tool call id changed at index, resetting accumulated data"
                         );
-                        entry.0 = id.clone();
+                        entry.0.clone_from(id);
                         entry.1 = String::new();
                         entry.2 = String::new();
                     } else {
-                        entry.0 = id.clone();
+                        entry.0.clone_from(id);
                     }
                 }
 
@@ -1176,7 +1176,7 @@ fn process_minimax_sse_line(
                         .or_insert_with(|| (String::new(), String::new(), String::new()));
 
                     if let Some(name) = &func.name {
-                        entry.1 = name.clone();
+                        entry.1.clone_from(name);
                     }
                     if let Some(args) = &func.arguments {
                         // Skip empty or whitespace-only argument chunks - MiniMax sends these
@@ -1251,9 +1251,9 @@ fn process_minimax_sse_line(
                 }
             }
 
-            stop_reason = choice.finish_reason.clone();
+            stop_reason.clone_from(&choice.finish_reason);
             if stop_reason.is_some() {
-                *last_stop_reason = stop_reason.clone();
+                last_stop_reason.clone_from(&stop_reason);
             }
         }
 

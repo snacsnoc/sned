@@ -663,7 +663,8 @@ async fn process_openai_sse_line(
                         accumulated_tool_calls
                             .entry(tc.index)
                             .or_insert_with(|| (String::new(), String::new(), String::new()))
-                            .0 = id.clone();
+                            .0
+                            .clone_from(id);
                     }
 
                     if let Some(function) = tc.function {
