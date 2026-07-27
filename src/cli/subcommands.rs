@@ -5,6 +5,178 @@
 use crate::cli::{AuthOptions, ConfigAction, ConfigOptions, HistoryOptions};
 use std::path::PathBuf;
 
+#[derive(Debug, PartialEq, Eq)]
+enum MaskedApiKeyInput {
+    Submitted(String),
+    Cancelled,
+}
+
+struct RawModeGuard {
+    active: bool,
+}
+
+impl RawModeGuard {
+    fn enable() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self { active: true })
+    }
+
+    fn restore(mut self) -> std::io::Result<()> {
+        crossterm::terminal::disable_raw_mode()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+fn read_masked_api_key<F, W>(
+    mut next_event: F,
+    output: &mut W,
+    prompt: &str,
+) -> std::io::Result<MaskedApiKeyInput>
+where
+    F: FnMut() -> std::io::Result<crossterm::event::Event>,
+    W: std::io::Write,
+{
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    write!(output, "{prompt}")?;
+    output.flush()?;
+
+    let mut key = String::new();
+    loop {
+        let event = match next_event()? {
+            Event::Paste(content) => {
+                for character in content.chars().filter(|character| !character.is_control()) {
+                    key.push(character);
+                    write!(output, "*")?;
+                    output.flush()?;
+                }
+                continue;
+            }
+            Event::Key(event) => event,
+            _ => continue,
+        };
+        if event.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        match event.code {
+            KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                writeln!(output)?;
+                output.flush()?;
+                return Ok(MaskedApiKeyInput::Cancelled);
+            }
+            KeyCode::Esc => {
+                writeln!(output)?;
+                output.flush()?;
+                return Ok(MaskedApiKeyInput::Cancelled);
+            }
+            KeyCode::Enter => {
+                writeln!(output)?;
+                output.flush()?;
+                return Ok(MaskedApiKeyInput::Submitted(key));
+            }
+            KeyCode::Backspace => {
+                if key.pop().is_some() {
+                    write!(output, "\r\x1b[K{prompt}{}", "*".repeat(key.chars().count()))?;
+                    output.flush()?;
+                }
+            }
+            KeyCode::Char(character) => {
+                key.push(character);
+                write!(output, "*")?;
+                output.flush()?;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_literal_environment_variable(value: &str) -> bool {
+    let is_name = |name: &str| {
+        let mut chars = name.chars();
+        matches!(chars.next(), Some(character) if character.is_ascii_alphabetic() || character == '_')
+            && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    };
+    let value = value.trim();
+    value
+        .strip_prefix('$')
+        .is_some_and(is_name)
+        || value
+            .strip_prefix('%')
+            .and_then(|name| name.strip_suffix('%'))
+            .is_some_and(is_name)
+}
+
+fn validate_api_key(value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!("API key cannot be empty");
+    }
+    if is_literal_environment_variable(value) {
+        anyhow::bail!("API key must be the key value, not a literal environment variable name");
+    }
+    Ok(())
+}
+
+fn auth_environment_variable(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" | "openai-native" => "OPENAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "gemini" => "GEMINI_API_KEY",
+        "minimax" => "MINIMAX_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        _ => "API_KEY",
+    }
+}
+
+fn non_tty_auth_error(provider: &str) -> anyhow::Error {
+    let env_var = auth_environment_variable(provider);
+    anyhow::anyhow!(
+        "sned auth requires --apikey when stdin is not a terminal\n\n\
+         For scripts:\n  sned auth --provider {provider} --apikey \"${env_var}\"\n\n\
+         For interactive use, run sned auth from your shell (no pipe)."
+    )
+}
+
+fn require_auth_stdin_terminal(is_terminal: bool, provider: &str) -> anyhow::Result<()> {
+    if is_terminal {
+        Ok(())
+    } else {
+        Err(non_tty_auth_error(provider))
+    }
+}
+
+fn read_interactive_api_key(provider: &str) -> anyhow::Result<Option<String>> {
+    use std::io::{self, IsTerminal};
+
+    require_auth_stdin_terminal(io::stdin().is_terminal(), provider)?;
+
+    let prompt = format!("Enter API key for {provider}: ");
+    let mut output = io::stdout();
+    let raw_mode = RawModeGuard::enable()?;
+    let input_result = read_masked_api_key(crossterm::event::read, &mut output, &prompt);
+    let restore_result = raw_mode.restore();
+
+    match (input_result, restore_result) {
+        (Ok(MaskedApiKeyInput::Submitted(key)), Ok(())) => Ok(Some(key)),
+        (Ok(MaskedApiKeyInput::Cancelled), Ok(())) => Ok(None),
+        (Ok(_), Err(restore_error)) => Err(restore_error.into()),
+        (Err(input_error), Ok(())) => Err(input_error.into()),
+        (Err(input_error), Err(restore_error)) => Err(anyhow::anyhow!(
+            "API key input failed: {input_error}; terminal restoration also failed: {restore_error}"
+        )),
+    }
+}
+
 pub fn run_history(opts: HistoryOptions) -> anyhow::Result<()> {
     use crate::storage::state_manager::StateManager;
     use crate::storage::state_manager::{list_tasks, sort_by_timestamp, total_pages};
@@ -655,7 +827,6 @@ pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -
 
 pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
     use crate::providers::env_auth::get_provider_from_env;
-    use std::io::{self, Write};
 
     if let Some(config_path) = &opts.config {
         // SAFETY: called during CLI startup before any worker threads spawn
@@ -693,19 +864,16 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
 
     let api_key = match &opts.apikey {
         Some(k) => k.clone(),
-        None => {
-            print!("Enter API key for {provider}: ");
-            io::stdout().flush()?;
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            input.trim().to_string()
-        }
+        None => match read_interactive_api_key(&provider)? {
+            Some(key) => key,
+            None => {
+                println!("API key entry cancelled.");
+                return Ok(());
+            }
+        },
     };
 
-    if api_key.is_empty() {
-        crate::cli::colors::eprint_error("API key cannot be empty");
-        return Ok(());
-    }
+    validate_api_key(&api_key)?;
 
     state_manager.set_secret(secret_key, api_key);
     state_manager.set_global_state_string_field("act_mode_api_provider", provider.clone())?;
@@ -894,11 +1062,128 @@ pub fn run_doctor() -> anyhow::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::VecDeque;
     use std::fs;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     static AUTH_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn test_read_masked_api_key_masks_and_erases_backspace() {
+        let mut events = VecDeque::from([
+            key_event(KeyCode::Char('s')),
+            key_event(KeyCode::Char('k')),
+            key_event(KeyCode::Backspace),
+            key_event(KeyCode::Char('e')),
+            key_event(KeyCode::Enter),
+        ]);
+        let mut output = Vec::new();
+
+        let result = read_masked_api_key(
+            || {
+                events.pop_front().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no more events")
+                })
+            },
+            &mut output,
+            "Enter API key: ",
+        )
+        .unwrap();
+
+        assert_eq!(result, MaskedApiKeyInput::Submitted("se".to_string()));
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Enter API key: **\r\x1b[KEnter API key: **\n"
+        );
+    }
+
+    #[test]
+    fn test_read_masked_api_key_accepts_pasted_key() {
+        let mut events = VecDeque::from([
+            Event::Paste("sk-pasted\n".to_string()),
+            key_event(KeyCode::Enter),
+        ]);
+        let mut output = Vec::new();
+
+        let result = read_masked_api_key(
+            || {
+                events.pop_front().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no more events")
+                })
+            },
+            &mut output,
+            "Enter API key: ",
+        )
+        .unwrap();
+
+        assert_eq!(result, MaskedApiKeyInput::Submitted("sk-pasted".to_string()));
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Enter API key: *********\n"
+        );
+    }
+
+    #[test]
+    fn test_read_masked_api_key_cancels_for_escape_and_ctrl_c() {
+        for event in [
+            key_event(KeyCode::Esc),
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        ] {
+            let mut events = VecDeque::from([event]);
+            let mut output = Vec::new();
+            let result = read_masked_api_key(
+                || {
+                    events.pop_front().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no more events")
+                    })
+                },
+                &mut output,
+                "Enter API key: ",
+            )
+            .unwrap();
+
+            assert_eq!(result, MaskedApiKeyInput::Cancelled);
+            assert_eq!(String::from_utf8(output).unwrap(), "Enter API key: \n");
+        }
+    }
+
+    #[test]
+    fn test_read_masked_api_key_propagates_read_error() {
+        let mut output = Vec::new();
+        let error = read_masked_api_key(
+            || Err(std::io::Error::other("read failed")),
+            &mut output,
+            "Enter API key: ",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(String::from_utf8(output).unwrap(), "Enter API key: ");
+    }
+
+    #[test]
+    fn test_validate_api_key_rejects_empty_and_literal_environment_variables() {
+        for value in ["", "  ", "$API_KEY", "%API_KEY%"] {
+            assert!(validate_api_key(value).is_err(), "expected {value:?} to fail");
+        }
+        assert!(validate_api_key("sk-test-key").is_ok());
+    }
+
+    #[test]
+    fn test_non_tty_auth_error_shows_automation_command() {
+        let error = require_auth_stdin_terminal(false, "anthropic").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "sned auth requires --apikey when stdin is not a terminal\n\nFor scripts:\n  sned auth --provider anthropic --apikey \"$ANTHROPIC_API_KEY\"\n\nFor interactive use, run sned auth from your shell (no pipe)."
+        );
+        assert!(require_auth_stdin_terminal(true, "anthropic").is_ok());
+    }
 
     #[test]
     fn test_run_auth_accepts_model_id_flag() {
