@@ -1082,7 +1082,7 @@ pub fn unknown_leading_slash_command(
 /// Category of a slash command entry for grouping in the picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommandCategory {
-    /// Commands injected to the agent (compact, newrule, etc.)
+    /// Commands injected to the agent (compact, etc.)
     Agent,
     /// Local CLI-only commands (exit, clear, help, etc.)
     Local,
@@ -1264,6 +1264,47 @@ pub fn filter_slash_commands(entries: &[SlashCommandEntry], query: &str) -> Vec<
 
     substring.into_iter().take(10).collect()
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelpSection {
+    Context,
+    Session,
+    TrackedChanges,
+    PlanMode,
+    Skills,
+}
+
+impl HelpSection {
+    const ORDER: [Self; 5] = [
+        Self::Context,
+        Self::Session,
+        Self::TrackedChanges,
+        Self::PlanMode,
+        Self::Skills,
+    ];
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Context => "Context",
+            Self::Session => "Session",
+            Self::TrackedChanges => "Tracked Changes",
+            Self::PlanMode => "Plan Mode",
+            Self::Skills => "Skills",
+        }
+    }
+}
+
+const fn help_section_for(spec: &SlashCommandSpec) -> HelpSection {
+    match spec.category {
+        SlashCommandCategory::Agent => HelpSection::Context,
+        SlashCommandCategory::Plan => HelpSection::PlanMode,
+        _ if matches!(spec.id, SlashCommandId::Skills) => HelpSection::Skills,
+        _ if matches!(spec.requirement, CommandRequirement::TrackChanges) => {
+            HelpSection::TrackedChanges
+        }
+        _ => HelpSection::Session,
+    }
+}
+
 #[must_use]
 pub fn format_help_text() -> String {
     use crate::cli::colors::style;
@@ -1274,34 +1315,47 @@ pub fn format_help_text() -> String {
         style::CYAN,
         style::RESET
     )];
-    for spec in SLASH_COMMAND_SPECS {
-        let aliases = if spec.aliases.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " (aliases: {})",
-                spec.aliases
-                    .iter()
-                    .map(|alias| format!("/{alias}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let requirement = if spec.requirement == CommandRequirement::TrackChanges {
-            " [requires --track-changes]"
-        } else {
-            ""
-        };
-        lines.push(format!(
-            "  {}{}{}  - {}{}{}{}",
-            style::CYAN,
-            spec.usage,
-            style::RESET,
-            spec.description,
-            aliases,
-            requirement,
-            style::RESET
-        ));
+    for section in HelpSection::ORDER {
+        let specs = SLASH_COMMAND_SPECS
+            .iter()
+            .copied()
+            .filter(|spec| help_section_for(spec) == section)
+            .collect::<Vec<_>>();
+        if specs.is_empty() {
+            continue;
+        }
+
+        lines.push(String::new());
+        lines.push(format!("{}{}:{}", style::BOLD, section.title(), style::RESET));
+        for spec in specs {
+            let aliases = if spec.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (aliases: {})",
+                    spec.aliases
+                        .iter()
+                        .map(|alias| format!("/{alias}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let requirement = if spec.requirement == CommandRequirement::TrackChanges {
+                " [requires --track-changes]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  {}{}{}  - {}{}{}{}",
+                style::CYAN,
+                spec.usage,
+                style::RESET,
+                spec.description,
+                aliases,
+                requirement,
+                style::RESET
+            ));
+        }
     }
     lines.extend([
         String::new(),
@@ -2037,6 +2091,26 @@ mod tests {
         assert!(!text.contains("/explain-changes"));
         assert!(!text.contains("/explain_changes"));
         assert!(!text.contains("/expand"));
+    }
+
+    #[test]
+    fn test_format_help_text_groups_commands_by_user_facing_section() {
+        let text = format_help_text();
+        let context = text.find("Context:").unwrap();
+        let session = text.find("Session:").unwrap();
+        let tracked_changes = text.find("Tracked Changes:").unwrap();
+        let plan_mode = text.find("Plan Mode:").unwrap();
+        let skills = text.find("Skills:").unwrap();
+
+        assert!(context < session);
+        assert!(session < tracked_changes);
+        assert!(tracked_changes < plan_mode);
+        assert!(plan_mode < skills);
+        assert!(text[context..session].contains("/compact"));
+        assert!(text[session..tracked_changes].contains("/exit"));
+        assert!(text[tracked_changes..plan_mode].contains("/undo"));
+        assert!(text[plan_mode..skills].contains("/plan"));
+        assert!(text[skills..].contains("/skills"));
     }
 
     #[test]
