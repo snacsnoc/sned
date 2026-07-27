@@ -432,7 +432,7 @@ pub struct AuthOptions {
     #[arg(short = 'p', long)]
     pub provider: Option<String>,
 
-    /// API key for the provider
+    /// API key for the provider; required when stdin is not a terminal
     #[arg(short = 'k', long)]
     pub apikey: Option<String>,
 
@@ -1068,7 +1068,12 @@ pub(crate) fn create_provider(
                 &["MINIMAX_CN_API_KEY", "MINIMAX_API_KEY"],
                 "minimaxApiKey",
             )
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MINIMAX_API_KEY or MINIMAX_CN_API_KEY is not set. \
+                     Set an environment variable, use --api-key, or run sned auth --provider minimax."
+                )
+            })?;
             Arc::new(crate::providers::Providers::Minimax(
                 crate::providers::minimax::MinimaxProvider::new(
                     crate::providers::minimax::MinimaxConfig {
@@ -1157,7 +1162,12 @@ pub(crate) fn create_provider(
                 &["GEMINI_API_KEY"],
                 "geminiApiKey",
             )
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GEMINI_API_KEY is not set. \
+                     Set the environment variable, use --api-key, or run sned auth --provider gemini."
+                )
+            })?;
             let base_url = task_opts
                 .base_url
                 .clone()
@@ -1235,7 +1245,12 @@ pub(crate) fn create_provider(
                 &["DEEPSEEK_API_KEY"],
                 "deepSeekApiKey",
             )
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DEEPSEEK_API_KEY is not set. \
+                     Set the environment variable, use --api-key, or run sned auth --provider deepseek."
+                )
+            })?;
             let model_id_str = model_id.unwrap_or_else(|| "deepseek-chat".to_string());
             Arc::new(crate::providers::Providers::DeepSeek(
                 crate::providers::deepseek::DeepSeekProvider::new(
@@ -1263,7 +1278,12 @@ pub(crate) fn create_provider(
                 &["OPENROUTER_API_KEY"],
                 "openRouterApiKey",
             )
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OPENROUTER_API_KEY is not set. \
+                     Set the environment variable, use --api-key, or run sned auth --provider openrouter."
+                )
+            })?;
             let model_id_str =
                 model_id.unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
             Arc::new(crate::providers::Providers::OpenRouter(
@@ -2800,6 +2820,41 @@ mod tests {
                 msg.contains("ANTHROPIC_API_KEY"),
                 "Error should mention ANTHROPIC_API_KEY, got: {}",
                 msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_provider_rejects_missing_keys_for_supported_providers() {
+        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        for env_var in [
+            "GEMINI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "OPENROUTER_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+        ] {
+            // SAFETY: provider environment mutation is serialized by PROVIDER_ENV_MUTEX.
+            unsafe { std::env::remove_var(env_var) };
+        }
+
+        for (provider, expected_env_var) in [
+            ("gemini", "GEMINI_API_KEY"),
+            ("deepseek", "DEEPSEEK_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+            ("minimax", "MINIMAX_API_KEY"),
+        ] {
+            let cli = Cli::try_parse_from(["sned", "--provider", provider, "test prompt"])
+                .unwrap();
+            let error = create_provider(&cli.task_opts, None).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(expected_env_var),
+                "{provider} error should mention {expected_env_var}, got: {message}"
+            );
+            assert!(
+                message.contains("sned auth --provider"),
+                "{provider} error should explain recovery, got: {message}"
             );
         }
     }
