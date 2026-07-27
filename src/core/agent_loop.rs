@@ -3959,7 +3959,7 @@ impl AgentLoop {
         let listed = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
         let suffix = if paths.len() > 3 { ", ..." } else { "" };
         Some(format!(
-            "[system] Before using edit_file again, call read_file on the stale path(s): {listed}{suffix}."
+            "[system] Before using edit_file again, refresh the stale path(s): {listed}{suffix}. Use read_file for the full file. For a supported named definition, get_function or get_file_skeleton can refresh only the anchors they return."
         ))
     }
 

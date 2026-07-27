@@ -22,14 +22,27 @@ pub(crate) fn max_file_read_size() -> usize {
     use std::sync::OnceLock;
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
-        let default_size = 100 * 1024;
-        let max_allowed = 100 * 1024 * 1024;
-        std::env::var("SNED_MAX_FILE_READ_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .map_or(default_size, |v| v.min(max_allowed))
+        max_file_read_size_from_value(std::env::var("SNED_MAX_FILE_READ_SIZE").ok().as_deref())
     })
+}
+
+const DEFAULT_MAX_FILE_READ_SIZE: usize = 512 * 1024;
+const MAX_FILE_READ_SIZE: usize = 100 * 1024 * 1024;
+
+fn max_file_read_size_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map_or(DEFAULT_MAX_FILE_READ_SIZE, |value| {
+            value.min(MAX_FILE_READ_SIZE)
+        })
+}
+
+pub(crate) fn record_complete_file_read(state: &mut TaskState, canonical_path: &Path) {
+    state.file_context_tracker.track_file_read(canonical_path);
+    state
+        .must_reread_before_edit
+        .remove(&canonical_path.to_string_lossy().into_owned());
 }
 
 /// Result of reading a single file.
@@ -45,6 +58,7 @@ struct FileReadResult {
     content: String,
     hash: String,
     success: bool,
+    refreshes_edit_context: bool,
     error: Option<String>,
 }
 
@@ -91,8 +105,9 @@ impl ReadFileHandler {
             content: String::new(),
             hash: String::new(),
             success: false,
+            refreshes_edit_context: false,
             error: Some(format!(
-                "Line-range read requires a file no larger than {max_kb}KB, but this file is {actual_kb}KB. Increase SNED_MAX_FILE_READ_SIZE or reduce the file size."
+                "Line-range read requires a file no larger than {max_kb}KB, but this file is {actual_kb}KB. Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE. For a supported definition, get_function or get_file_skeleton can provide anchors only for the lines they return."
             )),
         }
     }
@@ -209,6 +224,7 @@ impl ReadFileHandler {
                     content: String::new(),
                     hash: String::new(),
                     success: false,
+                    refreshes_edit_context: false,
                     error: Some(err.display()),
                 };
             }
@@ -225,6 +241,7 @@ impl ReadFileHandler {
                     content: String::new(),
                     hash: String::new(),
                     success: false,
+                    refreshes_edit_context: false,
                     error: Some(err.display()),
                 };
             }
@@ -241,6 +258,7 @@ impl ReadFileHandler {
                 content: String::new(),
                 hash: String::new(),
                 success: false,
+                refreshes_edit_context: false,
                 error: Some(err.display()),
             };
         }
@@ -256,60 +274,83 @@ impl ReadFileHandler {
             );
         }
 
-        let (content_for_hash, sliced_lines, clamping_note, full_lines, range_start, range_end) =
-            if has_line_range {
-                match self
-                    .read_lines_range(
-                        &canonical_path.to_string_lossy(),
-                        start_line,
-                        end_line,
-                        max_read_size,
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => return e.with_display_path(display_path),
-                }
-            } else if metadata.len() > max_read_size as u64 {
-                match self
-                    .read_truncated(&canonical_path.to_string_lossy(), max_read_size)
-                    .await
-                {
-                    Ok((content, lines)) => {
-                        let size_kb = metadata.len() / 1024;
-                        let max_kb = max_read_size as u64 / 1024;
-                        (
-                            content,
-                            lines.clone(),
-                            Some(format!(
-                                "[Note: File truncated to {max_kb}KB (file is {size_kb}KB). Increase SNED_MAX_FILE_READ_SIZE to read more.]"
-                            )),
-                            Some(lines.clone()),
-                            0,
-                            lines.len(),
-                        )
-                    }
-                    Err(e) => return e.with_display_path(display_path),
-                }
-            } else {
-                match self
-                    .read_full_file(&canonical_path.to_string_lossy(), output_writer)
-                    .await
-                {
-                    Ok((content, lines)) => (
+        let (
+            content_for_hash,
+            sliced_lines,
+            clamping_note,
+            full_lines,
+            range_start,
+            range_end,
+            refreshes_edit_context,
+        ) = if has_line_range {
+            match self
+                .read_lines_range(
+                    &canonical_path.to_string_lossy(),
+                    start_line,
+                    end_line,
+                    max_read_size,
+                )
+                .await
+            {
+                Ok((
+                    content_for_hash,
+                    sliced_lines,
+                    clamping_note,
+                    full_lines,
+                    range_start,
+                    range_end,
+                )) => (
+                    content_for_hash,
+                    sliced_lines,
+                    clamping_note,
+                    full_lines,
+                    range_start,
+                    range_end,
+                    true,
+                ),
+                Err(e) => return e.with_display_path(display_path),
+            }
+        } else if metadata.len() > max_read_size as u64 {
+            match self
+                .read_truncated(&canonical_path.to_string_lossy(), max_read_size)
+                .await
+            {
+                Ok((content, lines)) => {
+                    let size_kb = metadata.len() / 1024;
+                    let max_kb = max_read_size as u64 / 1024;
+                    (
                         content,
                         lines.clone(),
-                        None,
+                        Some(format!(
+                            "[Note: File truncated to {max_kb}KB (file is {size_kb}KB). Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE for a full read. For a supported definition, get_function or get_file_skeleton can return anchors only for the lines they show.]"
+                        )),
                         Some(lines.clone()),
                         0,
                         lines.len(),
-                    ),
-                    Err(e) => return e.with_display_path(display_path),
+                        false,
+                    )
                 }
-            };
+                Err(e) => return e.with_display_path(display_path),
+            }
+        } else {
+            match self
+                .read_full_file(&canonical_path.to_string_lossy(), output_writer)
+                .await
+            {
+                Ok((content, lines)) => (
+                    content,
+                    lines.clone(),
+                    None,
+                    Some(lines.clone()),
+                    0,
+                    lines.len(),
+                    true,
+                ),
+                Err(e) => return e.with_display_path(display_path),
+            }
+        };
 
-        // Register anchors using full file content (even for partial reads)
-        // This ensures anchor state is consistent with the complete file
+        // A truncated preview can only produce anchors for its visible prefix.
         let lines_for_reconcile = full_lines.as_ref().expect(
             "full_lines must be Some: all read paths (range/truncated/full) return Some(full_lines)"
         );
@@ -333,6 +374,7 @@ impl ReadFileHandler {
                 content: String::new(),
                 hash: String::new(),
                 success: false,
+                refreshes_edit_context: false,
                 error: Some(format!(
                     "Internal error: anchor/line length mismatch for {}: {} lines vs {} anchors",
                     display_path,
@@ -362,6 +404,7 @@ impl ReadFileHandler {
             content,
             hash,
             success: true,
+            refreshes_edit_context,
             error: None,
         }
     }
@@ -398,6 +441,7 @@ impl ReadFileHandler {
                     content: String::new(),
                     hash: String::new(),
                     success: false,
+                    refreshes_edit_context: false,
                     error: Some(err.display()),
                 });
             }
@@ -415,6 +459,7 @@ impl ReadFileHandler {
                     content: String::new(),
                     hash: String::new(),
                     success: false,
+                    refreshes_edit_context: false,
                     error: Some(err.display()),
                 });
             }
@@ -437,6 +482,7 @@ impl ReadFileHandler {
                         content: String::new(),
                         hash: String::new(),
                         success: false,
+                        refreshes_edit_context: false,
                         error: Some(err.display()),
                     });
                 }
@@ -510,14 +556,14 @@ impl ReadFileHandler {
 
     /// Read the entire file using BufReader for reduced peak memory.
     /// Reads the full file content and splits it into lines using `split_content_lines()`.
-    /// Files at this point are known to be under 100KB (caller check), so reading at once is fine.
+    /// Files at this point are known to be within the configured read limit.
     async fn read_full_file(
         &self,
         path: &str,
         _output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Result<(String, Vec<String>), FileReadResult> {
         // Read full file content for hash computation and line splitting.
-        // Files at this point are known to be under 100KB (caller check).
+        // Files at this point are known to be within the configured read limit.
         let content = match tokio::fs::read_to_string(path).await {
             Ok(c) => c,
             Err(e) => {
@@ -528,6 +574,7 @@ impl ReadFileHandler {
                     content: String::new(),
                     hash: String::new(),
                     success: false,
+                    refreshes_edit_context: false,
                     error: Some(err.display()),
                 });
             }
@@ -558,6 +605,7 @@ impl ReadFileHandler {
                     content: String::new(),
                     hash: String::new(),
                     success: false,
+                    refreshes_edit_context: false,
                     error: Some(err.display()),
                 });
             }
@@ -573,6 +621,7 @@ impl ReadFileHandler {
                     content: String::new(),
                     hash: String::new(),
                     success: false,
+                    refreshes_edit_context: false,
                     error: Some(err.display()),
                 });
             }
@@ -588,6 +637,7 @@ impl ReadFileHandler {
                     content: String::new(),
                     hash: String::new(),
                     success: false,
+                    refreshes_edit_context: false,
                     error: Some(err.display()),
                 });
             }
@@ -631,32 +681,18 @@ impl ReadFileHandler {
 
     fn track_read_files(state: &mut TaskState, paths: &[String], results: &[FileReadResult]) {
         for (path_str, res) in paths.iter().zip(results.iter()) {
-            if res.success {
-                let path = std::path::Path::new(path_str);
-                state.file_context_tracker.track_file_read(path);
-                // must_reread_before_edit is keyed by the canonicalized
-                // path that edit_file's mark_must_reread stores
-                // (src/core/tools/handlers/edit_file.rs:435). The
-                // model may provide a relative path here, so use the
-                // canonical_path from the read result (computed by
-                // tokio::fs::canonicalize in read_file) to match.
-                // Without this, the model's re-read after a successful
-                // edit would not clear the stale-anchor guard when the
-                // workspace has symlinks (e.g. /tmp → /private/tmp on
-                // macOS), causing an infinite re-read loop.
-                if let Some(canonical) = &res.canonical_path {
-                    state.must_reread_before_edit.remove(canonical);
-                }
+            if res.success && res.refreshes_edit_context {
+                let canonical = res.canonical_path.as_deref().unwrap_or(path_str);
+                record_complete_file_read(state, Path::new(canonical));
                 // Track consecutive reads for read-loop detection.
                 // If the same file is read 3+ times in a row with no
                 // edit, warn the model. Use the canonical path so the
                 // counter matches what edit_file removes at
                 // src/core/tools/handlers/edit_file.rs:1136.
-                let count_key = res
-                    .canonical_path
-                    .clone()
-                    .unwrap_or_else(|| path_str.clone());
-                let count = state.consecutive_reads.entry(count_key).or_insert(0);
+                let count = state
+                    .consecutive_reads
+                    .entry(canonical.to_string())
+                    .or_insert(0);
                 *count += 1;
             }
         }
@@ -684,13 +720,13 @@ impl ReadFileHandler {
                 // fires when the model reads the same file repeatedly
                 // via different path representations (relative vs
                 // absolute, or with/without ./).
-                let lookup_key = res
-                    .canonical_path
-                    .clone()
-                    .unwrap_or_else(|| path_str.clone());
+                if !res.success || !res.refreshes_edit_context {
+                    continue;
+                }
+                let lookup_key = res.canonical_path.as_deref().unwrap_or(path_str);
                 let count = state
                     .consecutive_reads
-                    .get(&lookup_key)
+                    .get(lookup_key)
                     .copied()
                     .unwrap_or(0);
                 if count >= 3 {
@@ -873,6 +909,18 @@ mod tests {
         let h1 = content_hash("test content");
         let h2 = content_hash("test content");
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_max_file_read_size_uses_512kb_default_and_bounds_overrides() {
+        assert_eq!(max_file_read_size_from_value(None), 512 * 1024);
+        assert_eq!(max_file_read_size_from_value(Some("300000")), 300_000);
+        assert_eq!(max_file_read_size_from_value(Some("0")), 512 * 1024);
+        assert_eq!(max_file_read_size_from_value(Some("invalid")), 512 * 1024);
+        assert_eq!(
+            max_file_read_size_from_value(Some("209715200")),
+            100 * 1024 * 1024
+        );
     }
 
     #[tokio::test]
@@ -1089,7 +1137,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_truncated_when_too_large() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        let data = "x".repeat(101 * 1024);
+        let data = "x".repeat(513 * 1024);
         temp_file.write_all(data.as_bytes()).unwrap();
 
         let handler = ReadFileHandler::new();
@@ -1107,7 +1155,8 @@ mod tests {
 
         assert!(result.success, "large file should auto-truncate, not error");
         assert!(result.error.is_none());
-        assert!(result.content.contains("truncated to 100KB"));
+        assert!(!result.refreshes_edit_context);
+        assert!(result.content.contains("truncated to 512KB"));
         assert!(result.content.contains("Hash:"));
     }
 
@@ -1116,7 +1165,7 @@ mod tests {
         let mut temp_file = NamedTempFile::new().unwrap();
         let ch: char = '€'; // U+20AC = 3 bytes in UTF-8
         let ch_str: String = ch.to_string();
-        let repeat_count = (101 * 1024) / ch_str.len() + 1;
+        let repeat_count = (513 * 1024) / ch_str.len() + 1;
         let data: String = ch_str.repeat(repeat_count);
         temp_file.write_all(data.as_bytes()).unwrap();
 
@@ -1144,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_rejects_oversized_line_range() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        let data = "x".repeat(101 * 1024);
+        let data = "x".repeat(513 * 1024);
         temp_file.write_all(data.as_bytes()).unwrap();
 
         let handler = ReadFileHandler::new();
@@ -1166,6 +1215,68 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|error| error.contains("Line-range read requires a file no larger"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_allows_104kb_line_range_with_default_limit() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(&vec![b'x'; 104 * 1024]).unwrap();
+
+        let result = ReadFileHandler::new()
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                Some(1),
+                Some(1),
+                &AnchorStateManager::new(),
+                Some("test-task"),
+                None,
+            )
+            .await;
+
+        assert!(result.success);
+        assert!(result.refreshes_edit_context);
+    }
+
+    #[tokio::test]
+    async fn test_truncated_read_does_not_clear_reread_requirement() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("large.txt");
+        std::fs::write(&file_path, "x".repeat(513 * 1024)).unwrap();
+        let canonical_path = std::fs::canonicalize(&file_path).unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(canonical_path.to_string_lossy().into_owned());
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = ToolHandler::execute(
+            &ReadFileHandler::new(),
+            &ctx,
+            serde_json::json!({"path": "large.txt"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.as_str().unwrap().contains("truncated to 512KB"));
+        assert!(
+            state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&canonical_path.to_string_lossy().into_owned())
         );
     }
 

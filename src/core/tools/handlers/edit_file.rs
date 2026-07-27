@@ -484,7 +484,7 @@ impl EditFileHandler {
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
         ToolError::ExecutionFailedWithMetadata(
             format!(
-                "You must re-read {display_path} before retrying edit_file. A successful edit (or a prior failed attempt) changed the file, so the hash anchors from your previous read_file are stale. Call read_file on this path to get fresh anchors, then retry the edit with the new anchors."
+                "You must re-read {display_path} before retrying edit_file. A successful edit (or a prior failed attempt) changed the file, so prior hash anchors are stale. Call read_file to refresh the full file. For a supported named definition, get_function or get_file_skeleton can also refresh the file, but only anchors shown in that result are usable."
             ),
             ToolFailureMetadata {
                 class: ToolFailureClass::AnchorInvalid,

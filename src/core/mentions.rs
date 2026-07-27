@@ -9,8 +9,6 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
-const MAX_FILE_READ_SIZE: u64 = 100 * 1024;
-
 static MENTION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"@("([^"]+)"|/[^\s]*|[a-f0-9]{7,40}|git-changes)"#).unwrap());
 
@@ -123,6 +121,19 @@ async fn expand_mention(mention: &Mention, workspace_root: &Path) -> Result<Stri
 }
 
 async fn expand_file_mention(path: &str, workspace_root: &Path) -> Result<String, String> {
+    expand_file_mention_with_limit(
+        path,
+        workspace_root,
+        crate::core::tools::handlers::read_file::max_file_read_size() as u64,
+    )
+    .await
+}
+
+async fn expand_file_mention_with_limit(
+    path: &str,
+    workspace_root: &Path,
+    max_file_read_size: u64,
+) -> Result<String, String> {
     let clean_path = path.trim_start_matches('/');
     let full_path = crate::core::tools::resolve_sanitized_path(workspace_root, clean_path)
         .map_err(|e| format!("Invalid path {path}: {e}"))?;
@@ -131,12 +142,12 @@ async fn expand_file_mention(path: &str, workspace_root: &Path) -> Result<String
         .await
         .map_err(|e| format!("Failed to stat file {path}: {e}"))?;
 
-    if metadata.len() > MAX_FILE_READ_SIZE {
+    if metadata.len() > max_file_read_size {
         return Err(format!(
             "File {} is too large ({}KB, max {}KB)",
             path,
             metadata.len() / 1024,
-            MAX_FILE_READ_SIZE / 1024
+            max_file_read_size / 1024
         ));
     }
 
@@ -367,5 +378,24 @@ mod tests {
 
         // Path traversal should be blocked, so no expansion
         assert!(expanded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_file_mention_uses_supplied_read_limit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("large.txt");
+        tokio::fs::write(&file_path, "x".repeat(200 * 1024))
+            .await
+            .unwrap();
+
+        let expanded = expand_file_mention_with_limit("/large.txt", workspace.path(), 300 * 1024)
+            .await
+            .expect("configured limit should allow the mention");
+        assert!(expanded.contains("<file_mention path=\"large.txt\">"));
+
+        let error = expand_file_mention_with_limit("/large.txt", workspace.path(), 100 * 1024)
+            .await
+            .expect_err("lower limit should reject the mention");
+        assert!(error.contains("max 100KB"));
     }
 }

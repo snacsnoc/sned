@@ -95,7 +95,7 @@ impl ToolSchema {
 pub fn read_file_schema() -> ToolSchema {
     ToolSchema {
         name: "read_file",
-        description: "Reads the complete contents of one or more files at the specified paths. Automatically extracts raw text from PDF and DOCX files. Returns hash-anchored lines (format: Word§line content) that you MUST use with the edit_file tool. IMPORTANT: Copy anchor strings EXACTLY as shown in the output (e.g., \"Crawler§void draw_game_over() {\"). You can also specify a line range to read only a specific part of the file(s). Examples: { paths: [\"src/main.ts\", \"package.json\"] }, { paths: [\"src/main.ts\"] }, { paths: [\"src/main.ts\"], start_line: 10, end_line: 50 }. Consider using surgical tools like get_file_skeleton or get_function over this.",
+        description: "Reads complete source files or line ranges and returns hash-anchored lines (format: Word§line content) for edit_file. Copy anchors exactly as shown. The read limit defaults to 512KB and is configured when Sned starts with SNED_MAX_FILE_READ_SIZE. For a supported named definition that exceeds this limit, get_function or get_file_skeleton can return anchors only for the lines they show. Examples: { paths: [\"src/main.ts\", \"package.json\"] }, { paths: [\"src/main.ts\"], start_line: 10, end_line: 50 }.",
         parameters: vec![
             ToolParameter {
                 name: "paths",
@@ -215,7 +215,7 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit one or more existing files by replacing, inserting after, or inserting before specific lines. edit_file does not create files; use write_to_file for a new file. CRITICAL: You MUST read files first using read_file to get the current hash-anchored lines. Use the EXACT anchor strings from read_file output (format: Word§line content). Each file contains an array of edits. EDIT TYPES: 1. replace (default): Replaces an inclusive range of lines from anchor to end_anchor. If end_anchor is omitted, defaults to anchor (single-line replace). 2. insert_after: Inserts the provided text immediately after the line specified by anchor. 3. insert_before: Inserts the provided text immediately before the line specified by anchor.",
+        description: "Edit one or more existing files by replacing, inserting after, or inserting before specific lines. edit_file does not create files; use write_to_file for a new file. CRITICAL: use current hash-anchored lines from read_file, get_function, or get_file_skeleton. Only exact anchors shown by the tool that read the file are usable. Each file contains an array of edits. EDIT TYPES: 1. replace (default): Replaces an inclusive range of lines from anchor to end_anchor. If end_anchor is omitted, defaults to anchor (single-line replace). 2. insert_after: Inserts the provided text immediately after the line specified by anchor. 3. insert_before: Inserts the provided text immediately before the line specified by anchor.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
@@ -241,11 +241,11 @@ pub fn edit_file_schema() -> ToolSchema {
                                 },
                                 "anchor": {
                                     "type": "string",
-                                    "description": "Anchor for the start of the edit or the insertion point. MUST be copied exactly from read_file output (format: Word§line content). Example: \"Crawler§void draw_game_over() {\". Must be a single line only, no newline char."
+                                    "description": "Anchor for the start of the edit or insertion point. MUST be copied exactly from read_file, get_function, or get_file_skeleton output (format: Word§line content). Example: \"Crawler§void draw_game_over() {\". Must be a single line only, no newline char."
                                 },
                                 "end_anchor": {
                                     "type": "string",
-                                    "description": "Anchor for the end of the edit (required for 'replace'). MUST be copied exactly from read_file output (format: Word§line content). Example: \"Crawler§void draw_game_over() {\". Must be a single line only, no newline char."
+                                    "description": "Anchor for the end of the edit (required for 'replace'). MUST be copied exactly from read_file, get_function, or get_file_skeleton output (format: Word§line content). Example: \"Crawler§void draw_game_over() {\". Must be a single line only, no newline char."
                                 },
                                 "text": {
                                     "type": "string",
@@ -377,7 +377,7 @@ pub fn plan_mode_respond_schema() -> ToolSchema {
 pub fn get_function_schema() -> ToolSchema {
     ToolSchema {
         name: "get_function",
-        description: "Get the implementation of a specific function or method from a file.",
+        description: "Get the implementation of a specific function or method from a file. Returned lines include hash anchors that can be passed directly to edit_file; a successful result refreshes edit state for that file.",
         parameters: vec![
             ToolParameter {
                 name: "path",
@@ -403,7 +403,7 @@ pub fn get_function_schema() -> ToolSchema {
 pub fn get_file_skeleton_schema() -> ToolSchema {
     ToolSchema {
         name: "get_file_skeleton",
-        description: "Get a structural skeleton of a file showing classes, functions, and their signatures without full implementations.",
+        description: "Get a structural skeleton showing definitions and signatures. Returned definition lines include hash anchors usable only for edits of those lines; a successful result refreshes edit state for that file.",
         parameters: vec![ToolParameter {
             name: "path",
             required: true,

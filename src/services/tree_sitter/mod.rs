@@ -13,6 +13,8 @@ use streaming_iterator::StreamingIterator;
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::hash_utils::{content_hash, format_line_with_hash};
 
+pub(crate) const MAX_STRUCTURAL_FILE_READ_SIZE: u64 = 5 * 1024 * 1024;
+
 /// A parsed definition from a source file.
 ///
 /// Equivalent to `ParsedDefinition` in `dirac/src/services/tree-sitter/index.ts`.
