@@ -931,15 +931,16 @@ fn handle_text_selection_mouse_event(
                 return false;
             }
             let click_target = app.text_selection_click_target(mouse_event.column, mouse_event.row);
-            if let Some(text) = app.finish_text_selection(mouse_event.column, mouse_event.row)
+            if let Some(path) = click_target {
+                app.clear_text_selection();
+                open(path);
+            } else if let Some(text) = app.finish_text_selection(mouse_event.column, mouse_event.row)
                 && let Err(error) = copy(&text)
             {
                 app.push_styled(
                     format!("Failed to copy selection: {error}"),
                     Style::default().fg(theme::ERROR_FG),
                 );
-            } else if let Some(path) = click_target {
-                open(path);
             }
             true
         }
@@ -4709,7 +4710,10 @@ mod tests {
         ));
         assert!(handle_text_selection_mouse_event(
             &mut app,
-            event(MouseEventKind::Up(MouseButton::Left)),
+            MouseEvent {
+                column: column + 1,
+                ..event(MouseEventKind::Up(MouseButton::Left))
+            },
             |_| panic!("a click must not copy text"),
             move |path| {
                 *opened_for_callback.borrow_mut() = Some(path);

@@ -1673,10 +1673,7 @@ impl App {
         }
         let surface = self.selection_surface(selection.pane)?;
         let (row_index, column_index) = Self::normalize_surface_point(surface, column, row)?;
-        let point = Self::selection_point(surface, row_index, column_index)?;
-        (point == selection.anchor)
-            .then(|| Self::surface_hyperlink_at(surface, row_index, column_index))
-            .flatten()
+        Self::surface_hyperlink_at(surface, row_index, column_index)
             .filter(|target| selection.click_target.as_ref() == Some(target))
     }
 
@@ -4192,6 +4189,22 @@ mod tests {
             .expect("linked cell should exist");
         assert!(cell.modifier.contains(Modifier::UNDERLINED));
         assert!(App::hyperlink_marker_index(cell.underline_color).is_none());
+    }
+
+    #[test]
+    fn test_osc8_click_accepts_release_on_another_cell_of_the_same_target() {
+        let mut app = App::new();
+        app.push_output(Line::from(
+            "\x1b]8;;file:///tmp/jitter.rs\x1b\\/tmp/jitter.rs\x1b]8;;\x1b\\",
+        ));
+        render_for_selection(&mut app);
+
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "/");
+        assert!(app.begin_text_selection(column, row, Instant::now()));
+        assert_eq!(
+            app.text_selection_click_target(column + 1, row),
+            Some(PathBuf::from("/tmp/jitter.rs"))
+        );
     }
 
     #[test]
