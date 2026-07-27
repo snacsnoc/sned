@@ -439,7 +439,7 @@ impl MigrationEngine {
         let destination = if destination_path.exists() {
             read_json_value(&destination_path)?
         } else {
-            Value::Object(Default::default())
+            Value::Object(serde_json::Map::default())
         };
 
         let source_obj = as_object(&source, &source_path)?;
@@ -985,12 +985,12 @@ fn compare_json_object_file(
     let source = if source_exists {
         read_json_value(source_path)?
     } else {
-        Value::Object(Default::default())
+        Value::Object(serde_json::Map::default())
     };
     let destination = if destination_exists {
         read_json_value(destination_path)?
     } else {
-        Value::Object(Default::default())
+        Value::Object(serde_json::Map::default())
     };
 
     let source_obj = as_object(&source, source_path)?;

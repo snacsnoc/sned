@@ -871,6 +871,7 @@ impl AgentLoop {
 
     /// Enable yolo mode — forces tool profile to `Validate` so
     /// `execute_command` is available (explicit shell opt-in).
+    #[must_use]
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.deps.yolo = yolo;
         self
@@ -928,6 +929,7 @@ impl AgentLoop {
     }
 
     /// Initialize the agent loop with a checkpoint manager.
+    #[must_use]
     pub fn with_checkpoint_manager(
         mut self,
         checkpoint_manager: crate::core::checkpoints::TaskCheckpointManager,
@@ -937,6 +939,7 @@ impl AgentLoop {
     }
 
     /// Initialize the agent loop with an approval manager.
+    #[must_use]
     pub fn with_approval_manager(
         mut self,
         approval_manager: Arc<tokio::sync::Mutex<crate::core::approval::ApprovalManager>>,
@@ -946,18 +949,21 @@ impl AgentLoop {
     }
 
     /// Initialize the agent loop with a context loader.
+    #[must_use]
     pub fn with_context_loader(mut self, loader: crate::core::context::ContextLoader) -> Self {
         self.deps.context_loader = Some(loader);
         self
     }
 
     /// Initialize the agent loop with task storage for persisting conversation history.
+    #[must_use]
     pub fn with_task_storage(mut self, task_storage: TaskStorage) -> Self {
         self.deps.task_storage = Some(task_storage);
         self
     }
 
     /// Set the system prompt context.
+    #[must_use]
     pub fn with_system_prompt_context(mut self, context: SystemPromptContext) -> Self {
         self.deps.system_prompt_context = Some(context);
         self.deps.cached_system_prompt = None;
@@ -976,12 +982,14 @@ impl AgentLoop {
     /// 7. Repeat until complete, cancelled, or max turns reached
     ///
     /// Initialize the agent loop with tool handlers.
+    #[must_use]
     pub fn with_tools(mut self, registry: Arc<ToolRegistry>) -> Self {
         self.deps.registry = Some(registry);
         self
     }
 
     /// Initialize the agent loop with hook manager.
+    #[must_use]
     pub fn with_hooks(mut self, hook_manager: Arc<crate::core::hooks::HookManager>) -> Self {
         self.deps.hook_manager = Some(hook_manager);
         self

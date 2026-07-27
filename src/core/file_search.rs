@@ -262,8 +262,7 @@ async fn workspace_file_index(workspace_path: &str) -> std::io::Result<Vec<FileS
 
     match tokio::time::timeout(WORKSPACE_INDEX_TIMEOUT, complete_rx).await {
         Ok(Ok(results)) => results,
-        Ok(Err(_)) => Ok(stale_results.unwrap_or_default()),
-        Err(_) => Ok(stale_results.unwrap_or_default()),
+        Ok(Err(_)) | Err(_) => Ok(stale_results.unwrap_or_default()),
     }
 }
 

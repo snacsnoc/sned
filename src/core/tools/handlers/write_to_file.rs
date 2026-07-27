@@ -95,7 +95,7 @@ impl WriteToFileHandler {
                 .unwrap_or_else(|_| PathBuf::from(path))
         } else {
             // File doesn't exist yet - canonicalize parent and append filename
-            let parent = path_obj.parent().unwrap_or(Path::new("."));
+            let parent = path_obj.parent().unwrap_or_else(|| Path::new("."));
             let canonical_parent = fs::canonicalize(parent)
                 .await
                 .unwrap_or_else(|_| PathBuf::from(parent));
@@ -117,6 +117,7 @@ impl WriteToFileHandler {
         Ok(format!("Successfully wrote to {path}"))
     }
 
+    #[must_use]
     pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
         self.symbol_index_service = Some(service);
         self

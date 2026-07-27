@@ -144,10 +144,10 @@ pub fn get_file_skeleton(
         }
     }
 
-    if !formatted_output.is_empty() {
-        Ok(Some(format!("|----\n{formatted_output}|----\n")))
-    } else {
+    if formatted_output.is_empty() {
         Ok(None)
+    } else {
+        Ok(Some(format!("|----\n{formatted_output}|----\n")))
     }
 }
 
@@ -220,7 +220,7 @@ pub fn get_functions(
             if cap_name.starts_with("name.")
                 && let Ok(text) = cap.node.utf8_text(file_content.as_bytes())
             {
-                match_to_name_text.entry(mid).or_insert(text.to_string());
+                match_to_name_text.entry(mid).or_insert_with(|| text.to_string());
             }
         }
     }
@@ -432,7 +432,7 @@ pub fn get_symbol_range(
             if cap_name.starts_with("name.")
                 && let Ok(t) = cap.node.utf8_text(file_content.as_bytes())
             {
-                match_to_name_text.entry(mid).or_insert(t.to_string());
+                match_to_name_text.entry(mid).or_insert_with(|| t.to_string());
             }
         }
     }

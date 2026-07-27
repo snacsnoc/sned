@@ -260,12 +260,12 @@ impl PlanState {
                 self.steps[next_idx].status = PlanStepStatus::Running;
                 self.bump_version();
                 return Some(next_idx);
-            } else {
-                if self.is_complete() {
-                    self.mark_complete();
-                }
-                return None;
             }
+
+            if self.is_complete() {
+                self.mark_complete();
+            }
+            return None;
         }
 
         let mut changed = false;

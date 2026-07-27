@@ -21,11 +21,7 @@ impl ListSkillsHandler {
         Self
     }
 
-    fn build_response(
-        state: &mut TaskState,
-        workspace_root: &std::path::Path,
-        _params: serde_json::Value,
-    ) -> Result<String, ToolError> {
+    fn build_response(state: &TaskState, workspace_root: &std::path::Path) -> String {
         let skills = if state.available_skills.is_empty() {
             let project_skills = discover_skills(workspace_root);
             get_available_skills(project_skills)
@@ -34,7 +30,7 @@ impl ListSkillsHandler {
         };
 
         if skills.is_empty() {
-            return Ok("No skills are currently available.".to_string());
+            return "No skills are currently available.".to_string();
         }
 
         let project_skills: Vec<&SkillMetadata> = skills
@@ -54,18 +50,18 @@ impl ListSkillsHandler {
 
         response.push_str("\nUse the 'use_skill' tool to activate a skill.");
 
-        Ok(response)
+        response
     }
 
     pub fn execute(
         &self,
-        state: &mut TaskState,
+        state: &TaskState,
         _params: serde_json::Value,
     ) -> Result<String, ToolError> {
         let workspace_root = std::env::current_dir().map_err(|e| {
             ToolError::ExecutionFailed(format!("Failed to get current directory: {e}"))
         })?;
-        Self::build_response(state, &workspace_root, _params)
+        Ok(Self::build_response(state, &workspace_root))
     }
 }
 
@@ -135,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_skills_empty_state() {
         // Test with pre-populated empty state (no filesystem discovery)
-        let mut state = TaskState {
+        let state = TaskState {
             available_skills: vec![],
             ..Default::default()
         };
@@ -146,12 +142,10 @@ mod tests {
         #[cfg(not(unix))]
         let test_path = std::env::temp_dir();
 
-        let result =
-            ListSkillsHandler::build_response(&mut state, test_path, serde_json::json!({}));
-        assert!(result.is_ok());
+        let result = ListSkillsHandler::build_response(&state, test_path);
         // When state.available_skills is empty, discover_skills is called
         // which may find global skills, so we just verify the response is valid
-        assert!(!result.unwrap().is_empty());
+        assert!(!result.is_empty());
     }
 
     #[tokio::test]

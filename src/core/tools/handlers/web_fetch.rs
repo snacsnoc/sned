@@ -226,7 +226,7 @@ impl WebFetchHandler {
 
         let port = url
             .port()
-            .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+            .unwrap_or_else(|| if url.scheme() == "https" { 443 } else { 80 });
 
         // For bare IP addresses, validate directly without DNS resolution
         let ip_str = host.trim_start_matches('[').trim_end_matches(']');

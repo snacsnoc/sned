@@ -46,7 +46,10 @@ impl DiagnosticsScanHandler {
     /// Detect the project type for a given file path.
     /// Uses a cache keyed by (parent directory, extension) to avoid redundant filesystem walks.
     pub fn detect_project_type(file_path: &Path) -> ProjectType {
-        let parent = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let parent = file_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let ext = file_path
             .extension()
             .map(|e| e.to_string_lossy().to_string())
@@ -75,7 +78,7 @@ impl DiagnosticsScanHandler {
 
     /// Uncached project type detection (used internally and for cache misses).
     fn detect_project_type_uncached(file_path: &Path) -> ProjectType {
-        let parent = file_path.parent().unwrap_or(Path::new("."));
+        let parent = file_path.parent().unwrap_or_else(|| Path::new("."));
 
         // Check for Rust project
         if parent.join("Cargo.toml").exists() || Self::has_ancestor_file(file_path, "Cargo.toml") {
@@ -118,7 +121,12 @@ impl DiagnosticsScanHandler {
             ProjectType::Rust => {
                 // Find the directory with Cargo.toml
                 let cargo_dir = Self::find_ancestor_with_file(file_path, "Cargo.toml")
-                    .unwrap_or_else(|| file_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+                    .unwrap_or_else(|| {
+                        file_path
+                            .parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .to_path_buf()
+                    });
 
                 let output = Command::new("cargo")
                     .args(["check", "--message-format=short", "--quiet"])
@@ -150,7 +158,12 @@ impl DiagnosticsScanHandler {
             }
             ProjectType::JavaScript => {
                 let js_dir = Self::find_ancestor_with_file(file_path, "package.json")
-                    .unwrap_or_else(|| file_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+                    .unwrap_or_else(|| {
+                        file_path
+                            .parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .to_path_buf()
+                    });
 
                 // Try npm run lint first, then fall back to npx eslint
                 let mut result = String::new();

@@ -31,12 +31,14 @@ pub struct ReplaceSymbolHandler {
 }
 
 impl ReplaceSymbolHandler {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             symbol_index_service: None,
         }
     }
 
+    #[must_use]
     pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
         self.symbol_index_service = Some(service);
         self
@@ -193,6 +195,7 @@ impl ReplaceSymbolHandler {
             .await
     }
 
+    #[must_use]
     pub fn description(&self, _params: &serde_json::Value) -> String {
         "[replace_symbol]".to_string()
     }
@@ -206,7 +209,6 @@ impl ToolHandler for ReplaceSymbolHandler {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send + '_>> {
         let handler = self;
         let ctx = ctx.clone();
-        let params = params.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
             handler
@@ -217,7 +219,7 @@ impl ToolHandler for ReplaceSymbolHandler {
     }
 
     fn description(&self, params: &serde_json::Value) -> String {
-        ReplaceSymbolHandler::description(self, params)
+        Self::description(self, params)
     }
 }
 
@@ -333,12 +335,16 @@ async fn process_batch(
         let resolved_range = match symbol_index_service {
             Some(mutex) => {
                 let locations = {
-                    let index_service = mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    let index_service = mutex
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     index_service.get_definitions(&r.symbol, None)
                 };
                 let mut result = None;
                 let project_root = {
-                    let index_service = mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    let index_service = mutex
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     index_service.get_project_root().to_string()
                 };
                 for loc in locations {
@@ -390,18 +396,15 @@ async fn process_batch(
             )?,
         };
 
-        match resolved_range {
-            Some(range) => resolved_replacements.push((r.clone(), range)),
-            None => {
-                state.consecutive_mistakes += 1;
-                return Err(ToolError::ExecutionFailed(
-                    error_guidance::symbol_not_found(
-                        &r.symbol,
-                        &r.path,
-                        state.consecutive_mistakes,
-                    ),
-                ));
-            }
+        if let Some(range) = resolved_range {
+            resolved_replacements.push((r.clone(), range));
+        } else {
+            state.consecutive_mistakes += 1;
+            return Err(ToolError::ExecutionFailed(error_guidance::symbol_not_found(
+                &r.symbol,
+                &r.path,
+                state.consecutive_mistakes,
+            )));
         }
     }
 
@@ -449,10 +452,10 @@ async fn process_batch(
                 if non_whitespace_start >= whitespace_len {
                     new_text[whitespace_len..].to_string()
                 } else {
-                    new_text.to_string()
+                    new_text.clone()
                 }
             } else {
-                new_text.to_string()
+                new_text.clone()
             }
         } else {
             new_text.clone()
