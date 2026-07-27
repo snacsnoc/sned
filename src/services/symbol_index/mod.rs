@@ -61,7 +61,6 @@ static SYMBOL_INDEX_REFRESHING: LazyLock<Mutex<HashSet<String>>> =
 
 const INDEX_BATCH_SIZE: usize = 64;
 const INDEX_PREFLIGHT_MIN_FILES: usize = 100;
-const INDEX_PREFLIGHT_SAMPLE_SIZE: usize = 128;
 
 struct SymbolIndexRefreshGuard {
     project_root: String,
@@ -430,16 +429,11 @@ fn run_initial_walk(service: &Arc<Mutex<SymbolIndexService>>, project_root: &Pat
     }
 
     let candidates = collect_index_candidates(project_root);
-    let sampled_latest_mtime = candidates
-        .iter()
-        .take(INDEX_PREFLIGHT_SAMPLE_SIZE)
-        .map(|candidate| candidate.mtime)
-        .max()
-        .unwrap_or(0);
+    let latest_candidate_mtime = latest_candidate_mtime(&candidates);
 
     {
         let mut index = service.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if index.should_skip_initial_walk(sampled_latest_mtime) {
+        if index.should_skip_initial_walk(latest_candidate_mtime) {
             index.finish_initial_walk(candidates.len());
             return Ok(());
         }
@@ -488,6 +482,14 @@ fn run_initial_walk(service: &Arc<Mutex<SymbolIndexService>>, project_root: &Pat
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .finish_initial_walk(candidates.len());
     Ok(())
+}
+
+fn latest_candidate_mtime(candidates: &[IndexCandidate]) -> u64 {
+    candidates
+        .iter()
+        .map(|candidate| candidate.mtime)
+        .max()
+        .unwrap_or(0)
 }
 
 fn flush_initial_batch(
@@ -855,6 +857,26 @@ mod tests {
 
         assert!(service.should_skip_initial_walk(100));
         assert!(!service.should_skip_initial_walk(101));
+    }
+
+    #[test]
+    fn test_latest_candidate_mtime_considers_candidates_after_legacy_sample_boundary() {
+        let mut candidates: Vec<_> = (0..128)
+            .map(|index| IndexCandidate {
+                absolute_path: PathBuf::from(format!("src/{index}.rs")),
+                relative_path: format!("src/{index}.rs"),
+                mtime: 100,
+                size: 10,
+            })
+            .collect();
+        candidates.push(IndexCandidate {
+            absolute_path: PathBuf::from("src/newer.rs"),
+            relative_path: "src/newer.rs".to_string(),
+            mtime: 101,
+            size: 10,
+        });
+
+        assert_eq!(latest_candidate_mtime(&candidates), 101);
     }
 
     #[test]
