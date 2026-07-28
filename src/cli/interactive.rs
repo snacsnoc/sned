@@ -1015,9 +1015,7 @@ fn drain_output_queues(
     if let Some(line) = pending_model_update.take() {
         app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
     }
-    if app.has_pending_approval() {
-        app.pin_approval_bottom();
-    } else if crate::core::approval::take_followup_prompt_scroll() {
+    if crate::core::approval::take_followup_prompt_scroll() {
         app.pin_approval_bottom();
     } else if crate::core::approval::is_any_followup_question_active() {
         // Any interactive prompt that blocks progress must keep its input line
@@ -3703,9 +3701,11 @@ async fn run_main_loop(
                     match mouse_event.kind {
                         MouseEventKind::ScrollDown => {
                             app.clear_text_selection();
-                            if app.has_pending_approval() {
-                                app.scroll_pending_approval(-mouse_scroll_lines);
-                            } else if !app.scroll_completion_at(
+                            if !app.scroll_pending_approval_at(
+                                mouse_event.column,
+                                mouse_event.row,
+                                -mouse_scroll_lines,
+                            ) && !app.scroll_completion_at(
                                 mouse_event.column,
                                 mouse_event.row,
                                 mouse_scroll_lines,
@@ -3715,9 +3715,11 @@ async fn run_main_loop(
                         }
                         MouseEventKind::ScrollUp => {
                             app.clear_text_selection();
-                            if app.has_pending_approval() {
-                                app.scroll_pending_approval(mouse_scroll_lines);
-                            } else if !app.scroll_completion_at(
+                            if !app.scroll_pending_approval_at(
+                                mouse_event.column,
+                                mouse_event.row,
+                                mouse_scroll_lines,
+                            ) && !app.scroll_completion_at(
                                 mouse_event.column,
                                 mouse_event.row,
                                 -mouse_scroll_lines,
@@ -4324,7 +4326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_output_keeps_scroll_pinned_while_approval_is_pending() {
+    fn test_drain_output_preserves_manual_scroll_while_approval_is_pending() {
         use crate::cli::tui::app::ScrollMode;
 
         let (_tx, mut rx) = mpsc::channel(1);
@@ -4341,8 +4343,8 @@ mod tests {
 
         drain_output(&mut rx, &mut app);
 
-        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
-        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 7);
     }
 
     #[test]

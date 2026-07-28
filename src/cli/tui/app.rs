@@ -445,6 +445,7 @@ pub struct App {
     /// Input textarea (live user input)
     pub input: TextArea<'static>,
     pending_approval: Option<PendingApproval>,
+    approval_detail_area: Option<Rect>,
     /// Whether the agent is currently busy
     pub agent_busy: bool,
     /// Whether the model is currently in a reasoning/thinking phase (no displayable output yet).
@@ -761,7 +762,6 @@ impl App {
         self.model_picker_active = false;
         self.clear_text_selection();
         self.needs_redraw = true;
-        self.pin_approval_bottom();
         true
     }
 
@@ -810,8 +810,8 @@ impl App {
     ) -> Option<bool> {
         let pending = self.pending_approval.take()?;
         let delivered = pending.request.respond(result);
+        self.approval_detail_area = None;
         self.needs_redraw = true;
-        self.clear_approval_pin();
         Some(delivered)
     }
 
@@ -824,8 +824,8 @@ impl App {
             return false;
         }
         self.pending_approval.take();
+        self.approval_detail_area = None;
         self.needs_redraw = true;
-        self.clear_approval_pin();
         true
     }
 
@@ -847,11 +847,31 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub fn scroll_pending_approval_at(
+        &mut self,
+        column: u16,
+        row: u16,
+        rows_toward_history: isize,
+    ) -> bool {
+        let Some(area) = self.approval_detail_area else {
+            return false;
+        };
+        let contains = column >= area.x
+            && column < area.x.saturating_add(area.width)
+            && row >= area.y
+            && row < area.y.saturating_add(area.height);
+        if !contains {
+            return false;
+        }
+        self.scroll_pending_approval(rows_toward_history);
+        true
+    }
+
     fn approval_panel_height(&self) -> u16 {
         let Some(pending) = self.pending_approval.as_ref() else {
             return 0;
         };
-        let wrap_width = self.last_wrap_width().saturating_sub(2).max(1);
+        let wrap_width = self.last_wrap_width().saturating_sub(3).max(1);
         let detail_rows = pending
             .lines
             .iter()
@@ -883,6 +903,7 @@ impl App {
             output_line_kinds: VecDeque::new(),
             input: Self::new_textarea(Vec::new()),
             pending_approval: None,
+            approval_detail_area: None,
             agent_busy: false,
             reasoning_active: false,
             reasoning_partial_line: String::new(),
@@ -3196,6 +3217,7 @@ impl App {
             self.render_approval_panel(frame, input_area);
             return;
         }
+        self.approval_detail_area = None;
 
         let input_title = if let Some(pending) = self.pending_model_switch.as_ref() {
             format!(" API key for {} ", pending.provider)
@@ -3252,7 +3274,11 @@ impl App {
             height: inner.height.saturating_sub(detail_height),
         };
 
-        let wrap_width = detail_area.width.max(1) as usize;
+        let text_area = Rect {
+            width: detail_area.width.saturating_sub(1).max(1),
+            ..detail_area
+        };
+        let wrap_width = text_area.width as usize;
         let total_rows = lines
             .iter()
             .map(|line| Self::line_visual_rows(line, wrap_width))
@@ -3265,8 +3291,24 @@ impl App {
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((Self::terminal_scroll_offset(scroll_y), 0)),
-            detail_area,
+            text_area,
         );
+
+        if max_scroll > 0 {
+            let mut state = ScrollbarState::new(total_rows)
+                .viewport_content_length(viewport_rows)
+                .position(scroll_y);
+            frame.render_stateful_widget(
+                Scrollbar::default()
+                    .orientation(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("↑"))
+                    .end_symbol(Some("↓"))
+                    .style(theme::scrollbar_style())
+                    .thumb_style(theme::scrollbar_thumb_style()),
+                detail_area,
+                &mut state,
+            );
+        }
 
         let mut actions = Vec::new();
         for (index, choice) in choices.iter().enumerate() {
@@ -3291,7 +3333,7 @@ impl App {
         }
         if max_scroll > 0 {
             actions.push(Span::styled(
-                "  [↑/↓] Review",
+                "  [↑/↓/wheel] Review",
                 Style::default().fg(theme::STATUS_FG),
             ));
         }
@@ -3308,6 +3350,8 @@ impl App {
             pending.rendered =
                 detail_area.height > 0 && action_area.height > 0 && !choices.is_empty();
         }
+        self.approval_detail_area =
+            (detail_area.width > 0 && detail_area.height > 0).then_some(detail_area);
     }
 
     fn has_blocking_prompt(&self) -> bool {
@@ -5071,6 +5115,77 @@ mod tests {
     }
 
     #[test]
+    fn test_approval_panel_scrolls_only_inside_its_detail_area() {
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        let details = (0..24)
+            .map(|index| format!("detail line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            2,
+            "Approval required · edit_file",
+            &details,
+        );
+        assert!(app.set_pending_approval(request));
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("approval panel should render");
+
+        let detail_area = app
+            .approval_detail_area
+            .expect("approval detail area should be recorded after rendering");
+        let initial_scroll = app
+            .pending_approval
+            .as_ref()
+            .expect("approval should remain pending")
+            .scroll_from_bottom;
+        assert!(app.scroll_pending_approval_at(detail_area.x, detail_area.y, 1));
+        assert_eq!(
+            app.pending_approval
+                .as_ref()
+                .expect("approval should remain pending")
+                .scroll_from_bottom,
+            initial_scroll + 1
+        );
+        assert!(!app.scroll_pending_approval_at(detail_area.x.saturating_sub(1), detail_area.y, 1));
+
+        let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("[↑/↓/wheel] Review"));
+    }
+
+    #[test]
+    fn test_approval_panel_preserves_manual_transcript_view_after_render() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        for index in 0..80 {
+            app.push_plain(format!("transcript line {index}"));
+        }
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("transcript should render");
+        app.scroll_lines(-5);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert!(app.scroll_offset > 0);
+
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            3,
+            "Approval required · edit_file",
+            "Review these edits before continuing.",
+        );
+        assert!(app.set_pending_approval(request));
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("approval panel should render");
+
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert!(app.scroll_offset > 0);
+    }
+
+    #[test]
     fn test_sequential_approval_ids_ignore_stale_finish_events() {
         let mut app = App::new();
         let (first, first_rx) = crate::core::approval::approval_request_for_test(
@@ -6742,11 +6857,7 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("post-prompt render should succeed");
 
-        assert_eq!(
-            app.scroll_mode,
-            ScrollMode::ApprovalPinned,
-            "scroll mode must be ApprovalPinned while approval prompt is active"
-        );
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
 
         let buffer = terminal.backend().buffer().clone();
         let width = buffer.area.width as usize;
@@ -6818,11 +6929,7 @@ mod tests {
             .expect("approval request should fit");
 
         crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
-        assert_eq!(
-            app.scroll_mode,
-            ScrollMode::ApprovalPinned,
-            "a pending approval should pin transcript output"
-        );
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
         assert!(!app.approval_accepts_input());
 
         terminal
