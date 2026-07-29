@@ -20,6 +20,141 @@ pub struct ExecuteCommandHandler {
     safety_checker: CommandSafetyChecker,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SandboxEnvReport {
+    not_allowlisted: Vec<String>,
+    sensitive: Vec<String>,
+}
+
+impl SandboxEnvReport {
+    fn record(&mut self, name: String) {
+        if is_secret_like(&name) {
+            self.sensitive.push(name);
+        } else {
+            self.not_allowlisted.push(name);
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.not_allowlisted.extend(other.not_allowlisted);
+        self.sensitive.extend(other.sensitive);
+    }
+
+    fn normalize(&mut self) {
+        self.not_allowlisted.sort();
+        self.not_allowlisted.dedup();
+        self.sensitive.sort();
+        self.sensitive.dedup();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.not_allowlisted.is_empty() && self.sensitive.is_empty()
+    }
+
+    fn total(&self) -> usize {
+        self.not_allowlisted.len() + self.sensitive.len()
+    }
+}
+
+fn is_secret_like(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    upper.ends_with("_KEY")
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_PASSWORD")
+        || upper.ends_with("_PASSWD")
+        || upper.ends_with("_CREDENTIAL")
+        || upper.ends_with("_PRIVATE_KEY")
+        || matches!(upper.as_str(), "KEY" | "SECRET" | "TOKEN" | "PASSWORD")
+}
+
+fn format_sandbox_env_note(report: &SandboxEnvReport) -> String {
+    let mut note = format!(
+        "\n[Sandbox: {} environment variables withheld from this command.",
+        report.total()
+    );
+    if !report.not_allowlisted.is_empty() {
+        note.push_str("\n  Not allowlisted: ");
+        note.push_str(&report.not_allowlisted.join(", "));
+    }
+    if !report.sensitive.is_empty() {
+        note.push_str("\n  Sensitive and always blocked: ");
+        note.push_str(&report.sensitive.join(", "));
+    }
+    note.push_str(
+        "\n  To pass non-sensitive variables, set SNED_ALLOW_ENV=VAR1,VAR2; sensitive variables remain blocked.]",
+    );
+    note
+}
+
+fn command_output_limit() -> usize {
+    std::env::var("SNED_COMMAND_OUTPUT_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0 && v <= 1024 * 1024)
+        .unwrap_or(10 * 1024)
+}
+
+fn format_bounded_sandbox_env_note(report: &SandboxEnvReport, limit_bytes: usize) -> String {
+    let note = format_sandbox_env_note(report);
+    if note.len() <= limit_bytes {
+        return note;
+    }
+
+    let compact_note = format!(
+        "\n[Sandbox: {} environment variables withheld; diagnostic truncated by output limit. \
+Increase SNED_COMMAND_OUTPUT_LIMIT to see all names.]",
+        report.total()
+    );
+    let safe_end = compact_note.floor_char_boundary(limit_bytes);
+    compact_note[..safe_end].to_string()
+}
+
+fn truncate_command_output(output: String, limit_bytes: usize) -> String {
+    if output.len() <= limit_bytes {
+        return output;
+    }
+
+    let marker = "\n\n(Output truncated due to size limit.)";
+    let safe_end = output.floor_char_boundary(limit_bytes.saturating_sub(marker.len()));
+    let mut truncated = output[..safe_end].to_string();
+    if truncated.len() + marker.len() <= limit_bytes {
+        truncated.push_str(marker);
+    }
+    truncated
+}
+
+fn assemble_sandboxed_output(
+    output: String,
+    report: &SandboxEnvReport,
+    limit_bytes: usize,
+) -> String {
+    if report.is_empty() {
+        return truncate_command_output(output, limit_bytes);
+    }
+
+    let note = format_bounded_sandbox_env_note(report, limit_bytes);
+    if note.len() >= limit_bytes {
+        return note;
+    }
+
+    let output_budget = limit_bytes - note.len();
+    if output.len() <= output_budget {
+        let mut result = output;
+        result.push_str(&note);
+        return result;
+    }
+
+    let marker = "\n\n(Output truncated due to size limit.)";
+    let safe_end = output.floor_char_boundary(output_budget.saturating_sub(marker.len()));
+    let mut result = output[..safe_end].to_string();
+    if result.len() + marker.len() <= output_budget {
+        result.push_str(marker);
+    }
+    result.push_str(&note);
+    result
+}
+
 impl Default for ExecuteCommandHandler {
     fn default() -> Self {
         Self::new()
@@ -190,7 +325,7 @@ impl ExecuteCommandHandler {
         use tokio::time::timeout;
 
         let mut combined_output = String::new();
-        let mut all_filtered_names: Vec<String> = Vec::new();
+        let mut sandbox_env_report = SandboxEnvReport::default();
 
         for cmd_str in commands {
             // Safety check: validate command against safe list and patterns
@@ -225,11 +360,9 @@ impl ExecuteCommandHandler {
                 c
             };
 
-            let (sandboxed_env, filtered_names) = Self::build_sandbox_env(cwd);
+            let (sandboxed_env, env_report) = Self::build_sandbox_env(cwd);
             cmd.env_clear().envs(sandboxed_env);
-            if !filtered_names.is_empty() {
-                all_filtered_names.extend(filtered_names);
-            }
+            sandbox_env_report.extend(env_report);
 
             if let Some(dir) = cwd {
                 if !dir.exists() || !dir.is_dir() {
@@ -588,51 +721,20 @@ impl ExecuteCommandHandler {
             combined_output.push_str("Command executed successfully with no output.");
         }
 
-        if !all_filtered_names.is_empty() {
-            all_filtered_names.sort();
-            all_filtered_names.dedup();
-            let sample: Vec<&str> = all_filtered_names
-                .iter()
-                .take(5)
-                .map(std::string::String::as_str)
-                .collect();
-            let note = if all_filtered_names.len() > 5 {
-                format!(
-                    "\n[Sandbox: {} env vars filtered (e.g. {}). Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
-                    all_filtered_names.len(),
-                    sample.join(", ")
-                )
-            } else {
-                format!(
-                    "\n[Sandbox: env vars filtered: {}. Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
-                    sample.join(", ")
-                )
-            };
-            combined_output.push_str(&note);
-        }
-
-        let truncated = combined_output.len() > 10 * 1024;
+        sandbox_env_report.normalize();
+        let limit_bytes = command_output_limit();
+        let truncated = combined_output.len() > limit_bytes;
         tracing::info!(
             output_len = combined_output.len(),
             truncated,
             "execute_command result assembled"
         );
 
-        let limit_bytes = std::env::var("SNED_COMMAND_OUTPUT_LIMIT")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v > 0 && v <= 1024 * 1024)
-            .unwrap_or(10 * 1024);
-
-        if combined_output.len() > limit_bytes {
-            // Use floor_char_boundary to avoid splitting multi-byte UTF-8 characters
-            let safe_end = combined_output.floor_char_boundary(limit_bytes);
-            let mut truncated = combined_output[..safe_end].to_string();
-            truncated.push_str("\n\n(Output truncated due to size limit.)");
-            Ok(truncated)
-        } else {
-            Ok(combined_output)
-        }
+        Ok(assemble_sandboxed_output(
+            combined_output,
+            &sandbox_env_report,
+            limit_bytes,
+        ))
     }
 
     /// Execute a script in a specific language.
@@ -684,7 +786,7 @@ impl ExecuteCommandHandler {
             }
         };
 
-        let (sandboxed_env, filtered_names) = Self::build_sandbox_env(cwd);
+        let (sandboxed_env, env_report) = Self::build_sandbox_env(cwd);
         let mut cmd = Command::new(shell);
         for arg in args {
             cmd.arg(arg);
@@ -804,26 +906,7 @@ impl ExecuteCommandHandler {
             combined.push_str(&format!("\n{}", err.display()));
         }
 
-        if !filtered_names.is_empty() {
-            let sample: Vec<&str> = filtered_names
-                .iter()
-                .take(5)
-                .map(std::string::String::as_str)
-                .collect();
-            let note = if filtered_names.len() > 5 {
-                format!(
-                    "\n[Sandbox: {} env vars filtered (e.g. {}). Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
-                    filtered_names.len(),
-                    sample.join(", ")
-                )
-            } else {
-                format!(
-                    "\n[Sandbox: env vars filtered: {}. Set SNED_ALLOW_ENV=VAR1,VAR2 to allow.]",
-                    sample.join(", ")
-                )
-            };
-            combined.push_str(&note);
-        }
+        let combined = assemble_sandboxed_output(combined, &env_report, command_output_limit());
 
         if !combined.is_empty() {
             use crate::cli::output::OutputEvent;
@@ -834,7 +917,7 @@ impl ExecuteCommandHandler {
     }
     fn build_sandbox_env(
         cwd: Option<&Path>,
-    ) -> (std::collections::HashMap<String, String>, Vec<String>) {
+    ) -> (std::collections::HashMap<String, String>, SandboxEnvReport) {
         use std::collections::HashMap;
 
         static BASE_ALLOWLIST: &[&str] = &[
@@ -864,19 +947,6 @@ impl ExecuteCommandHandler {
 
         static SNED_ALLOW_ENV: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         let extra = SNED_ALLOW_ENV.get_or_init(|| {
-            // Block vars ending with secret-like suffixes (more precise than contains())
-            fn is_secret_like(name: &str) -> bool {
-                let upper = name.to_uppercase();
-                upper.ends_with("_KEY")
-                    || upper.ends_with("_SECRET")
-                    || upper.ends_with("_TOKEN")
-                    || upper.ends_with("_PASSWORD")
-                    || upper.ends_with("_PASSWD")
-                    || upper.ends_with("_CREDENTIAL")
-                    || upper.ends_with("_PRIVATE_KEY")
-                    || upper == "KEY" || upper == "SECRET" || upper == "TOKEN" || upper == "PASSWORD"
-            }
-
             std::env::var("SNED_ALLOW_ENV")
                 .unwrap_or_default()
                 .split(',')
@@ -902,13 +972,13 @@ impl ExecuteCommandHandler {
             .collect();
 
         let mut env = HashMap::new();
-        let mut filtered = Vec::new();
+        let mut report = SandboxEnvReport::default();
 
         for (k, v) in std::env::vars() {
             if allow_set.contains_key(k.as_str()) && !k.starts_with("SNED_") {
                 env.insert(k, v);
             } else if !k.starts_with("SNED_") {
-                filtered.push(k);
+                report.record(k);
             }
         }
 
@@ -916,7 +986,8 @@ impl ExecuteCommandHandler {
             env.insert("PWD".to_string(), dir.display().to_string());
         }
 
-        (env, filtered)
+        report.normalize();
+        (env, report)
     }
 
     #[must_use]
@@ -1559,18 +1630,22 @@ mod tests {
 
     #[test]
     fn test_sandbox_allows_base_vars() {
-        let (env, filtered) = ExecuteCommandHandler::build_sandbox_env(None);
+        let (env, report) = ExecuteCommandHandler::build_sandbox_env(None);
         assert!(env.contains_key("PATH"), "PATH should be allowed");
         assert!(env.contains_key("HOME"), "HOME should be allowed");
         assert!(
-            !filtered.iter().any(|k| k == "PATH"),
+            !report
+                .not_allowlisted
+                .iter()
+                .chain(report.sensitive.iter())
+                .any(|k| k == "PATH"),
             "PATH should not be in filtered list"
         );
     }
 
     #[test]
     fn test_sandbox_filters_sensitive_vars() {
-        let (env, _filtered) = ExecuteCommandHandler::build_sandbox_env(None);
+        let (env, _report) = ExecuteCommandHandler::build_sandbox_env(None);
         for key in &[
             "API_KEY",
             "SECRET_TOKEN",
@@ -1583,14 +1658,71 @@ mod tests {
 
     #[test]
     fn test_sandbox_silently_drops_sned_internal() {
-        let (env, filtered) = ExecuteCommandHandler::build_sandbox_env(None);
+        let (env, report) = ExecuteCommandHandler::build_sandbox_env(None);
         for key in &["SNED_PROVIDER", "SNED_API_KEY", "SNED_DIR"] {
             assert!(!env.contains_key(*key), "SNED_* internal should not leak");
             assert!(
-                !filtered.iter().any(|f| f == *key),
+                !report
+                    .not_allowlisted
+                    .iter()
+                    .chain(report.sensitive.iter())
+                    .any(|f| f == *key),
                 "SNED_* should be silently dropped, not reported as filtered"
             );
         }
+    }
+
+    #[test]
+    fn test_sandbox_env_note_lists_all_names_and_policy() {
+        let mut report = SandboxEnvReport {
+            not_allowlisted: vec![
+                "SSH_CONNECTION".to_string(),
+                "SHLVL".to_string(),
+                "SSH_CONNECTION".to_string(),
+            ],
+            sensitive: vec![
+                "SALAD_API_KEY".to_string(),
+                "MINI_MAX_TOKEN_API_KEY".to_string(),
+            ],
+        };
+        report.normalize();
+
+        let note = format_sandbox_env_note(&report);
+        assert!(note.contains("4 environment variables withheld"));
+        assert!(note.contains("Not allowlisted: SHLVL, SSH_CONNECTION"));
+        assert!(
+            note.contains("Sensitive and always blocked: MINI_MAX_TOKEN_API_KEY, SALAD_API_KEY")
+        );
+        assert!(note.contains("SNED_ALLOW_ENV=VAR1,VAR2"));
+        assert!(!note.contains("e.g."));
+    }
+
+    #[test]
+    fn test_sandbox_output_limit_includes_metadata() {
+        let report = SandboxEnvReport {
+            not_allowlisted: vec!["WORKSPACE_ID".to_string()],
+            sensitive: vec!["SERVICE_API_KEY".to_string()],
+        };
+        let result = assemble_sandboxed_output("output".repeat(1024), &report, 512);
+
+        assert!(result.len() <= 512);
+        assert!(result.contains("WORKSPACE_ID"));
+        assert!(result.contains("SERVICE_API_KEY"));
+        assert!(result.contains("(Output truncated due to size limit.)"));
+    }
+
+    #[test]
+    fn test_secret_like_names_are_always_blocked() {
+        for name in [
+            "API_KEY",
+            "SECRET_TOKEN",
+            "MY_PASSWORD",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(is_secret_like(name), "{name} should be sensitive");
+        }
+        assert!(!is_secret_like("SSH_CONNECTION"));
+        assert!(!is_secret_like("SHLVL"));
     }
 
     #[test]
@@ -1628,5 +1760,79 @@ mod tests {
             result.starts_with("Command executed successfully with no output.\n[Sandbox:"),
             "silent success should remain explicit before sandbox metadata, got: {result}"
         );
+        assert!(result.contains("EXECUTE_COMMAND_TEST_SECRET"));
+        assert!(result.contains("Sensitive and always blocked"));
+        assert!(!result.contains("filtered"));
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_note_survives_command_output_truncation() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let env_var = "EXECUTE_COMMAND_TRUNCATED_SECRET";
+        let original_env = std::env::var_os(env_var);
+        let original_limit = std::env::var_os("SNED_COMMAND_OUTPUT_LIMIT");
+        unsafe {
+            std::env::set_var(env_var, "truncated-secret-value");
+            std::env::set_var("SNED_COMMAND_OUTPUT_LIMIT", "1");
+        }
+
+        let handler = ExecuteCommandHandler::new();
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let result = handler
+            .execute_commands_with_timeout(
+                vec!["printf output".to_string()],
+                None,
+                None,
+                true,
+                None,
+                false,
+                &output_writer,
+            )
+            .await;
+
+        unsafe {
+            match original_env {
+                Some(value) => std::env::set_var(env_var, value),
+                None => std::env::remove_var(env_var),
+            }
+            match original_limit {
+                Some(value) => std::env::set_var("SNED_COMMAND_OUTPUT_LIMIT", value),
+                None => std::env::remove_var("SNED_COMMAND_OUTPUT_LIMIT"),
+            }
+        }
+
+        let result = result.unwrap();
+        assert!(result.len() <= 1);
+        assert!(!result.contains("truncated-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn test_script_reports_sandbox_names_without_values() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let env_var = "EXECUTE_SCRIPT_TEST_SECRET";
+        let original = std::env::var_os(env_var);
+        unsafe { std::env::set_var(env_var, "script-secret-value") };
+
+        let result = ExecuteCommandHandler::new()
+            .with_yolo(true)
+            .execute_script("print('script output')", "python3", None)
+            .await
+            .unwrap();
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var(env_var, value),
+                None => std::env::remove_var(env_var),
+            }
+        }
+
+        assert!(result.contains("EXECUTE_SCRIPT_TEST_SECRET"));
+        assert!(result.contains("Sensitive and always blocked"));
+        assert!(!result.contains("script-secret-value"));
     }
 }
