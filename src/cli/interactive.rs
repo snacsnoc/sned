@@ -753,7 +753,7 @@ fn apply_output_event(
         }
         OutputEvent::UserPromptLine(line) => {
             flush_model_update(app, pending_model_update);
-            app.clear_completion_lines();
+            app.dismiss_completion_lines();
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
         OutputEvent::LocalCommandEcho(line) => {
@@ -793,7 +793,10 @@ fn apply_output_event(
                 .map(App::line_to_string)
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !model_text.trim().is_empty() && model_text.trim() == result.trim() {
+            let result_matches_model =
+                !model_text.trim().is_empty() && model_text.trim() == result.trim();
+            app.set_completion_needs_transcript_copy(!result_matches_model);
+            if result_matches_model {
                 for line in
                     crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed")
                 {
@@ -1013,6 +1016,14 @@ fn drain_output_queues(
     }
 
     while let Ok(event) = rx.try_recv() {
+        if matches!(&event, OutputEvent::TurnEnd { .. }) {
+            // Completion is emitted before its turn-end marker. If completion
+            // spilled into the priority lane, apply it after streamed prose but
+            // before turn finalization clears the stream entries it compares.
+            for deferred_event in std::mem::take(&mut deferred_priority) {
+                apply_output_event(app, deferred_event, &mut pending_model_update);
+            }
+        }
         saw_output = true;
         apply_output_event(app, event, &mut pending_model_update);
     }
@@ -1478,10 +1489,7 @@ async fn cancel_agent(
 
 fn handle_idle_ctrl_c(app: &mut App) {
     if !app.completion_lines.is_empty() && app.error_lines.is_empty() {
-        // A visible completion is the most recent turn's transient artifact.
-        // Dismiss it without inserting a transcript line between the output
-        // and the completion box.
-        app.clear_completion_lines();
+        app.dismiss_completion_lines();
     } else {
         app.push_styled(
             "Press Ctrl+C again to quit.",
@@ -4249,6 +4257,40 @@ mod tests {
     }
 
     #[test]
+    fn test_priority_completion_precedes_main_lane_turn_end() {
+        use crate::cli::output::OutputEvent;
+
+        let result = "STREAMED_RESULT_MARKER";
+        let (tx, mut rx) = mpsc::channel(2);
+        let (priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        tx.try_send(OutputEvent::Line(Line::from(result))).unwrap();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: result.to_string(),
+        })
+        .unwrap();
+        priority_tx
+            .send(OutputEvent::Completion(result.to_string()))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+            .unwrap();
+        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+
+        assert_eq!(
+            app.output_lines
+                .iter()
+                .map(App::line_to_string)
+                .filter(|line| line.contains(result))
+                .count(),
+            1,
+            "a priority-lane completion must not be archived when its result already streamed"
+        );
+    }
+
+    #[test]
     fn test_drain_output_priority_lane_preempts_backlog_for_approval_panel() {
         use crate::cli::output::{OutputEvent, OutputWriter};
         use ratatui::Terminal;
@@ -4516,6 +4558,125 @@ mod tests {
             "❯ queued message"
         );
         assert_eq!(app.output_line_kinds.back(), Some(&BlockKind::UserPrompt));
+    }
+
+    #[test]
+    fn test_dismissed_result_only_completion_is_preserved_in_rendered_transcript() {
+        use crate::cli::output::OutputEvent;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let result = "FORMAL_RESULT_MARKER";
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.try_send(OutputEvent::Completion(result.to_string()))
+            .unwrap();
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        assert!(app.completion_lines.is_empty());
+        assert_eq!(app.last_completion_text(), Some(result));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("dismissed completion should render in the transcript");
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains(result),
+            "result-only completion must remain visible after dismissal; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_dismissed_completion_preserves_result_when_streamed_prose_differs() {
+        use crate::cli::output::OutputEvent;
+
+        let streamed = "I have the evidence. I will compile the review.";
+        let result = "FORMAL_REVIEW_RESULT_MARKER";
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::Line(Line::from(streamed)))
+            .unwrap();
+        tx.try_send(OutputEvent::Completion(result.to_string()))
+            .unwrap();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: streamed.to_string(),
+        })
+        .unwrap();
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let transcript = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains(streamed));
+        assert!(transcript.contains(result));
+    }
+
+    #[test]
+    fn test_dismissed_completion_does_not_duplicate_matching_streamed_result() {
+        use crate::cli::output::OutputEvent;
+
+        let result = "STREAMED_RESULT_MARKER";
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::Line(Line::from(result))).unwrap();
+        tx.try_send(OutputEvent::Completion(result.to_string()))
+            .unwrap();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: result.to_string(),
+        })
+        .unwrap();
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let matching_lines = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .filter(|line| line.contains(result))
+            .count();
+        assert_eq!(matching_lines, 1);
+    }
+
+    #[test]
+    fn test_idle_ctrl_c_preserves_result_only_completion_in_transcript() {
+        use crate::cli::output::OutputEvent;
+
+        let result = "CTRL_C_RESULT_MARKER";
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(OutputEvent::Completion(result.to_string()))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+        handle_idle_ctrl_c(&mut app);
+
+        assert!(app.completion_lines.is_empty());
+        assert!(
+            app.output_lines
+                .iter()
+                .map(App::line_to_string)
+                .any(|line| line.contains(result))
+        );
     }
 
     #[test]

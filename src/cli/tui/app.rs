@@ -616,6 +616,8 @@ pub struct App {
     /// Completion box lines rendered as a dedicated Block widget.
     pub completion_lines: VecDeque<Line<'static>>,
     last_completion_text: Option<String>,
+    /// Whether dismissing the completion box must preserve its result in the transcript.
+    completion_needs_transcript_copy: bool,
     /// Cached completion row count, valid when cached_wrap_width matches.
     pub cached_completion_rows: usize,
     completion_scroll_offset: usize,
@@ -976,6 +978,7 @@ impl App {
             pending_model_switch: None,
             completion_lines: VecDeque::new(),
             last_completion_text: None,
+            completion_needs_transcript_copy: false,
             cached_completion_rows: 0,
             completion_scroll_offset: 0,
             completion_viewport_rows: 0,
@@ -1040,21 +1043,33 @@ impl App {
             };
 
         for l in lines_to_push {
-            self._push_output_line(l, kind, wrap_width);
+            self._push_output_line(l, kind, wrap_width, true);
         }
+    }
+
+    fn push_archived_completion_line(&mut self, line: Line<'static>) {
+        // The line already exists in completion_lines. Move it without the
+        // transcript limit so dismissal preserves the complete result.
+        self._push_output_line(line, BlockKind::Model, self.last_wrap_width(), false);
     }
 
     /// Internal: push a single pre-wrapped line to the buffer with a
     /// kind tag.  `output_line_kinds` is kept in lockstep with
     /// `output_lines` so render-time grouping can walk both buffers
     /// with the same indices.
-    fn _push_output_line(&mut self, line: Line<'static>, kind: BlockKind, wrap_width: usize) {
+    fn _push_output_line(
+        &mut self,
+        line: Line<'static>,
+        kind: BlockKind,
+        wrap_width: usize,
+        enforce_transcript_limit: bool,
+    ) {
         let previous_kind = self.output_line_kinds.back().copied();
         self.needs_redraw = true;
         self.output_lines.push_back(line);
         self.output_line_kinds.push_back(kind);
         self.cached_visible_window = None;
-        if self.output_lines.len() > 10_000 {
+        if enforce_transcript_limit && self.output_lines.len() > 10_000 {
             let evicted_rows = if self.scroll_mode == ScrollMode::Manual {
                 let evicted_kind = *self
                     .output_line_kinds
@@ -1586,6 +1601,10 @@ impl App {
         self.last_completion_text = Some(text);
     }
 
+    pub fn set_completion_needs_transcript_copy(&mut self, needed: bool) {
+        self.completion_needs_transcript_copy = needed;
+    }
+
     #[must_use]
     pub fn last_completion_text(&self) -> Option<&str> {
         self.last_completion_text.as_deref()
@@ -1979,11 +1998,26 @@ impl App {
         self.clear_text_selection();
         self.needs_redraw = true;
         self.completion_lines.clear();
+        self.completion_needs_transcript_copy = false;
         self.cached_completion_rows = 0;
         self.completion_scroll_offset = 0;
         self.completion_viewport_rows = 0;
         self.completion_area = None;
         self.cached_wrap_width = None;
+    }
+
+    /// Dismiss the completion box, preserving result-only completions in the transcript.
+    pub fn dismiss_completion_lines(&mut self) {
+        let archived_lines = self
+            .completion_needs_transcript_copy
+            .then(|| std::mem::take(&mut self.completion_lines));
+        self.clear_completion_lines();
+
+        if let Some(lines) = archived_lines {
+            for line in lines {
+                self.push_archived_completion_line(line);
+            }
+        }
     }
 
     /// Push an error line to the error buffer.
@@ -2312,6 +2346,7 @@ impl App {
         self.output_line_kinds.clear();
         self.completion_lines.clear();
         self.last_completion_text = None;
+        self.completion_needs_transcript_copy = false;
         self.error_lines.clear();
         self.turn_stream_entries.clear();
         self.last_stream_group = None;
@@ -4758,6 +4793,28 @@ mod tests {
             .next()
             .expect("manual viewport should contain a transcript row");
         assert!(App::line_to_string(&first_visible).contains("line 42"));
+    }
+
+    #[test]
+    fn test_dismiss_completion_preserves_lines_beyond_transcript_limit() {
+        let mut app = App::new();
+        for index in 0..10_001 {
+            app.push_completion_line(Line::from(format!("completion line {index}")));
+        }
+        app.set_completion_needs_transcript_copy(true);
+
+        app.dismiss_completion_lines();
+
+        assert!(app.completion_lines.is_empty());
+        assert_eq!(app.output_lines.len(), 10_001);
+        assert_eq!(
+            app.output_lines.front().map(App::line_to_string).as_deref(),
+            Some("completion line 0")
+        );
+        assert_eq!(
+            app.output_lines.back().map(App::line_to_string).as_deref(),
+            Some("completion line 10000")
+        );
     }
 
     #[test]
