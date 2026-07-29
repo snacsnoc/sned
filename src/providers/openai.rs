@@ -2605,6 +2605,16 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn test_qwen_thinking_wrapper_normalizes_trailing_tag_delimiter() {
+        assert_eq!(
+            normalize_qwen_thinking_tool_name(
+                "write_to_file\n</think>\n\n<tool_call>\n<function=write_to_file>"
+            ),
+            Some("write_to_file".to_string())
+        );
+    }
 }
 #[cfg(test)]
 mod debug_test {
