@@ -357,10 +357,10 @@ For memory allocation benchmarks, use dhat:
 cargo run --features dhat-heap > /dev/null 2>&1
 
 # Analyze heap allocations
-../user-scripts/analyze-dhat-heap.sh dhat-heap.json
+./scripts/analyze-dhat-heap.sh dhat-heap.json
 ```
 
-See `DEBUG_MEMORY_LEAK_TESTING.md` at repo root for complete memory profiling guide.
+See `.internal/DEBUG_MEMORY_LEAK_TESTING.md` for the complete memory profiling guide.
 
 ---
 
