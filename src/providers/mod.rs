@@ -261,6 +261,7 @@ pub enum MessageContent {
 pub enum ApiStreamChunk {
     Text(ApiStreamTextChunk),
     Reasoning(ApiStreamReasoningChunk),
+    ToolCallStarted { call_id: String, name: String },
     ToolCalls(ApiStreamToolCallsChunk),
     Usage(ApiStreamUsageChunk),
     Error(String),

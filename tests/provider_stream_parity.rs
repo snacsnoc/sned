@@ -175,11 +175,19 @@ data: [DONE]
 
     let chunks = collect_openai_chunks(sse).await;
 
-    // Tool calls are accumulated and flushed on finish_reason:tool_calls
-    // Should have 1 tool call chunk (accumulated) + 1 synthetic usage = 2 chunks
-    assert_eq!(chunks.len(), 2);
+    // A valid name is announced before arguments complete, then the accumulated
+    // call flushes on finish_reason:tool_calls.
+    assert_eq!(chunks.len(), 3);
 
     match &chunks[0] {
+        ApiStreamChunk::ToolCallStarted { call_id, name } => {
+            assert_eq!(call_id, "call_abc");
+            assert_eq!(name, "read_file");
+        }
+        _ => panic!("Expected tool_call_started chunk, got {:?}", chunks[0]),
+    }
+
+    match &chunks[1] {
         ApiStreamChunk::ToolCalls(tc) => {
             assert_eq!(tc.tool_call.call_id, Some("call_abc".to_string()));
             assert_eq!(tc.tool_call.function.name, Some("read_file".to_string()));
@@ -188,14 +196,14 @@ data: [DONE]
                 Some("{\"path\": \"/tmp/test.txt\"}".to_string())
             );
         }
-        _ => panic!("Expected tool_calls chunk, got {:?}", chunks[0]),
+        _ => panic!("Expected tool_calls chunk, got {:?}", chunks[1]),
     }
 
-    match &chunks[1] {
+    match &chunks[2] {
         ApiStreamChunk::Usage(u) => {
             assert_eq!(u.stop_reason, Some("tool_calls".to_string()));
         }
-        _ => panic!("Expected usage chunk with stop_reason, got {:?}", chunks[1]),
+        _ => panic!("Expected usage chunk with stop_reason, got {:?}", chunks[2]),
     }
 }
 
@@ -240,8 +248,8 @@ data: [DONE]
 
     let chunks = collect_openai_chunks(sse).await;
 
-    // 2 text + 1 tool_calls (accumulated) + 1 usage from SSE = 4 chunks
-    assert_eq!(chunks.len(), 4);
+    // 2 text + 1 tool-start + 1 accumulated tool call + 1 usage from SSE = 5 chunks
+    assert_eq!(chunks.len(), 5);
 
     assert!(
         matches!(&chunks[0], ApiStreamChunk::Text(ApiStreamTextChunk { text, .. }) if text == "I'll")
@@ -250,10 +258,14 @@ data: [DONE]
         matches!(&chunks[1], ApiStreamChunk::Text(ApiStreamTextChunk { text, .. }) if text == " help")
     );
     assert!(
-        matches!(&chunks[2], ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk { tool_call, .. }) if tool_call.function.name == Some("list_files".to_string()))
+        matches!(&chunks[2], ApiStreamChunk::ToolCallStarted { call_id, name } if call_id == "call_xyz" && name == "list_files")
     );
     assert!(matches!(
         &chunks[3],
+        ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk { tool_call, .. }) if tool_call.function.name == Some("list_files".to_string())
+    ));
+    assert!(matches!(
+        &chunks[4],
         ApiStreamChunk::Usage(ApiStreamUsageChunk {
             input_tokens: 15,
             output_tokens: 25,
@@ -602,26 +614,42 @@ data: [DONE]
 
     let chunks = collect_openai_chunks(sse).await;
 
-    // Multiple tool calls in same delta are accumulated, then flushed at stream end + synthetic usage
-    assert_eq!(chunks.len(), 3);
+    // Each valid name is announced before the accumulated calls flush at stream end.
+    assert_eq!(chunks.len(), 5);
 
     match &chunks[0] {
+        ApiStreamChunk::ToolCallStarted { call_id, name } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(name, "read_file");
+        }
+        _ => panic!("Expected first tool_call_started chunk, got {:?}", chunks[0]),
+    }
+
+    match &chunks[1] {
+        ApiStreamChunk::ToolCallStarted { call_id, name } => {
+            assert_eq!(call_id, "call_2");
+            assert_eq!(name, "list_files");
+        }
+        _ => panic!("Expected second tool_call_started chunk, got {:?}", chunks[1]),
+    }
+
+    match &chunks[2] {
         ApiStreamChunk::ToolCalls(tc) => {
             assert_eq!(tc.tool_call.call_id, Some("call_1".to_string()));
             assert_eq!(tc.tool_call.function.name, Some("read_file".to_string()));
         }
-        _ => panic!("Expected tool_calls chunk, got {:?}", chunks[0]),
+        _ => panic!("Expected tool_calls chunk, got {:?}", chunks[2]),
     }
 
-    match &chunks[1] {
+    match &chunks[3] {
         ApiStreamChunk::ToolCalls(tc) => {
             assert_eq!(tc.tool_call.call_id, Some("call_2".to_string()));
             assert_eq!(tc.tool_call.function.name, Some("list_files".to_string()));
         }
-        _ => panic!("Expected tool_calls chunk, got {:?}", chunks[1]),
+        _ => panic!("Expected tool_calls chunk, got {:?}", chunks[3]),
     }
 
-    match &chunks[2] {
+    match &chunks[4] {
         ApiStreamChunk::Usage(_) => {}
         _ => panic!("Expected usage chunk, got {:?}", chunks[2]),
     }

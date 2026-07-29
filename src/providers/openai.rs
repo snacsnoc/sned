@@ -638,6 +638,22 @@ fn try_send_chunk(
 #[derive(Debug, Default)]
 pub struct OpenAiStreamDeltaState {
     emitted_reasoning: String,
+    started_tool_call_indices: std::collections::HashSet<usize>,
+}
+
+fn normalize_qwen_thinking_tool_name(name: &str) -> Option<String> {
+    let (initial_name, wrapped_name) = name.split_once("\n</think>\n\n<tool_call>\n<function=")?;
+    let function_name = wrapped_name.strip_suffix('>').unwrap_or(wrapped_name);
+
+    (initial_name.trim() == function_name && is_safe_tool_name(function_name))
+        .then(|| function_name.to_owned())
+}
+
+fn is_safe_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 #[allow(clippy::unused_async)]
@@ -712,13 +728,14 @@ async fn process_openai_sse_line(
             // dispatch only when finish_reason == "tool_calls" per OpenAI spec.
             if let Some(tool_calls) = delta.tool_calls {
                 for tc in tool_calls {
-                    if completed_tool_call_indices.contains(&tc.index) {
+                    let tool_index = tc.index;
+                    if completed_tool_call_indices.contains(&tool_index) {
                         continue;
                     }
 
                     if let Some(id) = &tc.id {
                         accumulated_tool_calls
-                            .entry(tc.index)
+                            .entry(tool_index)
                             .or_insert_with(|| (String::new(), String::new(), String::new()))
                             .0
                             .clone_from(id);
@@ -726,14 +743,15 @@ async fn process_openai_sse_line(
 
                     if let Some(function) = tc.function {
                         if let Some(name) = function.name.filter(|n| !n.is_empty()) {
+                            let name = normalize_qwen_thinking_tool_name(&name).unwrap_or(name);
                             accumulated_tool_calls
-                                .entry(tc.index)
+                                .entry(tool_index)
                                 .or_insert_with(|| (String::new(), String::new(), String::new()))
                                 .1 = name;
                         }
                         if let Some(args) = function.arguments.filter(|a| !a.is_empty()) {
                             let entry = accumulated_tool_calls
-                                .entry(tc.index)
+                                .entry(tool_index)
                                 .or_insert_with(|| (String::new(), String::new(), String::new()));
                             // Enforce MAX_TOOL_ARGUMENT_SIZE during accumulation to prevent
                             // memory exhaustion from providers sending many small deltas.
@@ -756,6 +774,22 @@ async fn process_openai_sse_line(
                                 );
                             }
                         }
+                    }
+
+                    if !delta_state.started_tool_call_indices.contains(&tool_index)
+                        && let Some((id, name, _)) = accumulated_tool_calls.get(&tool_index)
+                        && !id.is_empty()
+                        && is_safe_tool_name(name)
+                        && try_send_chunk(
+                            tx,
+                            ApiStreamChunk::ToolCallStarted {
+                                call_id: id.clone(),
+                                name: name.clone(),
+                            },
+                            "tool_call_started",
+                        )
+                    {
+                        delta_state.started_tool_call_indices.insert(tool_index);
                     }
                 }
             }
@@ -2484,6 +2518,92 @@ mod tests {
         }
 
         assert_eq!(reasoning, "The user wants");
+    }
+
+    #[tokio::test]
+    async fn test_qwen_thinking_wrapper_normalizes_tool_name_and_announces_start() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
+        let model_info: Option<crate::providers::OpenAiCompatibleModelInfo> = None;
+        let wrapped_name = "write_to_file\n</think>\n\n<tool_call>\n<function=write_to_file";
+        let line = format!(
+            "data: {}",
+            serde_json::json!({
+                "id": "chatcmpl_123",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_write",
+                            "function": {
+                                "name": wrapped_name,
+                                "arguments": r#"{"path":"tetris.c","content":"x"}"#,
+                            },
+                        }],
+                    },
+                    "finish_reason": null,
+                }],
+            })
+        );
+
+        process_openai_sse_line(
+            &line,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            model_info.as_ref(),
+            &mut usage_sent,
+        )
+        .await;
+        finish_openai_sse_to_chunks(
+            &mut SseLineBuffer::default(),
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            model_info.as_ref(),
+            &mut usage_sent,
+        )
+        .await;
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        assert!(matches!(
+            chunks.first(),
+            Some(ApiStreamChunk::ToolCallStarted { call_id, name })
+                if call_id == "call_write" && name == "write_to_file"
+        ));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::ToolCalls(tool_chunk)
+                if tool_chunk.tool_call.function.name.as_deref() == Some("write_to_file")
+        )));
+    }
+
+    #[test]
+    fn test_qwen_thinking_wrapper_does_not_normalize_mismatched_or_unsafe_names() {
+        assert_eq!(
+            normalize_qwen_thinking_tool_name(
+                "read_file\n</think>\n\n<tool_call>\n<function=write_to_file"
+            ),
+            None
+        );
+        assert_eq!(
+            normalize_qwen_thinking_tool_name(
+                "write_to_file;\n</think>\n\n<tool_call>\n<function=write_to_file;"
+            ),
+            None
+        );
     }
 }
 #[cfg(test)]

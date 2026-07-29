@@ -1953,6 +1953,7 @@ impl AgentLoop {
             // Use HashMap for O(1) merge + Vec to preserve insertion order (P4)
             let mut tool_calls_map: HashMap<String, ApiStreamToolCall> = HashMap::with_capacity(4);
             let mut tool_call_order: Vec<String> = Vec::new();
+            let mut announced_tool_call_ids = std::collections::HashSet::new();
             let mut tool_call_detected = false;
             let mut display_buffer = String::new();
             let mut in_code_block = false;
@@ -1965,8 +1966,8 @@ impl AgentLoop {
             let mut stream_errored = false;
             let mut retryable_stream_error_before_output: Option<String> = None;
             let mut non_retryable_stream_error: Option<String> = None;
+            let mut substantive_stream_output_received = false;
             let mut in_thinking_tag = false;
-            let mut emitted_output_this_attempt = false;
             let mut partial_line_displayed = false;
             let mut last_partial_flush_at: Option<std::time::Instant> = None;
             let mut stream_usage: Option<ApiReqInfo> = None;
@@ -2029,6 +2030,7 @@ impl AgentLoop {
                     ApiStreamChunk::Text(text_chunk) => {
                         tracing::debug!(text = %text_chunk.text, "received text chunk");
                         if self.config.json_output {
+                            substantive_stream_output_received |= !text_chunk.text.is_empty();
                             tracing::info!(
                                 target: "json_output",
                                 "{}",
@@ -2086,6 +2088,7 @@ impl AgentLoop {
 
                             // Only display non-thinking content
                             if !processed.is_empty() {
+                                substantive_stream_output_received = true;
                                 self.record_first_displayable_text_time().await;
                                 display_buffer.push_str(&processed);
                                 while let Some(nl_pos) = display_buffer.find('\n') {
@@ -2121,7 +2124,6 @@ impl AgentLoop {
                                             code_block_snipped = false;
                                         }
 
-                                        emitted_output_this_attempt = true;
                                         print_model_line_with_prefix_if_pending(
                                             trimmed_line,
                                             &self.config.output_writer,
@@ -2148,7 +2150,6 @@ impl AgentLoop {
 
                                     // Regular content - already trimmed
                                     self.record_first_output_emit_time().await;
-                                    emitted_output_this_attempt = true;
                                     if partial_line_displayed {
                                         update_model_line_with_prefix_if_pending(
                                             trimmed_line,
@@ -2179,7 +2180,6 @@ impl AgentLoop {
                                     });
                                 if should_flush_partial {
                                     self.record_first_output_emit_time().await;
-                                    emitted_output_this_attempt = true;
                                     if partial_line_displayed {
                                         update_model_line_with_prefix_if_pending(
                                             trimmed_partial,
@@ -2206,6 +2206,7 @@ impl AgentLoop {
                         accumulated_text.push_str(&text_chunk.text);
                     }
                     ApiStreamChunk::Reasoning(reasoning_chunk) => {
+                        substantive_stream_output_received |= !reasoning_chunk.reasoning.is_empty();
                         self.record_first_reasoning_chunk_time().await;
                         if self.config.json_output {
                             tracing::info!(
@@ -2223,7 +2224,6 @@ impl AgentLoop {
                             self.config.output_writer.emit(OutputEvent::ReasoningChunk(
                                 reasoning_chunk.reasoning.clone(),
                             ));
-                            emitted_output_this_attempt = true;
                         }
                         accumulated_reasoning.push_str(&reasoning_chunk.reasoning);
                         if reasoning_chunk.signature.is_some() {
@@ -2347,7 +2347,19 @@ impl AgentLoop {
                             state.cumulative_cost += cost;
                         }
                     }
+                    ApiStreamChunk::ToolCallStarted { call_id, name } => {
+                        if !self.config.json_output && announced_tool_call_ids.insert(call_id) {
+                            if !tool_call_detected {
+                                self.config.output_writer.flush();
+                                tool_call_detected = true;
+                            }
+                            self.config
+                                .output_writer
+                                .emit(OutputEvent::tool_call(format!("Preparing {name}…")));
+                        }
+                    }
                     ApiStreamChunk::ToolCalls(tool_chunk) => {
+                        substantive_stream_output_received = true;
                         // Print separator when first tool call is detected
                         if !tool_call_detected && !self.config.json_output {
                             self.config.output_writer.flush();
@@ -2374,12 +2386,14 @@ impl AgentLoop {
                         );
 
                         // Print tool call header only on first appearance of this tool call key
-                        if !self.config.json_output && !tool_calls_map.contains_key(&key) {
+                        if !self.config.json_output
+                            && !tool_calls_map.contains_key(&key)
+                            && !announced_tool_call_ids.contains(&key)
+                        {
                             let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
                             self.config
                                 .output_writer
                                 .emit(OutputEvent::tool_call(format!("▶ {tool_name}")));
-                            emitted_output_this_attempt = true;
                         }
                         if self.config.json_output {
                             tracing::info!(
@@ -2491,7 +2505,6 @@ impl AgentLoop {
                                             "error": err
                                         })
                                     );
-                                    emitted_output_this_attempt = true;
                                 }
                                 non_retryable_stream_error = Some(err);
                             }
@@ -2500,7 +2513,7 @@ impl AgentLoop {
                         if non_retryable_stream_error.is_some() {
                             continue;
                         }
-                        if !first_chunk_received && !emitted_output_this_attempt {
+                        if !substantive_stream_output_received {
                             retryable_stream_error_before_output = Some(err);
                             break;
                         }
@@ -2514,12 +2527,10 @@ impl AgentLoop {
                                     "error": err
                                 })
                             );
-                            emitted_output_this_attempt = true;
                         } else {
                             self.config
                                 .output_writer
                                 .emit(OutputEvent::error(format!("Provider stream error: {err}")));
-                            emitted_output_this_attempt = true;
                         }
                     }
                 }
@@ -4954,6 +4965,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streamed_tool_start_announces_preparation_once() {
+        let responses = vec![vec![
+            ApiStreamChunk::ToolCallStarted {
+                call_id: "call_write".to_string(),
+                name: "write_to_file".to_string(),
+            },
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_write".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("write_to_file".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"path": "tetris.c", "content": "x"}).to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "streamed-tool-start");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::WriteToFile,
+            Arc::new(StaticResultHandler("written")),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+
+        let output = drain_rendered_output(&mut rx);
+        assert_eq!(
+            output
+                .iter()
+                .filter(|line| line.as_str() == "Preparing write_to_file…")
+                .count(),
+            1,
+            "streamed tool start should have one preparation notice: {output:?}"
+        );
+        assert!(
+            !output.iter().any(|line| line == "▶ write_to_file"),
+            "completed tool call should not duplicate the preparation header: {output:?}"
+        );
+        assert!(
+            output
+                .iter()
+                .all(|line| !line.contains("\"content\"")),
+            "tool preparation leaked streamed arguments: {output:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_disabled_parallel_tool_calling_serializes_tools() {
         let responses = vec![vec![
             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
@@ -5558,6 +5630,126 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("error decoding response body"))
         );
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retryable_stream_error_after_tool_preparation_retries_once() {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![
+                crate::providers::mock::MockResponse::Stream(vec![
+                    crate::providers::mock::MockStreamEvent::Chunk(
+                        ApiStreamChunk::ToolCallStarted {
+                            call_id: "call_write".to_string(),
+                            name: "write_to_file".to_string(),
+                        },
+                    ),
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                        "OpenAI SSE stream error: error decoding response body (retryable)"
+                            .to_string(),
+                    )),
+                ]),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+            ],
+        )));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-stream-retry-after-tool-preparation");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(rendered.iter().any(|line| line.contains("recovered output")));
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retryable_stream_error_after_signature_only_text_retries_once() {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![
+                crate::providers::mock::MockResponse::Stream(vec![
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Text(
+                        ApiStreamTextChunk {
+                            text: String::new(),
+                            id: None,
+                            signature: Some("gemini-signature".to_string()),
+                        },
+                    )),
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                        "Gemini stream error: error decoding response body (retryable)"
+                            .to_string(),
+                    )),
+                ]),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+            ],
+        )));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-stream-retry-after-signature-only-text");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(rendered.iter().any(|line| line.contains("recovered output")));
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retryable_stream_error_after_hidden_thinking_text_retries_once() {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![
+                crate::providers::mock::MockResponse::Stream(vec![
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Text(
+                        ApiStreamTextChunk {
+                            text: "<think>hidden reasoning</think>".to_string(),
+                            id: None,
+                            signature: None,
+                        },
+                    )),
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Text(
+                        ApiStreamTextChunk {
+                            text: "<!-- think -->hidden reasoning<!-- /think -->".to_string(),
+                            id: None,
+                            signature: None,
+                        },
+                    )),
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                        "OpenAI SSE stream error: error decoding response body (retryable)"
+                            .to_string(),
+                    )),
+                ]),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+            ],
+        )));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-stream-retry-after-hidden-thinking");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(rendered.iter().any(|line| line.contains("recovered output")));
         assert!(
             agent
                 .state
