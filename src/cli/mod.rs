@@ -227,7 +227,7 @@ pub struct TaskOptions {
     pub yolo: bool,
 
     /// Enable auto-approve all actions while keeping interactive mode
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub auto_approve_all: bool,
 
     /// Optional timeout in seconds (applies only when provided)
@@ -238,20 +238,32 @@ pub struct TaskOptions {
     #[arg(short = 'm', long)]
     pub model: Option<String>,
 
-    /// API provider to use (requires --model). Auto-detected when --base-url is set
-    #[arg(long)]
+    /// API provider to use. Auto-detected when --base-url is set.
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new([
+            clap::builder::PossibleValue::new("anthropic"),
+            clap::builder::PossibleValue::new("openai"),
+            clap::builder::PossibleValue::new("openai-native"),
+            clap::builder::PossibleValue::new("openrouter"),
+            clap::builder::PossibleValue::new("gemini"),
+            clap::builder::PossibleValue::new("minimax"),
+            clap::builder::PossibleValue::new("deepseek"),
+            clap::builder::PossibleValue::new("mock").hide(true),
+        ])
+    )]
     pub provider: Option<String>,
 
     /// Base URL for custom OpenAI-compatible provider (or set OPENAI_API_BASE env var)
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub base_url: Option<String>,
 
     /// API key for custom provider (or set OPENAI_API_KEY env var)
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub api_key: Option<String>,
 
     /// Additional JSON object fields for OpenAI-compatible chat-completions requests
-    #[arg(long, value_name = "JSON")]
+    #[arg(long, value_name = "JSON", hide_short_help = true)]
     pub extra_body: Option<String>,
 
     /// Show verbose output
@@ -263,7 +275,7 @@ pub struct TaskOptions {
     pub cwd: Option<String>,
 
     /// Path to Sned configuration directory
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub config: Option<String>,
 
     /// Set a provider-supported thinking token budget (Anthropic, Gemini 2.5).
@@ -274,36 +286,37 @@ pub struct TaskOptions {
         conflicts_with = "reasoning_effort",
         require_equals = true,
         default_missing_value = "1024",
-        action = clap::ArgAction::Set
+        action = clap::ArgAction::Set,
+        hide_short_help = true
     )]
     pub thinking: Option<Option<String>>,
 
     /// Set a provider-supported reasoning level (OpenAI-compatible, OpenRouter, Gemini 3).
-    #[arg(long, value_enum, conflicts_with = "thinking")]
+    #[arg(long, value_enum, conflicts_with = "thinking", hide_short_help = true)]
     pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Maximum consecutive mistakes before halting in yolo mode
-    #[arg(long, value_name = "count")]
+    #[arg(long, value_name = "count", hide_short_help = true)]
     pub max_consecutive_mistakes: Option<String>,
 
     /// Output messages as JSON instead of styled text
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub json: bool,
 
     /// Reject first completion attempt to force re-verification
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub double_check_completion: bool,
 
     /// Enable adaptive context compaction instead of mechanical truncation (enabled by default)
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, hide_short_help = true)]
     pub auto_condense: bool,
 
     /// Disable token usage display after each turn (hidden by default)
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub no_token_display: bool,
 
     /// Enable subagents for the task
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub subagents: bool,
 
     /// Internal flag: marks this task as running inside a subagent (prevents recursion)
@@ -311,15 +324,15 @@ pub struct TaskOptions {
     pub is_subagent: bool,
 
     /// Custom User-Agent header for OpenAI-compatible provider
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub user_agent: Option<String>,
 
     /// Path to additional hooks directory for runtime hook injection
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub hooks_dir: Option<String>,
 
     /// Export conversation to file after completion (JSON or markdown)
-    #[arg(long, value_name = "path")]
+    #[arg(long, value_name = "path", hide_short_help = true)]
     pub export: Option<String>,
 
     /// Image files to include with the task prompt
@@ -331,15 +344,15 @@ pub struct TaskOptions {
     pub track_changes: bool,
 
     /// Maximum number of context turns before pruning (default: 50)
-    #[arg(long, value_name = "turns")]
+    #[arg(long, value_name = "turns", hide_short_help = true)]
     pub max_context_turns: Option<String>,
 
     /// Maximum provider output tokens for this task
-    #[arg(long, value_name = "tokens")]
+    #[arg(long, value_name = "tokens", hide_short_help = true)]
     pub max_tokens: Option<u32>,
 
     /// Enable debug logging to /tmp/sned-debug.log
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub debug: bool,
 }
 
@@ -348,7 +361,7 @@ pub struct TaskOptions {
 #[command(next_help_heading = "Root Command Options")]
 pub struct RootOnlyOptions {
     /// Resume an existing task by ID
-    #[arg(short = 'T', long)]
+    #[arg(short = 'T', long, hide_short_help = true)]
     pub task_id: Option<String>,
 
     /// Resume the most recent task from the current working directory
@@ -522,15 +535,6 @@ pub enum DevSubcommand {
     Log,
 }
 
-/// For custom OpenAI-compatible providers: set OPENAI_API_KEY + OPENAI_API_BASE env vars, or use --api-key + --base-url flags
-///
-/// Exit Codes:
-/// - 0: Success
-/// - 1: General error (API failure, unexpected error)
-/// - 2: Configuration error (missing API key, invalid config)
-/// - 3: Input error (invalid prompt, bad flag)
-/// - 4: Tool error (edit_file failure, command execution failure)
-/// - 5: Signal/interrupted
 #[derive(Debug, Parser)]
 #[command(
     name = "sned",
@@ -539,8 +543,7 @@ pub enum DevSubcommand {
         env!("GIT_COMMIT_HASH"),
         env!("BUILD_PROFILE")
     ),
-    about = "Sned CLI for code editing in your terminal",
-    after_help = "Exit Codes: 0=Success, 1=General error, 2=Config error, 3=Input error, 4=Tool error, 5=Interrupted"
+    about = None
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -2911,46 +2914,69 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_rejects_qwen_provider() {
-        let cli = Cli::try_parse_from(["sned", "--provider", "qwen", "test prompt"]).unwrap();
-        let err = match create_provider(&cli.task_opts, None) {
-            Ok(_) => panic!("unsupported provider should fail"),
-            Err(err) => err,
-        };
+    fn test_provider_flag_lists_and_validates_accepted_names() {
+        let help = Cli::command().render_long_help().to_string();
+        for provider in [
+            "anthropic",
+            "openai",
+            "openai-native",
+            "openrouter",
+            "gemini",
+            "minimax",
+            "deepseek",
+        ] {
+            assert!(
+                help.contains(provider),
+                "--help should list {provider} as an accepted provider"
+            );
+        }
+        assert!(!help.contains("mock"), "--help should not advertise mock");
+        assert!(Cli::try_parse_from(["sned", "--provider", "mock", "test prompt"]).is_ok());
 
-        let cli_err = err
-            .downcast_ref::<crate::error::CliError>()
-            .expect("unsupported provider should be a typed CliError");
-        assert!(matches!(
-            cli_err,
-            crate::error::CliError::Config(message) if message == "Unsupported provider: qwen"
-        ));
+        for provider in ["qwen", "openai-compatible"] {
+            let error = Cli::try_parse_from(["sned", "--provider", provider, "test prompt"])
+                .expect_err("{provider} should not be accepted as a provider");
+            let message = error.to_string();
+            assert!(message.contains("possible values"), "{message}");
+        }
     }
 
     #[test]
-    fn test_create_provider_rejects_openai_compatible_alias() {
-        let cli = Cli::try_parse_from([
-            "sned",
-            "--provider",
-            "openai-compatible",
+    fn test_short_help_hides_advanced_task_options() {
+        let short_help = Cli::command().render_help().to_string();
+        assert!(!short_help.contains("Sned CLI for code editing in your terminal"));
+        assert!(!short_help.contains("Additional options only on the root"));
+        for option in [
+            "--base-url",
             "--api-key",
-            "test-key",
-            "test prompt",
-        ])
-        .unwrap();
-        let err = match create_provider(&cli.task_opts, None) {
-            Ok(_) => panic!("unsupported provider should fail"),
-            Err(err) => err,
-        };
+            "--extra-body",
+            "--thinking",
+            "--reasoning-effort",
+            "--json",
+            "--subagents",
+            "--debug",
+            "--task-id",
+        ] {
+            assert!(
+                !short_help
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(option)),
+                "-h should hide {option}: {short_help}"
+            );
+        }
+        for option in ["--model", "--provider", "--yolo", "--continue"] {
+            assert!(
+                short_help.contains(option),
+                "-h should retain common option {option}: {short_help}"
+            );
+        }
 
-        let cli_err = err
-            .downcast_ref::<crate::error::CliError>()
-            .expect("unsupported provider should be a typed CliError");
-        assert!(matches!(
-            cli_err,
-            crate::error::CliError::Config(message)
-                if message == "Unsupported provider: openai-compatible"
-        ));
+        let long_help = Cli::command().render_long_help().to_string();
+        assert!(long_help.contains("--extra-body"));
+        assert!(!long_help.contains("Sned CLI for code editing in your terminal"));
+        assert!(!long_help.contains("Additional options only on the root"));
+        assert!(!long_help.contains("For custom OpenAI-compatible providers"));
+        assert!(!long_help.contains("Exit Codes:"));
     }
 
     #[test]
