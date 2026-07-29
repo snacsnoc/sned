@@ -5242,7 +5242,8 @@ mod tests {
                     rendered.push(line.to_string())
                 }
                 crate::cli::output::OutputEvent::ReasoningChunk(chunk) => rendered.push(chunk),
-                crate::cli::output::OutputEvent::UserPromptLine(line) => {
+                crate::cli::output::OutputEvent::UserPromptLine(line)
+                | crate::cli::output::OutputEvent::LocalCommandEcho(line) => {
                     rendered.push(line.to_string())
                 }
                 crate::cli::output::OutputEvent::ApprovalRequested(request) => {

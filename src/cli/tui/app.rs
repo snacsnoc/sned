@@ -2093,7 +2093,15 @@ impl App {
     /// Push a user message with proper formatting (splits on newlines).
     /// Multi-line messages get a left border accent for visual grouping.
     pub fn push_user_message(&mut self, text: &str, writer: &OutputWriterArc) {
-        self.clear_completion_lines();
+        self.push_submission_echo(text, writer, false);
+    }
+
+    /// Echo a local slash command without starting a new turn.
+    pub fn push_local_command_echo(&mut self, text: &str, writer: &OutputWriterArc) {
+        self.push_submission_echo(text, writer, true);
+    }
+
+    fn push_submission_echo(&mut self, text: &str, writer: &OutputWriterArc, local_command: bool) {
         let style = Style::default()
             .fg(theme::PROMPT_FG)
             .add_modifier(Modifier::BOLD);
@@ -2109,9 +2117,12 @@ impl App {
             } else {
                 format!("❯ {line}")
             };
-            writer.emit(OutputEvent::UserPromptLine(Line::from(Span::styled(
-                content, style,
-            ))));
+            let line = Line::from(Span::styled(content, style));
+            if local_command {
+                writer.emit(OutputEvent::LocalCommandEcho(line));
+            } else {
+                writer.emit(OutputEvent::UserPromptLine(line));
+            }
         }
         self.force_bottom();
     }
@@ -6717,6 +6728,43 @@ mod tests {
         assert_eq!(last_three[0], "│ ❯ first line");
         assert_eq!(last_three[1], "│   second line");
         assert_eq!(last_three[2], "│   third line");
+    }
+
+    #[test]
+    fn test_local_command_echo_keeps_completion_visible_after_render() {
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(2);
+        let writer: Arc<dyn crate::cli::output::OutputWriter> =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.push_completion_line("COMPLETION_RESULT_MARKER".into());
+
+        app.push_local_command_echo("/copy", &writer);
+        crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("local command frame should render");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("COMPLETION_RESULT_MARKER"),
+            "completion result must remain visible after /copy; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("❯ /copy"),
+            "local command echo must remain visible; got:\n{rendered}"
+        );
     }
 
     /// Contract test: after a multiline submit + drain + render, the bottom

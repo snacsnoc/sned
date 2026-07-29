@@ -38,6 +38,8 @@ pub enum OutputEvent {
     ReasoningChunk(String),
     /// User-submitted prompt line ("❯ ..." or multi-line "│ ❯ ...").
     UserPromptLine(Line<'static>),
+    /// Local slash-command echo rendered like a user prompt without starting a new turn.
+    LocalCommandEcho(Line<'static>),
     /// Raw ANSI escape sequences (for PTY output, etc.).
     RawAnsi(String),
     /// Task completion message rendered as a dedicated Block widget.
@@ -282,7 +284,8 @@ impl OutputWriter for StderrOutputWriter {
             | OutputEvent::ToolHeaderLine(line)
             | OutputEvent::CommandHeaderLine(line)
             | OutputEvent::CommandOutputLine(line)
-            | OutputEvent::UserPromptLine(line) => {
+            | OutputEvent::UserPromptLine(line)
+            | OutputEvent::LocalCommandEcho(line) => {
                 eprintln!("{line}");
             }
             OutputEvent::ReasoningChunk(chunk) => {

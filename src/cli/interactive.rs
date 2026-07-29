@@ -453,7 +453,10 @@ impl InteractiveSession {
 
 /// Action returned by key event handler.
 enum Action {
-    Submit(String),
+    Submit {
+        text: String,
+        cli_cmd: Option<crate::cli::slash_commands::CliOnlyCommand>,
+    },
     ModelSwitch(PendingModelSwitch),
     ModelApiKeySubmitted(PendingModelSwitch, String),
     PlanApprove,
@@ -620,6 +623,7 @@ fn resolve_interactive_model_input(
     Ok(crate::cli::slash_commands::process_slash_command_with_context(text, skills))
 }
 
+#[cfg(test)]
 fn is_shutdown_submit(text: &str) -> bool {
     crate::cli::slash_commands::get_cli_only_command(text).is_some_and(|cmd| cmd.is_shutdown())
 }
@@ -750,6 +754,10 @@ fn apply_output_event(
         OutputEvent::UserPromptLine(line) => {
             flush_model_update(app, pending_model_update);
             app.clear_completion_lines();
+            app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
+        }
+        OutputEvent::LocalCommandEcho(line) => {
+            flush_model_update(app, pending_model_update);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
         OutputEvent::RawAnsi(s) => {
@@ -1699,13 +1707,15 @@ async fn handle_key_event(
                 return Ok(None);
             }
 
+            let cli_cmd = crate::cli::slash_commands::get_cli_only_command(&text);
+
             // Shutdown commands should bypass the session echo lock so /quit still works
             // even if the agent is currently holding the session mutex.
-            if is_shutdown_submit(&text) {
+            if cli_cmd.as_ref().is_some_and(|cmd| cmd.is_shutdown()) {
                 app.input = App::new_textarea(Vec::new());
                 app.clear_pastes();
                 close_slash_command_mode(app);
-                return Ok(Some(Action::Submit(text)));
+                return Ok(Some(Action::Submit { text, cli_cmd }));
             }
 
             // Turn separator before user message (only if a previous turn completed)
@@ -1719,11 +1729,15 @@ async fn handle_key_event(
             {
                 app.push_turn_separator();
             }
-            app.push_user_message(&text, output_writer);
+            if cli_cmd.is_some() {
+                app.push_local_command_echo(&text, output_writer);
+            } else {
+                app.push_user_message(&text, output_writer);
+            }
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
             close_slash_command_mode(app);
-            return Ok(Some(Action::Submit(text)));
+            return Ok(Some(Action::Submit { text, cli_cmd }));
         }
         return Ok(None);
     }
@@ -2162,6 +2176,7 @@ async fn handle_cli_only_command(
                     NotificationKind::Info,
                 );
             } else {
+                app.clear_completion_lines();
                 spawn_agent_task_from_message(
                     session,
                     retry_message,
@@ -2839,6 +2854,7 @@ async fn handle_cli_only_command(
                                 steps_len,
                                 step_desc
                             );
+                            app.clear_completion_lines();
                             spawn_agent_task(
                                 session,
                                 &prompt,
@@ -2897,6 +2913,7 @@ async fn handle_cli_only_command(
                                 // The agent is idle, so resume requires a new task.
                                 let prompt =
                                     format!("Execute step {step_num}/{step_total}: {step_desc}");
+                                app.clear_completion_lines();
                                 spawn_agent_task(
                                     session,
                                     &prompt,
@@ -3459,7 +3476,7 @@ async fn run_main_loop(
                                 .await?;
                                 continue;
                             }
-                            Action::Submit(text) => {
+                            Action::Submit { text, cli_cmd } => {
                                 // Make the echoed submit visible before any
                                 // command bookkeeping or agent startup work.
                                 drain_and_render_user_submit(
@@ -3474,9 +3491,7 @@ async fn run_main_loop(
                                 record_submit_history(app, &text);
 
                                 // Check for CLI-only slash commands FIRST
-                                if let Some(cli_cmd) =
-                                    crate::cli::slash_commands::get_cli_only_command(&text)
-                                {
+                                if let Some(cli_cmd) = cli_cmd {
                                     // Handle /plan <prompt> specially: clear old plan, enter Plan mode, spawn agent
                                     if let crate::cli::slash_commands::CliOnlyCommand::PlanPrompt(
                                         ref prompt_text,
@@ -3512,6 +3527,7 @@ async fn run_main_loop(
                                         app.update_placeholder();
                                         // The busy check above guarantees this will not wait on
                                         // an AgentLoop currently held by another run.
+                                        app.clear_completion_lines();
                                         spawn_agent_task(
                                             &session,
                                             prompt_text,
@@ -4014,6 +4030,7 @@ pub fn render_interactive_prompt_prefix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::slash_commands::CliOnlyCommand;
     use crate::cli::tui::BlockKind;
     use ratatui::text::Line;
     use serde::ser::{Error as _, Serialize, Serializer};
@@ -4499,6 +4516,120 @@ mod tests {
             "❯ queued message"
         );
         assert_eq!(app.output_line_kinds.back(), Some(&BlockKind::UserPrompt));
+    }
+
+    #[test]
+    fn test_local_command_echo_preserves_completion_box() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let mut app = App::new();
+        app.push_completion_line(Line::from("model output here"));
+        app.set_last_completion_text("model output here".to_string());
+
+        app.push_local_command_echo("/help", &output_writer);
+        drain_output(&mut rx, &mut app);
+
+        assert!(
+            !app.completion_lines.is_empty(),
+            "local command echoes must not dismiss the completion box"
+        );
+        assert_eq!(app.last_completion_text(), Some("model output here"));
+        assert_eq!(app.output_lines.back().unwrap().to_string(), "❯ /help");
+        assert_eq!(app.output_line_kinds.back(), Some(&BlockKind::UserPrompt));
+    }
+
+    #[tokio::test]
+    async fn test_copy_submit_preserves_completion_box() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, mut rx) = mpsc::channel(2);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.push_completion_line(Line::from("model output here"));
+        app.set_last_completion_text("model output here".to_string());
+        app.input = App::new_textarea(vec!["/copy".to_string()]);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(matches!(
+            action,
+            Some(Action::Submit {
+                text,
+                cli_cmd: Some(CliOnlyCommand::Copy),
+            }) if text == "/copy"
+        ));
+
+        drain_output(&mut rx, &mut app);
+        let copied = std::cell::RefCell::new(None);
+        handle_copy_command(&mut app, |text| {
+            *copied.borrow_mut() = Some(text.to_string());
+            Ok(())
+        });
+
+        assert!(
+            !app.completion_lines.is_empty(),
+            "/copy must preserve the visible completion"
+        );
+        assert_eq!(copied.borrow().as_deref(), Some("model output here"));
+        assert!(
+            app.output_lines
+                .back()
+                .unwrap()
+                .to_string()
+                .contains("Copied latest completion")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_normal_prompt_echo_clears_completion_box() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let mut app = App::new();
+        app.push_completion_line(Line::from("model output"));
+
+        app.push_user_message("what is 2+2", &output_writer);
+        drain_output(&mut rx, &mut app);
+
+        assert!(
+            app.completion_lines.is_empty(),
+            "normal user prompts must dismiss the prior completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_clear_keeps_completion_box() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(1);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.push_completion_line(Line::from("model output"));
+        app.pending_clear = Some("slash".to_string());
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(
+            !app.completion_lines.is_empty(),
+            "cancelling /clear must retain the completion box"
+        );
+        Ok(())
     }
 
     #[test]
@@ -6524,7 +6655,9 @@ mod tests {
         )
         .await?;
 
-        assert!(matches!(action, Some(Action::Submit(text)) if text == "hello\nworld"));
+        assert!(
+            matches!(action, Some(Action::Submit { text, cli_cmd: None }) if text == "hello\nworld")
+        );
         assert_eq!(app.input.lines(), [""]);
 
         reset_prompt_state();
@@ -6810,7 +6943,9 @@ mod tests {
         )
         .await?;
 
-        assert!(matches!(action, Some(Action::Submit(text)) if text == "/exit"));
+        assert!(
+            matches!(action, Some(Action::Submit { text, cli_cmd: Some(CliOnlyCommand::Exit) }) if text == "/exit")
+        );
         assert!(app.input.lines().join("\n").is_empty());
 
         Ok(())
