@@ -161,6 +161,25 @@ impl Default for ExecuteCommandHandler {
     }
 }
 
+fn is_serialized_command_container(value: &str) -> bool {
+    let value = value.trim_start();
+
+    if let Some(rest) = value.strip_prefix('{') {
+        let rest = rest.trim_start();
+        let is_command_key = rest
+            .strip_prefix("'command'")
+            .or_else(|| rest.strip_prefix("\"command\""))
+            .is_some_and(|rest| rest.trim_start().starts_with(':'));
+        if is_command_key {
+            return true;
+        }
+    }
+
+    value
+        .strip_prefix('[')
+        .is_some_and(|rest| matches!(rest.trim_start().as_bytes().first(), Some(b'\'' | b'\"')))
+}
+
 impl ExecuteCommandHandler {
     /// Resolve command timeout based on command patterns.
     ///
@@ -1034,6 +1053,17 @@ impl ExecuteCommandHandler {
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
+        if params
+            .get("commands")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_serialized_command_container)
+        {
+            return Err(ToolError::InvalidInput(
+                "`commands` must be a JSON array of command strings, not a serialized object or list. Use {\"commands\":[\"<command>\"]}."
+                    .to_string(),
+            ));
+        }
+
         let commands = coerce_string_array(&params, "commands", "command");
         let commands = if commands.is_empty() {
             None
@@ -1129,6 +1159,81 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("hello"));
+    }
+
+    #[test]
+    fn test_serialized_command_containers_are_recognized() {
+        for value in [
+            "{'command': \"echo invalid\"}",
+            "{ \"command\" : \"echo invalid\"}",
+            "['echo invalid']",
+            "[ \"echo invalid\" ]",
+        ] {
+            assert!(
+                is_serialized_command_container(value),
+                "should reject serialized container: {value}"
+            );
+        }
+
+        assert!(!is_serialized_command_container("echo valid"));
+        assert!(!is_serialized_command_container("{ echo valid; }"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_serialized_command_object_without_running_it() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let workspace_root = tempfile::tempdir().unwrap();
+        let marker = workspace_root.path().join("serialized-command-ran");
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let params = serde_json::json!({
+            "commands": format!("{{'command': \"touch {}\"}}", marker.display()),
+        });
+
+        let err = handler
+            .execute_without_state(
+                Some(workspace_root.path()),
+                params,
+                None,
+                false,
+                false,
+                None,
+                false,
+                &output_writer,
+            )
+            .await
+            .expect_err("serialized command object should be rejected");
+
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+        assert!(err.to_string().contains("{\"commands\":[\"<command>\"]}"));
+        assert!(!marker.exists(), "rejected command must not execute");
+    }
+
+    #[tokio::test]
+    async fn test_execute_accepts_scalar_and_array_commands() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+
+        for (params, expected) in [
+            (serde_json::json!({"commands": "printf scalar"}), "scalar"),
+            (serde_json::json!({"commands": ["printf array"]}), "array"),
+        ] {
+            let output = handler
+                .execute_without_state(
+                    None,
+                    params,
+                    None,
+                    false,
+                    false,
+                    None,
+                    false,
+                    &output_writer,
+                )
+                .await
+                .expect("valid command form should execute");
+            assert!(output.contains(expected), "unexpected output: {output}");
+        }
     }
 
     #[tokio::test]
