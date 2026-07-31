@@ -125,7 +125,8 @@ impl SearchFilesHandler {
             }
         }
 
-        cmd.arg(regex).arg(search_path);
+        // Keep a leading '-' in the pattern from being interpreted as a search-tool option.
+        cmd.arg("--").arg(regex).arg(search_path);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = run_with_timeout(cmd, search_timeout()).await?;
@@ -362,6 +363,20 @@ mod tests {
             "expected no-matches message, got: {}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn test_search_files_treats_leading_dash_regex_as_pattern() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("file1.txt"), "hello world").unwrap();
+
+        let result = SearchFilesHandler::new()
+            .search_files(Some(temp_dir.path().to_str().unwrap()), "--files", None)
+            .await
+            .unwrap();
+
+        assert!(result.contains("No matches found"));
+        assert!(!result.contains("file1.txt"));
     }
 
     #[tokio::test]
