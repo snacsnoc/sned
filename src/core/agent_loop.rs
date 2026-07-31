@@ -939,7 +939,12 @@ impl AgentLoop {
 
     /// Set the agent mode (used for Plan -> Act transition after approval).
     pub fn set_mode(&mut self, mode: crate::core::agent_types::AgentMode) {
-        self.config.mode = mode;
+        if self.config.mode != mode {
+            self.config.mode = mode;
+            // A cached profile from the previous mode can omit the completion
+            // tool required in ACT or expose it while gathering a plan.
+            self.deps.tool_profile = None;
+        }
     }
 
     /// Get the task ID.
@@ -1736,9 +1741,9 @@ impl AgentLoop {
                 crate::core::agent_types::AgentMode::Plan => "plan",
                 crate::core::agent_types::AgentMode::Act => "act",
             };
-            let prompt = pruned_history
-                .iter()
-                .find(|m| m.role == crate::providers::MessageRole::User)
+            let prompt = self
+                .current_turn_retry_candidate
+                .as_ref()
                 .and_then(|m| match &m.content {
                     crate::providers::MessageContent::Text(t) => Some(t.as_str()),
                     _ => None,
@@ -4689,6 +4694,10 @@ fn resolve_tool_profile(
     prompt: &str,
     mode_str: &str,
 ) -> crate::core::tools::definitions::ToolProfile {
+    if mode_str == "plan" {
+        return crate::core::tools::definitions::ToolProfile::Plan;
+    }
+
     let selected = match cached {
         Some(profile) => profile,
         None => crate::core::tools::definitions::select_tool_profile(prompt, mode_str),
@@ -5282,6 +5291,63 @@ mod tests {
         assert_eq!(
             profile,
             crate::core::tools::definitions::ToolProfile::Validate
+        );
+    }
+
+    #[test]
+    fn test_resolve_tool_profile_plan_mode_ignores_cached_profile_and_yolo() {
+        let profile = resolve_tool_profile(
+            Some(crate::core::tools::definitions::ToolProfile::Full),
+            true,
+            "inspect the workspace",
+            "plan",
+        );
+
+        assert_eq!(profile, crate::core::tools::definitions::ToolProfile::Plan);
+    }
+
+    #[tokio::test]
+    async fn test_act_profile_uses_current_task_after_plan_transition() {
+        let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+            text: "I need to inspect the file first.".to_string(),
+            id: None,
+            signature: None,
+        })]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "act-profile-after-plan"));
+
+        let user_message = |text: &str| StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .extend([
+                user_message("Explain this repository"),
+                user_message("Edit the configuration parser and run its tests"),
+            ]);
+
+        agent.set_mode(AgentMode::Plan);
+        agent.set_mode(AgentMode::Act);
+        let _ = agent.execute_turn().await;
+
+        let requests = requests.lock().unwrap();
+        let tools = requests
+            .first()
+            .and_then(|request| request.tools.as_ref())
+            .expect("ACT edit task should receive tools");
+        assert!(
+            tools.iter().any(|tool| tool.function.name == "edit_file"),
+            "ACT profile should be selected from the current task, not the first historical prompt"
         );
     }
 

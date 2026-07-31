@@ -713,6 +713,7 @@ pub enum ToolProfile {
     CoreEdit,
     Validate,
     Symbol,
+    Plan,
     Full,
 }
 
@@ -725,7 +726,7 @@ impl ToolProfile {
             Self::DirectAnswer => Some(Self::AnswerOnly),
             Self::AnswerOnly => Some(Self::WriteOnly),
             Self::WriteOnly => Some(Self::CoreEdit),
-            Self::CoreEdit | Self::Validate | Self::Symbol | Self::Full => None,
+            Self::CoreEdit | Self::Validate | Self::Symbol | Self::Plan | Self::Full => None,
         }
     }
 
@@ -772,6 +773,27 @@ impl ToolProfile {
                 SnedTool::ReplaceSymbol,
                 SnedTool::AttemptCompletion,
                 SnedTool::AskFollowupQuestion,
+            ],
+            Self::Plan => &[
+                SnedTool::ReadFile,
+                SnedTool::WriteToFile,
+                SnedTool::ListFiles,
+                SnedTool::SearchFiles,
+                SnedTool::EditFile,
+                SnedTool::ExecuteCommand,
+                SnedTool::AskFollowupQuestion,
+                SnedTool::PlanModeRespond,
+                SnedTool::GetFunction,
+                SnedTool::GetFileSkeleton,
+                SnedTool::FindSymbolReferences,
+                SnedTool::ReplaceSymbol,
+                SnedTool::RenameSymbol,
+                SnedTool::UseSubagents,
+                SnedTool::UseSkill,
+                SnedTool::ListSkills,
+                SnedTool::DiagnosticsScan,
+                SnedTool::Condense,
+                SnedTool::WebFetch,
             ],
             Self::Full => &[
                 SnedTool::ReadFile,
@@ -823,7 +845,7 @@ pub fn select_tool_profile(prompt: &str, mode: &str) -> ToolProfile {
     let lower = prompt.to_lowercase();
 
     if mode == "plan" {
-        return ToolProfile::Full;
+        return ToolProfile::Plan;
     }
 
     let is_answer_only = is_answer_only_prompt(&lower);
@@ -1117,6 +1139,7 @@ mod tests {
         assert!(ToolProfile::CoreEdit.tools().len() >= 7);
         assert!(ToolProfile::Validate.tools().len() >= 9);
         assert!(ToolProfile::Symbol.tools().len() >= 9);
+        assert_eq!(ToolProfile::Plan.tools().len(), 19);
         assert_eq!(ToolProfile::Full.tools().len(), 20);
     }
 
@@ -1239,6 +1262,7 @@ mod tests {
         assert_eq!(ToolProfile::Validate.escalate(), None);
         assert_eq!(ToolProfile::Full.escalate(), None);
         assert_eq!(ToolProfile::Symbol.escalate(), None);
+        assert_eq!(ToolProfile::Plan.escalate(), None);
     }
 
     #[test]
@@ -1319,8 +1343,20 @@ mod tests {
     fn test_select_tool_profile_plan_mode() {
         assert_eq!(
             select_tool_profile("Create a file", "plan"),
-            ToolProfile::Full
+            ToolProfile::Plan
         );
+    }
+
+    #[test]
+    fn test_plan_profile_excludes_attempt_completion() {
+        let names = ToolProfile::Plan
+            .tools()
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"plan_mode_respond"));
+        assert!(!names.contains(&"attempt_completion"));
     }
 
     #[test]

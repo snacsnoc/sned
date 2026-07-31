@@ -30,6 +30,7 @@ enum SlashCommandId {
     Queue,
     Retry,
     Model,
+    Act,
     Plan,
     PlanApprove,
     PlanPause,
@@ -336,6 +337,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
+        id: SlashCommandId::Act,
+        name: "act",
+        aliases: &[],
+        description: "Exit plan mode and discard the pending plan",
+        usage: "/act",
+        detail: "Leaves plan mode without starting execution. Submit a task afterward to continue in act mode.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::PlanActive,
+    },
+    SlashCommandSpec {
         id: SlashCommandId::Plan,
         name: "plan",
         aliases: &[],
@@ -570,6 +582,7 @@ pub enum CliOnlyCommand {
     HelpOption(String),
     Queue,
     Retry,
+    Act,
     Plan(PlanSubcommand),
     PlanPrompt(String),
     PlanApprove,
@@ -728,6 +741,7 @@ impl CliOnlyCommand {
                 | Self::Changes
                 | Self::Queue
                 | Self::Retry
+                | Self::Act
                 | Self::Plan(_)
                 | Self::PlanPrompt(_)
                 | Self::PlanApprove
@@ -761,6 +775,7 @@ impl CliOnlyCommand {
         matches!(
             self,
             Self::Plan(_)
+                | Self::Act
                 | Self::PlanPrompt(_)
                 | Self::PlanApprove
                 | Self::PlanPause
@@ -859,6 +874,7 @@ fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCom
         SlashCommandId::Queue => Some(CliOnlyCommand::Queue),
         SlashCommandId::Retry => Some(CliOnlyCommand::Retry),
         SlashCommandId::Model => Some(CliOnlyCommand::ModelSwitch(args.to_string())),
+        SlashCommandId::Act => Some(CliOnlyCommand::Act),
         SlashCommandId::Plan => CliOnlyCommand::parse_plan_with_args(args),
         SlashCommandId::PlanApprove => Some(CliOnlyCommand::PlanApprove),
         SlashCommandId::PlanPause => Some(CliOnlyCommand::PlanPause),
@@ -2377,6 +2393,12 @@ mod tests {
         let result = get_cli_only_command("/plan approve");
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), CliOnlyCommand::PlanApprove));
+    }
+
+    #[test]
+    fn test_parse_cli_only_act() {
+        let result = get_cli_only_command("/act");
+        assert!(matches!(result, Some(CliOnlyCommand::Act)));
     }
 
     #[test]

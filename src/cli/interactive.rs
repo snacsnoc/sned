@@ -2606,7 +2606,7 @@ async fn handle_cli_only_command(
         CliOnlyCommand::PlanPrompt(_) => {
             app.push_plain("Plan prompt should be handled by the main loop.");
         }
-        CliOnlyCommand::PlanAbort => {
+        CliOnlyCommand::Act | CliOnlyCommand::PlanAbort => {
             if agent_busy.load(Ordering::Relaxed) {
                 app.push_styled(
                     "Agent is busy. Cancel it before aborting the plan.",
@@ -2642,7 +2642,13 @@ async fn handle_cli_only_command(
                 .set_mode(crate::core::agent_types::AgentMode::Act);
             app.mode = "ACT".to_string();
             app.update_placeholder();
-            if had_plan {
+            if matches!(cli_cmd, CliOnlyCommand::Act) {
+                app.push_plain(if had_plan {
+                    "Act mode enabled. Pending plan discarded."
+                } else {
+                    "Act mode enabled."
+                });
+            } else if had_plan {
                 app.push_plain("Plan aborted. Already-applied changes are kept.");
             } else {
                 app.push_plain("Exited plan mode. Ready for act mode.");
@@ -2982,7 +2988,13 @@ async fn handle_cli_only_command(
                     _ => unreachable!(),
                 }
             } else {
-                app.push_plain("No active plan.");
+                if app.mode == "PLAN" {
+                    app.push_plain(
+                        "No active plan. You are still in PLAN mode; use /act or /plan abort to leave it.",
+                    );
+                } else {
+                    app.push_plain("No active plan.");
+                }
             }
         }
     }
@@ -8337,18 +8349,11 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test for the `--plan` flag entry path: when the user
-    /// starts a task with `TaskOptions { plan: true, .. }` and the model
-    /// answers a follow-up question without calling `plan_mode_respond`,
-    /// `/plan abort` must still exit plan mode. Unlike
-    /// `test_plan_abort_exits_plan_mode_without_plan_state`, this test
-    /// does NOT explicitly call `set_mode(Plan)` after building the
-    /// session — it relies on the flag-driven `build_task_components`
-    /// initialization in `src/cli/mod.rs:1107` to set Plan mode. This
-    /// guards against a future change to that initialization silently
-    /// breaking the abort path for the `--plan` flag.
+    /// Regression test for the `--plan` flag entry path: `/act` must
+    /// always leave plan mode, including before the model has created a
+    /// plan_state.
     #[tokio::test]
-    async fn test_plan_abort_exits_plan_mode_from_flag_entry() -> anyhow::Result<()> {
+    async fn test_act_exits_plan_mode_from_flag_entry() -> anyhow::Result<()> {
         use crate::cli::slash_commands::CliOnlyCommand;
 
         let task_opts = TaskOptions {
@@ -8426,8 +8431,8 @@ mod tests {
         };
 
         let should_exit = handle_cli_only_command(
-            CliOnlyCommand::PlanAbort,
-            "/plan abort",
+            CliOnlyCommand::Act,
+            "/act",
             &mut app,
             &output_writer,
             &session,
@@ -8445,14 +8450,14 @@ mod tests {
         assert!(!should_exit);
         assert_eq!(
             app.mode, "ACT",
-            "/plan abort must transition out of plan mode entered via the --plan flag"
+            "/act must transition out of plan mode entered via the --plan flag"
         );
         assert!(app.output_lines.iter().any(|line| {
             line.spans
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
-                .contains("Exited plan mode")
+                .contains("Act mode enabled")
         }));
         let state = state_handle.lock().await;
         assert!(state.plan_state.is_none());
@@ -8461,7 +8466,7 @@ mod tests {
         assert_eq!(
             sess.agent_loop().await.mode(),
             crate::core::agent_types::AgentMode::Act,
-            "agent loop must also be switched out of Plan mode after --plan flag abort"
+            "agent loop must also be switched out of Plan mode after /act"
         );
 
         Ok(())
