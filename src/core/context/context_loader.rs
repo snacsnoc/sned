@@ -158,9 +158,8 @@ impl ContextLoader {
     #[must_use]
     pub fn extract_context(text: &str) -> Vec<String> {
         let mut mentions = Vec::new();
-        let mention_regex = regex::Regex::new(r"@([A-Za-z0-9_./\-]+)").unwrap();
 
-        for cap in mention_regex.captures_iter(text) {
+        for cap in MENTION_REGEX.captures_iter(text) {
             if let Some(matched) = cap.get(1) {
                 mentions.push(matched.as_str().to_string());
             }

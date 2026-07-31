@@ -5,7 +5,9 @@
 //! `ImageContentBlock` values for provider requests.
 
 use base64::Engine;
+use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
 
 /// Supported image file extensions and their MIME types.
 const IMAGE_EXTENSIONS: &[(&str, &str)] = &[
@@ -15,6 +17,13 @@ const IMAGE_EXTENSIONS: &[(&str, &str)] = &[
     (".gif", "image/gif"),
     (".webp", "image/webp"),
 ];
+
+static AT_IMAGE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\s)@(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))").expect("valid regex")
+});
+static STANDALONE_IMAGE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\s)(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))(?:\s|$)").expect("valid regex")
+});
 
 /// Error type for image loading operations.
 #[derive(Debug, thiserror::Error)]
@@ -115,9 +124,7 @@ pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
     let mut image_paths = Vec::new();
 
     // Match @/path/to/image.ext patterns
-    let at_path_regex =
-        regex::Regex::new(r"(?:^|\s)@(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))").expect("valid regex");
-    for cap in at_path_regex.captures_iter(input) {
+    for cap in AT_IMAGE_PATH_REGEX.captures_iter(input) {
         if let Some(m) = cap.get(1) {
             let path = m.as_str().to_string();
             if !image_paths.contains(&path) {
@@ -127,10 +134,7 @@ pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
     }
 
     // Match standalone absolute paths that look like images
-    let standalone_regex =
-        regex::Regex::new(r"(?:^|\s)(/[^\s]+\.(?:png|jpg|jpeg|gif|webp))(?:\s|$)")
-            .expect("valid regex");
-    for cap in standalone_regex.captures_iter(input) {
+    for cap in STANDALONE_IMAGE_PATH_REGEX.captures_iter(input) {
         if let Some(m) = cap.get(1) {
             let path = m.as_str().to_string();
             if !image_paths.contains(&path) {
@@ -140,8 +144,10 @@ pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
     }
 
     // Remove image references from prompt
-    let mut prompt = at_path_regex.replace_all(input, " ").to_string();
-    prompt = standalone_regex.replace_all(&prompt, " ").to_string();
+    let mut prompt = AT_IMAGE_PATH_REGEX.replace_all(input, " ").to_string();
+    prompt = STANDALONE_IMAGE_PATH_REGEX
+        .replace_all(&prompt, " ")
+        .to_string();
     prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
 
     (prompt, image_paths)

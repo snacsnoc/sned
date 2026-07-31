@@ -1,8 +1,11 @@
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::core::context::instructions::{self, SkillMetadata};
 
-const SLASH_COMMAND_REGEX: &str = r"(^|\s)\/([a-zA-Z0-9_.:@?-]+)";
+const SLASH_COMMAND_PATTERN: &str = r"(^|\s)\/([a-zA-Z0-9_.:@?-]+)";
+static SLASH_COMMAND_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(SLASH_COMMAND_PATTERN).expect("valid regex"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlashCommandId {
@@ -916,8 +919,7 @@ pub fn parse_slash_command(text: &str) -> SlashCommandParseResult {
         };
     }
 
-    let regex = Regex::new(SLASH_COMMAND_REGEX).unwrap();
-    let caps = regex.captures(text);
+    let caps = SLASH_COMMAND_REGEX.captures(text);
     if let Some(caps) = caps {
         let m = caps.get(0).unwrap();
         let start = m.start();
