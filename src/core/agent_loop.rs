@@ -1044,6 +1044,13 @@ impl AgentLoop {
         state_manager: Arc<crate::storage::state_manager::StateManager>,
     ) -> Result<(), AgentError> {
         tracing::debug!(target: "sned::agent_loop", "AgentLoop::run() called with {} initial messages", initial_messages.len());
+        if initial_messages
+            .iter()
+            .any(|message| message.role == MessageRole::User)
+        {
+            // Adaptive profiles belong to the top-level task, not the session.
+            self.deps.tool_profile = None;
+        }
         // Store state_manager for use during execution
         self.state_manager = Some(state_manager.clone());
         self.current_turn_retry_candidate = initial_messages
@@ -5348,6 +5355,65 @@ mod tests {
         assert!(
             tools.iter().any(|tool| tool.function.name == "edit_file"),
             "ACT profile should be selected from the current task, not the first historical prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_task_recomputes_profile_in_same_act_session() {
+        let responses = vec![
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "The answer is 4.".to_string(),
+                id: None,
+                signature: None,
+            })],
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "I need to inspect the file first.".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+        ));
+        let mut config = test_agent_config(provider, "act-profile-new-task");
+        config.interactive_mode = false;
+        let mut agent = AgentLoop::new(config);
+        let state_manager = Arc::new(StateManager::new().unwrap());
+
+        let user_message = |text: &str| StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+
+        agent
+            .run(
+                vec![user_message("Explain this repository")],
+                state_manager.clone(),
+            )
+            .await
+            .expect("answer task should complete");
+        agent
+            .run(
+                vec![user_message("Edit the configuration parser")],
+                state_manager,
+            )
+            .await
+            .expect("edit task should complete");
+
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].tools.is_none());
+        let tools = requests[1]
+            .tools
+            .as_ref()
+            .expect("new ACT task should receive tools");
+        assert!(
+            tools.iter().any(|tool| tool.function.name == "edit_file"),
+            "new ACT task should recompute its profile instead of reusing DirectAnswer"
         );
     }
 
