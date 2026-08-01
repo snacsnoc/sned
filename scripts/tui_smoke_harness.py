@@ -741,6 +741,80 @@ def model_switch():
         )
 
 
+def plan_approve_act():
+    sent_prompt = False
+    sent_approve = False
+    sent_tool_approve = False
+    tool_approval_visible = False
+    sent_exit = False
+    plan_generated = False
+    plan_approved = False
+    act_mode_seen = False
+    completion_seen = False
+    command_executed_before_approval = False
+    marker_path = None
+
+    def tick(session):
+        nonlocal sent_prompt, sent_approve, sent_tool_approve, sent_exit
+        nonlocal plan_generated, plan_approved, act_mode_seen, completion_seen
+        nonlocal command_executed_before_approval, tool_approval_visible
+        clean = clean_output(session.buf)
+        tail = visible_tail(clean)
+
+        if "type a prompt" in clean and not sent_prompt:
+            session.send(b"/plan create an approved plan\r")
+            sent_prompt = True
+        if sent_prompt and "Plan Generated" in clean:
+            plan_generated = True
+        if plan_generated and not sent_approve:
+            session.send(b"/plan approve\r")
+            sent_approve = True
+        if sent_approve and re.search(r"Plan\s*approved\..{0,80}Starting", clean):
+            plan_approved = True
+        if plan_approved and ("| ACT" in tail or "[ACT]" in tail):
+            act_mode_seen = True
+        if plan_approved and ("[y] Approve" in tail or "Execute this tool?" in tail) and not sent_tool_approve:
+            if not tool_approval_visible:
+                tool_approval_visible = True
+            else:
+                if marker_path is not None and os.path.exists(marker_path):
+                    command_executed_before_approval = True
+                session.send(b"y\r")
+                sent_tool_approve = True
+        if sent_tool_approve and "PLAN_APPROVE_ACT_COMPLETION" in clean:
+            completion_seen = True
+            if not sent_exit:
+                session.send(b"/exit\r")
+                sent_exit = True
+
+    with PtySession(
+        "sned-plan-approve-act.",
+        {"SNED_MOCK_PLAN_APPROVE_ACT": "1"},
+        args=["--provider", "mock"],
+    ) as session:
+        marker_path = os.path.join(session.tmp, "plan-approve-act-smoke")
+        session.run(18, tick, interval=0.05)
+        clean = clean_output(session.buf)
+        session.dump_if_verbose()
+        report(
+            [
+                (sent_prompt, "initial plan prompt was not sent"),
+                (plan_generated, "mock plan was not generated"),
+                (sent_approve, "/plan approve was not sent"),
+                (plan_approved, "plan approval did not start execution"),
+                (act_mode_seen, "ACT mode was not visible after plan approval"),
+                (sent_tool_approve, "approved command prompt did not appear"),
+                (not command_executed_before_approval, "approved ACT command executed before approval input"),
+                (os.path.exists(marker_path), "approved ACT command did not execute"),
+                (completion_seen, "ACT completion result was not rendered"),
+                (sent_exit, "/exit was not sent after ACT completion"),
+                (not session.timed_out, "plan approval scenario timed out"),
+                (session.exit_code == 0, f"sned exited with {session.exit_code}"),
+            ],
+            "PLAN approval transitioned to ACT and executed the approved step",
+        )
+
+
 def cancel_agent_notice():
     sent_prompt = False
     sent_cancel = False
@@ -864,6 +938,7 @@ SCENARIOS = {
     "tui-history-navigation": history_navigation,
     "tui-slash-commands": slash_commands,
     "tui-model-switch": model_switch,
+    "tui-plan-approve-act": plan_approve_act,
     "tui-busy-exit": busy_exit,
     "tui-cancel-agent-notice": cancel_agent_notice,
     "tui-approval-rejection": approval_rejection,

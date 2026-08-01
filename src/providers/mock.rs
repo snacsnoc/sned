@@ -184,6 +184,43 @@ impl MockProvider {
     }
 
     #[must_use]
+    pub fn plan_approval_scenario() -> Self {
+        let marker_path = std::env::var("SNED_DIR")
+            .map(|d| format!("{d}/plan-approve-act-smoke"))
+            .unwrap_or_else(|_| "/tmp/sned-plan-approve-act-smoke".to_string());
+        let shell_marker_path = marker_path.replace('\'', "'\"'\"'");
+
+        let plan_response = MockToolCall {
+            call_id: "plan-approve-act-plan".to_string(),
+            name: "plan_mode_respond".to_string(),
+            arguments: serde_json::json!({
+                "response": "1. Verify the approved plan command",
+                "needs_more_exploration": false,
+            }),
+        };
+        let execute_command = MockToolCall {
+            call_id: "plan-approve-act-exec".to_string(),
+            name: "execute_command".to_string(),
+            arguments: serde_json::json!({
+                "commands": [format!("touch '{shell_marker_path}'")]
+            }),
+        };
+        let attempt_completion = MockToolCall {
+            call_id: "plan-approve-act-complete".to_string(),
+            name: "attempt_completion".to_string(),
+            arguments: serde_json::json!({
+                "result": "PLAN_APPROVE_ACT_COMPLETION"
+            }),
+        };
+
+        Self::new(vec![
+            MockResponse::ToolCalls(vec![plan_response]),
+            MockResponse::ToolCalls(vec![execute_command]),
+            MockResponse::ToolCalls(vec![attempt_completion]),
+        ])
+    }
+
+    #[must_use]
     pub fn approval_under_backpressure_scenario() -> Self {
         let marker_path = std::env::var("SNED_DIR")
             .map(|d| format!("{d}/approval-backpressure-smoke"))

@@ -1293,7 +1293,11 @@ pub(crate) fn create_provider(
             ))
         }
         "mock" => {
-            if std::env::var_os("SNED_MOCK_APPROVAL_SCALAR_COMMAND").is_some() {
+            if std::env::var_os("SNED_MOCK_PLAN_APPROVE_ACT").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::plan_approval_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_APPROVAL_SCALAR_COMMAND").is_some() {
                 Arc::new(crate::providers::Providers::Mock(
                     crate::providers::mock::MockProvider::scalar_command_approval_scenario(),
                 ))
