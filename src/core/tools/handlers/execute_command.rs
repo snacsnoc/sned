@@ -345,6 +345,7 @@ impl ExecuteCommandHandler {
 
         let mut combined_output = String::new();
         let mut sandbox_env_report = SandboxEnvReport::default();
+        let mut command_failed = false;
 
         for cmd_str in commands {
             // Safety check: validate command against safe list and patterns
@@ -732,6 +733,7 @@ impl ExecuteCommandHandler {
                     output.status.code(),
                 );
                 combined_output.push_str(&format!("\n{}", err.display()));
+                command_failed = true;
                 break;
             }
         }
@@ -749,11 +751,17 @@ impl ExecuteCommandHandler {
             "execute_command result assembled"
         );
 
-        Ok(assemble_sandboxed_output(
+        let assembled_output = assemble_sandboxed_output(
             combined_output,
             &sandbox_env_report,
             limit_bytes,
-        ))
+        );
+
+        if command_failed {
+            Err(anyhow::anyhow!(assembled_output))
+        } else {
+            Ok(assembled_output)
+        }
     }
 
     /// Execute a script in a specific language.
@@ -917,7 +925,8 @@ impl ExecuteCommandHandler {
             combined.push_str(&stderr);
         }
 
-        if !output.status.success() {
+        let script_failed = !output.status.success();
+        if script_failed {
             let err = crate::cli::actionable_errors::command_exit_code(
                 &format!("{language} script"),
                 output.status.code(),
@@ -932,7 +941,11 @@ impl ExecuteCommandHandler {
             output_writer.emit(OutputEvent::RawAnsi(combined.clone()));
         }
 
-        Ok(combined)
+        if script_failed {
+            Err(anyhow::anyhow!(combined))
+        } else {
+            Ok(combined)
+        }
     }
     fn build_sandbox_env(
         cwd: Option<&Path>,
@@ -1283,8 +1296,18 @@ mod tests {
         let result = handler
             .execute_commands(vec!["false".to_string()], None)
             .await
-            .unwrap();
-        assert!(result.contains("Command failed with exit code"));
+            .expect_err("a non-zero command exit must be a tool failure");
+        assert!(result.to_string().contains("Command failed with exit code"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_failure() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let result = handler
+            .execute_script("exit 7", "bash", None)
+            .await
+            .expect_err("a non-zero script exit must be a tool failure");
+        assert!(result.to_string().contains("Command failed with exit code"));
     }
 
     #[tokio::test]
@@ -1403,6 +1426,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_uses_workspace_root_not_process_cwd() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new();
         let workspace_root = tempfile::tempdir().unwrap();
 
@@ -1435,6 +1461,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_script_uses_workspace_root_not_process_cwd() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new();
         let workspace_root = tempfile::tempdir().unwrap();
 

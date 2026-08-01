@@ -26,6 +26,24 @@ impl AttemptCompletionHandler {
         state: &mut TaskState,
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
+        let plan_blocks_completion = state.plan_state.as_ref().is_some_and(|plan| {
+            plan.approved
+                && !plan.complete
+                && (plan.paused
+                    || plan
+                        .steps
+                        .iter()
+                        .any(|step| {
+                            step.status == crate::core::plan_state::PlanStepStatus::Failed
+                        }))
+        });
+        if plan_blocks_completion {
+            return Err(ToolError::ExecutionFailed(
+                "Cannot complete while the approved plan is paused or has failed steps. Use /plan resume to retry or /plan abort to cancel."
+                    .to_string(),
+            ));
+        }
+
         let result = params.get("result").and_then(|r| r.as_str()).unwrap_or("");
 
         // Reset consecutive mistakes on completion
@@ -210,5 +228,27 @@ mod tests {
             "Third attempt should be rejected again (new double-check cycle)"
         );
         assert!(state.double_check_completion_pending);
+    }
+
+    #[test]
+    fn test_attempt_completion_rejected_for_failed_plan() {
+        let handler = AttemptCompletionHandler::new();
+        let mut state = TaskState::default();
+        let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+            "Run the command".to_string(),
+        ]);
+        plan.approved = true;
+        plan.paused = true;
+        plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Failed;
+        state.plan_state = Some(plan);
+
+        let result = handler.execute(
+            &mut state,
+            serde_json::json!({"result": "Everything completed successfully"}),
+        );
+
+        let error = result.expect_err("failed plans must not accept completion");
+        assert!(error.to_string().contains("/plan resume"));
+        assert!(!state.double_check_completion_pending);
     }
 }

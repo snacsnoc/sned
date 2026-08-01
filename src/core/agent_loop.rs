@@ -3805,6 +3805,17 @@ impl AgentLoop {
                 Some(SnedTool::AttemptCompletion)
             )
         });
+        let plan_blocks_completion = {
+            let state = self.state.lock().await;
+            state.plan_state.as_ref().is_some_and(|plan| {
+                plan.approved
+                    && !plan.complete
+                    && (plan.paused
+                        || plan.steps.iter().any(|step| {
+                            step.status == PlanStepStatus::Failed
+                        }))
+            })
+        };
         let plan_active = self.plan_execution_active().await;
         let is_completion = (prepared_tool_calls.iter().any(|prepared| {
             matches!(
@@ -3813,6 +3824,7 @@ impl AgentLoop {
             )
         }) || text_only_completes_task)
             && !plan_active
+            && !plan_blocks_completion
             || (tool_failure_count == 0
                 && prepared_tool_calls.iter().any(|prepared| {
                     matches!(
@@ -9831,6 +9843,114 @@ mod tests {
             assert!(plan.paused, "Plan should be paused after step failure");
             assert!(!plan.complete, "Plan should not be complete after failure");
         }
+    }
+
+    #[tokio::test]
+    async fn test_failed_command_blocks_misleading_attempt_completion() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::attempt_completion::AttemptCompletionHandler;
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+
+        let responses = vec![
+            vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_failed_command".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("execute_command".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"commands": ["false"]}).to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            })],
+            vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_misleading_completion".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("attempt_completion".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"result": "Everything completed successfully"})
+                                .to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            })],
+        ];
+
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        let mut config = test_agent_config(provider, "test-failed-command-completion");
+        config.output_writer = writer;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new().with_yolo(true)),
+        );
+        registry.register(
+            crate::core::tools::SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Run the command".to_string(),
+            ]);
+            plan.approved = true;
+            plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
+            state.plan_state = Some(plan);
+        }
+
+        let first_result = agent.execute_turn().await;
+        assert!(matches!(first_result, TurnResult::Continue));
+        let first_events = drain_output_events(&mut priority_rx, &mut rx);
+        assert!(first_events.iter().any(|event| {
+            matches!(event, OutputEvent::ErrorBox(message) if message.contains("Plan step 1/1 failed"))
+        }));
+
+        {
+            let state = agent.state.lock().await;
+            let plan = state
+                .plan_state
+                .as_ref()
+                .expect("plan should remain present");
+            assert_eq!(
+                plan.steps[0].status,
+                crate::core::plan_state::PlanStepStatus::Failed
+            );
+            assert!(plan.paused);
+            assert!(!plan.complete);
+        }
+
+        let second_result = agent.execute_turn().await;
+        assert!(matches!(second_result, TurnResult::Continue));
+        let second_events = drain_output_events(&mut priority_rx, &mut rx);
+        assert!(second_events.iter().any(|event| {
+            matches!(event, OutputEvent::ToolOutputLine(line) if line.to_string().contains("Cannot complete while the approved plan"))
+        }));
+        assert!(!first_events
+            .iter()
+            .chain(second_events.iter())
+            .any(|event| matches!(event, OutputEvent::Completion(_))));
     }
 
     // =====================================================================
