@@ -8,7 +8,7 @@ Models should not blindly patch text they have not recently read. sned hashes th
 
 For larger changes, sned can batch edits across files, use tree-sitter for symbol-level work, and track accepted agent turns in a separate `.sned/.git-agent/` shadot git repo. 
 
-
+On Apple Silicon, Sned used 93–97% less peak memory than OpenCode in same-model runs. [See the table](#benchmark-results).
 
 ## Build
 
@@ -302,6 +302,38 @@ CLI flags override env vars.
 cargo test
 cargo test -p sned
 ```
+
+## benchmarks
+
+```bash
+cargo bench
+```
+
+See [`scripts/INDEX.md`](./scripts/INDEX.md) for profiling and the Sned-to-OpenCode benchmark.
+
+### Benchmark results
+
+Each fixture ran three times on Apple Silicon. The tests used the same model in
+Sned and OpenCode. The table gives average values. Lower values are better.
+The table does not measure output quality.
+
+| Model | Fixture | Peak RSS (MB): Sned / OpenCode | User CPU (ms): Sned / OpenCode | Wall time (s): Sned / OpenCode |
+|---|---|---:|---:|---:|
+| MiniMax M2.7 | trivial | 14.4 / 526.4 | 10 / 2,046 | 2.33 / 3.48 — 1.5× faster |
+| MiniMax M2.7 | single Rust file | 19.2 / 531.4 | 63 / 4,553 | 9.75 / 55.73 — 5.7× faster |
+| MiniMax M2.7 | two Python files | 34.9 / 559.1 | 103 / 7,766 | 45.39 / 45.81 — tied |
+| Gemini 3.1 Flash Lite | trivial | 14.1 / 525.3 | 6 / 1,736 | 0.57 / 2.17 — 3.8× faster |
+| Gemini 3.1 Flash Lite | single Rust file | 18.6 / 529.2 | 40 / 2,913 | 1.51 / 49.82 — 33× faster |
+| Gemini 3.1 Flash Lite | two Python files | 17.9 / 546.0 | 30 / 3,266 | —† |
+
+† OpenCode wrote both requested files in one of three runs. Two runs had
+file-write errors and reported success. Do not compare their wall times. Sned
+wrote both files in all three runs.
+
+Sned used 2.7–6.5% of the peak RSS used by OpenCode. This was 93–97% less.
+Five rows did not have file-write errors. Sned had lower elapsed time in four
+of these rows. The MiniMax two-file test had the same elapsed time.
+Run [`scripts/bench-vs-opencode.sh`](./scripts/bench-vs-opencode.sh) to repeat the benchmark.
 
 ## license
 
