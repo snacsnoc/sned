@@ -9,8 +9,8 @@ SNED_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-scalar-command tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-model-switch tui-plan-approve-act tui-busy-exit tui-cancel-agent-notice tui-approval-rejection tui-provider-error-box help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
-TOTAL_TESTS=21
+ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-scalar-command tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-model-switch tui-plan-approve-act tui-plan-act tui-plan-abort tui-plan-act-no-state tui-plan-abort-no-state tui-plan-queued-input tui-busy-exit tui-cancel-agent-notice tui-approval-rejection tui-provider-error-box help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
+TOTAL_TESTS=26
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -55,6 +55,11 @@ tui-history-navigation Type prompts, press Up arrow, verify previous prompt appe
 tui-slash-commands    Search /help, then reject an unknown slash command locally
 tui-model-switch      Type /model mock/mock-model, verify switch message renders
 tui-plan-approve-act  Approve a mock plan, verify ACT mode, and execute its step
+tui-plan-act          Exit an active plan with /act, verify ACT tools execute
+tui-plan-abort        Abort an active plan, verify ACT tools execute afterward
+tui-plan-act-no-state Exit with /act before a plan exists, then execute a tool
+tui-plan-abort-no-state Exit with /plan abort before a plan exists, then execute a tool
+tui-plan-queued-input Queue input during a busy plan, then exit to ACT safely
 tui-busy-exit         While mock provider streams output, send /exit and verify prompt shutdown
 tui-cancel-agent-notice While streaming output, send Ctrl+C and verify cancellation notice appears
 tui-approval-rejection Verify typing 'n' on approval prompt strictly prevents execution
@@ -111,6 +116,11 @@ test_description() {
         tui-slash-commands) echo "Search /help, then reject an unknown slash command locally" ;;
         tui-model-switch) echo "Type /model mock/mock-model, verify switch message renders" ;;
         tui-plan-approve-act) echo "Approve a mock plan, verify ACT mode, and execute its step" ;;
+        tui-plan-act) echo "Exit an active plan with /act, verify ACT tools execute" ;;
+        tui-plan-abort) echo "Abort an active plan, verify ACT tools execute afterward" ;;
+        tui-plan-act-no-state) echo "Exit with /act before a plan exists, then execute a tool" ;;
+        tui-plan-abort-no-state) echo "Exit with /plan abort before a plan exists, then execute a tool" ;;
+        tui-plan-queued-input) echo "Queue input during a busy plan, then exit to ACT safely" ;;
         tui-busy-exit) echo "While mock provider streams output, send /exit and verify prompt shutdown" ;;
         tui-cancel-agent-notice) echo "While streaming output, send Ctrl+C and verify cancellation notice appears" ;;
         tui-approval-rejection) echo "Verify typing 'n' on approval prompt strictly prevents execution" ;;
@@ -138,6 +148,11 @@ test_source() {
         tui-slash-commands) echo "src/cli/interactive.rs help overlay and unknown-command routing / src/cli/slash_commands.rs registry" ;;
         tui-model-switch) echo "src/cli/interactive.rs handle_cli_only_command ModelSwitch / src/core/agent_loop.rs set_provider" ;;
         tui-plan-approve-act) echo "scripts/tui_smoke_harness.py plan_approve_act / src/providers/mock.rs plan_approval_scenario / src/cli/interactive.rs PlanApprove" ;;
+        tui-plan-act) echo "scripts/tui_smoke_harness.py plan_act / src/providers/mock.rs plan_act_scenario / src/cli/interactive.rs Act" ;;
+        tui-plan-abort) echo "scripts/tui_smoke_harness.py plan_abort / src/providers/mock.rs plan_abort_scenario / src/cli/interactive.rs PlanAbort" ;;
+        tui-plan-act-no-state) echo "scripts/tui_smoke_harness.py plan_act_no_state / src/providers/mock.rs plan_act_no_state_scenario / src/cli/interactive.rs Act" ;;
+        tui-plan-abort-no-state) echo "scripts/tui_smoke_harness.py plan_abort_no_state / src/providers/mock.rs plan_abort_no_state_scenario / src/cli/interactive.rs PlanAbort" ;;
+        tui-plan-queued-input) echo "scripts/tui_smoke_harness.py plan_queued_input / src/providers/mock.rs plan_queued_input_scenario / src/core/agent_loop.rs message queue" ;;
         tui-busy-exit) echo "src/cli/interactive.rs busy-state shutdown path / src/providers/mock.rs busy_stream_scenario" ;;
         tui-cancel-agent-notice) echo "src/cli/interactive.rs cancel_agent notice path / src/core/agent_loop.rs abort task" ;;
         tui-approval-rejection) echo "src/cli/interactive.rs approval rejection routing 'n' / src/core/approval.rs" ;;

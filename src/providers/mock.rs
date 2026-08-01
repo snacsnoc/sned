@@ -220,6 +220,198 @@ impl MockProvider {
         ])
     }
 
+    fn plan_exit_scenario(marker_name: &str, completion: &str) -> Self {
+        let marker_path = std::env::var("SNED_DIR")
+            .map(|d| format!("{d}/{marker_name}"))
+            .unwrap_or_else(|_| format!("/tmp/{marker_name}"));
+        let shell_marker_path = marker_path.replace('\'', "'\"'\"'");
+
+        let plan_response = MockToolCall {
+            call_id: format!("{marker_name}-plan"),
+            name: "plan_mode_respond".to_string(),
+            arguments: serde_json::json!({
+                "response": "1. Keep the pending plan for the exit-path smoke test",
+                "needs_more_exploration": false,
+            }),
+        };
+        let execute_command = MockToolCall {
+            call_id: format!("{marker_name}-exec"),
+            name: "execute_command".to_string(),
+            arguments: serde_json::json!({
+                "commands": [format!("touch '{shell_marker_path}'")]
+            }),
+        };
+        let attempt_completion = MockToolCall {
+            call_id: format!("{marker_name}-complete"),
+            name: "attempt_completion".to_string(),
+            arguments: serde_json::json!({"result": completion}),
+        };
+
+        Self::new(vec![
+            MockResponse::ToolCalls(vec![plan_response]),
+            MockResponse::ToolCalls(vec![execute_command]),
+            MockResponse::ToolCalls(vec![attempt_completion]),
+        ])
+    }
+
+    #[must_use]
+    pub fn plan_act_scenario() -> Self {
+        Self::plan_exit_scenario("plan-act-smoke", "PLAN_ACT_COMPLETION")
+    }
+
+    #[must_use]
+    pub fn plan_abort_scenario() -> Self {
+        Self::plan_exit_scenario("plan-abort-smoke", "PLAN_ABORT_COMPLETION")
+    }
+
+    #[must_use]
+    fn plan_no_state_exit_scenario(marker_name: &str, completion: &str) -> Self {
+        let marker_path = std::env::var("SNED_DIR")
+            .map(|d| format!("{d}/{marker_name}"))
+            .unwrap_or_else(|_| format!("/tmp/{marker_name}"));
+        let shell_marker_path = marker_path.replace('\'', "'\"'\"'");
+        let no_state_plan = MockToolCall {
+            call_id: format!("{marker_name}-plan"),
+            name: "plan_mode_respond".to_string(),
+            arguments: serde_json::json!({
+                "response": "I need more exploration before creating a plan",
+                "needs_more_exploration": true,
+            }),
+        };
+        let execute_marker = MockToolCall {
+            call_id: format!("{marker_name}-exec"),
+            name: "execute_command".to_string(),
+            arguments: serde_json::json!({
+                "commands": [format!("touch '{shell_marker_path}'")]
+            }),
+        };
+        let attempt_completion = MockToolCall {
+            call_id: format!("{marker_name}-complete"),
+            name: "attempt_completion".to_string(),
+            arguments: serde_json::json!({"result": completion}),
+        };
+
+        Self::new(vec![
+            MockResponse::ToolCalls(vec![no_state_plan]),
+            MockResponse::ToolCalls(vec![execute_marker]),
+            MockResponse::ToolCalls(vec![attempt_completion]),
+        ])
+    }
+
+    #[must_use]
+    pub fn plan_act_no_state_scenario() -> Self {
+        Self::plan_no_state_exit_scenario(
+            "plan-act-no-state-smoke",
+            "PLAN_ACT_NO_STATE_COMPLETION",
+        )
+    }
+
+    #[must_use]
+    pub fn plan_abort_no_state_scenario() -> Self {
+        Self::plan_no_state_exit_scenario(
+            "plan-abort-no-state-smoke",
+            "PLAN_ABORT_NO_STATE_COMPLETION",
+        )
+    }
+
+    #[must_use]
+    pub fn plan_queued_input_scenario() -> Self {
+        let plan_response = MockToolCall {
+            call_id: "plan-queued-input-plan".to_string(),
+            name: "plan_mode_respond".to_string(),
+            arguments: serde_json::json!({
+                "response": "I need more exploration before creating a plan",
+                "needs_more_exploration": true,
+            }),
+        };
+        let queued_response = MockToolCall {
+            call_id: "plan-queued-input-response".to_string(),
+            name: "plan_mode_respond".to_string(),
+            arguments: serde_json::json!({
+                "response": "The queued request was processed",
+                "needs_more_exploration": true,
+            }),
+        };
+
+        let mut events = vec![MockStreamEvent::Chunk(ApiStreamChunk::Text(
+            ApiStreamTextChunk {
+                text: "QUEUE_BUSY_PLAN\n".to_string(),
+                id: None,
+                signature: None,
+            },
+        ))];
+        events.push(MockStreamEvent::Delay(Duration::from_millis(1200)));
+        events.push(MockStreamEvent::Chunk(ApiStreamChunk::ToolCalls(
+            ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some(plan_response.call_id),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some(plan_response.name),
+                        arguments: Some(plan_response.arguments.to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            },
+        )));
+        events.push(MockStreamEvent::Chunk(ApiStreamChunk::Usage(
+            ApiStreamUsageChunk {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_write_tokens: None,
+                cache_read_tokens: None,
+                reasoning_tokens: None,
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: None,
+                id: None,
+            },
+        )));
+
+        let mut queued_events = vec![MockStreamEvent::Chunk(ApiStreamChunk::Text(
+            ApiStreamTextChunk {
+                text: "QUEUED_INPUT_PROCESSED\n".to_string(),
+                id: None,
+                signature: None,
+            },
+        ))];
+        queued_events.push(MockStreamEvent::Chunk(ApiStreamChunk::ToolCalls(
+            ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some(queued_response.call_id),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some(queued_response.name),
+                        arguments: Some(queued_response.arguments.to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            },
+        )));
+        queued_events.push(MockStreamEvent::Chunk(ApiStreamChunk::Usage(
+            ApiStreamUsageChunk {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_write_tokens: None,
+                cache_read_tokens: None,
+                reasoning_tokens: None,
+                thoughts_token_count: None,
+                total_cost: None,
+                stop_reason: None,
+                id: None,
+            },
+        )));
+
+        Self::new(vec![
+            MockResponse::Stream(events),
+            MockResponse::Stream(queued_events),
+        ])
+    }
+
     #[must_use]
     pub fn approval_under_backpressure_scenario() -> Self {
         let marker_path = std::env::var("SNED_DIR")

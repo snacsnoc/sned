@@ -26,6 +26,10 @@ def visible_tail(text, rows=24):
     return "\n".join(lines[-rows:])
 
 
+def compact_output(text):
+    return re.sub(r"[^A-Za-z0-9]+", "", text)
+
+
 def report(checks, success):
     for passed, failure in checks:
         if not passed:
@@ -815,6 +819,281 @@ def plan_approve_act():
         )
 
 
+def plan_exit_active(command, env_name, expected_message, marker_name, completion):
+    sent_prompt = False
+    plan_generated = False
+    sent_command = False
+    mode_transition_seen = False
+    mode_seen = False
+    sent_followup = False
+    marker_created_before_followup = False
+    completion_seen = False
+    sent_exit = False
+
+    def tick(session):
+        nonlocal sent_prompt, plan_generated, sent_command, mode_transition_seen
+        nonlocal mode_seen, sent_followup, marker_created_before_followup
+        nonlocal completion_seen, sent_exit
+        clean = clean_output(session.buf)
+        tail = visible_tail(clean)
+        compact_clean = compact_output(clean)
+        marker_path = os.path.join(session.tmp, marker_name)
+
+        if "type a prompt" in clean and not sent_prompt:
+            session.send(b"create a pending plan for the exit-path smoke test\r")
+            sent_prompt = True
+        if sent_prompt and "Plan Generated" in clean:
+            plan_generated = True
+        if plan_generated and "Elapsed:" in clean and not sent_command:
+            session.send((command + "\r").encode())
+            sent_command = True
+        if sent_command and all(
+            compact_output(part) in compact_clean
+            for part in expected_message.split(".")
+            if part.strip()
+        ):
+            mode_transition_seen = True
+        if mode_transition_seen and (
+            "| ACT" in tail or "[ACT]" in tail or "ACT Context" in clean
+        ):
+            mode_seen = True
+        if mode_seen and not sent_followup:
+            marker_created_before_followup = os.path.exists(marker_path)
+            session.send(b"run the exit-path marker command\r")
+            sent_followup = True
+        if sent_followup and completion in clean:
+            completion_seen = True
+            if not sent_exit:
+                session.send(b"/exit\r")
+                sent_exit = True
+
+    with PtySession(
+        f"sned-{marker_name}.",
+        {env_name: "1"},
+        args=["--provider", "mock", "--yolo"],
+    ) as session:
+        session.run(18, tick, interval=0.05)
+        session.dump_if_verbose()
+        clean = clean_output(session.buf)
+        compact_clean = compact_output(clean)
+        report(
+            [
+                (sent_prompt, "initial plan prompt was not sent"),
+                (plan_generated, "mock plan was not generated"),
+                (sent_command, f"{command} was not sent"),
+                (
+                    all(
+                        compact_output(part) in compact_clean
+                        for part in expected_message.split(".")
+                        if part.strip()
+                    ),
+                    "plan exit confirmation was not rendered",
+                ),
+                (mode_seen, "ACT mode was not visible after leaving the plan"),
+                (sent_followup, "follow-up ACT prompt was not sent"),
+                (not marker_created_before_followup, "ACT marker was created before the mode transition"),
+                (os.path.exists(os.path.join(session.tmp, marker_name)), "ACT tool did not execute after the mode transition"),
+                (completion_seen, "ACT completion result was not rendered"),
+                (sent_exit, "/exit was not sent after the ACT completion"),
+                (not session.timed_out, "plan exit scenario timed out"),
+                (session.exit_code == 0, f"sned exited with {session.exit_code}"),
+            ],
+            f"{command} left an active plan in ACT mode and restored tool execution",
+        )
+
+
+def plan_act():
+    plan_exit_active(
+        "/act",
+        "SNED_MOCK_PLAN_ACT",
+        "Act mode enabled. Pending plan discarded.",
+        "plan-act-smoke",
+        "PLAN_ACT_COMPLETION",
+    )
+
+
+def plan_abort():
+    plan_exit_active(
+        "/plan abort",
+        "SNED_MOCK_PLAN_ABORT",
+        "Plan aborted. Already-applied changes are kept.",
+        "plan-abort-smoke",
+        "PLAN_ABORT_COMPLETION",
+    )
+
+
+def plan_no_state_exit(command, env_name, expected_message, marker_name, completion):
+    sent_prompt = False
+    sent_command = False
+    mode_transition_seen = False
+    mode_seen = False
+    sent_followup = False
+    marker_created_before_followup = False
+    completion_seen = False
+    sent_exit = False
+
+    def tick(session):
+        nonlocal sent_prompt, sent_command, mode_transition_seen, mode_seen
+        nonlocal sent_followup, marker_created_before_followup, completion_seen
+        nonlocal sent_exit
+        clean = clean_output(session.buf)
+        compact_clean = compact_output(clean)
+        tail = visible_tail(clean)
+        marker_path = os.path.join(session.tmp, marker_name)
+        message_seen = all(
+            compact_output(part) in compact_clean
+            for part in expected_message.split(".")
+            if part.strip()
+        )
+
+        if "type a prompt" in clean and not sent_prompt:
+            session.send(b"explore this request without creating a plan\r")
+            sent_prompt = True
+        if sent_prompt and "Elapsed:" in clean and not sent_command:
+            session.send((command + "\r").encode())
+            sent_command = True
+        if sent_command and message_seen:
+            mode_transition_seen = True
+        if mode_transition_seen and (
+            "| ACT" in tail or "[ACT]" in tail or "ACT Context" in clean
+        ):
+            mode_seen = True
+        if mode_seen and not sent_followup:
+            marker_created_before_followup = os.path.exists(marker_path)
+            session.send(b"run the no-state ACT marker command\r")
+            sent_followup = True
+        if sent_followup and completion in clean:
+            completion_seen = True
+            if not sent_exit:
+                session.send(b"/exit\r")
+                sent_exit = True
+
+    with PtySession(
+        f"sned-{marker_name}.",
+        {env_name: "1"},
+        args=["--provider", "mock", "--plan", "--yolo"],
+    ) as session:
+        session.run(18, tick, interval=0.05)
+        session.dump_if_verbose()
+        clean = clean_output(session.buf)
+        compact_clean = compact_output(clean)
+        report(
+            [
+                (sent_prompt, "initial no-state plan prompt was not sent"),
+                (sent_command, f"{command} was not sent without plan state"),
+                (mode_transition_seen, f"{command} did not leave plan mode without plan state"),
+                (mode_seen, "ACT mode was not visible after the no-state exit"),
+                (sent_followup, "no-state ACT follow-up was not sent"),
+                (not marker_created_before_followup, "no-state ACT tool ran before the mode transition"),
+                (os.path.exists(os.path.join(session.tmp, marker_name)), "no-state ACT tool did not execute"),
+                (completion_seen, "no-state ACT completion was not rendered"),
+                ("PlanGenerated" not in compact_clean, "no-state fixture unexpectedly created a plan"),
+                (sent_exit, "/exit was not sent after the no-state exit"),
+                (not session.timed_out, "no-state plan exit timed out"),
+                (session.exit_code == 0, f"sned exited with {session.exit_code}"),
+            ],
+            f"{command} left plan mode when no plan state existed",
+        )
+
+
+def plan_act_no_state():
+    plan_no_state_exit(
+        "/act",
+        "SNED_MOCK_PLAN_ACT_NO_STATE",
+        "Act mode enabled.",
+        "plan-act-no-state-smoke",
+        "PLAN_ACT_NO_STATE_COMPLETION",
+    )
+
+
+def plan_abort_no_state():
+    plan_no_state_exit(
+        "/plan abort",
+        "SNED_MOCK_PLAN_ABORT_NO_STATE",
+        "Exited plan mode. Ready for act mode.",
+        "plan-abort-no-state-smoke",
+        "PLAN_ABORT_NO_STATE_COMPLETION",
+    )
+
+
+def plan_queued_input():
+    sent_prompt = False
+    sent_queued = False
+    queue_ack_seen = False
+    queued_processed = False
+    next_act_attempt_at = None
+    sent_act = False
+    act_mode_seen = False
+    sent_exit = False
+
+    def tick(session):
+        nonlocal sent_prompt, sent_queued, queue_ack_seen, queued_processed
+        nonlocal next_act_attempt_at, sent_act, act_mode_seen
+        nonlocal sent_exit
+        clean = clean_output(session.buf)
+        compact_clean = compact_output(clean)
+        tail = visible_tail(clean)
+
+        if "type a prompt" in clean and not sent_prompt:
+            session.send(b"create a plan while another prompt is queued\r")
+            sent_prompt = True
+        if "QUEUE_BUSY_PLAN" in clean and not sent_queued:
+            session.send(b"queued while the plan agent is busy\r")
+            sent_queued = True
+        if sent_queued and "Message queued" in clean:
+            queue_ack_seen = True
+        if sent_queued and "QUEUEDINPUTPROCESSED" in compact_clean:
+            queued_processed = True
+            if next_act_attempt_at is None:
+                next_act_attempt_at = time.monotonic() + 0.5
+        if (
+            queued_processed
+            and next_act_attempt_at is not None
+            and time.monotonic() >= next_act_attempt_at
+            and not sent_act
+        ):
+            session.send(b"/act\r")
+            sent_act = True
+        if sent_act and "Agentisbusy" in compact_clean and not act_mode_seen:
+            sent_act = False
+            next_act_attempt_at = time.monotonic() + 0.5
+        if sent_act and "Actmodeenabled" in compact_clean:
+            act_mode_seen = "| ACT" in tail or "[ACT]" in tail or "ACT Context" in clean
+        if act_mode_seen and not sent_exit:
+            session.send(b"/exit\r")
+            sent_exit = True
+
+    with PtySession(
+        "sned-plan-queued-input.",
+        {"SNED_MOCK_PLAN_QUEUED_INPUT": "1"},
+        args=["--provider", "mock", "--plan", "--yolo"],
+    ) as session:
+        session.run(20, tick, interval=0.05)
+        session.dump_if_verbose()
+        clean = clean_output(session.buf)
+        compact_clean = compact_output(clean)
+        queued_prompt = "queuedwhiletheplanagentisbusy"
+        first_prompt_index = compact_clean.find(queued_prompt)
+        queued_prompt_index = compact_clean.find(
+            queued_prompt, first_prompt_index + len(queued_prompt)
+        )
+        report(
+            [
+                (sent_prompt, "initial busy plan prompt was not sent"),
+                (sent_queued, "user message was not submitted while the plan agent was busy"),
+                (queue_ack_seen, "queued user message was not acknowledged"),
+                (queued_prompt_index > first_prompt_index, "queued input was not replayed after queue processing began"),
+                (queued_processed, "queued user message response was lost or misrouted"),
+                (sent_act, "/act was not sent after queued input completed"),
+                (act_mode_seen, "ACT mode was not visible after queued-input plan exit"),
+                (sent_exit, "/exit was not sent after queued-input completion"),
+                (not session.timed_out, "queued-input plan scenario timed out"),
+                (session.exit_code == 0, f"sned exited with {session.exit_code}"),
+            ],
+            "queued plan input was preserved, processed, and exited to ACT",
+        )
+
+
 def cancel_agent_notice():
     sent_prompt = False
     sent_cancel = False
@@ -939,6 +1218,11 @@ SCENARIOS = {
     "tui-slash-commands": slash_commands,
     "tui-model-switch": model_switch,
     "tui-plan-approve-act": plan_approve_act,
+    "tui-plan-act": plan_act,
+    "tui-plan-abort": plan_abort,
+    "tui-plan-act-no-state": plan_act_no_state,
+    "tui-plan-abort-no-state": plan_abort_no_state,
+    "tui-plan-queued-input": plan_queued_input,
     "tui-busy-exit": busy_exit,
     "tui-cancel-agent-notice": cancel_agent_notice,
     "tui-approval-rejection": approval_rejection,

@@ -1297,6 +1297,26 @@ pub(crate) fn create_provider(
                 Arc::new(crate::providers::Providers::Mock(
                     crate::providers::mock::MockProvider::plan_approval_scenario(),
                 ))
+            } else if std::env::var_os("SNED_MOCK_PLAN_ACT").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::plan_act_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_PLAN_ABORT").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::plan_abort_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_PLAN_ACT_NO_STATE").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::plan_act_no_state_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_PLAN_ABORT_NO_STATE").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::plan_abort_no_state_scenario(),
+                ))
+            } else if std::env::var_os("SNED_MOCK_PLAN_QUEUED_INPUT").is_some() {
+                Arc::new(crate::providers::Providers::Mock(
+                    crate::providers::mock::MockProvider::plan_queued_input_scenario(),
+                ))
             } else if std::env::var_os("SNED_MOCK_APPROVAL_SCALAR_COMMAND").is_some() {
                 Arc::new(crate::providers::Providers::Mock(
                     crate::providers::mock::MockProvider::scalar_command_approval_scenario(),
