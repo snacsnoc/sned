@@ -754,7 +754,12 @@ fn apply_output_event(
         OutputEvent::UserPromptLine(line) => {
             flush_model_update(app, pending_model_update);
             app.dismiss_completion_lines();
+            app.clear_error_lines();
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
+        }
+        OutputEvent::QueuedMessageStarted { remaining } => {
+            app.queued_message_count = remaining;
+            app.set_pending_queued_prompts(remaining);
         }
         OutputEvent::LocalCommandEcho(line) => {
             flush_model_update(app, pending_model_update);
@@ -795,6 +800,12 @@ fn apply_output_event(
                 .join("\n");
             let result_matches_model =
                 !model_text.trim().is_empty() && model_text.trim() == result.trim();
+            if app.suppress_terminal_panels() {
+                if !result_matches_model {
+                    app.archive_completion_result(&result);
+                }
+                return;
+            }
             app.set_completion_needs_transcript_copy(!result_matches_model);
             if result_matches_model {
                 for line in
@@ -812,6 +823,10 @@ fn apply_output_event(
         }
         OutputEvent::ErrorBox(msg) => {
             flush_model_update(app, pending_model_update);
+            if app.suppress_terminal_panels() {
+                app.clear_error_lines();
+                return;
+            }
             if !msg.trim().is_empty() {
                 app.clear_error_lines();
                 for line in crate::cli::markdown::render_error_markdown("✗ Error", &msg) {
@@ -1016,10 +1031,15 @@ fn drain_output_queues(
     }
 
     while let Ok(event) = rx.try_recv() {
-        if matches!(&event, OutputEvent::TurnEnd { .. }) {
+        if matches!(
+            &event,
+            OutputEvent::TurnEnd { .. } | OutputEvent::UserPromptLine(_)
+        ) {
             // Completion is emitted before its turn-end marker. If completion
             // spilled into the priority lane, apply it after streamed prose but
             // before turn finalization clears the stream entries it compares.
+            // A prompt also wins over older terminal panels when the prior
+            // turn has no TurnEnd event (for example, a terminal provider error).
             for deferred_event in std::mem::take(&mut deferred_priority) {
                 apply_output_event(app, deferred_event, &mut pending_model_update);
             }
@@ -2179,12 +2199,15 @@ async fn handle_cli_only_command(
                     return Ok(false);
                 }
                 let count = sess.queue_handle().await.queued_message_count().await;
+                app.set_pending_queued_prompts(count);
                 app.show_notification(
                     format!("Retry queued to run next ({count} in queue)."),
                     NotificationKind::Info,
                 );
             } else {
                 app.clear_completion_lines();
+                app.clear_error_lines();
+                app.set_pending_queued_prompts(0);
                 spawn_agent_task_from_message(
                     session,
                     retry_message,
@@ -3615,6 +3638,7 @@ async fn run_main_loop(
                                         if let Some(qh) = queue_handle.lock().await.as_ref() {
                                             qh.enqueue_text_message(text.clone()).await;
                                             let count = qh.queued_message_count().await;
+                                            app.set_pending_queued_prompts(count);
                                             // Message already echoed by handle_key_event
                                             app.push_styled(
                                                 format!(
@@ -3658,11 +3682,13 @@ async fn run_main_loop(
                                     // Message already echoed by handle_key_event; just enqueue
                                     qh.enqueue_text_message(processed).await;
                                     let count = qh.queued_message_count().await;
+                                    app.set_pending_queued_prompts(count);
                                     app.push_styled(
                                         format!("Message queued ({count} in queue)"),
                                         theme::dim_style(),
                                     );
                                 } else {
+                                    app.set_pending_queued_prompts(0);
                                     if let Some(acknowledgement) =
                                         crate::cli::slash_commands::compact_acknowledgement(&text)
                                     {
@@ -4570,6 +4596,14 @@ mod tests {
             "❯ queued message"
         );
         assert_eq!(app.output_line_kinds.back(), Some(&BlockKind::UserPrompt));
+        let transcript = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains("first completion"));
+        assert!(!transcript.contains("Task Completed"));
     }
 
     #[test]
@@ -4607,6 +4641,113 @@ mod tests {
         assert!(
             rendered.contains(result),
             "result-only completion must remain visible after dismissal; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Task Completed"),
+            "dismissed completion must render as normal transcript text, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_user_prompt_dismisses_provider_error_box() {
+        use crate::cli::output::OutputEvent;
+
+        let (tx, mut rx) = mpsc::channel(3);
+        tx.try_send(OutputEvent::ErrorBox("network error".to_string()))
+            .unwrap();
+        tx.try_send(OutputEvent::user_prompt_line("❯ try again"))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        assert!(app.error_lines.is_empty());
+        assert_eq!(app.output_lines.back().unwrap().to_string(), "❯ try again");
+    }
+
+    #[test]
+    fn test_queued_followup_suppresses_prior_completion_panel() {
+        use crate::cli::output::OutputEvent;
+
+        let result = "QUEUED_FOLLOWUP_RESULT";
+        let (tx, mut rx) = mpsc::channel(3);
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+            .unwrap();
+        tx.try_send(OutputEvent::Completion(result.to_string()))
+            .unwrap();
+        tx.try_send(OutputEvent::ErrorBox("network error".to_string()))
+            .unwrap();
+
+        let mut app = App::new();
+        app.set_pending_queued_prompts(1);
+        drain_output(&mut rx, &mut app);
+
+        assert!(app.completion_lines.is_empty());
+        assert!(app.error_lines.is_empty());
+        assert_eq!(app.last_completion_text(), Some(result));
+        assert!(
+            app.output_lines
+                .iter()
+                .map(App::line_to_string)
+                .any(|line| line.contains(result)),
+            "a suppressed completion must remain in the transcript"
+        );
+    }
+
+    #[test]
+    fn test_queued_message_start_restores_terminal_panels_after_final_followup() {
+        use crate::cli::output::OutputEvent;
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut app = App::new();
+        app.set_pending_queued_prompts(2);
+
+        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 1 })
+            .unwrap();
+        tx.try_send(OutputEvent::Completion("first queued result".to_string()))
+            .unwrap();
+        drain_output(&mut rx, &mut app);
+        assert!(app.completion_lines.is_empty());
+
+        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 0 })
+            .unwrap();
+        tx.try_send(OutputEvent::Completion("final queued result".to_string()))
+            .unwrap();
+        drain_output(&mut rx, &mut app);
+
+        assert_eq!(app.queued_message_count, 0);
+        assert!(
+            !app.completion_lines.is_empty(),
+            "the final queued task must be allowed to show its completion panel"
+        );
+    }
+
+    #[test]
+    fn test_priority_terminal_panels_do_not_reappear_after_new_prompt() {
+        use crate::cli::output::OutputEvent;
+
+        let (tx, mut rx) = mpsc::channel(2);
+        let (priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        priority_tx
+            .send(OutputEvent::Completion("PRIORITY_RESULT".to_string()))
+            .unwrap();
+        priority_tx
+            .send(OutputEvent::ErrorBox("priority network error".to_string()))
+            .unwrap();
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+
+        assert!(app.completion_lines.is_empty());
+        assert!(app.error_lines.is_empty());
+        assert!(
+            app.output_lines
+                .iter()
+                .map(App::line_to_string)
+                .any(|line| line.contains("PRIORITY_RESULT")),
+            "a priority completion must be archived before the new prompt clears its panel"
         );
     }
 
@@ -7318,6 +7459,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_retry_command_clears_provider_error_before_starting() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                retry_test_task_opts(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        {
+            let state_handle = {
+                let sess = session.lock().await;
+                sess.agent_loop().await.state_handle()
+            };
+            state_handle.lock().await.retryable_failed_request =
+                Some(crate::providers::StorageMessage {
+                    id: None,
+                    role: crate::providers::MessageRole::User,
+                    content: crate::providers::MessageContent::Text("retry me".to_string()),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                });
+        }
+
+        let mut app = App::new();
+        app.push_error_line(Line::from("network error"));
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        let should_exit = handle_cli_only_command(
+            CliOnlyCommand::Retry,
+            "/retry",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &retry_test_task_opts(),
+            false,
+        )
+        .await?;
+
+        assert!(!should_exit);
+        assert!(app.error_lines.is_empty());
+        if let Some(handle) = agent_task.lock().await.take() {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_retry_command_queues_failed_request_to_run_next_when_busy() -> anyhow::Result<()>
     {
         use crate::cli::slash_commands::CliOnlyCommand;
@@ -7398,6 +7608,7 @@ mod tests {
             app.notification_message(),
             Some("Retry queued to run next (2 in queue).")
         );
+        assert!(app.suppress_terminal_panels());
         Ok(())
     }
 

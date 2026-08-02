@@ -733,7 +733,9 @@ mod tests {
                 OutputEvent::ToolOutputLine(line) => line.to_string(),
                 OutputEvent::RawAnsi(text) => text,
                 OutputEvent::Completion(_) => String::new(),
-                OutputEvent::TurnEnd { .. } => return,
+                OutputEvent::TurnEnd { .. } | OutputEvent::QueuedMessageStarted { .. } => {
+                    return;
+                }
                 OutputEvent::TurnIndicator(line) => line.to_string(),
                 OutputEvent::ErrorBox(msg) => msg,
                 OutputEvent::ToolHeaderLine(line) => line.to_string(),

@@ -38,6 +38,9 @@ pub enum OutputEvent {
     ReasoningChunk(String),
     /// User-submitted prompt line ("❯ ..." or multi-line "│ ❯ ...").
     UserPromptLine(Line<'static>),
+    /// A queued user message is about to begin a new agent turn. The TUI uses
+    /// the remaining count to stop suppressing terminal panels from prior turns.
+    QueuedMessageStarted { remaining: usize },
     /// Local slash-command echo rendered like a user prompt without starting a new turn.
     LocalCommandEcho(Line<'static>),
     /// Raw ANSI escape sequences (for PTY output, etc.).
@@ -229,6 +232,10 @@ impl OutputEvent {
     pub fn user_prompt_line(text: impl Into<String>) -> Self {
         Self::UserPromptLine(Line::from(text.into()))
     }
+
+    pub fn queued_message_started(remaining: usize) -> Self {
+        Self::QueuedMessageStarted { remaining }
+    }
 }
 
 /// Trait for writing output events.
@@ -327,6 +334,7 @@ impl OutputWriter for StderrOutputWriter {
             }
             OutputEvent::TurnEnd { .. }
             | OutputEvent::TurnIndicator(_)
+            | OutputEvent::QueuedMessageStarted { .. }
             | OutputEvent::ApprovalFinished { .. } => {}
         }
     }
@@ -516,6 +524,7 @@ impl OutputWriter for ChannelOutputWriter {
                 OutputEvent::TurnEnd { .. }
                     | OutputEvent::Completion(_)
                     | OutputEvent::ErrorBox(_)
+                    | OutputEvent::QueuedMessageStarted { .. }
                     | OutputEvent::ReasoningChunk(_)
             );
 

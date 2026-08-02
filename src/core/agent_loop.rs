@@ -1342,6 +1342,9 @@ impl AgentLoop {
                         if let MessageContent::Text(ref text) = queued_message.content {
                             self.config
                                 .output_writer
+                                .emit(OutputEvent::queued_message_started(queue_remaining));
+                            self.config
+                                .output_writer
                                 .emit(OutputEvent::user_prompt_line(text));
                         }
                     }
@@ -1425,6 +1428,9 @@ impl AgentLoop {
                                 }
                                 // Re-display the queued message as a user prompt in the TUI output.
                                 if let MessageContent::Text(ref text) = queued_message.content {
+                                    self.config
+                                        .output_writer
+                                        .emit(OutputEvent::queued_message_started(queue_remaining));
                                     self.config
                                         .output_writer
                                         .emit(OutputEvent::user_prompt_line(text));
@@ -5256,6 +5262,7 @@ mod tests {
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. } => {}
+                crate::cli::output::OutputEvent::QueuedMessageStarted { .. } => {}
                 crate::cli::output::OutputEvent::TurnIndicator(line) => {
                     rendered.push(line.to_string())
                 }

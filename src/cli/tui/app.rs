@@ -504,6 +504,9 @@ pub struct App {
     pub output_overflow_summary: String,
     /// Number of messages queued for the agent.
     pub queued_message_count: usize,
+    /// Queued prompts which have not started yet. Terminal panels from the
+    /// current turn are stale once the user has submitted one of these.
+    pending_queued_prompts: usize,
     /// Path to the scrollback file for evicted output lines.
     pub scrollback_file: Option<std::path::PathBuf>,
     /// Number of lines stored in the scrollback file.
@@ -998,6 +1001,7 @@ impl App {
             output_overflow_count: 0,
             output_overflow_summary: String::new(),
             queued_message_count: 0,
+            pending_queued_prompts: 0,
             scrollback_file: Some(crate::storage::disk::get_data_dir().join("scrollback/lines")),
             scrollback_count: 0,
             scrollback_pending: String::new(),
@@ -1605,6 +1609,21 @@ impl App {
         self.completion_needs_transcript_copy = needed;
     }
 
+    pub fn set_pending_queued_prompts(&mut self, count: usize) {
+        self.pending_queued_prompts = count;
+    }
+
+    #[must_use]
+    pub fn suppress_terminal_panels(&self) -> bool {
+        self.pending_queued_prompts > 0
+    }
+
+    pub fn archive_completion_result(&mut self, result: &str) {
+        for line in crate::cli::markdown::render_completion_markdown("", result) {
+            self.push_archived_completion_line(line);
+        }
+    }
+
     #[must_use]
     pub fn last_completion_text(&self) -> Option<&str> {
         self.last_completion_text.as_deref()
@@ -2006,14 +2025,21 @@ impl App {
         self.cached_wrap_width = None;
     }
 
-    /// Dismiss the completion box, preserving result-only completions in the transcript.
+    /// Dismiss the completion box, preserving result-only completions as normal transcript text.
     pub fn dismiss_completion_lines(&mut self) {
-        let archived_lines = self
-            .completion_needs_transcript_copy
+        let archive_required = self.completion_needs_transcript_copy;
+        let archived_result = archive_required
+            .then(|| self.last_completion_text.clone())
+            .flatten();
+        // Some callers construct completion lines directly without a raw result.
+        // Preserve those lines rather than silently dropping a visible completion.
+        let archived_lines = (archive_required && archived_result.is_none())
             .then(|| std::mem::take(&mut self.completion_lines));
         self.clear_completion_lines();
 
-        if let Some(lines) = archived_lines {
+        if let Some(result) = archived_result {
+            self.archive_completion_result(&result);
+        } else if let Some(lines) = archived_lines {
             for line in lines {
                 self.push_archived_completion_line(line);
             }
