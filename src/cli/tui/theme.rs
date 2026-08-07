@@ -18,6 +18,9 @@ pub const STATUS_FG: Color = Color::DarkGray;
 /// Prompt echo color (user input confirmation).
 pub const PROMPT_FG: Color = Color::LightGreen;
 
+/// Success color for completed work and approval-ready input.
+pub const SUCCESS_FG: Color = Color::LightGreen;
+
 /// Warning color.
 pub const WARNING_FG: Color = Color::LightYellow;
 
@@ -54,24 +57,33 @@ pub fn border_block(title: impl Into<String>) -> Block<'static> {
         .title(title.into())
 }
 
+/// Visual state for the prompt border.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputBorderState {
+    Idle,
+    Processing,
+    Reasoning,
+    Error,
+    Approval,
+}
+
 /// Create a styled block for the input area.
-///
-/// # Arguments
-/// * `title` - The title to display (left-aligned)
-/// * `busy` - Whether the agent is currently busy
-///
-/// # Returns
-/// A `Block` with:
-/// - Rounded border type
-/// - Cyan border when busy, DarkGray when idle
-/// - The provided title
-pub fn input_block(title: impl Into<String>, busy: bool) -> Block<'static> {
-    let border_color = if busy { ACCENT } else { BORDER_FG };
-    Block::default()
+pub fn input_block(title: Option<String>, state: InputBorderState) -> Block<'static> {
+    let border_color = match state {
+        InputBorderState::Idle => Color::Blue,
+        InputBorderState::Processing => ACCENT,
+        InputBorderState::Reasoning => WARNING_FG,
+        InputBorderState::Error => ERROR_FG,
+        InputBorderState::Approval => SUCCESS_FG,
+    };
+    let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(title.into())
+        .border_style(Style::default().fg(border_color));
+    match title {
+        Some(title) => block.title(title),
+        None => block,
+    }
 }
 
 /// Create a styled block for overlays (file picker, etc.).

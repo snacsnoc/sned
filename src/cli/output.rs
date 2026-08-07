@@ -45,9 +45,9 @@ pub enum OutputEvent {
     LocalCommandEcho(Line<'static>),
     /// Raw ANSI escape sequences (for PTY output, etc.).
     RawAnsi(String),
-    /// Task completion message rendered as a dedicated Block widget.
+    /// Task completion message retained in the interactive transcript.
     Completion(String),
-    /// Error message rendered as a dedicated Block widget with red border.
+    /// Error message shown at the interactive transcript tail until the next prompt.
     ErrorBox(String),
     /// End of a streamed agent turn. The TUI uses this to re-render
     /// the raw streamed lines recorded during the turn as formatted

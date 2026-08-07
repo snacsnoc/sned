@@ -30,6 +30,10 @@ def compact_output(text):
     return re.sub(r"[^A-Za-z0-9]+", "", text)
 
 
+def mode_visible(text, mode):
+    return f"{mode} ·" in text or f"[{mode}]" in text
+
+
 def report(checks, success):
     for passed, failure in checks:
         if not passed:
@@ -282,11 +286,13 @@ def approval_scroll():
     sent_user_prompt = False
     sent_scroll = False
     sent_approve = False
-    sent_exit = False
     prompt_visible = False
+    approval_visible_at = None
+    marker_path = "/tmp/sned-approval-scroll-smoke"
 
     def tick(session):
-        nonlocal sent_user_prompt, sent_scroll, sent_approve, sent_exit, prompt_visible
+        nonlocal sent_user_prompt, sent_scroll, sent_approve
+        nonlocal prompt_visible, approval_visible_at
         text = session.text
         if "type a prompt" in text and not sent_user_prompt:
             session.send(b"trigger approval scroll\r")
@@ -297,31 +303,44 @@ def approval_scroll():
         tail = visible_tail(clean_output(session.buf))
         if "Execute this tool?" in tail:
             prompt_visible = True
-        if "Execute this tool?" in text and not sent_approve:
+            if approval_visible_at is None:
+                approval_visible_at = time.monotonic()
+        if (
+            approval_visible_at is not None
+            and time.monotonic() - approval_visible_at >= 0.25
+            and not sent_approve
+        ):
             session.send(b"y\r")
             sent_approve = True
-        if sent_approve and "Task Completed" in text and not sent_exit:
-            time.sleep(0.25)
-            session.send(b"/exit\r")
-            sent_exit = True
 
-    with PtySession(
-        "sned-approval-scroll.", {"SNED_MOCK_APPROVAL_SCROLL": "1"}
-    ) as session:
-        session.run(18, tick)
-        session.dump_if_verbose()
-        report(
-            [
-                (sent_user_prompt, "initial user prompt was not sent"),
-                (sent_scroll, "PageUp was not sent"),
-                ("Execute this tool?" in session.text, "approval prompt did not appear after scrolling"),
-                (prompt_visible, "approval prompt appeared in transcript but not in the visible viewport"),
-                (sent_approve, "approval prompt was not acknowledged"),
-                ("approval-scroll smoke test complete" in visible_tail(clean_output(session.buf)), "completion result did not appear in visible viewport after approval"),
-                (session.exit_code in (0, None), f"sned exited with {session.exit_code}"),
-            ],
-            "approval prompt stayed visible after scrolling",
-        )
+    try:
+        try:
+            os.unlink(marker_path)
+        except FileNotFoundError:
+            pass
+
+        with PtySession(
+            "sned-approval-scroll.", {"SNED_MOCK_APPROVAL_SCROLL": "1"}
+        ) as session:
+            session.run(18, tick)
+            session.dump_if_verbose()
+            report(
+                [
+                    (sent_user_prompt, "initial user prompt was not sent"),
+                    (sent_scroll, "PageUp was not sent"),
+                    ("Execute this tool?" in session.text, "approval prompt did not appear after scrolling"),
+                    (prompt_visible, "approval prompt appeared in transcript but not in the visible viewport"),
+                    (sent_approve, "approval prompt was not acknowledged"),
+                    (os.path.exists(marker_path), "approved command did not execute after scrolling"),
+                    (session.exit_code in (0, None), f"sned exited with {session.exit_code}"),
+                ],
+                "approval prompt stayed visible after scrolling",
+            )
+    finally:
+        try:
+            os.unlink(marker_path)
+        except FileNotFoundError:
+            pass
 
 
 def approval_scalar_command():
@@ -395,7 +414,7 @@ def approval_under_backpressure():
         if "type a prompt" in clean and not sent_prompt:
             session.send(b"trigger approval under backpressure\r")
             sent_prompt = True
-        if re.search(r"output overflow \(([1-9][0-9]*) dro", clean):
+        if re.search(r"⚠\s+[1-9][0-9]*\s+dropped", clean):
             overflow_visible = True
         if "APPROVAL_BACKPRESSURE_REASONING_TAIL" in clean:
             reasoning_tail_visible = True
@@ -775,7 +794,7 @@ def plan_approve_act():
             sent_approve = True
         if sent_approve and re.search(r"Plan\s*approved\..{0,80}Starting", clean):
             plan_approved = True
-        if plan_approved and ("| ACT" in tail or "[ACT]" in tail):
+        if plan_approved and mode_visible(tail, "ACT"):
             act_mode_seen = True
         if plan_approved and ("[y] Approve" in tail or "Execute this tool?" in tail) and not sent_tool_approve:
             if not tool_approval_visible:
@@ -853,9 +872,7 @@ def plan_exit_active(command, env_name, expected_message, marker_name, completio
             if part.strip()
         ):
             mode_transition_seen = True
-        if mode_transition_seen and (
-            "| ACT" in tail or "[ACT]" in tail or "ACT Context" in clean
-        ):
+        if mode_transition_seen and mode_visible(tail, "ACT"):
             mode_seen = True
         if mode_seen and not sent_followup:
             marker_created_before_followup = os.path.exists(marker_path)
@@ -954,9 +971,7 @@ def plan_no_state_exit(command, env_name, expected_message, marker_name, complet
             sent_command = True
         if sent_command and message_seen:
             mode_transition_seen = True
-        if mode_transition_seen and (
-            "| ACT" in tail or "[ACT]" in tail or "ACT Context" in clean
-        ):
+        if mode_transition_seen and mode_visible(tail, "ACT"):
             mode_seen = True
         if mode_seen and not sent_followup:
             marker_created_before_followup = os.path.exists(marker_path)
@@ -1058,7 +1073,7 @@ def plan_queued_input():
             sent_act = False
             next_act_attempt_at = time.monotonic() + 0.5
         if sent_act and "Actmodeenabled" in compact_clean:
-            act_mode_seen = "| ACT" in tail or "[ACT]" in tail or "ACT Context" in clean
+            act_mode_seen = mode_visible(tail, "ACT")
         if act_mode_seen and not sent_exit:
             session.send(b"/exit\r")
             sent_exit = True

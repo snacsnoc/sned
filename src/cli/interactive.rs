@@ -753,7 +753,6 @@ fn apply_output_event(
         }
         OutputEvent::UserPromptLine(line) => {
             flush_model_update(app, pending_model_update);
-            app.dismiss_completion_lines();
             app.clear_error_lines();
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
@@ -787,7 +786,6 @@ fn apply_output_event(
         }
         OutputEvent::Completion(result) => {
             flush_model_update(app, pending_model_update);
-            app.clear_completion_lines();
             app.set_last_completion_text(result.clone());
             // Historical model blocks must not suppress a result from the current turn.
             let model_text = app
@@ -806,17 +804,15 @@ fn apply_output_event(
                 }
                 return;
             }
-            app.set_completion_needs_transcript_copy(!result_matches_model);
             if result_matches_model {
-                for line in
-                    crate::cli::markdown::render_completion_markdown("🚀 ", "Task Completed")
+                for line in crate::cli::markdown::render_completion_markdown("✓ ", "Task completed")
                 {
                     app.push_completion_line(line);
                 }
                 return;
             }
             for line in
-                crate::cli::markdown::render_completion_markdown("🚀 Task Completed: ", &result)
+                crate::cli::markdown::render_completion_markdown("✓ Task completed: ", &result)
             {
                 app.push_completion_line(line);
             }
@@ -1508,14 +1504,10 @@ async fn cancel_agent(
 }
 
 fn handle_idle_ctrl_c(app: &mut App) {
-    if !app.completion_lines.is_empty() && app.error_lines.is_empty() {
-        app.dismiss_completion_lines();
-    } else {
-        app.push_styled(
-            "Press Ctrl+C again to quit.",
-            Style::default().fg(theme::WARNING_FG),
-        );
-    }
+    app.push_styled(
+        "Press Ctrl+C again to quit.",
+        Style::default().fg(theme::WARNING_FG),
+    );
 
     if !app.input.lines().join("\n").is_empty() {
         app.push_plain("^C");
@@ -1771,15 +1763,11 @@ async fn handle_key_event(
     }
 
     if key.code == KeyCode::PageUp {
-        if !app.scroll_completion_pages(-1) {
-            app.scroll_pages(-1);
-        }
+        app.scroll_pages(-1);
         return Ok(None);
     }
     if key.code == KeyCode::PageDown {
-        if !app.scroll_completion_pages(1) {
-            app.scroll_pages(1);
-        }
+        app.scroll_pages(1);
         return Ok(None);
     }
 
@@ -2205,7 +2193,6 @@ async fn handle_cli_only_command(
                     NotificationKind::Info,
                 );
             } else {
-                app.clear_completion_lines();
                 app.clear_error_lines();
                 app.set_pending_queued_prompts(0);
                 spawn_agent_task_from_message(
@@ -2891,7 +2878,6 @@ async fn handle_cli_only_command(
                                 steps_len,
                                 step_desc
                             );
-                            app.clear_completion_lines();
                             spawn_agent_task(
                                 session,
                                 &prompt,
@@ -2950,7 +2936,6 @@ async fn handle_cli_only_command(
                                 // The agent is idle, so resume requires a new task.
                                 let prompt =
                                     format!("Execute step {step_num}/{step_total}: {step_desc}");
-                                app.clear_completion_lines();
                                 spawn_agent_task(
                                     session,
                                     &prompt,
@@ -3570,7 +3555,6 @@ async fn run_main_loop(
                                         app.update_placeholder();
                                         // The busy check above guarantees this will not wait on
                                         // an AgentLoop currently held by another run.
-                                        app.clear_completion_lines();
                                         spawn_agent_task(
                                             &session,
                                             prompt_text,
@@ -3767,10 +3751,6 @@ async fn run_main_loop(
                                 mouse_event.column,
                                 mouse_event.row,
                                 -mouse_scroll_lines,
-                            ) && !app.scroll_completion_at(
-                                mouse_event.column,
-                                mouse_event.row,
-                                mouse_scroll_lines,
                             ) {
                                 app.scroll_lines(mouse_scroll_lines);
                             }
@@ -3781,10 +3761,6 @@ async fn run_main_loop(
                                 mouse_event.column,
                                 mouse_event.row,
                                 mouse_scroll_lines,
-                            ) && !app.scroll_completion_at(
-                                mouse_event.column,
-                                mouse_event.row,
-                                -mouse_scroll_lines,
                             ) {
                                 app.scroll_lines(-mouse_scroll_lines);
                             }
@@ -4084,6 +4060,18 @@ mod tests {
     fn reset_prompt_state() {
         crate::core::approval::clear_followup_prompt_scroll();
         crate::core::approval::set_followup_question_active("test-task", false);
+    }
+
+    fn transcript_text(app: &App) -> String {
+        app.output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn transcript_has_kind(app: &App, kind: BlockKind) -> bool {
+        app.output_line_kinds.iter().any(|current| *current == kind)
     }
 
     #[test]
@@ -4516,7 +4504,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_output_replaces_previous_completion_box() {
+    fn test_drain_output_appends_completions_to_transcript() {
         use crate::cli::output::OutputEvent;
 
         let _lock = crate::core::approval::approval_test_guard();
@@ -4529,55 +4517,29 @@ mod tests {
         let mut app = App::new();
         drain_output(&mut rx, &mut app);
 
-        // Completion box always shows "Task Completed" — the actual result
-        // text is visible as ToolOutputLine in the main output, so we never
-        // duplicate it in the completion box.
-        let first_rendered = app
-            .completion_lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let first_rendered = transcript_text(&app);
         assert!(
-            first_rendered.contains("Task Completed"),
-            "expected 'Task Completed' to render, got: {first_rendered}"
+            first_rendered.contains("first completion"),
+            "expected first completion in transcript, got: {first_rendered}"
         );
 
         tx.try_send(OutputEvent::Completion("second completion".to_string()))
             .unwrap();
         drain_output(&mut rx, &mut app);
 
-        let second_rendered = app
-            .completion_lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let second_rendered = transcript_text(&app);
         assert!(
-            second_rendered.contains("Task Completed"),
-            "completion box should still show 'Task Completed', got: {second_rendered}"
+            second_rendered.contains("first completion")
+                && second_rendered.contains("second completion"),
+            "both completions should remain in transcript, got: {second_rendered}"
         );
-        // Verify the box was cleared and re-rendered (not appended).
-        assert!(
-            second_rendered.lines().count() <= first_rendered.lines().count(),
-            "completion box should be replaced, not appended to"
-        );
+        assert!(transcript_has_kind(&app, BlockKind::Completion));
 
         reset_prompt_state();
     }
 
     #[test]
-    fn test_drain_output_clears_completion_when_queued_prompt_begins() {
+    fn test_drain_output_keeps_completion_when_queued_prompt_begins() {
         use crate::cli::output::OutputEvent;
 
         let (tx, mut rx) = mpsc::channel(4);
@@ -4589,7 +4551,6 @@ mod tests {
         let mut app = App::new();
         drain_output(&mut rx, &mut app);
 
-        assert!(app.completion_lines.is_empty());
         assert_eq!(app.last_completion_text(), Some("first completion"));
         assert_eq!(
             app.output_lines.back().unwrap().to_string(),
@@ -4603,11 +4564,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(transcript.contains("first completion"));
-        assert!(!transcript.contains("Task Completed"));
+        assert!(transcript.contains("Task completed"));
     }
 
     #[test]
-    fn test_dismissed_result_only_completion_is_preserved_in_rendered_transcript() {
+    fn test_completion_is_preserved_in_rendered_transcript_after_next_prompt() {
         use crate::cli::output::OutputEvent;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -4622,14 +4583,13 @@ mod tests {
         let mut app = App::new();
         drain_output(&mut rx, &mut app);
 
-        assert!(app.completion_lines.is_empty());
         assert_eq!(app.last_completion_text(), Some(result));
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         terminal
             .draw(|frame| app.render(frame))
-            .expect("dismissed completion should render in the transcript");
+            .expect("completion should render in the transcript");
         let buffer = terminal.backend().buffer();
         let width = buffer.area.width as usize;
         let rendered = buffer
@@ -4640,11 +4600,11 @@ mod tests {
             .join("\n");
         assert!(
             rendered.contains(result),
-            "result-only completion must remain visible after dismissal; got:\n{rendered}"
+            "completion must remain visible after the next prompt; got:\n{rendered}"
         );
         assert!(
-            !rendered.contains("Task Completed"),
-            "dismissed completion must render as normal transcript text, got:\n{rendered}"
+            rendered.contains("Task completed"),
+            "completion marker must render in the transcript, got:\n{rendered}"
         );
     }
 
@@ -4666,7 +4626,7 @@ mod tests {
     }
 
     #[test]
-    fn test_queued_followup_suppresses_prior_completion_panel() {
+    fn test_queued_followup_archives_prior_completion_without_transient_error() {
         use crate::cli::output::OutputEvent;
 
         let result = "QUEUED_FOLLOWUP_RESULT";
@@ -4682,7 +4642,6 @@ mod tests {
         app.set_pending_queued_prompts(1);
         drain_output(&mut rx, &mut app);
 
-        assert!(app.completion_lines.is_empty());
         assert!(app.error_lines.is_empty());
         assert_eq!(app.last_completion_text(), Some(result));
         assert!(
@@ -4695,7 +4654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_queued_message_start_restores_terminal_panels_after_final_followup() {
+    fn test_queued_message_start_marks_final_completion_in_transcript() {
         use crate::cli::output::OutputEvent;
 
         let (tx, mut rx) = mpsc::channel(4);
@@ -4707,7 +4666,7 @@ mod tests {
         tx.try_send(OutputEvent::Completion("first queued result".to_string()))
             .unwrap();
         drain_output(&mut rx, &mut app);
-        assert!(app.completion_lines.is_empty());
+        assert!(transcript_text(&app).contains("first queued result"));
 
         tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 0 })
             .unwrap();
@@ -4717,8 +4676,8 @@ mod tests {
 
         assert_eq!(app.queued_message_count, 0);
         assert!(
-            !app.completion_lines.is_empty(),
-            "the final queued task must be allowed to show its completion panel"
+            transcript_text(&app).contains("✓ Task completed: final queued result"),
+            "the final queued task must include a completion marker"
         );
     }
 
@@ -4740,19 +4699,18 @@ mod tests {
         let mut app = App::new();
         drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
 
-        assert!(app.completion_lines.is_empty());
         assert!(app.error_lines.is_empty());
         assert!(
             app.output_lines
                 .iter()
                 .map(App::line_to_string)
                 .any(|line| line.contains("PRIORITY_RESULT")),
-            "a priority completion must be archived before the new prompt clears its panel"
+            "a priority completion must remain in the transcript before the new prompt"
         );
     }
 
     #[test]
-    fn test_dismissed_completion_preserves_result_when_streamed_prose_differs() {
+    fn test_completion_preserves_result_when_streamed_prose_differs() {
         use crate::cli::output::OutputEvent;
 
         let streamed = "I have the evidence. I will compile the review.";
@@ -4783,7 +4741,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dismissed_completion_does_not_duplicate_matching_streamed_result() {
+    fn test_completion_does_not_duplicate_matching_streamed_result() {
         use crate::cli::output::OutputEvent;
 
         let result = "STREAMED_RESULT_MARKER";
@@ -4823,7 +4781,6 @@ mod tests {
         drain_output(&mut rx, &mut app);
         handle_idle_ctrl_c(&mut app);
 
-        assert!(app.completion_lines.is_empty());
         assert!(
             app.output_lines
                 .iter()
@@ -4833,7 +4790,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_command_echo_preserves_completion_box() {
+    fn test_local_command_echo_preserves_completion_in_transcript() {
         let (tx, mut rx) = mpsc::channel(2);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
         let mut app = App::new();
@@ -4844,8 +4801,8 @@ mod tests {
         drain_output(&mut rx, &mut app);
 
         assert!(
-            !app.completion_lines.is_empty(),
-            "local command echoes must not dismiss the completion box"
+            transcript_has_kind(&app, BlockKind::Completion),
+            "local command echoes must not remove a completion"
         );
         assert_eq!(app.last_completion_text(), Some("model output here"));
         assert_eq!(app.output_lines.back().unwrap().to_string(), "❯ /help");
@@ -4853,7 +4810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_submit_preserves_completion_box() -> anyhow::Result<()> {
+    async fn test_copy_submit_preserves_completion_in_transcript() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (tx, mut rx) = mpsc::channel(2);
@@ -4888,8 +4845,8 @@ mod tests {
         });
 
         assert!(
-            !app.completion_lines.is_empty(),
-            "/copy must preserve the visible completion"
+            transcript_has_kind(&app, BlockKind::Completion),
+            "/copy must preserve the completion"
         );
         assert_eq!(copied.borrow().as_deref(), Some("model output here"));
         assert!(
@@ -4903,7 +4860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normal_prompt_echo_clears_completion_box() {
+    fn test_normal_prompt_echo_preserves_completion_in_transcript() {
         let (tx, mut rx) = mpsc::channel(2);
         let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
         let mut app = App::new();
@@ -4913,13 +4870,13 @@ mod tests {
         drain_output(&mut rx, &mut app);
 
         assert!(
-            app.completion_lines.is_empty(),
-            "normal user prompts must dismiss the prior completion"
+            transcript_has_kind(&app, BlockKind::Completion),
+            "normal user prompts must keep the prior completion in scrollback"
         );
     }
 
     #[tokio::test]
-    async fn test_cancelled_clear_keeps_completion_box() -> anyhow::Result<()> {
+    async fn test_cancelled_clear_keeps_completion_in_transcript() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (tx, _rx) = mpsc::channel(1);
@@ -4940,33 +4897,36 @@ mod tests {
 
         assert!(action.is_none());
         assert!(
-            !app.completion_lines.is_empty(),
-            "cancelling /clear must retain the completion box"
+            transcript_has_kind(&app, BlockKind::Completion),
+            "cancelling /clear must retain the completion"
         );
         Ok(())
     }
 
     #[test]
-    fn test_idle_ctrl_c_dismisses_completion_without_transcript_hint() {
+    fn test_idle_ctrl_c_keeps_completion_and_shows_quit_hint() {
         let mut app = App::new();
         app.push_plain("previous transcript line");
         app.push_completion_line(ratatui::text::Line::from("Task Completed"));
 
         handle_idle_ctrl_c(&mut app);
 
-        assert!(app.completion_lines.is_empty());
         assert_eq!(
             app.output_lines
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["previous transcript line"],
-            "dismissing a completion must not insert a quit hint into the transcript"
+            [
+                "previous transcript line",
+                "Task Completed",
+                "Press Ctrl+C again to quit."
+            ],
+            "Ctrl+C must leave transcript history intact and show its quit hint"
         );
     }
 
     #[test]
-    fn test_idle_ctrl_c_keeps_hidden_completion_and_shows_quit_hint_for_error() {
+    fn test_idle_ctrl_c_keeps_error_and_shows_quit_hint() {
         use crate::cli::output::OutputEvent;
 
         let (tx, mut rx) = mpsc::channel(2);
@@ -4981,12 +4941,8 @@ mod tests {
         handle_idle_ctrl_c(&mut app);
 
         assert!(
-            !app.completion_lines.is_empty(),
-            "the error panel hides completion, so Ctrl+C must not dismiss it"
-        );
-        assert!(
             !app.error_lines.is_empty(),
-            "the visible error panel must remain visible"
+            "the transient error must remain visible until a new prompt"
         );
         assert_eq!(
             app.output_lines.back().map(ToString::to_string).as_deref(),
@@ -5199,8 +5155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_key_event_pages_through_long_completion_before_transcript()
-    -> anyhow::Result<()> {
+    async fn test_handle_key_event_pages_through_completion_in_transcript() -> anyhow::Result<()> {
         use crate::cli::tui::app::ScrollMode;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -5246,11 +5201,8 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("TRANSCRIPT_ROW_13"), "got:\n{rendered}");
-        assert!(!rendered.contains("TRANSCRIPT_ROW_19"), "got:\n{rendered}");
-
-        app.scroll_mode = ScrollMode::Manual;
-        app.scroll_offset = 2;
+        assert!(rendered.contains("COMPLETION_ROW_00"), "got:\n{rendered}");
+        assert!(!rendered.contains("COMPLETION_ROW_11"), "got:\n{rendered}");
 
         let action = handle_key_event(
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
@@ -5262,10 +5214,10 @@ mod tests {
         .await?;
 
         assert!(action.is_none());
-        assert_eq!(app.scroll_offset, 2);
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
         terminal
             .draw(|frame| app.render(frame))
-            .expect("scrolled render should succeed");
+            .expect("bottom render should succeed");
         let buffer = terminal.backend().buffer();
         let width = buffer.area.width as usize;
         let rendered = buffer
@@ -5274,30 +5226,15 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!rendered.contains("COMPLETION_ROW_00"), "got:\n{rendered}");
-        assert!(rendered.contains("COMPLETION_ROW_03"), "got:\n{rendered}");
-
-        app.scroll_completion_lines(isize::MAX);
-        let transcript_offset = app.scroll_offset;
-        let action = handle_key_event(
-            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
-            &mut app,
-            &output_writer,
-            &state_handle,
-            "task-1",
-        )
-        .await?;
-
-        assert!(action.is_none());
-        assert!(app.scroll_offset > transcript_offset);
+        assert!(rendered.contains("COMPLETION_ROW_11"), "got:\n{rendered}");
 
         reset_prompt_state();
         Ok(())
     }
 
     /// Regression test: when a model's streamed text matches the
-    /// completion result, the completion box should show "Task
-    /// Completed" instead of duplicating the model text. The dedup
+    /// completion result, the transcript should add a compact completion
+    /// marker instead of duplicating the model text. The dedup
     /// must filter by BlockKind::Model so tool headers, tool results,
     /// and command output interleaved in `output_lines` do not break
     /// the comparison.
@@ -5329,29 +5266,26 @@ mod tests {
         let mut app = App::new();
         drain_output(&mut rx, &mut app);
 
-        let rendered = app
-            .completion_lines
+        let model_occurrences = app
+            .output_lines
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .zip(app.output_line_kinds.iter())
+            .filter(|(_, kind)| **kind == BlockKind::Model)
+            .map(|(line, _)| App::line_to_string(line))
+            .filter(|line| line.contains(model_text))
+            .count();
         assert!(
-            !rendered.contains(model_text),
-            "completion box must not duplicate model text, got: {rendered}"
+            model_occurrences == 1,
+            "completion must not duplicate model text"
         );
+        let rendered = transcript_text(&app);
         assert!(
-            rendered.contains("Task Completed"),
-            "completion box should show 'Task Completed' for duplicate text, got: {rendered}"
+            rendered.contains("Task completed"),
+            "completion must include a compact marker, got: {rendered}"
         );
 
         // The interleaved non-Model lines must still be present in
-        // output_lines for the TUI to render them — only the
-        // completion box is deduped.
+        // output_lines for the TUI to render them — only the completion text is deduped.
         let kinds: Vec<&BlockKind> = app.output_line_kinds.iter().collect();
         assert!(
             kinds.contains(&&BlockKind::ToolHeader),
@@ -5364,6 +5298,10 @@ mod tests {
         assert!(
             kinds.contains(&&BlockKind::Model),
             "model line should still be in output_lines"
+        );
+        assert!(
+            kinds.contains(&&BlockKind::Completion),
+            "completion marker should be in output_lines"
         );
 
         reset_prompt_state();
@@ -5394,12 +5332,7 @@ mod tests {
 
         drain_output(&mut rx, &mut app);
 
-        let rendered = app
-            .completion_lines
-            .iter()
-            .map(App::line_to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rendered = transcript_text(&app);
         assert!(
             rendered.contains(repeated_text),
             "completion text matching an earlier turn must remain visible, got: {rendered}"

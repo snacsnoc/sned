@@ -11,9 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -89,6 +87,10 @@ pub enum BlockKind {
     UserPrompt,
     /// Kept distinct so transcript pruning cannot hide a blocking prompt.
     BlockingPrompt,
+    /// A completed task result retained in the transcript.
+    Completion,
+    /// A transient provider or runtime error shown at the transcript tail.
+    Error,
     /// Explicit turn separator (e.g. "──── ♦ ────").
     Separator,
 }
@@ -105,6 +107,8 @@ fn block_kind_accent_style(kind: BlockKind) -> Style {
             .add_modifier(Modifier::DIM),
         BlockKind::UserPrompt => Style::default().fg(theme::PROMPT_FG),
         BlockKind::BlockingPrompt => Style::default().fg(theme::WARNING_FG),
+        BlockKind::Completion => Style::default().fg(theme::SUCCESS_FG),
+        BlockKind::Error => Style::default().fg(theme::ERROR_FG),
         BlockKind::Separator => Style::default().fg(theme::BORDER_FG),
     }
 }
@@ -186,7 +190,6 @@ struct PendingApproval {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionPane {
     Transcript,
-    Completion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,7 +452,7 @@ pub struct App {
     /// Whether the agent is currently busy
     pub agent_busy: bool,
     /// Whether the model is currently in a reasoning/thinking phase (no displayable output yet).
-    /// Drives the "Reasoning..." indicator rendered above the status bar.
+    /// Drives the prompt border while the model is busy.
     pub reasoning_active: bool,
     reasoning_partial_line: String,
     /// Manual scroll offset (top-of-viewport line index)
@@ -551,20 +554,8 @@ pub struct App {
     pub mention_search_generation: u64,
     /// Result channel for async mention searches.
     pub mention_search_tx: Option<tokio::sync::mpsc::UnboundedSender<MentionSearchUpdate>>,
-    /// Cached status bar left segment (provider / model | task | mode).
-    /// Rebuilt only when the underlying fields change.
-    pub cached_status_left: String,
-    /// Fingerprint of the fields used to build cached_status_left.
-    pub status_left_fingerprint: (String, String, String, String, bool, bool),
-    /// Cached status bar right segment (elapsed timer). Rebuilt when seconds change.
-    pub cached_status_right: String,
     /// Last known context usage percentage from the API.
     pub context_pct: Option<f64>,
-    pub cached_status_right_secs: (u64, Option<f64>, bool, u64, usize, usize, ScrollMode),
-    /// Cached spacer string for the status bar.
-    pub cached_spacer: String,
-    /// Length the cached spacer was built for.
-    pub cached_spacer_len: usize,
     /// Cached visible output window result (start_idx, take_count, start_row_offset).
     pub cached_visible_window: Option<(usize, usize, usize)>,
     /// Fingerprint for the visible window cache (output_len, scroll_y, wrap_width, content_height, cached_visual_rows, scroll_mode).
@@ -616,28 +607,14 @@ pub struct App {
     pub model_picker_selected: usize,
     /// Model switch awaiting an API key for a provider not configured in this process.
     pub pending_model_switch: Option<PendingModelSwitch>,
-    /// Completion box lines rendered as a dedicated Block widget.
-    pub completion_lines: VecDeque<Line<'static>>,
     last_completion_text: Option<String>,
-    /// Whether dismissing the completion box must preserve its result in the transcript.
-    completion_needs_transcript_copy: bool,
-    /// Cached completion row count, valid when cached_wrap_width matches.
-    pub cached_completion_rows: usize,
-    completion_scroll_offset: usize,
-    completion_viewport_rows: usize,
-    completion_area: Option<Rect>,
     transcript_selection_area: Option<Rect>,
-    completion_selection_area: Option<Rect>,
     transcript_selection_row_sources: Vec<Option<SelectionRowSource>>,
-    completion_selection_row_sources: Vec<Option<SelectionRowSource>>,
     text_selection: Option<TextSelection>,
     selection_surfaces: Vec<SelectionSurface>,
     rendered_hyperlink_targets: Vec<PathBuf>,
-    /// Error box lines rendered as a dedicated Block widget with red border.
-    /// Takes priority over completion_lines when non-empty.
+    /// Transient error lines appended after the persisted transcript.
     pub error_lines: VecDeque<Line<'static>>,
-    /// Cached error row count, valid when cached_wrap_width matches.
-    pub cached_error_rows: usize,
 }
 
 impl App {
@@ -950,20 +927,7 @@ impl App {
             mention_search_active: false,
             mention_search_query: String::new(),
             mention_search_deadline: Instant::now(),
-            cached_status_left: String::new(),
-            status_left_fingerprint: (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                false,
-                false,
-            ),
-            cached_status_right: String::new(),
-            cached_status_right_secs: (u64::MAX, None, false, 0, 0, 0, ScrollMode::Auto),
             context_pct: None,
-            cached_spacer: String::new(),
-            cached_spacer_len: 0,
             slash_command_active: false,
             slash_command_help_active: false,
             slash_command_track_changes: false,
@@ -979,22 +943,13 @@ impl App {
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
             pending_model_switch: None,
-            completion_lines: VecDeque::new(),
             last_completion_text: None,
-            completion_needs_transcript_copy: false,
-            cached_completion_rows: 0,
-            completion_scroll_offset: 0,
-            completion_viewport_rows: 0,
-            completion_area: None,
             transcript_selection_area: None,
-            completion_selection_area: None,
             transcript_selection_row_sources: Vec::new(),
-            completion_selection_row_sources: Vec::new(),
             text_selection: None,
             selection_surfaces: Vec::new(),
             rendered_hyperlink_targets: Vec::new(),
             error_lines: VecDeque::new(),
-            cached_error_rows: 0,
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
             output_overflow: false,
@@ -1049,12 +1004,6 @@ impl App {
         for l in lines_to_push {
             self._push_output_line(l, kind, wrap_width, true);
         }
-    }
-
-    fn push_archived_completion_line(&mut self, line: Line<'static>) {
-        // The line already exists in completion_lines. Move it without the
-        // transcript limit so dismissal preserves the complete result.
-        self._push_output_line(line, BlockKind::Model, self.last_wrap_width(), false);
     }
 
     /// Internal: push a single pre-wrapped line to the buffer with a
@@ -1588,25 +1537,13 @@ impl App {
         self.refresh_pending_manual_viewport_anchor(wrap_width);
     }
 
-    /// Push a completion line to the completion buffer.
+    /// Push a completion line into the durable transcript.
     pub fn push_completion_line(&mut self, line: Line<'static>) {
-        self.needs_redraw = true;
-        self.completion_lines.push_back(line);
-        self.completion_scroll_offset = 0;
-        self.completion_viewport_rows = 0;
-        self.completion_area = None;
-        // Invalidate the visual-row cache so cached_completion_rows is
-        // recomputed on the next render. Without this, the completion box
-        // keeps its stale height (just borders) and the text is clipped.
-        self.cached_wrap_width = None;
+        self.push_output_with_kind(line, BlockKind::Completion);
     }
 
     pub fn set_last_completion_text(&mut self, text: String) {
         self.last_completion_text = Some(text);
-    }
-
-    pub fn set_completion_needs_transcript_copy(&mut self, needed: bool) {
-        self.completion_needs_transcript_copy = needed;
     }
 
     pub fn set_pending_queued_prompts(&mut self, count: usize) {
@@ -1620,7 +1557,7 @@ impl App {
 
     pub fn archive_completion_result(&mut self, result: &str) {
         for line in crate::cli::markdown::render_completion_markdown("", result) {
-            self.push_archived_completion_line(line);
+            self.push_completion_line(line);
         }
     }
 
@@ -1880,25 +1817,18 @@ impl App {
     }
 
     fn refresh_selection_surfaces(&mut self, buffer: &Buffer) {
-        let areas = [
-            (
-                SelectionPane::Transcript,
-                self.transcript_selection_area,
-                self.transcript_selection_row_sources.as_slice(),
-            ),
-            (
-                SelectionPane::Completion,
-                self.completion_selection_area,
-                self.completion_selection_row_sources.as_slice(),
-            ),
-        ];
-        let selection_surfaces = areas
-            .into_iter()
-            .filter_map(|(pane, area, row_sources)| {
-                area.map(|area| self.snapshot_selection_surface(buffer, pane, area, row_sources))
+        self.selection_surfaces = self
+            .transcript_selection_area
+            .map(|area| {
+                self.snapshot_selection_surface(
+                    buffer,
+                    SelectionPane::Transcript,
+                    area,
+                    self.transcript_selection_row_sources.as_slice(),
+                )
             })
+            .into_iter()
             .collect();
-        self.selection_surfaces = selection_surfaces;
         if self.text_selection.as_ref().is_some_and(|selection| {
             let Some(surface) = self.selection_surface(selection.pane) else {
                 return true;
@@ -2012,54 +1942,22 @@ impl App {
         (content.width > 0 && content.height > 0).then_some(content)
     }
 
-    /// Clear the completion box and invalidate cached layout for the next render.
-    pub fn clear_completion_lines(&mut self) {
-        self.clear_text_selection();
-        self.needs_redraw = true;
-        self.completion_lines.clear();
-        self.completion_needs_transcript_copy = false;
-        self.cached_completion_rows = 0;
-        self.completion_scroll_offset = 0;
-        self.completion_viewport_rows = 0;
-        self.completion_area = None;
-        self.cached_wrap_width = None;
-    }
-
-    /// Dismiss the completion box, preserving result-only completions as normal transcript text.
-    pub fn dismiss_completion_lines(&mut self) {
-        let archive_required = self.completion_needs_transcript_copy;
-        let archived_result = archive_required
-            .then(|| self.last_completion_text.clone())
-            .flatten();
-        // Some callers construct completion lines directly without a raw result.
-        // Preserve those lines rather than silently dropping a visible completion.
-        let archived_lines = (archive_required && archived_result.is_none())
-            .then(|| std::mem::take(&mut self.completion_lines));
-        self.clear_completion_lines();
-
-        if let Some(result) = archived_result {
-            self.archive_completion_result(&result);
-        } else if let Some(lines) = archived_lines {
-            for line in lines {
-                self.push_archived_completion_line(line);
-            }
-        }
-    }
-
     /// Push an error line to the error buffer.
     pub fn push_error_line(&mut self, line: Line<'static>) {
         self.needs_redraw = true;
         self.error_lines.push_back(line);
         self.cached_wrap_width = None;
+        self.cached_visible_window = None;
+        self.force_bottom();
     }
 
-    /// Clear the error box and invalidate cached layout for the next render.
+    /// Clear the transient error tail and invalidate cached layout for the next render.
     pub fn clear_error_lines(&mut self) {
         self.clear_text_selection();
         self.needs_redraw = true;
         self.error_lines.clear();
-        self.cached_error_rows = 0;
         self.cached_wrap_width = None;
+        self.cached_visible_window = None;
     }
 
     /// Push a plain text line.
@@ -2370,9 +2268,7 @@ impl App {
         self.needs_redraw = true;
         self.output_lines.clear();
         self.output_line_kinds.clear();
-        self.completion_lines.clear();
         self.last_completion_text = None;
-        self.completion_needs_transcript_copy = false;
         self.error_lines.clear();
         self.turn_stream_entries.clear();
         self.last_stream_group = None;
@@ -2380,11 +2276,6 @@ impl App {
         self.turn_indicator = None;
         self.turn_had_streamed_line = false;
         self.cached_visual_rows = 0;
-        self.cached_completion_rows = 0;
-        self.cached_error_rows = 0;
-        self.completion_scroll_offset = 0;
-        self.completion_viewport_rows = 0;
-        self.completion_area = None;
         self.cached_wrap_width = Some(self.last_wrap_width());
         self.cached_visible_window = None;
         self.in_scrollback = false;
@@ -2521,56 +2412,6 @@ impl App {
         self.scroll_lines(delta_pages.saturating_mul(page_height));
     }
 
-    pub fn scroll_completion_lines(&mut self, delta: isize) -> bool {
-        self.clear_text_selection();
-        if !self.error_lines.is_empty()
-            || self.completion_lines.is_empty()
-            || self.completion_viewport_rows == 0
-        {
-            return false;
-        }
-        let max_offset = self
-            .cached_completion_rows
-            .saturating_sub(self.completion_viewport_rows);
-        if max_offset == 0 {
-            return false;
-        }
-        let next_offset = if delta.is_negative() {
-            self.completion_scroll_offset
-                .saturating_sub(delta.unsigned_abs())
-        } else {
-            self.completion_scroll_offset
-                .saturating_add(delta as usize)
-                .min(max_offset)
-        };
-        if next_offset == self.completion_scroll_offset {
-            return false;
-        }
-        self.completion_scroll_offset = next_offset;
-        self.needs_redraw = true;
-        true
-    }
-
-    pub fn scroll_completion_pages(&mut self, delta_pages: isize) -> bool {
-        let page_height = self.completion_viewport_rows.saturating_sub(1).max(1);
-        let page_height = page_height.min(isize::MAX as usize) as isize;
-        self.scroll_completion_lines(delta_pages.saturating_mul(page_height))
-    }
-
-    pub fn scroll_completion_at(&mut self, column: u16, row: u16, delta: isize) -> bool {
-        let Some(area) = self.completion_area else {
-            return false;
-        };
-        if column < area.x
-            || column >= area.x.saturating_add(area.width)
-            || row < area.y
-            || row >= area.y.saturating_add(area.height)
-        {
-            return false;
-        }
-        self.scroll_completion_lines(delta)
-    }
-
     pub fn resolved_scroll_y_for(&self, total_lines: usize, content_height: usize) -> usize {
         let max_offset = Self::max_scroll_offset_for(total_lines, content_height);
         match self.scroll_mode {
@@ -2693,7 +2534,7 @@ impl App {
         scroll_y: usize,
         content_height: usize,
     ) -> (usize, usize, usize) {
-        if self.output_lines.is_empty() {
+        if self.output_lines.is_empty() && self.error_lines.is_empty() {
             return (0, 0, 0);
         }
 
@@ -2778,22 +2619,7 @@ impl App {
             output_rows =
                 output_rows.saturating_add(Self::output_row_visual_rows(line, kind, wrap_width));
         });
-        // Completion box uses the same wrap width (only borders, no gutter).
-        let completion_rows: usize = self
-            .completion_lines
-            .iter()
-            .map(|line| Self::line_visual_rows(line, wrap_width))
-            .sum();
-        let error_rows: usize = self
-            .error_lines
-            .iter()
-            .map(|line| Self::line_visual_rows(line, wrap_width))
-            .sum();
-        self.cached_visual_rows = output_rows
-            .saturating_add(completion_rows)
-            .saturating_add(error_rows);
-        self.cached_completion_rows = completion_rows;
-        self.cached_error_rows = error_rows;
+        self.cached_visual_rows = output_rows;
         self.cached_wrap_width = Some(wrap_width);
     }
 
@@ -2819,6 +2645,15 @@ impl App {
             }
             visitor(Some(line), *kind, Some(index));
             prev = Some(*kind);
+        }
+        for line in &self.error_lines {
+            if let Some(previous) = prev
+                && Self::should_insert_separator(previous, BlockKind::Error)
+            {
+                visitor(None, BlockKind::Separator, None);
+            }
+            visitor(Some(line), BlockKind::Error, None);
+            prev = Some(BlockKind::Error);
         }
     }
 
@@ -3141,30 +2976,6 @@ impl App {
         row_sources
     }
 
-    fn build_completion_selection_row_sources(
-        &self,
-        content_height: usize,
-    ) -> Vec<Option<SelectionRowSource>> {
-        let wrap_width = self.last_wrap_width();
-        let mut skipped_rows = self.completion_scroll_offset;
-        let mut row_sources = Vec::with_capacity(content_height);
-        for (output_line_index, line) in self.completion_lines.iter().enumerate() {
-            let row_count = Self::line_visual_rows(line, wrap_width);
-            for row_in_line in 0..row_count {
-                if skipped_rows > 0 {
-                    skipped_rows -= 1;
-                } else if row_sources.len() < content_height {
-                    row_sources.push(Some(SelectionRowSource {
-                        output_line_index,
-                        row_in_line,
-                    }));
-                }
-            }
-        }
-        row_sources.resize(content_height, None);
-        row_sources
-    }
-
     /// Predicate for whether a blank-line separator should be drawn
     /// between two consecutive output block kinds.  Explicit
     /// `BlockKind::Separator` lines are themselves visual boundaries,
@@ -3189,9 +3000,13 @@ impl App {
                     | BlockKind::CommandOutput
                     | BlockKind::Reasoning
                     | BlockKind::UserPrompt
-                    | BlockKind::BlockingPrompt,
+                    | BlockKind::BlockingPrompt
+                    | BlockKind::Completion
+                    | BlockKind::Error,
             ) | (_, BlockKind::UserPrompt)
                 | (_, BlockKind::BlockingPrompt)
+                | (_, BlockKind::Completion)
+                | (_, BlockKind::Error)
                 | (
                     BlockKind::ToolOutput
                         | BlockKind::CommandOutput
@@ -3199,7 +3014,9 @@ impl App {
                         | BlockKind::CommandHeader
                         | BlockKind::Reasoning
                         | BlockKind::UserPrompt
-                        | BlockKind::BlockingPrompt,
+                        | BlockKind::BlockingPrompt
+                        | BlockKind::Completion
+                        | BlockKind::Error,
                     BlockKind::Model,
                 )
                 | (BlockKind::ToolHeader, BlockKind::ToolOutput)
@@ -3215,10 +3032,7 @@ impl App {
     }
 
     fn output_visual_rows(&mut self, wrap_width: usize) -> usize {
-        let total_rows = self.total_visual_rows(wrap_width);
-        total_rows
-            .saturating_sub(self.cached_completion_rows)
-            .saturating_sub(self.cached_error_rows)
+        self.total_visual_rows(wrap_width)
     }
 
     /// Render the application state to the frame.
@@ -3291,25 +3105,38 @@ impl App {
         }
         self.approval_detail_area = None;
 
-        let input_title = if let Some(pending) = self.pending_model_switch.as_ref() {
-            format!(" API key for {} ", pending.provider)
+        let (input_title, border_state) = if let Some(pending) = self.pending_model_switch.as_ref()
+        {
+            (
+                Some(format!(" API key for {} ", pending.provider)),
+                theme::InputBorderState::Idle,
+            )
         } else if self.slash_command_help_active {
-            " Help search ".to_string()
+            (
+                Some(" Help search ".to_string()),
+                theme::InputBorderState::Idle,
+            )
         } else if crate::core::approval::is_any_followup_question_active() {
-            " Follow-up reply ".to_string()
+            (
+                Some(" Follow-up reply ".to_string()),
+                theme::InputBorderState::Approval,
+            )
+        } else if !self.error_lines.is_empty()
+            || self
+                .status_notification
+                .as_ref()
+                .is_some_and(|notification| notification.kind == NotificationKind::Error)
+        {
+            (None, theme::InputBorderState::Error)
+        } else if self.reasoning_active {
+            (None, theme::InputBorderState::Reasoning)
         } else if self.agent_busy {
-            if self.reasoning_active {
-                format!(" {} Reasoning... ", self.spinner_char())
-            } else {
-                format!(" {} Agent processing... ", self.spinner_char())
-            }
+            (None, theme::InputBorderState::Processing)
         } else {
-            " Input ".to_string()
+            (None, theme::InputBorderState::Idle)
         };
-        self.input.set_block(theme::input_block(
-            input_title,
-            self.agent_busy || self.has_blocking_prompt(),
-        ));
+        self.input
+            .set_block(theme::input_block(input_title, border_state));
 
         self.update_placeholder();
 
@@ -3326,8 +3153,10 @@ impl App {
         let choices = pending.request.choices().to_vec();
         let scroll_from_bottom = pending.scroll_from_bottom;
 
-        let block = theme::input_block(format!(" {title} "), true)
-            .border_style(Style::default().fg(theme::WARNING_FG));
+        let block = theme::input_block(
+            Some(format!(" {title} ")),
+            theme::InputBorderState::Approval,
+        );
         let inner = block.inner(area);
         frame.render_widget(Clear, area);
         frame.render_widget(block, area);
@@ -3440,6 +3269,44 @@ impl App {
         }
     }
 
+    fn truncate_status_text(text: &str, max_width: usize) -> String {
+        if UnicodeWidthStr::width(text) <= max_width {
+            return text.to_string();
+        }
+        if max_width == 0 {
+            return String::new();
+        }
+        if max_width == 1 {
+            return "…".to_string();
+        }
+
+        let mut result = String::new();
+        for ch in text.chars() {
+            let candidate = format!("{result}{ch}");
+            if UnicodeWidthStr::width(candidate.as_str()) >= max_width {
+                break;
+            }
+            result.push(ch);
+        }
+        result.push('…');
+        result
+    }
+
+    fn status_left_required(&self) -> String {
+        let mut left = self.approval_mode_badge().trim_end().to_string();
+        if !self.mode.is_empty() {
+            if !left.is_empty() {
+                left.push(' ');
+            }
+            left.push_str(&self.mode);
+        }
+        if left.is_empty() {
+            "sned".to_string()
+        } else {
+            left
+        }
+    }
+
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect) {
         if let Some(notification) = self.status_notification.as_ref() {
             let (marker, color) = match notification.kind {
@@ -3448,13 +3315,14 @@ impl App {
                 NotificationKind::Warning => ("!", theme::WARNING_FG),
                 NotificationKind::Error => ("×", theme::ERROR_FG),
             };
-            let approval_badge = self.approval_mode_badge();
+            let left = self.status_left_required();
+            let message = Self::truncate_status_text(
+                &format!("{left} · {marker} {}", notification.message),
+                (status_area.width as usize).saturating_sub(1),
+            );
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!(
-                        " {approval_badge}{} · {marker} {} ",
-                        self.mode, notification.message
-                    ),
+                    format!(" {message}"),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ))),
                 status_area,
@@ -3462,80 +3330,66 @@ impl App {
             return;
         }
 
-        if self.status_left_fingerprint.0 != self.provider_name
-            || self.status_left_fingerprint.1 != self.model_name
-            || self.status_left_fingerprint.2 != self.task_id
-            || self.status_left_fingerprint.3 != self.mode
-            || self.status_left_fingerprint.4 != self.yolo_mode
-            || self.status_left_fingerprint.5 != self.auto_approve_all
-        {
-            let approval_badge = self.approval_mode_badge();
-            self.cached_status_left = format!(
-                " {}{} / {} | {} | {} ",
-                approval_badge, self.provider_name, self.model_name, self.task_id, self.mode
-            );
-            self.status_left_fingerprint = (
-                self.provider_name.clone(),
-                self.model_name.clone(),
-                self.task_id.clone(),
-                self.mode.clone(),
-                self.yolo_mode,
-                self.auto_approve_all,
-            );
+        let required_left = self.status_left_required();
+        let total_width = status_area.width as usize;
+        let leading_width = 1usize;
+        let left_width = UnicodeWidthStr::width(required_left.as_str());
+        let right_budget = total_width.saturating_sub(leading_width + left_width + 1);
+        let mut right_segments = Vec::new();
+        if let Some(pct) = self.context_pct {
+            right_segments.push(format!("{:.0}% ctx", 100.0 - pct));
         }
-        let elapsed_secs = self.elapsed.map_or(u64::MAX, |e| e.as_secs());
-        let context_key = (
-            elapsed_secs,
-            self.context_pct,
-            self.output_overflow,
-            self.output_overflow_count,
-            self.queued_message_count,
-            self.unseen_output_count,
-            self.scroll_mode,
-        );
-        if context_key != self.cached_status_right_secs {
-            let mut status = String::new();
-            if self.scroll_mode == ScrollMode::Manual && self.unseen_output_count > 0 {
-                status.push_str(&format!("↑ {} new · ", self.unseen_output_count));
+        if let Some(elapsed) = self.elapsed {
+            right_segments.push(format!("⏱ {}", format_duration(elapsed)));
+        }
+        if self.output_overflow {
+            right_segments.push(format!("⚠ {} dropped", self.output_overflow_count));
+        }
+        if self.queued_message_count > 0 {
+            right_segments.push(format!("📨 {} queued", self.queued_message_count));
+        }
+        if self.scroll_mode == ScrollMode::Manual && self.unseen_output_count > 0 {
+            right_segments.push(format!("↑ {} new", self.unseen_output_count));
+        }
+
+        let mut right = String::new();
+        for segment in right_segments {
+            let separator = if right.is_empty() { "" } else { " · " };
+            let candidate = format!("{right}{separator}{segment}");
+            if UnicodeWidthStr::width(candidate.as_str()) <= right_budget {
+                right = candidate;
             }
-            if self.output_overflow {
-                let summary = if self.output_overflow_summary.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", self.output_overflow_summary)
-                };
-                status.push_str(&format!(
-                    "⚠ output overflow ({} dropped{}) · ",
-                    self.output_overflow_count, summary
+        }
+
+        let right_width = UnicodeWidthStr::width(right.as_str());
+        let left_budget = total_width
+            .saturating_sub(leading_width + right_width + usize::from(!right.is_empty()));
+        let provider_model = match (self.provider_name.is_empty(), self.model_name.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => self.model_name.clone(),
+            (false, true) => self.provider_name.clone(),
+            (false, false) => format!("{} / {}", self.provider_name, self.model_name),
+        };
+        let mut left = required_left.clone();
+        if !provider_model.is_empty() {
+            let prefix = " · ";
+            let provider_budget =
+                left_budget.saturating_sub(left_width + UnicodeWidthStr::width(prefix));
+            if provider_budget > 0 {
+                left.push_str(prefix);
+                left.push_str(&Self::truncate_status_text(
+                    &provider_model,
+                    provider_budget,
                 ));
             }
-            if let Some(pct) = self.context_pct {
-                status.push_str(&format!("Context: {:.0}% left · ", 100.0 - pct));
-            }
-            if self.queued_message_count > 0 {
-                status.push_str(&format!("📨 {} queued · ", self.queued_message_count));
-            }
-            if let Some(elapsed) = self.elapsed {
-                status.push_str(&format!("⏱ {} ", format_duration(elapsed)));
-            } else if !status.is_empty() {
-                status.push(' ');
-            }
-            self.cached_status_right = status;
-            self.cached_status_right_secs = context_key;
         }
-        let left_width = UnicodeWidthStr::width(self.cached_status_left.as_str());
-        let right_width = UnicodeWidthStr::width(self.cached_status_right.as_str());
-        let spacer_len = status_area
-            .width
-            .saturating_sub((left_width + right_width) as u16) as usize;
-        if spacer_len != self.cached_spacer_len {
-            self.cached_spacer = " ".repeat(spacer_len);
-            self.cached_spacer_len = spacer_len;
-        }
+        left = Self::truncate_status_text(&left, left_budget);
+        let spacer_len = total_width
+            .saturating_sub(leading_width + UnicodeWidthStr::width(left.as_str()) + right_width);
         let status_line = Line::from(vec![
-            Span::styled(self.cached_status_left.clone(), theme::status_style()),
-            Span::raw(self.cached_spacer.clone()),
-            Span::styled(self.cached_status_right.clone(), theme::status_style()),
+            Span::styled(format!(" {left}"), theme::status_style()),
+            Span::raw(" ".repeat(spacer_len.saturating_sub(1))),
+            Span::styled(right, theme::status_style()),
         ]);
         let status = Paragraph::new(status_line);
         frame.render_widget(status, status_area);
@@ -3552,91 +3406,15 @@ impl App {
     }
 
     fn render_output(&mut self, frame: &mut Frame, output_area: Rect) {
-        // Error box takes priority over completion box.
-        let has_error = !self.error_lines.is_empty();
-        let has_completion = !self.completion_lines.is_empty();
-        let has_bottom_box = has_error || has_completion;
-        // Rebuild the visual-row cache up front so bottom_height reflects
-        // the current error_lines/completion_lines. Without this, a push
-        // that invalidates cached_wrap_width still leaves the height math
-        // using the stale cached row count from the prior render.
         let wrap_width = Self::content_wrap_width(output_area.width as usize);
-        let _ = self.total_visual_rows(wrap_width);
-        let bottom_height: u16 = if has_error {
-            self.cached_error_rows
-                .saturating_add(2)
-                .min(u16::MAX as usize)
-                .min(output_area.height as usize) as u16
-        } else if has_completion {
-            // Keeping half the region available prevents a long final result from hiding history.
-            let max_completion_height = output_area
-                .height
-                .div_ceil(2)
-                .max(3)
-                .min(output_area.height);
-            self.cached_completion_rows
-                .saturating_add(2)
-                .min(u16::MAX as usize)
-                .min(max_completion_height as usize) as u16
-        } else {
-            0
-        };
-        let main_output_area = if has_bottom_box {
-            Rect {
-                x: output_area.x,
-                y: output_area.y,
-                width: output_area.width,
-                height: output_area.height.saturating_sub(bottom_height),
-            }
-        } else {
-            output_area
-        };
-        let bottom_area = if has_bottom_box {
-            Rect {
-                x: output_area.x,
-                y: output_area.y + main_output_area.height,
-                width: output_area.width,
-                height: bottom_height,
-            }
-        } else {
-            output_area
-        };
-        if has_completion && !has_error {
-            self.completion_viewport_rows = bottom_area.height.saturating_sub(2) as usize;
-            self.completion_scroll_offset = self.completion_scroll_offset.min(
-                self.cached_completion_rows
-                    .saturating_sub(self.completion_viewport_rows),
-            );
-            self.completion_area = Some(bottom_area);
-        } else {
-            self.completion_viewport_rows = 0;
-            self.completion_area = None;
-        }
-
-        let visible_height = main_output_area.height as usize;
         // Content height excludes border (1 line top + 1 line bottom)
-        let content_height = visible_height.saturating_sub(2);
-        self.last_content_width = main_output_area.width as usize;
+        let content_height = (output_area.height as usize).saturating_sub(2);
+        self.last_content_width = output_area.width as usize;
         self.last_content_height = content_height;
         self.restore_pending_manual_viewport_after_reflow(wrap_width);
-        let total_rows = self.total_visual_rows(wrap_width);
-        // The output Paragraph only renders output_lines; completion_lines are
-        // drawn as a separate Block below the main output. Scroll math must
-        // therefore be based on output_rows alone, or the bottom of the
-        // output gets hidden behind the completion overlay.
-        let output_rows = total_rows
-            .saturating_sub(self.cached_completion_rows)
-            .saturating_sub(self.cached_error_rows);
+        let output_rows = self.total_visual_rows(wrap_width);
         self.transcript_selection_area =
-            Self::selection_content_area(main_output_area, output_rows > content_height);
-        let completion_max_scroll = self
-            .cached_completion_rows
-            .saturating_sub(self.completion_viewport_rows);
-        self.completion_selection_area = if has_completion && !has_error {
-            Self::selection_content_area(bottom_area, completion_max_scroll > 0)
-        } else {
-            None
-        };
+            Self::selection_content_area(output_area, output_rows > content_height);
         let scroll_y = self.resolved_output_scroll_y_for(wrap_width, output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y, content_height);
@@ -3658,13 +3436,8 @@ impl App {
         {
             *source = None;
         }
-        self.completion_selection_row_sources = self
-            .completion_selection_area
-            .map(|area| self.build_completion_selection_row_sources(area.height as usize))
-            .unwrap_or_default();
-
         {
-            frame.render_widget(Clear, main_output_area);
+            frame.render_widget(Clear, output_area);
             let visible_lines = self.collect_output_rows_range(start_idx, visible_count);
             let title = if self.in_scrollback {
                 " sned (scrollback) "
@@ -3677,10 +3450,10 @@ impl App {
                 .block(
                     theme::border_block(title).padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
                 );
-            frame.render_widget(output, main_output_area);
+            frame.render_widget(output, output_area);
         }
 
-        if !self.in_scrollback && self.scrollback_count > 0 && main_output_area.height > 0 {
+        if !self.in_scrollback && self.scrollback_count > 0 && output_area.height > 0 {
             let indicator = Paragraph::new(Line::from(format!(
                 "↓ {} lines of scrollback — press Shift+S to view",
                 self.scrollback_count,
@@ -3688,72 +3461,15 @@ impl App {
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(theme::ACCENT).italic());
             let indicator_area = Rect {
-                x: main_output_area.x,
-                y: main_output_area.y + main_output_area.height - 1,
-                width: main_output_area.width,
+                x: output_area.x,
+                y: output_area.y + output_area.height - 1,
+                width: output_area.width,
                 height: 1,
             };
             frame.render_widget(Clear, indicator_area);
             frame.render_widget(indicator, indicator_area);
         }
 
-        if has_error {
-            frame.render_widget(Clear, bottom_area);
-            let error_lines: Vec<Line<'static>> = self.error_lines.iter().cloned().collect();
-            let error_box = Paragraph::new(error_lines)
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme::ERROR_FG))
-                        .border_type(ratatui::widgets::BorderType::Rounded),
-                );
-            frame.render_widget(error_box, bottom_area);
-        } else if has_completion {
-            frame.render_widget(Clear, bottom_area);
-            let completion_lines: Vec<Line<'static>> =
-                self.completion_lines.iter().cloned().collect();
-            let max_completion_scroll = completion_max_scroll;
-            let mut completion_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::PROMPT_FG))
-                .border_type(ratatui::widgets::BorderType::Rounded);
-            if max_completion_scroll > 0 {
-                completion_block =
-                    completion_block.title(Span::styled(" Scroll: PgUp/PgDn ", theme::dim_style()));
-            }
-            let completion = Paragraph::new(completion_lines)
-                .wrap(Wrap { trim: false })
-                .scroll((
-                    Self::terminal_scroll_offset(self.completion_scroll_offset),
-                    0,
-                ))
-                .block(completion_block);
-            frame.render_widget(completion, bottom_area);
-            if max_completion_scroll > 0 {
-                let mut completion_scrollbar_state =
-                    ScrollbarState::new(self.cached_completion_rows)
-                        .viewport_content_length(self.completion_viewport_rows)
-                        .position(self.completion_scroll_offset);
-                frame.render_stateful_widget(
-                    Scrollbar::default()
-                        .orientation(ScrollbarOrientation::VerticalRight)
-                        .begin_symbol(Some("↑"))
-                        .end_symbol(Some("↓"))
-                        .style(theme::scrollbar_style())
-                        .thumb_style(theme::scrollbar_thumb_style()),
-                    bottom_area.inner(ratatui::layout::Margin {
-                        horizontal: 0,
-                        vertical: 1,
-                    }),
-                    &mut completion_scrollbar_state,
-                );
-            }
-        }
-
-        // Use output_rows (not total_rows) so the scrollbar thumb
-        // reflects only the output pane content — completion rows are
-        // rendered separately and must not affect scroll geometry.
         if output_rows > content_height {
             self.scrollbar_state = self
                 .scrollbar_state
@@ -3767,7 +3483,7 @@ impl App {
                     .end_symbol(Some("↓"))
                     .style(theme::scrollbar_style())
                     .thumb_style(theme::scrollbar_thumb_style()),
-                main_output_area.inner(ratatui::layout::Margin {
+                output_area.inner(ratatui::layout::Margin {
                     horizontal: 0,
                     vertical: 1,
                 }),
@@ -4601,12 +4317,12 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_selection_copies_visible_cells() {
+    fn test_completion_selection_copies_from_transcript() {
         let mut app = App::new();
         app.push_plain("transcript");
         app.push_completion_line(Line::from("done now"));
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Completion, "d");
+        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "d");
         let now = Instant::now();
 
         assert!(app.begin_text_selection(column, row, now));
@@ -4822,20 +4538,15 @@ mod tests {
     }
 
     #[test]
-    fn test_dismiss_completion_preserves_lines_beyond_transcript_limit() {
+    fn test_completion_uses_transcript_scrollback_limit() {
         let mut app = App::new();
         for index in 0..10_001 {
             app.push_completion_line(Line::from(format!("completion line {index}")));
         }
-        app.set_completion_needs_transcript_copy(true);
-
-        app.dismiss_completion_lines();
-
-        assert!(app.completion_lines.is_empty());
-        assert_eq!(app.output_lines.len(), 10_001);
+        assert_eq!(app.output_lines.len(), 10_000);
         assert_eq!(
             app.output_lines.front().map(App::line_to_string).as_deref(),
-            Some("completion line 0")
+            Some("completion line 1")
         );
         assert_eq!(
             app.output_lines.back().map(App::line_to_string).as_deref(),
@@ -5046,7 +4757,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transcript_scroll_excludes_completion_rows() {
+    fn test_transcript_scroll_includes_completion_rows() {
         let mut app = App::new();
         app.set_content_height(5);
         app.set_content_width(80);
@@ -5323,7 +5034,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_output_keeps_single_busy_loading_message() {
+    fn test_render_input_uses_processing_border_without_busy_title() {
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -5346,9 +5057,28 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("Agent processing..."));
-        assert!(!rendered.contains("Working"));
-        assert!(!rendered.contains("Agent working..."));
+        assert!(!rendered.contains("Agent processing..."));
+        assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::ACCENT));
+    }
+
+    #[test]
+    fn test_render_input_uses_error_border_while_a_retry_is_busy() {
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.mode = "ACT".to_string();
+        app.push_error_line(Line::from("network error"));
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 9)).map(|cell| cell.fg),
+            Some(theme::ERROR_FG)
+        );
     }
 
     #[test]
@@ -5669,7 +5399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_status_bar_caches_static_fields() {
+    fn test_render_status_bar_shows_mode_and_model_without_task_id() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -5686,29 +5416,16 @@ mod tests {
             .draw(|frame| app.render_status_bar(frame, status_area))
             .expect("first render should succeed");
 
-        let cached_after_first = app.cached_status_left.clone();
-        assert!(cached_after_first.contains("openai"));
-        assert!(cached_after_first.contains("gpt-4"));
-
-        // Second render with no field changes — cache should be reused
-        terminal
-            .draw(|frame| app.render_status_bar(frame, status_area))
-            .expect("second render should succeed");
-        assert_eq!(
-            app.cached_status_left, cached_after_first,
-            "cache should be reused when fields are unchanged"
-        );
-
-        // Mutate a field — cache should rebuild
-        app.task_id = "task-2".to_string();
-        terminal
-            .draw(|frame| app.render_status_bar(frame, status_area))
-            .expect("third render should succeed");
-        assert_ne!(
-            app.cached_status_left, cached_after_first,
-            "cache should rebuild when a field changes"
-        );
-        assert!(app.cached_status_left.contains("task-2"));
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("ACT"));
+        assert!(rendered.contains("openai / gpt-4"));
+        assert!(!rendered.contains("task-1"));
     }
 
     #[test]
@@ -5774,21 +5491,23 @@ mod tests {
         terminal
             .draw(|frame| app.render_status_bar(frame, status_area))
             .expect("standard render should succeed");
-        assert!(!app.cached_status_left.contains("YOLO"));
-        assert!(!app.cached_status_left.contains("AUTO-APPROVE"));
-
         app.auto_approve_all = true;
         terminal
             .draw(|frame| app.render_status_bar(frame, status_area))
             .expect("auto-approve render should succeed");
-        assert!(app.cached_status_left.starts_with(" [AUTO-APPROVE] "));
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[AUTO-APPROVE] ACT"));
 
         app.yolo_mode = true;
         terminal
             .draw(|frame| app.render_status_bar(frame, status_area))
             .expect("yolo render should succeed");
-        assert!(app.cached_status_left.starts_with(" [YOLO] "));
-        assert!(!app.cached_status_left.contains("AUTO-APPROVE"));
         let rendered = terminal
             .backend()
             .buffer()
@@ -5797,6 +5516,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("[YOLO]"));
+        assert!(!rendered.contains("AUTO-APPROVE"));
     }
 
     #[test]
@@ -5961,7 +5681,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_status_bar_caches_right_segment() {
+    fn test_render_status_bar_prioritizes_context_then_timer() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use std::time::Duration;
@@ -5969,34 +5689,59 @@ mod tests {
         let backend = TestBackend::new(80, 1);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
+        app.mode = "ACT".to_string();
+        app.context_pct = Some(27.0);
         app.elapsed = Some(Duration::from_secs(42));
+        app.queued_message_count = 2;
+        app.unseen_output_count = 3;
+        app.scroll_mode = ScrollMode::Manual;
 
         let status_area = ratatui::layout::Rect::new(0, 0, 80, 1);
         terminal
             .draw(|frame| app.render_status_bar(frame, status_area))
             .expect("first render should succeed");
-        let cached_after_first = app.cached_status_right.clone();
-        assert!(cached_after_first.contains("42"));
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("73% ctx"));
+        assert!(rendered.contains("⏱ 42s"));
+    }
 
-        // Same second — cache should be reused
-        terminal
-            .draw(|frame| app.render_status_bar(frame, status_area))
-            .expect("second render should succeed");
-        assert_eq!(
-            app.cached_status_right, cached_after_first,
-            "cache should be reused within the same second"
-        );
+    #[test]
+    fn test_narrow_status_bar_keeps_safety_mode_and_context_before_queue() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
-        // Different second — cache should rebuild
-        app.elapsed = Some(Duration::from_secs(43));
+        let backend = TestBackend::new(30, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.yolo_mode = true;
+        app.mode = "ACT".to_string();
+        app.provider_name = "openai".to_string();
+        app.model_name = "a-very-long-model-name".to_string();
+        app.context_pct = Some(35.0);
+        app.elapsed = Some(Duration::from_secs(42));
+        app.queued_message_count = 2;
+
         terminal
-            .draw(|frame| app.render_status_bar(frame, status_area))
-            .expect("third render should succeed");
-        assert_ne!(
-            app.cached_status_right, cached_after_first,
-            "cache should rebuild when seconds change"
-        );
-        assert!(app.cached_status_right.contains("43"));
+            .draw(|frame| app.render_status_bar(frame, Rect::new(0, 0, 30, 1)))
+            .expect("status render should succeed");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[YOLO] ACT"));
+        assert!(rendered.contains("65% ctx"));
+        assert!(rendered.contains("⏱ 42s"));
+        assert!(!rendered.contains("queued"));
     }
 
     #[test]
@@ -6011,13 +5756,27 @@ mod tests {
         terminal
             .draw(|frame| app.render_status_bar(frame, status_area))
             .expect("manual status bar should render");
-        assert!(app.cached_status_right.contains("↑ 1 new"));
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("↑ 1 new"));
 
         app.force_bottom();
         terminal
             .draw(|frame| app.render_status_bar(frame, status_area))
             .expect("auto-follow status bar should render");
-        assert!(!app.cached_status_right.contains("new"));
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("new"));
     }
 
     #[test]
@@ -6530,7 +6289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_output_shows_reasoning_indicator_when_reasoning_active() {
+    fn test_render_input_uses_reasoning_border_when_reasoning_active() {
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -6554,18 +6313,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(
-            rendered.contains("Reasoning..."),
-            "expected 'Reasoning...' indicator when reasoning_active is true, got:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("Agent processing..."),
-            "should not show 'Agent processing...' when reasoning is active, got:\n{rendered}"
+        assert!(!rendered.contains("Reasoning..."));
+        assert!(!rendered.contains("Agent processing..."));
+        assert_eq!(
+            buffer.cell((0, 9)).map(|cell| cell.fg),
+            Some(theme::WARNING_FG)
         );
     }
 
     #[test]
-    fn test_render_output_shows_agent_processing_when_not_reasoning() {
+    fn test_render_input_uses_processing_border_when_not_reasoning() {
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -6589,22 +6346,15 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(
-            rendered.contains("Agent processing..."),
-            "expected 'Agent processing...' when reasoning is not active, got:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("Reasoning..."),
-            "should not show 'Reasoning...' when reasoning is not active, got:\n{rendered}"
-        );
+        assert!(!rendered.contains("Agent processing..."));
+        assert!(!rendered.contains("Reasoning..."));
+        assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::ACCENT));
     }
 
     #[test]
     fn test_completion_line_renders_in_buffer() {
         // Regression guard: push_completion_line must invalidate the visual
-        // row cache so the completion box height reflects the new line.
-        // A prior bug left cached_wrap_width stale, so completion_height
-        // collapsed to 2 (just borders) and the text was clipped.
+        // row cache so the durable transcript line appears immediately.
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -6643,7 +6393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_long_completion_keeps_transcript_visible_and_scrolls_to_overflow() {
+    fn test_long_completion_scrolls_with_the_transcript() {
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(60, 16);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -6660,31 +6410,22 @@ mod tests {
             .expect("initial render should succeed");
 
         let initial = rendered_rows(terminal.backend().buffer()).join("\n");
-        assert!(initial.contains("TRANSCRIPT_MARKER"), "got:\n{initial}");
-        assert!(initial.contains("COMPLETION_WORD_00"), "got:\n{initial}");
-        assert!(!initial.contains("COMPLETION_WORD_19"), "got:\n{initial}");
+        assert!(initial.contains("COMPLETION_WORD_19"), "got:\n{initial}");
 
-        let completion_area = app.completion_area.expect("completion area should render");
-        assert!(app.scroll_completion_at(
-            completion_area.x.saturating_add(1),
-            completion_area.y.saturating_add(1),
-            isize::MAX,
-        ));
+        app.scroll_lines(-isize::MAX);
         terminal
             .draw(|frame| app.render(frame))
             .expect("scrolled render should succeed");
 
         let scrolled = rendered_rows(terminal.backend().buffer()).join("\n");
         assert!(scrolled.contains("TRANSCRIPT_MARKER"), "got:\n{scrolled}");
-        assert!(!scrolled.contains("COMPLETION_WORD_00"), "got:\n{scrolled}");
-        assert!(scrolled.contains("COMPLETION_WORD_19"), "got:\n{scrolled}");
+        assert!(scrolled.contains("COMPLETION_WORD_00"), "got:\n{scrolled}");
     }
 
     #[test]
     fn test_error_line_renders_in_buffer() {
-        // push_error_line must invalidate the visual row cache so
-        // cached_error_rows reflects the new line. The error box
-        // renders with red border and takes priority over completion.
+        // push_error_line must invalidate the visual-row cache so the
+        // transient tail appears in the same transcript panel.
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -6719,9 +6460,19 @@ mod tests {
     }
 
     #[test]
-    fn test_error_box_takes_priority_over_completion() {
-        // When both error_lines and completion_lines are non-empty,
-        // only the error box should render (red border).
+    fn test_error_line_returns_manual_scroll_to_transcript_tail() {
+        let mut app = make_scrolling_app(20, 5);
+        app.scroll_lines(-1);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+
+        app.push_error_line(Line::from("network error"));
+
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_error_and_completion_share_the_transcript() {
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -6729,7 +6480,7 @@ mod tests {
         app.force_bottom();
         app.push_plain("line 1");
 
-        // Push both completion and error lines.
+        // Completion is durable while an error stays visible until the next prompt.
         app.push_completion_line("COMPLETION_MARKER".into());
         app.push_error_line("ERROR_MARKER".into());
 
@@ -6748,11 +6499,11 @@ mod tests {
 
         assert!(
             rendered.contains("ERROR_MARKER"),
-            "error box should be visible; got:\n{rendered}"
+            "error should be visible in the transcript; got:\n{rendered}"
         );
         assert!(
-            !rendered.contains("COMPLETION_MARKER"),
-            "completion box should NOT render when error box is present; got:\n{rendered}"
+            rendered.contains("COMPLETION_MARKER"),
+            "completion should remain visible beside an error; got:\n{rendered}"
         );
     }
 
@@ -7129,7 +6880,7 @@ mod tests {
         // status bar is at row 10.
         let status_row = &rows[10];
         assert!(
-            status_row.contains("output overflow"),
+            status_row.contains("⚠ 7 dropped"),
             "status bar must show overflow warning, got: {status_row:?}"
         );
         assert!(
@@ -7178,13 +6929,9 @@ mod tests {
 
     /// Regression test for the stale-output-artifacts bug fixed in
     /// commit 75caee3 ("fix(tui): clear stale output artifacts in
-    /// render loop"). That commit added `frame.render_widget(Clear,
-    /// main_output_area)` before rendering the output Paragraph and
-    /// `frame.render_widget(Clear, completion_area)` before the
-    /// completion Paragraph, so that when `output_lines` or
-    /// `completion_lines` shrink between frames, the previous
-    /// frame's content doesn't bleed through on terminals that use
-    /// differential rendering.
+    /// render loop"). The single transcript panel must be cleared before
+    /// rendering, so removed transient errors cannot bleed through on
+    /// terminals that use differential rendering.
     ///
     /// The TestBackend resets its buffer on every draw, so it cannot
     /// reproduce the stale-artifact symptom directly. This test
@@ -7202,14 +6949,12 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
 
         let mut app = App::new();
-        // Seed output lines (the Clear call on main_output_area
-        // must render before the output Paragraph).
+        // Seed output lines (the Clear call on output_area must render before
+        // the output Paragraph).
         for i in 0..3 {
             app.push_plain(format!("line {}", i));
         }
-        // Seed completion lines (the Clear call on
-        // completion_area must render before the completion
-        // Paragraph).
+        // Completion now uses the same transcript surface.
         app.push_completion_line("completion line 1".into());
 
         terminal
@@ -7243,11 +6988,8 @@ mod tests {
         // Clear calls would reintroduce the bug on real terminals
         // but pass the TestBackend-based test.
         //
-        // We check for the SPECIFIC Clear calls added by the
-        // 75caee3 fix: `Clear, main_output_area` and
-        // `Clear, completion_area`. These are unique to the
-        // output pane (other Clear calls in the file target the
-        // plan panel, picker overlay, etc.).
+        // We check for the Clear call targeting the single output pane. Other
+        // Clear calls target overlays or the plan panel.
         let source = include_str!("app.rs");
         let has_active_call = |area_arg: &str| -> bool {
             let needle = format!("render_widget(Clear, {})", area_arg);
@@ -7256,13 +6998,8 @@ mod tests {
                 .any(|line| !line.trim_start().starts_with("//") && line.contains(&needle))
         };
         assert!(
-            has_active_call("main_output_area"),
-            "render_output must call Clear on main_output_area before drawing the output Paragraph (fix for 75caee3). \
-             The bug causes stale content to bleed through on real terminals."
-        );
-        assert!(
-            has_active_call("bottom_area"),
-            "render_output must call Clear on bottom_area before drawing the completion/error Paragraph (fix for 75caee3). \
+            has_active_call("output_area"),
+            "render_output must call Clear on output_area before drawing the output Paragraph (fix for 75caee3). \
              The bug causes stale content to bleed through on real terminals."
         );
     }
@@ -7315,7 +7052,7 @@ mod tests {
             "status bar must show exact dropped count, got: {status_row:?}"
         );
         assert!(
-            status_row.contains("output overflow"),
+            status_row.contains("⚠ 4 dropped"),
             "status bar must show overflow warning, got: {status_row:?}"
         );
     }
@@ -7363,10 +7100,10 @@ mod tests {
 
         let status_row = rows
             .iter()
-            .find(|row| row.contains("output overflow"))
+            .find(|row| row.contains("⚠ 3 dropped"))
             .expect("status bar should contain overflow warning");
         assert!(
-            status_row.contains("output overflow"),
+            status_row.contains("⚠ 3 dropped"),
             "status bar must still show overflow warning during approval prompt. \
              status_row: {status_row:?}"
         );
