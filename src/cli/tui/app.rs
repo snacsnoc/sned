@@ -1980,12 +1980,19 @@ impl App {
             .sum();
 
         if !contains_hyperlink && total_width > wrap_width && wrap_width > 0 {
+            let single_span_style = (line.spans.len() == 1).then_some(line.spans[0].style);
             let mut full_text = String::new();
             for span in &line.spans {
                 full_text.push_str(span.content.as_ref());
             }
             let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
-            wrapped.lines().map(|l| Line::from(l.to_string())).collect()
+            wrapped
+                .lines()
+                .map(|wrapped_line| match single_span_style {
+                    Some(style) => Line::from(Span::styled(wrapped_line.to_string(), style)),
+                    None => Line::from(wrapped_line.to_string()),
+                })
+                .collect()
         } else {
             vec![line]
         }
@@ -5933,6 +5940,23 @@ mod tests {
         let style = app.output_lines[0].spans[0].style;
         assert_eq!(style.fg, Some(crate::cli::tui::theme::ACCENT));
         assert!(style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn test_wrapped_reasoning_preserves_its_style() {
+        let mut app = App::new();
+        app.last_content_width = 24;
+
+        app.push_reasoning_chunk(
+            "this reasoning line is long enough to wrap across several transcript rows",
+        );
+        app.finish_reasoning_stream();
+
+        assert!(app.output_lines.len() > 1, "reasoning should wrap");
+        for line in &app.output_lines {
+            assert_eq!(line.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
+            assert!(line.spans[0].style.add_modifier.contains(Modifier::ITALIC));
+        }
     }
 
     #[test]
