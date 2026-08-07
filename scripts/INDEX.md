@@ -1,6 +1,6 @@
 # sned Scripts
 
-Helper scripts for profiling, memory analysis, TUI testing, build, signing, and benchmarking.
+Helper scripts for profiling, memory analysis, TUI testing, building, and benchmarking.
 
 ## Quick guide
 
@@ -12,9 +12,9 @@ Helper scripts for profiling, memory analysis, TUI testing, build, signing, and 
 | Build and package macOS arm64 | `./scripts/build-macos-arm64.sh` |
 | Build and package macOS x86_64 | `./scripts/build-macos-x86_64.sh` |
 | Build and package Linux amd64 | `./scripts/build-linux-amd64.sh` |
+| Build and package Linux armv7l | `./scripts/build-linux-armv7l.sh` |
 | Build and package FreeBSD amd64 | `./scripts/build-freebsd-amd64.sh` |
-| Sign a macOS binary | `./scripts/sign-macos.sh` |
-| Notarize a macOS binary | `./scripts/notarize-macos.sh` |
+| Smoke-test release scripts | `./scripts/build-release-smoke-test.sh` |
 | Update the Homebrew formula | `./scripts/homebrew-formula.sh` |
 | Run the opencode comparison benchmark | `./scripts/bench-vs-opencode.sh` |
 
@@ -104,13 +104,13 @@ Dependencies: `python3`, `gcc`/`clang` (only for the rebuild).
 
 ---
 
-## macOS release
+## Release packaging
 
 ### `build-release-package.sh`
 
 Shared helper used by the macOS, Linux, and FreeBSD packaging wrappers. Builds a
-single target triple and writes a tar.gz release artifact under
-`target/dist/<suffix>/`.
+single target triple and writes a persistent package directory plus tar.gz
+release artifact under `${CARGO_TARGET_DIR:-target}/dist/<suffix>/`.
 
 ### `build-macos-arm64.sh`
 
@@ -124,17 +124,13 @@ Builds `x86_64-apple-darwin` and packages `sned-<version>-macos-x86_64.tar.gz`.
 
 Builds `x86_64-unknown-linux-gnu` and packages `sned-<version>-linux-amd64.tar.gz`.
 
+### `build-linux-armv7l.sh`
+
+Builds `armv7-unknown-linux-gnueabihf` and packages `sned-<version>-linux-armv7l.tar.gz`.
+
 ### `build-freebsd-amd64.sh`
 
 Builds `x86_64-unknown-freebsd` and packages `sned-<version>-freebsd-amd64.tar.gz`.
-
-### `sign-macos.sh`
-
-Signs the binary with the Apple Developer ID. Requires `APPLE_SIGNING_IDENTITY` and `APPLE_SIGNING_KEYCHAIN_PROFILE` env vars (or use `xcrun notarytool` setup).
-
-### `notarize-macos.sh`
-
-Submits the signed binary to Apple notarization service and staples the ticket.
 
 ### `homebrew-formula.sh`
 
@@ -174,8 +170,6 @@ Sample inputs used by `bench-vs-opencode.sh`. Three sizes: `trivial.txt`, `mediu
 **dhat-heap.json not found after profiling.** The workload may not have triggered heap allocations. Try `--workload all` and check that `dhat-heap` is enabled in `Cargo.toml`.
 
 **sned-pty-helper missing.** Run the gcc command shown in the TUI smoke test section above.
-
-**macOS signing fails.** Verify `APPLE_SIGNING_IDENTITY` is set and that your keychain profile is configured per `xcrun notarytool store-credentials`.
 
 ---
 

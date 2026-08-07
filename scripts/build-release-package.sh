@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/release-package-common.sh"
+
 TARGET_TRIPLE="${1:-}"
 ARTIFACT_SUFFIX="${2:-}"
 BUILD_MODE="release"
@@ -15,6 +17,11 @@ Builds sned for the requested target triple and packages the binary into a
 tar.gz file suitable for GitHub release uploads.
 EOF
 }
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
 
 if [[ -z "${TARGET_TRIPLE}" || -z "${ARTIFACT_SUFFIX}" ]]; then
     usage
@@ -37,23 +44,25 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo "Unknown option: $1" >&2
+            printf 'Unknown option: %s\n' "$1" >&2
             usage >&2
             exit 1
             ;;
     esac
 done
 
-VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${PROJECT_ROOT}/Cargo.toml")"
+VERSION="$(release_version "${PROJECT_ROOT}")"
 if [[ -z "${VERSION}" ]]; then
     printf '%s\n' "unable to read package version from Cargo.toml" >&2
     exit 1
 fi
 
 HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+HOST_TARGET="$(rustc -vV | awk '/^host:/ { print $2 }')"
+TARGET_DIR="$(release_target_dir "${PROJECT_ROOT}")"
 
 case "${TARGET_TRIPLE}" in
-    *-unknown-linux-gnu)
+    *-unknown-linux-gnu|*-unknown-linux-gnueabihf)
         TARGET_OS="linux"
         ;;
     *-unknown-freebsd)
@@ -68,33 +77,21 @@ case "${TARGET_TRIPLE}" in
         ;;
 esac
 
-case "${TARGET_OS}" in
-    linux|freebsd|darwin)
-        ;;
-    *)
-        printf '%s\n' "unsupported target OS in triple: ${TARGET_TRIPLE}" >&2
-        exit 1
-        ;;
-esac
-
 BUILD_FLAG=""
 if [[ "${BUILD_MODE}" == "release" ]]; then
     BUILD_FLAG="--release"
 fi
 PROFILE_DIR="${BUILD_MODE}"
-TARGET_BINARY="${PROJECT_ROOT}/target/${TARGET_TRIPLE}/${PROFILE_DIR}/sned"
-ARTIFACT_DIR="${PROJECT_ROOT}/target/dist/${ARTIFACT_SUFFIX}"
+TARGET_BINARY="${TARGET_DIR}/${TARGET_TRIPLE}/${PROFILE_DIR}/sned"
+ARTIFACT_DIR="${TARGET_DIR}/dist/${ARTIFACT_SUFFIX}"
+PACKAGE_DIR="${ARTIFACT_DIR}/sned-${VERSION}-${ARTIFACT_SUFFIX}"
 TARBALL="${ARTIFACT_DIR}/sned-${VERSION}-${ARTIFACT_SUFFIX}.tar.gz"
-STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sned-package.XXXXXX")"
-
-cleanup() {
-    rm -rf "${STAGING_DIR}"
-}
-trap cleanup EXIT
 
 mkdir -p "${ARTIFACT_DIR}"
+rm -rf "${PACKAGE_DIR}"
+rm -f "${TARBALL}"
 
-if [[ "${HOST_OS}" == "${TARGET_OS}" ]]; then
+if [[ "${HOST_TARGET}" == "${TARGET_TRIPLE}" ]]; then
     BUILD_CMD=(cargo build)
 elif command -v cargo-zigbuild >/dev/null 2>&1; then
     BUILD_CMD=(cargo zigbuild)
@@ -108,13 +105,33 @@ printf '%s\n' "version: ${VERSION}"
 printf '%s\n' "target: ${TARGET_TRIPLE}"
 printf '%s\n' "mode: ${BUILD_MODE}"
 printf '%s\n' "builder: ${BUILD_CMD[*]}"
+printf '%s\n' "target directory: ${TARGET_DIR}"
 
-rustup target add "${TARGET_TRIPLE}" >/dev/null 2>&1 || true
+if ! command -v rustup >/dev/null 2>&1; then
+    printf '%s\n' "rustup is required to install target ${TARGET_TRIPLE}" >&2
+    exit 1
+fi
+
+if ! rustup target add "${TARGET_TRIPLE}"; then
+    printf '%s\n' "unable to install Rust target ${TARGET_TRIPLE}" >&2
+    exit 1
+fi
+
+BUILD_ARGS=(
+    --target "${TARGET_TRIPLE}"
+    --target-dir "${TARGET_DIR}"
+    --locked
+    --manifest-path "${PROJECT_ROOT}/Cargo.toml"
+    --bin sned
+)
+if [[ -n "${BUILD_FLAG}" ]]; then
+    BUILD_ARGS+=("${BUILD_FLAG}")
+fi
 
 if [[ "${BUILD_CMD[1]}" == "zigbuild" ]]; then
-    CARGO_INCREMENTAL=0 cargo zigbuild --target "${TARGET_TRIPLE}" ${BUILD_FLAG} --manifest-path "${PROJECT_ROOT}/Cargo.toml"
+    CARGO_INCREMENTAL=0 cargo zigbuild "${BUILD_ARGS[@]}"
 else
-    CARGO_INCREMENTAL=0 cargo build --target "${TARGET_TRIPLE}" ${BUILD_FLAG} --manifest-path "${PROJECT_ROOT}/Cargo.toml"
+    CARGO_INCREMENTAL=0 cargo build "${BUILD_ARGS[@]}"
 fi
 
 if [[ ! -f "${TARGET_BINARY}" ]]; then
@@ -122,11 +139,9 @@ if [[ ! -f "${TARGET_BINARY}" ]]; then
     exit 1
 fi
 
-mkdir -p "${STAGING_DIR}"
-cp "${TARGET_BINARY}" "${STAGING_DIR}/sned"
-chmod +x "${STAGING_DIR}/sned"
+mkdir -p "${PACKAGE_DIR}"
+cp "${TARGET_BINARY}" "${PACKAGE_DIR}/sned"
+chmod +x "${PACKAGE_DIR}/sned"
 
-tar -C "${STAGING_DIR}" -czf "${TARBALL}" sned
-
-printf '%s\n' "packaged ${TARBALL}"
-file "${STAGING_DIR}/sned" || true
+repack_release "${TARGET_DIR}" "${ARTIFACT_SUFFIX}" "${VERSION}"
+file "${PACKAGE_DIR}/sned" || true
