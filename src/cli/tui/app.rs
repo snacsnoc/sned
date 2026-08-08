@@ -3136,9 +3136,15 @@ impl App {
         {
             (None, theme::InputBorderState::Error)
         } else if self.reasoning_active {
-            (None, theme::InputBorderState::Reasoning)
+            (
+                Some(" Ɵ Thinking… ".to_string()),
+                theme::InputBorderState::Reasoning,
+            )
         } else if self.agent_busy {
-            (None, theme::InputBorderState::Processing)
+            (
+                Some(format!(" {} Processing… ", self.spinner_char())),
+                theme::InputBorderState::Processing,
+            )
         } else {
             (None, theme::InputBorderState::Idle)
         };
@@ -4917,7 +4923,6 @@ mod tests {
         assert!(rendered.contains("[n/Esc] Stop"));
         assert!(rendered.contains("[a] Trust session"));
         assert!(rendered.contains("[AUTO-APPROVE]"));
-        assert!(!rendered.contains("Agent processing..."));
         assert!(!rendered.contains("draft that must remain untouched"));
         assert!(app.approval_accepts_input());
         assert_eq!(
@@ -5041,7 +5046,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_input_uses_processing_border_without_busy_title() {
+    fn test_render_input_uses_processing_border_with_busy_title() {
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -5064,7 +5069,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(!rendered.contains("Agent processing..."));
+        assert!(rendered.contains("⠋ Processing…"));
         assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::ACCENT));
     }
 
@@ -6337,8 +6342,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(!rendered.contains("Reasoning..."));
-        assert!(!rendered.contains("Agent processing..."));
+        assert!(rendered.contains("Ɵ Thinking…"));
         assert_eq!(
             buffer.cell((0, 9)).map(|cell| cell.fg),
             Some(theme::WARNING_FG)
@@ -6346,7 +6350,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_input_uses_processing_border_when_not_reasoning() {
+    fn test_render_input_uses_processing_border_and_title_when_not_reasoning() {
         let _approval_guard = crate::core::approval::approval_test_guard();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -6370,8 +6374,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(!rendered.contains("Agent processing..."));
-        assert!(!rendered.contains("Reasoning..."));
+        assert!(rendered.contains("⠋ Processing…"));
         assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::ACCENT));
     }
 
