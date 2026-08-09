@@ -3209,7 +3209,7 @@ impl App {
         );
 
         if max_scroll > 0 {
-            let mut state = ScrollbarState::new(total_rows)
+            let mut state = ScrollbarState::new(max_scroll.saturating_add(1))
                 .viewport_content_length(viewport_rows)
                 .position(scroll_y);
             frame.render_stateful_widget(
@@ -3484,11 +3484,14 @@ impl App {
         }
 
         if output_rows > content_height {
+            let scrollbar_content_length = output_rows
+                .saturating_sub(content_height.max(1))
+                .saturating_add(1);
             self.scrollbar_state = self
                 .scrollbar_state
-                .content_length(output_rows)
+                .content_length(scrollbar_content_length)
                 .viewport_content_length(content_height.max(1))
-                .position(scroll_y.min(output_rows));
+                .position(scroll_y.min(scrollbar_content_length.saturating_sub(1)));
             frame.render_stateful_widget(
                 Scrollbar::default()
                     .orientation(ScrollbarOrientation::VerticalRight)
@@ -5805,6 +5808,58 @@ mod tests {
         let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
         assert!(!rendered.contains('↑'));
         assert!(!rendered.contains('↓'));
+    }
+
+    #[test]
+    fn test_output_scrollbar_tracks_top_and_bottom_of_transcript() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        for index in 0..30 {
+            app.push_plain(format!("line {index}"));
+        }
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("bottom output should render");
+        let width = terminal.backend().buffer().area.width as usize;
+        let right_edge = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width)
+            .map(|row| row.last().expect("every row has a right edge").symbol())
+            .collect::<Vec<_>>();
+        let end_arrow = right_edge
+            .iter()
+            .position(|symbol| *symbol == "↓")
+            .expect("bottom scrollbar arrow should render");
+        assert_eq!(
+            right_edge[end_arrow.saturating_sub(1)],
+            "█",
+            "bottom scrollbar thumb should touch the end arrow"
+        );
+
+        app.scroll_lines(-isize::MAX);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("top output should render");
+        let right_edge = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width)
+            .map(|row| row.last().expect("every row has a right edge").symbol())
+            .collect::<Vec<_>>();
+        let start_arrow = right_edge
+            .iter()
+            .position(|symbol| *symbol == "↑")
+            .expect("top scrollbar arrow should render");
+        assert_eq!(
+            right_edge[start_arrow + 1],
+            "█",
+            "top scrollbar thumb should touch the start arrow"
+        );
     }
 
     #[test]
