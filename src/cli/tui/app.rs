@@ -507,6 +507,8 @@ pub struct App {
     pub output_overflow_summary: String,
     /// Number of messages queued for the agent.
     pub queued_message_count: usize,
+    /// Text previews for messages still waiting in the agent queue.
+    queued_message_previews: Vec<String>,
     /// Queued prompts which have not started yet. Terminal panels from the
     /// current turn are stale once the user has submitted one of these.
     pending_queued_prompts: usize,
@@ -956,6 +958,7 @@ impl App {
             output_overflow_count: 0,
             output_overflow_summary: String::new(),
             queued_message_count: 0,
+            queued_message_previews: Vec::new(),
             pending_queued_prompts: 0,
             scrollback_file: Some(crate::storage::disk::get_data_dir().join("scrollback/lines")),
             scrollback_count: 0,
@@ -1548,6 +1551,32 @@ impl App {
 
     pub fn set_pending_queued_prompts(&mut self, count: usize) {
         self.pending_queued_prompts = count;
+    }
+
+    /// Update the live queue display from the agent's current queue.
+    pub fn set_queued_message_state(&mut self, count: usize, previews: Vec<String>) {
+        let mut previews = previews;
+        previews.truncate(count);
+        if self.queued_message_count == count && self.queued_message_previews == previews {
+            return;
+        }
+        self.queued_message_count = count;
+        self.queued_message_previews = previews;
+        self.needs_redraw = true;
+    }
+
+    /// Remove the message that is beginning its agent turn from the live queue display.
+    pub fn queued_message_started(&mut self, remaining: usize) {
+        if !self.queued_message_previews.is_empty() {
+            self.queued_message_previews.remove(0);
+        }
+        self.queued_message_previews.truncate(remaining);
+        self.queued_message_count = remaining;
+        self.needs_redraw = true;
+    }
+
+    fn queued_preview_height(&self) -> u16 {
+        u16::from(self.queued_message_count > 0)
     }
 
     #[must_use]
@@ -3058,14 +3087,16 @@ impl App {
         };
         frame.render_widget(Clear, plan_area);
 
-        let [output_area, status_area, input_area] = Layout::vertical([
+        let [output_area, queue_area, status_area, input_area] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(self.queued_preview_height()),
             Constraint::Length(1),
             Constraint::Length(self.render_input_height()),
         ])
         .areas(main_area);
 
         self.render_output(frame, output_area);
+        self.render_queue_preview(frame, queue_area);
         self.render_status_bar(frame, status_area);
         self.render_input(frame, input_area);
         if self.picker_active {
@@ -3103,6 +3134,36 @@ impl App {
         if let Some(ref plan) = self.plan_state_cache {
             super::plan_panel::render_plan_panel(plan, frame, area);
         }
+    }
+
+    fn render_queue_preview(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+
+        frame.render_widget(Clear, area);
+
+        let count = self.queued_message_count;
+        let mut message = format!(" ⏳ Queued ({count})");
+        if let Some(preview) = self.queued_message_previews.first() {
+            let preview = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !preview.is_empty() {
+                message.push_str(": ");
+                message.push_str(&preview);
+            }
+        }
+        if count > 1 {
+            message.push_str(&format!("  +{} more", count - 1));
+        }
+
+        let message = Self::truncate_status_text(&message, area.width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                message,
+                Style::default().fg(theme::WARNING_FG),
+            ))),
+            area,
+        );
     }
 
     fn render_input(&mut self, frame: &mut Frame, input_area: Rect) {
@@ -3357,9 +3418,6 @@ impl App {
         }
         if self.output_overflow {
             right_segments.push(format!("⚠ {} dropped", self.output_overflow_count));
-        }
-        if self.queued_message_count > 0 {
-            right_segments.push(format!("📨 {} queued", self.queued_message_count));
         }
         if self.scroll_mode == ScrollMode::Manual && self.unseen_output_count > 0 {
             right_segments.push(format!("↑ {} new", self.unseen_output_count));
@@ -5757,6 +5815,62 @@ mod tests {
         assert!(rendered.contains("65% ctx"));
         assert!(rendered.contains("⏱ 42s"));
         assert!(!rendered.contains("queued"));
+    }
+
+    #[test]
+    fn test_queued_preview_is_visible_until_queue_drains() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.set_queued_message_state(
+            2,
+            vec![
+                "first line\nsecond line".to_string(),
+                "another queued message".to_string(),
+            ],
+        );
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("queued preview should render");
+        let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("⏳"));
+        assert!(rendered.contains("Queued (2): first line second line"));
+        assert!(rendered.contains("+1 more"));
+        assert!(!rendered.contains("📨 2 queued"));
+
+        app.set_queued_message_state(0, Vec::new());
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("cleared queue should render");
+        let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert!(!rendered.contains("Queued (2)"));
+    }
+
+    #[test]
+    fn test_queued_preview_truncates_to_one_line() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.set_queued_message_state(
+            1,
+            vec!["a very long queued message that continues".to_string()],
+        );
+
+        terminal
+            .draw(|frame| app.render_queue_preview(frame, Rect::new(0, 0, 40, 1)))
+            .expect("queued preview should render");
+        let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("⏳"));
+        assert!(rendered.contains("Queued (1):"));
+        assert!(rendered.contains('…'));
+        assert!(!rendered.contains("continues"));
     }
 
     #[test]

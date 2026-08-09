@@ -53,6 +53,7 @@ use tracing::{error, info, warn};
 
 const DEFAULT_MESSAGE_QUEUE_MAX_LEN: usize = 1000;
 const MESSAGE_QUEUE_MAX_LEN_ENV: &str = "SNED_AGENT_MAX_QUEUED_MESSAGES";
+const MAX_QUEUED_MESSAGE_PREVIEW_CHARS: usize = 256;
 
 /// Default token limit for tool results stored in history (~5000 tokens / ~20KB)
 const DEFAULT_TOOL_RESULT_HISTORY_LIMIT: usize = 20_000;
@@ -596,6 +597,31 @@ impl MessageQueueHandle {
     /// Synchronous queue length (for use in the TUI main loop).
     pub fn try_queued_message_count(&self) -> Option<usize> {
         self.queue.try_lock().ok().map(|q| q.len())
+    }
+
+    /// Synchronously read the queue count and text previews for the TUI.
+    pub fn try_queued_message_snapshot(&self, limit: usize) -> Option<(usize, Vec<String>)> {
+        let queue = self.queue.try_lock().ok()?;
+        let count = queue.len();
+        let previews = queue
+            .iter()
+            .take(limit)
+            .filter_map(|msg| match &msg.content {
+                MessageContent::Text(text) => {
+                    let mut chars = text.chars();
+                    let mut preview: String = chars
+                        .by_ref()
+                        .take(MAX_QUEUED_MESSAGE_PREVIEW_CHARS)
+                        .collect();
+                    if chars.next().is_some() {
+                        preview.push('…');
+                    }
+                    Some(preview)
+                }
+                _ => None,
+            })
+            .collect();
+        Some((count, previews))
     }
 
     pub async fn has_queued_messages(&self) -> bool {
@@ -1338,7 +1364,8 @@ impl AgentLoop {
                                 .output_writer
                                 .emit(OutputEvent::info("Processing queued message"));
                         }
-                        // Re-display the queued message as a user prompt in the TUI output.
+                        // Display the queued message in the transcript only when
+                        // it leaves the queue and begins its agent turn.
                         if let MessageContent::Text(ref text) = queued_message.content {
                             self.config
                                 .output_writer
@@ -1426,7 +1453,8 @@ impl AgentLoop {
                                         .output_writer
                                         .emit(OutputEvent::info("Processing queued message"));
                                 }
-                                // Re-display the queued message as a user prompt in the TUI output.
+                                // Display the queued message in the transcript only when
+                                // it leaves the queue and begins its agent turn.
                                 if let MessageContent::Text(ref text) = queued_message.content {
                                     self.config
                                         .output_writer
@@ -7678,6 +7706,22 @@ mod tests {
         agent.enqueue_text_message("World".to_string()).await;
         assert_eq!(agent.queued_message_count().await, 2);
         assert!(agent.has_queued_messages().await);
+        assert_eq!(
+            agent
+                .message_queue_handle()
+                .try_queued_message_snapshot(3),
+            Some((2, vec!["Hello".to_string(), "World".to_string()]))
+        );
+
+        let long_message = "x".repeat(MAX_QUEUED_MESSAGE_PREVIEW_CHARS + 100);
+        agent.enqueue_text_message(long_message).await;
+        let (_, previews) = agent
+            .message_queue_handle()
+            .try_queued_message_snapshot(3)
+            .expect("queue snapshot should be available");
+        assert_eq!(previews.len(), 3);
+        assert_eq!(previews[2].chars().count(), MAX_QUEUED_MESSAGE_PREVIEW_CHARS + 1);
+        assert!(previews[2].ends_with('…'));
     }
 
     #[tokio::test]

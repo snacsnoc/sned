@@ -1036,6 +1036,7 @@ def plan_queued_input():
     sent_queued = False
     queue_ack_seen = False
     queued_processed = False
+    queued_transcript_seen = False
     next_act_attempt_at = None
     sent_act = False
     act_mode_seen = False
@@ -1043,6 +1044,7 @@ def plan_queued_input():
 
     def tick(session):
         nonlocal sent_prompt, sent_queued, queue_ack_seen, queued_processed
+        nonlocal queued_transcript_seen
         nonlocal next_act_attempt_at, sent_act, act_mode_seen
         nonlocal sent_exit
         clean = clean_output(session.buf)
@@ -1055,12 +1057,24 @@ def plan_queued_input():
         if "QUEUE_BUSY_PLAN" in clean and not sent_queued:
             session.send(b"queued while the plan agent is busy\r")
             sent_queued = True
-        if sent_queued and "Message queued" in clean:
+        if (
+            sent_queued
+            and "Queued (1)" in clean
+            and "queued while the plan agent is busy" in clean
+        ):
             queue_ack_seen = True
         if sent_queued and "QUEUEDINPUTPROCESSED" in compact_clean:
             queued_processed = True
             if next_act_attempt_at is None:
                 next_act_attempt_at = time.monotonic() + 0.5
+        compact_tail = compact_output(tail)
+        processed_index = compact_tail.rfind("QUEUEDINPUTPROCESSED")
+        queued_index = compact_tail.find(
+            "queuedwhiletheplanagentisbusy",
+            processed_index + len("QUEUEDINPUTPROCESSED"),
+        )
+        if queued_processed and processed_index >= 0 and queued_index >= 0:
+            queued_transcript_seen = True
         if (
             queued_processed
             and next_act_attempt_at is not None
@@ -1087,18 +1101,13 @@ def plan_queued_input():
         session.dump_if_verbose()
         clean = clean_output(session.buf)
         compact_clean = compact_output(clean)
-        queued_prompt = "queuedwhiletheplanagentisbusy"
-        first_prompt_index = compact_clean.find(queued_prompt)
-        queued_prompt_index = compact_clean.find(
-            queued_prompt, first_prompt_index + len(queued_prompt)
-        )
         report(
             [
                 (sent_prompt, "initial busy plan prompt was not sent"),
                 (sent_queued, "user message was not submitted while the plan agent was busy"),
-                (queue_ack_seen, "queued user message was not acknowledged"),
-                (queued_prompt_index > first_prompt_index, "queued input was not replayed after queue processing began"),
+                (queue_ack_seen, "queued user message was not shown in the live queue strip"),
                 (queued_processed, "queued user message response was lost or misrouted"),
+                (queued_transcript_seen, "queued input did not enter the visible transcript after processing began"),
                 (sent_act, "/act was not sent after queued input completed"),
                 (act_mode_seen, "ACT mode was not visible after queued-input plan exit"),
                 (sent_exit, "/exit was not sent after queued-input completion"),

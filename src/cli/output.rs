@@ -525,6 +525,7 @@ impl OutputWriter for ChannelOutputWriter {
                     | OutputEvent::Completion(_)
                     | OutputEvent::ErrorBox(_)
                     | OutputEvent::QueuedMessageStarted { .. }
+                    | OutputEvent::UserPromptLine(_)
                     | OutputEvent::ReasoningChunk(_)
             );
 

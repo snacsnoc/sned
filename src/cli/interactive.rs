@@ -757,7 +757,7 @@ fn apply_output_event(
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
         OutputEvent::QueuedMessageStarted { remaining } => {
-            app.queued_message_count = remaining;
+            app.queued_message_started(remaining);
             app.set_pending_queued_prompts(remaining);
         }
         OutputEvent::LocalCommandEcho(line) => {
@@ -1026,6 +1026,22 @@ fn drain_output_queues(
         }
     }
 
+    // A queued turn begins with a prompt. If either half of that boundary
+    // bypassed a full main channel, apply the deferred priority events first
+    // so an older response cannot appear before the prompt that follows it.
+    let queued_prompt_boundary = deferred_priority.iter().any(|event| {
+        matches!(
+            event,
+            OutputEvent::QueuedMessageStarted { .. } | OutputEvent::UserPromptLine(_)
+        )
+    });
+    if queued_prompt_boundary {
+        for event in std::mem::take(&mut deferred_priority) {
+            saw_output = true;
+            apply_output_event(app, event, &mut pending_model_update);
+        }
+    }
+
     while let Ok(event) = rx.try_recv() {
         if matches!(
             &event,
@@ -1114,6 +1130,21 @@ fn record_submit_history(app: &mut App, text: &str) {
     if let Err(e) = append_to_history(text) {
         tracing::warn!("Failed to save command history: {}", e);
     }
+}
+
+fn echo_agent_prompt(app: &mut App, text: &str, output_writer: &OutputWriterArc) {
+    // Echo only after the caller has decided to start a turn. A prompt that
+    // is queued must not appear in transcript history before it is dequeued.
+    if !app.output_lines.is_empty()
+        && app.output_lines.back().is_some_and(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.content.as_ref().starts_with('─'))
+        })
+    {
+        app.push_turn_separator();
+    }
+    app.push_user_message(text, output_writer);
 }
 
 /// Test-only: drain the output channel into the app buffer without any
@@ -1517,7 +1548,18 @@ fn handle_idle_ctrl_c(app: &mut App) {
 }
 
 /// Handle key events in ratatui loop (non-Ctrl+C keys).
+#[cfg(test)]
 async fn handle_key_event(
+    key: KeyEvent,
+    app: &mut App,
+    output_writer: &OutputWriterArc,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    task_id: &str,
+) -> anyhow::Result<Option<Action>> {
+    handle_key_event_inner(key, app, output_writer, state_handle, task_id).await
+}
+
+async fn handle_key_event_inner(
     key: KeyEvent,
     app: &mut App,
     output_writer: &OutputWriterArc,
@@ -1738,21 +1780,23 @@ async fn handle_key_event(
                 return Ok(Some(Action::Submit { text, cli_cmd }));
             }
 
-            // Turn separator before user message (only if a previous turn completed)
-            // Check if output already has a turn separator (from previous agent completion)
-            if !app.output_lines.is_empty()
-                && app.output_lines.back().is_some_and(|line| {
-                    line.spans
-                        .first()
-                        .is_some_and(|span| span.content.as_ref().starts_with('─'))
-                })
-            {
-                app.push_turn_separator();
-            }
-            if cli_cmd.is_some() {
+            let is_local_command = cli_cmd
+                .as_ref()
+                .is_some_and(crate::cli::slash_commands::CliOnlyCommand::is_local_command);
+            if is_local_command {
+                // Turn separator before an actual user message (only if a
+                // previous turn completed). Queued prompts get neither a
+                // transcript line nor a separator until they start.
+                if !app.output_lines.is_empty()
+                    && app.output_lines.back().is_some_and(|line| {
+                        line.spans
+                            .first()
+                            .is_some_and(|span| span.content.as_ref().starts_with('─'))
+                    })
+                {
+                    app.push_turn_separator();
+                }
                 app.push_local_command_echo(&text, output_writer);
-            } else {
-                app.push_user_message(&text, output_writer);
             }
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
@@ -3183,11 +3227,9 @@ async fn run_main_loop(
             // Poll queue count from AgentLoop so the TUI can show it in the status bar.
             if let Ok(qh) = queue_handle.try_lock()
                 && let Some(handle) = qh.as_ref()
-                && let Some(new_count) = handle.try_queued_message_count()
-                && new_count != app.queued_message_count
+                && let Some((new_count, previews)) = handle.try_queued_message_snapshot(3)
             {
-                app.queued_message_count = new_count;
-                app.needs_redraw = true;
+                app.set_queued_message_state(new_count, previews);
             }
             let us = t.elapsed().as_micros() as u64;
             timing.drain_total_us += us;
@@ -3423,7 +3465,8 @@ async fn run_main_loop(
                     }
 
                     if let Some(action) =
-                        handle_key_event(key, app, &output_writer, &state_handle, &task_id).await?
+                        handle_key_event_inner(key, app, &output_writer, &state_handle, &task_id)
+                            .await?
                     {
                         app.clear_text_selection();
                         match action {
@@ -3553,6 +3596,13 @@ async fn run_main_loop(
                                         app.push_plain("Entering plan mode...");
                                         app.mode = "PLAN".to_string();
                                         app.update_placeholder();
+                                        echo_agent_prompt(app, &text, &output_writer);
+                                        drain_and_render_user_submit(
+                                            terminal,
+                                            app,
+                                            priority_output_rx,
+                                            output_rx,
+                                        )?;
                                         // The busy check above guarantees this will not wait on
                                         // an AgentLoop currently held by another run.
                                         spawn_agent_task(
@@ -3623,13 +3673,6 @@ async fn run_main_loop(
                                             qh.enqueue_text_message(text.clone()).await;
                                             let count = qh.queued_message_count().await;
                                             app.set_pending_queued_prompts(count);
-                                            // Message already echoed by handle_key_event
-                                            app.push_styled(
-                                                format!(
-                                                    "Command queued ({count} in queue): {text}"
-                                                ),
-                                                theme::dim_style(),
-                                            );
                                         }
                                         continue;
                                     }
@@ -3663,14 +3706,9 @@ async fn run_main_loop(
                                     && let Some(qh) = queue_handle.lock().await.as_ref()
                                     && !processed.is_empty()
                                 {
-                                    // Message already echoed by handle_key_event; just enqueue
                                     qh.enqueue_text_message(processed).await;
                                     let count = qh.queued_message_count().await;
                                     app.set_pending_queued_prompts(count);
-                                    app.push_styled(
-                                        format!("Message queued ({count} in queue)"),
-                                        theme::dim_style(),
-                                    );
                                 } else {
                                     app.set_pending_queued_prompts(0);
                                     if let Some(acknowledgement) =
@@ -3678,6 +3716,13 @@ async fn run_main_loop(
                                     {
                                         app.push_plain(acknowledgement);
                                     }
+                                    echo_agent_prompt(app, &text, &output_writer);
+                                    drain_and_render_user_submit(
+                                        terminal,
+                                        app,
+                                        priority_output_rx,
+                                        output_rx,
+                                    )?;
                                     spawn_agent_task(
                                         &session,
                                         &processed,
@@ -4256,6 +4301,38 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_output_priority_lane_preserves_queued_prompt_under_stress() {
+        use crate::cli::output::{OutputEvent, OutputWriter};
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        writer.emit(OutputEvent::plain("line 1"));
+        writer.emit(OutputEvent::queued_message_started(0));
+        writer.emit(OutputEvent::user_prompt_line("queued under backpressure"));
+
+        let mut app = App::new();
+        app.set_queued_message_state(1, vec!["queued under backpressure".to_string()]);
+        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+
+        assert_eq!(app.queued_message_count, 0);
+        let rendered = transcript_text(&app);
+        let queued_prompt = rendered
+            .find("queued under backpressure")
+            .expect("queued prompt should enter the transcript");
+        let backlog = rendered.find("line 1").expect("main backlog should remain");
+        assert!(
+            queued_prompt < backlog,
+            "queued prompt must precede a response already waiting in the main lane"
+        );
+        assert_eq!(writer.dropped_count(), 0);
+        assert!(!writer.take_overflow_signal());
+    }
+
+    #[test]
     fn test_drain_output_priority_lane_preserves_reasoning_under_stress() {
         use crate::cli::output::{OutputEvent, OutputWriter};
 
@@ -4651,6 +4728,78 @@ mod tests {
                 .any(|line| line.contains(result)),
             "a suppressed completion must remain in the transcript"
         );
+    }
+
+    #[tokio::test]
+    async fn test_queued_prompt_enters_transcript_only_when_dequeued() -> anyhow::Result<()> {
+        use crate::cli::output::OutputEvent;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx.clone()));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.input = App::new_textarea(vec!["queued message".to_string()]);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(matches!(action, Some(Action::Submit { .. })));
+        drain_output(&mut rx, &mut app);
+        assert!(!transcript_text(&app).contains("queued message"));
+
+        app.set_queued_message_state(1, vec!["queued message".to_string()]);
+        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 0 })
+            .unwrap();
+        tx.try_send(OutputEvent::user_prompt_line("❯ queued message"))
+            .unwrap();
+        drain_output(&mut rx, &mut app);
+
+        assert_eq!(
+            transcript_text(&app).matches("queued message").count(),
+            1,
+            "the queued prompt should enter history once when its turn starts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_echo_waits_for_final_busy_state() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.agent_busy = true;
+        app.input = App::new_textarea(vec!["finished prompt".to_string()]);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(matches!(action, Some(Action::Submit { .. })));
+        drain_output(&mut rx, &mut app);
+        assert!(!transcript_text(&app).contains("finished prompt"));
+
+        // The caller has now observed the worker as idle and is starting the
+        // turn, so this is the point where the prompt enters history.
+        echo_agent_prompt(&mut app, "finished prompt", &output_writer);
+        drain_output(&mut rx, &mut app);
+        assert!(transcript_text(&app).contains("finished prompt"));
+        Ok(())
     }
 
     #[test]
