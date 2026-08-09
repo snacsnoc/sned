@@ -2018,6 +2018,7 @@ async fn handle_cli_only_command(
     agent_start_time: &Arc<Mutex<Option<Instant>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    queue_handle: &Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
     task_opts: &TaskOptions,
     auto_approve: bool,
 ) -> anyhow::Result<bool> {
@@ -2168,22 +2169,26 @@ async fn handle_cli_only_command(
             }
         }
         CliOnlyCommand::Stats => {
-            let sess = session.lock().await;
-            let sh = sess.agent_loop().await.state_handle();
-            let state = sh.lock().await;
-            let stats = format_stats_text(&state);
-            app.push_plain(stats);
+            let state = state_handle.lock().await.clone();
+            if let Some(state) = state {
+                let state = state.lock().await;
+                app.push_plain(format_stats_text(&state));
+            } else {
+                app.push_plain("Task state unavailable.");
+            }
         }
         CliOnlyCommand::Changes => {
-            let sess = session.lock().await;
-            let sh = sess.agent_loop().await.state_handle();
-            let state = sh.lock().await;
-            let changes = format_changes_text(&state);
-            app.push_plain(changes);
+            let state = state_handle.lock().await.clone();
+            if let Some(state) = state {
+                let state = state.lock().await;
+                app.push_plain(format_changes_text(&state));
+            } else {
+                app.push_plain("Task state unavailable.");
+            }
         }
         CliOnlyCommand::Queue => {
-            let sess = session.lock().await;
-            if let Some(qh) = sess.message_queue_handle().await {
+            let queue = queue_handle.lock().await.clone();
+            if let Some(qh) = queue {
                 let count = qh.queued_message_count().await;
                 if count == 0 {
                     app.push_plain("No messages queued.");
@@ -3541,6 +3546,7 @@ async fn run_main_loop(
                                     &agent_start_time,
                                     &agent_task,
                                     &state_handle,
+                                    &queue_handle,
                                     task_opts,
                                     auto_approve,
                                 )
@@ -3633,6 +3639,7 @@ async fn run_main_loop(
                                             &agent_start_time,
                                             &agent_task,
                                             &state_handle,
+                                            &queue_handle,
                                             task_opts,
                                             auto_approve,
                                         )
@@ -7471,6 +7478,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
@@ -7527,6 +7535,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &retry_test_task_opts(),
             false,
         )
@@ -7596,6 +7605,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &retry_test_task_opts(),
             false,
         )
@@ -7672,6 +7682,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &retry_test_task_opts(),
             false,
         )
@@ -7782,6 +7793,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
@@ -7865,6 +7877,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
@@ -7937,6 +7950,7 @@ mod tests {
                 &agent_start_time,
                 &agent_task,
                 &state_handle_slot,
+                &Arc::new(Mutex::new(None)),
                 &task_opts,
                 false,
             ),
@@ -7952,6 +7966,231 @@ mod tests {
                 .collect::<String>()
                 .contains("No active plan.")
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_inspection_commands_do_not_wait_for_running_agent_loop() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        use tokio::time::{Duration, timeout};
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let (agent_loop, task_id, task_state, queue) = {
+            let sess = session.lock().await;
+            let task_id = sess.agent_loop().await.task_id().to_string();
+            let task_state = sess.state_handle().await;
+            let queue = sess.queue_handle().await;
+            (Arc::clone(&sess.agent_loop), task_id, task_state, queue)
+        };
+        queue
+            .enqueue_text_message("queued while agent is busy".to_string())
+            .await;
+
+        let _running_agent = agent_loop.lock().await;
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(task_state)));
+        let queue_handle_slot = Arc::new(Mutex::new(Some(queue)));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+
+        let mut stats_app = App::new();
+        let stats_result = timeout(
+            Duration::from_millis(100),
+            handle_cli_only_command(
+                CliOnlyCommand::Stats,
+                "/stats",
+                &mut stats_app,
+                &output_writer,
+                &session,
+                &task_id,
+                &agent_busy,
+                &agent_done,
+                &agent_start_time,
+                &agent_task,
+                &state_handle_slot,
+                &queue_handle_slot,
+                &task_opts,
+                false,
+            ),
+        )
+        .await
+        .expect("/stats must not wait for a running agent loop")?;
+        assert!(!stats_result);
+        assert!(stats_app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("No API request info available yet.")
+        }));
+
+        let mut changes_app = App::new();
+        let changes_result = timeout(
+            Duration::from_millis(100),
+            handle_cli_only_command(
+                CliOnlyCommand::Changes,
+                "/changes",
+                &mut changes_app,
+                &output_writer,
+                &session,
+                &task_id,
+                &agent_busy,
+                &agent_done,
+                &agent_start_time,
+                &agent_task,
+                &state_handle_slot,
+                &queue_handle_slot,
+                &task_opts,
+                false,
+            ),
+        )
+        .await
+        .expect("/changes must not wait for a running agent loop")?;
+        assert!(!changes_result);
+        assert!(changes_app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("No files tracked in this session yet.")
+        }));
+
+        let mut queue_app = App::new();
+        let queue_result = timeout(
+            Duration::from_millis(100),
+            handle_cli_only_command(
+                CliOnlyCommand::Queue,
+                "/queue",
+                &mut queue_app,
+                &output_writer,
+                &session,
+                &task_id,
+                &agent_busy,
+                &agent_done,
+                &agent_start_time,
+                &agent_task,
+                &state_handle_slot,
+                &queue_handle_slot,
+                &task_opts,
+                false,
+            ),
+        )
+        .await
+        .expect("/queue must not wait for a running agent loop")?;
+        assert!(!queue_result);
+        assert!(queue_app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("1 message(s) queued:")
+        }));
+        assert!(queue_app.output_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("queued while agent is busy")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_inspection_commands_handle_unavailable_published_handles() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        use tokio::time::{Duration, timeout};
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let (agent_loop, task_id) = {
+            let sess = session.lock().await;
+            (
+                Arc::clone(&sess.agent_loop),
+                sess.agent_loop().await.task_id().to_string(),
+            )
+        };
+        let _running_agent = agent_loop.lock().await;
+
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>> =
+            Arc::new(Mutex::new(None));
+        let queue_handle_slot: Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>> =
+            Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+
+        for (command, text, expected) in [
+            (CliOnlyCommand::Stats, "/stats", "Task state unavailable."),
+            (
+                CliOnlyCommand::Changes,
+                "/changes",
+                "Task state unavailable.",
+            ),
+            (
+                CliOnlyCommand::Queue,
+                "/queue",
+                "No message queue available.",
+            ),
+        ] {
+            let mut app = App::new();
+            let result = timeout(
+                Duration::from_millis(100),
+                handle_cli_only_command(
+                    command,
+                    text,
+                    &mut app,
+                    &output_writer,
+                    &session,
+                    &task_id,
+                    &agent_busy,
+                    &agent_done,
+                    &agent_start_time,
+                    &agent_task,
+                    &state_handle_slot,
+                    &queue_handle_slot,
+                    &task_opts,
+                    false,
+                ),
+            )
+            .await
+            .expect("inspection command must not wait for an unavailable handle")?;
+
+            assert!(!result);
+            assert!(app.output_lines.iter().any(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains(expected)
+            }));
+        }
+
         Ok(())
     }
 
@@ -8002,6 +8241,7 @@ mod tests {
                 &agent_start_time,
                 &agent_task,
                 &state_handle_slot,
+                &Arc::new(Mutex::new(None)),
                 &task_opts,
                 false,
             ),
@@ -8107,6 +8347,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
@@ -8241,6 +8482,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
@@ -8365,6 +8607,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
@@ -8493,6 +8736,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
@@ -8612,6 +8856,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
@@ -8735,6 +8980,7 @@ mod tests {
             &agent_start_time,
             &agent_task,
             &state_handle_slot,
+            &Arc::new(Mutex::new(None)),
             &task_opts,
             false,
         )
