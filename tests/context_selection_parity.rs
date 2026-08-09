@@ -59,6 +59,7 @@ fn create_api_req_info(
         cache_writes,
         cache_reads,
         reasoning_tokens: None,
+        context_tokens: None,
         cost: None,
         context_window,
         context_usage_percentage: None,

@@ -38,6 +38,7 @@ fn create_api_req_info(tokens_in: u32, tokens_out: u32, context_window: u64) -> 
         cache_writes: None,
         cache_reads: None,
         reasoning_tokens: None,
+        context_tokens: None,
         cost: None,
         context_window: Some(context_window),
         context_usage_percentage: None,

@@ -480,7 +480,7 @@ async fn activate_model_switch(
             let mut sess = session.lock().await;
             {
                 let mut agent = sess.agent_loop().await;
-                agent.set_provider(new_provider);
+                agent.set_provider(new_provider).await;
             }
             if let Some(api_key) = temp_opts.api_key.clone() {
                 sess.remember_provider_api_key(&request.provider, api_key);

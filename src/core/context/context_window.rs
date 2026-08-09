@@ -165,17 +165,38 @@ pub fn calculate_context_usage_percentage(
     cache_writes: Option<u32>,
     cache_reads: Option<u32>,
     context_window: u64,
-    _provider_name: &str,
+    provider_name: &str,
 ) -> f64 {
-    let cache_tokens = cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64;
-
-    let total_tokens = tokens_in as u64 + tokens_out as u64 + cache_tokens;
+    let total_tokens = calculate_context_tokens(
+        tokens_in,
+        tokens_out,
+        cache_writes,
+        cache_reads,
+        provider_name,
+    );
 
     if context_window == 0 {
         return 0.0;
     }
 
-    (total_tokens as f64 / context_window as f64) * 100.0
+    ((total_tokens as f64 / context_window as f64) * 100.0).min(100.0)
+}
+
+/// Reconstruct the context-sized token total from provider-normalized usage.
+#[must_use]
+pub(crate) fn calculate_context_tokens(
+    tokens_in: u32,
+    tokens_out: u32,
+    cache_writes: Option<u32>,
+    cache_reads: Option<u32>,
+    provider_name: &str,
+) -> u64 {
+    let cache_tokens = match provider_name {
+        "openai" | "minimax" | "deepseek" | "openrouter" => cache_reads.unwrap_or(0) as u64,
+        _ => cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64,
+    };
+
+    tokens_in as u64 + tokens_out as u64 + cache_tokens
 }
 
 #[cfg(test)]
@@ -254,7 +275,7 @@ mod tests {
                 200_000,
                 "anthropic"
             ),
-            107.5
+            100.0
         );
         assert_eq!(
             calculate_context_usage_percentage(0, 0, None, None, 100_000, "anthropic"),
@@ -281,6 +302,18 @@ mod tests {
         assert!(
             with_cache > without_cache,
             "for OpenAI, cache tokens should be counted (input_tokens excludes cache)"
+        );
+        assert_eq!(
+            calculate_context_usage_percentage(
+                50_000,
+                10_000,
+                Some(20_000),
+                Some(15_000),
+                200_000,
+                "openai"
+            ),
+            37.5,
+            "OpenAI cache writes are already included in input_tokens"
         );
     }
 

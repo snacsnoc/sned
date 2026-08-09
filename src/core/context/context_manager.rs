@@ -22,6 +22,8 @@ pub struct ApiReqInfo {
     pub cache_reads: Option<u32>,
     #[serde(rename = "reasoningTokens")]
     pub reasoning_tokens: Option<u32>,
+    #[serde(rename = "contextTokens")]
+    pub context_tokens: Option<u64>,
     pub cost: Option<f64>,
     pub context_window: Option<u64>,
     pub context_usage_percentage: Option<f64>,

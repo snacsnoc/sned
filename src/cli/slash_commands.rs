@@ -1584,6 +1584,12 @@ pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String 
         let cost = api_req_info.cost.unwrap_or(0.0);
         let context_pct = api_req_info.context_usage_percentage.unwrap_or(0.0);
         let context_window = api_req_info.context_window.unwrap_or(0);
+        let context_tokens = api_req_info.context_tokens.unwrap_or_else(|| {
+            u64::from(tokens_in)
+                .saturating_add(u64::from(tokens_out))
+                .saturating_add(u64::from(cache_writes))
+                .saturating_add(u64::from(cache_reads))
+        });
 
         let cache_str = if cache_writes > 0 || cache_reads > 0 {
             format!(" ({cache_writes}w/{cache_reads}r)")
@@ -1611,7 +1617,7 @@ pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String 
             reasoning_str,
             cost_str,
             context_pct,
-            api_req_info.tokens_in.unwrap_or(0) + api_req_info.tokens_out.unwrap_or(0),
+            context_tokens,
             context_window
         )
     } else {
@@ -2795,5 +2801,25 @@ mod tests {
                 "description must not be empty"
             );
         }
+    }
+
+    #[test]
+    fn test_stats_context_uses_tracked_context_tokens() {
+        let mut state = crate::core::agent_types::TaskState::default();
+        state.last_api_req_info = Some(crate::core::context::context_manager::ApiReqInfo {
+            tokens_in: Some(100),
+            tokens_out: Some(50),
+            cache_writes: Some(20),
+            cache_reads: Some(30),
+            reasoning_tokens: Some(25),
+            context_tokens: Some(200),
+            context_window: Some(1_000),
+            context_usage_percentage: Some(20.0),
+            ..Default::default()
+        });
+
+        let stats = format_stats_text(&state);
+
+        assert!(stats.contains("Context: 20.0% (200 / 1000)"));
     }
 }

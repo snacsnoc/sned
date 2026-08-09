@@ -959,8 +959,9 @@ impl AgentLoop {
     }
 
     /// Set the active provider. Preserves conversation history.
-    pub fn set_provider(&mut self, new_provider: Arc<Providers>) {
+    pub async fn set_provider(&mut self, new_provider: Arc<Providers>) {
         *self.config.provider.lock().unwrap() = new_provider;
+        self.state.lock().await.last_api_req_info = None;
     }
 
     /// Set the agent mode (used for Plan -> Act transition after approval).
@@ -2307,7 +2308,9 @@ impl AgentLoop {
                             && usage_chunk.id.is_none();
                         let mut state = self.state.lock().await;
                         if is_synthetic_empty_usage && stream_usage.is_none() {
-                            state.last_api_req_info = None;
+                            // Keep the last measured usage when this provider
+                            // response has no usage data. Do not replace it
+                            // with a fabricated zero or an estimate.
                             continue;
                         }
                         let prev_info = stream_usage.as_ref();
@@ -2334,10 +2337,28 @@ impl AgentLoop {
                         let cache_reads = usage_chunk
                             .cache_read_tokens
                             .or(prev_info.and_then(|r| r.cache_reads));
+                        let reasoning_tokens = usage_chunk
+                            .reasoning_tokens
+                            .or(prev_info.and_then(|r| r.reasoning_tokens));
+                        // Gemini marks thinking tokens separately from candidate output;
+                        // OpenAI-compatible providers include reasoning in completion_tokens.
+                        let context_output_tokens = if usage_chunk.thoughts_token_count.is_some() {
+                            tokens_out.saturating_add(reasoning_tokens.unwrap_or(0))
+                        } else {
+                            tokens_out
+                        };
+                        let context_tokens =
+                            crate::core::context::context_window::calculate_context_tokens(
+                                tokens_in,
+                                context_output_tokens,
+                                cache_writes,
+                                cache_reads,
+                                &provider_name,
+                            );
                         let context_usage_pct =
                             crate::core::context::context_window::calculate_context_usage_percentage(
                                 tokens_in,
-                                tokens_out,
+                                context_output_tokens,
                                 cache_writes,
                                 cache_reads,
                                 context_window,
@@ -2349,9 +2370,8 @@ impl AgentLoop {
                             tokens_out: Some(tokens_out),
                             cache_writes,
                             cache_reads,
-                            reasoning_tokens: usage_chunk
-                                .reasoning_tokens
-                                .or(prev_info.and_then(|r| r.reasoning_tokens)),
+                            reasoning_tokens,
+                            context_tokens: Some(context_tokens),
                             cost: usage_chunk.total_cost.or(prev_info.and_then(|r| r.cost)),
                             context_window: Some(context_window),
                             context_usage_percentage: Some(context_usage_pct),
@@ -9106,7 +9126,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_synthetic_empty_usage_does_not_reuse_prior_request_context() {
+    async fn test_context_percentage_includes_separate_thinking_tokens() {
+        use crate::providers::ApiStreamUsageChunk;
+
+        let responses = vec![vec![ApiStreamChunk::Usage(ApiStreamUsageChunk {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_write_tokens: None,
+            cache_read_tokens: None,
+            reasoning_tokens: Some(25),
+            thoughts_token_count: Some(25),
+            total_cost: None,
+            stop_reason: Some("stop".to_string()),
+            id: Some("thinking".to_string()),
+        })]];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-thinking-context"));
+
+        let _ = agent.execute_turn().await;
+
+        let state = agent.state.lock().await;
+        let usage = state
+            .last_api_req_info
+            .as_ref()
+            .expect("usage should be recorded");
+        assert_eq!(usage.context_tokens, Some(175));
+        assert_eq!(usage.context_usage_percentage, Some(175.0 / 8192.0 * 100.0));
+    }
+
+    #[tokio::test]
+    async fn test_synthetic_empty_usage_keeps_last_measured_context() {
         use crate::providers::ApiStreamUsageChunk;
 
         let responses = vec![
@@ -9151,6 +9205,70 @@ mod tests {
         );
 
         let _ = agent.execute_turn().await;
+        let state = agent.state.lock().await;
+        let api_info = state
+            .last_api_req_info
+            .as_ref()
+            .expect("synthetic empty usage must not erase the last measured context");
+        assert_eq!(api_info.tokens_in, Some(7_500));
+        assert_eq!(api_info.tokens_out, Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_provider_switch_clears_last_measured_context() {
+        use crate::providers::ApiStreamUsageChunk;
+
+        let first_provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                vec![vec![ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                    input_tokens: 7_500,
+                    output_tokens: 100,
+                    cache_write_tokens: None,
+                    cache_read_tokens: None,
+                    reasoning_tokens: None,
+                    thoughts_token_count: None,
+                    total_cost: None,
+                    stop_reason: Some("stop".to_string()),
+                    id: Some("first-provider".to_string()),
+                })]],
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(
+            first_provider,
+            "test-provider-switch-context",
+        ));
+
+        let _ = agent.execute_turn().await;
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .last_api_req_info
+                .is_some(),
+            "first provider should record usage"
+        );
+
+        let second_provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                vec![vec![ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_tokens: Some(0),
+                    cache_read_tokens: None,
+                    reasoning_tokens: None,
+                    thoughts_token_count: None,
+                    total_cost: None,
+                    stop_reason: Some("stop".to_string()),
+                    id: None,
+                })]],
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        agent.set_provider(second_provider).await;
+
+        let _ = agent.execute_turn().await;
         assert!(
             agent
                 .state
@@ -9158,7 +9276,7 @@ mod tests {
                 .await
                 .last_api_req_info
                 .is_none(),
-            "synthetic empty usage must not retain the prior request's context percentage"
+            "provider switch must not retain usage from the previous provider"
         );
     }
 
