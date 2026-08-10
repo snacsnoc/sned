@@ -733,6 +733,9 @@ fn apply_output_event(
         }
         OutputEvent::ToolOutputLine(line) => {
             flush_model_update(app, pending_model_update);
+            if line.to_string().contains("📋 Plan Generated") {
+                app.discard_current_turn_model_stream();
+            }
             app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
         }
         OutputEvent::ToolHeaderLine(line) => {
@@ -2666,7 +2669,22 @@ async fn handle_cli_only_command(
             app.push_plain("Plan prompt should be handled by the main loop.");
         }
         CliOnlyCommand::Act | CliOnlyCommand::PlanAbort => {
-            if agent_busy.load(Ordering::Relaxed) {
+            let paused_plan = if agent_busy.load(Ordering::Relaxed) {
+                let shared_state = state_handle.lock().await.clone();
+                if let Some(shared_state) = shared_state {
+                    shared_state
+                        .lock()
+                        .await
+                        .plan_state
+                        .as_ref()
+                        .is_some_and(|plan| plan.approved && plan.paused)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if agent_busy.load(Ordering::Relaxed) && !paused_plan {
                 app.push_styled(
                     "Agent is busy. Cancel it before aborting the plan.",
                     Style::default().fg(theme::WARNING_FG),
@@ -5573,6 +5591,87 @@ mod tests {
 
         // The recorded indices buffer is cleared after finalize.
         assert!(app.turn_stream_entries.is_empty());
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_discards_prose_before_plan_response() {
+        use crate::cli::output::OutputEvent;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(OutputEvent::model_output(
+            "Right — the plan is ready for your review.",
+        ))
+        .unwrap();
+        tx.try_send(OutputEvent::tool_call("▶ plan_mode_respond"))
+            .unwrap();
+        tx.try_send(OutputEvent::tool_output_line(
+            "📋 Plan Generated\n1. Run the tests",
+            Style::default(),
+        ))
+        .unwrap();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: "Right — the plan is ready for your review.".to_string(),
+        })
+        .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let rendered = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>();
+        assert!(!rendered.iter().any(|line| line.contains("Right —")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("📋 Plan Generated"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("1. Run the tests"))
+        );
+
+        reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_preserves_exploratory_plan_response() {
+        use crate::cli::output::OutputEvent;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(OutputEvent::model_output(
+            "I need more exploration before I can create the plan.",
+        ))
+        .unwrap();
+        tx.try_send(OutputEvent::tool_call("▶ plan_mode_respond"))
+            .unwrap();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: "I need more exploration before I can create the plan.".to_string(),
+        })
+        .unwrap();
+
+        let mut app = App::new();
+        drain_output(&mut rx, &mut app);
+
+        let rendered = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>();
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("I need more exploration")));
 
         reset_prompt_state();
     }
@@ -8713,7 +8812,7 @@ mod tests {
 
         let mut app = App::new();
         app.mode = "PLAN".to_string();
-        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_busy = Arc::new(AtomicBool::new(true));
         let agent_done = Arc::new(tokio::sync::Notify::new());
         let agent_start_time = Arc::new(Mutex::new(None));
         let agent_task = Arc::new(Mutex::new(None));
@@ -8756,6 +8855,7 @@ mod tests {
         assert!(state.plan_state.is_none());
         assert!(state.strict_plan_mode_enabled);
         assert_eq!(state.last_injected_plan_state_hash, None);
+        agent_busy.store(false, Ordering::Relaxed);
 
         Ok(())
     }

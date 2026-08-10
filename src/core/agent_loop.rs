@@ -1250,8 +1250,49 @@ impl AgentLoop {
         }
 
         let mut dequeued_message_for_notification = false;
+        let mut paused_plan_epoch = false;
+        let mut pause_notice_emitted = false;
 
         loop {
+            // A paused plan must wait without consuming provider turns. Emit
+            // one notice per pause epoch, then let /plan resume or /plan abort
+            // change the shared state while the task remains available.
+            {
+                let state = self.state.lock().await;
+                let plan_is_paused = state
+                    .plan_state
+                    .as_ref()
+                    .is_some_and(|plan| plan.paused && plan.approved);
+                if plan_is_paused {
+                    drop(state);
+                    paused_plan_epoch = true;
+                    if !pause_notice_emitted {
+                        self.config.output_writer.emit(OutputEvent::dim_yellow(
+                            "Plan is paused. Type /plan resume to continue.",
+                        ));
+                        pause_notice_emitted = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                drop(state);
+
+                if paused_plan_epoch {
+                    let plan_still_active = {
+                        let state = self.state.lock().await;
+                        state
+                            .plan_state
+                            .as_ref()
+                            .is_some_and(|plan| plan.approved && !plan.complete)
+                    };
+                    if !plan_still_active {
+                        return Ok(());
+                    }
+                    paused_plan_epoch = false;
+                    pause_notice_emitted = false;
+                }
+            }
+
             if turn_count >= self.config.max_turns {
                 // Persist state on max turns exceeded
                 if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
@@ -1269,24 +1310,6 @@ impl AgentLoop {
                 return Err(AgentError::MaxTurnsExceeded);
             }
             turn_count += 1;
-
-            // Check plan pause: halt iteration if plan is paused
-            {
-                let state = self.state.lock().await;
-                if let Some(ref plan) = state.plan_state
-                    && plan.paused
-                    && plan.approved
-                {
-                    drop(state);
-                    self.config.output_writer.emit(OutputEvent::dim_yellow(
-                        "Plan is paused. Type /plan resume to continue.",
-                    ));
-                    // Prevent CPU spinning on pause
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
-                }
-                drop(state);
-            }
 
             // Check if cancelled
             {
@@ -6232,6 +6255,58 @@ mod tests {
                 None => std::env::remove_var("SNED_DATA_DIR"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_run_waits_on_approved_paused_plan_without_repeating_notice() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("SENTINEL_NOT_CONSUMED"),
+        ));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut config = test_agent_config(provider, "test-run-paused-plan");
+        config.max_turns = 1;
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Resume this step later".to_string(),
+            ]);
+            plan.approved = true;
+            plan.paused = true;
+            state.plan_state = Some(plan);
+        }
+
+        let state_handle = Arc::clone(&agent.state);
+        let state_manager = Arc::new(StateManager::new().unwrap());
+        let run = tokio::spawn(async move { agent.run(vec![], state_manager).await });
+        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+
+        let rendered = drain_rendered_output(&mut rx);
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("Plan is paused. Type /plan resume to continue."))
+                .count(),
+            1
+        );
+        assert!(!rendered
+            .iter()
+            .any(|line| line.contains("SENTINEL_NOT_CONSUMED")));
+
+        {
+            let mut state = state_handle.lock().await;
+            state.plan_state = None;
+            state.is_cancelled = true;
+            state
+                .is_cancelled_atomic
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), run)
+            .await
+            .expect("paused plan task should observe cancellation")
+            .expect("paused plan task should not panic");
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

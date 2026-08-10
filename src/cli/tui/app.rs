@@ -1230,6 +1230,58 @@ impl App {
         self.turn_indicator = Some(line);
     }
 
+    /// Remove model prose that preceded a terminal plan response.
+    ///
+    /// Some providers stream a natural-language answer before emitting the
+    /// `plan_mode_respond` tool call. The tool handler then emits the
+    /// canonical plan text, so retaining both would show the plan twice.
+    pub(crate) fn discard_current_turn_model_stream(&mut self) {
+        self.finish_reasoning_stream();
+
+        let entries = std::mem::take(&mut self.turn_stream_entries);
+        let original_len = self.output_lines.len();
+        let model_indices: Vec<usize> = entries
+            .iter()
+            .filter(|(_, kind)| *kind == StreamKind::Model)
+            .map(|(index, _)| *index)
+            .filter(|index| *index < original_len)
+            .collect();
+
+        self.last_stream_group = None;
+        self.turn_had_streamed_line = false;
+        self.turn_indicator = None;
+
+        if model_indices.is_empty() {
+            self.turn_stream_entries = entries;
+            return;
+        }
+
+        for index in model_indices.iter().rev() {
+            self.output_lines.remove(*index);
+            self.output_line_kinds.remove(*index);
+        }
+
+        let remaining_entries = entries
+            .into_iter()
+            .filter_map(|(index, kind)| {
+                if kind == StreamKind::Model || index >= original_len {
+                    return None;
+                }
+                let removed_before = model_indices
+                    .iter()
+                    .filter(|removed_index| **removed_index < index)
+                    .count();
+                Some((index - removed_before, kind))
+            })
+            .collect();
+        self.turn_stream_entries = remaining_entries;
+        self.cached_wrap_width = None;
+        self.cached_visible_window = None;
+        self.rebuild_visual_row_cache(self.last_wrap_width());
+        self.clear_text_selection();
+        self.clamp_to_content();
+    }
+
     /// Re-render the model-streamed lines recorded during the current
     /// turn as markdown.  Pops only the `Model` entries from the
     /// buffer (highest index first to preserve earlier indices) and
