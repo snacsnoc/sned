@@ -4794,6 +4794,13 @@ fn resolve_tool_profile(
         return crate::core::tools::definitions::ToolProfile::Plan;
     }
 
+    // /compact injects an explicit condense instruction. The model must
+    // receive the condense tool schema; reduced profiles (especially YOLO's
+    // Validate) omit it and force the model to hallucinate a tool name.
+    if prompt.contains("type=\"condense\"") {
+        return crate::core::tools::definitions::ToolProfile::Full;
+    }
+
     let selected = match cached {
         Some(profile) => profile,
         None => crate::core::tools::definitions::select_tool_profile(prompt, mode_str),
@@ -5401,6 +5408,58 @@ mod tests {
         );
 
         assert_eq!(profile, crate::core::tools::definitions::ToolProfile::Plan);
+    }
+
+    #[test]
+    fn test_resolve_tool_profile_compact_instruction_ignores_yolo_and_cached_profile() {
+        // /compact injects <explicit_instructions type="condense">. The model
+        // must receive the condense tool schema even in YOLO mode (which
+        // otherwise forces Validate and omits condense).
+        let prompt = r#"<explicit_instructions type="condense">
+The user has explicitly asked you to create a detailed summary of the conversation so far.
+Irrespective of whether additional information or instructions are given, you are only allowed to respond to this message by calling the condense tool.
+</explicit_instructions>
+"#;
+
+        let profile_yolo = resolve_tool_profile(
+            Some(crate::core::tools::definitions::ToolProfile::WriteOnly),
+            true,
+            prompt,
+            "act",
+        );
+        assert_eq!(
+            profile_yolo,
+            crate::core::tools::definitions::ToolProfile::Full
+        );
+
+        let profile_cached = resolve_tool_profile(
+            Some(crate::core::tools::definitions::ToolProfile::CoreEdit),
+            false,
+            prompt,
+            "act",
+        );
+        assert_eq!(
+            profile_cached,
+            crate::core::tools::definitions::ToolProfile::Full
+        );
+    }
+
+    #[test]
+    fn test_compact_profile_includes_condense_tool() {
+        // Regression guard: a /compact turn must expose the condense tool.
+        // The qwen bug was that the model hallucinated `condense_tool`
+        // because Validate (YOLO's forced profile) omitted `condense`.
+        let prompt = "<explicit_instructions type=\"condense\">compact now</explicit_instructions>";
+        let profile = resolve_tool_profile(None, true, prompt, "act");
+        let has_condense = profile
+            .tools()
+            .iter()
+            .any(|t| t.name() == "condense");
+        assert!(
+            has_condense,
+            "condense must be in the resolved profile for /compact, got: {:?}",
+            profile
+        );
     }
 
     #[tokio::test]
