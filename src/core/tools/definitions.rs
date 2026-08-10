@@ -776,10 +776,8 @@ impl ToolProfile {
             ],
             Self::Plan => &[
                 SnedTool::ReadFile,
-                SnedTool::WriteToFile,
                 SnedTool::ListFiles,
                 SnedTool::SearchFiles,
-                SnedTool::EditFile,
                 SnedTool::ExecuteCommand,
                 SnedTool::AskFollowupQuestion,
                 SnedTool::PlanModeRespond,
@@ -1139,7 +1137,7 @@ mod tests {
         assert!(ToolProfile::CoreEdit.tools().len() >= 7);
         assert!(ToolProfile::Validate.tools().len() >= 9);
         assert!(ToolProfile::Symbol.tools().len() >= 9);
-        assert_eq!(ToolProfile::Plan.tools().len(), 19);
+        assert_eq!(ToolProfile::Plan.tools().len(), 17);
         assert_eq!(ToolProfile::Full.tools().len(), 20);
     }
 

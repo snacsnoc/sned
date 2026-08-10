@@ -252,7 +252,7 @@ QWEN MODEL GUIDANCE
 
         let mut section = "\n\n# AVAILABLE SKILLS\n".to_string();
         section.push_str(
-            "Use `use_skill` once only when a listed skill clearly matches the task.\n\n",
+            "When a listed skill clearly matches the task, activate it before acting. Follow the skill's instructions directly once loaded.\n\n",
         );
 
         // Prioritize Project skills
@@ -281,7 +281,7 @@ QWEN MODEL GUIDANCE
 
         if self.context.skills.len() > 10 {
             section.push_str(&format!(
-                "\n... and {} more. Use the 'list_skills' tool to see the full list.\n",
+                "\n... and {} more available skills are present in this workspace.\n",
                 self.context.skills.len() - 10
             ));
         }
@@ -350,6 +350,35 @@ mod tests {
         assert!(prompt.contains("AVAILABLE SKILLS"));
         assert!(prompt.contains("rust: Rust programming expertise"));
         assert!(prompt.contains("python: Python programming expertise"));
+    }
+
+    /// Skills section must not name tools that only appear in the Full/Plan
+    /// profile. Telling the model to call `use_skill`/`list_skills` in a
+    /// reduced profile (Validate, CoreEdit, etc.) forces hallucination of the
+    /// tool name on the next turn.
+    #[test]
+    fn test_prompt_builder_skills_section_does_not_name_profile_excluded_tools() {
+        let context = SystemPromptContext {
+            skills: vec![SkillMetadata {
+                name: "rust".to_string(),
+                description: "Rust programming expertise".to_string(),
+                path: ".sned/skills/rust".to_string(),
+                source: SkillSource::Project,
+            }],
+            ..Default::default()
+        };
+
+        let builder = PromptBuilder::new(context);
+        let prompt = builder.build();
+
+        assert!(
+            !prompt.contains("use_skill"),
+            "skills section must not reference the use_skill tool by name: {prompt}"
+        );
+        assert!(
+            !prompt.contains("list_skills"),
+            "skills section must not reference the list_skills tool by name: {prompt}"
+        );
     }
 
     #[test]

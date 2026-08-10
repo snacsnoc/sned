@@ -971,6 +971,9 @@ impl AgentLoop {
             // A cached profile from the previous mode can omit the completion
             // tool required in ACT or expose it while gathering a plan.
             self.deps.tool_profile = None;
+            // Invalidate the cached system prompt so any mode-dependent text
+            // is rebuilt under the new mode.
+            self.deps.cached_system_prompt = None;
         }
     }
 
@@ -3015,6 +3018,13 @@ impl AgentLoop {
                 };
 
                 let immediate_output = if let Some(tool) = SnedTool::from_name(&tool_name) {
+                    // Reject tools that are not in the active profile so the model
+                    // cannot call tools its current profile has filtered out.
+                    let profile_denied = self
+                        .deps
+                        .tool_profile
+                        .is_some_and(|p| !p.tools().contains(&tool));
+
                     // Check plan mode restrictions
                     let is_restricted = {
                         let state = self.state.lock().await;
@@ -3023,7 +3033,14 @@ impl AgentLoop {
                             && Self::is_plan_mode_restricted(tool)
                     };
 
-                    if is_restricted {
+                    if profile_denied {
+                        ToolExecutionOutput::error(
+                            format!(
+                                "Tool '{tool_name}' is not available in the current tool profile. Use one of the tools listed for this turn."
+                            ),
+                            None,
+                        )
+                    } else if is_restricted {
                         ToolExecutionOutput::error(
                             format!(
                                 "Tool '{tool_name}' is not available in PLAN MODE. This tool is restricted to ACT MODE for file modifications. Only use tools available for PLAN MODE when in that mode."
@@ -3350,7 +3367,13 @@ impl AgentLoop {
                     }
                 } else {
                     tracing::warn!(tool = %tool_name, "unknown tool requested");
-                    let available = crate::core::tools::definitions::get_active_tool_definitions()
+                    // Surface only the tools in the active profile so the model
+                    // does not hallucinate names from tools it cannot actually call.
+                    let active_profile = self
+                        .deps
+                        .tool_profile
+                        .unwrap_or(crate::core::tools::definitions::ToolProfile::Full);
+                    let available = crate::core::tools::definitions::get_tool_definitions_for_profile(active_profile)
                         .iter()
                         .map(|t| t.function.name.as_str())
                         .collect::<Vec<_>>()
@@ -4205,7 +4228,7 @@ impl AgentLoop {
         let listed = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
         let suffix = if paths.len() > 3 { ", ..." } else { "" };
         Some(format!(
-            "[system] Before using edit_file again, refresh the stale path(s): {listed}{suffix}. Use read_file for the full file. For a supported named definition, get_function or get_file_skeleton can refresh only the anchors they return."
+            "[system] Before using edit_file again, refresh the stale path(s): {listed}{suffix}. Use read_file for the full file. A symbol-scoped read of just the surrounding definition can also refresh only the relevant anchors when one is available."
         ))
     }
 
@@ -8303,6 +8326,27 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(
             hint.is_none(),
             "hint must be None when must_reread_before_edit is empty, got: {hint:?}"
+        );
+    }
+
+    /// Recovery hint must not name symbol-scoped tools by name: those tools
+    /// are absent from Validate/CoreEdit profiles and naming them would cause
+    /// the model to hallucinate calls it cannot make.
+    #[test]
+    fn test_reread_recovery_hint_does_not_name_profile_excluded_tools() {
+        let mut state = TaskState::default();
+        state
+            .must_reread_before_edit
+            .insert("/tmp/a.rs".to_string());
+
+        let hint = AgentLoop::reread_recovery_hint(&state).expect("hint should be present");
+        assert!(
+            !hint.contains("get_function"),
+            "hint must not name get_function: {hint}"
+        );
+        assert!(
+            !hint.contains("get_file_skeleton"),
+            "hint must not name get_file_skeleton: {hint}"
         );
     }
 
