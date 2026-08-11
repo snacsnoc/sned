@@ -428,21 +428,26 @@ impl ExecuteCommandHandler {
             let mut stdout_collected = String::new();
             let mut stderr_collected = String::new();
 
-            // Head+tail streaming condensation state
+            // Head+tail streaming condensation state. Tracked per stream so a
+            // burst on one stream (e.g. chatty stderr) cannot pre-empt the
+            // head window of the other.
             let stream_limit = Self::stream_output_line_limit();
             let half = stream_limit / 2;
-            let mut displayed: usize = 0;
-            let mut truncated = false;
-            let mut tail_buffer: VecDeque<String> = VecDeque::with_capacity(half);
+            let mut stdout_displayed: usize = 0;
+            let mut stdout_truncated = false;
+            let mut stdout_tail_buffer: VecDeque<String> = VecDeque::with_capacity(half);
+            let mut stderr_displayed: usize = 0;
+            let mut stderr_truncated = false;
+            let mut stderr_tail_buffer: VecDeque<String> = VecDeque::with_capacity(half);
 
             let output = loop {
                 tokio::select! {
                     result = stdout_reader.next_line() => {
                         match result {
                             Ok(Some(line)) => {
-                                displayed += 1;
+                                stdout_displayed += 1;
                                 if !json_output {
-                                    if displayed <= half {
+                                    if stdout_displayed <= half {
                                         // Head: print live
                                         use crate::cli::output::OutputEvent;
                                         use ratatui::style::{Modifier, Style};
@@ -450,21 +455,21 @@ impl ExecuteCommandHandler {
                                             line.clone(),
                                             Style::default().add_modifier(Modifier::DIM),
                                         ))));
-                                    } else if displayed == half + 1 && !truncated {
-                                        // First skipped line: emit condensed note once
+                                    } else if stdout_displayed == half + 1 && !stdout_truncated {
+                                        // First skipped line on this stream: emit condensed note once
                                         use ratatui::style::{Modifier, Style};
                                         output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                            "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
+                                            "… stdout: stream condensed, set SNED_STREAM_OUTPUT_LINES for more".to_string(),
                                             Style::default().add_modifier(Modifier::DIM),
                                         ))));
-                                        truncated = true;
+                                        stdout_truncated = true;
                                     }
                                 }
-                                if truncated {
+                                if stdout_truncated {
                                     // Keep tail ring buffer
-                                    tail_buffer.push_back(line.clone());
-                                    if tail_buffer.len() > half {
-                                        tail_buffer.pop_front();
+                                    stdout_tail_buffer.push_back(line.clone());
+                                    if stdout_tail_buffer.len() > half {
+                                        stdout_tail_buffer.pop_front();
                                     }
                                 }
                                 stdout_collected.push_str(&line);
@@ -477,9 +482,9 @@ impl ExecuteCommandHandler {
                     result = stderr_reader.next_line() => {
                         match result {
                             Ok(Some(line)) => {
-                                displayed += 1;
+                                stderr_displayed += 1;
                                 if !json_output {
-                                    if displayed <= half {
+                                    if stderr_displayed <= half {
                                         // Head: print live
                                         use crate::cli::output::OutputEvent;
                                         use crate::cli::tui::theme::WARNING_FG;
@@ -488,21 +493,21 @@ impl ExecuteCommandHandler {
                                             line.clone(),
                                             Style::default().fg(WARNING_FG),
                                         ))));
-                                    } else if displayed == half + 1 && !truncated {
-                                        // First skipped line: emit condensed note once
+                                    } else if stderr_displayed == half + 1 && !stderr_truncated {
+                                        // First skipped line on this stream: emit condensed note once
                                         use ratatui::style::{Modifier, Style};
                                         output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                            "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
+                                            "… stderr: stream condensed, set SNED_STREAM_OUTPUT_LINES for more".to_string(),
                                             Style::default().add_modifier(Modifier::DIM),
                                         ))));
-                                        truncated = true;
+                                        stderr_truncated = true;
                                     }
                                 }
-                                if truncated {
+                                if stderr_truncated {
                                     // Keep tail ring buffer
-                                    tail_buffer.push_back(line.clone());
-                                    if tail_buffer.len() > half {
-                                        tail_buffer.pop_front();
+                                    stderr_tail_buffer.push_back(line.clone());
+                                    if stderr_tail_buffer.len() > half {
+                                        stderr_tail_buffer.pop_front();
                                     }
                                 }
                                 stderr_collected.push_str(&line);
@@ -558,37 +563,37 @@ impl ExecuteCommandHandler {
                         break match result {
                             Ok(Ok(status)) => {
                                 while let Ok(Some(line)) = stdout_reader.next_line().await {
-                                    displayed += 1;
+                                    stdout_displayed += 1;
                                     if !json_output {
-                                        if displayed <= half {
+                                        if stdout_displayed <= half {
                                             use crate::cli::output::OutputEvent;
                                             use ratatui::style::{Modifier, Style};
                                             output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                                 line.clone(),
                                                 Style::default().add_modifier(Modifier::DIM),
                                             ))));
-                                        } else if displayed == half + 1 && !truncated {
+                                        } else if stdout_displayed == half + 1 && !stdout_truncated {
                                             use ratatui::style::{Modifier, Style};
                                             output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                                "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
+                                                "… stdout: stream condensed, set SNED_STREAM_OUTPUT_LINES for more".to_string(),
                                                 Style::default().add_modifier(Modifier::DIM),
                                             ))));
-                                            truncated = true;
+                                            stdout_truncated = true;
                                         }
                                     }
-                                    if truncated {
-                                        tail_buffer.push_back(line.clone());
-                                        if tail_buffer.len() > half {
-                                            tail_buffer.pop_front();
+                                    if stdout_truncated {
+                                        stdout_tail_buffer.push_back(line.clone());
+                                        if stdout_tail_buffer.len() > half {
+                                            stdout_tail_buffer.pop_front();
                                         }
                                     }
                                     stdout_collected.push_str(&line);
                                     stdout_collected.push('\n');
                                 }
                                 while let Ok(Some(line)) = stderr_reader.next_line().await {
-                                    displayed += 1;
+                                    stderr_displayed += 1;
                                     if !json_output {
-                                        if displayed <= half {
+                                        if stderr_displayed <= half {
                                             use crate::cli::output::OutputEvent;
                                             use crate::cli::tui::theme::WARNING_FG;
                                             use ratatui::style::Style;
@@ -596,19 +601,19 @@ impl ExecuteCommandHandler {
                                                 line.clone(),
                                                 Style::default().fg(WARNING_FG),
                                             ))));
-                                        } else if displayed == half + 1 && !truncated {
+                                        } else if stderr_displayed == half + 1 && !stderr_truncated {
                                             use ratatui::style::{Modifier, Style};
                                             output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                                "... (stream condensed, set SNED_STREAM_OUTPUT_LINES for more)".to_string(),
+                                                "… stderr: stream condensed, set SNED_STREAM_OUTPUT_LINES for more".to_string(),
                                                 Style::default().add_modifier(Modifier::DIM),
                                             ))));
-                                            truncated = true;
+                                            stderr_truncated = true;
                                         }
                                     }
-                                    if truncated {
-                                        tail_buffer.push_back(line.clone());
-                                        if tail_buffer.len() > half {
-                                            tail_buffer.pop_front();
+                                    if stderr_truncated {
+                                        stderr_tail_buffer.push_back(line.clone());
+                                        if stderr_tail_buffer.len() > half {
+                                            stderr_tail_buffer.pop_front();
                                         }
                                     }
                                     stderr_collected.push_str(&line);
@@ -661,20 +666,44 @@ impl ExecuteCommandHandler {
                 }
             };
 
-            // Print tail lines after command completes (if we truncated)
-            if truncated && !tail_buffer.is_empty() && !json_output {
-                let total = displayed;
-                use crate::cli::output::OutputEvent;
-                use ratatui::style::{Modifier, Style};
-                output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                    format!("--- last {} of {} lines ---", tail_buffer.len(), total),
-                    Style::default().add_modifier(Modifier::DIM),
-                ))));
-                for line in &tail_buffer {
+            // Print tail lines after command completes (if we truncated).
+            // Flush each stream independently so attribution survives.
+            if !json_output {
+                if stdout_truncated && !stdout_tail_buffer.is_empty() {
+                    use crate::cli::output::OutputEvent;
+                    use ratatui::style::{Modifier, Style};
                     output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                        line.clone(),
+                        format!(
+                            "--- stdout: last {} of {} lines ---",
+                            stdout_tail_buffer.len(),
+                            stdout_displayed
+                        ),
                         Style::default().add_modifier(Modifier::DIM),
                     ))));
+                    for line in &stdout_tail_buffer {
+                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                            line.clone(),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ))));
+                    }
+                }
+                if stderr_truncated && !stderr_tail_buffer.is_empty() {
+                    use crate::cli::output::OutputEvent;
+                    use ratatui::style::{Modifier, Style};
+                    output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                        format!(
+                            "--- stderr: last {} of {} lines ---",
+                            stderr_tail_buffer.len(),
+                            stderr_displayed
+                        ),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))));
+                    for line in &stderr_tail_buffer {
+                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                            line.clone(),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ))));
+                    }
                 }
             }
 
@@ -1968,5 +1997,138 @@ mod tests {
         assert!(result.contains("EXECUTE_SCRIPT_TEST_SECRET"));
         assert!(result.contains("Sensitive and always blocked"));
         assert!(!result.contains("script-secret-value"));
+    }
+
+    /// Captures `CommandOutputLine` events so a streaming condensation
+    /// test can inspect what the TUI actually saw.
+    #[derive(Default)]
+    struct RecordingOutputWriter {
+        lines: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::cli::output::OutputWriter for RecordingOutputWriter {
+        fn emit(&self, event: crate::cli::output::OutputEvent) {
+            if let crate::cli::output::OutputEvent::CommandOutputLine(line) = event {
+                self.lines
+                    .lock()
+                    .expect("recorder mutex poisoned")
+                    .push(line.to_string());
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    /// Regression guard: a chatty stderr must not consume stdout's head
+    /// window. Before the per-stream counter split, both streams shared
+    /// a single `displayed` counter so the first burst on either stream
+    /// pushed the other out of the live head window.
+    #[tokio::test]
+    async fn test_stream_condensation_keeps_stdout_head_when_stderr_bursts() {
+        // 15 stderr lines then 5 stdout lines. With the default
+        // SNED_STREAM_OUTPUT_LINES=20 (half=10), the per-stream counter
+        // emits all 15 stderr lines (head window is per-stream) and then
+        // the 5 stdout lines also within stdout's head window. Under the
+        // shared-counter implementation, the first 10 of the combined 20
+        // lines would consume the head and the stdout lines would only
+        // arrive via the post-completion tail flush.
+        let script = "\
+            for i in $(seq 1 15); do echo \"stderr-line-$i\" >&2; done
+            for i in $(seq 1 5); do echo \"stdout-line-$i\"; done";
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let recorder = Arc::new(RecordingOutputWriter::default());
+        let writer: crate::cli::output::OutputWriterArc = recorder.clone();
+
+        let _ = handler
+            .execute_commands_with_timeout(
+                vec![script.to_string()],
+                None,
+                Some(Duration::from_secs(10)),
+                false,
+                None,
+                false, /* json_output = false so stream events are emitted */
+                &writer,
+            )
+            .await
+            .unwrap();
+
+        let lines: Vec<String> = recorder
+            .lines
+            .lock()
+            .expect("recorder mutex poisoned")
+            .clone();
+        // Under the per-stream counter split, all 5 stdout lines are
+        // visible as live head emission. Under the shared-counter bug the
+        // first 10 of the combined 20 lines would consume the head window
+        // and every stdout line would land in the post-completion tail
+        // flush instead — which is emitted as part of a "last N of M
+        // lines" block.
+        let stdout_lines_in_head: usize = lines
+            .iter()
+            .filter(|line| line.contains("stdout-line-"))
+            .filter(|line| {
+                !lines
+                    .iter()
+                    .take_while(|prior| prior.as_str() != line.as_str())
+                    .any(|prior| prior.contains("--- ") && prior.contains(" last "))
+            })
+            .count();
+        assert!(
+            stdout_lines_in_head >= 5,
+            "stdout should retain its head window independently of stderr; saw {lines:?}"
+        );
+    }
+
+    /// Regression guard: per-stream tail buffers flush with their own
+    /// attribution line.
+    #[tokio::test]
+    async fn test_stream_condensation_per_stream_tail_attribution() {
+        // 60 stdout lines, 60 stderr lines, total far beyond the default
+        // stream limit. Both streams should produce a stream-condensed
+        // note and a tail attribution line.
+        let script = "\
+            for i in $(seq 1 60); do echo \"stderr-line-$i\" >&2; done
+            for i in $(seq 1 60); do echo \"stdout-line-$i\"; done";
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let recorder = Arc::new(RecordingOutputWriter::default());
+        let writer: crate::cli::output::OutputWriterArc = recorder.clone();
+
+        let _ = handler
+            .execute_commands_with_timeout(
+                vec![script.to_string()],
+                None,
+                Some(Duration::from_secs(10)),
+                false,
+                None,
+                false,
+                &writer,
+            )
+            .await
+            .unwrap();
+
+        let lines: Vec<String> = recorder
+            .lines
+            .lock()
+            .expect("recorder mutex poisoned")
+            .clone();
+        let has_stdout_note = lines
+            .iter()
+            .any(|line: &String| line.contains("stdout: stream condensed"));
+        let has_stderr_note = lines
+            .iter()
+            .any(|line: &String| line.contains("stderr: stream condensed"));
+        let has_stdout_tail = lines
+            .iter()
+            .any(|line: &String| line.contains("--- stdout: last"));
+        let has_stderr_tail = lines
+            .iter()
+            .any(|line: &String| line.contains("--- stderr: last"));
+        assert!(
+            has_stdout_note && has_stderr_note,
+            "both streams should produce a condensed note; saw {lines:?}"
+        );
+        assert!(
+            has_stdout_tail && has_stderr_tail,
+            "both streams should flush their own tail attribution; saw {lines:?}"
+        );
     }
 }
