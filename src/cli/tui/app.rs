@@ -3030,16 +3030,29 @@ impl App {
     /// between two consecutive output block kinds.  Explicit
     /// `BlockKind::Separator` lines are themselves visual boundaries,
     /// so no extra separator is inserted around them.
+    ///
+    /// Same-kind headers (`ToolHeader → ToolHeader` and
+    /// `CommandHeader → CommandHeader`) return `true` so two distinct
+    /// tool calls always get breathing room, even when their kinds
+    /// match.  This relies on the invariant that each header is one
+    /// logical entry (one `push_output_with_kind` call) — see the
+    /// deferred-wrap change in `push_output_with_kind`.  All other
+    /// same-kind pairs are part of one logical block and stay
+    /// un-separated.
     fn should_insert_separator(prev: BlockKind, next: BlockKind) -> bool {
-        if prev == next {
-            return false;
-        }
         if prev == BlockKind::Separator || next == BlockKind::Separator {
             return false;
         }
+        if prev == next {
+            return matches!(
+                prev,
+                BlockKind::ToolHeader | BlockKind::CommandHeader
+            );
+        }
         // Insert separators between model text and tool/command blocks
         // to visually group related output. Also separate tool headers
-        // from their output, and command headers from their output.
+        // from their output, command headers from their output, and
+        // tool/command bodies from their next header.
         matches!(
             (prev, next),
             (
@@ -3071,6 +3084,8 @@ impl App {
                 )
                 | (BlockKind::ToolHeader, BlockKind::ToolOutput)
                 | (BlockKind::CommandHeader, BlockKind::CommandOutput)
+                | (BlockKind::ToolOutput, BlockKind::ToolHeader)
+                | (BlockKind::CommandOutput, BlockKind::CommandHeader)
         )
     }
 
@@ -8115,5 +8130,32 @@ mod tests {
             scroll_y + app.last_content_height <= total_rows + app.last_content_height,
             "scroll math must not exceed rendered row count after width change"
         );
+    }
+
+    /// Block-boundary rules: two distinct tool/command calls get
+    /// breathing room even when their kinds match; same-kind bodies
+    /// stay un-separated because they are one logical block.
+    #[test]
+    fn test_should_insert_separator_block_boundaries() {
+        use BlockKind::{
+            CommandHeader, CommandOutput, Model, Separator, ToolHeader, ToolOutput,
+        };
+
+        // Body → next header (new call begins).
+        assert!(App::should_insert_separator(CommandOutput, CommandHeader));
+        assert!(App::should_insert_separator(ToolOutput, ToolHeader));
+
+        // Same-kind header pairs (two distinct calls, e.g. zero-output
+        // consecutive commands).
+        assert!(App::should_insert_separator(CommandHeader, CommandHeader));
+        assert!(App::should_insert_separator(ToolHeader, ToolHeader));
+
+        // Same-kind body pairs are still one block (one push_output).
+        assert!(!App::should_insert_separator(CommandOutput, CommandOutput));
+        assert!(!App::should_insert_separator(ToolOutput, ToolOutput));
+
+        // Separator rows suppress surrounding blanks.
+        assert!(!App::should_insert_separator(Model, Separator));
+        assert!(!App::should_insert_separator(Separator, Model));
     }
 }
