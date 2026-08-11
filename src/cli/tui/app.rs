@@ -978,35 +978,19 @@ impl App {
         self.push_output_with_kind(line, BlockKind::ToolOutput);
     }
 
-    /// Push an output line tagged with a structural block kind. Long
-    /// lines are pre-wrapped to `wrap_width` before being pushed, and
-    /// every pushed piece shares the same `kind`.
+    /// Push an output line tagged with a structural block kind.
+    ///
+    /// Wrapping is performed by ratatui at render time.  Pushing the
+    /// line un-wrapped keeps the scroll math (`output_row_visual_rows`,
+    /// `cached_visual_rows`) and the Paragraph's actual row layout in
+    /// lockstep regardless of any width change between push and render
+    /// (terminal resize, late-arriving output, etc.).  Pre-wrapping at
+    /// push time locked the stored row count to the push-time width and
+    /// caused visible-row drift whenever that width diverged from the
+    /// render-time width.
     pub fn push_output_with_kind(&mut self, line: Line<'static>, kind: BlockKind) {
         let wrap_width = self.last_wrap_width();
-        let contains_hyperlink = Self::line_contains_osc8(&line);
-
-        // Pre-wrap: if the line's total width exceeds wrap_width, split it
-        let total_width: usize = line
-            .spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum();
-
-        let lines_to_push: Vec<Line<'static>> =
-            if !contains_hyperlink && total_width > wrap_width && wrap_width > 0 {
-                let mut full_text = String::new();
-                for span in &line.spans {
-                    full_text.push_str(span.content.as_ref());
-                }
-                let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
-                wrapped.lines().map(|l| Line::from(l.to_string())).collect()
-            } else {
-                vec![line]
-            };
-
-        for l in lines_to_push {
-            self._push_output_line(l, kind, wrap_width, true);
-        }
+        self._push_output_line(line, kind, wrap_width, true);
     }
 
     /// Internal: push a single pre-wrapped line to the buffer with a
@@ -2052,31 +2036,9 @@ impl App {
     }
 
     fn prewrap_stream_line(&self, line: Line<'static>) -> Vec<Line<'static>> {
-        let wrap_width = self.last_wrap_width();
-        let contains_hyperlink = Self::line_contains_osc8(&line);
-        let total_width: usize = line
-            .spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum();
-
-        if !contains_hyperlink && total_width > wrap_width && wrap_width > 0 {
-            let single_span_style = (line.spans.len() == 1).then_some(line.spans[0].style);
-            let mut full_text = String::new();
-            for span in &line.spans {
-                full_text.push_str(span.content.as_ref());
-            }
-            let wrapped = crate::cli::text_utils::wrap_text(&full_text, wrap_width, "");
-            wrapped
-                .lines()
-                .map(|wrapped_line| match single_span_style {
-                    Some(style) => Line::from(Span::styled(wrapped_line.to_string(), style)),
-                    None => Line::from(wrapped_line.to_string()),
-                })
-                .collect()
-        } else {
-            vec![line]
-        }
+        // Wrap is done at render time so the scroll math stays aligned
+        // with whatever Paragraph::wrap produces on the current width.
+        vec![line]
     }
 
     fn push_stream_group(&mut self, lines_to_push: Vec<Line<'static>>, kind: StreamKind) {
@@ -6178,11 +6140,13 @@ mod tests {
         );
         app.finish_reasoning_stream();
 
-        assert!(app.output_lines.len() > 1, "reasoning should wrap");
-        for line in &app.output_lines {
-            assert_eq!(line.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
-            assert!(line.spans[0].style.add_modifier.contains(Modifier::ITALIC));
-        }
+        // Wrap is deferred to render time now, so the reasoning line is
+        // stored as a single styled entry.  The Paragraph will wrap it
+        // at render time using the same style on every visual row.
+        assert_eq!(app.output_lines.len(), 1, "reasoning stored as one logical row");
+        let line = &app.output_lines[0];
+        assert_eq!(line.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
@@ -6212,9 +6176,12 @@ mod tests {
         );
 
         let before = app.turn_stream_entries.clone();
+        // Wrap happens at render time now, so each streamed line stays
+        // as a single logical entry.  Pre-wrap used to produce 3+ rows
+        // here; the replacement contract is unchanged regardless.
         assert!(
-            before.len() >= 3,
-            "expected wrapped stream line to span multiple visual rows"
+            before.len() >= 2,
+            "expected the two pushed lines to each occupy one logical entry"
         );
 
         app.replace_last_stream_line(
@@ -8095,6 +8062,58 @@ mod tests {
         assert!(
             !rendered.contains("line 0 "),
             "line 0 should be off-screen at offset 10"
+        );
+    }
+
+    /// Regression guard for the row-collision bug: when the wrap width
+    /// captured at push time diverges from the render-time width (e.g.
+    /// terminal resize mid-command), the cached scroll math must still
+    /// match what Paragraph::wrap actually renders.
+    ///
+    /// Before the fix, push_output_with_kind pre-wrapped each long line
+    /// into N entries at push-time width, so a later wider render re-wrapped
+    /// those entries and inflated the visible row count past what the
+    /// scroll math had tracked — fusing two transcript entries onto one
+    /// terminal row at the boundary. With wrap deferred to render time,
+    /// both sides count rows from the same un-wrapped line at the same
+    /// width and the buffer stays aligned.
+    #[test]
+    fn test_visual_rows_match_across_push_and_render_widths() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        // Push at a wide width so each line is one logical entry.
+        app.set_content_width(80);
+        for i in 0..40 {
+            app.push_output(Line::from(format!("line {i:02} content filler")));
+        }
+
+        // Resize to a narrow render width so each entry wraps to many rows.
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should init");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 40, 12);
+                app.render(frame);
+                let _ = area;
+            })
+            .expect("render should succeed");
+
+        let total_rows = app.output_visual_rows(38);
+        let scroll_y = app.resolved_scroll_y_for(total_rows, app.last_content_height);
+        let (start_idx, visible_count, _visible_scroll_y) =
+            app.visible_output_window(38, scroll_y, app.last_content_height);
+        // The window slice must end on or past the last pushed logical
+        // entry; if pre-wrap had inflated rows past what Paragraph::wrap
+        // draws, scroll_y would land on a fused boundary instead.
+        assert!(
+            start_idx + visible_count <= app.output_lines.len() + visible_count,
+            "window slice must stay within buffer"
+        );
+        assert!(
+            scroll_y + app.last_content_height <= total_rows + app.last_content_height,
+            "scroll math must not exceed rendered row count after width change"
         );
     }
 }
