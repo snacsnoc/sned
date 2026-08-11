@@ -180,7 +180,10 @@ pub fn format_tool_result_digest(
                 .unwrap_or("?");
             let line_count = result_text.lines().count();
             vec![DigestLine {
-                text: format!("  {status_glyph} read {path} ({line_count} lines)"),
+                text: format!(
+                    "  {status_glyph} read {path} ({line_count} {})",
+                    if line_count == 1 { "line" } else { "lines" }
+                ),
                 fg: Some(status_fg),
                 dim: false,
             }]
@@ -193,7 +196,10 @@ pub fn format_tool_result_digest(
             let entry_count = count_non_blank_lines(result_text);
             let label = if is_error { "failed" } else { "listed" };
             vec![DigestLine {
-                text: format!("  {status_glyph} {label} {path} ({entry_count} entries)"),
+                text: format!(
+                    "  {status_glyph} {label} {path} ({entry_count} {})",
+                    if entry_count == 1 { "entry" } else { "entries" }
+                ),
                 fg: Some(status_fg),
                 dim: false,
             }]
@@ -206,7 +212,10 @@ pub fn format_tool_result_digest(
             let match_count = count_non_blank_lines(result_text);
             let label = if is_error { "failed" } else { "searched" };
             vec![DigestLine {
-                text: format!("  {status_glyph} {label} {path} ({match_count} matches)"),
+                text: format!(
+                    "  {status_glyph} {label} {path} ({match_count} {})",
+                    if match_count == 1 { "match" } else { "matches" }
+                ),
                 fg: Some(status_fg),
                 dim: false,
             }]
@@ -227,16 +236,9 @@ pub fn format_tool_result_digest(
             } else {
                 tool_name.to_string()
             };
-            let truncated = if cmd_text.chars().count() > 80 {
-                let mut out = String::new();
-                for (i, ch) in cmd_text.chars().enumerate() {
-                    if i >= 77 {
-                        out.push('…');
-                        break;
-                    }
-                    out.push(ch);
-                }
-                out
+            let truncated = if cmd_text.len() > 120 {
+                let end = cmd_text.floor_char_boundary(117);
+                format!("{}...", &cmd_text[..end])
             } else {
                 cmd_text
             };
@@ -752,7 +754,7 @@ mod tests {
         );
         assert_eq!(
             digest_text(&lines),
-            vec!["  ✗ read missing.txt (1 lines)"]
+            vec!["  ✗ read missing.txt (1 line)"]
         );
     }
 
@@ -790,8 +792,11 @@ mod tests {
         );
         assert_eq!(lines.len(), 1);
         assert!(lines[0].text.starts_with("  ✓ "));
-        assert!(lines[0].text.ends_with('…'));
-        assert!(lines[0].text.chars().count() < long_cmd.chars().count());
+        assert!(lines[0].text.ends_with("..."));
+        // Status prefix is "  ✓ " (6 bytes for the 3-byte UTF-8 glyph);
+        // truncated command body is up to 120 bytes (117 chars + "...").
+        assert!(lines[0].text.len() <= 130);
+        assert!(lines[0].text.len() < long_cmd.len());
     }
 
     #[test]
@@ -881,5 +886,41 @@ mod tests {
                 "digest should not contain its own truncation marker: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_pluralizes_counts() {
+        // 1-line read uses singular "line", not "1 lines".
+        let lines = format_tool_result_digest(
+            "read_file",
+            &serde_json::json!({"paths": [".env"]}),
+            "SECRET=1",
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(digest_text(&lines), vec!["  ✓ read .env (1 line)"]);
+
+        // 1-entry list_files uses singular "entry".
+        let lines = format_tool_result_digest(
+            "list_files",
+            &serde_json::json!({"path": "."}),
+            "only-one.rs",
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(digest_text(&lines), vec!["  ✓ listed . (1 entry)"]);
+
+        // 1-match search_files uses singular "match".
+        let lines = format_tool_result_digest(
+            "search_files",
+            &serde_json::json!({"path": "src"}),
+            "src/foo.rs:1: PlanState",
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(digest_text(&lines), vec!["  ✓ searched src (1 match)"]);
     }
 }
