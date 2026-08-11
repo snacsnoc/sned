@@ -25,7 +25,7 @@ fn highlight_diff_content(content: &str, language: &str, colored: bool) -> Strin
 }
 
 fn highlighted_line_with_hash(content: &str, hash: &str, language: &str, colored: bool) -> String {
-    format_line_with_hash(&highlight_diff_content(content, language, colored), hash)
+    format_line_with_hash(&highlight_diff_content(content, language, colored), hash, &[])
 }
 
 // ============================================================================

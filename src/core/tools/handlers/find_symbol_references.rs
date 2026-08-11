@@ -174,7 +174,7 @@ impl FindSymbolReferencesHandler {
             for (line_index, symbols) in merged {
                 if let Some(line_content) = data.lines.get(line_index) {
                     let anchor = anchors.get(line_index).cloned().unwrap_or_default();
-                    let formatted = format_line_with_hash(line_content, &anchor)
+                    let formatted = format_line_with_hash(line_content, &anchor, &[])
                         .trim()
                         .to_string();
                     file_lines.push(format!(

@@ -58,7 +58,7 @@ fn anchor_reconcile_matches_ts_semantics() {
 }
 
 #[test]
-fn edit_executor_matches_ts_validation_messages() {
+fn edit_executor_validation_messages_documents_deliberate_divergence() {
     let executor = EditExecutor::new();
     let content = "line 1\nline 2\nline 3";
     let content_lines = lines(content);

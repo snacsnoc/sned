@@ -141,7 +141,7 @@ pub fn get_file_skeleton(
 
         if start_line as i32 > last_line_added {
             let anchor = anchors.get(start_line).cloned().unwrap_or_default();
-            formatted_output.push_str(&format!("│{}\n", format_line_with_hash(&def.text, &anchor)));
+            formatted_output.push_str(&format!("│{}\n", format_line_with_hash(&def.text, &anchor, &[])));
             last_line_added = start_line as i32;
         }
     }
@@ -323,7 +323,7 @@ pub fn get_functions(
                     .enumerate()
                     .map(|(i, line)| {
                         let anchor = def_anchors.get(i).cloned().unwrap_or_default();
-                        format_line_with_hash(line, &anchor)
+                        format_line_with_hash(line, &anchor, &[])
                     })
                     .collect();
 

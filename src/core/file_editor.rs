@@ -825,7 +825,19 @@ impl EditExecutor {
             let (line_idx, start_error) = if using_fingerprint {
                 self.resolve_anchor_by_word("anchor", &edit.anchor, &normalized_line_hashes, lines)
             } else {
-                self.resolve_anchor("anchor", &edit.anchor, &normalized_line_hashes, lines)
+                let hint = match edit_type.as_str() {
+                    "insert_before" | "insert_after" => Some(
+                        "Anchor a unique neighboring line instead, or rewrite the file with write_to_file. The fingerprint escape hatch (anchor + end_anchor + content) does not apply to insert_before / insert_after.",
+                    ),
+                    _ => None,
+                };
+                self.resolve_anchor_with_hint(
+                    "anchor",
+                    &edit.anchor,
+                    &normalized_line_hashes,
+                    lines,
+                    hint,
+                )
             };
             if let Some(error) = start_error {
                 diagnostics.push(error);
@@ -936,6 +948,24 @@ impl EditExecutor {
         raw_anchor: &str,
         normalized_line_hashes: &[String],
         lines: &[String],
+    ) -> (usize, Option<String>) {
+        self.resolve_anchor_with_hint(anchor_type, raw_anchor, normalized_line_hashes, lines, None)
+    }
+
+    /// Variant of [`resolve_anchor`] that appends an edit-type-aware
+    /// recovery hint to the content-ambiguity rejection. The hint
+    /// teaches the model how to escape the ambiguity using tools it
+    /// actually has: `replace` learns the fingerprint shape
+    /// (`anchor + end_anchor + content`); `insert_before` /
+    /// `insert_after` learn to anchor a unique neighbor or fall back
+    /// to `write_to_file`.
+    pub fn resolve_anchor_with_hint(
+        &self,
+        anchor_type: &str,
+        raw_anchor: &str,
+        normalized_line_hashes: &[String],
+        lines: &[String],
+        content_ambiguity_hint: Option<&str>,
     ) -> (usize, Option<String>) {
         let anchor_raw = raw_anchor.trim();
         if anchor_raw.is_empty() {
@@ -1065,12 +1095,15 @@ impl EditExecutor {
                 content_matches.len(),
                 content_matches
             );
+            let base_hint = "Pin a unique span by quoting anchor + end_anchor + the lines between them in the 'content' field, then retry.";
+            let hint = content_ambiguity_hint.unwrap_or(base_hint);
             return (
                 usize::MAX,
                 Some(format!(
-                    "{anchor_type} \"{anchor_name}{ANCHOR_DELIMITER}{provided_content}\" matches {} lines with identical content:\n{}\nPin a unique span by quoting anchor + end_anchor + the lines between them in the 'content' field, then retry.",
+                    "{anchor_type} \"{anchor_name}{ANCHOR_DELIMITER}{provided_content}\" matches {} lines with identical content:\n{}\n{}",
                     content_matches.len(),
-                    listing
+                    listing,
+                    hint
                 )),
             );
         }

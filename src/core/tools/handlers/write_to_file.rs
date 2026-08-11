@@ -63,6 +63,12 @@ impl WriteToFileHandler {
         // Acquire exclusive file lock to prevent concurrent writes
         let _guard = FileEditGuard::acquire(path).await;
 
+        // Capture whether the file existed before the write so the
+        // success message can explicitly flag overwrite operations.
+        // Without this, the model feared write_to_file as a destructive
+        // op; making the overwrite explicit reduces that hesitation.
+        let file_existed_before = Path::new(path).exists();
+
         // Canonicalize workspace root once for consistent comparison
         let canonical_workspace = fs::canonicalize(workspace_root)
             .await
@@ -114,7 +120,13 @@ impl WriteToFileHandler {
         // Write the file atomically using async I/O (avoids spawn_blocking overhead)
         crate::storage::disk::atomic_write_file_async(&final_canonical, content).await?;
 
-        Ok(format!("Successfully wrote to {path}"))
+        if file_existed_before {
+            Ok(format!(
+                "File {path} existed and was overwritten.\nSuccessfully wrote to {path}."
+            ))
+        } else {
+            Ok(format!("Successfully wrote to {path} (new file)."))
+        }
     }
 
     #[must_use]
@@ -324,6 +336,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fs::read_to_string(file_path).unwrap(), content);
+    }
+
+    /// Field incident regression: when the model falls back to
+    /// `write_to_file` after `edit_file` rejects (or after a duplicate
+    /// line scenario), the success message must explicitly state
+    /// whether the file existed and was overwritten, so the model
+    /// cannot misread the tool as having silently created a new file
+    /// when it actually replaced an existing one.
+    #[tokio::test]
+    async fn test_write_file_result_names_overwrite_vs_create() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("overwrite.txt");
+        std::fs::write(&file_path, "old content").unwrap();
+
+        let handler = WriteToFileHandler::new();
+        let overwrite_msg = handler
+            .write_file(file_path.to_str().unwrap(), "new content", temp_dir.path())
+            .await
+            .unwrap();
+        assert!(
+            overwrite_msg.contains("existed and was overwritten"),
+            "overwrite path must be flagged explicitly: {overwrite_msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "new content");
+
+        let new_path = temp_dir.path().join("fresh.txt");
+        let create_msg = handler
+            .write_file(new_path.to_str().unwrap(), "fresh", temp_dir.path())
+            .await
+            .unwrap();
+        assert!(
+            create_msg.contains("new file"),
+            "create path must be flagged as new: {create_msg}"
+        );
     }
 
     #[tokio::test]

@@ -57,11 +57,54 @@ pub fn compute_hashes(lines: &[String]) -> Vec<u64> {
         .collect()
 }
 
-/// Formats a line with its anchor prefix.
-///
+/// Computes, for each line in `lines`, the 1-based indices of other
+/// lines whose content is identical. Returned vector is parallel to
+/// `lines`; an empty inner slice means the line is unique. Used by
+/// `read_file` to flag duplicate lines so the model can pick a
+/// fingerprint anchor or fall back to `write_to_file` when many lines
+/// share content.
 #[must_use]
-pub fn format_line_with_hash(content: &str, anchor: &str) -> String {
-    format!("{anchor}{ANCHOR_DELIMITER}{content}")
+pub fn identical_content_indices(lines: &[String]) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let mut dupes: Vec<usize> = Vec::new();
+        for (j, other) in lines.iter().enumerate() {
+            if i != j && other == line {
+                dupes.push(j + 1);
+            }
+        }
+        out.push(dupes);
+    }
+    out
+}
+
+/// Formats a line with its anchor prefix, appending a duplicate-content
+/// annotation when the line's content appears elsewhere in the slice.
+///
+/// The annotation is appended after the line content using the same
+/// `saturating_sub(8)` overflow pattern as `UnchangedSite`: when more
+/// than eight other occurrences exist, the annotation reads
+/// "identical content also at lines N1, N2, … (X more)". When the line
+/// is unique the annotation is omitted and the line is returned as
+/// `{anchor}§{content}`. Line numbers are 1-based.
+#[must_use]
+pub fn format_line_with_hash(content: &str, anchor: &str, identical_at: &[usize]) -> String {
+    if identical_at.is_empty() {
+        return format!("{anchor}{ANCHOR_DELIMITER}{content}");
+    }
+    const MAX_LISTED: usize = 8;
+    let listed: Vec<String> = identical_at
+        .iter()
+        .take(MAX_LISTED)
+        .map(|n| n.to_string())
+        .collect();
+    let overflow = identical_at.len().saturating_sub(listed.len());
+    let listing = if overflow > 0 {
+        format!("{}, … ({} more)", listed.join(", "), overflow)
+    } else {
+        listed.join(", ")
+    };
+    format!("{anchor}{ANCHOR_DELIMITER}{content} [identical content also at lines {listing}]")
 }
 
 /// Splits a raw anchor string into anchor word and content.
@@ -231,7 +274,33 @@ mod tests {
 
     #[test]
     fn test_format_line_with_hash() {
-        assert_eq!(format_line_with_hash("content", "Apple"), "Apple§content");
+        assert_eq!(
+            format_line_with_hash("content", "Apple", &[]),
+            "Apple§content"
+        );
+        assert_eq!(
+            format_line_with_hash("dup", "Apple", &[3, 7]),
+            "Apple§dup [identical content also at lines 3, 7]"
+        );
+        let nine: Vec<usize> = (2..=10).collect();
+        assert_eq!(
+            format_line_with_hash("dup", "Apple", &nine),
+            "Apple§dup [identical content also at lines 2, 3, 4, 5, 6, 7, 8, 9, … (1 more)]"
+        );
+    }
+
+    #[test]
+    fn test_identical_content_indices() {
+        let lines = vec!["a".into(), "b".into(), "a".into(), "c".into(), "a".into()];
+        let dupes = identical_content_indices(&lines);
+        assert!(dupes[0].contains(&3));
+        assert!(dupes[0].contains(&5));
+        assert!(dupes[1].is_empty());
+        assert!(dupes[2].contains(&1));
+        assert!(dupes[2].contains(&5));
+        assert!(dupes[3].is_empty());
+        assert!(dupes[4].contains(&1));
+        assert!(dupes[4].contains(&3));
     }
 
     #[test]

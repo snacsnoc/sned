@@ -69,10 +69,15 @@ fn is_secret_like(name: &str) -> bool {
 }
 
 fn format_sandbox_env_note(report: &SandboxEnvReport) -> String {
-    let mut note = format!(
-        "\n[Sandbox: {} environment variables withheld from this command.",
+    // Use `Note:` prefix and a divider line so the model cannot parse
+    // the sandbox diagnostic as a tool failure. The bracketed
+    // `[Sandbox: ...]` framing historically tripped the model into
+    // treating the diagnostic as an error and rerunning the command.
+    let mut note = String::from("\n\n--- Note (informational, not a tool error) ---\n");
+    note.push_str(&format!(
+        "Sandbox withheld {} environment variables from this command.",
         report.total()
-    );
+    ));
     if !report.not_allowlisted.is_empty() {
         note.push_str("\n  Not allowlisted: ");
         note.push_str(&report.not_allowlisted.join(", "));
@@ -82,7 +87,7 @@ fn format_sandbox_env_note(report: &SandboxEnvReport) -> String {
         note.push_str(&report.sensitive.join(", "));
     }
     note.push_str(
-        "\n  To pass non-sensitive variables, set SNED_ALLOW_ENV=VAR1,VAR2; sensitive variables remain blocked.]",
+        "\n  To pass non-sensitive variables, set SNED_ALLOW_ENV=VAR1,VAR2; sensitive variables remain blocked.",
     );
     note
 }
@@ -102,8 +107,9 @@ fn format_bounded_sandbox_env_note(report: &SandboxEnvReport, limit_bytes: usize
     }
 
     let compact_note = format!(
-        "\n[Sandbox: {} environment variables withheld; diagnostic truncated by output limit. \
-Increase SNED_COMMAND_OUTPUT_LIMIT to see all names.]",
+        "\n\n--- Note (informational, not a tool error) ---\n\
+Sandbox: {} environment variables withheld; diagnostic truncated by output limit. \
+Increase SNED_COMMAND_OUTPUT_LIMIT to see all names.",
         report.total()
     );
     let safe_end = compact_note.floor_char_boundary(limit_bytes);
@@ -723,10 +729,12 @@ impl ExecuteCommandHandler {
                         Style::default().add_modifier(Modifier::DIM),
                     ))));
                     for line in &stdout_tail_buffer {
-                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                            line.clone(),
-                            Style::default().add_modifier(Modifier::DIM),
-                        ))));
+                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(
+                            Span::styled(
+                                line.clone(),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ),
+                        )));
                     }
                 }
                 if stderr_truncated && !stderr_tail_buffer.is_empty() {
@@ -741,10 +749,12 @@ impl ExecuteCommandHandler {
                         Style::default().add_modifier(Modifier::DIM),
                     ))));
                     for line in &stderr_tail_buffer {
-                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                            line.clone(),
-                            Style::default().add_modifier(Modifier::DIM),
-                        ))));
+                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(
+                            Span::styled(
+                                line.clone(),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ),
+                        )));
                     }
                 }
             }
@@ -822,11 +832,8 @@ impl ExecuteCommandHandler {
             "execute_command result assembled"
         );
 
-        let assembled_output = assemble_sandboxed_output(
-            combined_output,
-            &sandbox_env_report,
-            limit_bytes,
-        );
+        let assembled_output =
+            assemble_sandboxed_output(combined_output, &sandbox_env_report, limit_bytes);
 
         if command_failed {
             Err(anyhow::anyhow!(assembled_output))
@@ -1854,7 +1861,11 @@ mod tests {
         report.normalize();
 
         let note = format_sandbox_env_note(&report);
-        assert!(note.contains("4 environment variables withheld"));
+        assert!(
+            note.contains("informational, not a tool error"),
+            "sandbox note must be framed as informational so the model cannot parse it as a failure: {note}"
+        );
+        assert!(note.contains("Sandbox withheld 4 environment variables"));
         assert!(note.contains("Not allowlisted: SHLVL, SSH_CONNECTION"));
         assert!(
             note.contains("Sensitive and always blocked: MINI_MAX_TOKEN_API_KEY, SALAD_API_KEY")
@@ -1923,8 +1934,12 @@ mod tests {
 
         let result = result.unwrap();
         assert!(
-            result.starts_with("Command executed successfully with no output.\n[Sandbox:"),
-            "silent success should remain explicit before sandbox metadata, got: {result}"
+            result.starts_with("Command executed successfully with no output.\n\n--- Note"),
+            "silent success should remain explicit before sandbox note, got: {result}"
+        );
+        assert!(
+            result.contains("informational, not a tool error"),
+            "sandbox note must be explicitly framed as informational so the model cannot parse it as a failure: {result}"
         );
         assert!(result.contains("EXECUTE_COMMAND_TEST_SECRET"));
         assert!(result.contains("Sensitive and always blocked"));

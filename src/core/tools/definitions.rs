@@ -129,7 +129,7 @@ pub fn read_file_schema() -> ToolSchema {
 pub fn write_to_file_schema() -> ToolSchema {
     ToolSchema {
         name: "write_to_file",
-        description: "Write content to a file at the specified path. If the file exists, it will be overwritten. Creates parent directories if needed.",
+        description: "Write content to a file at the specified path. If the file exists, it will be overwritten. Creates parent directories if needed. PREFERRED ESCAPE HATCH for files with many duplicate lines where hash-anchored edits would refuse — the model should fall back to write_to_file (with the entire new contents) when anchor uniqueness cannot be guaranteed.",
         parameters: vec![
             ToolParameter {
                 name: "path",

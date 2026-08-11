@@ -505,7 +505,7 @@ impl EditFileHandler {
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
         ToolError::ExecutionFailedWithMetadata(
             format!(
-                "You must re-read {display_path} before retrying edit_file. A successful edit (or a prior failed attempt) changed the file, so prior hash anchors are stale. Call read_file to refresh the full file. For a supported named definition, get_function or get_file_skeleton can also refresh the file, but only anchors shown in that result are usable."
+                "You must re-read {display_path} before retrying edit_file. A successful edit (or a prior failed attempt) changed the file, so prior hash anchors are stale. Do not edit the file with external scripts while anchors are live — out-of-band writes invalidate anchors and bypass the edit_file safety net. Call read_file to refresh the full file, then prefer edit_file (with anchors from the new read) or write_to_file for the whole file. For a supported named definition, get_function or get_file_skeleton can also refresh the file, but only anchors shown in that result are usable."
             ),
             ToolFailureMetadata {
                 class: ToolFailureClass::AnchorInvalid,
@@ -518,7 +518,7 @@ impl EditFileHandler {
     fn external_modification_error(display_path: &str, absolute_path: &str) -> ToolError {
         ToolError::ExecutionFailedWithMetadata(
             format!(
-                "File {display_path} was modified externally during edit operation. Aborting write to prevent data loss. Re-read the file and retry."
+                "File {display_path} was modified externally during edit operation (e.g., by another tool, a shell command, or a human). Aborting write to prevent data loss. Re-read the file with read_file to refresh anchors, then prefer edit_file or write_to_file — do not continue patching the file with external scripts while anchors are live."
             ),
             ToolFailureMetadata {
                 class: ToolFailureClass::AnchorInvalid,
@@ -5655,6 +5655,140 @@ edition = "2021"
             msg.contains("differs from the file's content only in leading or trailing whitespace"),
             "whitespace mismatch must surface whitespace-specific diagnostic. Got: {}",
             msg
+        );
+    }
+
+    /// Field incident regression: when an `insert_before` edit targets an
+    /// anchor whose content is ambiguous (matches multiple lines), the
+    /// batch must be rejected without applying any insertions. The
+    /// earlier field agent saw "duplicate insertions that corrupted the
+    /// file" — the contract test pins the rejection and asserts the file
+    /// remains untouched.
+    #[tokio::test]
+    async fn model_sim_insert_before_ambiguous_anchor_does_not_apply() {
+        let _guard = TEST_MUTEX.lock().await;
+        let original = "keep top\n    \"\"\",\nmid line\n    \"\"\",\nkeep bottom\n";
+        let (dir, file_path, _anchors) = setup_test_file(original, "sim-insert-ambiguous").await;
+        let ctx = ctx_for_dir(&dir, "sim-insert-ambiguous");
+
+        // Two `""",` lines exist; the model picks a `""",` content
+        // without quoting a unique anchor word, so the resolver hits
+        // the content-ambiguity branch and rejects the batch.
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": "MissingWord§    \"\"\",",
+                    "edit_type": "insert_before",
+                    "text": "INSERTED"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let output = result.expect("tool must report outcome");
+        let msg = output.as_str().unwrap();
+        assert!(
+            msg.contains("not found in the file"),
+            "ambiguous insert_before must surface anchor-not-found guidance: {msg}"
+        );
+        let content_after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            content_after, original,
+            "rejected batch must not mutate the file"
+        );
+        assert!(
+            !content_after.contains("INSERTED"),
+            "no partial insertion may leak into the file on batch rejection"
+        );
+    }
+
+    /// Field incident regression: edit-type-aware rejection guidance.
+    /// For `insert_before` / `insert_after` the fingerprint escape
+    /// hatch (anchor + end_anchor + content) does not apply, so the
+    /// model must learn a different recovery path: anchor a unique
+    /// neighbor, or rewrite the file with `write_to_file`. The
+    /// contract test pins the suffix through the resolver directly
+    /// (anchor words are globally unique in the file context, so a
+    /// full handler test cannot reach the content-ambiguity path).
+    #[test]
+    fn model_sim_insert_after_ambiguous_anchor_suggests_unique_neighbor() {
+        use crate::core::file_editor::{Edit, EditExecutor};
+        let executor = EditExecutor::new();
+        let lines: Vec<String> = vec![
+            "header".into(),
+            "    \"\"\",".into(),
+            "body".into(),
+            "    \"\"\",".into(),
+            "footer".into(),
+        ];
+        // Two duplicate lines sharing the same anchor word to force
+        // content-ambiguity rejection.
+        let line_hashes: Vec<String> = vec![
+            "WordHeader".into(),
+            "WordDup".into(),
+            "WordBody".into(),
+            "WordDup".into(),
+            "WordFooter".into(),
+        ];
+        let edit = Edit {
+            anchor: "WordDup§    \"\"\",".into(),
+            end_anchor: None,
+            edit_type: "insert_after".into(),
+            text: "INSERTED".into(),
+            content: None,
+        };
+        let (_resolved, failed) = executor.resolve_edits(&[edit], &lines, &line_hashes);
+        assert_eq!(failed.len(), 1);
+        let err = &failed[0].error;
+        assert!(
+            err.contains("matches 2 lines with identical content"),
+            "content-ambiguity path must fire: {err}"
+        );
+        assert!(
+            err.contains("insert_before / insert_after"),
+            "edit-type-aware hint must appear for insert_after: {err}"
+        );
+        assert!(
+            err.contains("write_to_file"),
+            "recovery hint must point at write_to_file: {err}"
+        );
+    }
+
+    /// Sanity check: the original fingerprint escape-hatch text is
+    /// preserved for `replace` edits so the model still sees the
+    /// anchor + end_anchor + content guidance it has learned.
+    #[test]
+    fn model_sim_replace_ambiguous_anchor_keeps_fingerprint_hint() {
+        use crate::core::file_editor::{Edit, EditExecutor};
+        let executor = EditExecutor::new();
+        let lines: Vec<String> = vec![
+            "header".into(),
+            "    \"\"\",".into(),
+            "body".into(),
+            "    \"\"\",".into(),
+            "footer".into(),
+        ];
+        let line_hashes: Vec<String> = vec![
+            "WordHeader".into(),
+            "WordDup".into(),
+            "WordBody".into(),
+            "WordDup".into(),
+            "WordFooter".into(),
+        ];
+        let edit = Edit {
+            anchor: "WordDup§    \"\"\",".into(),
+            end_anchor: None,
+            edit_type: "replace".into(),
+            text: "x".into(),
+            content: None,
+        };
+        let (_resolved, failed) = executor.resolve_edits(&[edit], &lines, &line_hashes);
+        assert_eq!(failed.len(), 1);
+        let err = &failed[0].error;
+        assert!(
+            err.contains("anchor + end_anchor + the lines between them"),
+            "replace rejection must keep fingerprint escape hatch: {err}"
         );
     }
 }

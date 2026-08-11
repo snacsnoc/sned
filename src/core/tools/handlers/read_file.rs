@@ -11,7 +11,7 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::{AnchorStateManager, normalize_file_content, split_content_lines};
-use crate::core::hash_utils::{content_hash, format_line_with_hash};
+use crate::core::hash_utils::{content_hash, format_line_with_hash, identical_content_indices};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use futures::StreamExt;
 use std::future::Future;
@@ -384,12 +384,18 @@ impl ReadFileHandler {
             };
         }
 
-        let anchored_content = output_lines
-            .iter()
-            .zip(output_anchors.iter())
-            .map(|(line, anchor)| format_line_with_hash(line, anchor))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let anchored_content = {
+            let dupes = identical_content_indices(&output_lines);
+            output_lines
+                .iter()
+                .zip(output_anchors.iter())
+                .zip(dupes.iter())
+                .map(|((line, anchor), identical_at)| {
+                    format_line_with_hash(line, anchor, identical_at)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
         let hash = content_hash(&content_for_hash);
 
@@ -1670,5 +1676,50 @@ mod tests {
                 i, i
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_file_annotates_duplicate_content_lines() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "unique line one").unwrap();
+        writeln!(temp_file, "    \"\"\"").unwrap();
+        writeln!(temp_file, "unique line two").unwrap();
+        writeln!(temp_file, "    \"\"\"").unwrap();
+        writeln!(temp_file, "unique line three").unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let result = handler
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                None,
+                None,
+                &anchor_mgr,
+                Some("dup-task"),
+                None,
+            )
+            .await;
+
+        assert!(result.success, "read_file must succeed: {:?}", result.error);
+        let dup_line_annotations = result
+            .content
+            .matches("identical content also at lines")
+            .count();
+        assert_eq!(
+            dup_line_annotations, 2,
+            "both duplicate `    \"\"\"` lines must be annotated, got: {}",
+            result.content
+        );
+        let unique_line_count = result
+            .content
+            .matches("unique line one")
+            .chain(result.content.matches("unique line two"))
+            .chain(result.content.matches("unique line three"))
+            .count();
+        assert_eq!(
+            unique_line_count, 3,
+            "unique lines must remain unannotated: {}",
+            result.content
+        );
     }
 }
