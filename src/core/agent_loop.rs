@@ -68,13 +68,11 @@ const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
 use crate::core::tool_output::{
-    extract_edit_stats_detailed, format_heat_map, format_heat_map_plain, format_tool_result,
-    format_tool_summary,
+    DigestLine, extract_edit_stats_detailed, format_heat_map, format_heat_map_plain,
+    format_tool_result, format_tool_result_digest, format_tool_summary,
     path_from_read_file_header, summarize_matching_sections,
 };
 
-const MAX_TOOL_RESULT_DISPLAY_LINES: usize = 5;
-const MAX_COMMAND_RESULT_DISPLAY_LINES: usize = 8;
 const MAX_EDIT_RESULT_DISPLAY_LINES: usize = 10;
 /// Default concurrency limit for parallel non-grouped tool execution.
 /// Prevents I/O contention when many tools run simultaneously.
@@ -2990,6 +2988,7 @@ impl AgentLoop {
                 Option<ToolExecutionOutput>,
                 Option<futures::future::BoxFuture<'static, ToolExecutionOutput>>,
                 Vec<FileActionPath>,
+                serde_json::Value,
             );
             let mut tool_tasks: Vec<ToolTask> = Vec::with_capacity(prepared_tool_calls.len());
 
@@ -3012,6 +3011,7 @@ impl AgentLoop {
                             Some(ToolExecutionOutput::error(parse_error.clone(), None)),
                             None,
                             vec![],
+                            serde_json::Value::Null,
                         ));
                         continue;
                     }
@@ -3321,6 +3321,7 @@ impl AgentLoop {
                                 let conversation_history = self.conversation_history.clone();
                                 let message_counter = self.message_counter.clone();
 
+                                let tool_params_for_task = tool_params.clone();
                                 tool_tasks.push((
                                     tool_id,
                                     tool_name.clone(),
@@ -3354,6 +3355,7 @@ impl AgentLoop {
                                         .boxed(),
                                     ),
                                     edit_file_paths,
+                                    tool_params_for_task,
                                 ));
                                 continue;
                             }
@@ -3384,7 +3386,7 @@ impl AgentLoop {
                     )
                 };
 
-                tool_tasks.push((tool_id, tool_name, Some(immediate_output), None, vec![]));
+                tool_tasks.push((tool_id, tool_name, Some(immediate_output), None, vec![], tool_params));
             }
 
             let parallel_enabled = self
@@ -3395,7 +3397,7 @@ impl AgentLoop {
             let mut result_map: std::collections::HashMap<usize, ToolExecutionOutput> =
                 std::collections::HashMap::with_capacity(tool_tasks.len());
             if !parallel_enabled {
-                for (i, (_, _, _, task, _)) in tool_tasks.iter_mut().enumerate() {
+                for (i, (_, _, _, task, _, _)) in tool_tasks.iter_mut().enumerate() {
                     if let Some(future) = task.take() {
                         result_map.insert(i, future.await);
                     }
@@ -3411,7 +3413,7 @@ impl AgentLoop {
                 )>,
             );
             let mut edit_groups: Vec<EditGroup> = Vec::new();
-            for (i, (_, tool_name, _, task, edit_file_paths)) in tool_tasks.iter_mut().enumerate() {
+            for (i, (_, tool_name, _, task, edit_file_paths, _tool_params)) in tool_tasks.iter_mut().enumerate() {
                 if (tool_name == "edit_file" || tool_name == "write_to_file")
                     && let Some(future) = task.take()
                 {
@@ -3438,7 +3440,7 @@ impl AgentLoop {
             let non_edit_futures: Vec<_> = tool_tasks
                 .iter_mut()
                 .enumerate()
-                .filter_map(|(i, (_, tool_name, _, task, _))| {
+                .filter_map(|(i, (_, tool_name, _, task, _, _))| {
                     if task.is_some() && tool_name != "edit_file" && tool_name != "write_to_file" {
                         non_edit_executed.insert(i);
                         task.take()
@@ -3509,7 +3511,7 @@ impl AgentLoop {
             // Phase 3: Collect results in order, then push as ONE StorageMessage
             let mut execution_results_iter = execution_results.into_iter();
             let mut tool_result_blocks: Vec<UserContentBlock> = Vec::new();
-            for (tool_id, tool_name, immediate_result_text, _task, edit_file_path) in tool_tasks {
+            for (tool_id, tool_name, immediate_result_text, _task, edit_file_path, tool_params) in tool_tasks {
                 let mut result_output = if let Some(result_text) = immediate_result_text {
                     result_text
                 } else {
@@ -3556,17 +3558,6 @@ impl AgentLoop {
                                 }
                             }
                         }
-                    } else if tool_name == "execute_command" {
-                        let max_lines = MAX_COMMAND_RESULT_DISPLAY_LINES;
-                        let displayed = format_tool_result(&result_output.text, max_lines);
-                        let status = if is_error { "✗" } else { "✓" };
-                        let first_line = displayed.lines().next().unwrap_or("");
-                        self.config
-                            .output_writer
-                            .emit(OutputEvent::tool_output_line(
-                                format!("  {status} {first_line}"),
-                                Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
-                            ));
                     } else if !matches!(
                         tool_name.as_str(),
                         "plan_mode_respond"
@@ -3575,35 +3566,25 @@ impl AgentLoop {
                             | "use_subagents"
                     ) && (tool_name != "attempt_completion" || is_error)
                     {
-                        let max_lines = MAX_TOOL_RESULT_DISPLAY_LINES;
-                        let displayed = format_tool_result(&result_output.text, max_lines);
-                        let status = if is_error { "✗" } else { "✓" };
-                        let mut display_lines = displayed.lines();
-                        let first = display_lines.next().unwrap_or("");
-                        let tool_style =
-                            Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG });
-                        self.config
-                            .output_writer
-                            .emit(OutputEvent::tool_output_line(
-                                format!("  {status} {first}"),
-                                tool_style,
-                            ));
-                        for line in display_lines.take(2) {
+                        let digest_lines = format_tool_result_digest(
+                            &tool_name,
+                            &tool_params,
+                            &result_output.text,
+                            is_error,
+                            if is_error { ERROR_FG } else { PROMPT_FG },
+                            PROMPT_FG,
+                        );
+                        for DigestLine { text, fg, dim } in digest_lines {
+                            let mut style = Style::default();
+                            if let Some(color) = fg {
+                                style = style.fg(color);
+                            }
+                            if dim {
+                                style = style.add_modifier(Modifier::DIM);
+                            }
                             self.config
                                 .output_writer
-                                .emit(OutputEvent::tool_output_line(
-                                    format!("    {line}"),
-                                    Style::default().add_modifier(Modifier::DIM),
-                                ));
-                        }
-                        let total_lines = displayed.lines().count();
-                        if total_lines > 3 {
-                            self.config
-                                .output_writer
-                                .emit(OutputEvent::tool_output_line(
-                                    format!("    ... {} more lines", total_lines - 3),
-                                    Style::default().add_modifier(Modifier::DIM),
-                                ));
+                                .emit(OutputEvent::tool_output_line(text, style));
                         }
                     }
                 }

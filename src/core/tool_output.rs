@@ -6,6 +6,19 @@
 use crate::core::tools::SnedTool;
 use std::collections::HashSet;
 
+/// One styled line emitted as part of a tool-result digest in the TUI.
+///
+/// Used by [`format_tool_result_digest`] so the agent loop can render
+/// per-line without re-parsing the summary string. The status line is
+/// always emitted first and carries `fg = status_fg`; continuation lines
+/// are rendered dim and indented two spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestLine {
+    pub text: String,
+    pub fg: Option<ratatui::style::Color>,
+    pub dim: bool,
+}
+
 pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> String {
     let tool = SnedTool::from_name(tool_name);
     let (verb, path) = match tool {
@@ -122,6 +135,146 @@ pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> Strin
     };
     let hyperlinked = crate::cli::colors::hyperlink_path(&path_str);
     format!("  ▶ {verb} {hyperlinked}")
+}
+
+/// Render a one-line digest (plus an optional dim continuation) that
+/// summarizes a tool result for the TUI transcript.
+///
+/// This replaces the previous behaviour of dumping the first raw line of
+/// the tool result body under the `✓` status glyph, which produced
+/// confusing transcripts for `read_file` (showing `  ✓ .venv/` instead
+/// of `  ✓ read .gitignore (12 lines)`) and for `execute_command`
+/// (showing `  ✓ EXIT=1` because the user echoed `$?` in their shell).
+///
+/// Per-tool rules:
+/// - `read_file`:       `  ✓ read <path> (<N> lines)` / `  ✗ read <path> (<N> lines)`
+/// - `list_files`:      `  ✓ listed <path> (<N> entries)`
+/// - `search_files`:    `  ✓ searched <path> (<N> matches)`
+/// - `execute_command`: `  ✓ <command>` / `  ✗ <command>`
+/// - everything else:   `  ✓ <first body line>` plus at most one dim
+///   continuation. `format_tool_result` already appends its own
+///   `... N more lines` marker, so we do not add a second one here.
+///
+/// `status_fg` is the theme colour for the status line; `dim_fg` is
+/// the colour used for continuation lines.
+#[must_use]
+pub fn format_tool_result_digest(
+    tool_name: &str,
+    params: &serde_json::Value,
+    result_text: &str,
+    is_error: bool,
+    status_fg: ratatui::style::Color,
+    dim_fg: ratatui::style::Color,
+) -> Vec<DigestLine> {
+    let tool = SnedTool::from_name(tool_name);
+    let status_glyph = if is_error { "✗" } else { "✓" };
+
+    match tool {
+        Some(SnedTool::ReadFile) => {
+            let path = params
+                .get("paths")
+                .and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .or_else(|| params.get("paths").and_then(|p| p.as_str()))
+                .unwrap_or("?");
+            let line_count = result_text.lines().count();
+            vec![DigestLine {
+                text: format!("  {status_glyph} read {path} ({line_count} lines)"),
+                fg: Some(status_fg),
+                dim: false,
+            }]
+        }
+        Some(SnedTool::ListFiles) => {
+            let path = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let entry_count = count_non_blank_lines(result_text);
+            let label = if is_error { "failed" } else { "listed" };
+            vec![DigestLine {
+                text: format!("  {status_glyph} {label} {path} ({entry_count} entries)"),
+                fg: Some(status_fg),
+                dim: false,
+            }]
+        }
+        Some(SnedTool::SearchFiles) => {
+            let path = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let match_count = count_non_blank_lines(result_text);
+            let label = if is_error { "failed" } else { "searched" };
+            vec![DigestLine {
+                text: format!("  {status_glyph} {label} {path} ({match_count} matches)"),
+                fg: Some(status_fg),
+                dim: false,
+            }]
+        }
+        Some(SnedTool::ExecuteCommand) => {
+            let cmd_text = if let Some(commands) = params.get("commands").and_then(|v| v.as_array())
+            {
+                let cmds: Vec<&str> = commands
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                cmds.join(" && ")
+            } else if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
+                cmd.to_string()
+            } else if let Some(script) = params.get("script").and_then(|v| v.as_str()) {
+                script.to_string()
+            } else {
+                tool_name.to_string()
+            };
+            let truncated = if cmd_text.chars().count() > 80 {
+                let mut out = String::new();
+                for (i, ch) in cmd_text.chars().enumerate() {
+                    if i >= 77 {
+                        out.push('…');
+                        break;
+                    }
+                    out.push(ch);
+                }
+                out
+            } else {
+                cmd_text
+            };
+            vec![DigestLine {
+                text: format!("  {status_glyph} {truncated}"),
+                fg: Some(status_fg),
+                dim: false,
+            }]
+        }
+        _ => {
+            // Generic fallback: first body line + at most one dim
+            // continuation. `format_tool_result` already appends its own
+            // `... N more lines` marker, so we do not emit a second one.
+            let mut out = Vec::new();
+            let mut display_lines = result_text.lines();
+            let first = display_lines.next().unwrap_or("").trim_end();
+            out.push(DigestLine {
+                text: format!("  {status_glyph} {first}"),
+                fg: Some(status_fg),
+                dim: false,
+            });
+            if let Some(next) = display_lines.next() {
+                let trimmed = next.trim_end();
+                if !trimmed.is_empty() {
+                    out.push(DigestLine {
+                        text: format!("    {trimmed}"),
+                        fg: Some(dim_fg),
+                        dim: true,
+                    });
+                }
+            }
+            out
+        }
+    }
+}
+
+fn count_non_blank_lines(text: &str) -> usize {
+    text.lines().filter(|line| !line.trim().is_empty()).count()
 }
 
 #[must_use]
@@ -561,5 +714,172 @@ mod tests {
     #[test]
     fn test_format_tool_result_empty() {
         assert_eq!(format_tool_result("", 10), "");
+    }
+
+    fn digest_text(lines: &[DigestLine]) -> Vec<String> {
+        lines.iter().map(|line| line.text.clone()).collect()
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_read_file_shows_path_and_line_count() {
+        let params = serde_json::json!({
+            "paths": [".gitignore"],
+        });
+        let body = ".venv/\n__pycache__/\n*.pyc";
+        let lines = format_tool_result_digest(
+            "read_file",
+            &params,
+            body,
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(digest_text(&lines), vec!["  ✓ read .gitignore (3 lines)"]);
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_read_file_error() {
+        let params = serde_json::json!({
+            "paths": ["missing.txt"],
+        });
+        let lines = format_tool_result_digest(
+            "read_file",
+            &params,
+            "Error reading missing.txt: not found",
+            true,
+            ratatui::style::Color::Red,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(
+            digest_text(&lines),
+            vec!["  ✗ read missing.txt (1 lines)"]
+        );
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_execute_command_shows_command_text() {
+        let params = serde_json::json!({
+            "command": "rm -rf data/normalized && python scripts/rollup.py",
+        });
+        let body = "Sold listings file not found\nEXIT=1\n";
+        let lines = format_tool_result_digest(
+            "execute_command",
+            &params,
+            body,
+            true,
+            ratatui::style::Color::Red,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(
+            digest_text(&lines),
+            vec!["  ✗ rm -rf data/normalized && python scripts/rollup.py"]
+        );
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_execute_command_truncates_long_command() {
+        let long_cmd: String = "a".repeat(200);
+        let params = serde_json::json!({"command": long_cmd.clone()});
+        let lines = format_tool_result_digest(
+            "execute_command",
+            &params,
+            "",
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].text.starts_with("  ✓ "));
+        assert!(lines[0].text.ends_with('…'));
+        assert!(lines[0].text.chars().count() < long_cmd.chars().count());
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_list_files_shows_entry_count() {
+        let params = serde_json::json!({"path": "src/core"});
+        let body = "agent_loop.rs\ntools/\n\nmod.rs\n";
+        let lines = format_tool_result_digest(
+            "list_files",
+            &params,
+            body,
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(
+            digest_text(&lines),
+            vec!["  ✓ listed src/core (3 entries)"]
+        );
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_search_files_shows_match_count() {
+        let params = serde_json::json!({"path": "src", "regex": "PlanState"});
+        let body = "src/foo.rs:1: PlanState::default()\nsrc/bar.rs:2: PlanState::new()\n";
+        let lines = format_tool_result_digest(
+            "search_files",
+            &params,
+            body,
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(
+            digest_text(&lines),
+            vec!["  ✓ searched src (2 matches)"]
+        );
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_generic_first_line_plus_one_continuation() {
+        let body = "first line\nsecond line\nthird line\nfourth line";
+        let lines = format_tool_result_digest(
+            "diagnostics_scan",
+            &serde_json::json!({}),
+            body,
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(
+            digest_text(&lines),
+            vec!["  ✓ first line".to_string(), "    second line".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_generic_skips_blank_continuation() {
+        let body = "first line\n   \nthird line";
+        let lines = format_tool_result_digest(
+            "diagnostics_scan",
+            &serde_json::json!({}),
+            body,
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(digest_text(&lines), vec!["  ✓ first line"]);
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_does_not_emit_more_lines_marker() {
+        // The helper intentionally does not append `... N more lines`
+        // because `format_tool_result` already does that when called
+        // from the generic tool-result render path. Regression guard.
+        let body = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj";
+        let lines = format_tool_result_digest(
+            "diagnostics_scan",
+            &serde_json::json!({}),
+            body,
+            false,
+            ratatui::style::Color::Green,
+            ratatui::style::Color::Gray,
+        );
+        for line in &lines {
+            assert!(
+                !line.text.contains("more lines"),
+                "digest should not contain its own truncation marker: {line:?}"
+            );
+        }
     }
 }
