@@ -1,5 +1,7 @@
 use sned::core::edit_batch::BatchProcessor;
-use sned::core::file_editor::{AnchorStateManager, Edit, EditExecutor, split_content_lines};
+use sned::core::file_editor::{
+    AnchorStateManager, ApplyOutcome, Edit, EditExecutor, split_content_lines,
+};
 
 fn lines(content: &str) -> Vec<String> {
     split_content_lines(content)
@@ -81,18 +83,21 @@ fn edit_executor_matches_ts_validation_messages() {
         end_anchor: Some(anchored[1].clone()),
         edit_type: "replace".to_string(),
         text: "new line 2".to_string(),
+        content: None,
     };
     let bad_format = Edit {
         anchor: "bad§line 1".to_string(),
         end_anchor: Some("bad§line 1".to_string()),
         edit_type: "replace".to_string(),
         text: "new line 1".to_string(),
+        content: None,
     };
     let missing = Edit {
         anchor: format!("{missing_anchor}§line 1"),
         end_anchor: Some(format!("{missing_anchor}§line 1")),
         edit_type: "replace".to_string(),
         text: "new line 1".to_string(),
+        content: None,
     };
     let wrong_content = Edit {
         anchor: format!("{}§wrong content", anchored[0].split('§').next().unwrap()),
@@ -102,6 +107,7 @@ fn edit_executor_matches_ts_validation_messages() {
         )),
         edit_type: "replace".to_string(),
         text: "wrong content".to_string(),
+        content: None,
     };
 
     let (resolved, failed) = executor.resolve_edits(
@@ -119,16 +125,12 @@ fn edit_executor_matches_ts_validation_messages() {
     assert_eq!(failed.len(), 3);
     assert!(failed[0].error.contains("incorrectly formatted"));
     assert!(failed[1].error.contains("not found in the file"));
-    assert!(
-        failed[2]
-            .error
-            .contains("does not match the file's content")
-    );
+    assert!(failed[2].error.contains("anchor is stale"));
 
-    let Some((final_lines, added, removed, applied)) =
+    let ApplyOutcome::Applied(final_lines, added, removed, applied, _unchanged) =
         executor.apply_edits(&content_lines, &resolved)
     else {
-        panic!("apply_edits returned None (overlapping edits)");
+        panic!("apply_edits must succeed");
     };
     assert_eq!(added, 1);
     assert_eq!(removed, 1);
@@ -169,18 +171,21 @@ fn file_editor_matches_ts_partial_success_flow() {
             end_anchor: Some(anchored[1].clone()),
             edit_type: "replace".to_string(),
             text: "new line 2".to_string(),
+            content: None,
         },
         Edit {
             anchor: format!("{missing_anchor}§this should fail"),
             end_anchor: Some(format!("{missing_anchor}§this should fail")),
             edit_type: "replace".to_string(),
             text: "this should fail".to_string(),
+            content: None,
         },
         Edit {
             anchor: anchored[3].clone(),
             end_anchor: Some(anchored[3].clone()),
             edit_type: "replace".to_string(),
             text: "new line 4".to_string(),
+            content: None,
         },
     ];
 
@@ -239,6 +244,7 @@ fn file_editor_preserves_trailing_newline_semantics() {
         end_anchor: Some(anchored[1].clone()),
         edit_type: "replace".to_string(),
         text: "new line 2".to_string(),
+        content: None,
     }];
 
     let processor = BatchProcessor::new(sned::core::edit_batch::DiffMode::Full);

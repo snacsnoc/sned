@@ -18,7 +18,9 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::anchor_dictionary::ANCHOR_DICTIONARY;
-use crate::core::hash_utils::{ANCHOR_DELIMITER, compute_hashes, split_anchor, strip_hashes};
+use crate::core::hash_utils::{
+    ANCHOR_DELIMITER, compute_hashes, find_glued_anchor_in_lines, split_anchor, strip_hashes,
+};
 
 /// Split file content into logical lines while preserving a trailing empty line
 /// when the file ends with `\n`. Anchor reconciliation and edit resolution must
@@ -702,6 +704,11 @@ pub struct Edit {
     pub end_anchor: Option<String>,
     pub edit_type: String,
     pub text: String,
+    /// Optional multi-line fingerprint: when both `anchor` and
+    /// `end_anchor` are present, the lines between them must equal this
+    /// list verbatim. Words pin the span authoritatively; `content`
+    /// verifies the interior.
+    pub content: Option<Vec<String>>,
 }
 
 /// A file with multiple edits.
@@ -717,6 +724,22 @@ pub struct ResolvedEdit {
     pub line_idx: usize,
     pub end_idx: usize,
     pub edit: Edit,
+}
+
+/// Per-edit diagnostic for a replace that was filtered as a no-op because
+/// the file already matches the replacement at the bound range. Carries the
+/// line number the edit would have targeted plus the list of lines whose
+/// content equals the first line of the bound range, so the model can tell
+/// when a "1 edit unchanged" actually meant "applied at the wrong location."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnchangedSite {
+    pub line_idx: usize,
+    pub end_idx: usize,
+    pub identical_content_at: Vec<usize>,
+    pub total_identical_count: usize,
+    /// The anchor word that bound the no-op replace, so the summary
+    /// can name which quoted word landed at the bound line.
+    pub anchor_word: Option<String>,
 }
 
 /// A failed edit with error message.
@@ -741,6 +764,30 @@ pub struct AppliedEdit {
 // ============================================================================
 // Edit Executor
 // ============================================================================
+
+/// Outcome of attempting to apply resolved edits to lines.
+///
+/// `Applied` carries the final content, line-count delta, the
+/// per-edit `AppliedEdit` records, and any `UnchangedSite`
+/// diagnostics for replaces filtered as no-ops.
+///
+/// `Overlap` means at least one pair of effective edits covered
+/// overlapping ranges — caller should reject the whole batch.
+///
+/// `GluedAnchor { lines }` means the final assembled content still
+/// contained a `Word§` or `hex§` fragment. Caller should reject the
+/// whole batch and tell the model which lines to fix.
+pub enum ApplyOutcome {
+    Applied(
+        Vec<String>,
+        usize,
+        usize,
+        Vec<AppliedEdit>,
+        Vec<UnchangedSite>,
+    ),
+    Overlap,
+    GluedAnchor(Vec<usize>),
+}
 
 /// Executes hash-anchored edits.
 ///
@@ -770,8 +817,16 @@ impl EditExecutor {
             let mut diagnostics: Vec<String> = Vec::new();
             let edit_type = &edit.edit_type;
 
-            let (line_idx, start_error) =
-                self.resolve_anchor("anchor", &edit.anchor, &normalized_line_hashes, lines);
+            // Boundary words pin the span authoritatively even if their content
+            // repeats across mirrored classes.
+            let using_fingerprint =
+                edit_type == "replace" && edit.end_anchor.is_some() && edit.content.is_some();
+
+            let (line_idx, start_error) = if using_fingerprint {
+                self.resolve_anchor_by_word("anchor", &edit.anchor, &normalized_line_hashes, lines)
+            } else {
+                self.resolve_anchor("anchor", &edit.anchor, &normalized_line_hashes, lines)
+            };
             if let Some(error) = start_error {
                 diagnostics.push(error);
             }
@@ -783,12 +838,21 @@ impl EditExecutor {
                     // Auto-default: missing end_anchor on replace means single-line
                     // replace (end_idx = line_idx, already set above).
                 } else {
-                    let (resolved_end_idx, end_error) = self.resolve_anchor(
-                        "end_anchor",
-                        end_anchor_str,
-                        &normalized_line_hashes,
-                        lines,
-                    );
+                    let (resolved_end_idx, end_error) = if using_fingerprint {
+                        self.resolve_anchor_by_word(
+                            "end_anchor",
+                            end_anchor_str,
+                            &normalized_line_hashes,
+                            lines,
+                        )
+                    } else {
+                        self.resolve_anchor(
+                            "end_anchor",
+                            end_anchor_str,
+                            &normalized_line_hashes,
+                            lines,
+                        )
+                    };
                     if let Some(error) = end_error {
                         diagnostics.push(error);
                     }
@@ -798,6 +862,45 @@ impl EditExecutor {
 
             if line_idx != usize::MAX && end_idx != usize::MAX && end_idx < line_idx {
                 diagnostics.push("Range error: anchor must refer to a line that precedes or is the same as end_anchor.".to_string());
+            }
+
+            // Boundary words pin the span authoritatively (each word is globally
+            // unique), so no window-uniqueness scan is needed — the words ARE the
+            // unique window by construction. Escape hatch for content-ambiguous
+            // single-line anchors on mirrored classes.
+            if let (Some(fp_content), true) = (
+                edit.content.as_ref(),
+                line_idx != usize::MAX && end_idx != usize::MAX,
+            ) {
+                let interior_len = end_idx.saturating_sub(line_idx).saturating_sub(1);
+                if interior_len != fp_content.len() {
+                    diagnostics.push(format!(
+                        "fingerprint content does not match the lines between anchor and end_anchor: expected {} line(s), got {}",
+                        fp_content.len(),
+                        interior_len
+                    ));
+                } else if end_idx <= line_idx {
+                    diagnostics.push(
+                        "fingerprint requires anchor and end_anchor to span at least one line between them."
+                            .to_string(),
+                    );
+                } else {
+                    let interior = &lines[line_idx + 1..=end_idx - 1];
+                    let matches = interior.iter().zip(fp_content.iter()).all(|(a, b)| a == b);
+                    if !matches {
+                        let first_diff = interior
+                            .iter()
+                            .zip(fp_content.iter())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(0);
+                        diagnostics.push(format!(
+                            "fingerprint content differs from the file starting at interior line {}: file has {:?} but content lists {:?}",
+                            line_idx + 1 + first_diff,
+                            interior[first_diff],
+                            fp_content[first_diff]
+                        ));
+                    }
+                }
             }
 
             if diagnostics.is_empty() {
@@ -818,6 +921,15 @@ impl EditExecutor {
     }
 
     /// Resolves an anchor to a line index.
+    ///
+    /// Rejects content-ambiguous anchors: when `provided_content` matches
+    /// two or more lines in the file (regardless of which word each line
+    /// carries), resolution fails with an occurrence listing. The model's
+    /// `Word§content` quoting identifies a line by content, not by word —
+    /// and content is what can collide. Words are globally unique by
+    /// construction (`reconcile` salts `get_word_for_hash`), so an
+    /// earlier word-ambiguity branch was unreachable and silently landed
+    /// edits on the wrong occurrence.
     pub fn resolve_anchor(
         &self,
         anchor_type: &str,
@@ -858,8 +970,7 @@ impl EditExecutor {
             );
         }
 
-        // Find all matching anchor names
-        let matches: Vec<usize> = normalized_line_hashes
+        let word_bound_lines: Vec<usize> = normalized_line_hashes
             .iter()
             .enumerate()
             .filter(|(_, h)| **h == anchor_name)
@@ -867,15 +978,15 @@ impl EditExecutor {
             .collect();
 
         tracing::debug!(
-            "Anchor resolution: anchor_type={}, anchor_name={}, provided_content={:?}, matches_count={}, total_lines={}",
+            "Anchor resolution: anchor_type={}, anchor_name={}, provided_content={:?}, word_matches={}, total_lines={}",
             anchor_type,
             anchor_name,
             provided_content,
-            matches.len(),
+            word_bound_lines.len(),
             lines.len()
         );
 
-        if matches.is_empty() {
+        if word_bound_lines.is_empty() {
             tracing::debug!(
                 "Anchor resolution failed: anchor name '{}' not found in file. Available anchors: {:?}",
                 anchor_name,
@@ -884,63 +995,150 @@ impl EditExecutor {
             return (
                 usize::MAX,
                 Some(format!(
-                    "{anchor_type} \"{anchor_name}\" not found in the file. Please ensure you are using the latest anchors from the most recent read_file output. COPY THE EXACT ANCHOR STRING FROM read_file OUTPUT (e.g., \"Crawler§void draw_game_over() {{\"). Do NOT modify the anchor text or omit the Word§ prefix."
+                    "{anchor_type} \"{anchor_name}\" not found in the file. Please ensure you are using the latest anchors from the most recent read_file output. COPY THE EXACT ANCHOR STRING FROM read_file OUTPUT (e.g., \"Crawler§void draw_game_over() {{\"). Do not modify the anchor text or omit the Word§ prefix."
                 )),
             );
         }
 
-        // Find the matching line by verifying content
-        let mut matching_indices: Vec<usize> = Vec::new();
-        for &index in &matches {
-            let actual_content = &lines[index];
-            let content_matches = provided_content == *actual_content;
-            tracing::debug!(
-                "Checking anchor match at line {}: provided_content={:?}, actual_content={:?}, match={}",
-                index,
-                provided_content,
-                actual_content,
-                content_matches
-            );
-            if content_matches {
-                matching_indices.push(index);
-            }
-        }
+        let content_matches: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == provided_content)
+            .map(|(i, _)| i)
+            .collect();
 
-        if matching_indices.is_empty() {
-            // Anchor name exists but content doesn't match any occurrence
-            let match_details: Vec<String> = matches
-                .iter()
-                .map(|&idx| format!("line {}: {:?}", idx, lines[idx]))
-                .collect();
-            tracing::debug!(
-                "Anchor resolution failed: content mismatch. anchor_name={}, provided_content={:?}, matching_lines_with_different_content=[{}]",
-                anchor_name,
-                provided_content,
-                match_details.join(", ")
-            );
-            return (
-                usize::MAX,
-                Some(format!(
-                    "{anchor_type} \"{anchor_name}\" exists, but the code line you provided does not match the file's content at any location with this anchor. Please use the latest anchors from the most recent read tool output."
-                )),
-            );
-        }
-
-        if matching_indices.len() > 1 {
-            // Multiple matches with same content - ambiguous
-            tracing::debug!(
-                "Anchor resolution failed: ambiguous anchor. anchor_name={}, matching_indices={:?}, content={:?}",
-                anchor_name,
-                matching_indices,
-                provided_content
-            );
-            return (
-                usize::MAX,
-                Some(format!(
-                    "{} \"{}\" matches {} lines with identical content. Please use a more specific anchor or edit one occurrence at a time.",
+        if word_bound_lines.len() == 1 {
+            let bound = word_bound_lines[0];
+            let bound_content = lines[bound].as_str();
+            if bound_content == provided_content {
+                tracing::debug!(
+                    "Anchor resolved by unique word match: anchor_type={}, anchor_name={}, line_index={}",
                     anchor_type,
                     anchor_name,
-                    matching_indices.len()
+                    bound
+                );
+                return (bound, None);
+            }
+            if bound_content.trim() == provided_content.trim() && !bound_content.is_empty() {
+                return (
+                    usize::MAX,
+                    Some(format!(
+                        "{anchor_type} \"{anchor_name}\" matches a line only after trimming whitespace (line {}), but the word-bound line is {:?}. The supplied content differs from the file's content only in leading or trailing whitespace — copy the line EXACTLY from read_file output (preserving spaces) and retry. Do NOT re-read first; re-reading won't change whitespace.",
+                        bound + 1,
+                        bound_content
+                    )),
+                );
+            }
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} \"{anchor_name}\" exists, but the supplied content does not match the line it currently binds to (now: {:?}). The anchor is stale: the quoted word resolved to a different line after a prior edit. Please re-read the file with read_file to get fresh anchors before retrying.",
+                    bound_content
+                )),
+            );
+        }
+
+        if content_matches.len() >= 2 {
+            let occurrences: Vec<String> = content_matches
+                .iter()
+                .take(8)
+                .map(|&idx| {
+                    let word_at = normalized_line_hashes
+                        .get(idx)
+                        .map(String::as_str)
+                        .unwrap_or("?");
+                    format!(
+                        "  line {}: {word_at}{ANCHOR_DELIMITER}{}",
+                        idx + 1,
+                        lines[idx]
+                    )
+                })
+                .collect();
+            let overflow = content_matches.len().saturating_sub(occurrences.len());
+            let mut listing = occurrences.join("\n");
+            if overflow > 0 {
+                listing.push_str(&format!("\n  ... and {overflow} more"));
+            }
+            tracing::debug!(
+                "Anchor resolution failed: content-ambiguous anchor. anchor_name={}, content_match_count={}, content_match_indices={:?}",
+                anchor_name,
+                content_matches.len(),
+                content_matches
+            );
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} \"{anchor_name}{ANCHOR_DELIMITER}{provided_content}\" matches {} lines with identical content:\n{}\nPin a unique span by quoting anchor + end_anchor + the lines between them in the 'content' field, then retry.",
+                    content_matches.len(),
+                    listing
+                )),
+            );
+        }
+
+        if content_matches.is_empty() {
+            // Distinguish whitespace-only mismatch from a genuine
+            // rebind: if a line matches provided_content modulo
+            // whitespace, the model quoted with wrong whitespace
+            // (re-reading won't fix it); otherwise the anchor is stale.
+            let trimmed_matches: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.trim() == provided_content.trim() && !line.is_empty())
+                .map(|(i, _)| i)
+                .collect();
+
+            if !trimmed_matches.is_empty() {
+                let rebound = word_bound_lines
+                    .iter()
+                    .map(|&idx| format!("line {}: {:?}", idx + 1, lines[idx]))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return (
+                    usize::MAX,
+                    Some(format!(
+                        "{anchor_type} \"{anchor_name}\" matches a line only after trimming whitespace (lines {}), but the word-bound line is ({rebound}). The supplied content differs from the file's content only in leading or trailing whitespace — copy the line EXACTLY from read_file output (preserving spaces) and retry. Do NOT re-read first; re-reading won't change whitespace.",
+                        trimmed_matches
+                            .iter()
+                            .map(|i| (i + 1).to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                );
+            }
+
+            let rebound = word_bound_lines
+                .iter()
+                .map(|&idx| format!("line {}: {:?}", idx + 1, lines[idx]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::debug!(
+                "Anchor resolution failed: content mismatch on word-bound line. anchor_name={}, provided_content={:?}, word_bound=[{rebound}]",
+                anchor_name,
+                provided_content,
+            );
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} \"{anchor_name}\" exists, but the supplied content does not match the line it currently binds to (now: {rebound}). The anchor is stale: the quoted word resolved to a different line after a prior edit. Please re-read the file with read_file to get fresh anchors before retrying."
+                )),
+            );
+        }
+
+        let content_idx = content_matches[0];
+        let word_idx = word_bound_lines[0];
+        if word_idx != content_idx {
+            tracing::debug!(
+                "Anchor resolution: rebind detected. quoted_word={} now binds to line {} but supplied content matches line {}",
+                anchor_name,
+                word_idx,
+                content_idx
+            );
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} \"{anchor_name}{ANCHOR_DELIMITER}{provided_content}\" now binds to content that appears at a different line: the quoted word resolves to line {} but the supplied content matches line {}. Re-read the file with read_file to refresh anchors before retrying.",
+                    word_idx + 1,
+                    content_idx + 1
                 )),
             );
         }
@@ -949,18 +1147,76 @@ impl EditExecutor {
             "Anchor resolved successfully: anchor_type={}, anchor_name={}, line_index={}",
             anchor_type,
             anchor_name,
-            matching_indices[0]
+            content_idx
         );
-        (matching_indices[0], None)
+        (content_idx, None)
+    }
+
+    /// Resolves an anchor to a line index using ONLY the word identity
+    /// (no content check). Use this when the caller has separately
+    /// pinned the span — typically via a multi-line fingerprint where
+    /// `anchor` + `end_anchor` + `content` together identify a unique
+    /// region, but each individual line's content may legitimately
+    /// repeat across mirrored classes.
+    #[allow(clippy::unused_self)]
+    pub fn resolve_anchor_by_word(
+        &self,
+        anchor_type: &str,
+        raw_anchor: &str,
+        normalized_line_hashes: &[String],
+        _lines: &[String],
+    ) -> (usize, Option<String>) {
+        let anchor_raw = raw_anchor.trim();
+        if anchor_raw.is_empty() {
+            return (usize::MAX, Some(format!("{anchor_type} is missing.")));
+        }
+        if anchor_raw.contains('\n') || anchor_raw.contains('\r') {
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} contains multiple lines. Anchors must refer to a single line only in the format Anchor{0}line_text.",
+                    ANCHOR_DELIMITER
+                )),
+            );
+        }
+
+        let (anchor_name, _) = split_anchor(anchor_raw);
+        if !ANCHOR_NAME_REGEX.is_match(&anchor_name) {
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} is missing or incorrectly formatted. It must start with a single word followed by the delimiter (e.g., \"Apple{0}\").",
+                    ANCHOR_DELIMITER
+                )),
+            );
+        }
+
+        let word_bound_lines: Vec<usize> = normalized_line_hashes
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| **h == anchor_name)
+            .map(|(i, _)| i)
+            .collect();
+
+        if word_bound_lines.is_empty() {
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} \"{anchor_name}\" not found in the file. Please ensure you are using the latest anchors from the most recent read_file output."
+                )),
+            );
+        }
+
+        (word_bound_lines[0], None)
     }
 
     /// Applies resolved edits to lines.
     /// Returns None if edits have overlapping ranges (detected before application).
-    pub fn apply_edits(
-        &self,
-        lines: &[String],
-        resolved_edits: &[ResolvedEdit],
-    ) -> Option<(Vec<String>, usize, usize, Vec<AppliedEdit>)> {
+    /// Applies resolved edits to lines.
+    /// Returns the outcome — see [`ApplyOutcome`]. Overlap is detected
+    /// before application; glued-anchor detection runs after assembly.
+    pub fn apply_edits(&self, lines: &[String], resolved_edits: &[ResolvedEdit]) -> ApplyOutcome {
+        let mut unchanged_sites: Vec<UnchangedSite> = Vec::new();
         let effective_edits: Vec<&ResolvedEdit> = resolved_edits
             .iter()
             .filter(|resolved| {
@@ -976,7 +1232,30 @@ impl EditExecutor {
                 {
                     !replacement_lines.is_empty()
                 } else {
-                    lines[resolved.line_idx..=resolved.end_idx] != replacement_lines
+                    let bound = &lines[resolved.line_idx..=resolved.end_idx];
+                    if bound == replacement_lines.as_slice() {
+                        let first_line = bound.first().cloned().unwrap_or_default();
+                        let all_identical: Vec<usize> = lines
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, line)| **line == first_line)
+                            .map(|(i, _)| i)
+                            .filter(|&i| i != resolved.line_idx)
+                            .collect();
+                        let total_identical_count = all_identical.len();
+                        let identical_at: Vec<usize> = all_identical.into_iter().take(8).collect();
+                        let (word, _) = split_anchor(&resolved.edit.anchor);
+                        unchanged_sites.push(UnchangedSite {
+                            line_idx: resolved.line_idx,
+                            end_idx: resolved.end_idx,
+                            identical_content_at: identical_at,
+                            total_identical_count,
+                            anchor_word: if word.is_empty() { None } else { Some(word) },
+                        });
+                        false
+                    } else {
+                        true
+                    }
                 }
             })
             .collect();
@@ -1013,7 +1292,7 @@ impl EditExecutor {
                         b_start,
                         b_end
                     );
-                    return None;
+                    return ApplyOutcome::Overlap;
                 }
             }
         }
@@ -1091,7 +1370,34 @@ impl EditExecutor {
             })
             .collect();
 
-        Some((new_lines, added_count, removed_count, applied_edits))
+        // Defense-in-depth: refuse to write content that still has any
+        // `Word§` or `hex§` fragment in touched or added lines. The model
+        // can reconstruct content from a partial `read_file` view and forget a newline
+        // between anchored lines, producing `WordA§WordB§...` where
+        // `strip_hashes` (line-start only) can't reach. Scope the check to
+        // changed/added lines so pre-existing or legitimate § text in untouched
+        // lines does not trigger false-positive rejections.
+        let check_indices: Vec<usize> = applied_edits
+            .iter()
+            .filter(|e| e.lines_added > 0)
+            .flat_map(|e| e.start_idx..=e.end_idx)
+            .collect();
+        let glued_lines = find_glued_anchor_in_lines(&new_lines, &check_indices);
+        if !glued_lines.is_empty() {
+            tracing::warn!(
+                "Final assembled content has Word§/hex§ fragments at lines {:?}; rejecting batch",
+                glued_lines
+            );
+            return ApplyOutcome::GluedAnchor(glued_lines);
+        }
+
+        ApplyOutcome::Applied(
+            new_lines,
+            added_count,
+            removed_count,
+            applied_edits,
+            unchanged_sites,
+        )
     }
 
     /// Formats a failure message for an edit.
@@ -1168,12 +1474,28 @@ impl FileEditor {
             });
         }
 
-        let Some((final_lines, _added, _removed, applied_edits)) =
-            self.executor.apply_edits(&lines, &resolved_edits)
-        else {
-            return Err(FileEditorError::OverlappingEdits {
-                message: "Edit ranges overlap. Apply edits sequentially or ensure non-overlapping ranges.".to_string(),
-            });
+        let outcome = self.executor.apply_edits(&lines, &resolved_edits);
+        let (final_lines, applied_edits) = match outcome {
+            ApplyOutcome::Overlap => {
+                return Err(FileEditorError::OverlappingEdits {
+                    message: "Edit ranges overlap. Apply edits sequentially or ensure non-overlapping ranges.".to_string(),
+                });
+            }
+            ApplyOutcome::GluedAnchor(glued_lines) => {
+                let listing = glued_lines
+                    .iter()
+                    .map(|l| format!("line {l}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(FileEditorError::AllEditsFailed {
+                    message: format!(
+                        "Assembled content has Word§/hex§ fragments at {listing}; the model likely reconstructed content without a newline between anchored lines. Re-read the file with read_file and retry, preserving line breaks exactly."
+                    ),
+                });
+            }
+            ApplyOutcome::Applied(final_lines, _added, _removed, applied_edits, _unchanged) => {
+                (final_lines, applied_edits)
+            }
         };
 
         let final_content = final_lines.join("\n");
@@ -1492,14 +1814,18 @@ mod tests {
             error
         );
 
-        // Second occurrence with different content should also match
+        // Second occurrence: word "Hello" still resolves to line 0, but
+        // supplied content "def hello():  # duplicate" only matches
+        // line 2. Old behavior silently landed on whichever occurrence
+        // carried the word — that's the silent wrong-location bug.
+        // New behavior surfaces the rebind explicitly.
         let (idx, error) =
             executor.resolve_anchor("anchor", "Hello§def hello():  # duplicate", &hashes, &lines);
-        assert_eq!(idx, 2);
+        assert_eq!(idx, usize::MAX);
+        let err_msg = error.expect("rebind must surface an error");
         assert!(
-            error.is_none(),
-            "Second occurrence should match: {:?}",
-            error
+            err_msg.contains("now binds to content that appears at a different line"),
+            "got: {err_msg}"
         );
 
         // Wrong content for the anchor should fail
@@ -1508,9 +1834,8 @@ mod tests {
         assert_eq!(idx, usize::MAX);
         assert!(error.is_some(), "Should error on content mismatch");
         assert!(
-            error
-                .unwrap()
-                .contains("does not match the file's content at any location")
+            error.unwrap().contains("anchor is stale"),
+            "wrong content with existing word must surface anchor-stale diagnostic"
         );
     }
 
@@ -1537,7 +1862,7 @@ mod tests {
         assert!(error.is_some(), "Should error on ambiguous anchor");
         let err_msg = error.unwrap();
         assert!(err_msg.contains("matches 2 lines with identical content"));
-        assert!(err_msg.contains("use a more specific anchor"));
+        assert!(err_msg.contains("'content' field"));
     }
 
     #[test]
@@ -1611,6 +1936,7 @@ mod tests {
             end_anchor: Some("Banana§    print('world')".to_string()),
             edit_type: "replace".to_string(),
             text: "def greeting():\n    pass".to_string(),
+            content: None,
         }];
 
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
@@ -1637,12 +1963,14 @@ mod tests {
                 end_anchor: Some("Banana§    print('world')".to_string()),
                 edit_type: "replace".to_string(),
                 text: "def greeting():\n    pass".to_string(),
+                content: None,
             },
         }];
 
-        let Some((final_lines, added, removed, applied)) = executor.apply_edits(&lines, &edits)
+        let ApplyOutcome::Applied(final_lines, added, removed, applied, _unchanged) =
+            executor.apply_edits(&lines, &edits)
         else {
-            panic!("apply_edits returned None (overlapping edits)");
+            panic!("apply_edits must succeed");
         };
         assert_eq!(final_lines.len(), 3);
         assert_eq!(final_lines[0], "def greeting():");
@@ -1666,12 +1994,14 @@ mod tests {
                 end_anchor: None,
                 edit_type: "insert_after".to_string(),
                 text: "    print('world')".to_string(),
+                content: None,
             },
         }];
 
-        let Some((final_lines, _added, _removed, applied)) = executor.apply_edits(&lines, &edits)
+        let ApplyOutcome::Applied(final_lines, _added, _removed, applied, _unchanged) =
+            executor.apply_edits(&lines, &edits)
         else {
-            panic!("apply_edits returned None (overlapping edits)");
+            panic!("apply_edits must succeed");
         };
         assert_eq!(final_lines.len(), 3);
         assert_eq!(final_lines[0], "def hello():");
@@ -1700,6 +2030,7 @@ mod tests {
             end_anchor: Some(format!("{}§    print('world')", anchors[1])),
             edit_type: "replace".to_string(),
             text: "def greeting():\n    pass".to_string(),
+            content: None,
         }];
 
         let result = editor.apply_edits(content, &edits, "/tmp/e2e.py", Some(task_id));
@@ -1796,7 +2127,7 @@ mod tests {
         assert_eq!(idx, usize::MAX);
         assert!(error.is_some());
         let err_msg = error.unwrap();
-        assert!(err_msg.contains("does not match the file's content"));
+        assert!(err_msg.contains("anchor is stale"));
         assert!(err_msg.contains("Apple"));
     }
 

@@ -100,6 +100,34 @@ pub fn strip_hashes(content: &str) -> String {
     }
 }
 
+static GLUED_ANCHOR_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    // `strip_hashes` only handles line-start anchors; content reconstructed
+    // by the model from partial reads can leak such fragments into the file
+    // verbatim (e.g., `FranticBreakfast§SolubleGuildhall`). Word and hex
+    // anchors are internal to the edit machinery and must never appear in user source.
+    Regex::new(r"(?:[A-Z][a-zA-Z0-9]*|[0-9a-f]{8,16})§").unwrap()
+});
+
+/// Defense against the silent-corruption path where the model reconstructs
+/// content from a partial `read_file` view and forgets a newline between
+/// consecutive anchored lines, producing `WordA§WordB§...` where the `§`
+/// delimiter survives into the file and corrupts the source. Scopes the check
+/// to the 0-based `check_indices` corresponding to changed or added lines in `lines`.
+/// Returns the 1-indexed line numbers of offending lines.
+#[must_use]
+pub fn find_glued_anchor_in_lines(lines: &[String], check_indices: &[usize]) -> Vec<usize> {
+    check_indices
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            lines
+                .get(idx)
+                .map_or(false, |line| GLUED_ANCHOR_REGEX.is_match(line))
+        })
+        .map(|idx| idx + 1)
+        .collect()
+}
+
 /// Extracts the ID from a line reference.
 ///
 #[must_use]

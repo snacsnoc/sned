@@ -3,7 +3,8 @@
 //! and `dirac/src/core/task/tools/handlers/edit-file/EditFormatter.ts`.
 
 use crate::core::file_editor::{
-    AppliedEdit, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit, split_content_lines,
+    AppliedEdit, ApplyOutcome, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit,
+    UnchangedSite, split_content_lines,
 };
 use crate::core::hash_utils::format_line_with_hash;
 use std::path::Path;
@@ -23,16 +24,8 @@ fn highlight_diff_content(content: &str, language: &str, colored: bool) -> Strin
     }
 }
 
-fn highlighted_line_with_hash(
-    content: &str,
-    hash: &str,
-    language: &str,
-    colored: bool,
-) -> String {
-    format_line_with_hash(
-        &highlight_diff_content(content, language, colored),
-        hash,
-    )
+fn highlighted_line_with_hash(content: &str, hash: &str, language: &str, colored: bool) -> String {
+    format_line_with_hash(&highlight_diff_content(content, language, colored), hash)
 }
 
 // ============================================================================
@@ -81,6 +74,15 @@ pub struct BatchResult {
     pub lines_added: u32,
     /// Net lines removed for session summary.
     pub lines_removed: u32,
+    /// Per-edit diagnostics for replaces filtered as no-ops, so the
+    /// caller can surface line number and content-occurrence count
+    /// instead of reporting silent success.
+    pub unchanged_sites: Vec<UnchangedSite>,
+    /// 1-indexed line numbers in the assembled output that still
+    /// contained a `Word§` or `hex§` fragment. Empty when the batch
+    /// applied cleanly; populated (with `success: false`) when the
+    /// post-assembly § check rejects the batch.
+    pub glued_anchor_lines: Vec<usize>,
 }
 
 // ============================================================================
@@ -184,6 +186,17 @@ impl BatchProcessor {
             // end_anchor defaults to anchor at resolve time (file_editor.rs).
         }
 
+        // The `content` field is meaningful only as a multi-line
+        // fingerprint interior, which requires both end_anchor and the
+        // replace type. Supplying content on an insert or on a
+        // single-line replace is silently ignored at resolve time —
+        // reject it here so the model gets feedback instead.
+        if edit.content.is_some() && !(is_replace && has_end_anchor) {
+            return Err(FileEditorError::ValidationError(
+                "The 'content' field is only valid for replace edits with an 'end_anchor' (multi-line fingerprint shape). Remove 'content', or add 'end_anchor' to make it a multi-line replace.".to_string(),
+            ));
+        }
+
         if edit.text.is_empty() && edit_type == "replace" {
             // Allow empty text for replace (deletes content)
         }
@@ -246,11 +259,11 @@ impl BatchProcessor {
         _absolute_path: &str,
         display_path: &str,
     ) -> BatchResult {
-        let Some((final_lines, added_count, removed_count, applied_edits)) = self
+        let outcome = self
             .executor
-            .apply_edits(&batch.lines, &batch.resolved_edits)
-        else {
-            return BatchResult {
+            .apply_edits(&batch.lines, &batch.resolved_edits);
+        match outcome {
+            ApplyOutcome::Overlap => BatchResult {
                 success: false,
                 final_content: None,
                 resolved_count: batch.resolved_edits.len(),
@@ -258,26 +271,47 @@ impl BatchProcessor {
                 overlap: true,
                 lines_added: 0,
                 lines_removed: 0,
-            };
-        };
+                unchanged_sites: Vec::new(),
+                glued_anchor_lines: Vec::new(),
+            },
+            ApplyOutcome::GluedAnchor(lines) => BatchResult {
+                success: false,
+                final_content: None,
+                resolved_count: batch.resolved_edits.len(),
+                failed_count: batch.failed_edits.len(),
+                overlap: false,
+                lines_added: 0,
+                lines_removed: 0,
+                unchanged_sites: Vec::new(),
+                glued_anchor_lines: lines,
+            },
+            ApplyOutcome::Applied(
+                final_lines,
+                added_count,
+                removed_count,
+                applied_edits,
+                unchanged_sites,
+            ) => {
+                let resolved_count = applied_edits.len();
+                batch.final_lines = final_lines.clone();
+                batch.final_content = final_lines.join("\n");
+                batch.applied_edits = applied_edits;
 
-        let resolved_count = applied_edits.len();
-        batch.final_lines = final_lines.clone();
-        batch.final_content = final_lines.join("\n");
-        batch.applied_edits = applied_edits;
+                let diff = self.generate_diff(display_path, batch);
+                batch.diff = diff;
 
-        // Generate diff
-        let diff = self.generate_diff(display_path, batch);
-        batch.diff = diff;
-
-        BatchResult {
-            success: true,
-            final_content: Some(batch.final_content.clone()),
-            resolved_count,
-            failed_count: batch.failed_edits.len(),
-            overlap: false,
-            lines_added: added_count as u32,
-            lines_removed: removed_count as u32,
+                BatchResult {
+                    success: true,
+                    final_content: Some(batch.final_content.clone()),
+                    resolved_count,
+                    failed_count: batch.failed_edits.len(),
+                    overlap: false,
+                    lines_added: added_count as u32,
+                    lines_removed: removed_count as u32,
+                    unchanged_sites,
+                    glued_anchor_lines: Vec::new(),
+                }
+            }
         }
     }
 
@@ -645,8 +679,7 @@ impl BatchProcessor {
         if let Some(end) = final_range_end {
             for i in applied.start_idx..=end {
                 let hash = &final_hashes[i];
-                let line =
-                    highlighted_line_with_hash(&final_lines[i], hash, language, colored);
+                let line = highlighted_line_with_hash(&final_lines[i], hash, language, colored);
                 if original_hashes_set.contains(hash) {
                     res.push(crate::cli::colors::diff_context(&line));
                 } else {
@@ -698,6 +731,7 @@ mod tests {
                     end_anchor: Some("Banana§println!()".to_string()),
                     edit_type: "replace".to_string(),
                     text: "fn new_main()".to_string(),
+                    content: None,
                 }],
             ),
             (
@@ -707,6 +741,7 @@ mod tests {
                     end_anchor: None,
                     edit_type: "insert_after".to_string(),
                     text: "pub fn sub()".to_string(),
+                    content: None,
                 }],
             ),
         ];
@@ -729,6 +764,7 @@ mod tests {
             end_anchor: Some("Banana§content".to_string()),
             edit_type: "replace".to_string(),
             text: "new content".to_string(),
+            content: None,
         };
         assert!(processor.validate_edit(&valid).is_ok());
 
@@ -738,6 +774,7 @@ mod tests {
             end_anchor: Some("Banana§content".to_string()),
             edit_type: "".to_string(),
             text: "new".to_string(),
+            content: None,
         };
         assert!(processor.validate_edit(&invalid).is_err());
 
@@ -747,6 +784,7 @@ mod tests {
             end_anchor: Some("Banana§content".to_string()),
             edit_type: "replace".to_string(),
             text: "new".to_string(),
+            content: None,
         };
         assert!(processor.validate_edit(&invalid).is_err());
 
@@ -756,8 +794,38 @@ mod tests {
             end_anchor: None,
             edit_type: "replace".to_string(),
             text: "new".to_string(),
+            content: None,
         };
         assert!(processor.validate_edit(&valid).is_ok());
+
+        // `content` requires both end_anchor and replace — silent
+        // ignore would let the model think it supplied a fingerprint.
+        let with_content_no_end = Edit {
+            anchor: "Apple§content".to_string(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: "new".to_string(),
+            content: Some(vec!["middle".to_string()]),
+        };
+        assert!(processor.validate_edit(&with_content_no_end).is_err());
+
+        let content_with_insert = Edit {
+            anchor: "Apple§content".to_string(),
+            end_anchor: Some("Banana§content".to_string()),
+            edit_type: "insert_after".to_string(),
+            text: "new".to_string(),
+            content: Some(vec!["middle".to_string()]),
+        };
+        assert!(processor.validate_edit(&content_with_insert).is_err());
+
+        let valid_fingerprint = Edit {
+            anchor: "Apple§content".to_string(),
+            end_anchor: Some("Banana§content".to_string()),
+            edit_type: "replace".to_string(),
+            text: "new".to_string(),
+            content: Some(vec!["middle".to_string()]),
+        };
+        assert!(processor.validate_edit(&valid_fingerprint).is_ok());
     }
 
     #[test]
@@ -777,6 +845,7 @@ mod tests {
             end_anchor: Some(format!("{}§    println!(\"world\");", hashes[1])),
             edit_type: "replace".to_string(),
             text: "fn greeting() {\n    println!(\"hello\");".to_string(),
+            content: None,
         }];
 
         let prepared =
@@ -811,6 +880,7 @@ mod tests {
             end_anchor: Some(format!("{}§line2", hashes[1])),
             edit_type: "replace".to_string(),
             text: "replacement\n\n".to_string(),
+            content: None,
         }];
 
         let mut prepared = processor
@@ -853,6 +923,7 @@ mod tests {
             end_anchor: Some(format!("{}§only line", hashes[0])),
             edit_type: "replace".to_string(),
             text: String::new(),
+            content: None,
         }];
 
         let mut prepared = processor
@@ -888,6 +959,7 @@ mod tests {
             end_anchor: Some(format!("{}§line2", hashes[1])),
             edit_type: "replace".to_string(),
             text: String::new(),
+            content: None,
         }];
 
         let mut prepared = processor
@@ -924,18 +996,21 @@ mod tests {
                 end_anchor: Some(format!("{}§line2", hashes[1])),
                 edit_type: "replace".to_string(),
                 text: "alpha".to_string(),
+                content: None,
             },
             Edit {
                 anchor: format!("{}§line2", hashes[1]),
                 end_anchor: Some(format!("{}§line3", hashes[2])),
                 edit_type: "replace".to_string(),
                 text: "beta".to_string(),
+                content: None,
             },
             Edit {
                 anchor: "bogus§missing".to_string(),
                 end_anchor: Some("bogus§missing".to_string()),
                 edit_type: "replace".to_string(),
                 text: "gamma".to_string(),
+                content: None,
             },
         ];
 
@@ -970,6 +1045,7 @@ mod tests {
             end_anchor: Some(format!("{}§line2", hashes[1])),
             edit_type: "replace".to_string(),
             text: "new_line2".to_string(),
+            content: None,
         }];
 
         let mut prepared = processor
@@ -994,6 +1070,7 @@ mod tests {
             end_anchor: Some("Banana§same".to_string()),
             edit_type: "replace".to_string(),
             text: "same".to_string(),
+            content: None,
         };
         let prepared = PreparedEdits {
             content: "same\nsame".to_string(),
@@ -1048,6 +1125,7 @@ mod tests {
             end_anchor: Some(format!("{}§line2", hashes[1])),
             edit_type: "replace".to_string(),
             text: "new_line2".to_string(),
+            content: None,
         }];
 
         let mut prepared = processor
@@ -1064,13 +1142,8 @@ mod tests {
         let final_lines = prepared.final_lines.clone();
         let final_hashes = anchor_mgr.reconcile("/tmp/additions.rs", &final_lines, Some(task_id));
 
-        let formatted = processor.format_result(
-            "additions.rs",
-            &prepared,
-            &final_lines,
-            &final_hashes,
-            None,
-        );
+        let formatted =
+            processor.format_result("additions.rs", &prepared, &final_lines, &final_hashes, None);
 
         // In additions-only mode, deleted lines should show as "X lines have been deleted"
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
@@ -1093,6 +1166,7 @@ mod tests {
             end_anchor: Some(format!("{}§line2", hashes[1])),
             edit_type: "replace".to_string(),
             text: "new_line2".to_string(),
+            content: None,
         }];
 
         let mut prepared = processor
@@ -1140,6 +1214,7 @@ mod tests {
             end_anchor: Some(format!("{}§line2", hashes[1])),
             edit_type: "replace".to_string(),
             text: "new_line2\nnew_line2b".to_string(),
+            content: None,
         }];
 
         let mut prepared = processor
@@ -1230,6 +1305,7 @@ mod tests {
             end_anchor: Some(format!("{}§line2", hashes[1])),
             edit_type: "replace".to_string(),
             text: "new_line2".to_string(),
+            content: None,
         }];
 
         let mut prepared = processor

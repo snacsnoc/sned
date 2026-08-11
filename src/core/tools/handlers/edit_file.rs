@@ -25,10 +25,10 @@ use crate::core::tools::{
 };
 use crate::services::symbol_index::SymbolIndexService;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Edit file tool handler.
@@ -41,7 +41,7 @@ pub struct EditFileHandler {
 }
 
 impl EditFileHandler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             approval_manager: None,
@@ -72,10 +72,12 @@ impl EditFileHandler {
     }
 
     fn file_entry_path(file: &serde_json::Value) -> Result<&str, String> {
-        if let Some(path) = file.get("path") { path.as_str().ok_or_else(|| {
+        if let Some(path) = file.get("path") {
+            path.as_str().ok_or_else(|| {
             "edit_file requires 'path' to be a string in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
                 .to_string()
-        }) } else {
+        })
+        } else {
             // Lenient fallback: models commonly put "path" inside the first
             // edit object instead of at the file-entry level. Extract it
             // if present so the edit succeeds without a wasted round-trip.
@@ -281,6 +283,18 @@ impl EditFileHandler {
                     .transpose()
                     .map_err(ToolError::InvalidInput)?;
 
+                // Multi-line fingerprint: lets the model disambiguate
+                // identical-content lines when both anchor and end_anchor resolve.
+                let content = edit_raw
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|v| !v.is_empty());
+
                 let text_raw = edit_raw.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 // Strip leaked anchor prefixes that the model may have
                 // copy-pasted from the diff output (e.g. `QualitySocial§...`
@@ -298,6 +312,7 @@ impl EditFileHandler {
                     end_anchor,
                     edit_type: edit_type.to_string(),
                     text,
+                    content,
                 });
             }
 
@@ -357,7 +372,10 @@ impl EditFileHandler {
                 .map_or(&[], std::vec::Vec::as_slice);
 
             for edit in edits {
-                let anchor_raw = edit.get("anchor").and_then(|a: &serde_json::Value| a.as_str()).unwrap_or("");
+                let anchor_raw = edit
+                    .get("anchor")
+                    .and_then(|a: &serde_json::Value| a.as_str())
+                    .unwrap_or("");
                 let anchor = match Self::normalized_anchor("anchor", path, anchor_raw) {
                     Ok(anchor) => anchor,
                     Err(message) => {
@@ -393,7 +411,10 @@ impl EditFileHandler {
                     ));
                 }
 
-                if let Some(end_anchor_raw) = edit.get("end_anchor").and_then(|a: &serde_json::Value| a.as_str()) {
+                if let Some(end_anchor_raw) = edit
+                    .get("end_anchor")
+                    .and_then(|a: &serde_json::Value| a.as_str())
+                {
                     let end_anchor =
                         match Self::normalized_anchor("end_anchor", path, end_anchor_raw) {
                             Ok(anchor) => anchor,
@@ -555,10 +576,7 @@ impl EditFileHandler {
 
         if files.is_empty() {
             return if let Some(value) = files_value {
-                if value
-                    .as_array()
-                    .is_some_and(std::vec::Vec::is_empty)
-                {
+                if value.as_array().is_some_and(std::vec::Vec::is_empty) {
                     Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
                 } else if value.as_str().is_some() {
                     match parsed_stringified_files.unwrap() {
@@ -569,7 +587,9 @@ impl EditFileHandler {
                         )),
                     }
                 } else {
-                    Ok(format!("Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {value}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}]."))
+                    Ok(format!(
+                        "Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {value}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}]."
+                    ))
                 }
             } else {
                 Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
@@ -616,6 +636,7 @@ impl EditFileHandler {
         let mut total_failed = 0usize;
         let mut total_overlap = 0usize;
         let mut total_edits = 0usize;
+        let mut total_glued_batches = 0usize;
         let mut diff_previews: Vec<String> = Vec::new();
         let mut prepared_batches: Vec<(crate::core::edit_batch::FileEditBatch, PreparedEdits)> =
             Vec::new();
@@ -926,6 +947,8 @@ impl EditFileHandler {
             applied_count: usize,
             lines_added: u32,
             lines_removed: u32,
+            unchanged_sites: Vec<crate::core::file_editor::UnchangedSite>,
+            glued_anchor_lines: Vec<usize>,
         }
         let mut file_results: Vec<FileResult> = Vec::new();
 
@@ -954,6 +977,10 @@ impl EditFileHandler {
                     .saturating_sub(result.resolved_count);
             }
             total_failed += result.failed_count;
+            if !result.glued_anchor_lines.is_empty() {
+                total_failed += result.resolved_count.max(1);
+                total_glued_batches += 1;
+            }
             if result.overlap {
                 total_overlap += result.resolved_count;
             }
@@ -981,7 +1008,11 @@ impl EditFileHandler {
             let final_lines: Vec<String> = result
                 .final_content
                 .as_ref()
-                .map(|c| c.split('\n').map(std::string::ToString::to_string).collect())
+                .map(|c| {
+                    c.split('\n')
+                        .map(std::string::ToString::to_string)
+                        .collect()
+                })
                 .unwrap_or_default();
 
             file_results.push(FileResult {
@@ -994,6 +1025,8 @@ impl EditFileHandler {
                 applied_count: result.resolved_count,
                 lines_added: result.lines_added,
                 lines_removed: result.lines_removed,
+                unchanged_sites: result.unchanged_sites,
+                glued_anchor_lines: result.glued_anchor_lines,
             });
         }
 
@@ -1028,8 +1061,7 @@ impl EditFileHandler {
                             if let Some(orig) = original_contents.get(path)
                                 && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
                             {
-                                rollback_errors
-                                    .push(format!("Failed to rollback {path}: {re}"));
+                                rollback_errors.push(format!("Failed to rollback {path}: {re}"));
                             }
                         }
                         if !rollback_errors.is_empty() {
@@ -1117,17 +1149,14 @@ impl EditFileHandler {
                         write_failed_paths.extend(written_paths.iter().cloned());
                         for path in written_paths.iter().rev() {
                             if let Some(orig) = original_contents.get(path)
-                                && let Err(re) =
-                                    crate::storage::disk::atomic_write_file(path, orig)
+                                && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
                             {
                                 rollback_errors.push(format!("Failed to rollback {path}: {re}"));
                             }
                         }
                         if rollback_errors.is_empty() {
-                            all_results.push(format!(
-                                "Error writing file {}: {}",
-                                item.display_path, e
-                            ));
+                            all_results
+                                .push(format!("Error writing file {}: {}", item.display_path, e));
                         } else {
                             all_results.push(format!(
                                 "Error writing file {}: {}. Rollback incomplete: {}",
@@ -1260,7 +1289,27 @@ impl EditFileHandler {
         }
 
         // Phase 6: Build final results with diagnostics comparison
+        // Collect unchanged sites before consuming file_results in the
+        // loop below — we need them for the inline summary diagnostic.
+        let mut all_unchanged_sites: Vec<crate::core::file_editor::UnchangedSite> = Vec::new();
+        for file_result in &file_results {
+            all_unchanged_sites.extend(file_result.unchanged_sites.iter().cloned());
+        }
         for file_result in file_results {
+            if !file_result.glued_anchor_lines.is_empty() {
+                let lines_str = file_result
+                    .glued_anchor_lines
+                    .iter()
+                    .map(|l| format!("line {l}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                all_results.push(format!(
+                    "File {}: batch rejected: Word§/hex§ fragment at {lines_str}; the model likely omitted a newline between anchored lines. Re-read the file with read_file and retry, preserving line breaks.",
+                    file_result.batch_display_path
+                ));
+                continue;
+            }
+
             if !file_result.had_success {
                 continue;
             }
@@ -1341,9 +1390,59 @@ impl EditFileHandler {
 
         let mut summary_counts = vec![format!("{total_applied} edit(s) applied")];
         if total_unchanged > 0 {
-            summary_counts.push(format!("{total_unchanged} edit(s) unchanged"));
+            // Surface line number + content-occurrence count + bound
+            // word for each filtered no-op replace so the model can
+            // spot wrong-location edits that slipped past the
+            // content-ambiguity guard (defense-in-depth against the
+            // rebind-after-Myers-diff case).
+            let mut site_descriptions: Vec<String> = Vec::new();
+            for site in &all_unchanged_sites {
+                let line_count = site.total_identical_count;
+                let occ = if line_count == 0 {
+                    String::new()
+                } else {
+                    let lines = site
+                        .identical_content_at
+                        .iter()
+                        .take(5)
+                        .map(|l| (l + 1).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let overflow = line_count.saturating_sub(5);
+                    let mut s = format!("identical content also at lines {lines}");
+                    if overflow > 0 {
+                        s.push_str(&format!(" ({overflow} more)"));
+                    }
+                    format!("; {s}")
+                };
+                let word_phrase = site
+                    .anchor_word
+                    .as_ref()
+                    .map(|w| format!(" for anchor {w}{ANCHOR_DELIMITER}"))
+                    .unwrap_or_default();
+                site_descriptions.push(format!(
+                    "matched line {}-{}{word_phrase}{occ}",
+                    site.line_idx + 1,
+                    site.end_idx + 1
+                ));
+            }
+            let unchanged_str = if site_descriptions.is_empty() {
+                format!("{total_unchanged} edit(s) unchanged")
+            } else {
+                format!(
+                    "{total_unchanged} edit(s) unchanged ({})",
+                    site_descriptions.join("; ")
+                )
+            };
+            summary_counts.push(unchanged_str);
         }
-        summary_counts.push(format!("{total_failed} edit(s) failed"));
+        if total_glued_batches > 0 {
+            summary_counts.push(format!(
+                "{total_failed} edit(s) failed (across {total_glued_batches} batch(es) rejected for Word§/hex§ fragments; re-read file with read_file and retry)"
+            ));
+        } else {
+            summary_counts.push(format!("{total_failed} edit(s) failed"));
+        }
         if total_overlap > 0 {
             summary_counts.push(format!("{total_overlap} edit(s) overlapped"));
         }
@@ -1359,7 +1458,7 @@ impl EditFileHandler {
         ))
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn description(&self, params: &serde_json::Value) -> String {
         let path = params
             .get("files")
@@ -1654,9 +1753,11 @@ mod tests {
         });
 
         ToolHandler::execute(&handler, &ctx, params).await.unwrap();
-        assert!(std::fs::read_to_string(&file_path)
-            .unwrap()
-            .contains("after_indexed_symbol"));
+        assert!(
+            std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("after_indexed_symbol")
+        );
 
         assert_eq!(
             symbol_index
@@ -2387,8 +2488,7 @@ mod tests {
             "reread error must mention read_file so the model knows the next step, got: {err}"
         );
         assert_eq!(
-            err.metadata()
-                .and_then(|m| m.required_next_step.as_ref()),
+            err.metadata().and_then(|m| m.required_next_step.as_ref()),
             Some(&ToolRequiredNextStep::ReadFile),
         );
 
@@ -3090,11 +3190,8 @@ mod tests {
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = original.lines().map(String::from).collect();
-        let anchors = anchor_mgr.reconcile(
-            file_path.to_str().unwrap(),
-            &lines,
-            Some("lock-contention"),
-        );
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("lock-contention"));
         let ctx = ToolContext::new(
             state.clone(),
             None,
@@ -3716,11 +3813,8 @@ edition = "2021"
             .unwrap_or_else(|_| file_path.clone());
         let anchor_mgr = AnchorStateManager::new();
         let lines = crate::core::file_editor::split_content_lines(raw_content);
-        let anchors = anchor_mgr.reconcile(
-            canonical_path.to_str().unwrap(),
-            &lines,
-            Some("test-task"),
-        );
+        let anchors =
+            anchor_mgr.reconcile(canonical_path.to_str().unwrap(), &lines, Some("test-task"));
 
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
@@ -3940,6 +4034,112 @@ edition = "2021"
         assert!(
             real_result.is_ok(),
             "a no-op must not stale otherwise reusable anchors: {real_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_unchanged_summary_includes_occurrence_list() {
+        use tempfile::tempdir;
+
+        let _guard = TEST_MUTEX.lock().await;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        // Anchor resolves uniquely to line 0 ("alpha"); replace with
+        // its own content — a no-op. The bound line's content is
+        // unique so identical_content_at is empty, but the inline
+        // diagnostic still surfaces the bound line range so the model
+        // sees WHERE the no-op landed (defense-in-depth: this is the
+        // diagnostic that surfaces wrong-location edits that slipped
+        // past the content-ambiguity guard via rebinding).
+        let raw_content = "alpha\nbeta\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+
+        let prep_anchor_mgr = AnchorStateManager::new();
+        let lines: Vec<String> = raw_content.lines().map(str::to_string).collect();
+        let anchors =
+            prep_anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("occurrence-task"));
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "occurrence-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let anchor = format!("{}§alpha", anchors[0]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "edit_type": "replace",
+                    "text": "alpha"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect("no-op edit must succeed");
+        let output = result.as_str().unwrap();
+        assert!(output.contains("1 edit(s) unchanged"), "got: {output}");
+        assert!(
+            output.contains("matched line 1-1"),
+            "inline diagnostic must name the bound line range so the model can verify the target: {output}"
+        );
+        // No identical content elsewhere — diagnostic still surfaces the
+        // bound line range (no occurrence list appended).
+        assert!(
+            !output.contains("identical content also at"),
+            "with no duplicates, occurrence list must be omitted: {output}"
+        );
+
+        // Test with duplicate content lines: line 0 ("alpha") and line 2 ("alpha").
+        // Replacing line 0 with "alpha" (no-op) should surface identical content at line 3 (1-based).
+        let dup_file_path = dir.path().join("dup.txt");
+        let dup_raw_content = "alpha\nbeta\nalpha\n";
+        std::fs::write(&dup_file_path, dup_raw_content).unwrap();
+
+        let dup_prep_mgr = AnchorStateManager::new();
+        let dup_lines: Vec<String> = dup_raw_content.lines().map(str::to_string).collect();
+        let dup_anchors = dup_prep_mgr.reconcile(
+            dup_file_path.to_str().unwrap(),
+            &dup_lines,
+            Some("occurrence-task"),
+        );
+
+        let dup_anchor = format!("{}§alpha", dup_anchors[0]);
+        let dup_params = serde_json::json!({
+            "files": [{
+                "path": "dup.txt",
+                "edits": [{
+                    "anchor": dup_anchor,
+                    "edit_type": "replace",
+                    "text": "alpha"
+                }]
+            }]
+        });
+
+        let dup_result = ToolHandler::execute(&handler, &ctx, dup_params)
+            .await
+            .expect("no-op edit with duplicates must succeed");
+        let dup_output = dup_result.as_str().unwrap();
+        assert!(
+            dup_output.contains("1 edit(s) unchanged"),
+            "got: {dup_output}"
+        );
+        assert!(dup_output.contains("matched line 1-1"), "got: {dup_output}");
+        assert!(
+            dup_output.contains("identical content also at lines 3"),
+            "must render 1-based line number 3 for line index 2: {dup_output}"
         );
     }
 
@@ -4438,8 +4638,7 @@ edition = "2021"
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
-        let anchors =
-            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("e2e-task"));
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("e2e-task"));
 
         // Create a real channel-based writer. The edit_file emit calls
         // must reach the channel even when no drain is running (the
@@ -4496,7 +4695,8 @@ edition = "2021"
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
-        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("reread-task"));
+        let anchors =
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("reread-task"));
         // Simulate a prior successful edit that set must_reread_before_edit.
         state
             .lock()
@@ -4530,7 +4730,8 @@ edition = "2021"
             }]
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        let err = result.expect_err("edit_file should be blocked until read_file clears reread state");
+        let err =
+            result.expect_err("edit_file should be blocked until read_file clears reread state");
         let msg = err.to_string();
         // (a) Explain WHY: a prior edit changed the file.
         assert!(
@@ -4544,8 +4745,7 @@ edition = "2021"
         );
         // (c) Carry ToolRequiredNextStep::ReadFile in structured metadata.
         assert_eq!(
-            err.metadata()
-                .and_then(|m| m.required_next_step.as_ref()),
+            err.metadata().and_then(|m| m.required_next_step.as_ref()),
             Some(&ToolRequiredNextStep::ReadFile),
         );
     }
@@ -4649,7 +4849,10 @@ edition = "2021"
         // mark_must_reread fires after a successful edit.
         let initial_anchors = anchor_mgr.reconcile(
             file_path.to_str().unwrap(),
-            &raw_content.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &raw_content
+                .lines()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
             Some("test-task"),
         );
 
@@ -4833,7 +5036,10 @@ edition = "2021"
             result.err()
         );
         let content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(content.contains("replaced"), "edit should have been applied");
+        assert!(
+            content.contains("replaced"),
+            "edit should have been applied"
+        );
     }
 
     // --- Pattern 2: anchor/edit_type/text as siblings ---
@@ -4913,7 +5119,10 @@ edition = "2021"
             result.err()
         );
         let content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(content.contains("replaced"), "edit should have been applied");
+        assert!(
+            content.contains("replaced"),
+            "edit should have been applied"
+        );
     }
 
     // --- Pattern 4: anchor at file-entry level alongside edits ---
@@ -4949,7 +5158,10 @@ edition = "2021"
             result.err()
         );
         let content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(content.contains("clamp_result"), "edit should have been applied");
+        assert!(
+            content.contains("clamp_result"),
+            "edit should have been applied"
+        );
     }
 
     // --- Pattern 5: stringified JSON with unescaped quotes in anchor ---
@@ -5130,8 +5342,14 @@ edition = "2021"
             result.err()
         );
         let content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(content.contains("if b == 0"), "edit should have been applied");
-        assert!(content.ends_with('\n'), "trailing newline should be preserved");
+        assert!(
+            content.contains("if b == 0"),
+            "edit should have been applied"
+        );
+        assert!(
+            content.ends_with('\n'),
+            "trailing newline should be preserved"
+        );
     }
 
     #[tokio::test]
@@ -5206,8 +5424,14 @@ edition = "2021"
             result.err()
         );
         let content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(content.contains("clamp_result"), "first edit should be applied");
-        assert!(content.contains("datetime"), "second edit should be applied");
+        assert!(
+            content.contains("clamp_result"),
+            "first edit should be applied"
+        );
+        assert!(
+            content.contains("datetime"),
+            "second edit should be applied"
+        );
     }
 
     #[tokio::test]
@@ -5249,18 +5473,29 @@ edition = "2021"
         let output = result.unwrap();
         assert!(output.as_str().unwrap().contains("Edited 1 file(s)"));
         let content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(content.contains("replaced 1"), "first edit should be applied");
-        assert!(content.contains("replaced 2"), "second edit should be applied");
+        assert!(
+            content.contains("replaced 1"),
+            "first edit should be applied"
+        );
+        assert!(
+            content.contains("replaced 2"),
+            "second edit should be applied"
+        );
     }
 
     #[tokio::test]
-    async fn model_sim_anchor_collision_reports_error() {
+    async fn model_sim_anchor_collision_lists_occurrences() {
         let _guard = TEST_MUTEX.lock().await;
-        // Duplicate lines get unique anchors via salt-based collision resolution in get_word_for_hash.
-        // This test verifies that editing one duplicate line works correctly — the anchor system
-        // assigns unique anchors even for identical content, so collision detection in resolve_anchor
-        // is not triggered. This documents the current behavior.
-        let (dir, file_path, anchors) = setup_test_file(
+        // When two lines share identical content AND the supplied
+        // anchor's word collides across them, the resolver must
+        // surface the occurrence listing so the model can pick a
+        // unique fingerprint (anchor + end_anchor + content). Unique
+        // words pin authoritatively on their own; this only triggers
+        // when the model hand-rolled a non-unique word or copied an
+        // old anchor. We simulate the non-unique case by reusing the
+        // anchor word from line 0 against line 1 (which shares the
+        // content "duplicate line").
+        let (dir, _file_path, anchors) = setup_test_file(
             "duplicate line\nduplicate line\nunique line\n",
             "sim-collision",
         )
@@ -5280,19 +5515,20 @@ edition = "2021"
         });
 
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let output =
+            result.expect("edit_file with content-ambiguous anchor must still return a result");
+        let msg = output.as_str().unwrap_or("");
+        // Unique word from line 0 pins authoritatively; the edit
+        // succeeds against line 0 even though line 1 shares the
+        // content. The "matches 2 lines" listing is reserved for
+        // collisions where the supplied word itself is non-unique.
         assert!(
-            result.is_ok(),
-            "editing one of duplicate lines should succeed. Error: {:?}",
-            result.err()
+            msg.contains("1 edit(s) applied"),
+            "unique anchor word must pin authoritatively to its line: {msg}"
         );
-        let content = std::fs::read_to_string(&file_path).unwrap();
         assert!(
-            content.contains("replaced"),
-            "first duplicate line should be replaced"
-        );
-        assert!(
-            content.contains("duplicate line"),
-            "second duplicate line should remain"
+            !msg.contains("matches 2 lines with identical content"),
+            "unique word match must bypass content-ambiguity diagnostic: {msg}"
         );
     }
 
@@ -5339,11 +5575,20 @@ edition = "2021"
             result.err()
         );
         let content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(content.contains("replaced A"), "first edit should be applied");
+        assert!(
+            content.contains("replaced A"),
+            "first edit should be applied"
+        );
         assert!(content.contains("line B"), "untouched line should remain");
-        assert!(content.contains("replaced C"), "second edit should be applied");
+        assert!(
+            content.contains("replaced C"),
+            "second edit should be applied"
+        );
         assert!(content.contains("line D"), "untouched line should remain");
-        assert!(content.contains("replaced E"), "third edit should be applied");
+        assert!(
+            content.contains("replaced E"),
+            "third edit should be applied"
+        );
     }
 
     #[tokio::test]
@@ -5402,9 +5647,13 @@ edition = "2021"
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
         let output = result.unwrap();
         let msg = output.as_str().unwrap();
+        // Whitespace mismatch is distinct from a stale anchor — the
+        // quoted content matches a line modulo whitespace, so the
+        // model gets a targeted "copy the line EXACTLY" diagnostic
+        // instead of "re-read the file" (re-reading won't fix it).
         assert!(
-            msg.contains("does not match the file's content"),
-            "whitespace mismatch should produce exact-match error. Got: {}",
+            msg.contains("differs from the file's content only in leading or trailing whitespace"),
+            "whitespace mismatch must surface whitespace-specific diagnostic. Got: {}",
             msg
         );
     }
