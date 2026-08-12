@@ -7,6 +7,31 @@ use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
 use std::pin::Pin;
 
+struct FollowupStateGuard<'a> {
+    task_id: &'a str,
+    armed: bool,
+}
+
+impl<'a> FollowupStateGuard<'a> {
+    fn new(task_id: &'a str, sender: std::sync::mpsc::Sender<String>) -> Self {
+        crate::core::approval::set_followup_question_active(task_id, true);
+        crate::core::approval::set_followup_sender(task_id, sender);
+        Self {
+            task_id,
+            armed: true,
+        }
+    }
+}
+
+impl<'a> Drop for FollowupStateGuard<'a> {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::core::approval::clear_followup_sender(self.task_id);
+            crate::core::approval::set_followup_question_active(self.task_id, false);
+        }
+    }
+}
+
 /// Ask followup question tool handler.
 #[derive(Debug, Clone, Default)]
 pub struct AskFollowupQuestionHandler;
@@ -38,9 +63,8 @@ impl AskFollowupQuestionHandler {
 
             // Arm the prompt state before emitting any lines so a drain that
             // lands mid-emit still pins the viewport to the blocking question.
-            let (sender, receiver) = std::sync::mpsc::channel();
-            crate::core::approval::set_followup_question_active(&task_id, true);
-            crate::core::approval::set_followup_sender(&task_id, sender);
+            let (sender, receiver) = std::sync::mpsc::channel::<String>();
+            let _followup_guard = FollowupStateGuard::new(&task_id, sender);
 
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("\n{} {}\n", "[Sned Question]", question),
@@ -70,10 +94,6 @@ impl AskFollowupQuestionHandler {
                 receiver.recv_timeout(crate::core::approval::followup_timeout())
             })
             .await;
-
-            // Clean up followup state regardless of outcome
-            crate::core::approval::clear_followup_sender(&task_id);
-            crate::core::approval::set_followup_question_active(&task_id, false);
 
             let Ok(Ok(response)) = response_result else {
                 return Ok("User provided no response.".to_string());
@@ -125,10 +145,105 @@ impl ToolHandler for AskFollowupQuestionHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent_loop::TaskState;
+    use crate::core::approval::approval_test_guard;
+    use crate::core::file_editor::AnchorStateManager;
+    use crate::core::tools::ToolContext;
+    use crate::test_support::env_lock;
+    use std::sync::Arc;
 
     #[test]
     fn test_ask_handler_creation() {
         let handler = AskFollowupQuestionHandler::new();
         assert_eq!(format!("{:?}", handler), "AskFollowupQuestionHandler");
+    }
+
+    fn test_ctx_for_task(
+        task_id: &str,
+        json_output: bool,
+    ) -> (ToolContext, Arc<tokio::sync::Mutex<TaskState>>) {
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            std::env::current_dir().unwrap(),
+            AnchorStateManager::new(),
+            json_output,
+            task_id.to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        (ctx, state)
+    }
+
+    #[tokio::test]
+    async fn test_missing_question_does_not_set_followup_state() {
+        let _lock = approval_test_guard();
+        let task_id = "ask_followup_question_missing_question";
+        let (ctx, _state) = test_ctx_for_task(task_id, false);
+
+        let handler = AskFollowupQuestionHandler::new();
+        let result = handler.execute(&ctx, serde_json::json!({})).await;
+        assert!(matches!(
+            result,
+            Err(crate::core::tools::ToolError::InvalidInput(msg))
+                if msg == "Missing required parameter: question"
+        ));
+
+        assert!(!crate::core::approval::is_followup_question_active(task_id));
+        assert!(crate::core::approval::take_followup_sender(task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_json_output_rejects_without_arming_followup_state() {
+        let _lock = approval_test_guard();
+        let task_id = "ask_followup_question_json_output";
+        let (ctx, _state) = test_ctx_for_task(task_id, true);
+
+        let handler = AskFollowupQuestionHandler::new();
+        let result = handler
+            .execute(&ctx, serde_json::json!({"question": "What is your plan?"}))
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::core::tools::ToolError::ExecutionFailed(msg))
+                if msg == "Cannot read stdin in JSON mode"
+        ));
+
+        assert!(!crate::core::approval::is_followup_question_active(task_id));
+        assert!(crate::core::approval::take_followup_sender(task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_followup_cleanup_after_timeout() {
+        let _lock = approval_test_guard();
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let timeout_env = "SNED_FOLLOWUP_TIMEOUT_SECS";
+        let original_timeout = std::env::var_os(timeout_env);
+        unsafe {
+            std::env::set_var(timeout_env, "1");
+        }
+
+        let task_id = "ask_followup_question_timeout_cleanup";
+        let (ctx, _state) = test_ctx_for_task(task_id, false);
+        let handler = AskFollowupQuestionHandler::new();
+        let result = handler
+            .execute(
+                &ctx,
+                serde_json::json!({"question": "Still waiting for answer?"}),
+            )
+            .await;
+
+        unsafe {
+            match original_timeout {
+                Some(value) => std::env::set_var(timeout_env, value),
+                None => std::env::remove_var(timeout_env),
+            }
+        }
+
+        assert_eq!(result.unwrap(), "User provided no response.");
+        assert!(!crate::core::approval::is_followup_question_active(task_id));
+        assert!(crate::core::approval::take_followup_sender(task_id).is_none());
     }
 }
