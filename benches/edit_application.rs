@@ -9,6 +9,7 @@ fn create_resolved_edit(line_idx: usize, edit_type: &str, text: &str) -> Resolve
         edit: Edit {
             anchor: format!("hash_{}", line_idx),
             end_anchor: None,
+            content: None,
             edit_type: edit_type.to_string(),
             text: text.to_string(),
         },
@@ -89,6 +90,7 @@ fn bench_apply_delete_edit(c: &mut Criterion) {
         edit: Edit {
             anchor: "hash_500".to_string(),
             end_anchor: None,
+            content: None,
             edit_type: "replace".to_string(),
             text: String::new(), // Empty = delete
         },
