@@ -6,20 +6,26 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::time::Duration;
+use tempfile::TempDir;
 
 /// Helper to create a command with common test settings
-fn sned_cmd() -> Command {
+fn sned_cmd() -> (Command, TempDir) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let sned_dir = temp_dir.path().join("sned-home");
     let mut cmd = Command::cargo_bin("sned").unwrap();
     cmd.timeout(Duration::from_secs(30))
+        .current_dir(temp_dir.path())
+        .env("SNED_DIR", &sned_dir)
+        .env("SNED_SYMBOL_INDEX", "off")
         .arg("--yolo")
         .arg("--provider")
         .arg("mock");
-    cmd
+    (cmd, temp_dir)
 }
 
 #[test]
 fn test_e2e_mock_provider_starts_and_exits() {
-    let mut cmd = sned_cmd();
+    let (mut cmd, _temp_dir) = sned_cmd();
     cmd.arg("test");
 
     cmd.assert().stderr(
@@ -30,7 +36,7 @@ fn test_e2e_mock_provider_starts_and_exits() {
 
 #[test]
 fn test_e2e_mock_with_yolo_flag() {
-    let mut cmd = sned_cmd();
+    let (mut cmd, _temp_dir) = sned_cmd();
     cmd.arg("hello");
 
     cmd.assert()
@@ -39,12 +45,8 @@ fn test_e2e_mock_with_yolo_flag() {
 
 #[test]
 fn test_e2e_mock_provider_selection() {
-    let mut cmd = Command::cargo_bin("sned").unwrap();
-    cmd.timeout(Duration::from_secs(10))
-        .arg("--provider")
-        .arg("mock")
-        .arg("--yolo")
-        .arg("x");
+    let (mut cmd, _temp_dir) = sned_cmd();
+    cmd.timeout(Duration::from_secs(10)).arg("x");
 
     cmd.assert()
         .stderr(predicate::str::contains("Mock").or(predicate::str::contains("context limit")));
