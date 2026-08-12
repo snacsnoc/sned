@@ -45,6 +45,14 @@ impl PlanModeRespondHandler {
         drop(state);
 
         if needs_more {
+            if !ctx.json_output {
+                use crate::cli::output::OutputEvent;
+                use crate::cli::tui::theme::ACCENT;
+                ctx.output_writer.emit(OutputEvent::tool_output_line(
+                    response.to_string(),
+                    ratatui::style::Style::default().fg(ACCENT),
+                ));
+            }
             return Ok(
                 "[You have indicated that you need more exploration. Proceed with calling tools to continue the planning process.]"
                     .to_string(),

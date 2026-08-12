@@ -2553,29 +2553,24 @@ impl App {
             return 1;
         }
 
-        if Self::line_contains_osc8(line) {
+        // Use Ratatui's own wrapping algorithm for scroll math. A width-based
+        // estimate is wrong for word-wrapped lines: a line can occupy more
+        // rows than `display_width / wrap_width` when a word crosses a wrap
+        // boundary. The renderer must use the same row count as the viewport
+        // calculations or the newest output can be clipped below the screen.
+        let mut rendered = if Self::line_contains_osc8(line) {
             let mut hyperlink_targets = Vec::new();
-            let mut rendered = Self::parse_osc8_line(line, &mut hyperlink_targets);
-            if extra_width > 0 {
-                rendered.spans.insert(0, Span::raw("│".repeat(extra_width)));
-            }
-            return Paragraph::new(rendered)
-                .wrap(Wrap { trim: false })
-                .line_count(wrap_width.min(u16::MAX as usize) as u16)
-                .max(1);
+            Self::parse_osc8_line(line, &mut hyperlink_targets)
+        } else {
+            line.clone()
+        };
+        if extra_width > 0 {
+            rendered.spans.insert(0, Span::raw("│".repeat(extra_width)));
         }
-
-        // Bottom pinning must be computed in rendered rows, not logical lines.
-        // A single long prompt line can wrap into multiple terminal rows; if we
-        // count only logical lines, the actionable tail of the prompt can land
-        // below the visible viewport even while the TUI thinks it is at bottom.
-        let width = line
-            .spans
-            .iter()
-            .map(|span| Self::osc8_display_width(span.content.as_ref()))
-            .sum::<usize>()
-            .saturating_add(extra_width);
-        width.max(1).div_ceil(wrap_width)
+        Paragraph::new(rendered)
+            .wrap(Wrap { trim: false })
+            .line_count(wrap_width.min(u16::MAX as usize) as u16)
+            .max(1)
     }
 
     fn visible_output_window(
@@ -2796,27 +2791,6 @@ impl App {
             (Some(terminator), None) | (None, Some(terminator)) => Some(terminator),
             (None, None) => None,
         }
-    }
-
-    fn osc8_display_width(text: &str) -> usize {
-        if !text.contains(OSC8_PREFIX) {
-            return UnicodeWidthStr::width(text);
-        }
-        let mut remaining = text;
-        let mut width = 0usize;
-        while !remaining.is_empty() {
-            if let Some(payload) = remaining.strip_prefix(OSC8_PREFIX) {
-                let Some((terminator_at, terminator_len)) = Self::osc_terminator(payload) else {
-                    break;
-                };
-                remaining = &payload[terminator_at + terminator_len..];
-                continue;
-            }
-            let next_control = remaining.find(OSC8_PREFIX).unwrap_or(remaining.len());
-            width = width.saturating_add(UnicodeWidthStr::width(&remaining[..next_control]));
-            remaining = &remaining[next_control..];
-        }
-        width
     }
 
     fn hyperlink_marker(index: usize) -> Option<Color> {

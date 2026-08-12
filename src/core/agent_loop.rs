@@ -2954,6 +2954,7 @@ impl AgentLoop {
 
         // Provider tool-call order must remain stable even when independent work overlaps.
         let mut tool_failure_count = 0usize;
+        let mut completion_result: Option<String> = None;
         if !prepared_tool_calls.is_empty() {
             let mut edit_files: Vec<(String, i32, i32)> = Vec::new();
 
@@ -3607,6 +3608,10 @@ impl AgentLoop {
                     "tool result paired with ID"
                 );
 
+                if tool_name == "attempt_completion" && !result_output.is_error {
+                    completion_result = Some(result_output.text.clone());
+                }
+
                 // Truncate tool result before storing in history to prevent context bloat
                 let truncated_text = truncate_tool_result(&result_output.text);
 
@@ -3923,7 +3928,6 @@ impl AgentLoop {
         {
             tracing::info!(target: "json_output", "{}", event.to_string());
         }
-
         // Clear file content cache after each turn (cross-call coordination within a single turn)
         {
             let mut state = self.state.lock().await;
@@ -3966,6 +3970,13 @@ impl AgentLoop {
         }
 
         if is_completion {
+            if !self.config.json_output
+                && let Some(result) = completion_result
+            {
+                self.config
+                    .output_writer
+                    .emit(OutputEvent::Completion(result));
+            }
             // Force save on completion (async, non-blocking)
             if let Some(ref storage) = self.deps.task_storage {
                 let history = self.conversation_history.lock().await;
@@ -3983,11 +3994,17 @@ impl AgentLoop {
             // thinking tags which pulldown_cmark treats as raw HTML and
             // emits as raw text, defeating the markdown render.
             let markdown_text = response_text.as_deref().unwrap_or("");
-            emit_turn_end(
-                &self.config.output_writer,
-                self.config.json_output,
-                markdown_text,
-            );
+            if self.config.interactive_mode && !self.config.json_output && markdown_text.is_empty() {
+                self.config.output_writer.emit(OutputEvent::TurnEnd {
+                    accumulated_text: String::new(),
+                });
+            } else {
+                emit_turn_end(
+                    &self.config.output_writer,
+                    self.config.json_output,
+                    markdown_text,
+                );
+            }
             if !self.config.interactive_mode
                 && !self.config.json_output
                 && crate::cli::output::timing_enabled()

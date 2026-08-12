@@ -96,11 +96,6 @@ impl ToolHandler for AttemptCompletionHandler {
                     })
                     .to_string()
                 );
-            } else {
-                use crate::cli::output::OutputEvent;
-                let completion_text = result.clone();
-                ctx.output_writer
-                    .emit(OutputEvent::Completion(completion_text));
             }
 
             Ok(serde_json::Value::String(result))

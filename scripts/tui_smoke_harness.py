@@ -887,7 +887,7 @@ def plan_exit_active(command, env_name, expected_message, marker_name, completio
     with PtySession(
         f"sned-{marker_name}.",
         {env_name: "1"},
-        args=["--provider", "mock", "--yolo"],
+        args=["--provider", "mock", "--yolo", "--plan"],
     ) as session:
         session.run(18, tick, interval=0.05)
         session.dump_if_verbose()

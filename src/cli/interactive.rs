@@ -19,6 +19,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use std::collections::HashMap;
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "windows", unix))]
@@ -736,7 +737,9 @@ fn apply_output_event(
             if line.to_string().contains("📋 Plan Generated") {
                 app.discard_current_turn_model_stream();
             }
-            app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
+            for line in split_output_line_on_newlines(line) {
+                app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
+            }
         }
         OutputEvent::ToolHeaderLine(line) => {
             flush_model_update(app, pending_model_update);
@@ -842,6 +845,41 @@ fn apply_output_event(
             app.push_turn_indicator(line);
         }
     }
+}
+
+/// Convert embedded newlines into actual transcript rows before storing them.
+///
+/// `ratatui::text::Line` is a single logical row; putting `\n` in a span's
+/// content does not make the TUI's scroll accounting or row selection see
+/// additional rows. Preserve each span's style while splitting the content.
+fn split_output_line_on_newlines(line: Line<'static>) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default()];
+
+    for span in line.spans {
+        let mut parts = span.content.split('\n');
+        if let Some(part) = parts.next()
+            && !part.is_empty()
+        {
+            lines
+                .last_mut()
+                .unwrap()
+                .spans
+                .push(Span::styled(part.to_string(), span.style));
+        }
+
+        for part in parts {
+            lines.push(Line::default());
+            if !part.is_empty() {
+                lines
+                    .last_mut()
+                    .unwrap()
+                    .spans
+                    .push(Span::styled(part.to_string(), span.style));
+            }
+        }
+    }
+
+    lines
 }
 
 fn write_clipboard<W: std::io::Write>(mut writer: W, text: &str) -> std::io::Result<()> {
