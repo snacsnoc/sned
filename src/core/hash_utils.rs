@@ -7,6 +7,7 @@
 //! Deduplicated from `file_editor.rs` and `read_file.rs` to prevent drift.
 
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 // ============================================================================
@@ -22,6 +23,10 @@ static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         regex::escape(ANCHOR_DELIMITER)
     ))
     .unwrap()
+});
+
+static DUPLICATE_ANCHOR_SUFFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r" \[identical content also at lines \d+(?:, \d+)*(?:, … \(\d+ more\))?\]$").unwrap()
 });
 
 // ============================================================================
@@ -65,17 +70,20 @@ pub fn compute_hashes(lines: &[String]) -> Vec<u64> {
 /// share content.
 #[must_use]
 pub fn identical_content_indices(lines: &[String]) -> Vec<Vec<usize>> {
-    let mut out: Vec<Vec<usize>> = Vec::with_capacity(lines.len());
-    for (i, line) in lines.iter().enumerate() {
-        let mut dupes: Vec<usize> = Vec::new();
-        for (j, other) in lines.iter().enumerate() {
-            if i != j && other == line {
-                dupes.push(j + 1);
-            }
-        }
-        out.push(dupes);
+    let mut buckets: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        buckets.entry(line.as_str()).or_default().push(idx + 1);
     }
-    out
+
+    lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            buckets.get(line.as_str()).map_or_else(Vec::new, |indices| {
+                indices.iter().filter(|&&n| n != idx + 1).copied().collect()
+            })
+        })
+        .collect()
 }
 
 /// Formats a line with its anchor prefix, appending a duplicate-content
@@ -114,10 +122,16 @@ pub fn split_anchor(raw_anchor: &str) -> (String, String) {
     match raw_anchor.find(ANCHOR_DELIMITER) {
         Some(idx) => (
             raw_anchor[..idx].trim().to_string(),
-            raw_anchor[idx + ANCHOR_DELIMITER.len()..].to_string(),
+            strip_duplicate_anchor_suffix(&raw_anchor[idx + ANCHOR_DELIMITER.len()..]).to_string(),
         ),
         None => (raw_anchor.trim().to_string(), String::new()),
     }
+}
+
+fn strip_duplicate_anchor_suffix(content: &str) -> &str {
+    DUPLICATE_ANCHOR_SUFFIX_REGEX
+        .find(content)
+        .map_or(content, |m| &content[..m.start()])
 }
 
 /// Strips anchor prefixes from content.
@@ -308,6 +322,20 @@ mod tests {
         let (anchor, content) = split_anchor("Apple§content");
         assert_eq!(anchor, "Apple");
         assert_eq!(content, "content");
+    }
+
+    #[test]
+    fn test_split_anchor_strips_duplicate_annotation_suffix() {
+        let (anchor, content) =
+            split_anchor("Apple§duplicate [identical content also at lines 3, 7]");
+        assert_eq!(anchor, "Apple");
+        assert_eq!(content, "duplicate");
+
+        let (anchor, content) = split_anchor(
+            "Word§identical [identical content also at lines 2, 3, 4, 5, 6, 7, 8, 9, … (1 more)]",
+        );
+        assert_eq!(anchor, "Word");
+        assert_eq!(content, "identical");
     }
 
     #[test]

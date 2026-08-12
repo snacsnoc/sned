@@ -5658,6 +5658,52 @@ edition = "2021"
         );
     }
 
+    #[tokio::test]
+    async fn model_sim_annotated_duplicate_anchor_is_accepted() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, _) =
+            setup_test_file("dup line\nmid line\ndup line\n", "sim-annotated-anchor-dup").await;
+        let ctx = ctx_for_dir(&dir, "sim-annotated-anchor-dup");
+        let handler = EditFileHandler::new();
+        let read_handler = crate::core::tools::handlers::read_file::ReadFileHandler::new();
+
+        let read_output = ToolHandler::execute(
+            &read_handler,
+            &ctx,
+            serde_json::json!({"paths": ["test.txt"]}),
+        )
+        .await
+        .expect("read_file should succeed");
+
+        let annotated_anchor = read_output
+            .as_str()
+            .expect("read_file returns string output")
+            .lines()
+            .find(|line| line.contains("§dup line [identical content also at lines"))
+            .expect("duplicate line should be annotated")
+            .to_string();
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": annotated_anchor,
+                    "edit_type": "replace",
+                    "text": "replaced"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&handler, &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "annotated duplicate anchors should still be accepted by edit_file. Error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "replaced\nmid line\ndup line\n");
+    }
+
     /// Field incident regression: when an `insert_before` edit targets an
     /// anchor whose content is ambiguous (matches multiple lines), the
     /// batch must be rejected without applying any insertions. The

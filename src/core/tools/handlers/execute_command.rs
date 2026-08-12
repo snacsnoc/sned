@@ -1150,7 +1150,7 @@ impl ExecuteCommandHandler {
             .is_some_and(is_serialized_command_container)
         {
             return Err(ToolError::InvalidInput(
-                "`commands` must be a JSON array of command strings, not a serialized object or list. Use {\"commands\":[\"<command>\"]}."
+                "`commands` must be a JSON array of command strings (e.g. `[\"ls\"]`), not a serialized Python-style list or dict string (e.g. `\"['ls']\"` or `\"{'command': 'ls'}\"`). Re-issue with the literal JSON array, not a stringified representation of one."
                     .to_string(),
             ));
         }
@@ -1296,8 +1296,60 @@ mod tests {
             .expect_err("serialized command object should be rejected");
 
         assert!(matches!(err, ToolError::InvalidInput(_)));
-        assert!(err.to_string().contains("{\"commands\":[\"<command>\"]}"));
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("must be a JSON array of command strings"),
+            "expected shape guidance in error, got: {err_text}"
+        );
+        assert!(
+            err_text.contains("not a serialized"),
+            "expected explicit anti-pattern guidance, got: {err_text}"
+        );
         assert!(!marker.exists(), "rejected command must not execute");
+    }
+
+    /// Model-facing contract: when a model accidentally sends a stringified
+    /// list (e.g. `"[\"ls\"]"`) under the `commands` key, the rejection
+    /// message must guide it back to the literal JSON-array form so the
+    /// next turn is recoverable without re-reading the schema. Field
+    /// incident: `run.json` index 56, tool id
+    /// `chatcmpl-tool-9987d224ab5e0836`.
+    #[tokio::test]
+    async fn model_sim_serialized_commands_recovery_message_names_correct_shape() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let params = serde_json::json!({
+            "commands": "[\"python3.11 -m pytest tests/\"]"
+        });
+
+        let err = handler
+            .execute_without_state(
+                None,
+                params,
+                None,
+                false,
+                false,
+                None,
+                false,
+                &output_writer,
+            )
+            .await
+            .expect_err("serialized string form must be rejected");
+
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("JSON array"),
+            "error must name the correct shape, got: {err_text}"
+        );
+        assert!(
+            err_text.contains("not a serialized"),
+            "error must explicitly call out the anti-pattern, got: {err_text}"
+        );
+        assert!(
+            err_text.contains("[\"ls\"]"),
+            "error must include a correct-shape example, got: {err_text}"
+        );
     }
 
     #[tokio::test]
