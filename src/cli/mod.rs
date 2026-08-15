@@ -2602,6 +2602,8 @@ mod tests {
         use crate::providers::env_auth::get_provider_from_env;
         use std::env;
 
+        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         // Helper to clear test env vars
         fn clear_env() {
             for var in &[
