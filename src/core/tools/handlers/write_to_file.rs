@@ -36,10 +36,6 @@ impl WriteToFileHandler {
         }
     }
 
-    fn resolve_path(workspace_root: &Path, path: &str) -> Result<PathBuf, ToolError> {
-        crate::core::tools::resolve_sanitized_path(workspace_root, path)
-    }
-
     fn workspace_relative_display_path(workspace_root: &Path, requested_path: &str) -> String {
         let requested_path = Path::new(requested_path);
         requested_path
@@ -56,6 +52,17 @@ impl WriteToFileHandler {
         path: &str,
         content: &str,
         workspace_root: &Path,
+    ) -> anyhow::Result<String> {
+        self.write_file_with_allowed_roots(path, content, workspace_root, &[])
+            .await
+    }
+
+    async fn write_file_with_allowed_roots(
+        &self,
+        path: &str,
+        content: &str,
+        workspace_root: &Path,
+        allowed_external_roots: &[PathBuf],
     ) -> anyhow::Result<String> {
         use crate::core::file_editor::FileEditGuard;
         use tokio::fs;
@@ -83,7 +90,11 @@ impl WriteToFileHandler {
             // Re-verify parent directory after creation to catch symlink race
             let canonical_parent = fs::canonicalize(parent).await?;
 
-            if !canonical_parent.starts_with(&canonical_workspace) {
+            if !canonical_parent.starts_with(&canonical_workspace)
+                && !allowed_external_roots
+                    .iter()
+                    .any(|root| canonical_parent.starts_with(root))
+            {
                 anyhow::bail!(
                     "Parent directory {} resolved to {} which is outside workspace {}",
                     parent.display(),
@@ -108,7 +119,11 @@ impl WriteToFileHandler {
             canonical_parent.join(path_obj.file_name().unwrap_or_default())
         };
 
-        if !final_canonical.starts_with(&canonical_workspace) {
+        if !final_canonical.starts_with(&canonical_workspace)
+            && !allowed_external_roots
+                .iter()
+                .any(|root| final_canonical.starts_with(root))
+        {
             anyhow::bail!(
                 "Path {} resolved to {} which is outside workspace {} (symlink detected)",
                 path,
@@ -139,6 +154,7 @@ impl WriteToFileHandler {
         &self,
         params: serde_json::Value,
         workspace_root: &Path,
+        allowed_external_roots: &[PathBuf],
     ) -> Result<String, ToolError> {
         let path = params["path"]
             .as_str()
@@ -152,7 +168,7 @@ impl WriteToFileHandler {
             )));
         }
 
-        self.write_file(path, content, workspace_root)
+        self.write_file_with_allowed_roots(path, content, workspace_root, allowed_external_roots)
             .await
             .map_err(|e| {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
@@ -203,7 +219,7 @@ impl ToolHandler for WriteToFileHandler {
             let path = path.to_string();
             let display_path =
                 Self::workspace_relative_display_path(ctx.workspace_root.as_path(), &path);
-            let resolved_path = Self::resolve_path(ctx.workspace_root.as_path(), &path)?;
+            let resolved_path = ctx.resolve_path(&path)?;
             let mut resolved_params = params;
             if let Some(obj) = resolved_params.as_object_mut() {
                 obj.insert(
@@ -236,7 +252,11 @@ impl ToolHandler for WriteToFileHandler {
             }
 
             let result = handler
-                .execute_with_workspace(resolved_params, ctx.workspace_root.as_path())
+                .execute_with_workspace(
+                    resolved_params,
+                    ctx.workspace_root.as_path(),
+                    &ctx.allowed_external_roots,
+                )
                 .await;
             match result {
                 Ok(_) => {
@@ -322,6 +342,26 @@ mod tests {
             .unwrap();
         assert!(result.contains("Successfully wrote to"));
         assert_eq!(fs::read_to_string(file_path).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_write_file_allows_authorized_external_directory() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let file_path = external.path().join("generated.sql");
+        let handler = WriteToFileHandler::new();
+
+        handler
+            .write_file_with_allowed_roots(
+                file_path.to_str().unwrap(),
+                "select 1;\n",
+                workspace.path(),
+                &[external.path().canonicalize().unwrap()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(file_path).unwrap(), "select 1;\n");
     }
 
     #[tokio::test]

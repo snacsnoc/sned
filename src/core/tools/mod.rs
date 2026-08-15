@@ -190,6 +190,8 @@ pub struct ToolContext {
     pub state: Arc<Mutex<TaskState>>,
     pub approval_manager: Option<Arc<Mutex<ApprovalManager>>>,
     pub workspace_root: PathBuf,
+    /// Canonical external directory roots authorized for this tool invocation.
+    pub allowed_external_roots: Vec<PathBuf>,
     pub anchor_mgr: AnchorStateManager,
     pub json_output: bool,
     pub task_id: String,
@@ -220,6 +222,7 @@ impl ToolContext {
             state,
             approval_manager,
             workspace_root,
+            allowed_external_roots: Vec::new(),
             anchor_mgr,
             json_output,
             task_id,
@@ -228,6 +231,12 @@ impl ToolContext {
             session_command_scope_approved: false,
             output_writer,
         }
+    }
+
+    /// Resolve a path under the workspace or an external directory that was
+    /// explicitly authorized for this invocation.
+    pub fn resolve_path(&self, path: &str) -> Result<PathBuf, ToolError> {
+        resolve_authorized_path(&self.workspace_root, &self.allowed_external_roots, path)
     }
 }
 
@@ -401,6 +410,76 @@ pub fn resolve_sanitized_path(
     }
 
     Ok(normalized)
+}
+
+/// Resolve a file-tool path under the workspace or an explicitly authorized
+/// external directory. Callers that do not hold such an authority must keep
+/// using [`resolve_sanitized_path`].
+pub fn resolve_authorized_path(
+    workspace_root: &std::path::Path,
+    external_roots: &[PathBuf],
+    path: &str,
+) -> Result<PathBuf, ToolError> {
+    use std::path::{Component, Path};
+
+    let path_obj = Path::new(path);
+    if !path_obj.is_absolute() || path_obj.starts_with(workspace_root) {
+        return resolve_sanitized_path(workspace_root, path);
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path_obj.components() {
+        match component {
+            Component::Normal(component) => normalized.push(component),
+            Component::Prefix(component) => normalized.push(component.as_os_str()),
+            Component::RootDir => normalized.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
+    }
+
+    let canonical_path = canonicalize_existing_parent(&normalized)?;
+    if external_roots
+        .iter()
+        .any(|root| canonical_path.starts_with(root))
+    {
+        return Ok(canonical_path);
+    }
+
+    Err(ToolError::InvalidInput(format!(
+        "External path is not authorized for this session: {}. Ask the user to approve its directory or restart with --allow-dir <directory>.",
+        path_obj.display()
+    )))
+}
+
+fn canonicalize_existing_parent(path: &std::path::Path) -> Result<PathBuf, ToolError> {
+    let mut cursor = path.to_path_buf();
+    let mut missing_components = Vec::new();
+    while !cursor.exists() {
+        let component = cursor.file_name().ok_or_else(|| {
+            ToolError::InvalidInput(format!("Failed to resolve path: {}", path.display()))
+        })?;
+        missing_components.push(component.to_os_string());
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| {
+                ToolError::InvalidInput(format!("Failed to resolve path: {}", path.display()))
+            })?
+            .to_path_buf();
+    }
+
+    let mut canonical = std::fs::canonicalize(&cursor).map_err(|error| {
+        ToolError::InvalidInput(format!(
+            "Failed to resolve path: {} ({error})",
+            path.display()
+        ))
+    })?;
+    for component in missing_components.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 /// Trait for tool handlers.
@@ -594,6 +673,38 @@ mod tests {
         assert_eq!(
             result,
             std::path::PathBuf::from("/tmp/workspace/bar/baz.rs")
+        );
+    }
+
+    #[test]
+    fn test_resolve_authorized_path_allows_only_granted_external_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("generated.sql");
+        let external_root = external.path().canonicalize().unwrap();
+
+        let denied = resolve_authorized_path(workspace.path(), &[], target.to_str().unwrap());
+        assert!(denied.is_err());
+
+        let resolved = resolve_authorized_path(
+            workspace.path(),
+            std::slice::from_ref(&external_root),
+            target.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved, external_root.join("generated.sql"));
+
+        let sibling = external.path().parent().unwrap().join(format!(
+            "{}-sibling",
+            external.path().file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            resolve_authorized_path(
+                workspace.path(),
+                std::slice::from_ref(&external_root),
+                sibling.join("blocked.sql").to_str().unwrap(),
+            )
+            .is_err()
         );
     }
 

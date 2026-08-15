@@ -1,7 +1,7 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::hash_utils::strip_hashes;
 use crate::core::tools::handlers::error_guidance;
-use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::{SymbolRange, get_symbol_range, load_required_language_parsers};
 use std::collections::BTreeMap;
@@ -58,6 +58,17 @@ impl ReplaceSymbolHandler {
         params: serde_json::Value,
         workspace_root: &Path,
     ) -> Result<String, ToolError> {
+        self.execute_with_path_roots(state, params, workspace_root, &[])
+            .await
+    }
+
+    async fn execute_with_path_roots(
+        &self,
+        state: &mut TaskState,
+        params: serde_json::Value,
+        workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
+    ) -> Result<String, ToolError> {
         let replacements = read_replacements(&params);
         if replacements.is_empty() {
             state.consecutive_mistakes += 1;
@@ -71,7 +82,11 @@ impl ReplaceSymbolHandler {
             )));
         }
 
-        let batches = group_replacements_by_file(replacements, workspace_root)?;
+        let batches = group_replacements_by_file_with_allowed_roots(
+            replacements,
+            workspace_root,
+            allowed_external_roots,
+        )?;
 
         let mut file_results: Vec<FileResult> = Vec::new();
         let mut any_error = None;
@@ -212,7 +227,12 @@ impl ToolHandler for ReplaceSymbolHandler {
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
             handler
-                .execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
+                .execute_with_path_roots(
+                    &mut state,
+                    params,
+                    ctx.workspace_root.as_path(),
+                    &ctx.allowed_external_roots,
+                )
                 .await
                 .map(serde_json::Value::String)
         })
@@ -287,17 +307,30 @@ fn read_replacements(params: &serde_json::Value) -> Vec<Replacement> {
     }]
 }
 
+#[cfg(test)]
 fn group_replacements_by_file(
     replacements: Vec<Replacement>,
     workspace_root: &Path,
 ) -> Result<BTreeMap<String, FileBatch>, ToolError> {
+    group_replacements_by_file_with_allowed_roots(replacements, workspace_root, &[])
+}
+
+fn group_replacements_by_file_with_allowed_roots(
+    replacements: Vec<Replacement>,
+    workspace_root: &Path,
+    allowed_external_roots: &[std::path::PathBuf],
+) -> Result<BTreeMap<String, FileBatch>, ToolError> {
     let mut batches: BTreeMap<String, FileBatch> = BTreeMap::new();
 
     for r in replacements {
-        let absolute_path = resolve_sanitized_path(workspace_root, &r.path)?
-            .to_str()
-            .map(String::from)
-            .unwrap_or_else(|| r.path.clone());
+        let absolute_path = crate::core::tools::resolve_authorized_path(
+            workspace_root,
+            allowed_external_roots,
+            &r.path,
+        )?
+        .to_str()
+        .map(String::from)
+        .unwrap_or_else(|| r.path.clone());
 
         let display_path = r.path.clone();
 
@@ -400,11 +433,9 @@ async fn process_batch(
             resolved_replacements.push((r.clone(), range));
         } else {
             state.consecutive_mistakes += 1;
-            return Err(ToolError::ExecutionFailed(error_guidance::symbol_not_found(
-                &r.symbol,
-                &r.path,
-                state.consecutive_mistakes,
-            )));
+            return Err(ToolError::ExecutionFailed(
+                error_guidance::symbol_not_found(&r.symbol, &r.path, state.consecutive_mistakes),
+            ));
         }
     }
 

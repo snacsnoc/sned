@@ -10,7 +10,6 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
-    resolve_sanitized_path,
 };
 use futures::stream::{self, StreamExt};
 use std::future::Future;
@@ -417,6 +416,16 @@ impl ListFilesHandler {
         workspace_root: &Path,
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
+        self.execute_with_external_roots(workspace_root, &[], params)
+            .await
+    }
+
+    async fn execute_with_external_roots(
+        &self,
+        workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
+        params: serde_json::Value,
+    ) -> Result<String, ToolError> {
         let path = params["path"].as_str().unwrap_or(".");
         let recursive = params["recursive"].as_bool().unwrap_or(false);
         // Default: include line counts for single files, skip for recursive (performance)
@@ -424,7 +433,11 @@ impl ListFilesHandler {
             .as_bool()
             .unwrap_or(!recursive);
 
-        let sanitized_path = resolve_sanitized_path(workspace_root, path)?;
+        let sanitized_path = crate::core::tools::resolve_authorized_path(
+            workspace_root,
+            allowed_external_roots,
+            path,
+        )?;
         let result = self
             .list_directory_with_line_counts(
                 &sanitized_path.to_string_lossy(),
@@ -457,7 +470,11 @@ impl ToolHandler for ListFilesHandler {
         let ctx = ctx.clone();
         Box::pin(async move {
             handler
-                .execute_without_state(&ctx.workspace_root, params)
+                .execute_with_external_roots(
+                    &ctx.workspace_root,
+                    &ctx.allowed_external_roots,
+                    params,
+                )
                 .await
                 .map(serde_json::Value::String)
         })

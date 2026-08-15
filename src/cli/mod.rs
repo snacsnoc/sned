@@ -274,6 +274,10 @@ pub struct TaskOptions {
     #[arg(short = 'c', long)]
     pub cwd: Option<String>,
 
+    /// Allow file tools to access an external directory for this session (repeatable)
+    #[arg(long, value_name = "DIR")]
+    pub allow_dir: Vec<String>,
+
     /// Path to Sned configuration directory
     #[arg(long, hide_short_help = true)]
     pub config: Option<String>,
@@ -1706,12 +1710,19 @@ async fn build_task_components(
 
     let context_loader = crate::core::context::ContextLoader::new(workspace_root_str.clone())
         .with_symbol_index_service(Arc::clone(&symbol_index_service));
-    let approval_manager = Arc::new(tokio::sync::Mutex::new(
-        crate::core::approval::ApprovalManager::new()
-            .with_yolo(task_opts.yolo)
-            .with_auto_approve_all(task_opts.auto_approve_all)
-            .with_workspace_root(workspace_root_str.clone()),
-    ));
+    let mut approval_manager = crate::core::approval::ApprovalManager::new()
+        .with_yolo(task_opts.yolo)
+        .with_auto_approve_all(task_opts.auto_approve_all)
+        .with_workspace_root(workspace_root_str.clone());
+    for directory in &task_opts.allow_dir {
+        approval_manager
+            .grant_external_directory(directory, crate::core::tools::ToolCategory::ReadFiles)
+            .map_err(anyhow::Error::msg)?;
+        approval_manager
+            .grant_external_directory(directory, crate::core::tools::ToolCategory::EditFiles)
+            .map_err(anyhow::Error::msg)?;
+    }
+    let approval_manager = Arc::new(tokio::sync::Mutex::new(approval_manager));
 
     let registry = build_tool_registry(
         approval_manager.clone(),
@@ -2131,6 +2142,20 @@ mod tests {
         assert_eq!(cli.task_opts.provider.as_deref(), Some("openai-native"));
         assert!(cli.task_opts.json);
         assert!(cli.task_opts.auto_condense);
+    }
+
+    #[test]
+    fn parse_allow_dir_option() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--allow-dir",
+            "/tmp",
+            "--allow-dir",
+            "/var/tmp",
+            "inspect files",
+        ])
+        .unwrap();
+        assert_eq!(cli.task_opts.allow_dir, vec!["/tmp", "/var/tmp"]);
     }
 
     #[test]
@@ -2724,6 +2749,7 @@ mod tests {
                 extra_body: None,
                 verbose: false,
                 cwd: None,
+                allow_dir: Vec::new(),
                 config: None,
                 thinking: None,
                 reasoning_effort: None,
@@ -2793,6 +2819,7 @@ mod tests {
                 extra_body: None,
                 verbose: false,
                 cwd: None,
+                allow_dir: Vec::new(),
                 config: None,
                 thinking: None,
                 reasoning_effort: None,
@@ -2914,6 +2941,7 @@ mod tests {
                 extra_body: None,
                 verbose: false,
                 cwd: None,
+                allow_dir: Vec::new(),
                 config: None,
                 thinking: None,
                 reasoning_effort: None,

@@ -2,7 +2,7 @@
 //!
 
 use crate::core::agent_loop::TaskState;
-use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -183,6 +183,16 @@ impl SearchFilesHandler {
         workspace_root: &Path,
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
+        self.execute_with_external_roots(workspace_root, &[], params)
+            .await
+    }
+
+    async fn execute_with_external_roots(
+        &self,
+        workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
+        params: serde_json::Value,
+    ) -> Result<String, ToolError> {
         let regex = params["regex"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("Missing 'regex' parameter".to_string()))?;
@@ -202,7 +212,9 @@ impl SearchFilesHandler {
         let path = params["path"].as_str();
         let file_pattern = params["file_pattern"].as_str();
 
-        let sanitized_path = path.map(|p| resolve_sanitized_path(workspace_root, p));
+        let sanitized_path = path.map(|p| {
+            crate::core::tools::resolve_authorized_path(workspace_root, allowed_external_roots, p)
+        });
         let search_path = match sanitized_path {
             Some(Ok(p)) => Some(p.to_string_lossy().into_owned()),
             Some(Err(e)) => return Err(e),
@@ -308,7 +320,11 @@ impl ToolHandler for SearchFilesHandler {
         let ctx = ctx.clone();
         Box::pin(async move {
             handler
-                .execute_without_state(&ctx.workspace_root, params)
+                .execute_with_external_roots(
+                    &ctx.workspace_root,
+                    &ctx.allowed_external_roots,
+                    params,
+                )
                 .await
                 .map(serde_json::Value::String)
         })

@@ -807,7 +807,7 @@ impl ToolHandler for ReadFileHandler {
             let sanitized: Result<Vec<String>, ToolError> = paths
                 .iter()
                 .map(|p| {
-                    crate::core::tools::resolve_sanitized_path(&ctx.workspace_root, p)
+                    ctx.resolve_path(p)
                         .map(|pb| pb.to_string_lossy().to_string())
                 })
                 .collect();

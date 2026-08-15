@@ -144,7 +144,7 @@ QWEN MODEL GUIDANCE
         prompt.push_str(
             "- Use subagents or skills only when they clearly improve result quality.\n\
              - Workspace reads and writes must use tools, not prose: read files with `read_file`; create or overwrite files with `write_to_file`; change existing files with `edit_file` or AST-aware tools.\n\
-             - Use relative paths from the working directory for workspace tools. Do not pass absolute paths or paths outside the workspace to file tools.\n\
+             - Use relative paths from the working directory for workspace tools. Absolute paths outside the workspace require explicit user approval; request the needed external directory rather than retrying after a denial.\n\
              - For `edit_file`, read the current file first and copy the exact `Word§line content` anchors from tool output, including the prefix.\n\
              - For large generated files, write a small skeleton first and fill sections with `edit_file` instead of sending one huge payload.\n\
              - In ACT mode, perform the task and finish with `attempt_completion`; in PLAN mode, gather needed context and respond with `plan_mode_respond` without modifying files.\n\
@@ -314,7 +314,9 @@ mod tests {
                 .contains("Use subagents or skills only when they clearly improve result quality")
         );
         assert!(prompt.contains("Workspace reads and writes must use tools"));
-        assert!(prompt.contains("Do not pass absolute paths or paths outside the workspace"));
+        assert!(
+            prompt.contains("Absolute paths outside the workspace require explicit user approval")
+        );
         assert!(prompt.contains("If no tools are needed or available, answer directly in text"));
         assert!(prompt.contains("Word§line content"));
         assert!(prompt.contains("In ACT mode"));

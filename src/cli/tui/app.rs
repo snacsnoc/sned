@@ -3018,10 +3018,7 @@ impl App {
             return false;
         }
         if prev == next {
-            return matches!(
-                prev,
-                BlockKind::ToolHeader | BlockKind::CommandHeader
-            );
+            return matches!(prev, BlockKind::ToolHeader | BlockKind::CommandHeader);
         }
         // Insert separators between model text and tool/command blocks
         // to visually group related output. Also separate tool headers
@@ -3302,6 +3299,7 @@ impl App {
                 crate::core::approval::ApprovalResult::Approved => theme::PROMPT_FG,
                 crate::core::approval::ApprovalResult::Denied => theme::ERROR_FG,
                 crate::core::approval::ApprovalResult::Always => theme::ACCENT,
+                crate::core::approval::ApprovalResult::AllowExternalDirectory => theme::ACCENT,
             };
             actions.push(Span::styled(
                 format!("[{shortcut}]"),
@@ -6132,7 +6130,11 @@ mod tests {
         // Wrap is deferred to render time now, so the reasoning line is
         // stored as a single styled entry.  The Paragraph will wrap it
         // at render time using the same style on every visual row.
-        assert_eq!(app.output_lines.len(), 1, "reasoning stored as one logical row");
+        assert_eq!(
+            app.output_lines.len(),
+            1,
+            "reasoning stored as one logical row"
+        );
         let line = &app.output_lines[0];
         assert_eq!(line.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
         assert!(line.spans[0].style.add_modifier.contains(Modifier::ITALIC));
@@ -8111,9 +8113,7 @@ mod tests {
     /// stay un-separated because they are one logical block.
     #[test]
     fn test_should_insert_separator_block_boundaries() {
-        use BlockKind::{
-            CommandHeader, CommandOutput, Model, Separator, ToolHeader, ToolOutput,
-        };
+        use BlockKind::{CommandHeader, CommandOutput, Model, Separator, ToolHeader, ToolOutput};
 
         // Body → next header (new call begins).
         assert!(App::should_insert_separator(CommandOutput, CommandHeader));

@@ -323,8 +323,17 @@ impl EditFileHandler {
     }
 
     /// Resolve a relative path to absolute path with sanitization.
-    fn resolve_path(&self, workspace_root: &Path, path: &str) -> Result<String, ToolError> {
-        let resolved = crate::core::tools::resolve_sanitized_path(workspace_root, path)?;
+    fn resolve_path(
+        &self,
+        workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
+        path: &str,
+    ) -> Result<String, ToolError> {
+        let resolved = crate::core::tools::resolve_authorized_path(
+            workspace_root,
+            allowed_external_roots,
+            path,
+        )?;
         Ok(resolved.to_string_lossy().to_string())
     }
 
@@ -349,6 +358,7 @@ impl EditFileHandler {
         &self,
         files: &[serde_json::Value],
         workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
     ) -> Result<(), ToolError> {
         let mut invalid_anchors = Vec::new();
         let mut path_errors = Vec::new();
@@ -362,7 +372,7 @@ impl EditFileHandler {
                     continue;
                 }
             };
-            if let Ok(resolved) = self.resolve_path(workspace_root, path) {
+            if let Ok(resolved) = self.resolve_path(workspace_root, allowed_external_roots, path) {
                 affected_paths.push(resolved.clone());
             }
 
@@ -552,6 +562,7 @@ impl EditFileHandler {
         state: &mut TaskState,
         params: serde_json::Value,
         workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
         explicitly_approved: bool,
@@ -596,7 +607,7 @@ impl EditFileHandler {
             };
         }
 
-        self.validate_anchors(&files, workspace_root)?;
+        self.validate_anchors(&files, workspace_root, allowed_external_roots)?;
 
         let parsed = self.parse_edits(&files)?;
         let processor = BatchProcessor::new(DiffMode::Full);
@@ -608,7 +619,12 @@ impl EditFileHandler {
 
         let resolved_paths: Result<HashMap<String, String>, ToolError> = parsed
             .iter()
-            .map(|(path, _)| Ok((path.clone(), self.resolve_path(workspace_root, path)?)))
+            .map(|(path, _)| {
+                Ok((
+                    path.clone(),
+                    self.resolve_path(workspace_root, allowed_external_roots, path)?,
+                ))
+            })
             .collect();
         let resolved_paths = resolved_paths?;
         let mut missing_paths: Vec<&str> = resolved_paths
@@ -864,6 +880,12 @@ impl EditFileHandler {
                             // EditFile doesn't need command fingerprint (only for execute_command)
                             mgr.auto_approve(SnedTool::EditFile, None);
                         }
+                    }
+                    Ok(crate::core::approval::ApprovalResult::AllowExternalDirectory) => {
+                        return Err(ToolError::ExecutionFailed(
+                            "External directory approval must be handled before edit_file runs"
+                                .to_string(),
+                        ));
                     }
                     Ok(crate::core::approval::ApprovalResult::Approved) => {
                         // Proceed with edits
@@ -1486,6 +1508,7 @@ impl ToolHandler for EditFileHandler {
                     &mut state,
                     params,
                     ctx.workspace_root.as_path(),
+                    &ctx.allowed_external_roots,
                     &ctx.anchor_mgr,
                     Some(ctx.task_id.as_str()),
                     ctx.explicitly_approved,

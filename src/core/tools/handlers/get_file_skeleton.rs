@@ -1,5 +1,5 @@
 use crate::core::tools::handlers::read_file::record_complete_file_read;
-use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::tree_sitter::{
     MAX_STRUCTURAL_FILE_READ_SIZE, get_file_skeleton, load_required_language_parsers,
 };
@@ -27,7 +27,7 @@ impl GetFileSkeletonHandler {
 
         let abs_paths: Result<Vec<_>, _> = paths
             .iter()
-            .map(|rel_path| resolve_sanitized_path(&ctx.workspace_root, rel_path))
+            .map(|rel_path| ctx.resolve_path(rel_path))
             .collect();
         let abs_paths = abs_paths?;
         let mut results = Vec::with_capacity(paths.len());

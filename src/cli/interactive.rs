@@ -3427,6 +3427,9 @@ async fn run_main_loop(
                                         ApprovalResult::Approved => "approved",
                                         ApprovalResult::Denied => "denied",
                                         ApprovalResult::Always => "always approve",
+                                        ApprovalResult::AllowExternalDirectory => {
+                                            "allowed external directory"
+                                        }
                                     }
                                 ),
                                 Style::default().fg(theme::ACCENT),
@@ -5707,9 +5710,11 @@ mod tests {
             .iter()
             .map(App::line_to_string)
             .collect::<Vec<_>>();
-        assert!(rendered
-            .iter()
-            .any(|line| line.contains("I need more exploration")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("I need more exploration"))
+        );
 
         reset_prompt_state();
     }
@@ -7505,6 +7510,7 @@ mod tests {
             extra_body: None,
             verbose: false,
             cwd: None,
+            allow_dir: Vec::new(),
             config: None,
             thinking: None,
             reasoning_effort: None,
@@ -7860,6 +7866,7 @@ mod tests {
             extra_body: None,
             verbose: false,
             cwd: None,
+            allow_dir: Vec::new(),
             config: None,
             thinking: None,
             reasoning_effort: None,
@@ -8414,6 +8421,7 @@ mod tests {
             extra_body: None,
             verbose: false,
             cwd: None,
+            allow_dir: Vec::new(),
             config: None,
             thinking: None,
             reasoning_effort: None,
@@ -8546,6 +8554,7 @@ mod tests {
             extra_body: None,
             verbose: false,
             cwd: None,
+            allow_dir: Vec::new(),
             config: None,
             thinking: None,
             reasoning_effort: None,
@@ -8670,6 +8679,7 @@ mod tests {
             extra_body: None,
             verbose: false,
             cwd: None,
+            allow_dir: Vec::new(),
             config: None,
             thinking: None,
             reasoning_effort: None,
@@ -8804,6 +8814,7 @@ mod tests {
             extra_body: None,
             verbose: false,
             cwd: None,
+            allow_dir: Vec::new(),
             config: None,
             thinking: None,
             reasoning_effort: None,
@@ -8923,6 +8934,7 @@ mod tests {
             extra_body: None,
             verbose: false,
             cwd: None,
+            allow_dir: Vec::new(),
             config: None,
             thinking: None,
             reasoning_effort: None,
@@ -9045,6 +9057,7 @@ mod tests {
             extra_body: None,
             verbose: false,
             cwd: None,
+            allow_dir: Vec::new(),
             config: None,
             thinking: None,
             reasoning_effort: None,

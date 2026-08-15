@@ -13,9 +13,7 @@
 
 use crate::cli::output::OutputEvent;
 use crate::cli::tui::theme::{ERROR_FG, PROMPT_FG};
-pub use crate::core::agent_types::{
-    AgentConfig, AgentError, AgentMode, TaskState, TurnResult,
-};
+pub use crate::core::agent_types::{AgentConfig, AgentError, AgentMode, TaskState, TurnResult};
 use crate::core::agent_types::{
     MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE, MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT,
 };
@@ -31,12 +29,12 @@ use crate::core::tools::{
     ToolContext, ToolFailureClass, ToolFailureMetadata, ToolRegistry, ToolRequiredNextStep,
     coerce_string_array, tool_result_to_text,
 };
-use crate::providers::{ProviderError, Providers};
 use crate::providers::{
     ApiStreamChunk, ApiStreamToolCall, AssistantContentBlock, MessageContent, MessageRole,
     Provider, ProviderRequest, RedactedThinkingBlock, SharedContentFields, StorageMessage,
     TextContentBlock, ThinkingBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
 };
+use crate::providers::{ProviderError, Providers};
 use crate::storage::global_state::HistoryItem;
 use crate::storage::state_manager::StateManager;
 use crate::storage::task_storage::TaskStorage;
@@ -46,6 +44,7 @@ use ratatui::text::{Line, Span};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hasher;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc};
@@ -69,8 +68,8 @@ use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
 use crate::core::tool_output::{
     DigestLine, extract_edit_stats_detailed, format_heat_map, format_heat_map_plain,
-    format_tool_result, format_tool_result_digest, format_tool_summary,
-    path_from_read_file_header, summarize_matching_sections,
+    format_tool_result, format_tool_result_digest, format_tool_summary, path_from_read_file_header,
+    summarize_matching_sections,
 };
 
 const MAX_EDIT_RESULT_DISPLAY_LINES: usize = 10;
@@ -348,9 +347,7 @@ fn report_shadow_commit_result(
         .collect::<Vec<_>>()
         .join(" ");
     output_writer.emit(OutputEvent::tool_output_line(
-        format!(
-            "Change tracking failed; /diff and /log will not include this turn: {detail}"
-        ),
+        format!("Change tracking failed; /diff and /log will not include this turn: {detail}"),
         Style::default().fg(ERROR_FG),
     ));
 }
@@ -388,10 +385,7 @@ fn print_code_block(
 
     let code = lines.join("\n");
     let highlighted = crate::cli::syntax_highlight::highlight_code(&code, lang);
-    let rendered = format!(
-        "  {}\n",
-        highlighted.replace('\n', "\n  ")
-    );
+    let rendered = format!("  {}\n", highlighted.replace('\n', "\n  "));
     if interactive_mode {
         for line in crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&rendered) {
             output_writer.emit(OutputEvent::Line(line));
@@ -3058,6 +3052,11 @@ impl AgentLoop {
                         // For execute_command: if auto-approved but command is unsafe,
                         // force a prompt so the user can review.
                         let action_paths = Self::extract_action_path(tool, &tool_params);
+                        let external_directories = Self::external_action_directories(
+                            tool,
+                            &tool_context.workspace_root,
+                            &action_paths,
+                        );
                         let params_fingerprint = Self::tool_params_fingerprint(&tool_params);
                         let previously_denied = {
                             let state = self.state.lock().await;
@@ -3079,6 +3078,7 @@ impl AgentLoop {
                         } else {
                             let mut user_prompted = false;
                             let mut session_command_scope_approved = false;
+                            let mut allowed_external_roots = Vec::new();
                             let command_scopes = (tool_name == "execute_command")
                                 .then(|| {
                                     crate::core::approval::command_approval_scopes(&tool_params)
@@ -3088,8 +3088,19 @@ impl AgentLoop {
                                 self.deps.approval_manager
                             {
                                 let mgr = approval_mgr.lock().await;
+                                allowed_external_roots = mgr.external_directory_grants_for(
+                                    tool.category(),
+                                    &external_directories,
+                                );
+                                let external_needs_prompt = !external_directories.is_empty()
+                                    && !mgr.external_directories_are_granted(
+                                        tool.category(),
+                                        &external_directories,
+                                    );
                                 // Check if any action paths require prompting
-                                let needs_prompt = if action_paths.is_empty() {
+                                let needs_prompt = if external_needs_prompt {
+                                    true
+                                } else if action_paths.is_empty() {
                                     if tool_name == "execute_command" {
                                         session_command_scope_approved =
                                             command_scopes.as_ref().is_some_and(|scopes| {
@@ -3112,14 +3123,25 @@ impl AgentLoop {
                                 if needs_prompt {
                                     drop(mgr); // Drop lock before async call
                                     user_prompted = true;
-                                    match crate::core::approval::prompt_for_approval_async_in_workspace(
-                                        &tool_name,
-                                        &tool_params,
-                                        self.config.output_writer.clone(),
-                                        Some(tool_context.workspace_root.clone()),
-                                    )
-                                    .await
-                                    {
+                                    let approval = if external_needs_prompt {
+                                        crate::core::approval::prompt_for_external_directory_approval_async(
+                                            &tool_name,
+                                            &tool_params,
+                                            external_directories.clone(),
+                                            self.config.output_writer.clone(),
+                                            Some(tool_context.workspace_root.clone()),
+                                        )
+                                        .await
+                                    } else {
+                                        crate::core::approval::prompt_for_approval_async_in_workspace(
+                                            &tool_name,
+                                            &tool_params,
+                                            self.config.output_writer.clone(),
+                                            Some(tool_context.workspace_root.clone()),
+                                        )
+                                        .await
+                                    };
+                                    match approval {
                                         Ok(crate::core::approval::ApprovalResult::Denied) => {
                                             let mut state = self.state.lock().await;
                                             state.record_denied_tool_action(
@@ -3156,7 +3178,34 @@ impl AgentLoop {
                                             }
                                             None // Proceed to execute
                                         }
+                                        Ok(
+                                            crate::core::approval::ApprovalResult::AllowExternalDirectory,
+                                        ) => {
+                                            if let Some(ref am) = self.deps.approval_manager {
+                                                let mut mgr = am.lock().await;
+                                                if let Some(error) = external_directories.iter().find_map(|directory| {
+                                                    mgr.grant_external_directory(directory, tool.category()).err()
+                                                }) {
+                                                    Some(ToolExecutionOutput::error(
+                                                        format!("Could not authorize external directory: {error}"),
+                                                        None,
+                                                    ))
+                                                } else {
+                                                    allowed_external_roots = mgr.external_directory_grants_for(
+                                                        tool.category(),
+                                                        &external_directories,
+                                                    );
+                                                    None
+                                                }
+                                            } else {
+                                                Some(ToolExecutionOutput::error(
+                                                    "External directory approval is unavailable for this task".to_string(),
+                                                    None,
+                                                ))
+                                            }
+                                        }
                                         Ok(crate::core::approval::ApprovalResult::Approved) => {
+                                            allowed_external_roots = external_directories.clone();
                                             None // Proceed to execute
                                         }
                                         Err(e) => Some(ToolExecutionOutput::error(
@@ -3269,6 +3318,13 @@ impl AgentLoop {
                                                     None
                                                 }
                                                 Ok(
+                                                    crate::core::approval::ApprovalResult::AllowExternalDirectory,
+                                                ) => Some(ToolExecutionOutput::error(
+                                                    "External directory access does not apply to execute_command"
+                                                        .to_string(),
+                                                    None,
+                                                )),
+                                                Ok(
                                                     crate::core::approval::ApprovalResult::Approved,
                                                 ) => None,
                                                 Err(e) => Some(ToolExecutionOutput::error(
@@ -3298,6 +3354,7 @@ impl AgentLoop {
                                 // handler otherwise applies to an auto-approved command.
                                 let mut tool_context = (*tool_context).clone();
                                 tool_context.explicitly_approved = user_prompted;
+                                tool_context.allowed_external_roots = allowed_external_roots;
                                 tool_context.session_command_scope_approved =
                                     session_command_scope_approved;
                                 let tool_context = Arc::new(tool_context);
@@ -3376,7 +3433,10 @@ impl AgentLoop {
                         .deps
                         .tool_profile
                         .unwrap_or(crate::core::tools::definitions::ToolProfile::Full);
-                    let available = crate::core::tools::definitions::get_tool_definitions_for_profile(active_profile)
+                    let available =
+                        crate::core::tools::definitions::get_tool_definitions_for_profile(
+                            active_profile,
+                        )
                         .iter()
                         .map(|t| t.function.name.as_str())
                         .collect::<Vec<_>>()
@@ -3387,7 +3447,14 @@ impl AgentLoop {
                     )
                 };
 
-                tool_tasks.push((tool_id, tool_name, Some(immediate_output), None, vec![], tool_params));
+                tool_tasks.push((
+                    tool_id,
+                    tool_name,
+                    Some(immediate_output),
+                    None,
+                    vec![],
+                    tool_params,
+                ));
             }
 
             let parallel_enabled = self
@@ -3414,15 +3481,16 @@ impl AgentLoop {
                 )>,
             );
             let mut edit_groups: Vec<EditGroup> = Vec::new();
-            for (i, (_, tool_name, _, task, edit_file_paths, _tool_params)) in tool_tasks.iter_mut().enumerate() {
+            for (i, (_, tool_name, _, task, edit_file_paths, _tool_params)) in
+                tool_tasks.iter_mut().enumerate()
+            {
                 if (tool_name == "edit_file" || tool_name == "write_to_file")
                     && let Some(future) = task.take()
                 {
-                    let paths: std::collections::HashSet<String> =
-                        edit_file_paths
-                            .iter()
-                            .map(|path| path.normalized.clone())
-                            .collect();
+                    let paths: std::collections::HashSet<String> = edit_file_paths
+                        .iter()
+                        .map(|path| path.normalized.clone())
+                        .collect();
                     let mut found_group = None;
                     for (idx, (group_paths, _)) in edit_groups.iter().enumerate() {
                         if paths.iter().any(|p| group_paths.contains(p)) {
@@ -3512,7 +3580,9 @@ impl AgentLoop {
             // Phase 3: Collect results in order, then push as ONE StorageMessage
             let mut execution_results_iter = execution_results.into_iter();
             let mut tool_result_blocks: Vec<UserContentBlock> = Vec::new();
-            for (tool_id, tool_name, immediate_result_text, _task, edit_file_path, tool_params) in tool_tasks {
+            for (tool_id, tool_name, immediate_result_text, _task, edit_file_path, tool_params) in
+                tool_tasks
+            {
                 let mut result_output = if let Some(result_text) = immediate_result_text {
                     result_text
                 } else {
@@ -3897,9 +3967,10 @@ impl AgentLoop {
                 plan.approved
                     && !plan.complete
                     && (plan.paused
-                        || plan.steps.iter().any(|step| {
-                            step.status == PlanStepStatus::Failed
-                        }))
+                        || plan
+                            .steps
+                            .iter()
+                            .any(|step| step.status == PlanStepStatus::Failed))
             })
         };
         let plan_active = self.plan_execution_active().await;
@@ -3994,7 +4065,8 @@ impl AgentLoop {
             // thinking tags which pulldown_cmark treats as raw HTML and
             // emits as raw text, defeating the markdown render.
             let markdown_text = response_text.as_deref().unwrap_or("");
-            if self.config.interactive_mode && !self.config.json_output && markdown_text.is_empty() {
+            if self.config.interactive_mode && !self.config.json_output && markdown_text.is_empty()
+            {
                 self.config.output_writer.emit(OutputEvent::TurnEnd {
                     accumulated_text: String::new(),
                 });
@@ -4141,8 +4213,8 @@ impl AgentLoop {
     fn extract_action_path(tool: SnedTool, params: &serde_json::Value) -> Vec<String> {
         match tool {
             SnedTool::ReadFile
-            | SnedTool::SearchFiles
-            | SnedTool::ListFiles
+            | SnedTool::GetFileSkeleton
+            | SnedTool::FindSymbolReferences
             | SnedTool::RenameSymbol => {
                 if let Some(arr) = params.get("paths").and_then(|p| p.as_array()) {
                     arr.iter()
@@ -4151,29 +4223,42 @@ impl AgentLoop {
                         .collect()
                 } else if let Some(s) = params.get("paths").and_then(|p| p.as_str()) {
                     vec![String::from(s)]
+                } else if let Some(s) = params.get("path").and_then(|p| p.as_str()) {
+                    vec![String::from(s)]
                 } else {
                     vec![]
                 }
             }
             SnedTool::WriteToFile
-            | SnedTool::GetFileSkeleton
-            | SnedTool::FindSymbolReferences
-            | SnedTool::DiagnosticsScan => params
+            | SnedTool::SearchFiles
+            | SnedTool::ListFiles
+            | SnedTool::GetFunction => params
                 .get("path")
                 .and_then(|p| p.as_str())
                 .map(|s| vec![String::from(s)])
                 .unwrap_or_default(),
-            SnedTool::EditFile => params
-                .get("files")
-                .and_then(|f| f.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|f| f.get("path"))
-                        .filter_map(|p| p.as_str())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            SnedTool::EditFile => {
+                let paths: Vec<String> = params
+                    .get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|f| f.get("path"))
+                            .filter_map(|p| p.as_str())
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if paths.is_empty() {
+                    params
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .map(|p| vec![p.to_string()])
+                        .unwrap_or_default()
+                } else {
+                    paths
+                }
+            }
             SnedTool::ReplaceSymbol => {
                 if let Some(s) = params.get("path").and_then(|p| p.as_str()) {
                     vec![String::from(s)]
@@ -4193,6 +4278,32 @@ impl AgentLoop {
             }
             _ => vec![],
         }
+    }
+
+    fn external_action_directories(
+        tool: SnedTool,
+        workspace_root: &std::path::Path,
+        action_paths: &[String],
+    ) -> Vec<PathBuf> {
+        if !matches!(
+            tool.category(),
+            crate::core::tools::ToolCategory::ReadFiles
+                | crate::core::tools::ToolCategory::EditFiles
+        ) {
+            return Vec::new();
+        }
+
+        let mut directories = action_paths
+            .iter()
+            .filter(|path| {
+                let path = std::path::Path::new(path);
+                path.is_absolute() && !path.starts_with(workspace_root)
+            })
+            .filter_map(|path| crate::core::approval::external_directory_for_path(path))
+            .collect::<Vec<_>>();
+        directories.sort();
+        directories.dedup();
+        directories
     }
 
     fn canonicalize_tool_params(value: &serde_json::Value) -> serde_json::Value {
@@ -4243,9 +4354,9 @@ impl AgentLoop {
                 let fallback = params.get("path").and_then(|path| path.as_str());
                 let use_fallback = fallback.is_some()
                     && !files.is_empty()
-                    && files.iter().all(|file| {
-                        file.get("path").is_none() && file.get("edits").is_some()
-                    });
+                    && files
+                        .iter()
+                        .all(|file| file.get("path").is_none() && file.get("edits").is_some());
 
                 files
                     .iter()
@@ -4278,13 +4389,11 @@ impl AgentLoop {
         requested_paths
             .into_iter()
             .filter_map(|display| {
-                let normalized = crate::core::tools::resolve_sanitized_path(
-                    workspace_root,
-                    &display,
-                )
-                .ok()?
-                .to_string_lossy()
-                .into_owned();
+                let normalized =
+                    crate::core::tools::resolve_sanitized_path(workspace_root, &display)
+                        .ok()?
+                        .to_string_lossy()
+                        .into_owned();
                 if !seen.insert(normalized.clone()) {
                     return None;
                 }
@@ -5037,12 +5146,9 @@ mod tests {
         strip_edit_diff_anchors(&mut line);
 
         assert_eq!(line.to_string(), "+ let value = 1;");
-        assert!(
-            line.spans
-                .iter()
-                .any(|span| span.content == "let"
-                    && span.style.fg == Some(ratatui::style::Color::Cyan))
-        );
+        assert!(line.spans.iter().any(
+            |span| span.content == "let" && span.style.fg == Some(ratatui::style::Color::Cyan)
+        ));
     }
 
     #[tokio::test]
@@ -5151,9 +5257,7 @@ mod tests {
             "completed tool call should not duplicate the preparation header: {output:?}"
         );
         assert!(
-            output
-                .iter()
-                .all(|line| !line.contains("\"content\"")),
+            output.iter().all(|line| !line.contains("\"content\"")),
             "tool preparation leaked streamed arguments: {output:?}"
         );
     }
@@ -5229,9 +5333,8 @@ mod tests {
         let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let _approval_guard = crate::core::approval::approval_test_guard();
         let _input_override = crate::core::approval::override_approval_input_for_test();
-        let _timeout_override = crate::core::approval::override_approval_timeout_for_test(
-            Duration::from_millis(25),
-        );
+        let _timeout_override =
+            crate::core::approval::override_approval_timeout_for_test(Duration::from_millis(25));
 
         let responses = vec![vec![
             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
@@ -5472,10 +5575,7 @@ Irrespective of whether additional information or instructions are given, you ar
         // because Validate (YOLO's forced profile) omitted `condense`.
         let prompt = "<explicit_instructions type=\"condense\">compact now</explicit_instructions>";
         let profile = resolve_tool_profile(None, true, prompt, "act");
-        let has_condense = profile
-            .tools()
-            .iter()
-            .any(|t| t.name() == "condense");
+        let has_condense = profile.tools().iter().any(|t| t.name() == "condense");
         assert!(
             has_condense,
             "condense must be in the resolved profile for /compact, got: {:?}",
@@ -5504,14 +5604,10 @@ Irrespective of whether additional information or instructions are given, you ar
             metrics: None,
             ts: None,
         };
-        agent
-            .conversation_history
-            .lock()
-            .await
-            .extend([
-                user_message("Explain this repository"),
-                user_message("Edit the configuration parser and run its tests"),
-            ]);
+        agent.conversation_history.lock().await.extend([
+            user_message("Explain this repository"),
+            user_message("Edit the configuration parser and run its tests"),
+        ]);
 
         agent.set_mode(AgentMode::Plan);
         agent.set_mode(AgentMode::Act);
@@ -5649,8 +5745,7 @@ Irrespective of whether additional information or instructions are given, you ar
             span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
         assert!(inline.spans.iter().any(|span| {
-            span.content == "`code`"
-                && span.style.fg == Some(crate::cli::tui::theme::PROMPT_FG)
+            span.content == "`code`" && span.style.fg == Some(crate::cli::tui::theme::PROMPT_FG)
         }));
 
         let heading = streaming_model_line("  ### heading".to_string(), true);
@@ -5669,11 +5764,17 @@ Irrespective of whether additional information or instructions are given, you ar
     fn test_streaming_model_line_keeps_partial_and_block_markdown_raw() {
         let partial = streaming_model_line("**bol".to_string(), false);
         assert_eq!(partial.to_string(), "**bol");
-        assert_eq!(partial.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
+        assert_eq!(
+            partial.spans[0].style.fg,
+            Some(crate::cli::tui::theme::ACCENT)
+        );
 
         let block = streaming_model_line("---".to_string(), true);
         assert_eq!(block.to_string(), "---");
-        assert_eq!(block.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
+        assert_eq!(
+            block.spans[0].style.fg,
+            Some(crate::cli::tui::theme::ACCENT)
+        );
     }
 
     #[test]
@@ -5969,7 +6070,11 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
 
         let rendered = drain_rendered_output(&mut rx);
-        assert!(rendered.iter().any(|line| line.contains("recovered output")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("recovered output"))
+        );
         assert!(
             agent
                 .state
@@ -5992,8 +6097,7 @@ Irrespective of whether additional information or instructions are given, you ar
                         },
                     )),
                     crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
-                        "Gemini stream error: error decoding response body (retryable)"
-                            .to_string(),
+                        "Gemini stream error: error decoding response body (retryable)".to_string(),
                     )),
                 ]),
                 crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
@@ -6007,7 +6111,11 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
 
         let rendered = drain_rendered_output(&mut rx);
-        assert!(rendered.iter().any(|line| line.contains("recovered output")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("recovered output"))
+        );
         assert!(
             agent
                 .state
@@ -6052,7 +6160,11 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
 
         let rendered = drain_rendered_output(&mut rx);
-        assert!(rendered.iter().any(|line| line.contains("recovered output")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("recovered output"))
+        );
         assert!(
             agent
                 .state
@@ -6236,7 +6348,8 @@ Irrespective of whether additional information or instructions are given, you ar
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_non_retryable_stream_error_is_emitted_in_json_mode() {
-        let policy_error = "Gemini blocked the prompt (reason: SAFETY). Rephrase the prompt and try again.";
+        let policy_error =
+            "Gemini blocked the prompt (reason: SAFETY). Rephrase the prompt and try again.";
         let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
             vec![crate::providers::mock::MockResponse::Stream(vec![
                 crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
@@ -6370,9 +6483,11 @@ Irrespective of whether additional information or instructions are given, you ar
                 .count(),
             1
         );
-        assert!(!rendered
-            .iter()
-            .any(|line| line.contains("SENTINEL_NOT_CONSUMED")));
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("SENTINEL_NOT_CONSUMED"))
+        );
 
         {
             let mut state = state_handle.lock().await;
@@ -7882,9 +7997,7 @@ Irrespective of whether additional information or instructions are given, you ar
         assert_eq!(agent.queued_message_count().await, 2);
         assert!(agent.has_queued_messages().await);
         assert_eq!(
-            agent
-                .message_queue_handle()
-                .try_queued_message_snapshot(3),
+            agent.message_queue_handle().try_queued_message_snapshot(3),
             Some((2, vec!["Hello".to_string(), "World".to_string()]))
         );
 
@@ -7895,7 +8008,10 @@ Irrespective of whether additional information or instructions are given, you ar
             .try_queued_message_snapshot(3)
             .expect("queue snapshot should be available");
         assert_eq!(previews.len(), 3);
-        assert_eq!(previews[2].chars().count(), MAX_QUEUED_MESSAGE_PREVIEW_CHARS + 1);
+        assert_eq!(
+            previews[2].chars().count(),
+            MAX_QUEUED_MESSAGE_PREVIEW_CHARS + 1
+        );
         assert!(previews[2].ends_with('…'));
     }
 
@@ -8233,8 +8349,7 @@ Irrespective of whether additional information or instructions are given, you ar
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "fn main() {}\n").unwrap();
         let params = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"});
-        let paths =
-            AgentLoop::extract_file_action_path("write_to_file", &params, workspace.path());
+        let paths = AgentLoop::extract_file_action_path("write_to_file", &params, workspace.path());
 
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].display, "src/main.rs");
@@ -9371,12 +9486,7 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let _ = agent.execute_turn().await;
         assert!(
-            agent
-                .state
-                .lock()
-                .await
-                .last_api_req_info
-                .is_some(),
+            agent.state.lock().await.last_api_req_info.is_some(),
             "metered request should record usage"
         );
 
@@ -9417,12 +9527,7 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let _ = agent.execute_turn().await;
         assert!(
-            agent
-                .state
-                .lock()
-                .await
-                .last_api_req_info
-                .is_some(),
+            agent.state.lock().await.last_api_req_info.is_some(),
             "first provider should record usage"
         );
 
@@ -9446,12 +9551,7 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let _ = agent.execute_turn().await;
         assert!(
-            agent
-                .state
-                .lock()
-                .await
-                .last_api_req_info
-                .is_none(),
+            agent.state.lock().await.last_api_req_info.is_none(),
             "provider switch must not retain usage from the previous provider"
         );
     }
@@ -10203,9 +10303,7 @@ Irrespective of whether additional information or instructions are given, you ar
                     function: ApiStreamToolCallFunction {
                         id: None,
                         name: Some("execute_command".to_string()),
-                        arguments: Some(
-                            serde_json::json!({"commands": ["false"]}).to_string(),
-                        ),
+                        arguments: Some(serde_json::json!({"commands": ["false"]}).to_string()),
                     },
                     signature: None,
                 },
@@ -10292,10 +10390,12 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(second_events.iter().any(|event| {
             matches!(event, OutputEvent::ToolOutputLine(line) if line.to_string().contains("Cannot complete while the approved plan"))
         }));
-        assert!(!first_events
-            .iter()
-            .chain(second_events.iter())
-            .any(|event| matches!(event, OutputEvent::Completion(_))));
+        assert!(
+            !first_events
+                .iter()
+                .chain(second_events.iter())
+                .any(|event| matches!(event, OutputEvent::Completion(_)))
+        );
     }
 
     // =====================================================================

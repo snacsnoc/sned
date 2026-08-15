@@ -21,7 +21,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -772,6 +772,28 @@ pub struct AutoApprovalSettings {
     pub use_browser: bool,
 }
 
+/// A canonical external directory the user authorized for this session.
+///
+/// Grants are deliberately scoped by file capability so approving an external
+/// read does not also authorize writes below that directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalDirectoryGrant {
+    root: PathBuf,
+    category: ToolCategory,
+}
+
+impl ExternalDirectoryGrant {
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub const fn category(&self) -> ToolCategory {
+        self.category
+    }
+}
+
 use crate::cli::output::OutputWriterArc;
 
 /// Tracks which tool types have been auto-approved for the current session.
@@ -797,6 +819,8 @@ pub struct ApprovalManager {
     auto_approval_settings: AutoApprovalSettings,
     /// Per-path auto-approval patterns.
     auto_approve_patterns: Vec<PathPattern>,
+    /// Explicit external-directory access grants for this session only.
+    external_directory_grants: Vec<ExternalDirectoryGrant>,
     /// User-configured safe commands shared with the agent loop safety check.
     user_safe_commands: Vec<String>,
 }
@@ -853,6 +877,81 @@ impl ApprovalManager {
     pub fn with_auto_approve_patterns(mut self, patterns: Vec<PathPattern>) -> Self {
         self.auto_approve_patterns = patterns;
         self
+    }
+
+    /// Grant a canonical external directory for a file capability.
+    pub fn grant_external_directory(
+        &mut self,
+        directory: impl AsRef<Path>,
+        category: ToolCategory,
+    ) -> Result<(), String> {
+        if !matches!(category, ToolCategory::ReadFiles | ToolCategory::EditFiles) {
+            return Err("External directory grants only apply to file tools".to_string());
+        }
+
+        let directory = directory.as_ref();
+        if !directory.is_absolute() {
+            return Err(format!(
+                "External directory must be an absolute path: {}",
+                directory.display()
+            ));
+        }
+        let root = std::fs::canonicalize(directory).map_err(|error| {
+            format!(
+                "Cannot authorize external directory {}: {}",
+                directory.display(),
+                error
+            )
+        })?;
+        if !root.is_dir() {
+            return Err(format!(
+                "External path is not a directory: {}",
+                root.display()
+            ));
+        }
+        if self.is_path_local(&root.to_string_lossy()) {
+            return Err(format!(
+                "Directory is already inside the workspace: {}",
+                root.display()
+            ));
+        }
+        if !self
+            .external_directory_grants
+            .iter()
+            .any(|grant| grant.category == category && grant.root == root)
+        {
+            self.external_directory_grants
+                .push(ExternalDirectoryGrant { root, category });
+        }
+        Ok(())
+    }
+
+    /// Returns session grants that cover every requested external directory.
+    #[must_use]
+    pub fn external_directory_grants_for(
+        &self,
+        category: ToolCategory,
+        directories: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        self.external_directory_grants
+            .iter()
+            .filter(|grant| grant.category == category)
+            .filter(|grant| directories.iter().any(|dir| dir.starts_with(&grant.root)))
+            .map(|grant| grant.root.clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn external_directories_are_granted(
+        &self,
+        category: ToolCategory,
+        directories: &[PathBuf],
+    ) -> bool {
+        directories.iter().all(|directory| {
+            self.external_directory_grants
+                .iter()
+                .any(|grant| grant.category == category && directory.starts_with(&grant.root))
+        })
     }
 
     /// Set user-safe commands (overrides SNED_SAFE_COMMANDS env var).
@@ -937,6 +1036,12 @@ impl ApprovalManager {
             && !is_local
             && matches!(category, ToolCategory::EditFiles | ToolCategory::ReadFiles)
         {
+            if let Some(path) = action_path
+                && let Some(directory) = external_directory_for_path(path)
+                && self.external_directories_are_granted(category, &[directory])
+            {
+                return false;
+            }
             return true;
         }
 
@@ -1187,6 +1292,8 @@ pub enum ApprovalResult {
     Denied,
     /// User approved and wants to auto-approve this tool for the session.
     Always,
+    /// User approved access to the external directory for this session.
+    AllowExternalDirectory,
 }
 
 /// Keeping each shortcut with its result prevents approval sources and the
@@ -1254,6 +1361,42 @@ fn approval_choices_for_tool(tool_name: &str, params: &serde_json::Value) -> Vec
         ApprovalChoice::new('n', "Deny", ApprovalResult::Denied),
         ApprovalChoice::new('a', always_label, ApprovalResult::Always),
     ]
+}
+
+fn external_directory_approval_choices(directories: &[PathBuf]) -> Vec<ApprovalChoice> {
+    let label = match directories {
+        [directory] => format!("Allow {} this session", directory.display()),
+        _ => "Allow these external directories this session".to_string(),
+    };
+    vec![
+        ApprovalChoice::new('y', "Approve once", ApprovalResult::Approved),
+        ApprovalChoice::new('n', "Deny", ApprovalResult::Denied),
+        ApprovalChoice::new('a', label, ApprovalResult::AllowExternalDirectory),
+    ]
+}
+
+/// Returns the nearest existing directory that contains an absolute external
+/// path. This is the smallest stable scope a user can grant for a request.
+#[must_use]
+pub fn external_directory_for_path(path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let mut directory = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&directory)
+            && canonical.is_dir()
+        {
+            return Some(canonical);
+        }
+        directory = directory.parent()?.to_path_buf();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1575,9 +1718,8 @@ fn format_write_overwrite_preview(path: &str, old_content: &str, new_content: &s
         .and_then(|extension| extension.to_str())
         .unwrap_or("");
 
-    let mut output = format!(
-        "\n    [overwriting existing file: {old_lines} → {new_lines} lines]\n"
-    );
+    let mut output =
+        format!("\n    [overwriting existing file: {old_lines} → {new_lines} lines]\n");
     let selected_ranges = if diff_lines.len() <= WRITE_DIFF_PREVIEW_MAX_LINES {
         vec![(0, diff_lines.len())]
     } else {
@@ -1596,7 +1738,9 @@ fn format_write_overwrite_preview(path: &str, old_content: &str, new_content: &s
             (0, first_end),
             (
                 second_start,
-                second_start.saturating_add(second_len).min(diff_lines.len()),
+                second_start
+                    .saturating_add(second_len)
+                    .min(diff_lines.len()),
             ),
         ]
     };
@@ -1961,6 +2105,63 @@ pub async fn prompt_for_approval_async_in_workspace(
             &output_writer,
             workspace_root.as_deref(),
         )
+    })
+    .await
+    .map_err(|e| io::Error::other(format!("spawn_blocking failed: {e}")))?
+}
+
+/// Prompt for an external file-path operation. The session option grants only
+/// the displayed directory or directories, never every use of the tool.
+pub async fn prompt_for_external_directory_approval_async(
+    tool_name: &str,
+    params: &serde_json::Value,
+    directories: Vec<PathBuf>,
+    output_writer: OutputWriterArc,
+    workspace_root: Option<PathBuf>,
+) -> io::Result<ApprovalResult> {
+    let tool_name = tool_name.to_string();
+    let params_owned = params.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let stdin = io::stdin();
+        #[cfg(test)]
+        let input_available =
+            stdin.is_terminal() || APPROVAL_INPUT_AVAILABLE_OVERRIDE.load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let input_available = stdin.is_terminal();
+        if std::env::var("SNED_APPROVAL_DENY").is_ok() || !input_available {
+            return Ok(ApprovalResult::Denied);
+        }
+
+        let mut params_str = format_tool_parameters_in_workspace(
+            &tool_name,
+            &params_owned,
+            workspace_root.as_deref(),
+        );
+        let directory_list = directories
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(
+            params_str,
+            "\n    External directory access: {directory_list}"
+        );
+        let details = build_tool_approval_prompt(
+            &crate::cli::colors::colorize_stderr("🔧", crate::cli::colors::style::YELLOW),
+            &crate::cli::colors::tool_name(&tool_name),
+            &params_str,
+        );
+        let (_guard, request, receiver) = begin_approval_prompt(
+            format!("External directory access · {tool_name}"),
+            details,
+            external_directory_approval_choices(&directories),
+        )?;
+        let request_id = request.id();
+        output_writer.emit(crate::cli::output::OutputEvent::ApprovalRequested(request));
+        let result = receive_approval_response(&receiver);
+        output_writer.emit(crate::cli::output::OutputEvent::ApprovalFinished { id: request_id });
+        result
     })
     .await
     .map_err(|e| io::Error::other(format!("spawn_blocking failed: {e}")))?
@@ -2472,6 +2673,44 @@ mod tests {
         assert_eq!(ApprovalResult::Approved, ApprovalResult::Approved);
         assert_ne!(ApprovalResult::Approved, ApprovalResult::Denied);
         assert_ne!(ApprovalResult::Denied, ApprovalResult::Always);
+        assert_ne!(
+            ApprovalResult::Always,
+            ApprovalResult::AllowExternalDirectory
+        );
+    }
+
+    #[test]
+    fn test_external_directory_grant_is_capability_scoped() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_file = external.path().join("report.sql");
+        let mut manager = ApprovalManager::new()
+            .with_workspace_root(workspace.path().to_string_lossy().to_string());
+
+        manager
+            .grant_external_directory(external.path(), ToolCategory::ReadFiles)
+            .unwrap();
+
+        assert!(
+            !manager
+                .should_prompt_with_path(SnedTool::ReadFile, Some(external_file.to_str().unwrap()))
+        );
+        assert!(
+            manager.should_prompt_with_path(
+                SnedTool::WriteToFile,
+                Some(external_file.to_str().unwrap())
+            )
+        );
+    }
+
+    #[test]
+    fn test_external_directory_prompt_offers_session_scoped_choice() {
+        let choices = external_directory_approval_choices(&[PathBuf::from("/tmp")]);
+
+        assert_eq!(choices[0].label(), "Approve once");
+        assert_eq!(choices[1].label(), "Deny");
+        assert_eq!(choices[2].label(), "Allow /tmp this session");
+        assert_eq!(choices[2].result(), ApprovalResult::AllowExternalDirectory);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::handlers::error_guidance;
-use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::load_required_language_parsers;
 use std::collections::{HashMap, HashSet};
@@ -62,6 +62,17 @@ impl RenameSymbolHandler {
         params: serde_json::Value,
         workspace_root: &Path,
     ) -> Result<String, ToolError> {
+        self.execute_with_path_roots(state, params, workspace_root, &[])
+            .await
+    }
+
+    async fn execute_with_path_roots(
+        &self,
+        state: &mut TaskState,
+        params: serde_json::Value,
+        workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
+    ) -> Result<String, ToolError> {
         let paths = read_string_list(&params, "paths", "path");
         let existing_symbol = params
             .get("existing_symbol")
@@ -108,12 +119,13 @@ impl RenameSymbolHandler {
             )));
         }
 
-        let expanded_paths: Vec<String> = expand_paths(&paths, workspace_root)
-            .await?
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
+        let expanded_paths: Vec<String> =
+            expand_paths_with_allowed_roots(&paths, workspace_root, allowed_external_roots)
+                .await?
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
 
         // Read file contents and parse symbols outside the lock to avoid blocking tokio workers
         let mut file_contents: HashMap<String, String> = HashMap::with_capacity(paths.len().max(1));
@@ -300,8 +312,7 @@ impl RenameSymbolHandler {
                         state
                             .file_context_tracker
                             .mark_file_as_edited_by_sned(std::path::Path::new(&abs_path));
-                        if let Some(symbol_index_service) = &self.symbol_index_service
-                        {
+                        if let Some(symbol_index_service) = &self.symbol_index_service {
                             let index_root = tokio::fs::canonicalize(workspace_root)
                                 .await
                                 .unwrap_or_else(|_| workspace_root.to_path_buf());
@@ -384,7 +395,12 @@ impl ToolHandler for RenameSymbolHandler {
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
             handler
-                .execute_with_workspace_root(&mut state, params, ctx.workspace_root.as_path())
+                .execute_with_path_roots(
+                    &mut state,
+                    params,
+                    ctx.workspace_root.as_path(),
+                    &ctx.allowed_external_roots,
+                )
                 .await
                 .map(serde_json::Value::String)
         })
@@ -403,10 +419,20 @@ fn read_string_list(
     crate::core::tools::coerce_string_array(params, plural_key, singular_key)
 }
 
+#[cfg(test)]
 async fn expand_paths(paths: &[String], workspace_root: &Path) -> Result<Vec<String>, ToolError> {
+    expand_paths_with_allowed_roots(paths, workspace_root, &[]).await
+}
+
+async fn expand_paths_with_allowed_roots(
+    paths: &[String],
+    workspace_root: &Path,
+    allowed_external_roots: &[std::path::PathBuf],
+) -> Result<Vec<String>, ToolError> {
     let mut expanded = Vec::new();
     for p in paths {
-        let path = resolve_sanitized_path(workspace_root, p)?;
+        let path =
+            crate::core::tools::resolve_authorized_path(workspace_root, allowed_external_roots, p)?;
         if path.is_dir() {
             if let Ok(entries) = collect_source_files(&path).await {
                 expanded.extend(entries);

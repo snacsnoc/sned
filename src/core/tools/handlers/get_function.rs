@@ -1,5 +1,5 @@
 use crate::core::tools::handlers::read_file::record_complete_file_read;
-use crate::core::tools::{ToolContext, ToolError, ToolHandler, resolve_sanitized_path};
+use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::tree_sitter::{
     MAX_STRUCTURAL_FILE_READ_SIZE, get_functions, load_required_language_parsers,
 };
@@ -43,7 +43,7 @@ impl GetFunctionHandler {
         }
 
         let anchor_mgr = ctx.anchor_mgr.clone();
-        let abs_path = resolve_sanitized_path(&ctx.workspace_root, path)?;
+        let abs_path = ctx.resolve_path(path)?;
         let canonical_path = tokio::fs::canonicalize(&abs_path).await.map_err(|error| {
             ToolError::ExecutionFailed(format!("Error reading file {path}: {error}"))
         })?;
