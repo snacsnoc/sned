@@ -884,7 +884,8 @@ impl ExecuteCommandHandler {
         let (shell, args) = match language {
             "python" | "python3" => ("python3", vec!["-c", script]),
             "node" | "javascript" => ("node", vec!["-e", script]),
-            "bash" | "sh" | "zsh" => ("sh", vec!["-c", script]),
+            "bash" => ("bash", vec!["-c", script]),
+            "sh" | "zsh" => ("sh", vec!["-c", script]),
             _ => {
                 let err = crate::cli::actionable_errors::unsupported_language(language);
                 return Err(anyhow::anyhow!("{}", err.display()));
@@ -900,7 +901,7 @@ impl ExecuteCommandHandler {
             #[cfg(unix)]
             cmd.process_group(0);
         }
-        cmd.env_clear().envs(sandboxed_env);
+        cmd.env_clear().envs(sandboxed_env.clone());
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
@@ -909,7 +910,25 @@ impl ExecuteCommandHandler {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let timeout_duration = timeout_override.unwrap_or_else(|| Self::resolve_timeout(script));
-        let mut child = cmd.spawn()?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) if language == "bash" && error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!("bash was not found on PATH; falling back to sh");
+                let mut fallback = Command::new("sh");
+                fallback.args(["-c", script]);
+                if !cfg!(target_os = "windows") {
+                    #[cfg(unix)]
+                    fallback.process_group(0);
+                }
+                fallback.env_clear().envs(sandboxed_env);
+                if let Some(dir) = cwd {
+                    fallback.current_dir(dir);
+                }
+                fallback.stdout(Stdio::piped()).stderr(Stdio::piped());
+                fallback.spawn()?
+            }
+            Err(error) => return Err(error.into()),
+        };
         #[cfg(unix)]
         let child_pid = child.id().unwrap_or(0) as i32;
 
@@ -1448,6 +1467,17 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("hello from python"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_bash_script_uses_bash_syntax() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let result = handler
+            .execute_script("cat < <(printf 'bash works\\n')", "bash", None)
+            .await
+            .unwrap();
+        assert!(result.contains("bash works"));
     }
 
     #[tokio::test]
