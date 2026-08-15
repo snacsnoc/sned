@@ -458,6 +458,22 @@ fn canonicalize_existing_parent(path: &std::path::Path) -> Result<PathBuf, ToolE
     let mut cursor = path.to_path_buf();
     let mut missing_components = Vec::new();
     while !cursor.exists() {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Failed to resolve symlink path: {} (target does not exist)",
+                    cursor.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Failed to inspect path component {} ({error})",
+                    cursor.display()
+                )));
+            }
+        }
         let component = cursor.file_name().ok_or_else(|| {
             ToolError::InvalidInput(format!("Failed to resolve path: {}", path.display()))
         })?;
@@ -706,6 +722,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_authorized_path_rejects_dangling_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let symlink_path = external.path().join("dangling");
+        symlink(external.path().join("not-created"), &symlink_path).unwrap();
+
+        let result = resolve_authorized_path(
+            workspace.path(),
+            std::slice::from_ref(&external.path().canonicalize().unwrap()),
+            symlink_path.join("file.txt").to_str().unwrap(),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Failed to resolve symlink path"));
     }
 
     #[test]

@@ -532,6 +532,17 @@ impl DiagnosticsScanHandler {
         workspace_root: &std::path::Path,
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
+        self.execute_with_external_roots(state, workspace_root, &[], params)
+            .await
+    }
+
+    async fn execute_with_external_roots(
+        &self,
+        state: &mut TaskState,
+        workspace_root: &std::path::Path,
+        allowed_external_roots: &[PathBuf],
+        params: serde_json::Value,
+    ) -> Result<String, ToolError> {
         let paths = crate::core::tools::coerce_string_array(&params, "paths", "path");
         if paths.is_empty() {
             state.consecutive_mistakes += 1;
@@ -555,14 +566,17 @@ impl DiagnosticsScanHandler {
         let mut error_results = Vec::new();
 
         for rel_path in &paths {
-            let abs_path =
-                match crate::core::tools::resolve_sanitized_path(workspace_root, rel_path) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        error_results.push(format!("- file: {rel_path}\n  error: {e}"));
-                        continue;
-                    }
-                };
+            let abs_path = match crate::core::tools::resolve_authorized_path(
+                workspace_root,
+                allowed_external_roots,
+                rel_path,
+            ) {
+                Ok(path) => path,
+                Err(e) => {
+                    error_results.push(format!("- file: {rel_path}\n  error: {e}"));
+                    continue;
+                }
+            };
 
             // Try to read the file
             let file_content = match tokio::fs::read_to_string(&abs_path).await {
@@ -658,9 +672,15 @@ impl ToolHandler for DiagnosticsScanHandler {
         let ctx = ctx.clone();
         Box::pin(async move {
             let mut state = ctx.state.lock().await;
-            Self::execute(&handler, &mut state, &ctx.workspace_root, params)
-                .await
-                .map(serde_json::Value::String)
+            Self::execute_with_external_roots(
+                &handler,
+                &mut state,
+                &ctx.workspace_root,
+                &ctx.allowed_external_roots,
+                params,
+            )
+            .await
+            .map(serde_json::Value::String)
         })
     }
 
@@ -750,6 +770,28 @@ mod tests {
                 || text.contains("error")
                 || text.contains("Error")
         );
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_scan_allows_authorized_external_file() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let py_file = external.path().join("external.py");
+        std::fs::write(&py_file, "print('hello')\n").unwrap();
+
+        let handler = DiagnosticsScanHandler::new();
+        let mut state = TaskState::default();
+        let result = handler
+            .execute_with_external_roots(
+                &mut state,
+                workspace.path(),
+                std::slice::from_ref(&external.path().canonicalize().unwrap()),
+                serde_json::json!({"paths": [py_file.to_string_lossy().to_string()]}),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("external.py"));
     }
 
     #[test]

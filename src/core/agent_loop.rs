@@ -4215,6 +4215,7 @@ impl AgentLoop {
             SnedTool::ReadFile
             | SnedTool::GetFileSkeleton
             | SnedTool::FindSymbolReferences
+            | SnedTool::DiagnosticsScan
             | SnedTool::RenameSymbol => {
                 if let Some(arr) = params.get("paths").and_then(|p| p.as_array()) {
                     arr.iter()
@@ -8138,6 +8139,13 @@ Irrespective of whether additional information or instructions are given, you ar
         let params = serde_json::json!({"paths": "/home/user/project/README.md"});
         let paths = AgentLoop::extract_action_path(SnedTool::ReadFile, &params);
         assert_eq!(paths, vec!["/home/user/project/README.md".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_action_path_diagnostics_scan() {
+        let params = serde_json::json!({"paths": ["/tmp/outside.rs"]});
+        let paths = AgentLoop::extract_action_path(SnedTool::DiagnosticsScan, &params);
+        assert_eq!(paths, vec!["/tmp/outside.rs".to_string()]);
     }
 
     #[test]
