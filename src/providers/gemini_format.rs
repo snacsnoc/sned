@@ -344,7 +344,7 @@ fn convert_content_to_gemini_parts(
                         parts.push(GeminiPart {
                             text: Some(thinking.thinking.clone()),
                             thought: Some(true),
-                            thought_signature: Some(thinking.signature.clone()),
+                            thought_signature: thinking.signature.clone(),
                             function_call: None,
                             function_response: None,
                             inline_data: None,
@@ -534,7 +534,7 @@ mod tests {
     fn test_convert_thinking_block() {
         let thinking = AssistantContentBlock::Thinking(crate::providers::ThinkingBlock {
             thinking: "Let me think about this...".to_string(),
-            signature: "think_sig_789".to_string(),
+            signature: Some("think_sig_789".to_string()),
             shared: SharedContentFields {
                 call_id: None,
                 signature: None,
@@ -736,7 +736,7 @@ mod tests {
         // must NOT appear on functionResponse, and must survive across turns.
         let thinking = AssistantContentBlock::Thinking(crate::providers::ThinkingBlock {
             thinking: "I need to check the weather.".to_string(),
-            signature: "think_sig_round_trip".to_string(),
+            signature: Some("think_sig_round_trip".to_string()),
             shared: SharedContentFields {
                 call_id: None,
                 signature: None,

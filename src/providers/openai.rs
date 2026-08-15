@@ -188,6 +188,16 @@ impl OpenAiProvider {
             }
         }
 
+        // OpenAI-compatible APIs require at least one user message. Preserve
+        // that invariant even when an upstream empty-content filter removed
+        // the only user turn from the request history.
+        if !messages.iter().any(|message| message["role"] == "user") {
+            messages.push(json!({
+                "role": "user",
+                "content": "Please proceed.",
+            }));
+        }
+
         // Post-process: convert tool_use content blocks to OpenAI tool_calls format.
         // `convert_assistant_blocks` emits Anthropic-style `{"type":"tool_use",...}`
         // content parts, but OpenAI API expects a top-level `tool_calls` array with
@@ -1559,6 +1569,19 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert!(body["messages"].as_array().unwrap().len() >= 2);
         assert!(body.get("chat_template_kwargs").is_none());
+
+        let empty_history = ProviderRequest {
+            messages: Vec::new(),
+            ..request
+        };
+        let fallback_body = provider.build_request_body(&empty_history).unwrap();
+        assert!(
+            fallback_body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|msg| { msg["role"] == "user" && msg["content"] == "Please proceed." })
+        );
     }
 
     #[test]

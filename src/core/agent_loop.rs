@@ -2852,7 +2852,7 @@ impl AgentLoop {
             {
                 blocks.push(AssistantContentBlock::Thinking(ThinkingBlock {
                     thinking: thinking.clone(),
-                    signature: accumulated_signature.clone().unwrap_or_default(),
+                    signature: accumulated_signature.clone(),
                     shared: SharedContentFields {
                         call_id: None,
                         signature: None,
@@ -8927,7 +8927,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 content: MessageContent::AssistantBlocks(vec![
                     AssistantContentBlock::Thinking(ThinkingBlock {
                         thinking: "x".repeat(10000), // 10000 chars, well over limit
-                        signature: "sig1".to_string(),
+                        signature: Some("sig1".to_string()),
                         shared: SharedContentFields {
                             call_id: None,
                             signature: None,
@@ -8954,7 +8954,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 content: MessageContent::AssistantBlocks(vec![
                     AssistantContentBlock::Thinking(ThinkingBlock {
                         thinking: "y".repeat(10000), // 10000 chars, should NOT be truncated
-                        signature: "sig2".to_string(),
+                        signature: Some("sig2".to_string()),
                         shared: SharedContentFields {
                             call_id: None,
                             signature: None,
@@ -9032,7 +9032,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
                     ThinkingBlock {
                         thinking: "z".repeat(2000),
-                        signature: "sig".to_string(),
+                        signature: Some("sig".to_string()),
                         shared: SharedContentFields {
                             call_id: None,
                             signature: None,
@@ -9051,7 +9051,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
                     ThinkingBlock {
                         thinking: "w".repeat(2000),
-                        signature: "sig2".to_string(),
+                        signature: Some("sig2".to_string()),
                         shared: SharedContentFields {
                             call_id: None,
                             signature: None,

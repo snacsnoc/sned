@@ -137,7 +137,23 @@ impl GeminiProvider {
             .or(fallback_model_info.as_ref());
 
         // Convert messages to Gemini format
-        let contents = gemini_format::convert_to_gemini_contents(&request.messages);
+        let mut contents = gemini_format::convert_to_gemini_contents(&request.messages);
+        // Gemini requires a user turn. Keep the request valid if an upstream
+        // empty-content filter removed every user message from the history.
+        if !contents.iter().any(|content| content.role == "user") {
+            contents.push(gemini_format::GeminiContent {
+                role: "user".to_string(),
+                parts: vec![gemini_format::GeminiPart {
+                    text: Some("Please proceed.".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    function_call: None,
+                    function_response: None,
+                    inline_data: None,
+                    file_data: None,
+                }],
+            });
+        }
 
         // Gemini 3.5 and later reject deprecated sampling parameters.
         let omits_sampling_parameters =
@@ -1113,6 +1129,21 @@ mod tests {
         assert_eq!(
             body["systemInstruction"]["parts"][0]["text"],
             "You are a helpful assistant."
+        );
+
+        let empty_history = ProviderRequest {
+            messages: Vec::new(),
+            ..request
+        };
+        let fallback_body = provider.build_request_body(&empty_history).unwrap();
+        assert!(
+            fallback_body["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|content| {
+                    content["role"] == "user" && content["parts"][0]["text"] == "Please proceed."
+                })
         );
     }
 

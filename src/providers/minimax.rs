@@ -130,6 +130,15 @@ impl MinimaxProvider {
             .flat_map(convert_message_to_openai)
             .collect();
 
+        // MiniMax uses an OpenAI-compatible chat contract and requires a user
+        // turn even when empty upstream messages were filtered from history.
+        if !messages.iter().any(|message| message["role"] == "user") {
+            messages.push(json!({
+                "role": "user",
+                "content": "Please proceed.",
+            }));
+        }
+
         if !request.system_prompt.is_empty() {
             messages.insert(
                 0,
@@ -1560,6 +1569,15 @@ mod tests {
         );
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "Hello");
+
+        let empty_history = ProviderRequest {
+            messages: Vec::new(),
+            ..request
+        };
+        let fallback_body = provider.build_request_body(&empty_history).unwrap();
+        assert!(fallback_body["messages"].as_array().unwrap().iter().any(|msg| {
+            msg["role"] == "user" && msg["content"] == "Please proceed."
+        }));
     }
 
     #[test]
@@ -1892,7 +1910,7 @@ mod tests {
                 content: MessageContent::AssistantBlocks(vec![
                     AssistantContentBlock::Thinking(crate::providers::ThinkingBlock {
                         thinking: "Need to inspect the tool output before replying.".to_string(),
-                        signature: "sig_1".to_string(),
+                        signature: Some("sig_1".to_string()),
                         shared: SharedContentFields {
                             call_id: None,
                             signature: None,

@@ -146,7 +146,9 @@ pub struct ToolResultBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThinkingBlock {
     pub thinking: String,
-    pub signature: String,
+    /// Provider thought signatures are optional in persisted history. Older
+    /// sessions commonly contain an explicit `null` here.
+    pub signature: Option<String>,
     #[serde(flatten)]
     pub shared: SharedContentFields,
     pub summary: Option<Vec<ReasoningDetailParam>>,
@@ -1122,6 +1124,27 @@ mod tests {
         let json = serde_json::to_string(&block).unwrap();
         let deserialized: AssistantContentBlock = serde_json::from_str(&json).unwrap();
         assert_eq!(block, deserialized);
+    }
+
+    #[test]
+    fn test_thinking_block_accepts_null_signature_from_history() {
+        let message = serde_json::json!({
+            "role": "assistant",
+            "content": [{
+                "type": "thinking",
+                "thinking": "internal reasoning",
+                "signature": null
+            }]
+        });
+
+        let parsed: StorageMessage = serde_json::from_value(message).unwrap();
+        let MessageContent::AssistantBlocks(blocks) = parsed.content else {
+            panic!("expected assistant blocks");
+        };
+        let AssistantContentBlock::Thinking(thinking) = &blocks[0] else {
+            panic!("expected thinking block");
+        };
+        assert_eq!(thinking.signature, None);
     }
 
     #[test]

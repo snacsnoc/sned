@@ -140,7 +140,7 @@ impl AnthropicProvider {
 
         // Convert messages to Anthropic format
         let total_messages = request.messages.len();
-        let messages: Vec<serde_json::Value> = request
+        let mut messages: Vec<serde_json::Value> = request
             .messages
             .iter()
             .enumerate()
@@ -174,6 +174,15 @@ impl AnthropicProvider {
                 }
             })
             .collect();
+
+        // Keep the request valid if an upstream empty-content filter removed
+        // every user turn from the conversation history.
+        if !messages.iter().any(|message| message["role"] == "user") {
+            messages.push(json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "Please proceed."}],
+            }));
+        }
 
         let mut system_content = vec![json!({
             "type": "text",
@@ -1259,6 +1268,21 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0);
         assert!(!body["system"].as_array().unwrap().is_empty());
+
+        let empty_history = ProviderRequest {
+            messages: Vec::new(),
+            ..request
+        };
+        let fallback_body = provider.build_request_body(&empty_history).unwrap();
+        assert!(
+            fallback_body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|msg| {
+                    msg["role"] == "user" && msg["content"][0]["text"] == "Please proceed."
+                })
+        );
     }
 
     #[test]
