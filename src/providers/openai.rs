@@ -743,12 +743,14 @@ async fn process_openai_sse_line(
                         continue;
                     }
 
-                    if let Some(id) = &tc.id {
+                    // Some OpenAI-compatible providers send the call ID only in
+                    // the first delta, then use empty strings for continuations.
+                    // Keep the original ID so the completed call can be dispatched.
+                    if let Some(id) = tc.id.as_deref().filter(|id| !id.is_empty()) {
                         accumulated_tool_calls
                             .entry(tool_index)
                             .or_insert_with(|| (String::new(), String::new(), String::new()))
-                            .0
-                            .clone_from(id);
+                            .0 = id.to_owned();
                     }
 
                     if let Some(function) = tc.function {
@@ -2610,6 +2612,103 @@ mod tests {
             chunk,
             ApiStreamChunk::ToolCalls(tool_chunk)
                 if tool_chunk.tool_call.function.name.as_deref() == Some("write_to_file")
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_fragmented_tool_call_preserves_initial_id() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
+        let model_info: Option<crate::providers::OpenAiCompatibleModelInfo> = None;
+
+        let lines = [
+            serde_json::json!({
+                "id": "chatcmpl_123",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_qwen",
+                            "function": {
+                                "name": "execute_command",
+                                "arguments": "",
+                            },
+                        }],
+                    },
+                    "finish_reason": null,
+                }],
+            }),
+            serde_json::json!({
+                "id": "chatcmpl_123",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "",
+                            "function": {"arguments": "{\"commands\": "},
+                        }],
+                    },
+                    "finish_reason": null,
+                }],
+            }),
+            serde_json::json!({
+                "id": "chatcmpl_123",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "",
+                            "function": {"arguments": "[\"pwd\"]}"},
+                        }],
+                    },
+                    "finish_reason": null,
+                }],
+            }),
+            serde_json::json!({
+                "id": "chatcmpl_123",
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }],
+            }),
+        ];
+
+        for line in lines {
+            process_openai_sse_line(
+                &format!("data: {line}"),
+                &tx,
+                &mut delta_state,
+                &mut accumulated_tool_calls,
+                &mut completed_tool_call_indices,
+                &mut last_stop_reason,
+                model_info.as_ref(),
+                &mut usage_sent,
+            )
+            .await;
+        }
+
+        let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(matches!(
+            chunks.first(),
+            Some(ApiStreamChunk::ToolCallStarted { call_id, name })
+                if call_id == "call_qwen" && name == "execute_command"
+        ));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::ToolCalls(tool_chunk)
+                if tool_chunk.tool_call.call_id.as_deref() == Some("call_qwen")
+                    && tool_chunk.tool_call.function.name.as_deref() == Some("execute_command")
+                    && tool_chunk
+                        .tool_call
+                        .function
+                        .arguments
+                        .as_deref()
+                        .and_then(|arguments| serde_json::from_str(arguments).ok())
+                        == Some(serde_json::json!({"commands": ["pwd"]}))
         )));
     }
 
