@@ -10,14 +10,18 @@
 #
 # Outputs:
 #   - Prints the formula to stdout
-#   - Saves to target/dist/macos-arm64/sned.rb
+#   - Saves to target/release-metadata/sned.rb
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/release-package-common.sh"
 VERSION_FROM_MANIFEST=$(grep "^version" "${PROJECT_ROOT}/Cargo.toml" | head -1 | cut -d'"' -f2)
-MACOS_ARM64_TARBALL="${PROJECT_ROOT}/target/dist/macos-arm64/sned-${VERSION_FROM_MANIFEST}-macos-arm64.tar.gz"
+TARGET_DIR="$(release_target_dir "${PROJECT_ROOT}")"
+ARTIFACT_DIR="$(release_artifact_dir "${TARGET_DIR}")"
+METADATA_DIR="$(release_metadata_dir "${TARGET_DIR}")"
+MACOS_ARM64_TARBALL="${ARTIFACT_DIR}/sned-${VERSION_FROM_MANIFEST}-macos-arm64.tar.gz"
 
 # Get version from Cargo.toml if not provided
 if [[ -n "${1:-}" ]]; then
@@ -39,7 +43,8 @@ else
     fi
 fi
 
-FORMULA_PATH="${PROJECT_ROOT}/target/dist/macos-arm64/sned.rb"
+FORMULA_PATH="${METADATA_DIR}/sned.rb"
+mkdir -p "${METADATA_DIR}"
 
 echo "Generating Homebrew formula..."
 echo "Version: ${VERSION}"

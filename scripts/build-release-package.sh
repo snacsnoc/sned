@@ -60,6 +60,7 @@ fi
 HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 HOST_TARGET="$(rustc -vV | awk '/^host:/ { print $2 }')"
 TARGET_DIR="$(release_target_dir "${PROJECT_ROOT}")"
+ARTIFACT_DIR="$(release_artifact_dir "${TARGET_DIR}")"
 
 case "${TARGET_TRIPLE}" in
     *-unknown-linux-gnu|*-unknown-linux-gnueabihf)
@@ -83,13 +84,17 @@ if [[ "${BUILD_MODE}" == "release" ]]; then
 fi
 PROFILE_DIR="${BUILD_MODE}"
 TARGET_BINARY="${TARGET_DIR}/${TARGET_TRIPLE}/${PROFILE_DIR}/sned"
-ARTIFACT_DIR="${TARGET_DIR}/dist/${ARTIFACT_SUFFIX}"
-PACKAGE_DIR="${ARTIFACT_DIR}/sned-${VERSION}-${ARTIFACT_SUFFIX}"
+STAGING_DIR=""
+PACKAGE_DIR=""
 TARBALL="${ARTIFACT_DIR}/sned-${VERSION}-${ARTIFACT_SUFFIX}.tar.gz"
 
-mkdir -p "${ARTIFACT_DIR}"
-rm -rf "${PACKAGE_DIR}"
-rm -f "${TARBALL}"
+mkdir -p "${TARGET_DIR}" "${ARTIFACT_DIR}"
+STAGING_DIR="$(mktemp -d "${TARGET_DIR}/.sned-release-staging.XXXXXX")"
+PACKAGE_DIR="${STAGING_DIR}/sned-${VERSION}-${ARTIFACT_SUFFIX}"
+cleanup() {
+    rm -rf "${STAGING_DIR}"
+}
+trap cleanup EXIT
 
 if [[ "${HOST_TARGET}" == "${TARGET_TRIPLE}" ]]; then
     BUILD_CMD=(cargo build)
@@ -143,5 +148,5 @@ mkdir -p "${PACKAGE_DIR}"
 cp "${TARGET_BINARY}" "${PACKAGE_DIR}/sned"
 chmod +x "${PACKAGE_DIR}/sned"
 
-repack_release "${TARGET_DIR}" "${ARTIFACT_SUFFIX}" "${VERSION}"
+repack_release "${PACKAGE_DIR}" "${TARBALL}"
 file "${PACKAGE_DIR}/sned" || true

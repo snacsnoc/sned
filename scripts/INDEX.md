@@ -109,8 +109,22 @@ Dependencies: `python3`, `gcc`/`clang` (only for the rebuild).
 ### `build-release-package.sh`
 
 Shared helper used by the macOS, Linux, and FreeBSD packaging wrappers. Builds a
-single target triple and writes a persistent package directory plus tar.gz
-release artifact under `${CARGO_TARGET_DIR:-target}/dist/<suffix>/`.
+single target triple and packages `sned-<version>-<suffix>.tar.gz` under
+`${CARGO_TARGET_DIR:-target}/release-artifacts/`. Cargo build outputs remain in
+their target-specific directories.
+
+### `build-all-releases.sh`
+
+Builds all supported architecture packages by default and writes them to the
+shared `${CARGO_TARGET_DIR:-target}/release-artifacts/` directory. Use repeated
+`--target <suffix>` options for a subset and `--debug` for debug packages.
+`SHA256SUMS` is generated only after every selected target succeeds.
+
+```bash
+./scripts/build-all-releases.sh
+./scripts/build-all-releases.sh --target macos-arm64 --target linux-amd64
+gh release upload v<version> target/release-artifacts/*
+```
 
 ### `build-macos-arm64.sh`
 
@@ -134,7 +148,10 @@ Builds `x86_64-unknown-freebsd` and packages `sned-<version>-freebsd-amd64.tar.g
 
 ### `homebrew-formula.sh`
 
-Regenerates the Homebrew formula after a release. Run from the sned repo root after tagging a release.
+Regenerates the Homebrew formula after a release. Run from the sned repo root
+after tagging a release. The formula is written to
+`${CARGO_TARGET_DIR:-target}/release-metadata/sned.rb`, outside the upload
+directory.
 
 ---
 
