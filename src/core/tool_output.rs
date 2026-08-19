@@ -6,6 +6,44 @@
 use crate::core::tools::SnedTool;
 use std::collections::HashSet;
 
+/// Format a dispatched tool call for the interactive transcript.
+///
+/// The full argument object is intentionally shown so the user can verify
+/// what the model asked Sned to do, rather than only seeing a path/count
+/// summary after the fact.
+#[must_use]
+pub fn format_tool_call_lines(tool_name: &str, params: &serde_json::Value) -> Vec<String> {
+    let serialized = serde_json::to_string_pretty(params)
+        .unwrap_or_else(|error| format!("<unable to serialize arguments: {error}>"));
+    let mut lines = vec![format!("  ▶ {tool_name}")];
+    for (index, line) in serialized.lines().enumerate() {
+        if index == 0 {
+            lines.push(format!("    args: {line}"));
+        } else {
+            lines.push(format!("    {line}"));
+        }
+    }
+    lines
+}
+
+/// Format a tool call whose arguments could not be parsed as JSON.
+///
+/// Keep the original request visible so malformed provider output can be
+/// diagnosed from the transcript instead of being displayed as `null`.
+#[must_use]
+pub fn format_tool_call_lines_with_raw_arguments(
+    tool_name: &str,
+    raw_arguments: Option<&str>,
+    parse_error: &str,
+) -> Vec<String> {
+    let mut lines = vec![format!("  ▶ {tool_name}"), "    args (raw):".to_string()];
+    for line in raw_arguments.unwrap_or("<missing>").split('\n') {
+        lines.push(format!("      {line}"));
+    }
+    lines.push(format!("    args parse error: {parse_error}"));
+    lines
+}
+
 /// One styled line emitted as part of a tool-result digest in the TUI.
 ///
 /// Used by [`format_tool_result_digest`] so the agent loop can render
@@ -519,6 +557,16 @@ fn strip_anchor(line: &str) -> &str {
     line
 }
 
+/// Remove internal hash anchors without truncating the tool result.
+#[must_use]
+pub fn strip_tool_result_anchors(result: &str) -> String {
+    result
+        .split('\n')
+        .map(strip_anchor)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[must_use]
 pub fn format_tool_result(result: &str, max_lines: usize) -> String {
     // Strip hash anchors (Word§line content) from display — they're agent-internal
@@ -549,6 +597,37 @@ pub fn format_tool_result(result: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_tool_call_lines_shows_all_arguments() {
+        let params = serde_json::json!({
+            "path": ".",
+            "regex": "global_skills",
+            "file_pattern": "*.rs",
+        });
+        let lines = format_tool_call_lines("search_files", &params);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("▶ search_files"));
+        assert!(rendered.contains("\"path\": \".\""));
+        assert!(rendered.contains("\"regex\": \"global_skills\""));
+        assert!(rendered.contains("\"file_pattern\": \"*.rs\""));
+    }
+
+    #[test]
+    fn test_format_tool_call_lines_with_raw_arguments_shows_parse_failure() {
+        let lines = format_tool_call_lines_with_raw_arguments(
+            "read_file",
+            Some(r#"{"path":"unterminated"#),
+            "invalid JSON",
+        );
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("▶ read_file"));
+        assert!(rendered.contains(r#"{"path":"unterminated"#));
+        assert!(rendered.contains("args parse error: invalid JSON"));
+        assert!(!rendered.contains("args: null"));
+    }
 
     #[test]
     fn test_format_tool_summary_execute_command_singular() {
@@ -697,6 +776,13 @@ mod tests {
         let result = "TranslucentMismatch§/*\nWarehouseSetter§ * Tetris clone";
         let formatted = format_tool_result(result, 10);
         assert_eq!(formatted, "/*\n * Tetris clone");
+    }
+
+    #[test]
+    fn test_strip_tool_result_anchors_preserves_all_lines() {
+        let result = "First§one\nSecond§two\nplain\n";
+
+        assert_eq!(strip_tool_result_anchors(result), "one\ntwo\nplain\n");
     }
 
     #[test]

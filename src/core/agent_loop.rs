@@ -67,9 +67,9 @@ const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
 use crate::core::tool_output::{
-    DigestLine, extract_edit_stats_detailed, format_heat_map, format_heat_map_plain,
-    format_tool_result, format_tool_result_digest, format_tool_summary, path_from_read_file_header,
-    summarize_matching_sections,
+    extract_edit_stats_detailed, format_heat_map, format_heat_map_plain, format_tool_call_lines,
+    format_tool_call_lines_with_raw_arguments, format_tool_result, format_tool_result_digest,
+    path_from_read_file_header, strip_tool_result_anchors, summarize_matching_sections,
 };
 
 const MAX_EDIT_RESULT_DISPLAY_LINES: usize = 10;
@@ -2469,16 +2469,6 @@ impl AgentLoop {
                             "received tool call from stream"
                         );
 
-                        // Print tool call header only on first appearance of this tool call key
-                        if !self.config.json_output
-                            && !tool_calls_map.contains_key(&key)
-                            && !announced_tool_call_ids.contains(&key)
-                        {
-                            let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
-                            self.config
-                                .output_writer
-                                .emit(OutputEvent::tool_call(format!("▶ {tool_name}")));
-                        }
                         if self.config.json_output {
                             tracing::info!(
                                 target: "json_output",
@@ -2952,7 +2942,8 @@ impl AgentLoop {
         if !prepared_tool_calls.is_empty() {
             let mut edit_files: Vec<(String, i32, i32)> = Vec::new();
 
-            // Print compact tool call summaries (skip malformed tool calls with empty names)
+            // Print the complete dispatched call so the user can verify what the
+            // model asked Sned to do (skip malformed tool calls with empty names).
             if !self.config.json_output {
                 for prepared in &prepared_tool_calls {
                     let tool_name = prepared.tool_name.as_str();
@@ -2962,12 +2953,17 @@ impl AgentLoop {
                         continue;
                     }
 
-                    let tool_params = prepared
-                        .parsed_args
-                        .as_ref()
-                        .unwrap_or(&serde_json::Value::Null);
-                    let summary = format_tool_summary(tool_name, tool_params);
-                    self.config.output_writer.emit(OutputEvent::dim(summary));
+                    let call_lines = match &prepared.parsed_args {
+                        Ok(tool_params) => format_tool_call_lines(tool_name, tool_params),
+                        Err(parse_error) => format_tool_call_lines_with_raw_arguments(
+                            tool_name,
+                            prepared.tool_call.function.arguments.as_deref(),
+                            parse_error,
+                        ),
+                    };
+                    for line in call_lines {
+                        self.config.output_writer.emit(OutputEvent::tool_call(line));
+                    }
                     self.config.output_writer.flush();
                 }
             }
@@ -3629,14 +3625,10 @@ impl AgentLoop {
                                 }
                             }
                         }
-                    } else if !matches!(
-                        tool_name.as_str(),
-                        "plan_mode_respond"
-                            | "ask_followup_question"
-                            | "condense"
-                            | "use_subagents"
-                    ) && (tool_name != "attempt_completion" || is_error)
-                    {
+                    } else if tool_name == "execute_command" {
+                        // execute_command streams stdout/stderr while it runs;
+                        // keep the final status summary without duplicating the
+                        // already-visible command output.
                         let digest_lines = format_tool_result_digest(
                             &tool_name,
                             &tool_params,
@@ -3645,17 +3637,53 @@ impl AgentLoop {
                             if is_error { ERROR_FG } else { PROMPT_FG },
                             PROMPT_FG,
                         );
-                        for DigestLine { text, fg, dim } in digest_lines {
+                        for line in digest_lines {
                             let mut style = Style::default();
-                            if let Some(color) = fg {
+                            if let Some(color) = line.fg {
                                 style = style.fg(color);
                             }
-                            if dim {
+                            if line.dim {
                                 style = style.add_modifier(Modifier::DIM);
                             }
                             self.config
                                 .output_writer
-                                .emit(OutputEvent::tool_output_line(text, style));
+                                .emit(OutputEvent::tool_output_line(line.text, style));
+                        }
+                    } else if !matches!(
+                        tool_name.as_str(),
+                        "plan_mode_respond"
+                            | "ask_followup_question"
+                            | "condense"
+                            | "use_subagents"
+                    ) && (tool_name != "attempt_completion" || is_error)
+                    {
+                        let style =
+                            Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG });
+                        let status = if is_error { "✗" } else { "✓" };
+                        self.config
+                            .output_writer
+                            .emit(OutputEvent::tool_output_line(
+                                format!("  {status} {tool_name} result"),
+                                style,
+                            ));
+                        if result_output.text.is_empty() {
+                            self.config
+                                .output_writer
+                                .emit(OutputEvent::tool_output_line(
+                                    "  (empty tool result)",
+                                    style,
+                                ));
+                        } else {
+                            // Keep the result in one channel event. The TUI
+                            // splits embedded newlines into transcript rows,
+                            // while this avoids dropping individual lines if
+                            // the output channel is under pressure.
+                            self.config
+                                .output_writer
+                                .emit(OutputEvent::tool_output_line(
+                                    strip_tool_result_anchors(&result_output.text),
+                                    style,
+                                ));
                         }
                     }
                 }
@@ -4997,7 +5025,9 @@ fn truncate_old_thinking_blocks(history: &mut [StorageMessage]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::tool_output::{normalize_path_for_matching, summarize_single_section};
+    use crate::core::tool_output::{
+        format_tool_summary, normalize_path_for_matching, summarize_single_section,
+    };
     use crate::providers::{
         ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCallFunction,
         ApiStreamToolCallsChunk,
@@ -5254,12 +5284,16 @@ mod tests {
             "streamed tool start should have one preparation notice: {output:?}"
         );
         assert!(
-            !output.iter().any(|line| line == "▶ write_to_file"),
-            "completed tool call should not duplicate the preparation header: {output:?}"
+            output
+                .iter()
+                .filter(|line| line.contains("▶ write_to_file"))
+                .count()
+                == 1,
+            "completed tool call should have one full call display: {output:?}"
         );
         assert!(
-            output.iter().all(|line| !line.contains("\"content\"")),
-            "tool preparation leaked streamed arguments: {output:?}"
+            output.iter().any(|line| line.contains("\"content\"")),
+            "completed tool call should show its arguments: {output:?}"
         );
     }
 
@@ -8188,6 +8222,69 @@ Irrespective of whether additional information or instructions are given, you ar
         assert_eq!(
             format_tool_summary("read_file", parsed_args),
             format_tool_summary("read_file", &expected_args)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_files_output_shows_call_and_matches() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::search_files::SearchFilesHandler;
+
+        let params = serde_json::json!({
+            "path": "src/core/tool_output.rs",
+            "regex": "format_tool_call_lines",
+            "file_pattern": "*.rs",
+        });
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_tool_call(
+                "call_search",
+                "search_files",
+                params.clone(),
+            ),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        let mut config = test_agent_config(provider, "test-search-files-output");
+        config.output_writer = writer;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::SearchFiles, Arc::new(SearchFilesHandler::new()));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+
+        let events = drain_output_events(&mut priority_rx, &mut rx);
+        let tool_call = events
+            .iter()
+            .filter_map(|event| match event {
+                OutputEvent::ToolHeaderLine(line) => Some(line.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!tool_call.is_empty(), "search tool call should be visible");
+        assert!(tool_call.contains("search_files"));
+        assert!(tool_call.contains("format_tool_call_lines"));
+        assert!(tool_call.contains("src/core/tool_output.rs"));
+
+        let tool_output = events
+            .iter()
+            .filter_map(|event| match event {
+                OutputEvent::ToolOutputLine(line) => Some(line.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            tool_output.contains("src/core/tool_output.rs:"),
+            "raw search match was hidden from the TUI: {tool_output}"
+        );
+        assert!(
+            tool_output.contains("format_tool_call_lines"),
+            "raw search result was hidden from the TUI: {tool_output}"
         );
     }
 
