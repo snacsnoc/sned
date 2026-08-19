@@ -179,7 +179,7 @@ pub fn find_glued_anchor_in_lines(lines: &[String], check_indices: &[usize]) -> 
         .filter(|&idx| {
             lines
                 .get(idx)
-                .map_or(false, |line| GLUED_ANCHOR_REGEX.is_match(line))
+                .is_some_and(|line| GLUED_ANCHOR_REGEX.is_match(line))
         })
         .map(|idx| idx + 1)
         .collect()

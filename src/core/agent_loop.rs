@@ -211,7 +211,7 @@ fn get_terminal_width() -> usize {
 
     const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
-    let mut cache = TERM_WIDTH_CACHE.lock().unwrap();
+    let mut cache = TERM_WIDTH_CACHE.lock().expect("TERM_WIDTH_CACHE poisoned");
     let now = Instant::now();
 
     let needs_refresh = cache
@@ -233,7 +233,7 @@ fn streaming_model_line(text: String, style_markdown: bool) -> Line<'static> {
     if style_markdown {
         let mut rendered = crate::cli::markdown::render_markdown(None, &text);
         if rendered.len() == 1 {
-            let mut line = rendered.pop().unwrap();
+            let mut line = rendered.pop().expect("markdown renderer returned empty output");
             for span in &mut line.spans {
                 if span.style.fg.is_none() {
                     span.style.fg = Some(crate::cli::tui::theme::ACCENT);
@@ -942,7 +942,7 @@ impl AgentLoop {
 
     /// Get the underlying provider as a cloned Arc.
     pub fn get_provider(&self) -> Arc<Providers> {
-        self.config.provider.lock().unwrap().clone()
+        self.config.provider.lock().expect("provider poisoned").clone()
     }
 
     /// Get the current agent mode.
@@ -952,7 +952,7 @@ impl AgentLoop {
 
     /// Set the active provider. Preserves conversation history.
     pub async fn set_provider(&mut self, new_provider: Arc<Providers>) {
-        *self.config.provider.lock().unwrap() = new_provider;
+        *self.config.provider.lock().expect("provider poisoned") = new_provider;
         self.state.lock().await.last_api_req_info = None;
     }
 
@@ -1694,7 +1694,7 @@ impl AgentLoop {
                 deleted_range,
                 self.config.use_auto_condense,
                 compacted_summary.as_ref(),
-                self.config.provider.lock().unwrap().as_ref().name(),
+                self.config.provider.lock().expect("provider poisoned").as_ref().name(),
             );
             drop(conversation_guard);
 
@@ -1784,7 +1784,7 @@ impl AgentLoop {
 
         // 2.6 Record model usage for task metadata
         if let Some(ref tracker) = self.model_tracker {
-            let guard = self.config.provider.lock().unwrap();
+            let guard = self.config.provider.lock().expect("provider lock poisoned");
             let provider_id = guard.name().to_string();
             let model_id = guard.get_model().id;
             drop(guard);
@@ -1837,7 +1837,7 @@ impl AgentLoop {
         // because the compact instruction itself pushes the request over the limit).
         // This is a last-resort fallback after context_manager truncation.
         let validation_result = {
-            let provider = self.config.provider.lock().unwrap().clone();
+            let provider = self.config.provider.lock().expect("provider poisoned").clone();
             context_window::validate_context_window(&request, provider.as_ref())
         };
         if let Err(msg) = validation_result {
@@ -1857,7 +1857,7 @@ impl AgentLoop {
 
         let state_clone = self.state.clone();
         let history_clone = self.conversation_history.clone();
-        let provider = self.config.provider.lock().unwrap().clone();
+        let provider = self.config.provider.lock().expect("provider poisoned").clone();
 
         let retry_config = if provider.name() == "gemini" {
             RetryConfig {
@@ -2333,10 +2333,10 @@ impl AgentLoop {
                         }
                         let prev_info = stream_usage.as_ref();
                         let context_window_info = crate::core::context::get_context_window_info(
-                            self.config.provider.lock().unwrap().as_ref(),
+                            self.config.provider.lock().expect("provider poisoned").as_ref(),
                         );
                         let context_window = context_window_info.context_window;
-                        let guard = self.config.provider.lock().unwrap();
+            let guard = self.config.provider.lock().expect("provider lock poisoned");
                         let provider_name = guard.name().to_string();
                         drop(guard);
                         let tokens_in = if usage_chunk.input_tokens > 0 {
@@ -4687,7 +4687,7 @@ impl AgentLoop {
 
             let value = context_window::validate_context_window(
                 request,
-                self.config.provider.lock().unwrap().as_ref(),
+                self.config.provider.lock().expect("provider poisoned").as_ref(),
             );
             match value {
                 Ok(()) => break Ok(()),

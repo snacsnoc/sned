@@ -3100,14 +3100,12 @@ async fn handle_cli_only_command(
 
                     _ => unreachable!(),
                 }
+            } else if app.mode == "PLAN" {
+                app.push_plain(
+                    "No active plan. You are still in PLAN mode; use /act or /plan abort to leave it.",
+                );
             } else {
-                if app.mode == "PLAN" {
-                    app.push_plain(
-                        "No active plan. You are still in PLAN mode; use /act or /plan abort to leave it.",
-                    );
-                } else {
-                    app.push_plain("No active plan.");
-                }
+                app.push_plain("No active plan.");
             }
         }
     }

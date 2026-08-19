@@ -385,7 +385,7 @@ impl ReadFileHandler {
         }
 
         let anchored_content = {
-            let dupes = identical_content_indices(&output_lines);
+            let dupes = identical_content_indices(output_lines);
             output_lines
                 .iter()
                 .zip(output_anchors.iter())
