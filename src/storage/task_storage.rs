@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::cli::tui::BlockKind;
+use crate::core::context::context_manager::PersistedApiReqInfo;
 use crate::providers::StorageMessage;
 use crate::storage::disk::GlobalFileNames;
 
@@ -42,6 +43,8 @@ pub struct TaskMetadata {
     pub initial_info: Option<TaskInitialInfo>,
     #[serde(default = "default_transcript_format_version")]
     pub transcript_format_version: u32,
+    #[serde(default)]
+    pub last_api_req_info: Option<PersistedApiReqInfo>,
 }
 
 impl Default for TaskMetadata {
@@ -52,6 +55,7 @@ impl Default for TaskMetadata {
             environment_history: Vec::new(),
             initial_info: None,
             transcript_format_version: default_transcript_format_version(),
+            last_api_req_info: None,
         }
     }
 }
@@ -393,6 +397,7 @@ impl TaskStorage {
                     model: model.unwrap_or("default").to_string(),
                 }),
                 transcript_format_version: default_transcript_format_version(),
+                last_api_req_info: None,
             };
 
             let data = serde_json::to_string(&metadata)
@@ -764,6 +769,26 @@ mod tests {
             "claude-sonnet-4-20250514"
         );
         assert!(metadata["initial_info"]["created_at"].is_number());
+    }
+
+    #[test]
+    fn test_old_metadata_without_api_usage_still_loads() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("old-metadata");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(
+            task_dir.join(GlobalFileNames::TASK_METADATA),
+            r#"{"files_in_context":[],"model_usage":[],"environment_history":[]}"#,
+        )
+        .unwrap();
+
+        let storage = TaskStorage { task_dir };
+        let metadata = storage.read_task_metadata();
+        assert!(metadata.last_api_req_info.is_none());
+        assert_eq!(
+            metadata.transcript_format_version,
+            CURRENT_TRANSCRIPT_FORMAT_VERSION
+        );
     }
 
     #[test]

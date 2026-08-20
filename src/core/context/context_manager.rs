@@ -29,6 +29,80 @@ pub struct ApiReqInfo {
     pub context_usage_percentage: Option<f64>,
 }
 
+/// Provider-independent usage snapshot persisted with task metadata.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PersistedApiReqInfo {
+    pub request: Option<String>,
+    #[serde(rename = "tokensIn")]
+    pub tokens_in: Option<u32>,
+    #[serde(rename = "tokensOut")]
+    pub tokens_out: Option<u32>,
+    #[serde(rename = "cacheWrites")]
+    pub cache_writes: Option<u32>,
+    #[serde(rename = "cacheReads")]
+    pub cache_reads: Option<u32>,
+    #[serde(rename = "reasoningTokens")]
+    pub reasoning_tokens: Option<u32>,
+    #[serde(rename = "contextTokens")]
+    pub context_tokens: Option<u64>,
+    pub cost: Option<f64>,
+}
+
+impl From<&ApiReqInfo> for PersistedApiReqInfo {
+    fn from(info: &ApiReqInfo) -> Self {
+        Self {
+            request: info.request.clone(),
+            tokens_in: info.tokens_in,
+            tokens_out: info.tokens_out,
+            cache_writes: info.cache_writes,
+            cache_reads: info.cache_reads,
+            reasoning_tokens: info.reasoning_tokens,
+            context_tokens: info.context_tokens,
+            cost: info.cost,
+        }
+    }
+}
+
+impl PersistedApiReqInfo {
+    #[must_use]
+    pub fn into_api_req_info(self, context_window: u64) -> ApiReqInfo {
+        let context_usage_percentage = self.context_tokens.map(|tokens| {
+            if context_window == 0 {
+                0.0
+            } else {
+                ((tokens as f64 / context_window as f64) * 100.0).min(100.0)
+            }
+        });
+
+        ApiReqInfo {
+            request: self.request,
+            tokens_in: self.tokens_in,
+            tokens_out: self.tokens_out,
+            cache_writes: self.cache_writes,
+            cache_reads: self.cache_reads,
+            reasoning_tokens: self.reasoning_tokens,
+            context_tokens: self.context_tokens,
+            cost: self.cost,
+            context_window: Some(context_window),
+            context_usage_percentage,
+        }
+    }
+}
+
+impl ApiReqInfo {
+    /// Recalculate provider-dependent display fields after a model change.
+    pub fn recalculate_context_window(&mut self, context_window: u64) {
+        self.context_window = Some(context_window);
+        self.context_usage_percentage = self.context_tokens.map(|tokens| {
+            if context_window == 0 {
+                0.0
+            } else {
+                ((tokens as f64 / context_window as f64) * 100.0).min(100.0)
+            }
+        });
+    }
+}
+
 /// Result of getting new context messages and metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextUpdateResult {

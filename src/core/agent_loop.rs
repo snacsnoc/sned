@@ -952,8 +952,12 @@ impl AgentLoop {
 
     /// Set the active provider. Preserves conversation history.
     pub async fn set_provider(&mut self, new_provider: Arc<Providers>) {
+        let context_window =
+            crate::core::context::get_context_window_info(&new_provider).context_window;
         *self.config.provider.lock().expect("provider poisoned") = new_provider;
-        self.state.lock().await.last_api_req_info = None;
+        if let Some(info) = self.state.lock().await.last_api_req_info.as_mut() {
+            info.recalculate_context_window(context_window);
+        }
     }
 
     /// Set the agent mode (used for Plan -> Act transition after approval).
@@ -2325,7 +2329,7 @@ impl AgentLoop {
                             && usage_chunk.total_cost.is_none()
                             && usage_chunk.id.is_none();
                         let mut state = self.state.lock().await;
-                        if is_synthetic_empty_usage && stream_usage.is_none() {
+                        if is_synthetic_empty_usage {
                             // Keep the last measured usage when this provider
                             // response has no usage data. Do not replace it
                             // with a fabricated zero or an estimate.
@@ -4551,6 +4555,18 @@ impl AgentLoop {
         if let Some(ref storage) = self.deps.task_storage {
             let mut state = self.state.lock().await;
             state.turns_since_save += 1;
+            let persisted_usage = state
+                .last_api_req_info
+                .as_ref()
+                .map(crate::core::context::context_manager::PersistedApiReqInfo::from);
+
+            // Keep the latest usage available after short sessions too; only
+            // conversation history remains debounced below.
+            if let Err(e) = storage.update_metadata(|metadata| {
+                metadata.last_api_req_info = persisted_usage.clone();
+            }) {
+                error!("Failed to save last API request info: {}", e);
+            }
 
             // Debounce: only save every 5 turns to reduce I/O overhead
             if state.turns_since_save >= 5 {
@@ -4764,6 +4780,21 @@ impl AgentLoop {
             if let Some(summary) = compacted_summary {
                 let mut state = self.state.lock().await;
                 state.compacted_summary = Some(summary);
+                loaded = true;
+            }
+
+            let metadata = storage.read_task_metadata();
+            if let Some(persisted_usage) = metadata.last_api_req_info {
+                let context_window = crate::core::context::get_context_window_info(
+                    self.config
+                        .provider
+                        .lock()
+                        .expect("provider poisoned")
+                        .as_ref(),
+                )
+                .context_window;
+                let mut state = self.state.lock().await;
+                state.last_api_req_info = Some(persisted_usage.into_api_req_info(context_window));
                 loaded = true;
             }
 
@@ -7197,6 +7228,35 @@ Irrespective of whether additional information or instructions are given, you ar
             });
         }
 
+        // Usage metadata is persisted on the first save, without waiting for
+        // the five-turn conversation-history debounce.
+        {
+            let mut state = agent.state.lock().await;
+            state.last_api_req_info = Some(crate::core::context::context_manager::ApiReqInfo {
+                request: Some("test request".to_string()),
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                cache_writes: None,
+                cache_reads: None,
+                reasoning_tokens: None,
+                context_tokens: Some(150),
+                cost: Some(0.001),
+                context_window: Some(8_192),
+                context_usage_percentage: Some(1.8),
+            });
+        }
+        agent.save_conversation_history().await;
+        let metadata = agent
+            .deps
+            .task_storage
+            .as_ref()
+            .unwrap()
+            .read_task_metadata();
+        assert_eq!(
+            metadata.last_api_req_info.as_ref().unwrap().context_tokens,
+            Some(150)
+        );
+
         // Save conversation history (debounced: need 5 calls to trigger save)
         for _ in 0..5 {
             agent.save_conversation_history().await;
@@ -7286,6 +7346,21 @@ Irrespective of whether additional information or instructions are given, you ar
         task_storage
             .write_api_conversation_history(&pre_existing_messages)
             .unwrap();
+        task_storage
+            .update_metadata(|metadata| {
+                metadata.last_api_req_info =
+                    Some(crate::core::context::context_manager::PersistedApiReqInfo {
+                        request: Some("persisted request".to_string()),
+                        tokens_in: Some(100),
+                        tokens_out: Some(50),
+                        cache_writes: None,
+                        cache_reads: None,
+                        reasoning_tokens: None,
+                        context_tokens: Some(150),
+                        cost: Some(0.001),
+                    });
+            })
+            .unwrap();
 
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
@@ -7321,6 +7396,19 @@ Irrespective of whether additional information or instructions are given, you ar
         assert_eq!(history.len(), 2, "Should have 2 loaded messages");
         assert_eq!(history[0].role, MessageRole::User);
         assert_eq!(history[1].role, MessageRole::Assistant);
+        let usage = agent
+            .state
+            .lock()
+            .await
+            .last_api_req_info
+            .clone()
+            .expect("resume should restore persisted API usage");
+        assert_eq!(usage.context_tokens, Some(150));
+        assert_eq!(usage.context_window, Some(256_000));
+        assert_eq!(
+            usage.context_usage_percentage,
+            Some(150.0 / 256_000.0 * 100.0)
+        );
 
         // Verify no history is loaded when file is empty/missing
         let task_storage_empty = TaskStorage::new("empty-task").unwrap();
@@ -9606,7 +9694,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
-    async fn test_provider_switch_clears_last_measured_context() {
+    async fn test_provider_switch_preserves_last_measured_context() {
         use crate::providers::ApiStreamUsageChunk;
 
         let first_provider = Arc::new(Providers::RecordingChunk(
@@ -9655,10 +9743,58 @@ Irrespective of whether additional information or instructions are given, you ar
         agent.set_provider(second_provider).await;
 
         let _ = agent.execute_turn().await;
-        assert!(
-            agent.state.lock().await.last_api_req_info.is_none(),
-            "provider switch must not retain usage from the previous provider"
-        );
+        let usage = agent
+            .state
+            .lock()
+            .await
+            .last_api_req_info
+            .clone()
+            .expect("provider switch must retain usage from the previous provider");
+        assert_eq!(usage.tokens_in, Some(7_500));
+        assert_eq!(usage.tokens_out, Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_provider_switch_recalculates_context_percentage() {
+        use crate::providers::ApiStreamUsageChunk;
+
+        let first_provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                vec![vec![ApiStreamChunk::Usage(ApiStreamUsageChunk {
+                    input_tokens: 7_500,
+                    output_tokens: 100,
+                    cache_write_tokens: None,
+                    cache_read_tokens: None,
+                    reasoning_tokens: None,
+                    thoughts_token_count: None,
+                    total_cost: None,
+                    stop_reason: Some("stop".to_string()),
+                    id: Some("first-provider".to_string()),
+                })]],
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(
+            first_provider,
+            "test-provider-switch-context-window",
+        ));
+        let _ = agent.execute_turn().await;
+
+        let second_provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::new_with_context_window(vec![], 200_000),
+        ));
+        agent.set_provider(second_provider).await;
+
+        let usage = agent
+            .state
+            .lock()
+            .await
+            .last_api_req_info
+            .clone()
+            .expect("provider switch must retain usage");
+        assert_eq!(usage.context_window, Some(200_000));
+        assert_eq!(usage.context_tokens, Some(7_600));
+        assert_eq!(usage.context_usage_percentage, Some(3.8));
     }
 
     #[tokio::test]
