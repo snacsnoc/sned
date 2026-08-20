@@ -372,6 +372,40 @@ pub fn strip_tool_call_lines(input: &str) -> String {
         .join("\n")
 }
 
+/// Return the cleaned assistant response that is safe to show through the
+/// `/full` recovery path. Thinking blocks and internal tool status lines are
+/// not part of the response the user asked the model to produce.
+#[must_use]
+pub fn extract_response_text(text: &str) -> Option<String> {
+    let (_, response) = split_model_output(text);
+    response
+        .map(|response| strip_tool_call_lines(&response))
+        .filter(|response| !response.trim().is_empty())
+}
+
+/// Check whether a response contains a fenced code block larger than the
+/// streamed display limit. This keeps an oversized code response recoverable
+/// even when its non-code text is short.
+#[must_use]
+pub fn contains_code_block_over_limit(text: &str, limit: usize) -> bool {
+    let mut in_code_block = false;
+    let mut code_lines = 0usize;
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_code_block && code_lines > limit {
+                return true;
+            }
+            in_code_block = !in_code_block;
+            code_lines = 0;
+        } else if in_code_block {
+            code_lines += 1;
+        }
+    }
+
+    in_code_block && code_lines > limit
+}
+
 /// Returns true if a single line is a tool-call marker emitted by the
 /// agent loop's tool execution UI.  These lines are **not** part of the
 /// user-visible model response — they are purely internal status
@@ -610,5 +644,27 @@ mod tests {
         let result = strip_tool_call_lines(input);
         // The first line "▶ tool" is stripped; remaining lines are joined with \n.
         assert_eq!(result, "some normal text with ▶ in the middle\nend");
+    }
+
+    #[test]
+    fn test_extract_response_text_removes_thinking_and_tool_markers() {
+        let input = "<think>\nreasoning\n</think>\n▶ execute_command\nHere is the answer.";
+        assert_eq!(
+            extract_response_text(input).as_deref(),
+            Some("Here is the answer.")
+        );
+    }
+
+    #[test]
+    fn test_extract_response_text_rejects_tool_only_and_empty_input() {
+        assert_eq!(extract_response_text("▶ execute_command\n✓ done"), None);
+        assert_eq!(extract_response_text("<think>only reasoning</think>"), None);
+        assert_eq!(extract_response_text(""), None);
+    }
+
+    #[test]
+    fn test_contains_code_block_over_limit() {
+        assert!(contains_code_block_over_limit("```\na\nb\n```", 1));
+        assert!(!contains_code_block_over_limit("```\na\n```", 1));
     }
 }

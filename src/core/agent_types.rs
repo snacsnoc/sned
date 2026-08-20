@@ -20,10 +20,22 @@ pub const MAX_FILE_CONTENT_CACHE_SIZE: usize = 10 * 1024 * 1024;
 pub const MAX_FILE_CONTENT_CACHE_ENTRIES: usize = 50;
 
 /// Default max lines to display for code blocks in interactive mode.
-pub const MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE: usize = 15;
+pub const MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE: usize = 60;
 
 /// Default max lines to display for code blocks in one-shot mode.
-pub const MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT: usize = 40;
+pub const MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT: usize = 200;
+
+/// Minimum response size used before replacing an existing `/full` recovery response.
+pub const MIN_FULL_RESPONSE_CHARS: usize = 256;
+
+#[must_use]
+pub fn code_block_display_limit(interactive_mode: bool) -> usize {
+    if interactive_mode {
+        MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE
+    } else {
+        MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT
+    }
+}
 
 /// Exact denied tool action fingerprint for the current recovery context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +97,8 @@ pub struct TaskState {
     pub file_context_tracker: crate::core::context::trackers::FileContextTracker,
     /// Last API request info from the previous turn's usage chunk.
     pub last_api_req_info: Option<ApiReqInfo>,
+    /// Latest substantial completed response available to `/full`.
+    pub last_full_response: Option<String>,
     /// Available skills discovered for this task (populated from system prompt context).
     pub available_skills: Vec<crate::core::context::instructions::SkillMetadata>,
     /// Whether subagents are enabled (checked from global settings).
@@ -184,6 +198,7 @@ impl Default for TaskState {
             strict_plan_mode_enabled: true,
             file_context_tracker: crate::core::context::trackers::FileContextTracker::new(),
             last_api_req_info: None,
+            last_full_response: None,
             available_skills: Vec::new(),
             subagents_enabled: false,
             is_subagent_execution: false,
@@ -319,6 +334,23 @@ pub enum TurnResult {
 }
 
 impl TaskState {
+    /// Retain a completed response for `/full` without letting a tiny follow-up
+    /// response evict a large response that the user may still need to recover.
+    pub fn retain_full_response(&mut self, response: Option<String>, code_line_limit: usize) {
+        let Some(response) = response.filter(|text| !text.trim().is_empty()) else {
+            return;
+        };
+
+        let is_substantial = response.chars().count() >= MIN_FULL_RESPONSE_CHARS
+            || crate::core::stream_parsing::contains_code_block_over_limit(
+                &response,
+                code_line_limit,
+            );
+        if self.last_full_response.is_none() || is_substantial {
+            self.last_full_response = Some(response);
+        }
+    }
+
     /// Insert a file into the content cache with LRU eviction.
     /// Evicts oldest entries when cache exceeds size or entry limits.
     pub fn insert_file_content(&mut self, path: String, content: String) {
@@ -489,5 +521,26 @@ mod tests {
 
         state.strict_plan_mode_enabled = true;
         assert!(state.strict_plan_mode_enabled);
+    }
+
+    #[test]
+    fn test_full_response_retention_keeps_large_response_from_tiny_replacement() {
+        let mut state = TaskState::default();
+        let large = "x".repeat(MIN_FULL_RESPONSE_CHARS);
+
+        state.retain_full_response(Some(large.clone()), 60);
+        state.retain_full_response(Some("ok".to_string()), 60);
+
+        assert_eq!(state.last_full_response.as_deref(), Some(large.as_str()));
+    }
+
+    #[test]
+    fn test_full_response_retention_accepts_large_code_block() {
+        let mut state = TaskState::default();
+        let code = format!("```\n{}\n```", "x\n".repeat(61));
+
+        state.retain_full_response(Some(code.clone()), 60);
+
+        assert_eq!(state.last_full_response.as_deref(), Some(code.as_str()));
     }
 }

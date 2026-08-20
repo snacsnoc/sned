@@ -80,6 +80,8 @@ Other useful flags:
 --extra-body <JSON>      # pass additional fields to an OpenAI-compatible endpoint
 ```
 
+In the TUI, `/full` re-renders the latest retained substantial model response without the streamed code-block display cap. It is live-session only; `--json`, `--export`, and resumed transcripts keep their existing behavior.
+
 For OpenAI-compatible endpoints, `--extra-body` forwards provider-specific request fields:
 
 ```bash

@@ -94,11 +94,13 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
 }
 
 #[must_use]
-pub fn render_streamed_markdown(text: &str) -> Vec<Line<'static>> {
+pub fn render_streamed_markdown(text: &str, interactive_mode: bool) -> Vec<Line<'static>> {
     render_markdown_with_code_limit(
         None,
         text,
-        Some(crate::core::agent_types::MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE),
+        Some(crate::core::agent_types::code_block_display_limit(
+            interactive_mode,
+        )),
     )
 }
 
@@ -327,7 +329,7 @@ fn render_markdown_with_code_limit(
                         }
                         if code_lines.len() > limit {
                             out.push(Line::from(Span::styled(
-                                "│   ... [snipped from streamed display]",
+                                "│   ... [snipped from streamed display; use /full]",
                                 Style::default().add_modifier(Modifier::DIM),
                             )));
                         }
@@ -548,18 +550,18 @@ mod tests {
     #[test]
     fn streamed_fenced_code_is_capped_without_literal_fences() {
         let mut markdown = String::from("```rust\n");
-        for line in 1..=20 {
+        for line in 1..=61 {
             markdown.push_str(&format!("fn line_{line}() {{}}\n"));
         }
         markdown.push_str("```");
 
-        let rendered = render_streamed_markdown(&markdown);
+        let rendered = render_streamed_markdown(&markdown, true);
         let text = collect_text(&rendered);
 
         assert!(text.contains(" rust "));
-        assert!(text.contains("fn line_15()"));
-        assert!(!text.contains("fn line_16()"));
-        assert!(text.contains("[snipped from streamed display]"));
+        assert!(text.contains("fn line_60()"));
+        assert!(!text.contains("fn line_61()"));
+        assert!(text.contains("[snipped from streamed display; use /full]"));
         assert!(!text.contains("```"));
     }
 

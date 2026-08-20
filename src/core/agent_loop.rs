@@ -13,10 +13,8 @@
 
 use crate::cli::output::OutputEvent;
 use crate::cli::tui::theme::{ERROR_FG, PROMPT_FG};
+use crate::core::agent_types::code_block_display_limit;
 pub use crate::core::agent_types::{AgentConfig, AgentError, AgentMode, TaskState, TurnResult};
-use crate::core::agent_types::{
-    MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE, MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT,
-};
 use crate::core::context::{
     ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager, context_window,
 };
@@ -65,7 +63,9 @@ const DEFAULT_THINKING_HISTORY_LIMIT: usize = 2_000;
 const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 
 use crate::core::plan_state::PlanStepStatus;
-use crate::core::stream_parsing::{split_model_output, truncate_json_arguments};
+use crate::core::stream_parsing::{
+    extract_response_text, split_model_output, truncate_json_arguments,
+};
 use crate::core::tool_output::{
     extract_edit_stats_detailed, format_heat_map, format_heat_map_plain, format_tool_call_lines,
     format_tool_call_lines_with_raw_arguments, format_tool_result, format_tool_result_digest,
@@ -410,16 +410,8 @@ fn emit_turn_end(
     }
 }
 
-fn code_block_display_limit(interactive_mode: bool) -> usize {
-    if interactive_mode {
-        MAX_CODE_BLOCK_DISPLAY_LINES_INTERACTIVE
-    } else {
-        MAX_CODE_BLOCK_DISPLAY_LINES_ONE_SHOT
-    }
-}
-
 fn snipped_code_block_hint() -> &'static str {
-    "  ... [snipped from streamed display]"
+    "  ... [snipped from streamed display; use /full]"
 }
 
 fn message_queue_max_len() -> usize {
@@ -2807,7 +2799,17 @@ impl AgentLoop {
         // Split raw model text into thinking + response.
         // DeepSeek/Wafer embed thinking tags in delta.content; use the
         // response part for completion output so hidden thinking stays hidden.
-        let (extracted_thinking, response_text) = split_model_output(&accumulated_text);
+        let (extracted_thinking, _) = split_model_output(&accumulated_text);
+        let response_text = extract_response_text(&accumulated_text);
+        // A response that accompanies tool calls is an intermediate handoff,
+        // not the completed model response that `/full` should recover.
+        if prepared_tool_calls.is_empty() {
+            let mut state = state_clone.lock().await;
+            state.retain_full_response(
+                response_text.clone(),
+                code_block_display_limit(self.config.interactive_mode),
+            );
+        }
         {
             let mut history = history_clone.lock().await;
             let mut blocks: Vec<AssistantContentBlock> = Vec::new();
@@ -6069,6 +6071,48 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    async fn test_tool_call_turn_does_not_replace_full_response() {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![crate::providers::mock::MockResponse::Stream(vec![
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Text(
+                    ApiStreamTextChunk {
+                        text: "I will inspect the workspace first.".to_string(),
+                        id: None,
+                        signature: None,
+                    },
+                )),
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::ToolCalls(
+                    ApiStreamToolCallsChunk {
+                        tool_call: ApiStreamToolCall {
+                            call_id: Some("full-tool-call".to_string()),
+                            function: ApiStreamToolCallFunction {
+                                id: None,
+                                name: Some("list_files".to_string()),
+                                arguments: Some("{}".to_string()),
+                            },
+                            signature: None,
+                        },
+                        id: None,
+                        signature: None,
+                    },
+                )),
+            ])],
+        )));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::ListFiles,
+            Arc::new(crate::core::tools::handlers::list_files::ListFilesHandler::new()),
+        );
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-full-tool-turn"))
+            .with_tools(Arc::new(registry));
+
+        let result = agent.execute_turn().await;
+
+        assert!(matches!(result, TurnResult::Continue | TurnResult::Complete));
+        assert!(agent.state.lock().await.last_full_response.is_none());
+    }
+
+    #[tokio::test]
     async fn test_retryable_stream_error_before_output_retries_once() {
         let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
             vec![
@@ -6571,14 +6615,14 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
-    async fn test_interactive_stream_snips_long_code_block_without_recovery_command() {
+    async fn test_interactive_stream_snips_long_code_block_with_recovery_hint() {
         let mut code = String::from("```rust\n");
-        for line in 1..=25 {
+        for line in 1..=65 {
             code.push_str(&format!("fn line_{}() {{}}\n", line));
         }
         code.push_str("```\n");
 
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(256);
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
                 crate::providers::mock::MockProvider::single_text_response(&code),
@@ -6608,22 +6652,22 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events.iter().any(|event| {
-            matches!(event, OutputEvent::Line(line) if line.to_string().contains("[snipped from streamed display]"))
+            matches!(event, OutputEvent::Line(line) if line.to_string().contains("[snipped from streamed display; use /full]"))
         }));
         assert!(events.iter().any(|event| {
             matches!(
                 event,
                 OutputEvent::TurnEnd { accumulated_text }
                     if accumulated_text.contains("```rust")
-                        && accumulated_text.contains("fn line_25()")
+                        && accumulated_text.contains("fn line_65()")
             )
         }));
     }
 
     #[tokio::test]
-    async fn test_one_shot_stream_allows_25_line_code_block_without_snip() {
+    async fn test_one_shot_stream_snips_after_200_code_lines() {
         let mut code = String::from("```rust\n");
-        for line in 1..=25 {
+        for line in 1..=201 {
             code.push_str(&format!("fn line_{}() {{}}\n", line));
         }
         code.push_str("```\n");
@@ -6657,7 +6701,9 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(matches!(result, TurnResult::Complete));
 
         let rendered = drain_rendered_output(&mut rx).join("\n");
-        assert!(!rendered.contains("[snipped"));
+        assert!(rendered.contains("fn line_200()"));
+        assert!(!rendered.contains("fn line_201()"));
+        assert!(rendered.contains("[snipped from streamed display; use /full]"));
     }
 
     #[tokio::test]

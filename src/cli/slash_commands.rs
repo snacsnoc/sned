@@ -13,6 +13,7 @@ enum SlashCommandId {
     Exit,
     Clear,
     Copy,
+    Full,
     History,
     Skills,
     Help,
@@ -145,6 +146,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         description: "Copy the last completion to the clipboard",
         usage: "/copy",
         detail: "Copies the most recent agent completion as raw Markdown through the terminal clipboard.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Full,
+        name: "full",
+        aliases: &[],
+        description: "Show the latest full model response",
+        usage: "/full",
+        detail: "Re-renders the latest retained substantial model response without the streamed code-block display cap.",
         category: SlashCommandCategory::Local,
         requires_args: false,
         requirement: CommandRequirement::Always,
@@ -565,6 +577,7 @@ pub enum CliOnlyCommand {
     Quit,
     Clear,
     Copy,
+    Full,
     History,
     Skills,
     Help,
@@ -731,6 +744,7 @@ impl CliOnlyCommand {
                 | Self::Quit
                 | Self::Clear
                 | Self::Copy
+                | Self::Full
                 | Self::History
                 | Self::Skills
                 | Self::Help
@@ -851,6 +865,7 @@ fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCom
         }
         SlashCommandId::Clear => Some(CliOnlyCommand::Clear),
         SlashCommandId::Copy => Some(CliOnlyCommand::Copy),
+        SlashCommandId::Full => Some(CliOnlyCommand::Full),
         SlashCommandId::History => Some(CliOnlyCommand::History),
         SlashCommandId::Skills => Some(CliOnlyCommand::Skills),
         SlashCommandId::Help => {
@@ -2106,6 +2121,11 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_full_command() {
+        assert_eq!(CliOnlyCommand::parse("full"), Some(CliOnlyCommand::Full));
+    }
+
+    #[test]
     fn test_parse_cli_only_no_command() {
         let result = get_cli_only_command("Hello world");
         assert_eq!(result, None);
@@ -2119,6 +2139,7 @@ mod tests {
         assert!(text.contains("/exit"));
         assert!(text.contains("/clear"));
         assert!(text.contains("/copy"));
+        assert!(text.contains("/full"));
         assert!(text.contains("/history"));
         assert!(text.contains("/skills"));
         assert!(text.contains("/help"));

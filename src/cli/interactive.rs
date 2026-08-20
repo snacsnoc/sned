@@ -2211,6 +2211,14 @@ async fn handle_cli_only_command(
         return Ok(false);
     }
 
+    if agent_busy.load(Ordering::Relaxed) && matches!(&cli_cmd, CliOnlyCommand::Full) {
+        app.show_notification(
+            "Wait for the current turn to finish before using /full.",
+            NotificationKind::Warning,
+        );
+        return Ok(false);
+    }
+
     match cli_cmd {
         CliOnlyCommand::Exit | CliOnlyCommand::Quit => {
             return Ok(true);
@@ -2224,6 +2232,30 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::Copy => {
             handle_copy_command(app, copy_to_clipboard);
+        }
+        CliOnlyCommand::Full => {
+            let state = state_handle.lock().await.clone();
+            let response = if let Some(state) = state {
+                state.lock().await.last_full_response.clone()
+            } else {
+                None
+            };
+
+            let Some(response) = response else {
+                app.push_styled(
+                    "No full model response is available yet.",
+                    Style::default().fg(theme::WARNING_FG),
+                );
+                return Ok(false);
+            };
+
+            app.push_styled(
+                "──── Full model response ────",
+                Style::default().fg(theme::ACCENT),
+            );
+            for line in crate::cli::markdown::render_markdown(None, &response) {
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::Model);
+            }
         }
         CliOnlyCommand::History => {
             let last_n: Vec<String> = app
@@ -8702,6 +8734,108 @@ mod tests {
                     .contains(expected)
             }));
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_full_command_renders_retained_response_and_refuses_busy_turn()
+    -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        use tokio::time::{Duration, timeout};
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    task_id: None,
+                    continue_task: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+        let task_state = {
+            let sess = session.lock().await;
+            sess.state_handle().await
+        };
+        let full_response = format!(
+            "```rust\n{}\n```",
+            (1..=61)
+                .map(|line| format!("fn line_{line}() {{}}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        task_state.lock().await.last_full_response = Some(full_response);
+
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle_slot = Arc::new(Mutex::new(Some(task_state)));
+        let queue_handle_slot = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let mut app = App::new();
+
+        timeout(
+            Duration::from_secs(2),
+            handle_cli_only_command(
+                CliOnlyCommand::Full,
+                "/full",
+                &mut app,
+                &output_writer,
+                &session,
+                &task_id,
+                &agent_busy,
+                &agent_done,
+                &agent_start_time,
+                &agent_task,
+                &state_handle_slot,
+                &queue_handle_slot,
+                &task_opts,
+                false,
+            ),
+        )
+        .await??;
+
+        let rendered = app
+            .output_lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Full model response"));
+        assert!(rendered.contains("fn line_61()"));
+
+        agent_busy.store(true, Ordering::Relaxed);
+        let mut busy_app = App::new();
+        handle_cli_only_command(
+            CliOnlyCommand::Full,
+            "/full",
+            &mut busy_app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle_slot,
+            &queue_handle_slot,
+            &task_opts,
+            false,
+        )
+        .await?;
+        assert!(
+            busy_app
+                .notification_message()
+                .is_some_and(|message| message.contains("Wait for the current turn"))
+        );
 
         Ok(())
     }

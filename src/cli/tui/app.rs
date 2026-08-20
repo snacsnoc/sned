@@ -1352,7 +1352,7 @@ impl App {
                     markdown_text.to_string()
                 };
                 let rendered: Vec<Line<'static>> =
-                    crate::cli::markdown::render_streamed_markdown(&prefixed_markdown);
+                    crate::cli::markdown::render_streamed_markdown(&prefixed_markdown, true);
                 for line in rendered {
                     self.output_lines.push_back(line);
                     self.output_line_kinds.push_back(BlockKind::Model);
@@ -1378,7 +1378,7 @@ impl App {
         // text vanishes for a frame while render_markdown runs, then
         // reappears styled.
         let mut rendered: Vec<Line<'static>> =
-            crate::cli::markdown::render_streamed_markdown(markdown_text);
+            crate::cli::markdown::render_streamed_markdown(markdown_text, true);
         let can_skip_reinsert = rendered.len() == model_entry_indices.len()
             && rendered.iter().zip(model_entry_indices.iter()).all(
                 |(rendered_line, popped_idx)| {
@@ -1493,7 +1493,7 @@ impl App {
         // the start of the response.
         let have_indicator = self.turn_indicator.take().is_some();
         let mut rendered: Vec<Line<'static>> =
-            crate::cli::markdown::render_streamed_markdown(markdown_text);
+            crate::cli::markdown::render_streamed_markdown(markdown_text, true);
         if have_indicator && let Some(first) = rendered.first_mut() {
             let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
             new_spans.push(Span::styled(
