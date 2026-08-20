@@ -380,8 +380,8 @@ impl GlobalFileNames {
     pub const WINDSURF_RULES: &'static str = ".windsurfrules";
     pub const AGENTS_RULES_FILE: &'static str = "AGENTS.md";
     pub const TASK_METADATA: &'static str = "task_metadata.json";
+    pub const TRANSCRIPT: &'static str = "transcript.jsonl";
     pub const ENDPOINTS_JSON: &'static str = "endpoints.json";
-
 }
 
 #[cfg(test)]

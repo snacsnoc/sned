@@ -1,11 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::collections::VecDeque;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
+use crate::cli::tui::BlockKind;
 use crate::providers::StorageMessage;
 use crate::storage::disk::GlobalFileNames;
+
+pub const DEFAULT_TRANSCRIPT_CAP: usize = 1_000;
+pub const CURRENT_TRANSCRIPT_FORMAT_VERSION: u32 = 1;
+
+fn default_transcript_format_version() -> u32 {
+    CURRENT_TRANSCRIPT_FORMAT_VERSION
+}
 
 /// RAII guard that releases the task storage lock on drop.
 pub struct LockGuard {
@@ -19,7 +29,7 @@ impl Drop for LockGuard {
 }
 
 /// Task metadata (mirrors TypeScript TaskMetadata)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskMetadata {
     #[serde(default)]
     pub files_in_context: Vec<crate::core::context::trackers::FileMetadataEntry>,
@@ -30,6 +40,27 @@ pub struct TaskMetadata {
     /// Initial task creation info (preserved from create_initial_metadata)
     #[serde(default)]
     pub initial_info: Option<TaskInitialInfo>,
+    #[serde(default = "default_transcript_format_version")]
+    pub transcript_format_version: u32,
+}
+
+impl Default for TaskMetadata {
+    fn default() -> Self {
+        Self {
+            files_in_context: Vec::new(),
+            model_usage: Vec::new(),
+            environment_history: Vec::new(),
+            initial_info: None,
+            transcript_format_version: default_transcript_format_version(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptEntry {
+    pub kind: BlockKind,
+    pub ts: u64,
+    pub markdown: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +173,14 @@ impl TaskStorage {
         fs::create_dir_all(&task_dir)?;
 
         Ok(Self { task_dir })
+    }
+
+    /// Open a storage handle for an existing task directory.
+    pub fn from_task_dir(task_dir: &Path) -> io::Result<Self> {
+        fs::create_dir_all(task_dir)?;
+        Ok(Self {
+            task_dir: task_dir.to_path_buf(),
+        })
     }
 
     #[must_use]
@@ -353,6 +392,7 @@ impl TaskStorage {
                     cwd: cwd.to_string(),
                     model: model.unwrap_or("default").to_string(),
                 }),
+                transcript_format_version: default_transcript_format_version(),
             };
 
             let data = serde_json::to_string(&metadata)
@@ -529,11 +569,154 @@ impl TaskStorage {
     ) -> Vec<crate::core::context::trackers::FileMetadataEntry> {
         self.read_task_metadata().files_in_context
     }
+
+    /// Read the newest `cap` transcript entries in chronological order.
+    /// Corruption is isolated to the transcript: the original file is backed
+    /// up and resume continues with no visible transcript entries. The task
+    /// lock covers the read so a live reader cannot observe a partial append.
+    pub fn read_transcript(&self, cap: usize) -> io::Result<Vec<TranscriptEntry>> {
+        self.with_lock(|| self.read_transcript_unlocked(cap))
+    }
+
+    fn read_transcript_unlocked(&self, cap: usize) -> io::Result<Vec<TranscriptEntry>> {
+        let metadata = self.read_task_metadata_unlocked();
+        if metadata.transcript_format_version > CURRENT_TRANSCRIPT_FORMAT_VERSION {
+            tracing::warn!(
+                version = metadata.transcript_format_version,
+                supported = CURRENT_TRANSCRIPT_FORMAT_VERSION,
+                "Unsupported task transcript format version"
+            );
+            return Ok(Vec::new());
+        }
+
+        let path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+
+        let mut entries = VecDeque::with_capacity(cap.min(DEFAULT_TRANSCRIPT_CAP));
+        let mut truncated = false;
+        for line in io::BufReader::new(file).lines() {
+            let line = line?;
+            let entry = match serde_json::from_str::<TranscriptEntry>(&line) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
+                        tracing::warn!(
+                            file_path = %path.display(),
+                            backup_path = %backup_path.display(),
+                            error = %error,
+                            "Created backup of corrupted transcript JSONL"
+                        );
+                    } else {
+                        tracing::warn!(
+                            file_path = %path.display(),
+                            error = %error,
+                            "Failed to parse transcript JSONL and backup failed"
+                        );
+                    }
+                    return Ok(Vec::new());
+                }
+            };
+
+            if cap == 0 {
+                continue;
+            }
+            if entries.len() == cap {
+                entries.pop_front();
+                truncated = true;
+            }
+            entries.push_back(entry);
+        }
+
+        if truncated {
+            tracing::debug!(cap, "Transcript read retained newest entries at cap");
+        }
+        Ok(entries.into_iter().collect())
+    }
+
+    /// Append a visible transcript entry while holding the task lock.
+    pub fn write_transcript_entry(&self, entry: &TranscriptEntry) -> io::Result<()> {
+        if matches!(entry.kind, BlockKind::Completion | BlockKind::Error) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "completion and error entries are not persisted in transcripts",
+            ));
+        }
+
+        self.with_lock(|| {
+            let path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
+            let mut line = serde_json::to_vec(entry)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            line.push(b'\n');
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            file.write_all(&line)?;
+            file.sync_data()
+        })
+    }
+
+    /// Delete this task's transcript when it is older than `days`.
+    pub fn auto_purge(&self, days: u32) -> io::Result<()> {
+        if days == 0 {
+            return Ok(());
+        }
+
+        let path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let modified = match fs::metadata(&path) {
+            Ok(metadata) => metadata.modified()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or(Duration::ZERO);
+        if age >= Duration::from_secs(u64::from(days) * 24 * 60 * 60) {
+            self.with_lock(|| match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// Get the tasks directory (~/.sned/data/tasks/)
 fn get_tasks_dir() -> PathBuf {
     crate::storage::disk::get_tasks_dir()
+}
+
+/// Purge stale transcripts across all task directories without creating new
+/// storage directories for inactive tasks.
+pub fn purge_all_stale_transcripts(tasks_root: &Path, days: u32) -> io::Result<usize> {
+    if days == 0 {
+        return Ok(0);
+    }
+
+    let entries = match fs::read_dir(tasks_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut deleted = 0;
+    for entry in entries.flatten() {
+        let task_dir = entry.path();
+        if !task_dir.is_dir() {
+            continue;
+        }
+        let transcript = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let existed = transcript.exists();
+        TaskStorage { task_dir }.auto_purge(days)?;
+        if existed && !transcript.exists() {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -1063,5 +1246,166 @@ mod tests {
             backup_content, corrupted_content,
             "Backup should contain original corrupted content"
         );
+    }
+
+    #[test]
+    fn test_transcript_round_trip_preserves_kind_and_markdown() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-round-trip");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        let entries = vec![
+            TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: 1,
+                markdown: "model".to_string(),
+            },
+            TranscriptEntry {
+                kind: BlockKind::ToolHeader,
+                ts: 2,
+                markdown: "▶ read_file".to_string(),
+            },
+            TranscriptEntry {
+                kind: BlockKind::ToolOutput,
+                ts: 3,
+                markdown: "file contents".to_string(),
+            },
+        ];
+
+        for entry in &entries {
+            storage.write_transcript_entry(entry).unwrap();
+        }
+
+        assert_eq!(
+            storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap(),
+            entries
+        );
+    }
+
+    #[test]
+    fn test_transcript_cap_keeps_newest_entries_in_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-cap");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        for index in 0..5 {
+            storage
+                .write_transcript_entry(&TranscriptEntry {
+                    kind: BlockKind::Model,
+                    ts: index,
+                    markdown: format!("line {index}"),
+                })
+                .unwrap();
+        }
+
+        let entries = storage.read_transcript(3).unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.ts).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn test_corrupt_transcript_returns_empty_and_creates_backup() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-corrupt");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        fs::write(&path, "not json\n").unwrap();
+
+        assert!(
+            storage
+                .read_transcript(DEFAULT_TRANSCRIPT_CAP)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(path.with_extension("jsonl.bak").exists());
+    }
+
+    #[test]
+    fn test_transcript_excludes_completion_and_error_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-filter");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        for kind in [BlockKind::Completion, BlockKind::Error] {
+            assert!(
+                storage
+                    .write_transcript_entry(&TranscriptEntry {
+                        kind,
+                        ts: 1,
+                        markdown: "transient".to_string(),
+                    })
+                    .is_err()
+            );
+        }
+        assert!(
+            storage
+                .read_transcript(DEFAULT_TRANSCRIPT_CAP)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_transcript_future_format_is_not_replayed() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-future-format");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        storage
+            .write_transcript_entry(&TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: 1,
+                markdown: "future".to_string(),
+            })
+            .unwrap();
+        storage
+            .write_task_metadata(&TaskMetadata {
+                transcript_format_version: CURRENT_TRANSCRIPT_FORMAT_VERSION + 1,
+                ..TaskMetadata::default()
+            })
+            .unwrap();
+
+        assert!(
+            storage
+                .read_transcript(DEFAULT_TRANSCRIPT_CAP)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_auto_purge_removes_old_transcript_but_zero_is_disabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-purge");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        storage
+            .write_transcript_entry(&TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: 1,
+                markdown: "old".to_string(),
+            })
+            .unwrap();
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60)),
+        )
+        .unwrap();
+
+        storage.auto_purge(0).unwrap();
+        assert!(path.exists());
+        storage.auto_purge(1).unwrap();
+        assert!(!path.exists());
     }
 }

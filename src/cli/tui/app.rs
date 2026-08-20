@@ -13,6 +13,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -69,7 +70,8 @@ pub struct PendingModelSwitch {
 /// grouping (blank-line separators between different kinds, no
 /// separators within a block).  Mirrors `output_lines` length-for-length
 /// via `output_line_kinds`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockKind {
     /// Raw model response text (finalized or streamed).
     Model,
@@ -601,6 +603,13 @@ pub struct App {
     /// `finalize_turn_stream` to decide whether to replace or append
     /// the markdown-rendered output.
     pub turn_had_streamed_line: bool,
+    /// The last displayed streaming model line awaiting a finalized event.
+    /// Keeping it across drain cycles lets transcript persistence wait for a
+    /// real displacement or TurnEnd instead of writing every delta.
+    pending_transcript_model_line: Option<Line<'static>>,
+    /// Reasoning blocks awaiting a non-reasoning event or TurnEnd. Keeping
+    /// the rendered blocks together preserves chunk coalescing on replay.
+    pending_transcript_reasoning_lines: Option<Vec<Line<'static>>>,
     /// Whether the model picker is active.
     pub model_picker_active: bool,
     /// Model picker entries.
@@ -943,6 +952,8 @@ impl App {
             last_stream_group: None,
             turn_indicator: None,
             turn_had_streamed_line: false,
+            pending_transcript_model_line: None,
+            pending_transcript_reasoning_lines: None,
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
@@ -995,6 +1006,30 @@ impl App {
     pub fn push_output_with_kind(&mut self, line: Line<'static>, kind: BlockKind) {
         let wrap_width = self.last_wrap_width();
         self._push_output_line(line, kind, wrap_width, true);
+    }
+
+    pub(crate) fn take_pending_transcript_model_line(&mut self) -> Option<Line<'static>> {
+        self.pending_transcript_model_line.take()
+    }
+
+    pub(crate) fn set_pending_transcript_model_line(&mut self, line: Line<'static>) {
+        self.pending_transcript_model_line = Some(line);
+    }
+
+    pub(crate) fn take_pending_transcript_reasoning_lines(&mut self) -> Option<Vec<Line<'static>>> {
+        self.pending_transcript_reasoning_lines.take()
+    }
+
+    pub(crate) fn set_pending_transcript_reasoning_lines(&mut self, lines: Vec<Line<'static>>) {
+        self.pending_transcript_reasoning_lines = Some(lines);
+    }
+
+    pub(crate) fn reasoning_stream_lines(&self) -> Vec<Line<'static>> {
+        self.turn_stream_entries
+            .iter()
+            .filter(|(_, kind)| *kind == StreamKind::Reasoning)
+            .filter_map(|(index, _)| self.output_lines.get(*index).cloned())
+            .collect()
     }
 
     /// Internal: push a single pre-wrapped line to the buffer with a
@@ -2334,6 +2369,8 @@ impl App {
         self.error_lines.clear();
         self.turn_stream_entries.clear();
         self.last_stream_group = None;
+        self.pending_transcript_model_line = None;
+        self.pending_transcript_reasoning_lines = None;
         self.reasoning_partial_line.clear();
         self.turn_indicator = None;
         self.turn_had_streamed_line = false;

@@ -10,6 +10,9 @@ use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
 use crate::core::approval::ApprovalResult;
 use crate::providers::Provider;
+use crate::storage::task_storage::{
+    DEFAULT_TRANSCRIPT_CAP, TaskStorage, TranscriptEntry, purge_all_stale_transcripts,
+};
 use crate::terminal::input::EnableSnedMouseCapture;
 use futures::FutureExt;
 use ratatui::crossterm::event::{
@@ -133,6 +136,7 @@ pub struct InteractiveSession {
     approval_manager: Arc<tokio::sync::Mutex<crate::core::approval::ApprovalManager>>,
     hook_manager: Arc<crate::core::hooks::HookManager>,
     state_manager: Arc<crate::storage::state_manager::StateManager>,
+    task_storage: TaskStorage,
     provider_api_keys: HashMap<String, String>,
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
@@ -176,6 +180,7 @@ impl InteractiveSession {
             crate::cli::build_task_components(task_opts.clone(), root_opts.clone(), output_writer)
                 .await?;
         components.config.interactive_mode = interactive_mode;
+        let task_storage = components.task_storage.clone();
 
         let agent_loop = crate::core::agent_loop::AgentLoop::new(components.config)
             .with_system_prompt_context(components.system_prompt_context)
@@ -209,6 +214,7 @@ impl InteractiveSession {
             approval_manager: components.approval_manager,
             hook_manager: components.hook_manager,
             state_manager: components.state_manager,
+            task_storage,
             provider_api_keys,
             task_opts,
             root_opts,
@@ -260,6 +266,10 @@ impl InteractiveSession {
     fn remember_provider_api_key(&mut self, provider: &str, api_key: String) {
         self.provider_api_keys
             .insert(provider_credential_key(provider), api_key);
+    }
+
+    fn task_storage(&self) -> TaskStorage {
+        self.task_storage.clone()
     }
 
     /// Get startup info line showing provider, model, task ID, mode, and context window.
@@ -709,57 +719,124 @@ async fn wait_for_mention_search_test_blocker() {
     }
 }
 
+fn persist_transcript_line(
+    storage: Option<&TaskStorage>,
+    kind: crate::cli::tui::BlockKind,
+    line: &Line<'static>,
+) {
+    let Some(storage) = storage else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for markdown in line.to_string().split('\n') {
+        let entry = TranscriptEntry {
+            kind,
+            ts,
+            markdown: markdown.to_string(),
+        };
+        if let Err(error) = storage.write_transcript_entry(&entry) {
+            tracing::warn!(error = %error, "Failed to persist transcript entry");
+        }
+    }
+}
+
+fn replay_transcript(app: &mut App, storage: &TaskStorage) {
+    match storage.read_transcript(DEFAULT_TRANSCRIPT_CAP) {
+        Ok(entries) => {
+            for entry in entries {
+                app.push_output_with_kind(Line::from(entry.markdown), entry.kind);
+            }
+        }
+        Err(error) => tracing::warn!(error = %error, "Failed to read task transcript"),
+    }
+}
+
+fn flush_pending_model_update(
+    app: &mut App,
+    pending: &mut Option<Line<'static>>,
+    storage: Option<&TaskStorage>,
+) {
+    if let Some(line) = pending.take() {
+        persist_transcript_line(storage, crate::cli::tui::BlockKind::Model, &line);
+        app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
+    }
+}
+
+fn flush_pending_reasoning_lines(
+    pending: &mut Option<Vec<Line<'static>>>,
+    storage: Option<&TaskStorage>,
+) {
+    if let Some(lines) = pending.take() {
+        for line in lines {
+            persist_transcript_line(storage, crate::cli::tui::BlockKind::Reasoning, &line);
+        }
+    }
+}
+
 fn apply_output_event(
     app: &mut App,
     event: OutputEvent,
     pending_model_update: &mut Option<ratatui::text::Line<'static>>,
+    pending_reasoning_lines: &mut Option<Vec<Line<'static>>>,
+    storage: Option<&TaskStorage>,
 ) {
-    let flush_model_update = |app: &mut App, pending: &mut Option<ratatui::text::Line<'static>>| {
-        if let Some(line) = pending.take() {
-            app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
-        }
-    };
-
     if !matches!(&event, OutputEvent::ReasoningChunk(_)) {
+        let reasoning_lines = app.reasoning_stream_lines();
+        if !reasoning_lines.is_empty() {
+            *pending_reasoning_lines = Some(reasoning_lines);
+        }
+        flush_pending_reasoning_lines(pending_reasoning_lines, storage);
         app.finish_reasoning_stream();
     }
 
     match event {
         OutputEvent::Line(line) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
+            // A finalized Line displaces the streamed snapshot; both remain
+            // visible TUI blocks and should be persisted in that order.
+            persist_transcript_line(storage, crate::cli::tui::BlockKind::Model, &line);
             app.push_stream_line(line, crate::cli::tui::StreamKind::Model);
         }
         OutputEvent::ModelUpdateLine(line) => {
             *pending_model_update = Some(line);
         }
         OutputEvent::ToolOutputLine(line) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             if line.to_string().contains("📋 Plan Generated") {
                 app.discard_current_turn_model_stream();
             }
             for line in split_output_line_on_newlines(line) {
+                persist_transcript_line(storage, crate::cli::tui::BlockKind::ToolOutput, &line);
                 app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
             }
         }
         OutputEvent::ToolHeaderLine(line) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
+            persist_transcript_line(storage, crate::cli::tui::BlockKind::ToolHeader, &line);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
         }
         OutputEvent::CommandHeaderLine(line) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
+            persist_transcript_line(storage, crate::cli::tui::BlockKind::CommandHeader, &line);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandHeader);
         }
         OutputEvent::CommandOutputLine(line) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
+            persist_transcript_line(storage, crate::cli::tui::BlockKind::CommandOutput, &line);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
         }
         OutputEvent::ReasoningChunk(chunk) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             app.push_reasoning_chunk(&chunk);
+            *pending_reasoning_lines = Some(app.reasoning_stream_lines());
         }
         OutputEvent::UserPromptLine(line) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             app.clear_error_lines();
+            persist_transcript_line(storage, crate::cli::tui::BlockKind::UserPrompt, &line);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
         OutputEvent::QueuedMessageStarted { remaining } => {
@@ -767,11 +844,12 @@ fn apply_output_event(
             app.set_pending_queued_prompts(remaining);
         }
         OutputEvent::LocalCommandEcho(line) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
+            persist_transcript_line(storage, crate::cli::tui::BlockKind::UserPrompt, &line);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
         OutputEvent::RawAnsi(s) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             let lines = ansi_to_ratatui_lines(&s);
             let kind = if crate::core::approval::is_any_followup_question_active() {
                 crate::cli::tui::BlockKind::BlockingPrompt
@@ -783,15 +861,15 @@ fn apply_output_event(
             }
         }
         OutputEvent::ApprovalRequested(request) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             app.set_pending_approval(request);
         }
         OutputEvent::ApprovalFinished { id } => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             app.finish_pending_approval(id);
         }
         OutputEvent::Completion(result) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             app.set_last_completion_text(result.clone());
             // Historical model blocks must not suppress a result from the current turn.
             let model_text = app
@@ -825,7 +903,7 @@ fn apply_output_event(
             }
         }
         OutputEvent::ErrorBox(msg) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             if app.suppress_terminal_panels() {
                 app.clear_error_lines();
                 return;
@@ -838,11 +916,12 @@ fn apply_output_event(
             }
         }
         OutputEvent::TurnEnd { accumulated_text } => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
             app.finalize_turn_stream(&accumulated_text);
         }
         OutputEvent::TurnIndicator(line) => {
-            flush_model_update(app, pending_model_update);
+            flush_pending_model_update(app, pending_model_update, storage);
+            persist_transcript_line(storage, crate::cli::tui::BlockKind::Separator, &line);
             app.push_turn_indicator(line);
         }
     }
@@ -1051,9 +1130,11 @@ fn drain_output_queues(
     priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     rx: &mut mpsc::Receiver<OutputEvent>,
     app: &mut App,
+    storage: Option<&TaskStorage>,
 ) {
     let mut saw_output = false;
-    let mut pending_model_update: Option<ratatui::text::Line<'static>> = None;
+    let mut pending_model_update = app.take_pending_transcript_model_line();
+    let mut pending_reasoning_lines = app.take_pending_transcript_reasoning_lines();
 
     let mut deferred_priority = Vec::new();
     while let Ok(event) = priority_rx.try_recv() {
@@ -1062,7 +1143,13 @@ fn drain_output_queues(
             OutputEvent::ApprovalRequested(_) | OutputEvent::ApprovalFinished { .. }
         ) {
             saw_output = true;
-            apply_output_event(app, event, &mut pending_model_update);
+            apply_output_event(
+                app,
+                event,
+                &mut pending_model_update,
+                &mut pending_reasoning_lines,
+                storage,
+            );
         } else {
             deferred_priority.push(event);
         }
@@ -1080,7 +1167,13 @@ fn drain_output_queues(
     if queued_prompt_boundary {
         for event in std::mem::take(&mut deferred_priority) {
             saw_output = true;
-            apply_output_event(app, event, &mut pending_model_update);
+            apply_output_event(
+                app,
+                event,
+                &mut pending_model_update,
+                &mut pending_reasoning_lines,
+                storage,
+            );
         }
     }
 
@@ -1095,18 +1188,40 @@ fn drain_output_queues(
             // A prompt also wins over older terminal panels when the prior
             // turn has no TurnEnd event (for example, a terminal provider error).
             for deferred_event in std::mem::take(&mut deferred_priority) {
-                apply_output_event(app, deferred_event, &mut pending_model_update);
+                apply_output_event(
+                    app,
+                    deferred_event,
+                    &mut pending_model_update,
+                    &mut pending_reasoning_lines,
+                    storage,
+                );
             }
         }
         saw_output = true;
-        apply_output_event(app, event, &mut pending_model_update);
+        apply_output_event(
+            app,
+            event,
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            storage,
+        );
     }
     for event in deferred_priority {
         saw_output = true;
-        apply_output_event(app, event, &mut pending_model_update);
+        apply_output_event(
+            app,
+            event,
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            storage,
+        );
     }
     if let Some(line) = pending_model_update.take() {
-        app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
+        app.replace_last_stream_line(line.clone(), crate::cli::tui::StreamKind::Model);
+        app.set_pending_transcript_model_line(line);
+    }
+    if let Some(lines) = pending_reasoning_lines.take() {
+        app.set_pending_transcript_reasoning_lines(lines);
     }
     if crate::core::approval::take_followup_prompt_scroll() {
         app.pin_approval_bottom();
@@ -1136,7 +1251,7 @@ fn drain_output_queues(
 #[cfg(test)]
 fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut priority_rx, rx, app);
+    drain_output_queues(&mut priority_rx, rx, app, None);
 }
 
 fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
@@ -1159,8 +1274,9 @@ fn drain_and_render_user_submit(
     app: &mut App,
     priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     output_rx: &mut mpsc::Receiver<OutputEvent>,
+    storage: &TaskStorage,
 ) -> anyhow::Result<()> {
-    drain_output_queues(priority_output_rx, output_rx, app);
+    drain_output_queues(priority_output_rx, output_rx, app, Some(storage));
     app.force_bottom();
     sync_scroll_viewport(terminal, app)?;
     terminal.draw(|f| app.render(f))?;
@@ -1196,7 +1312,7 @@ fn echo_agent_prompt(app: &mut App, text: &str, output_writer: &OutputWriterArc)
 #[cfg(test)]
 pub(crate) fn drain_output_for_test(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut priority_rx, rx, app);
+    drain_output_queues(&mut priority_rx, rx, app, None);
 }
 
 #[cfg(test)]
@@ -1205,7 +1321,17 @@ pub(crate) fn drain_output_for_test_with_priority(
     rx: &mut mpsc::Receiver<OutputEvent>,
     app: &mut App,
 ) {
-    drain_output_queues(priority_rx, rx, app);
+    drain_output_queues(priority_rx, rx, app, None);
+}
+
+#[cfg(test)]
+pub(crate) fn drain_output_for_test_with_storage(
+    rx: &mut mpsc::Receiver<OutputEvent>,
+    app: &mut App,
+    storage: &TaskStorage,
+) {
+    let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+    drain_output_queues(&mut priority_rx, rx, app, Some(storage));
 }
 
 fn approval_result_for_key(app: &App, key: &KeyEvent) -> Option<ApprovalResult> {
@@ -3183,6 +3309,7 @@ async fn run_main_loop(
     output_writer: OutputWriterArc,
     session: Arc<Mutex<InteractiveSession>>,
     task_id: String,
+    task_storage: TaskStorage,
     agent_busy: Arc<AtomicBool>,
     agent_done: Arc<tokio::sync::Notify>,
     agent_start_time: Arc<Mutex<Option<Instant>>>,
@@ -3275,7 +3402,7 @@ async fn run_main_loop(
         // 1. Drain channel into app
         {
             let t = std::time::Instant::now();
-            drain_output_queues(priority_output_rx, output_rx, app);
+            drain_output_queues(priority_output_rx, output_rx, app, Some(&task_storage));
             // Lost transcript context remains visible because it may affect
             // whether the user can safely approve a pending operation.
             if output_writer.take_overflow_signal() {
@@ -3619,6 +3746,7 @@ async fn run_main_loop(
                                     app,
                                     priority_output_rx,
                                     output_rx,
+                                    &task_storage,
                                 )?;
 
                                 // Save to command history without rereading the
@@ -3666,6 +3794,7 @@ async fn run_main_loop(
                                             app,
                                             priority_output_rx,
                                             output_rx,
+                                            &task_storage,
                                         )?;
                                         // The busy check above guarantees this will not wait on
                                         // an AgentLoop currently held by another run.
@@ -3787,6 +3916,7 @@ async fn run_main_loop(
                                         app,
                                         priority_output_rx,
                                         output_rx,
+                                        &task_storage,
                                     )?;
                                     spawn_agent_task(
                                         &session,
@@ -4017,6 +4147,31 @@ pub async fn run_interactive_shell_inner(
         let sess = session.lock().await;
         sess.agent_loop().await.task_id().to_string()
     };
+    let is_resuming = root_opts.continue_task || root_opts.task_id.is_some();
+    {
+        let sess = session.lock().await;
+        if is_resuming {
+            let agent = sess.agent_loop().await;
+            let loaded = agent.load_conversation_history().await;
+            agent.load_file_context_tracker().await;
+            if loaded {
+                let _ = sess.hook_manager.task_resume(agent.task_id());
+            }
+        }
+    }
+    let task_storage = {
+        let sess = session.lock().await;
+        sess.task_storage()
+    };
+
+    if let Ok(raw_days) = std::env::var("SNED_AUTO_PURGE_DAYS")
+        && let Ok(days) = raw_days.parse::<u32>()
+        && days > 0
+        && let Err(error) =
+            purge_all_stale_transcripts(&crate::storage::disk::get_tasks_dir(), days)
+    {
+        tracing::warn!(error = %error, "Failed to purge stale task transcripts");
+    }
 
     // Set status bar fields from session info
     {
@@ -4047,19 +4202,25 @@ pub async fn run_interactive_shell_inner(
             for line in ansi_to_ratatui_lines(&startup_info) {
                 app.push_output(line);
             }
-            app.push_styled(
-                "type a prompt and press Enter; type /exit to leave",
-                theme::dim_style(),
-            );
-            app.push_styled(
-                "type /help for slash commands, @ to search and mention files",
-                theme::dim_style(),
-            );
-            app.push_styled(
-                "drag transcript or completion text to select and copy; mouse wheel scrolls",
-                theme::dim_style(),
-            );
+            if !is_resuming {
+                app.push_styled(
+                    "type a prompt and press Enter; type /exit to leave",
+                    theme::dim_style(),
+                );
+                app.push_styled(
+                    "type /help for slash commands, @ to search and mention files",
+                    theme::dim_style(),
+                );
+                app.push_styled(
+                    "drag transcript or completion text to select and copy; mouse wheel scrolls",
+                    theme::dim_style(),
+                );
+            }
         }
+    }
+
+    if is_resuming {
+        replay_transcript(&mut app, &task_storage);
     }
 
     // 5. Shared state (same as current)
@@ -4114,6 +4275,7 @@ pub async fn run_interactive_shell_inner(
         output_writer,
         session,
         task_id.clone(),
+        task_storage,
         agent_busy,
         agent_done,
         agent_start_time,
@@ -4305,6 +4467,213 @@ mod tests {
         assert_eq!(rendered, vec!["final partial"]);
 
         reset_prompt_state();
+    }
+
+    #[test]
+    fn test_transcript_capture_persists_only_finalized_model_updates() {
+        use crate::cli::output::OutputEvent;
+        use crate::storage::task_storage::DEFAULT_TRANSCRIPT_CAP;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("interactive-transcript");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 1")))
+            .unwrap();
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 2")))
+            .unwrap();
+        tx.try_send(OutputEvent::ToolHeaderLine(Line::from("▶ read_file")))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        let entries = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.markdown.as_str())
+                .collect::<Vec<_>>(),
+            vec!["partial 2", "▶ read_file"]
+        );
+    }
+
+    #[test]
+    fn test_transcript_capture_flushes_pending_update_on_later_turn_end() {
+        use crate::cli::output::OutputEvent;
+        use crate::storage::task_storage::DEFAULT_TRANSCRIPT_CAP;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("interactive-pending-transcript");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial")))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+        assert!(
+            storage
+                .read_transcript(DEFAULT_TRANSCRIPT_CAP)
+                .unwrap()
+                .is_empty()
+        );
+
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: "partial".to_string(),
+        })
+        .unwrap();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        assert_eq!(
+            storage
+                .read_transcript(DEFAULT_TRANSCRIPT_CAP)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.markdown.as_str())
+                .collect::<Vec<_>>(),
+            vec!["partial"]
+        );
+    }
+
+    #[test]
+    fn test_transcript_persists_reasoning_chunks_only_once_per_turn() {
+        use crate::cli::output::OutputEvent;
+        use crate::storage::task_storage::DEFAULT_TRANSCRIPT_CAP;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("reasoning-transcript");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(OutputEvent::reasoning_chunk("first")).unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" thought\n\nnext"))
+            .unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" step")).unwrap();
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+        assert!(
+            storage
+                .read_transcript(DEFAULT_TRANSCRIPT_CAP)
+                .unwrap()
+                .is_empty()
+        );
+
+        tx.try_send(OutputEvent::Line(Line::from("answer")))
+            .unwrap();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        let entries = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        let kinds: Vec<_> = entries.iter().map(|entry| entry.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::Reasoning,
+                BlockKind::Reasoning,
+                BlockKind::Reasoning,
+                BlockKind::Model,
+            ]
+        );
+        assert!(entries[0].markdown.contains("Ɵ"));
+        assert_eq!(entries[3].markdown, "answer");
+    }
+
+    #[test]
+    fn test_turn_indicator_is_persisted_as_separator() {
+        use crate::cli::output::OutputEvent;
+        use crate::storage::task_storage::DEFAULT_TRANSCRIPT_CAP;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("interactive-separator-transcript");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.try_send(OutputEvent::TurnIndicator(Line::from("♦")))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        let entries = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, BlockKind::Separator);
+        assert_eq!(entries[0].markdown, "♦");
+    }
+
+    #[test]
+    fn test_completion_is_not_written_to_transcript() {
+        use crate::cli::output::OutputEvent;
+        use crate::storage::task_storage::DEFAULT_TRANSCRIPT_CAP;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("interactive-completion");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::Completion("done".to_string()))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        assert!(
+            storage
+                .read_transcript(DEFAULT_TRANSCRIPT_CAP)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_transcript_replay_preserves_kind_and_order() {
+        use crate::storage::task_storage::TranscriptEntry;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("interactive-replay");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        let entries = [
+            (BlockKind::Model, "model"),
+            (BlockKind::ToolHeader, "▶ tool"),
+            (BlockKind::ToolOutput, "output"),
+            (BlockKind::UserPrompt, "❯ prompt"),
+        ];
+        for (index, (kind, markdown)) in entries.iter().enumerate() {
+            storage
+                .write_transcript_entry(&TranscriptEntry {
+                    kind: *kind,
+                    ts: index as u64,
+                    markdown: (*markdown).to_string(),
+                })
+                .unwrap();
+        }
+
+        let mut app = App::new();
+        replay_transcript(&mut app, &storage);
+        assert_eq!(
+            app.output_line_kinds.iter().copied().collect::<Vec<_>>(),
+            entries.iter().map(|(kind, _)| *kind).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.output_lines
+                .iter()
+                .map(App::line_to_string)
+                .collect::<Vec<_>>(),
+            entries
+                .iter()
+                .map(|(_, markdown)| (*markdown).to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
