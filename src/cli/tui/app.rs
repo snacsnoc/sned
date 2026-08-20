@@ -610,6 +610,8 @@ pub struct App {
     /// Model switch awaiting an API key for a provider not configured in this process.
     pub pending_model_switch: Option<PendingModelSwitch>,
     last_completion_text: Option<String>,
+    completion_lines: Vec<Line<'static>>,
+    needs_transcript_copy: bool,
     transcript_selection_area: Option<Rect>,
     transcript_selection_row_sources: Vec<Option<SelectionRowSource>>,
     text_selection: Option<TextSelection>,
@@ -946,6 +948,8 @@ impl App {
             model_picker_selected: 0,
             pending_model_switch: None,
             last_completion_text: None,
+            completion_lines: Vec::new(),
+            needs_transcript_copy: false,
             transcript_selection_area: None,
             transcript_selection_row_sources: Vec::new(),
             text_selection: None,
@@ -1583,6 +1587,14 @@ impl App {
 
     pub fn set_last_completion_text(&mut self, text: String) {
         self.last_completion_text = Some(text);
+    }
+
+    pub fn set_completion_needs_transcript_copy(&mut self, needs_copy: bool) {
+        self.needs_transcript_copy = needs_copy;
+    }
+
+    pub fn dismiss_completion_lines(&mut self) {
+        self.completion_lines.clear();
     }
 
     pub fn set_pending_queued_prompts(&mut self, count: usize) {

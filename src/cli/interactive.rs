@@ -804,6 +804,7 @@ fn apply_output_event(
                 .join("\n");
             let result_matches_model =
                 !model_text.trim().is_empty() && model_text.trim() == result.trim();
+            app.set_completion_needs_transcript_copy(!result_matches_model);
             if app.suppress_terminal_panels() {
                 if !result_matches_model {
                     app.archive_completion_result(&result);
