@@ -720,25 +720,31 @@ async fn wait_for_mention_search_test_blocker() {
 }
 
 fn persist_transcript_line(
+    app: &mut App,
     storage: Option<&TaskStorage>,
     kind: crate::cli::tui::BlockKind,
     line: &Line<'static>,
 ) {
-    let Some(storage) = storage else {
-        return;
-    };
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    for markdown in line.to_string().split('\n') {
-        let entry = TranscriptEntry {
+    let entries = line
+        .to_string()
+        .split('\n')
+        .map(|markdown| TranscriptEntry {
             kind,
             ts,
             markdown: markdown.to_string(),
-        };
-        if let Err(error) = storage.write_transcript_entry(&entry) {
-            tracing::warn!(error = %error, "Failed to persist transcript entry");
+        })
+        .collect::<Vec<_>>();
+    if app.task_transcript_writer_is_started() {
+        if let Err(error) = app.enqueue_task_transcript(entries) {
+            tracing::warn!(error = %error, "Failed to queue transcript entries");
+        }
+    } else if let Some(storage) = storage {
+        if let Err(error) = storage.write_transcript_entries(&entries) {
+            tracing::warn!(error = %error, "Failed to persist transcript entries");
         }
     }
 }
@@ -760,18 +766,19 @@ fn flush_pending_model_update(
     storage: Option<&TaskStorage>,
 ) {
     if let Some(line) = pending.take() {
-        persist_transcript_line(storage, crate::cli::tui::BlockKind::Model, &line);
+        persist_transcript_line(app, storage, crate::cli::tui::BlockKind::Model, &line);
         app.replace_last_stream_line(line, crate::cli::tui::StreamKind::Model);
     }
 }
 
 fn flush_pending_reasoning_lines(
+    app: &mut App,
     pending: &mut Option<Vec<Line<'static>>>,
     storage: Option<&TaskStorage>,
 ) {
     if let Some(lines) = pending.take() {
         for line in lines {
-            persist_transcript_line(storage, crate::cli::tui::BlockKind::Reasoning, &line);
+            persist_transcript_line(app, storage, crate::cli::tui::BlockKind::Reasoning, &line);
         }
     }
 }
@@ -788,7 +795,7 @@ fn apply_output_event(
         if !reasoning_lines.is_empty() {
             *pending_reasoning_lines = Some(reasoning_lines);
         }
-        flush_pending_reasoning_lines(pending_reasoning_lines, storage);
+        flush_pending_reasoning_lines(app, pending_reasoning_lines, storage);
         app.finish_reasoning_stream();
     }
 
@@ -797,7 +804,7 @@ fn apply_output_event(
             flush_pending_model_update(app, pending_model_update, storage);
             // A finalized Line displaces the streamed snapshot; both remain
             // visible TUI blocks and should be persisted in that order.
-            persist_transcript_line(storage, crate::cli::tui::BlockKind::Model, &line);
+            persist_transcript_line(app, storage, crate::cli::tui::BlockKind::Model, &line);
             app.push_stream_line(line, crate::cli::tui::StreamKind::Model);
         }
         OutputEvent::ModelUpdateLine(line) => {
@@ -809,23 +816,38 @@ fn apply_output_event(
                 app.discard_current_turn_model_stream();
             }
             for line in split_output_line_on_newlines(line) {
-                persist_transcript_line(storage, crate::cli::tui::BlockKind::ToolOutput, &line);
+                persist_transcript_line(
+                    app,
+                    storage,
+                    crate::cli::tui::BlockKind::ToolOutput,
+                    &line,
+                );
                 app.push_stream_line(line, crate::cli::tui::StreamKind::ToolOutput);
             }
         }
         OutputEvent::ToolHeaderLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            persist_transcript_line(storage, crate::cli::tui::BlockKind::ToolHeader, &line);
+            persist_transcript_line(app, storage, crate::cli::tui::BlockKind::ToolHeader, &line);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
         }
         OutputEvent::CommandHeaderLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            persist_transcript_line(storage, crate::cli::tui::BlockKind::CommandHeader, &line);
+            persist_transcript_line(
+                app,
+                storage,
+                crate::cli::tui::BlockKind::CommandHeader,
+                &line,
+            );
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandHeader);
         }
         OutputEvent::CommandOutputLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            persist_transcript_line(storage, crate::cli::tui::BlockKind::CommandOutput, &line);
+            persist_transcript_line(
+                app,
+                storage,
+                crate::cli::tui::BlockKind::CommandOutput,
+                &line,
+            );
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
         }
         OutputEvent::ReasoningChunk(chunk) => {
@@ -836,7 +858,7 @@ fn apply_output_event(
         OutputEvent::UserPromptLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
             app.clear_error_lines();
-            persist_transcript_line(storage, crate::cli::tui::BlockKind::UserPrompt, &line);
+            persist_transcript_line(app, storage, crate::cli::tui::BlockKind::UserPrompt, &line);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
         OutputEvent::QueuedMessageStarted { remaining } => {
@@ -845,7 +867,7 @@ fn apply_output_event(
         }
         OutputEvent::LocalCommandEcho(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            persist_transcript_line(storage, crate::cli::tui::BlockKind::UserPrompt, &line);
+            persist_transcript_line(app, storage, crate::cli::tui::BlockKind::UserPrompt, &line);
             app.push_output_with_kind(line, crate::cli::tui::BlockKind::UserPrompt);
         }
         OutputEvent::RawAnsi(s) => {
@@ -857,6 +879,7 @@ fn apply_output_event(
                 crate::cli::tui::BlockKind::ToolOutput
             };
             for line in lines {
+                persist_transcript_line(app, storage, kind, &line);
                 app.push_output_with_kind(line, kind);
             }
         }
@@ -921,7 +944,7 @@ fn apply_output_event(
         }
         OutputEvent::TurnIndicator(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            persist_transcript_line(storage, crate::cli::tui::BlockKind::Separator, &line);
+            persist_transcript_line(app, storage, crate::cli::tui::BlockKind::Separator, &line);
             app.push_turn_indicator(line);
         }
     }
@@ -1242,6 +1265,9 @@ fn drain_output_queues(
     if let Some(err) = app.take_scrollback_writer_error() {
         tracing::warn!("Failed to persist scrollback batch: {err}");
     }
+    if let Some(err) = app.take_task_transcript_writer_error() {
+        tracing::warn!("Failed to persist task transcript batch: {err}");
+    }
 }
 
 /// Drain the main output channel into the app buffer.
@@ -1314,6 +1340,10 @@ fn draw_tui_frame(
         Ok(_) => Ok(true),
         Err(error) => handle_tui_draw_error(app, error, debug),
     }
+}
+
+fn next_draw_retry_delay(current: Duration, maximum: Duration) -> Duration {
+    (current + current).min(maximum)
 }
 
 /// Drain the output channel, force the scroll to the bottom, sync the
@@ -3457,10 +3487,13 @@ async fn run_main_loop(
     const BUSY_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
     const BUSY_POLL_INTERVAL: Duration = BUSY_REDRAW_INTERVAL;
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const MAX_DRAW_RETRY_DELAY: Duration = Duration::from_secs(1);
     let mouse_scroll_lines = mouse_scroll_lines();
     let (path_open_failure_tx, mut path_open_failure_rx) = mpsc::unbounded_channel();
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
     let mut last_draw_at: Option<std::time::Instant> = None;
+    let mut draw_retry_delay = BUSY_REDRAW_INTERVAL;
+    let mut draw_retry_at: Option<std::time::Instant> = None;
     let mut timing = TimingSummary {
         enabled: timing_enabled,
         session_start_time: app.start_time,
@@ -3583,7 +3616,8 @@ async fn run_main_loop(
         }
 
         // 2. Render (skip if nothing changed)
-        let should_render = if app.needs_redraw || app.has_resized {
+        let retry_ready = draw_retry_at.is_none_or(|retry_at| retry_at <= Instant::now());
+        let should_render = if (app.needs_redraw || app.has_resized) && retry_ready {
             if app.has_unrendered_approval() {
                 true
             } else if app.agent_busy {
@@ -3599,6 +3633,8 @@ async fn run_main_loop(
                 let t = std::time::Instant::now();
                 if draw_tui_frame(terminal, app, task_opts.debug)? {
                     last_draw_at = Some(std::time::Instant::now());
+                    draw_retry_delay = BUSY_REDRAW_INTERVAL;
+                    draw_retry_at = None;
                     timing.draw_total_us += t.elapsed().as_micros() as u64;
                     timing.draw_count += 1;
                     if timing_enabled
@@ -3608,6 +3644,10 @@ async fn run_main_loop(
                         timing.first_render_time = Some(std::time::Instant::now());
                     }
                     app.needs_redraw = false;
+                } else {
+                    draw_retry_at = Some(Instant::now() + draw_retry_delay);
+                    draw_retry_delay =
+                        next_draw_retry_delay(draw_retry_delay, MAX_DRAW_RETRY_DELAY);
                 }
             }
         }
@@ -4308,6 +4348,9 @@ pub async fn run_interactive_shell_inner(
     if is_resuming {
         replay_transcript(&mut app, &task_storage);
     }
+    if let Err(error) = app.start_task_transcript_writer(&task_storage) {
+        tracing::warn!(error = %error, "Failed to start task transcript writer");
+    }
 
     // 5. Shared state (same as current)
     let agent_busy = Arc::new(AtomicBool::new(false));
@@ -4374,6 +4417,9 @@ pub async fn run_interactive_shell_inner(
     .await;
     if let Err(err) = app.shutdown_scrollback_writer() {
         tracing::warn!("Failed to shut down scrollback writer: {err}");
+    }
+    if let Err(err) = app.shutdown_task_transcript_writer() {
+        tracing::warn!("Failed to shut down task transcript writer: {err}");
     }
     run_result?;
     // In JSON mode stdout is reserved for structured events, so route
@@ -4472,6 +4518,21 @@ mod tests {
         .expect_err("non-WouldBlock draw errors should remain fatal");
 
         assert!(format!("{error:#}").contains("TUI draw failed"));
+    }
+
+    #[test]
+    fn test_draw_retry_delay_is_bounded_and_doubles() {
+        let initial = Duration::from_millis(16);
+        let maximum = Duration::from_secs(1);
+        assert_eq!(
+            next_draw_retry_delay(initial, maximum),
+            Duration::from_millis(32)
+        );
+        assert_eq!(
+            next_draw_retry_delay(Duration::from_millis(800), maximum),
+            maximum
+        );
+        assert_eq!(next_draw_retry_delay(maximum, maximum), maximum);
     }
 
     #[test]
@@ -4665,6 +4726,33 @@ mod tests {
                 .map(|entry| entry.markdown.as_str())
                 .collect::<Vec<_>>(),
             vec!["partial"]
+        );
+    }
+
+    #[test]
+    fn test_raw_ansi_output_is_persisted_for_resume() {
+        use crate::cli::output::OutputEvent;
+        use crate::storage::task_storage::DEFAULT_TRANSCRIPT_CAP;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("raw-ansi-transcript");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::RawAnsi("pty output\nsecond line".to_string()))
+            .unwrap();
+
+        let mut app = App::new();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        let entries = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.markdown.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pty output", "second line"]
         );
     }
 

@@ -4,6 +4,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use crate::cli::tui::BlockKind;
@@ -66,6 +68,101 @@ pub struct TranscriptEntry {
     pub kind: BlockKind,
     pub ts: u64,
     pub markdown: String,
+}
+
+enum TranscriptWriterCommand {
+    Append(Vec<TranscriptEntry>),
+    Flush(std_mpsc::Sender<io::Result<()>>),
+    Shutdown(std_mpsc::Sender<io::Result<()>>),
+}
+
+/// Background writer for interactive task transcripts.
+pub struct TaskTranscriptWriter {
+    sender: std_mpsc::Sender<TranscriptWriterCommand>,
+    errors: std_mpsc::Receiver<String>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TaskTranscriptWriter {
+    pub fn start(storage: TaskStorage) -> io::Result<Self> {
+        let (sender, receiver) = std_mpsc::channel();
+        let (error_sender, errors) = std_mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("sned-task-transcript-writer".to_string())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        TranscriptWriterCommand::Append(entries) => {
+                            if let Err(error) = storage.write_transcript_entries(&entries) {
+                                let _ = error_sender.send(error.to_string());
+                            }
+                        }
+                        TranscriptWriterCommand::Flush(response) => {
+                            let _ = response.send(Ok(()));
+                        }
+                        TranscriptWriterCommand::Shutdown(response) => {
+                            let _ = response.send(Ok(()));
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            sender,
+            errors,
+            handle: Some(handle),
+        })
+    }
+
+    pub fn append(&self, entries: Vec<TranscriptEntry>) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.sender
+            .send(TranscriptWriterCommand::Append(entries))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transcript writer stopped"))
+    }
+
+    pub fn flush(&self) -> io::Result<()> {
+        let (sender, receiver) = std_mpsc::channel();
+        self.sender
+            .send(TranscriptWriterCommand::Flush(sender))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transcript writer stopped"))?;
+        receiver
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transcript writer stopped"))?
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        let mut latest = None;
+        while let Ok(error) = self.errors.try_recv() {
+            latest = Some(error);
+        }
+        latest
+    }
+
+    pub fn shutdown(&mut self) -> io::Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        let (sender, receiver) = std_mpsc::channel();
+        let result = match self.sender.send(TranscriptWriterCommand::Shutdown(sender)) {
+            Ok(()) => receiver.recv().unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "transcript writer stopped",
+                ))
+            }),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "transcript writer stopped",
+            )),
+        };
+        if handle.join().is_err() {
+            return Err(io::Error::other("transcript writer panicked"));
+        }
+        result
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,7 +766,18 @@ impl TaskStorage {
 
     /// Append a visible transcript entry while holding the task lock.
     pub fn write_transcript_entry(&self, entry: &TranscriptEntry) -> io::Result<()> {
-        if matches!(entry.kind, BlockKind::Completion | BlockKind::Error) {
+        self.write_transcript_entries(std::slice::from_ref(entry))
+    }
+
+    /// Append visible transcript entries in one locked, durable batch.
+    pub fn write_transcript_entries(&self, entries: &[TranscriptEntry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if entries
+            .iter()
+            .any(|entry| matches!(entry.kind, BlockKind::Completion | BlockKind::Error))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "completion and error entries are not persisted in transcripts",
@@ -678,16 +786,59 @@ impl TaskStorage {
 
         self.with_lock(|| {
             let path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
-            let mut line = serde_json::to_vec(entry)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            line.push(b'\n');
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)?;
-            file.write_all(&line)?;
-            file.sync_data()
+            for entry in entries {
+                let mut line = serde_json::to_vec(entry)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                line.push(b'\n');
+                file.write_all(&line)?;
+            }
+            file.sync_data()?;
+            self.compact_transcript_unlocked()
         })
+    }
+
+    fn compact_transcript_unlocked(&self) -> io::Result<()> {
+        let path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let file = fs::File::open(&path)?;
+        let mut entries = VecDeque::with_capacity(DEFAULT_TRANSCRIPT_CAP);
+        for line in io::BufReader::new(file).lines() {
+            let line = line?;
+            let entry = match serde_json::from_str::<TranscriptEntry>(&line) {
+                Ok(entry) => entry,
+                Err(_) => return Ok(()),
+            };
+            if entries.len() == DEFAULT_TRANSCRIPT_CAP {
+                entries.pop_front();
+            }
+            entries.push_back(entry);
+        }
+
+        let line_count = entries.len();
+        let file_line_count = fs::read_to_string(&path)?.lines().count();
+        if file_line_count <= DEFAULT_TRANSCRIPT_CAP {
+            return Ok(());
+        }
+
+        let temp_path = path.with_extension(format!("jsonl.tmp.{}", std::process::id()));
+        let result = (|| {
+            let mut temp = fs::File::create(&temp_path)?;
+            for entry in entries {
+                serde_json::to_writer(&mut temp, &entry)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                temp.write_all(b"\n")?;
+            }
+            temp.sync_data()?;
+            fs::rename(&temp_path, &path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        tracing::debug!(line_count, "Compacted task transcript");
+        result
     }
 
     /// Delete this task's transcript when it is older than `days`.
@@ -1477,6 +1628,34 @@ mod tests {
             entries.iter().map(|entry| entry.ts).collect::<Vec<_>>(),
             vec![2, 3, 4]
         );
+    }
+
+    #[test]
+    fn test_transcript_batch_compacts_file_to_retention_cap() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-batch-cap");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let entries = (0..DEFAULT_TRANSCRIPT_CAP + 5)
+            .map(|index| TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: index as u64,
+                markdown: format!("line {index}"),
+            })
+            .collect::<Vec<_>>();
+
+        storage.write_transcript_entries(&entries).unwrap();
+
+        let on_disk_lines = fs::read_to_string(task_dir.join(GlobalFileNames::TRANSCRIPT))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(on_disk_lines, DEFAULT_TRANSCRIPT_CAP);
+        let retained = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(retained.first().unwrap().ts, 5);
+        assert_eq!(retained.last().unwrap().ts, 1004);
     }
 
     #[test]

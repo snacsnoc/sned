@@ -5,6 +5,7 @@
 use super::history::FileHistory;
 use super::theme;
 use crate::core::file_search::FileSearchResult;
+use crate::storage::task_storage::{TaskStorage, TaskTranscriptWriter, TranscriptEntry};
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -523,6 +524,7 @@ pub struct App {
     /// Number of buffered lines waiting in `scrollback_pending`.
     pub scrollback_pending_lines: usize,
     scrollback_writer: Option<ScrollbackWriter>,
+    task_transcript_writer: Option<TaskTranscriptWriter>,
     /// True when the user is viewing scrollback history.
     pub in_scrollback: bool,
     /// Session elapsed time for status bar
@@ -980,6 +982,7 @@ impl App {
             scrollback_pending: String::new(),
             scrollback_pending_lines: 0,
             scrollback_writer: None,
+            task_transcript_writer: None,
             in_scrollback: false,
             mention_search_generation: 0,
             mention_search_tx: None,
@@ -2192,6 +2195,46 @@ impl App {
 
     pub fn start_scrollback_writer(&mut self) -> io::Result<()> {
         self.ensure_scrollback_writer()
+    }
+
+    pub fn start_task_transcript_writer(&mut self, storage: &TaskStorage) -> io::Result<()> {
+        if self.task_transcript_writer.is_none() {
+            self.task_transcript_writer = Some(TaskTranscriptWriter::start(storage.clone())?);
+        }
+        Ok(())
+    }
+
+    pub fn task_transcript_writer_is_started(&self) -> bool {
+        self.task_transcript_writer.is_some()
+    }
+
+    pub fn enqueue_task_transcript(&mut self, entries: Vec<TranscriptEntry>) -> io::Result<()> {
+        if let Some(writer) = self.task_transcript_writer.as_ref() {
+            writer.append(entries)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn flush_task_transcript(&self) -> io::Result<()> {
+        if let Some(writer) = self.task_transcript_writer.as_ref() {
+            writer.flush()
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn take_task_transcript_writer_error(&self) -> Option<String> {
+        self.task_transcript_writer
+            .as_ref()
+            .and_then(TaskTranscriptWriter::take_error)
+    }
+
+    pub fn shutdown_task_transcript_writer(&mut self) -> io::Result<()> {
+        if let Some(mut writer) = self.task_transcript_writer.take() {
+            writer.shutdown()?
+        }
+        Ok(())
     }
 
     fn ensure_scrollback_writer(&mut self) -> io::Result<()> {
