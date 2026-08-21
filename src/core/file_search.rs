@@ -24,6 +24,7 @@ static FILE_SEARCH_REFRESHING: LazyLock<Arc<Mutex<HashMap<String, watch::Sender<
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 const CACHE_TTL: Duration = Duration::from_secs(5);
+const WORKSPACE_INDEX_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 struct RefreshTestBlocker {
@@ -34,6 +35,9 @@ struct RefreshTestBlocker {
 #[cfg(test)]
 static REFRESH_TEST_BLOCKERS: LazyLock<Mutex<HashMap<String, Arc<RefreshTestBlocker>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static FILE_SEARCH_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[cfg(test)]
 async fn wait_for_refresh_test_blocker(workspace_path: &str) {
@@ -289,24 +293,26 @@ async fn workspace_file_index(workspace_path: &str) -> std::io::Result<Vec<FileS
     };
 
     if owns_refresh {
-        let result =
-            refresh_workspace_file_index(workspace_path.clone(), PathBuf::from(&workspace_path))
-                .await;
-        let succeeded = result.is_ok();
-        let _ = refresh_tx.send(Some(succeeded));
-        FILE_SEARCH_REFRESHING.lock().await.remove(&workspace_path);
-        return match result {
-            Ok(results) => Ok(results),
-            Err(error) => stale_results.map_or(Err(error), Ok),
-        };
+        let refresh_path = workspace_path.clone();
+        tokio::spawn(async move {
+            let result =
+                refresh_workspace_file_index(refresh_path.clone(), PathBuf::from(&refresh_path))
+                    .await;
+            let _ = refresh_tx.send(Some(result.is_ok()));
+            FILE_SEARCH_REFRESHING.lock().await.remove(&refresh_path);
+        });
     }
 
-    let _ = refresh_rx.changed().await;
-    if *refresh_rx.borrow() == Some(true)
-        && let Some(entry) = FILE_SEARCH_CACHE.read().await.get(&workspace_path)
+    let refresh_completed = tokio::time::timeout(WORKSPACE_INDEX_TIMEOUT, refresh_rx.changed())
+        .await
+        .is_ok_and(|result| result.is_ok());
+    if let Some(entry) = FILE_SEARCH_CACHE.read().await.get(&workspace_path)
         && entry.timestamp.elapsed() < CACHE_TTL
     {
         return Ok(entry.results.clone());
+    }
+    if !refresh_completed || *refresh_rx.borrow() != Some(true) {
+        tracing::debug!(workspace = %workspace_path, "Workspace file index refresh did not complete");
     }
 
     Ok(stale_results.unwrap_or_default())
@@ -690,6 +696,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -717,6 +724,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -749,6 +757,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -780,6 +789,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -803,6 +813,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -830,6 +841,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -858,6 +870,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -912,10 +925,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_refresh_owner_cancellation_does_not_strand_waiters() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
+        clear_file_search_cache().await;
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        fs::write(workspace.join("after.rs"), "").unwrap();
+        let workspace_path = workspace.to_string_lossy().into_owned();
+        let (release_tx, release_rx) = watch::channel(false);
+        let blocker = Arc::new(RefreshTestBlocker {
+            started: tokio::sync::Notify::new(),
+            release: release_rx,
+        });
+        REFRESH_TEST_BLOCKERS
+            .lock()
+            .await
+            .insert(workspace_path.clone(), blocker.clone());
+
+        let first_path = workspace_path.clone();
+        let first =
+            tokio::spawn(async move { search_workspace_files("after", &first_path, 10).await });
+        tokio::time::timeout(Duration::from_secs(1), blocker.started.notified())
+            .await
+            .expect("refresh should start");
+        first.abort();
+
+        let second_path = workspace_path.clone();
+        let second =
+            tokio::spawn(async move { search_workspace_files("after", &second_path, 10).await });
+        release_tx.send(true).unwrap();
+
+        let results = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("waiter should not remain stranded")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "after.rs");
+        REFRESH_TEST_BLOCKERS.lock().await.remove(&workspace_path);
+    }
+
+    #[tokio::test]
     async fn test_search_workspace_files_limit() {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -933,6 +990,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -962,6 +1020,7 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
         clear_file_search_cache().await;
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
