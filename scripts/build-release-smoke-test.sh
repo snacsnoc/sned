@@ -166,6 +166,9 @@ assert_file "${AGGREGATE_TARGET}/release-artifacts/sned-${VERSION}-macos-arm64.t
 assert_not_exists "${AGGREGATE_TARGET}/release-artifacts/SHA256SUMS"
 
 SELECTED_TARGET="${SMOKE_ROOT}/selected-target"
+mkdir -p "${SELECTED_TARGET}/release-artifacts"
+cp "${AGGREGATE_TARGET}/release-artifacts/sned-${VERSION}-freebsd-amd64.tar.gz" \
+    "${SELECTED_TARGET}/release-artifacts/sned-${VERSION}-freebsd-amd64.tar.gz"
 PATH="${FAKE_BIN_DIR}:${PATH}" \
     FAKE_LOG="${FAKE_LOG}" \
     CARGO_TARGET_DIR="${SELECTED_TARGET}" \
@@ -173,8 +176,13 @@ PATH="${FAKE_BIN_DIR}:${PATH}" \
         --target macos-arm64 --target linux-amd64 >/dev/null
 assert_file "${SELECTED_TARGET}/release-artifacts/sned-${VERSION}-macos-arm64.tar.gz"
 assert_file "${SELECTED_TARGET}/release-artifacts/sned-${VERSION}-linux-amd64.tar.gz"
-assert_not_exists "${SELECTED_TARGET}/release-artifacts/sned-${VERSION}-freebsd-amd64.tar.gz"
+assert_file "${SELECTED_TARGET}/release-artifacts/sned-${VERSION}-freebsd-amd64.tar.gz"
 assert_file "${SELECTED_TARGET}/release-artifacts/SHA256SUMS"
+[[ "$(wc -l < "${SELECTED_TARGET}/release-artifacts/SHA256SUMS" | tr -d ' ')" == 2 ]]
+if grep -q 'freebsd-amd64' "${SELECTED_TARGET}/release-artifacts/SHA256SUMS"; then
+    printf '%s\n' 'selected checksum manifest included a stale archive' >&2
+    exit 1
+fi
 
 FAIL_TARGET="${SMOKE_ROOT}/aggregate-failure-target"
 PATH="${FAKE_BIN_DIR}:${PATH}" \

@@ -124,5 +124,5 @@ for target in "${TARGETS[@]}"; do
     completed_targets+=("${target}")
 done
 
-write_release_checksums "${TARGET_DIR}" "${VERSION}"
+write_release_checksums "${TARGET_DIR}" "${VERSION}" "${TARGETS[@]}"
 printf '%s\n' "release artifacts ready in ${ARTIFACT_DIR}"

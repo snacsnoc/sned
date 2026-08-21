@@ -54,6 +54,7 @@ repack_release() {
 write_release_checksums() {
     local target_dir="$1"
     local version="$2"
+    shift 2
     local artifact_dir
     artifact_dir="$(release_artifact_dir "${target_dir}")"
     local checksum_file="${artifact_dir}/SHA256SUMS"
@@ -62,15 +63,24 @@ write_release_checksums() {
     local staged_checksum_file
     staged_checksum_file="$(mktemp "${artifact_dir}/.SHA256SUMS.tmp.XXXXXX")"
     local archives=()
-    shopt -s nullglob
-    archives=("${artifact_dir}/sned-${version}-"*.tar.gz)
-    shopt -u nullglob
+    local suffix
+    for suffix in "$@"; do
+        archives+=("${artifact_dir}/sned-${version}-${suffix}.tar.gz")
+    done
 
     if [[ "${#archives[@]}" -eq 0 ]]; then
         rm -f "${staged_checksum_file}"
         printf '%s\n' "no release archives found for version ${version}" >&2
         return 1
     fi
+
+    for archive_path in "${archives[@]}"; do
+        if [[ ! -f "${archive_path}" ]]; then
+            rm -f "${staged_checksum_file}"
+            printf '%s\n' "release archive not found: ${archive_path}" >&2
+            return 1
+        fi
+    done
 
     if ! (
         cd "${artifact_dir}"
