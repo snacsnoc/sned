@@ -6705,6 +6705,11 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(matches!(result, TurnResult::Complete));
 
         let rendered = drain_rendered_output(&mut rx).join("\n");
+        let rendered = crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&rendered)
+            .iter()
+            .map(ratatui::text::Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rendered.contains("fn line_200()"));
         assert!(!rendered.contains("fn line_201()"));
         assert!(rendered.contains("[snipped from streamed display; use /full]"));

@@ -497,7 +497,10 @@ def long_completion_navigation():
         if "type a prompt" in clean and not sent_prompt:
             session.send(b"trigger long completion navigation\r")
             sent_prompt = True
-        if "COMPLETION_NAV_TOP" in tail and "COMPLETION_NAV_BOTTOM" not in tail and not sent_scroll_up:
+        # Completion opens pinned to its bottom. Start the boundary walk from
+        # there; waiting for the top marker cannot work once completion rows
+        # are counted as real transcript rows.
+        if "COMPLETION_NAV_BOTTOM" in tail and not sent_scroll_up:
             scroll_up_offset = len(session.buf)
             time.sleep(0.2)
             session.send(scroll_up * 3 + b"\r")
@@ -768,7 +771,6 @@ def plan_approve_act():
     sent_prompt = False
     sent_approve = False
     sent_tool_approve = False
-    tool_approval_visible = False
     sent_exit = False
     plan_generated = False
     plan_approved = False
@@ -780,7 +782,7 @@ def plan_approve_act():
     def tick(session):
         nonlocal sent_prompt, sent_approve, sent_tool_approve, sent_exit
         nonlocal plan_generated, plan_approved, act_mode_seen, completion_seen
-        nonlocal command_executed_before_approval, tool_approval_visible
+        nonlocal command_executed_before_approval
         clean = clean_output(session.buf)
         tail = visible_tail(clean)
 
@@ -792,18 +794,22 @@ def plan_approve_act():
         if plan_generated and not sent_approve:
             session.send(b"/plan approve\r")
             sent_approve = True
-        if sent_approve and re.search(r"Plan\s*approved\..{0,80}Starting", clean):
+        if sent_approve and (
+            re.search(r"Plan\s*approved\..{0,80}Starting", clean)
+            or "Execute this tool?" in clean
+        ):
             plan_approved = True
         if plan_approved and mode_visible(tail, "ACT"):
             act_mode_seen = True
-        if plan_approved and ("[y] Approve" in tail or "Execute this tool?" in tail) and not sent_tool_approve:
-            if not tool_approval_visible:
-                tool_approval_visible = True
-            else:
-                if marker_path is not None and os.path.exists(marker_path):
-                    command_executed_before_approval = True
-                session.send(b"y\r")
-                sent_tool_approve = True
+        if (
+            plan_approved
+            and ("[y] Approve" in clean or "Execute this tool?" in clean)
+            and not sent_tool_approve
+        ):
+            if marker_path is not None and os.path.exists(marker_path):
+                command_executed_before_approval = True
+            session.send(b"y\r")
+            sent_tool_approve = True
         if sent_tool_approve and "PLAN_APPROVE_ACT_COMPLETION" in clean:
             completion_seen = True
             if not sent_exit:
@@ -863,7 +869,7 @@ def plan_exit_active(command, env_name, expected_message, marker_name, completio
             sent_prompt = True
         if sent_prompt and "Plan Generated" in clean:
             plan_generated = True
-        if plan_generated and "Elapsed:" in clean and not sent_command:
+        if plan_generated and not sent_command:
             session.send((command + "\r").encode())
             sent_command = True
         if sent_command and all(

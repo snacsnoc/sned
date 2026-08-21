@@ -401,7 +401,25 @@ fn render_markdown_with_code_limit(
                         current_spans.push(Span::raw(p));
                     }
                     let style = *style_stack.last().unwrap();
-                    current_spans.push(Span::styled(piece, style));
+                    let mut parts = piece.split('\n');
+                    if let Some(first) = parts.next()
+                        && !first.is_empty()
+                    {
+                        current_spans.push(Span::styled(first.to_string(), style));
+                    }
+                    for part in parts {
+                        flush_line(
+                            &mut out,
+                            &mut current_text,
+                            &mut current_spans,
+                            *is_first_line,
+                            prefix,
+                        );
+                        *is_first_line = false;
+                        if !part.is_empty() {
+                            current_spans.push(Span::styled(part.to_string(), style));
+                        }
+                    }
                 }
             }
             Event::Code(c) => {
@@ -413,7 +431,14 @@ fn render_markdown_with_code_limit(
                 }
             }
             Event::SoftBreak => {
-                current_spans.push(Span::raw(" "));
+                flush_line(
+                    &mut out,
+                    &mut current_text,
+                    &mut current_spans,
+                    *is_first_line,
+                    prefix,
+                );
+                *is_first_line = false;
             }
             Event::HardBreak => {
                 flush_line(
@@ -501,6 +526,17 @@ mod tests {
         let text = collect_text(&lines);
         assert!(text.contains("Created the file."));
         assert!(text.contains("🚀 Task Completed:"));
+    }
+
+    #[test]
+    fn plain_text_newlines_render_as_separate_rows() {
+        let lines = render_completion_markdown("🚀 ", "first\nsecond\nthird");
+        let text: Vec<_> = lines.iter().map(Line::to_string).collect();
+
+        assert_eq!(text.len(), 3);
+        assert!(text[0].contains("first"));
+        assert!(text[1].contains("second"));
+        assert!(text[2].contains("third"));
     }
 
     #[test]
