@@ -1291,7 +1291,7 @@ impl AgentLoop {
                 }
                 // Force-save conversation history to preserve final turns
                 if let Some(ref storage) = self.deps.task_storage {
-                    let history = self.conversation_history.lock().await;
+                    let history = self.conversation_history.lock().await.clone();
                     if !history.is_empty()
                         && let Err(e) = storage.write_api_conversation_history_async(&history).await
                     {
@@ -1341,7 +1341,7 @@ impl AgentLoop {
                     // Force-save conversation history to preserve turns that would
                     // otherwise be lost to the debounce window (W4)
                     if let Some(ref storage) = self.deps.task_storage {
-                        let history = self.conversation_history.lock().await;
+                        let history = self.conversation_history.lock().await.clone();
                         if !history.is_empty()
                             && let Err(e) =
                                 storage.write_api_conversation_history_async(&history).await
@@ -1592,23 +1592,23 @@ impl AgentLoop {
                     // Force-save conversation history immediately on cancellation (W4 fix)
                     // Bypass the 5-turn debounce to prevent data loss
                     if let Some(ref storage) = self.deps.task_storage {
-                        let history = self.conversation_history.lock().await;
+                        let history = self.conversation_history.lock().await.clone();
                         if !history.is_empty()
                             && let Err(e) =
                                 storage.write_api_conversation_history_async(&history).await
                         {
                             error!("Failed to save conversation history on cancel: {}", e);
                         }
-                        drop(history);
 
-                        let state = self.state.lock().await;
-                        if let Some(ref summary) = state.compacted_summary
-                            && let Err(e) = storage.write_compacted_summary_async(summary).await
+                        let summary = self.state.lock().await.compacted_summary.clone();
+                        if let Some(summary) = summary
+                            && let Err(e) = storage.write_compacted_summary_async(&summary).await
                         {
                             error!("Failed to save compacted summary on cancel: {}", e);
                         }
 
                         // Persist deleted range to history item
+                        let state = self.state.lock().await;
                         if let Some(deleted_range) = state.conversation_history_deleted_range
                             && let Some(ref state_mgr) = self.state_manager
                             && let Some(mut history_item) =
@@ -4084,7 +4084,7 @@ impl AgentLoop {
             }
             // Force save on completion (async, non-blocking)
             if let Some(ref storage) = self.deps.task_storage {
-                let history = self.conversation_history.lock().await;
+                let history = self.conversation_history.lock().await.clone();
                 if !history.is_empty()
                     && let Err(e) = storage.write_api_conversation_history_async(&history).await
                 {
@@ -4508,10 +4508,14 @@ impl AgentLoop {
                 let res_text = tool_result_to_text(res);
 
                 // Persist compacted summary immediately if condense tool was used
-                if tool_name == "condense"
-                    && let Some(summary) = &tool_context.state.lock().await.compacted_summary
+                let summary = if tool_name == "condense" {
+                    tool_context.state.lock().await.compacted_summary.clone()
+                } else {
+                    None
+                };
+                if let Some(summary) = summary
                     && let Some(storage) = task_storage
-                    && let Err(e) = storage.write_compacted_summary_async(summary).await
+                    && let Err(e) = storage.write_compacted_summary_async(&summary).await
                 {
                     error!("Failed to persist compacted summary immediately: {}", e);
                 }
@@ -4576,7 +4580,7 @@ impl AgentLoop {
                 let compacted_summary = state.compacted_summary.clone();
                 drop(state); // Drop state lock before acquiring history lock
 
-                let history = self.conversation_history.lock().await;
+                let history = self.conversation_history.lock().await.clone();
                 if !history.is_empty()
                     && let Err(e) = storage.write_api_conversation_history_async(&history).await
                 {

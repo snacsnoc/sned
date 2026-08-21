@@ -13,6 +13,7 @@ use crate::storage::disk::GlobalFileNames;
 
 pub const DEFAULT_TRANSCRIPT_CAP: usize = 1_000;
 pub const CURRENT_TRANSCRIPT_FORMAT_VERSION: u32 = 1;
+const ASYNC_LOCK_RETRY_DELAYS_MS: &[u64] = &[100, 200, 400, 800, 1_600, 3_200];
 
 fn default_transcript_format_version() -> u32 {
     CURRENT_TRANSCRIPT_FORMAT_VERSION
@@ -246,8 +247,7 @@ impl TaskStorage {
             .task_dir
             .join(GlobalFileNames::API_CONVERSATION_HISTORY);
 
-        // Acquire lock before async operation
-        let _guard = self.acquire_lock()?;
+        let _guard = self.acquire_lock_with_retry().await?;
         crate::storage::disk::atomic_write_file_async(&file_path, &data).await
     }
 
@@ -305,8 +305,7 @@ impl TaskStorage {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let file_path = self.task_dir.join(GlobalFileNames::COMPACTED_SUMMARY);
 
-        // Acquire lock before async operation
-        let _guard = self.acquire_lock()?;
+        let _guard = self.acquire_lock_with_retry().await?;
         crate::storage::disk::atomic_write_file_async(&file_path, &data).await
     }
 
@@ -503,10 +502,36 @@ impl TaskStorage {
             .truncate(false)
             .open(&lock_path)?;
 
-        file.try_lock()
-            .map_err(|e| io::Error::other(format!("Task is locked by another process: {e}")))?;
+        file.try_lock().map_err(|e| {
+            let message = format!("Task is locked by another process: {e}");
+            match e {
+                std::fs::TryLockError::WouldBlock => {
+                    io::Error::new(io::ErrorKind::WouldBlock, message)
+                }
+                std::fs::TryLockError::Error(_) => io::Error::other(message),
+            }
+        })?;
 
         Ok(LockGuard { _file: file })
+    }
+
+    /// Retry short-lived cross-process contention without blocking a Tokio worker.
+    async fn acquire_lock_with_retry(&self) -> io::Result<LockGuard> {
+        for attempt in 0..=ASYNC_LOCK_RETRY_DELAYS_MS.len() {
+            match self.acquire_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && attempt < ASYNC_LOCK_RETRY_DELAYS_MS.len() =>
+                {
+                    tokio::time::sleep(Duration::from_millis(ASYNC_LOCK_RETRY_DELAYS_MS[attempt]))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("lock retry loop always returns after its final attempt")
     }
 
     /// Acquire an exclusive lock on the task directory, blocking until available.
@@ -1120,6 +1145,130 @@ mod tests {
 
         handle1.join().unwrap();
         handle2.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_async_history_write_retries_short_lock_contention() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("async-history-lock");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        let holder_storage = storage.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let holder_released = Arc::clone(&released);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let holder = thread::spawn(move || {
+            let _guard = holder_storage.acquire_lock().unwrap();
+            ready_tx.send(()).unwrap();
+            while !holder_released.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        ready_rx.recv().unwrap();
+
+        let writer_storage = storage.clone();
+        let write = tokio::spawn(async move {
+            writer_storage
+                .write_api_conversation_history_async(&[])
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!write.is_finished(), "write should wait for the held lock");
+        released.store(true, Ordering::Release);
+
+        assert!(write.await.unwrap().is_ok());
+        holder.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_async_summary_write_retries_short_lock_contention() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("async-summary-lock");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        let holder_storage = storage.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let holder_released = Arc::clone(&released);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let holder = thread::spawn(move || {
+            let _guard = holder_storage.acquire_lock().unwrap();
+            ready_tx.send(()).unwrap();
+            while !holder_released.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        ready_rx.recv().unwrap();
+
+        let writer_storage = storage.clone();
+        let write = tokio::spawn(async move {
+            writer_storage
+                .write_compacted_summary_async(
+                    &crate::core::context::context_manager::CompactedSummary::new(
+                        "summary".to_string(),
+                        1,
+                    ),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!write.is_finished(), "write should wait for the held lock");
+        released.store(true, Ordering::Release);
+
+        assert!(write.await.unwrap().is_ok());
+        holder.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_async_lock_retry_is_bounded() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("async-lock-timeout");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        let holder_storage = storage.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let holder_released = Arc::clone(&released);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let holder = thread::spawn(move || {
+            let _guard = holder_storage.acquire_lock().unwrap();
+            ready_tx.send(()).unwrap();
+            while !holder_released.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        ready_rx.recv().unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(8), storage.acquire_lock_with_retry())
+                .await
+                .expect("lock retry should be bounded");
+        let error = match result {
+            Ok(_) => panic!("held lock should exhaust retries"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        released.store(true, Ordering::Release);
+        holder.join().unwrap();
     }
 
     /// Regression test: concurrent metadata updates do not clobber each other.
