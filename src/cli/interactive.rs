@@ -1254,15 +1254,66 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     drain_output_queues(&mut priority_rx, rx, app, None);
 }
 
-fn sync_scroll_viewport(terminal: &ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+fn sync_scroll_viewport(
+    terminal: &ratatui::DefaultTerminal,
+    app: &mut App,
+    debug: bool,
+) -> anyhow::Result<()> {
     app.capture_manual_viewport_for_reflow();
-    let terminal_size = terminal.size()?;
+    let terminal_size = terminal
+        .size()
+        .map_err(|error| tui_io_error("TUI terminal size query failed", error, debug))?;
     let terminal_height = terminal_size.height;
     let content_height = terminal_height.saturating_sub(6) as usize;
     app.set_content_width(terminal_size.width as usize);
     app.set_content_height(content_height);
     app.has_resized = false;
     Ok(())
+}
+
+fn tui_io_error(operation: &'static str, error: std::io::Error, debug: bool) -> anyhow::Error {
+    if debug {
+        tracing::error!(
+            operation,
+            error_kind = ?error.kind(),
+            raw_os_error = ?error.raw_os_error(),
+            error = %error,
+            "TUI I/O operation failed"
+        );
+    }
+    anyhow::Error::new(error).context(operation)
+}
+
+fn handle_tui_draw_error(
+    app: &mut App,
+    error: std::io::Error,
+    debug: bool,
+) -> anyhow::Result<bool> {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        app.needs_redraw = true;
+        if debug {
+            tracing::debug!(
+                error_kind = ?error.kind(),
+                raw_os_error = ?error.raw_os_error(),
+                error = %error,
+                "TUI draw temporarily unavailable; retrying"
+            );
+        }
+        return Ok(false);
+    }
+
+    Err(tui_io_error("TUI draw failed", error, debug))
+}
+
+fn draw_tui_frame(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    debug: bool,
+) -> anyhow::Result<bool> {
+    match terminal.draw(|f| app.render(f)) {
+        Ok(_) => Ok(true),
+        Err(error) => handle_tui_draw_error(app, error, debug),
+    }
 }
 
 /// Drain the output channel, force the scroll to the bottom, sync the
@@ -1275,11 +1326,12 @@ fn drain_and_render_user_submit(
     priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     output_rx: &mut mpsc::Receiver<OutputEvent>,
     storage: &TaskStorage,
+    debug: bool,
 ) -> anyhow::Result<()> {
     drain_output_queues(priority_output_rx, output_rx, app, Some(storage));
     app.force_bottom();
-    sync_scroll_viewport(terminal, app)?;
-    terminal.draw(|f| app.render(f))?;
+    sync_scroll_viewport(terminal, app, debug)?;
+    let _ = draw_tui_frame(terminal, app, debug)?;
     Ok(())
 }
 
@@ -1853,9 +1905,7 @@ async fn handle_key_event_inner(
         let mq = crate::core::file_search::extract_mention_query_at_cursor(&text, cursor);
         if mq.in_mention_mode {
             if key.code == KeyCode::Tab
-                || (key.code == KeyCode::Enter
-                    && !key.modifiers.contains(KeyModifiers::SHIFT)
-                    && app.picker_selection_explicit)
+                || (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT))
             {
                 let result = &app.picker_results[app.picker_index];
                 let (new_text, cursor_pos) = crate::core::file_search::insert_mention(
@@ -1866,9 +1916,6 @@ async fn handle_key_event_inner(
                 );
                 app.set_input_text_and_cursor(&new_text, cursor_pos);
                 clear_mention_search(app, true);
-                return Ok(None);
-            }
-            if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
                 return Ok(None);
             }
         } else if key.code == KeyCode::Tab
@@ -3532,7 +3579,7 @@ async fn run_main_loop(
         }
 
         if app.has_resized {
-            sync_scroll_viewport(terminal, app)?;
+            sync_scroll_viewport(terminal, app, task_opts.debug)?;
         }
 
         // 2. Render (skip if nothing changed)
@@ -3550,18 +3597,19 @@ async fn run_main_loop(
         if should_render {
             {
                 let t = std::time::Instant::now();
-                terminal.draw(|f| app.render(f))?;
-                last_draw_at = Some(std::time::Instant::now());
-                timing.draw_total_us += t.elapsed().as_micros() as u64;
-                timing.draw_count += 1;
-                if timing_enabled
-                    && timing.first_render_time.is_none()
-                    && timing.first_output_emit_time.is_some()
-                {
-                    timing.first_render_time = Some(std::time::Instant::now());
+                if draw_tui_frame(terminal, app, task_opts.debug)? {
+                    last_draw_at = Some(std::time::Instant::now());
+                    timing.draw_total_us += t.elapsed().as_micros() as u64;
+                    timing.draw_count += 1;
+                    if timing_enabled
+                        && timing.first_render_time.is_none()
+                        && timing.first_output_emit_time.is_some()
+                    {
+                        timing.first_render_time = Some(std::time::Instant::now());
+                    }
+                    app.needs_redraw = false;
                 }
             }
-            app.needs_redraw = false;
         }
 
         // Crossterm wakes immediately for input, so idle sessions can wait longer
@@ -3571,9 +3619,12 @@ async fn run_main_loop(
         } else {
             IDLE_POLL_INTERVAL
         };
-        let has_event = ratatui::crossterm::event::poll(poll_interval)?;
+        let has_event = ratatui::crossterm::event::poll(poll_interval)
+            .map_err(|error| tui_io_error("TUI input poll failed", error, task_opts.debug))?;
         if has_event {
-            match ratatui::crossterm::event::read()? {
+            match ratatui::crossterm::event::read()
+                .map_err(|error| tui_io_error("TUI input read failed", error, task_opts.debug))?
+            {
                 Event::Key(key) => {
                     app.needs_redraw = true;
                     if let Some(outcome) = handle_approval_key(app, &key) {
@@ -3779,6 +3830,7 @@ async fn run_main_loop(
                                     priority_output_rx,
                                     output_rx,
                                     &task_storage,
+                                    task_opts.debug,
                                 )?;
 
                                 // Save to command history without rereading the
@@ -3827,6 +3879,7 @@ async fn run_main_loop(
                                             priority_output_rx,
                                             output_rx,
                                             &task_storage,
+                                            task_opts.debug,
                                         )?;
                                         // The busy check above guarantees this will not wait on
                                         // an AgentLoop currently held by another run.
@@ -3949,6 +4002,7 @@ async fn run_main_loop(
                                         priority_output_rx,
                                         output_rx,
                                         &task_storage,
+                                        task_opts.debug,
                                     )?;
                                     spawn_agent_task(
                                         &session,
@@ -4376,6 +4430,48 @@ mod tests {
 
     fn transcript_has_kind(app: &App, kind: BlockKind) -> bool {
         app.output_line_kinds.iter().any(|current| *current == kind)
+    }
+
+    #[test]
+    fn test_tui_io_error_identifies_operation_and_os_error() {
+        let error = tui_io_error(
+            "TUI input poll failed",
+            std::io::Error::from_raw_os_error(35),
+            true,
+        );
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("TUI input poll failed"));
+        assert!(rendered.contains("os error 35"));
+    }
+
+    #[test]
+    fn test_would_block_draw_preserves_redraw_request() {
+        let mut app = App::new();
+        app.needs_redraw = false;
+
+        let rendered = handle_tui_draw_error(
+            &mut app,
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "temporarily unavailable"),
+            false,
+        )
+        .expect("WouldBlock should be retryable");
+
+        assert!(!rendered);
+        assert!(app.needs_redraw);
+    }
+
+    #[test]
+    fn test_non_would_block_draw_error_is_fatal() {
+        let mut app = App::new();
+        let error = handle_tui_draw_error(
+            &mut app,
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed terminal"),
+            false,
+        )
+        .expect_err("non-WouldBlock draw errors should remain fatal");
+
+        assert!(format!("{error:#}").contains("TUI draw failed"));
     }
 
     #[test]
@@ -6720,7 +6816,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_picker_enter_requires_explicit_navigation() -> anyhow::Result<()> {
+    async fn test_file_picker_enter_accepts_first_result() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (tx, _rx) = mpsc::channel(4);
@@ -6730,19 +6826,6 @@ mod tests {
 
         let action = handle_key_event(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &mut app,
-            &output_writer,
-            &state_handle,
-            "task-1",
-        )
-        .await?;
-
-        assert!(action.is_none());
-        assert!(app.picker_active);
-        assert_eq!(app.input.lines().join("\n"), "@");
-
-        let action = handle_key_event(
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &mut app,
             &output_writer,
             &state_handle,
