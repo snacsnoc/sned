@@ -12,7 +12,6 @@ use std::process::Output;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -32,6 +31,48 @@ fn search_timeout() -> Duration {
 const DEFAULT_SEARCH_MAX_LINES: u32 = 100;
 /// Environment variable to configure search result limit
 const SEARCH_MAX_LINES_ENV: &str = "SNED_SEARCH_MAX_LINES";
+const DEFAULT_SEARCH_OUTPUT_LIMIT: usize = 100 * 1024;
+const OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+fn search_output_limit() -> usize {
+    std::env::var("SNED_SEARCH_OUTPUT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0 && value <= 64 * 1024 * 1024)
+        .unwrap_or(DEFAULT_SEARCH_OUTPUT_LIMIT)
+}
+
+async fn read_limited_search_output<R>(mut reader: R, limit: usize) -> io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut output = Vec::with_capacity(limit.min(OUTPUT_READ_CHUNK_BYTES));
+    let mut total_bytes = 0_u64;
+    let mut chunk = [0_u8; OUTPUT_READ_CHUNK_BYTES];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(read as u64);
+        let remaining = limit.saturating_sub(output.len());
+        output.extend_from_slice(&chunk[..read.min(remaining)]);
+    }
+
+    if total_bytes > limit as u64 {
+        output.extend_from_slice(
+            format!(
+                "\n\n(Search output truncated after retaining {} of {} bytes.)",
+                output.len(),
+                total_bytes
+            )
+            .as_bytes(),
+        );
+    }
+    Ok(output)
+}
 
 /// Cached ripgrep availability check (checked once per process lifetime)
 static RIPGREP_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -262,18 +303,9 @@ async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyho
         .take()
         .ok_or_else(|| anyhow::anyhow!("search command did not capture stderr"))?;
 
-    let stdout_task = tokio::spawn(async move {
-        let mut buffer = Vec::new();
-        let mut reader = tokio::io::BufReader::new(stdout);
-        reader.read_to_end(&mut buffer).await?;
-        Ok::<_, io::Error>(buffer)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buffer = Vec::new();
-        let mut reader = tokio::io::BufReader::new(stderr);
-        reader.read_to_end(&mut buffer).await?;
-        Ok::<_, io::Error>(buffer)
-    });
+    let output_limit = search_output_limit();
+    let stdout_task = tokio::spawn(read_limited_search_output(stdout, output_limit));
+    let stderr_task = tokio::spawn(read_limited_search_output(stderr, output_limit));
 
     // Drop child's stdout/stderr so kill() + wait() returns promptly.
     // The reader tasks still hold their own handles and will drain remaining data.
@@ -346,6 +378,26 @@ mod tests {
 
     // Mutex to serialize env var mutations across tests
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn test_limited_search_reader_drains_after_reaching_its_budget() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 16 * 1024]).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let output = read_limited_search_output(reader, 1024).await.unwrap();
+        writer_task.await.unwrap();
+
+        assert!(output.starts_with(&vec![b'x'; 1024]));
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains("Search output truncated after retaining 1024 of 16384 bytes")
+        );
+    }
 
     #[tokio::test]
     async fn test_search_files_basic() {

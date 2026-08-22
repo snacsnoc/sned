@@ -15,6 +15,224 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+const DEFAULT_COMMAND_COLLECT_LIMIT: usize = 10 * 1024 * 1024;
+const DEFAULT_SCRIPT_OUTPUT_LIMIT: usize = 1024 * 1024;
+const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
+const OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+fn configured_output_limit(env_var: &str, default: usize) -> usize {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0 && value <= 64 * 1024 * 1024)
+        .unwrap_or(default)
+}
+
+fn command_collect_limit() -> usize {
+    configured_output_limit("SNED_COMMAND_COLLECT_LIMIT", DEFAULT_COMMAND_COLLECT_LIMIT)
+}
+
+fn script_output_limit() -> usize {
+    configured_output_limit("SNED_SCRIPT_OUTPUT_LIMIT", DEFAULT_SCRIPT_OUTPUT_LIMIT)
+}
+
+#[derive(Debug, Default)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    total_bytes: u64,
+}
+
+impl CapturedOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(OUTPUT_READ_CHUNK_BYTES)),
+            total_bytes: 0,
+        }
+    }
+
+    fn is_truncated(&self, limit: usize) -> bool {
+        self.total_bytes > limit as u64
+    }
+
+    fn display(&self, limit: usize, stream: &str) -> String {
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.is_truncated(limit) {
+            text.push_str(&format!(
+                "\n\n({stream} truncated after retaining {} of {} bytes.)",
+                self.bytes.len(),
+                self.total_bytes
+            ));
+        }
+        text
+    }
+
+    fn push(&mut self, chunk: &[u8], limit: usize) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
+        let remaining = limit.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+}
+
+async fn read_limited_output<R>(mut reader: R, limit: usize) -> std::io::Result<CapturedOutput>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut captured = CapturedOutput::new(limit);
+    let mut chunk = [0_u8; OUTPUT_READ_CHUNK_BYTES];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(captured);
+        }
+        captured.push(&chunk[..read], limit);
+    }
+}
+
+enum StreamLine {
+    Text(String),
+    Overlong,
+}
+
+impl StreamLine {
+    fn into_text(self, stream: &str) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::Overlong => format!(
+                "({stream} line exceeded {} bytes and was discarded.)",
+                MAX_STREAM_LINE_BYTES
+            ),
+        }
+    }
+}
+
+struct BoundedLineReader<R> {
+    reader: R,
+    pending: Vec<u8>,
+    line: Vec<u8>,
+    discarding_line: bool,
+}
+
+impl<R> BoundedLineReader<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            pending: Vec::with_capacity(OUTPUT_READ_CHUNK_BYTES),
+            line: Vec::with_capacity(OUTPUT_READ_CHUNK_BYTES),
+            discarding_line: false,
+        }
+    }
+
+    async fn next_line(&mut self) -> std::io::Result<Option<StreamLine>> {
+        use tokio::io::AsyncReadExt;
+
+        loop {
+            if self.pending.is_empty() {
+                let mut chunk = [0_u8; OUTPUT_READ_CHUNK_BYTES];
+                let read = self.reader.read(&mut chunk).await?;
+                if read == 0 {
+                    if self.discarding_line {
+                        self.discarding_line = false;
+                        self.line.clear();
+                        return Ok(Some(StreamLine::Overlong));
+                    }
+                    if self.line.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(StreamLine::Text(self.take_line())));
+                }
+                self.pending.extend_from_slice(&chunk[..read]);
+            }
+
+            let newline = self.pending.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(self.pending.len(), |index| index + 1);
+            let complete_line = newline.is_some();
+            let mut fragment = self.pending.drain(..consumed).collect::<Vec<_>>();
+            if complete_line {
+                fragment.pop();
+            }
+
+            if !self.discarding_line {
+                let remaining = MAX_STREAM_LINE_BYTES.saturating_sub(self.line.len());
+                if fragment.len() > remaining {
+                    self.line.extend_from_slice(&fragment[..remaining]);
+                    self.discarding_line = true;
+                } else {
+                    self.line.extend_from_slice(&fragment);
+                }
+            }
+
+            if complete_line {
+                if self.discarding_line {
+                    self.discarding_line = false;
+                    self.line.clear();
+                    return Ok(Some(StreamLine::Overlong));
+                }
+                return Ok(Some(StreamLine::Text(self.take_line())));
+            }
+        }
+    }
+
+    fn take_line(&mut self) -> String {
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+        String::from_utf8_lossy(&std::mem::take(&mut self.line)).into_owned()
+    }
+}
+
+fn append_limited_output(output: &mut String, line: &str, limit: usize, truncated: &mut bool) {
+    if *truncated {
+        return;
+    }
+
+    let available = limit.saturating_sub(output.len());
+    let needed = line.len().saturating_add(1);
+    if needed <= available {
+        output.push_str(line);
+        output.push('\n');
+        return;
+    }
+
+    let end = line.floor_char_boundary(available);
+    output.push_str(&line[..end]);
+    *truncated = true;
+}
+
+fn append_limited_text(output: &mut String, text: &str, limit: usize, truncated: &mut bool) {
+    if *truncated {
+        return;
+    }
+
+    let available = limit.saturating_sub(output.len());
+    if text.len() <= available {
+        output.push_str(text);
+        return;
+    }
+
+    output.push_str(&text[..text.floor_char_boundary(available)]);
+    *truncated = true;
+}
+
+fn finalize_collected_output(
+    mut output: String,
+    truncated: bool,
+    stream: &str,
+    limit: usize,
+) -> String {
+    if truncated {
+        output.push_str(&format!(
+            "\n({stream} collection truncated at {limit} bytes; additional output was discarded.)\n"
+        ));
+    }
+    output
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecuteCommandHandler {
     safety_checker: CommandSafetyChecker,
@@ -358,6 +576,8 @@ impl ExecuteCommandHandler {
         use tokio::time::timeout;
 
         let mut combined_output = String::new();
+        let combined_output_limit = command_collect_limit();
+        let mut combined_output_truncated = false;
         let mut sandbox_env_report = SandboxEnvReport::default();
         let mut command_failed = false;
 
@@ -435,12 +655,14 @@ impl ExecuteCommandHandler {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("Command stderr was not captured"))?;
 
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut stdout_reader = BufReader::new(stdout).lines();
-            let mut stderr_reader = BufReader::new(stderr).lines();
+            let mut stdout_reader = BoundedLineReader::new(stdout);
+            let mut stderr_reader = BoundedLineReader::new(stderr);
 
             let mut stdout_collected = String::new();
             let mut stderr_collected = String::new();
+            let collect_limit = command_collect_limit();
+            let mut stdout_collect_truncated = false;
+            let mut stderr_collect_truncated = false;
 
             // Per-stream head+tail condensation.  Disabled by default (the env
             // var is opt-in) so the trailing context is always visible;
@@ -461,6 +683,7 @@ impl ExecuteCommandHandler {
                     result = stdout_reader.next_line() => {
                         match result {
                             Ok(Some(line)) => {
+                                let line = line.into_text("stdout");
                                 stdout_displayed += 1;
                                 if !json_output {
                                     if stream_limit.is_none() {
@@ -496,8 +719,12 @@ impl ExecuteCommandHandler {
                                         stdout_tail_buffer.pop_front();
                                     }
                                 }
-                                stdout_collected.push_str(&line);
-                                stdout_collected.push('\n');
+                                append_limited_output(
+                                    &mut stdout_collected,
+                                    &line,
+                                    collect_limit,
+                                    &mut stdout_collect_truncated,
+                                );
                             }
                             Ok(None) => {}
                             Err(e) => tracing::warn!("Failed to read stdout line: {}", e),
@@ -506,6 +733,7 @@ impl ExecuteCommandHandler {
                     result = stderr_reader.next_line() => {
                         match result {
                             Ok(Some(line)) => {
+                                let line = line.into_text("stderr");
                                 stderr_displayed += 1;
                                 if !json_output {
                                     if stream_limit.is_none() {
@@ -543,8 +771,12 @@ impl ExecuteCommandHandler {
                                         stderr_tail_buffer.pop_front();
                                     }
                                 }
-                                stderr_collected.push_str(&line);
-                                stderr_collected.push('\n');
+                                append_limited_output(
+                                    &mut stderr_collected,
+                                    &line,
+                                    collect_limit,
+                                    &mut stderr_collect_truncated,
+                                );
                             }
                             Ok(None) => {}
                             Err(e) => tracing::warn!("Failed to read stderr line: {}", e),
@@ -596,6 +828,7 @@ impl ExecuteCommandHandler {
                         break match result {
                             Ok(Ok(status)) => {
                                 while let Ok(Some(line)) = stdout_reader.next_line().await {
+                                    let line = line.into_text("stdout");
                                     stdout_displayed += 1;
                                     if !json_output {
                                         if stream_limit.is_none() {
@@ -627,10 +860,15 @@ impl ExecuteCommandHandler {
                                             stdout_tail_buffer.pop_front();
                                         }
                                     }
-                                    stdout_collected.push_str(&line);
-                                    stdout_collected.push('\n');
+                                    append_limited_output(
+                                        &mut stdout_collected,
+                                        &line,
+                                        collect_limit,
+                                        &mut stdout_collect_truncated,
+                                    );
                                 }
                                 while let Ok(Some(line)) = stderr_reader.next_line().await {
+                                    let line = line.into_text("stderr");
                                     stderr_displayed += 1;
                                     if !json_output {
                                         if stream_limit.is_none() {
@@ -664,13 +902,29 @@ impl ExecuteCommandHandler {
                                             stderr_tail_buffer.pop_front();
                                         }
                                     }
-                                    stderr_collected.push_str(&line);
-                                    stderr_collected.push('\n');
+                                    append_limited_output(
+                                        &mut stderr_collected,
+                                        &line,
+                                        collect_limit,
+                                        &mut stderr_collect_truncated,
+                                    );
                                 }
                                 std::process::Output {
                                     status,
-                                    stdout: stdout_collected.into_bytes(),
-                                    stderr: stderr_collected.into_bytes(),
+                                    stdout: finalize_collected_output(
+                                        stdout_collected,
+                                        stdout_collect_truncated,
+                                        "stdout",
+                                        collect_limit,
+                                    )
+                                    .into_bytes(),
+                                    stderr: finalize_collected_output(
+                                        stderr_collected,
+                                        stderr_collect_truncated,
+                                        "stderr",
+                                        collect_limit,
+                                    )
+                                    .into_bytes(),
                                 }
                             }
                             Ok(Err(e)) => return Err(anyhow::anyhow!("Command failed: {e}")),
@@ -707,7 +961,22 @@ impl ExecuteCommandHandler {
                                     }
                                 }
                                 let err = crate::cli::actionable_errors::command_timeout(&cmd_str, timeout_duration.as_secs());
-                                return Err(anyhow::anyhow!("{}\nStdout: {}\nStderr: {}", err.display(), stdout_collected, stderr_collected));
+                                return Err(anyhow::anyhow!(
+                                    "{}\nStdout: {}\nStderr: {}",
+                                    err.display(),
+                                    finalize_collected_output(
+                                        stdout_collected,
+                                        stdout_collect_truncated,
+                                        "stdout",
+                                        collect_limit,
+                                    ),
+                                    finalize_collected_output(
+                                        stderr_collected,
+                                        stderr_collect_truncated,
+                                        "stderr",
+                                        collect_limit,
+                                    )
+                                ));
                             }
                         };
                     }
@@ -794,18 +1063,43 @@ impl ExecuteCommandHandler {
             );
 
             if !combined_output.is_empty() {
-                combined_output.push_str("\n---\n");
+                append_limited_text(
+                    &mut combined_output,
+                    "\n---\n",
+                    combined_output_limit,
+                    &mut combined_output_truncated,
+                );
             }
 
             if !stdout.is_empty() {
-                combined_output.push_str(&stdout);
+                append_limited_text(
+                    &mut combined_output,
+                    &stdout,
+                    combined_output_limit,
+                    &mut combined_output_truncated,
+                );
             }
             if !stderr.is_empty() {
                 if !combined_output.is_empty() && !combined_output.ends_with('\n') {
-                    combined_output.push('\n');
+                    append_limited_text(
+                        &mut combined_output,
+                        "\n",
+                        combined_output_limit,
+                        &mut combined_output_truncated,
+                    );
                 }
-                combined_output.push_str("Stderr:\n");
-                combined_output.push_str(&stderr);
+                append_limited_text(
+                    &mut combined_output,
+                    "Stderr:\n",
+                    combined_output_limit,
+                    &mut combined_output_truncated,
+                );
+                append_limited_text(
+                    &mut combined_output,
+                    &stderr,
+                    combined_output_limit,
+                    &mut combined_output_truncated,
+                );
             }
 
             if !output.status.success() {
@@ -813,7 +1107,12 @@ impl ExecuteCommandHandler {
                     &cmd_str,
                     output.status.code(),
                 );
-                combined_output.push_str(&format!("\n{}", err.display()));
+                append_limited_text(
+                    &mut combined_output,
+                    &format!("\n{}", err.display()),
+                    combined_output_limit,
+                    &mut combined_output_truncated,
+                );
                 command_failed = true;
                 break;
             }
@@ -822,6 +1121,13 @@ impl ExecuteCommandHandler {
         if combined_output.is_empty() {
             combined_output.push_str("Command executed successfully with no output.");
         }
+
+        let combined_output = finalize_collected_output(
+            combined_output,
+            combined_output_truncated,
+            "command result",
+            combined_output_limit,
+        );
 
         sandbox_env_report.normalize();
         let limit_bytes = command_output_limit();
@@ -865,7 +1171,6 @@ impl ExecuteCommandHandler {
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
-        use tokio::io::AsyncReadExt;
         use tokio::process::Command;
         use tokio::time::timeout;
 
@@ -932,23 +1237,18 @@ impl ExecuteCommandHandler {
         #[cfg(unix)]
         let child_pid = child.id().unwrap_or(0) as i32;
 
-        let mut stdout = child
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("Script stdout was not captured"))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| anyhow::anyhow!("Script stderr was not captured"))?;
 
-        let stdout_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stdout.read_to_end(&mut buf).await.map(|_| buf)
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stderr.read_to_end(&mut buf).await.map(|_| buf)
-        });
+        let output_limit = script_output_limit();
+        let stdout_task = tokio::spawn(read_limited_output(stdout, output_limit));
+        let stderr_task = tokio::spawn(read_limited_output(stderr, output_limit));
 
         let output = match timeout(timeout_duration, child.wait()).await {
             Ok(Ok(status)) => {
@@ -961,11 +1261,7 @@ impl ExecuteCommandHandler {
                     .map_err(|e| anyhow::anyhow!("Failed to join stderr reader: {e}"))?
                     .map_err(|e| anyhow::anyhow!("Failed to read stderr: {e}"))?;
 
-                std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                }
+                (status, stdout, stderr)
             }
             Ok(Err(e)) => return Err(anyhow::anyhow!("Script failed to execute: {e}")),
             Err(_) => {
@@ -989,13 +1285,13 @@ impl ExecuteCommandHandler {
                     .await
                     .ok()
                     .and_then(std::result::Result::ok)
-                    .map(|buf| String::from_utf8_lossy(&buf).to_string())
+                    .map(|captured| captured.display(output_limit, "stdout"))
                     .unwrap_or_default();
                 let stderr = stderr_task
                     .await
                     .ok()
                     .and_then(std::result::Result::ok)
-                    .map(|buf| String::from_utf8_lossy(&buf).to_string())
+                    .map(|captured| captured.display(output_limit, "stderr"))
                     .unwrap_or_default();
                 let err = crate::cli::actionable_errors::command_timeout(
                     script,
@@ -1010,10 +1306,11 @@ impl ExecuteCommandHandler {
             }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let (status, stdout, stderr) = output;
+        let stdout = stdout.display(output_limit, "stdout");
+        let stderr = stderr.display(output_limit, "stderr");
 
-        let mut combined = stdout.to_string();
+        let mut combined = stdout;
         if !stderr.is_empty() {
             if !combined.is_empty() && !combined.ends_with('\n') {
                 combined.push('\n');
@@ -1022,11 +1319,11 @@ impl ExecuteCommandHandler {
             combined.push_str(&stderr);
         }
 
-        let script_failed = !output.status.success();
+        let script_failed = !status.success();
         if script_failed {
             let err = crate::cli::actionable_errors::command_exit_code(
                 &format!("{language} script"),
-                output.status.code(),
+                status.code(),
             );
             combined.push_str(&format!("\n{}", err.display()));
         }
@@ -1467,6 +1764,102 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("hello from python"));
+    }
+
+    #[tokio::test]
+    async fn test_limited_reader_drains_after_reaching_its_budget() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 16 * 1024]).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let captured = read_limited_output(reader, 1024).await.unwrap();
+        writer_task.await.unwrap();
+
+        assert_eq!(captured.bytes.len(), 1024);
+        assert_eq!(captured.total_bytes, 16 * 1024);
+        assert!(captured.is_truncated(1024));
+    }
+
+    #[tokio::test]
+    async fn test_line_reader_discards_a_newline_less_oversized_line() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; MAX_STREAM_LINE_BYTES + 16 * 1024])
+                .await
+                .unwrap();
+            writer.write_all(b"\nnext\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut reader = BoundedLineReader::new(reader);
+        assert!(matches!(
+            reader.next_line().await.unwrap(),
+            Some(StreamLine::Overlong)
+        ));
+        assert!(matches!(
+            reader.next_line().await.unwrap(),
+            Some(StreamLine::Text(line)) if line == "next"
+        ));
+        assert!(reader.next_line().await.unwrap().is_none());
+        writer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_limits_captured_output() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let original = std::env::var_os("SNED_SCRIPT_OUTPUT_LIMIT");
+        unsafe { std::env::set_var("SNED_SCRIPT_OUTPUT_LIMIT", "1024") };
+
+        let result = ExecuteCommandHandler::new()
+            .with_yolo(true)
+            .execute_script("import sys; sys.stdout.write('x' * 8192)", "python3", None)
+            .await;
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("SNED_SCRIPT_OUTPUT_LIMIT", value),
+                None => std::env::remove_var("SNED_SCRIPT_OUTPUT_LIMIT"),
+            }
+        }
+
+        let result = result.unwrap();
+        assert!(result.contains("stdout truncated after retaining 1024 of 8192 bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_limits_collected_output() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let original = std::env::var_os("SNED_COMMAND_COLLECT_LIMIT");
+        unsafe { std::env::set_var("SNED_COMMAND_COLLECT_LIMIT", "1024") };
+
+        let result = ExecuteCommandHandler::new()
+            .with_yolo(true)
+            .execute_commands(
+                vec!["python3 -c \"print(('x' * 128 + '\\n') * 64, end='')\"".to_string()],
+                None,
+            )
+            .await;
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("SNED_COMMAND_COLLECT_LIMIT", value),
+                None => std::env::remove_var("SNED_COMMAND_COLLECT_LIMIT"),
+            }
+        }
+
+        let result = result.unwrap();
+        assert!(result.contains("command result collection truncated at 1024 bytes"));
     }
 
     #[cfg(unix)]
