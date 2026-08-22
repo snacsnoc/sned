@@ -261,8 +261,7 @@ export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
 | `SNED_SEARCH_TIMEOUT_SECS` | File search timeout | `30` |
 | `SNED_FETCH_TIMEOUT_SECS` | Web fetch timeout | `30` |
 | `SNED_HOOK_TIMEOUT_MS` | Hook execution timeout | `10000` |
-| `SNED_DIR` | Config directory | `~/.sned` |
-| `SNED_DATA_DIR` | Data directory | `~/.sned/data` |
+| `SNED_DIR` | Sned storage root (`data/settings/global_settings.json`) | `~/.sned` |
 | `SNED_NO_ALTERNATE_SCREEN` | Use inline viewport | unset |
 | `SNED_SYSTEM_MD` | Extra system prompt file prepended before built-in prompt | unset |
 | `RUST_LOG` | Log level filter | `sned=warn` |

@@ -6,7 +6,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use ulid::Ulid;
 
 use std::time::Instant;
 
@@ -24,12 +23,6 @@ pub struct ConfigKeyInfo {
 
 /// List of all valid config keys with their types and descriptions.
 pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
-    // String fields
-    ConfigKeyInfo {
-        name: "mode",
-        key_type: "string",
-        description: "Operating mode (act/plan)",
-    },
     ConfigKeyInfo {
         name: "act_mode_api_provider",
         key_type: "string",
@@ -54,36 +47,6 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         name: "azure_api_version",
         key_type: "string",
         description: "Azure OpenAI API version",
-    },
-    ConfigKeyInfo {
-        name: "preferred_language",
-        key_type: "string",
-        description: "Preferred language for responses",
-    },
-    ConfigKeyInfo {
-        name: "default_terminal_profile",
-        key_type: "string",
-        description: "Default terminal profile",
-    },
-    ConfigKeyInfo {
-        name: "custom_prompt",
-        key_type: "string",
-        description: "Custom system prompt",
-    },
-    ConfigKeyInfo {
-        name: "worktree_auto_open_path",
-        key_type: "string",
-        description: "Worktree auto-open path",
-    },
-    ConfigKeyInfo {
-        name: "last_shown_announcement_id",
-        key_type: "string",
-        description: "Last shown announcement ID",
-    },
-    ConfigKeyInfo {
-        name: "write_prompt_metadata_directory",
-        key_type: "string",
-        description: "Directory for prompt metadata",
     },
     ConfigKeyInfo {
         name: "lite_llm_base_url",
@@ -111,61 +74,19 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Gemini API base URL",
     },
     ConfigKeyInfo {
-        name: "aws_region",
-        key_type: "string",
-        description: "AWS region",
-    },
-    // Numeric fields
-    ConfigKeyInfo {
-        name: "shell_integration_timeout",
-        key_type: "number",
-        description: "Shell integration timeout (ms)",
-    },
-    ConfigKeyInfo {
-        name: "terminal_output_line_limit",
-        key_type: "number",
-        description: "Terminal output line limit",
-    },
-    ConfigKeyInfo {
         name: "max_consecutive_mistakes",
         key_type: "number",
         description: "Max consecutive mistakes before intervention",
     },
-    ConfigKeyInfo {
-        name: "request_timeout_ms",
-        key_type: "number",
-        description: "API request timeout (ms)",
-    },
-    // Boolean fields
     ConfigKeyInfo {
         name: "enable_checkpoints_setting",
         key_type: "boolean",
         description: "Enable checkpoint saves",
     },
     ConfigKeyInfo {
-        name: "plan_act_separate_models_setting",
-        key_type: "boolean",
-        description: "Use separate models for plan/act",
-    },
-    ConfigKeyInfo {
         name: "strict_plan_mode_enabled",
         key_type: "boolean",
         description: "Enable strict plan mode",
-    },
-    ConfigKeyInfo {
-        name: "hooks_enabled",
-        key_type: "boolean",
-        description: "Enable hooks",
-    },
-    ConfigKeyInfo {
-        name: "use_auto_condense",
-        key_type: "boolean",
-        description: "Enable auto-condensing",
-    },
-    ConfigKeyInfo {
-        name: "show_token_usage",
-        key_type: "boolean",
-        description: "Show token usage in UI",
     },
     ConfigKeyInfo {
         name: "subagents_enabled",
@@ -178,29 +99,9 @@ pub const VALID_CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Enable Sned web tools",
     },
     ConfigKeyInfo {
-        name: "worktrees_enabled",
-        key_type: "boolean",
-        description: "Enable worktrees",
-    },
-    ConfigKeyInfo {
-        name: "background_edit_enabled",
-        key_type: "boolean",
-        description: "Enable background edits",
-    },
-    ConfigKeyInfo {
-        name: "opt_out_of_remote_config",
-        key_type: "boolean",
-        description: "Opt out of remote config",
-    },
-    ConfigKeyInfo {
-        name: "double_check_completion_enabled",
-        key_type: "boolean",
-        description: "Enable double-check completion",
-    },
-    ConfigKeyInfo {
-        name: "write_prompt_metadata_enabled",
-        key_type: "boolean",
-        description: "Enable prompt metadata writing",
+        name: "mode",
+        key_type: "string",
+        description: "Default agent mode",
     },
     ConfigKeyInfo {
         name: "enable_parallel_tool_calling",
@@ -229,49 +130,25 @@ pub type WorkspaceState = HashMap<String, serde_json::Value>;
 /// Replaces string-keyed dispatch to prevent typos and improve maintainability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalStateKey {
-    // Persistence fields (original)
     SnedVersion,
     TaskHistory,
-    FavoritedModelIds,
-    TerminalReuseEnabled,
-    IsNewUser,
-    Mode,
     SubagentsEnabled,
     GlobalSnedRulesToggles,
     EnableCheckpoints,
-    // Config fields (expanded to match VALID_CONFIG_KEYS)
     ActModeApiProvider,
     PlanModeApiProvider,
     ActModeApiModelId,
     PlanModeApiModelId,
     AzureApiVersion,
-    PreferredLanguage,
-    DefaultTerminalProfile,
-    CustomPrompt,
-    WorktreeAutoOpenPath,
-    LastShownAnnouncementId,
-    WritePromptMetadataDirectory,
     LiteLlmBaseUrl,
     AnthropicBaseUrl,
     OpenAiBaseUrl,
     OpenRouterBaseUrl,
     GeminiBaseUrl,
-    AwsRegion,
-    ShellIntegrationTimeout,
-    TerminalOutputLineLimit,
     MaxConsecutiveMistakes,
-    RequestTimeoutMs,
-    PlanActSeparateModelsSetting,
     StrictPlanModeEnabled,
-    HooksEnabled,
-    UseAutoCondense,
-    ShowTokenUsage,
     SnedWebToolsEnabled,
-    WorktreesEnabled,
-    BackgroundEditEnabled,
-    OptOutOfRemoteConfig,
-    DoubleCheckCompletionEnabled,
-    WritePromptMetadataEnabled,
+    Mode,
     EnableParallelToolCalling,
 }
 
@@ -280,52 +157,25 @@ impl GlobalStateKey {
     #[must_use]
     pub fn get_string_value(&self, state: &GlobalState) -> Option<String> {
         match self {
-            Self::Mode => Some(state.mode.clone()),
             Self::ActModeApiProvider => Some(state.act_mode_api_provider.clone()),
             Self::PlanModeApiProvider => Some(state.plan_mode_api_provider.clone()),
             Self::ActModeApiModelId => state.act_mode_api_model_id.clone(),
             Self::PlanModeApiModelId => state.plan_mode_api_model_id.clone(),
             Self::AzureApiVersion => state.azure_api_version.clone(),
-            Self::PreferredLanguage => Some(state.preferred_language.clone()),
-            Self::DefaultTerminalProfile => Some(state.default_terminal_profile.clone()),
-            Self::CustomPrompt => state.custom_prompt.clone(),
-            Self::WorktreeAutoOpenPath => state.worktree_auto_open_path.clone(),
-            Self::LastShownAnnouncementId => state.last_shown_announcement_id.clone(),
-            Self::WritePromptMetadataDirectory => state.write_prompt_metadata_directory.clone(),
             Self::LiteLlmBaseUrl => state.lite_llm_base_url.clone(),
             Self::AnthropicBaseUrl => state.anthropic_base_url.clone(),
             Self::OpenAiBaseUrl => state.open_ai_base_url.clone(),
             Self::OpenRouterBaseUrl => state.open_router_base_url.clone(),
             Self::GeminiBaseUrl => state.gemini_base_url.clone(),
-            Self::AwsRegion => state.aws_region.clone(),
-            Self::ShellIntegrationTimeout => Some(state.shell_integration_timeout.to_string()),
-            Self::TerminalOutputLineLimit => Some(state.terminal_output_line_limit.to_string()),
             Self::MaxConsecutiveMistakes => Some(state.max_consecutive_mistakes.to_string()),
-            Self::RequestTimeoutMs => state.request_timeout_ms.map(|v| v.to_string()),
             Self::EnableCheckpoints => Some(state.enable_checkpoints_setting.to_string()),
-            Self::PlanActSeparateModelsSetting => {
-                Some(state.plan_act_separate_models_setting.to_string())
-            }
             Self::StrictPlanModeEnabled => Some(state.strict_plan_mode_enabled.to_string()),
-            Self::HooksEnabled => Some(state.hooks_enabled.to_string()),
-            Self::UseAutoCondense => Some(state.use_auto_condense.to_string()),
-            Self::ShowTokenUsage => Some(state.show_token_usage.to_string()),
             Self::SubagentsEnabled => Some(state.subagents_enabled.to_string()),
             Self::SnedWebToolsEnabled => Some(state.sned_web_tools_enabled.to_string()),
-            Self::WorktreesEnabled => Some(state.worktrees_enabled.to_string()),
-            Self::BackgroundEditEnabled => Some(state.background_edit_enabled.to_string()),
-            Self::OptOutOfRemoteConfig => Some(state.opt_out_of_remote_config.to_string()),
-            Self::DoubleCheckCompletionEnabled => {
-                Some(state.double_check_completion_enabled.to_string())
-            }
-            Self::WritePromptMetadataEnabled => {
-                Some(state.write_prompt_metadata_enabled.to_string())
-            }
+            Self::Mode => Some(state.mode.clone()),
             Self::EnableParallelToolCalling => Some(state.enable_parallel_tool_calling.to_string()),
             Self::SnedVersion => state.sned_version.clone(),
-            Self::TaskHistory | Self::FavoritedModelIds | Self::GlobalSnedRulesToggles => None,
-            Self::TerminalReuseEnabled => Some(state.terminal_reuse_enabled.to_string()),
-            Self::IsNewUser => Some(state.is_new_user.to_string()),
+            Self::TaskHistory | Self::GlobalSnedRulesToggles => None,
         }
     }
 
@@ -335,10 +185,6 @@ impl GlobalStateKey {
         match self {
             Self::SnedVersion => serde_json::to_value(&state.sned_version).ok(),
             Self::TaskHistory => serde_json::to_value(&state.task_history).ok(),
-            Self::FavoritedModelIds => serde_json::to_value(&state.favorited_model_ids).ok(),
-            Self::TerminalReuseEnabled => serde_json::to_value(state.terminal_reuse_enabled).ok(),
-            Self::IsNewUser => serde_json::to_value(state.is_new_user).ok(),
-            Self::Mode => serde_json::to_value(&state.mode).ok(),
             Self::SubagentsEnabled => serde_json::to_value(state.subagents_enabled).ok(),
             Self::GlobalSnedRulesToggles => {
                 serde_json::to_value(&state.global_sned_rules_toggles).ok()
@@ -349,26 +195,6 @@ impl GlobalStateKey {
             Self::ActModeApiModelId => serde_json::to_value(&state.act_mode_api_model_id).ok(),
             Self::PlanModeApiModelId => serde_json::to_value(&state.plan_mode_api_model_id).ok(),
             Self::AzureApiVersion => serde_json::to_value(&state.azure_api_version).ok(),
-            Self::PreferredLanguage => serde_json::to_value(&state.preferred_language).ok(),
-            Self::DefaultTerminalProfile => {
-                serde_json::to_value(&state.default_terminal_profile).ok()
-            }
-            Self::CustomPrompt => state
-                .custom_prompt
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::WorktreeAutoOpenPath => state
-                .worktree_auto_open_path
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::LastShownAnnouncementId => state
-                .last_shown_announcement_id
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::WritePromptMetadataDirectory => state
-                .write_prompt_metadata_directory
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
             Self::LiteLlmBaseUrl => state
                 .lite_llm_base_url
                 .as_ref()
@@ -389,42 +215,14 @@ impl GlobalStateKey {
                 .gemini_base_url
                 .as_ref()
                 .map(|v| serde_json::to_value(v).unwrap()),
-            Self::AwsRegion => state
-                .aws_region
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::ShellIntegrationTimeout => {
-                serde_json::to_value(state.shell_integration_timeout).ok()
-            }
-            Self::TerminalOutputLineLimit => {
-                serde_json::to_value(state.terminal_output_line_limit).ok()
-            }
             Self::MaxConsecutiveMistakes => {
                 serde_json::to_value(state.max_consecutive_mistakes).ok()
-            }
-            Self::RequestTimeoutMs => state
-                .request_timeout_ms
-                .as_ref()
-                .map(|v| serde_json::to_value(v).unwrap()),
-            Self::PlanActSeparateModelsSetting => {
-                serde_json::to_value(state.plan_act_separate_models_setting).ok()
             }
             Self::StrictPlanModeEnabled => {
                 serde_json::to_value(state.strict_plan_mode_enabled).ok()
             }
-            Self::HooksEnabled => serde_json::to_value(state.hooks_enabled).ok(),
-            Self::UseAutoCondense => serde_json::to_value(state.use_auto_condense).ok(),
-            Self::ShowTokenUsage => serde_json::to_value(state.show_token_usage).ok(),
             Self::SnedWebToolsEnabled => serde_json::to_value(state.sned_web_tools_enabled).ok(),
-            Self::WorktreesEnabled => serde_json::to_value(state.worktrees_enabled).ok(),
-            Self::BackgroundEditEnabled => serde_json::to_value(state.background_edit_enabled).ok(),
-            Self::OptOutOfRemoteConfig => serde_json::to_value(state.opt_out_of_remote_config).ok(),
-            Self::DoubleCheckCompletionEnabled => {
-                serde_json::to_value(state.double_check_completion_enabled).ok()
-            }
-            Self::WritePromptMetadataEnabled => {
-                serde_json::to_value(state.write_prompt_metadata_enabled).ok()
-            }
+            Self::Mode => serde_json::to_value(&state.mode).ok(),
             Self::EnableParallelToolCalling => {
                 serde_json::to_value(state.enable_parallel_tool_calling).ok()
             }
@@ -438,26 +236,6 @@ impl GlobalStateKey {
             Self::TaskHistory => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.task_history = v;
-                }
-            }
-            Self::FavoritedModelIds => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.favorited_model_ids = v;
-                }
-            }
-            Self::TerminalReuseEnabled => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.terminal_reuse_enabled = v;
-                }
-            }
-            Self::IsNewUser => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.is_new_user = v;
-                }
-            }
-            Self::Mode => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.mode = v;
                 }
             }
             Self::SubagentsEnabled => {
@@ -494,28 +272,6 @@ impl GlobalStateKey {
             Self::AzureApiVersion => {
                 state.azure_api_version = serde_json::from_value(value).ok();
             }
-            Self::PreferredLanguage => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.preferred_language = v;
-                }
-            }
-            Self::DefaultTerminalProfile => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.default_terminal_profile = v;
-                }
-            }
-            Self::CustomPrompt => {
-                state.custom_prompt = serde_json::from_value(value).ok();
-            }
-            Self::WorktreeAutoOpenPath => {
-                state.worktree_auto_open_path = serde_json::from_value(value).ok();
-            }
-            Self::LastShownAnnouncementId => {
-                state.last_shown_announcement_id = serde_json::from_value(value).ok();
-            }
-            Self::WritePromptMetadataDirectory => {
-                state.write_prompt_metadata_directory = serde_json::from_value(value).ok();
-            }
             Self::LiteLlmBaseUrl => {
                 state.lite_llm_base_url = serde_json::from_value(value).ok();
             }
@@ -531,28 +287,9 @@ impl GlobalStateKey {
             Self::GeminiBaseUrl => {
                 state.gemini_base_url = serde_json::from_value(value).ok();
             }
-            Self::AwsRegion => state.aws_region = serde_json::from_value(value).ok(),
-            Self::ShellIntegrationTimeout => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.shell_integration_timeout = v;
-                }
-            }
-            Self::TerminalOutputLineLimit => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.terminal_output_line_limit = v;
-                }
-            }
             Self::MaxConsecutiveMistakes => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.max_consecutive_mistakes = v;
-                }
-            }
-            Self::RequestTimeoutMs => {
-                state.request_timeout_ms = serde_json::from_value(value).ok();
-            }
-            Self::PlanActSeparateModelsSetting => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.plan_act_separate_models_setting = v;
                 }
             }
             Self::StrictPlanModeEnabled => {
@@ -560,49 +297,14 @@ impl GlobalStateKey {
                     state.strict_plan_mode_enabled = v;
                 }
             }
-            Self::HooksEnabled => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.hooks_enabled = v;
-                }
-            }
-            Self::UseAutoCondense => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.use_auto_condense = v;
-                }
-            }
-            Self::ShowTokenUsage => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.show_token_usage = v;
-                }
-            }
             Self::SnedWebToolsEnabled => {
                 if let Ok(v) = serde_json::from_value(value) {
                     state.sned_web_tools_enabled = v;
                 }
             }
-            Self::WorktreesEnabled => {
+            Self::Mode => {
                 if let Ok(v) = serde_json::from_value(value) {
-                    state.worktrees_enabled = v;
-                }
-            }
-            Self::BackgroundEditEnabled => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.background_edit_enabled = v;
-                }
-            }
-            Self::OptOutOfRemoteConfig => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.opt_out_of_remote_config = v;
-                }
-            }
-            Self::DoubleCheckCompletionEnabled => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.double_check_completion_enabled = v;
-                }
-            }
-            Self::WritePromptMetadataEnabled => {
-                if let Ok(v) = serde_json::from_value(value) {
-                    state.write_prompt_metadata_enabled = v;
+                    state.mode = v;
                 }
             }
             Self::EnableParallelToolCalling => {
@@ -616,112 +318,32 @@ impl GlobalStateKey {
 
 impl std::str::FromStr for GlobalStateKey {
     type Err = ();
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Support both camelCase (original) and snake_case (VALID_CONFIG_KEYS) names
         match s {
-            // snedVersion
             "snedVersion" | "sned_version" => Ok(Self::SnedVersion),
-            // taskHistory
             "taskHistory" | "task_history" => Ok(Self::TaskHistory),
-            // favoritedModelIds
-            "favoritedModelIds" | "favorited_model_ids" => Ok(Self::FavoritedModelIds),
-            // terminalReuseEnabled
-            "terminalReuseEnabled" | "terminal_reuse_enabled" => Ok(Self::TerminalReuseEnabled),
-            // isNewUser
-            "isNewUser" | "is_new_user" => Ok(Self::IsNewUser),
-            // mode
-            "mode" => Ok(Self::Mode),
-            // subagentsEnabled
             "subagentsEnabled" | "subagents_enabled" => Ok(Self::SubagentsEnabled),
-            // globalSnedRulesToggles
             "globalSnedRulesToggles" | "global_sned_rules_toggles" => {
                 Ok(Self::GlobalSnedRulesToggles)
             }
-            // enableCheckpoints
             "enableCheckpoints" | "enable_checkpoints" => Ok(Self::EnableCheckpoints),
-            // actModeApiProvider
             "actModeApiProvider" | "act_mode_api_provider" => Ok(Self::ActModeApiProvider),
-            // planModeApiProvider
             "planModeApiProvider" | "plan_mode_api_provider" => Ok(Self::PlanModeApiProvider),
-            // actModeApiModelId
             "actModeApiModelId" | "act_mode_api_model_id" => Ok(Self::ActModeApiModelId),
-            // planModeApiModelId
             "planModeApiModelId" | "plan_mode_api_model_id" => Ok(Self::PlanModeApiModelId),
-            // azureApiVersion
             "azureApiVersion" | "azure_api_version" => Ok(Self::AzureApiVersion),
-            // preferredLanguage
-            "preferredLanguage" | "preferred_language" => Ok(Self::PreferredLanguage),
-            // defaultTerminalProfile
-            "defaultTerminalProfile" | "default_terminal_profile" => {
-                Ok(Self::DefaultTerminalProfile)
-            }
-            // customPrompt
-            "customPrompt" | "custom_prompt" => Ok(Self::CustomPrompt),
-            // worktreeAutoOpenPath
-            "worktreeAutoOpenPath" | "worktree_auto_open_path" => Ok(Self::WorktreeAutoOpenPath),
-            // lastShownAnnouncementId
-            "lastShownAnnouncementId" | "last_shown_announcement_id" => {
-                Ok(Self::LastShownAnnouncementId)
-            }
-            // writePromptMetadataDirectory
-            "writePromptMetadataDirectory" | "write_prompt_metadata_directory" => {
-                Ok(Self::WritePromptMetadataDirectory)
-            }
-            // liteLlmBaseUrl
             "liteLlmBaseUrl" | "lite_llm_base_url" => Ok(Self::LiteLlmBaseUrl),
-            // anthropicBaseUrl
             "anthropicBaseUrl" | "anthropic_base_url" => Ok(Self::AnthropicBaseUrl),
-            // openAiBaseUrl
             "openAiBaseUrl" | "open_ai_base_url" => Ok(Self::OpenAiBaseUrl),
-            // openRouterBaseUrl
             "openRouterBaseUrl" | "open_router_base_url" => Ok(Self::OpenRouterBaseUrl),
-            // geminiBaseUrl
             "geminiBaseUrl" | "gemini_base_url" => Ok(Self::GeminiBaseUrl),
-            // awsRegion
-            "awsRegion" | "aws_region" => Ok(Self::AwsRegion),
-            // shellIntegrationTimeout
-            "shellIntegrationTimeout" | "shell_integration_timeout" => {
-                Ok(Self::ShellIntegrationTimeout)
-            }
-            // terminalOutputLineLimit
-            "terminalOutputLineLimit" | "terminal_output_line_limit" => {
-                Ok(Self::TerminalOutputLineLimit)
-            }
-            // maxConsecutiveMistakes
             "maxConsecutiveMistakes" | "max_consecutive_mistakes" => {
                 Ok(Self::MaxConsecutiveMistakes)
             }
-            // requestTimeoutMs
-            "requestTimeoutMs" | "request_timeout_ms" => Ok(Self::RequestTimeoutMs),
-            // planActSeparateModelsSetting
-            "planActSeparateModelsSetting" | "plan_act_separate_models_setting" => {
-                Ok(Self::PlanActSeparateModelsSetting)
-            }
-            // strictPlanModeEnabled
             "strictPlanModeEnabled" | "strict_plan_mode_enabled" => Ok(Self::StrictPlanModeEnabled),
-            // hooksEnabled
-            "hooksEnabled" | "hooks_enabled" => Ok(Self::HooksEnabled),
-            // useAutoCondense
-            "useAutoCondense" | "use_auto_condense" => Ok(Self::UseAutoCondense),
-            // showTokenUsage
-            "showTokenUsage" | "show_token_usage" => Ok(Self::ShowTokenUsage),
-            // snedWebToolsEnabled
             "snedWebToolsEnabled" | "sned_web_tools_enabled" => Ok(Self::SnedWebToolsEnabled),
-            // worktreesEnabled
-            "worktreesEnabled" | "worktrees_enabled" => Ok(Self::WorktreesEnabled),
-            // backgroundEditEnabled
-            "backgroundEditEnabled" | "background_edit_enabled" => Ok(Self::BackgroundEditEnabled),
-            // optOutOfRemoteConfig
-            "optOutOfRemoteConfig" | "opt_out_of_remote_config" => Ok(Self::OptOutOfRemoteConfig),
-            // doubleCheckCompletionEnabled
-            "doubleCheckCompletionEnabled" | "double_check_completion_enabled" => {
-                Ok(Self::DoubleCheckCompletionEnabled)
-            }
-            // writePromptMetadataEnabled
-            "writePromptMetadataEnabled" | "write_prompt_metadata_enabled" => {
-                Ok(Self::WritePromptMetadataEnabled)
-            }
-            // enableParallelToolCalling
+            "mode" => Ok(Self::Mode),
             "enableParallelToolCalling" | "enable_parallel_tool_calling" => {
                 Ok(Self::EnableParallelToolCalling)
             }
@@ -735,10 +357,6 @@ impl std::fmt::Display for GlobalStateKey {
         match self {
             Self::SnedVersion => write!(f, "snedVersion"),
             Self::TaskHistory => write!(f, "taskHistory"),
-            Self::FavoritedModelIds => write!(f, "favoritedModelIds"),
-            Self::TerminalReuseEnabled => write!(f, "terminalReuseEnabled"),
-            Self::IsNewUser => write!(f, "isNewUser"),
-            Self::Mode => write!(f, "mode"),
             Self::SubagentsEnabled => write!(f, "subagentsEnabled"),
             Self::GlobalSnedRulesToggles => write!(f, "globalSnedRulesToggles"),
             Self::EnableCheckpoints => write!(f, "enableCheckpoints"),
@@ -747,39 +365,15 @@ impl std::fmt::Display for GlobalStateKey {
             Self::ActModeApiModelId => write!(f, "actModeApiModelId"),
             Self::PlanModeApiModelId => write!(f, "planModeApiModelId"),
             Self::AzureApiVersion => write!(f, "azureApiVersion"),
-            Self::PreferredLanguage => write!(f, "preferredLanguage"),
-            Self::DefaultTerminalProfile => write!(f, "defaultTerminalProfile"),
-            Self::CustomPrompt => write!(f, "customPrompt"),
-            Self::WorktreeAutoOpenPath => write!(f, "worktreeAutoOpenPath"),
-            Self::LastShownAnnouncementId => write!(f, "lastShownAnnouncementId"),
-            Self::WritePromptMetadataDirectory => {
-                write!(f, "writePromptMetadataDirectory")
-            }
             Self::LiteLlmBaseUrl => write!(f, "liteLlmBaseUrl"),
             Self::AnthropicBaseUrl => write!(f, "anthropicBaseUrl"),
             Self::OpenAiBaseUrl => write!(f, "openAiBaseUrl"),
             Self::OpenRouterBaseUrl => write!(f, "openRouterBaseUrl"),
             Self::GeminiBaseUrl => write!(f, "geminiBaseUrl"),
-            Self::AwsRegion => write!(f, "awsRegion"),
-            Self::ShellIntegrationTimeout => write!(f, "shellIntegrationTimeout"),
-            Self::TerminalOutputLineLimit => write!(f, "terminalOutputLineLimit"),
             Self::MaxConsecutiveMistakes => write!(f, "maxConsecutiveMistakes"),
-            Self::RequestTimeoutMs => write!(f, "requestTimeoutMs"),
-            Self::PlanActSeparateModelsSetting => {
-                write!(f, "planActSeparateModelsSetting")
-            }
             Self::StrictPlanModeEnabled => write!(f, "strictPlanModeEnabled"),
-            Self::HooksEnabled => write!(f, "hooksEnabled"),
-            Self::UseAutoCondense => write!(f, "useAutoCondense"),
-            Self::ShowTokenUsage => write!(f, "showTokenUsage"),
             Self::SnedWebToolsEnabled => write!(f, "snedWebToolsEnabled"),
-            Self::WorktreesEnabled => write!(f, "worktreesEnabled"),
-            Self::BackgroundEditEnabled => write!(f, "backgroundEditEnabled"),
-            Self::OptOutOfRemoteConfig => write!(f, "optOutOfRemoteConfig"),
-            Self::DoubleCheckCompletionEnabled => {
-                write!(f, "doubleCheckCompletionEnabled")
-            }
-            Self::WritePromptMetadataEnabled => write!(f, "writePromptMetadataEnabled"),
+            Self::Mode => write!(f, "mode"),
             Self::EnableParallelToolCalling => write!(f, "enableParallelToolCalling"),
         }
     }
@@ -851,7 +445,6 @@ impl StateManager {
 
     /// Initialize the state manager from disk.
     /// Loads global state, task history, secrets, and workspace state.
-    /// Generates and persists a machine ID if not already present.
     /// Cleans up orphaned atomic write temp files older than 24 hours.
     pub fn initialize(&self) -> io::Result<()> {
         // Clean up orphaned temp files from crashed atomic writes
@@ -875,36 +468,6 @@ impl StateManager {
             .global_state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = global_state;
-
-        // Generate machine ID if not present
-        let mut needs_persist = false;
-        {
-            let mut state = self
-                .global_state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.sned_generated_machine_id.is_none() {
-                let machine_id = Ulid::new().to_string();
-                state.sned_generated_machine_id = Some(machine_id);
-                needs_persist = true;
-            }
-            drop(state);
-        }
-
-        // Persist immediately if we generated a new machine ID
-        if needs_persist {
-            let settings_dir = self.state_dir.join("..").join("settings");
-            fs::create_dir_all(&settings_dir)?;
-            let state = self
-                .global_state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let data = serde_json::to_string_pretty(&*state)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            drop(state);
-            let file_path = settings_dir.join("global_settings.json");
-            crate::storage::disk::atomic_write_file(&file_path, &data)?;
-        }
 
         // Load secrets
         let secrets = self.secrets_store.load();
@@ -966,17 +529,11 @@ impl StateManager {
     }
 
     /// Get the distinct ID used by hooks.
-    /// Reads from `sned_generated_machine_id` field.
-    /// Falls back to "anonymous" if not set.
+    ///
+    /// Sned no longer persists a machine identifier, so hooks receive a stable
+    /// anonymous value unless they add their own identifier.
     pub fn get_distinct_id(&self) -> String {
-        let state = self
-            .global_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .sned_generated_machine_id
-            .clone()
-            .unwrap_or_else(|| "anonymous".to_string())
+        "anonymous".to_string()
     }
 
     // ==================== Task History ====================
@@ -1055,6 +612,15 @@ impl StateManager {
 
     // ==================== Global State ====================
 
+    /// Return a consistent snapshot for runtime consumers that need multiple settings.
+    #[must_use]
+    pub fn global_state_snapshot(&self) -> GlobalState {
+        self.global_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Get a global state key (typed enum version)
     pub fn get_global_state_key<T>(&self, key: GlobalStateKey) -> Option<T>
     where
@@ -1114,12 +680,21 @@ impl StateManager {
 
         // Validate value type matches expected type
         match key_info.key_type {
-            "number" if value.parse::<i32>().is_err() => {
-                return Err(ConfigFieldError::InvalidValue(
-                    key.to_string(),
-                    "number".to_string(),
-                    value,
-                ));
+            "number" => {
+                let parsed = value.parse::<i32>().map_err(|_| {
+                    ConfigFieldError::InvalidValue(
+                        key.to_string(),
+                        "a non-negative integer (0 disables the limit)".to_string(),
+                        value.clone(),
+                    )
+                })?;
+                if parsed < 0 {
+                    return Err(ConfigFieldError::InvalidValue(
+                        key.to_string(),
+                        "a non-negative integer (0 disables the limit)".to_string(),
+                        value,
+                    ));
+                }
             }
             "boolean" if !matches!(value.to_lowercase().as_str(), "true" | "false" | "1" | "0") => {
                 return Err(ConfigFieldError::InvalidValue(
@@ -1136,11 +711,6 @@ impl StateManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let handled = match key {
-            // String fields
-            "mode" => {
-                state.mode = value;
-                true
-            }
             "act_mode_api_provider" => {
                 state.act_mode_api_provider = value;
                 true
@@ -1159,30 +729,6 @@ impl StateManager {
             }
             "azure_api_version" => {
                 state.azure_api_version = Some(value);
-                true
-            }
-            "preferred_language" => {
-                state.preferred_language = value;
-                true
-            }
-            "default_terminal_profile" => {
-                state.default_terminal_profile = value;
-                true
-            }
-            "custom_prompt" => {
-                state.custom_prompt = Some(value);
-                true
-            }
-            "worktree_auto_open_path" => {
-                state.worktree_auto_open_path = Some(value);
-                true
-            }
-            "last_shown_announcement_id" => {
-                state.last_shown_announcement_id = Some(value);
-                true
-            }
-            "write_prompt_metadata_directory" => {
-                state.write_prompt_metadata_directory = Some(value);
                 true
             }
             "lite_llm_base_url" => {
@@ -1205,35 +751,12 @@ impl StateManager {
                 state.gemini_base_url = Some(value);
                 true
             }
-            "aws_region" => {
-                state.aws_region = Some(value);
-                true
-            }
-            // Numeric fields
-            "shell_integration_timeout" => {
-                state.shell_integration_timeout = value.parse::<i32>().unwrap_or(4000);
-                true
-            }
-            "terminal_output_line_limit" => {
-                state.terminal_output_line_limit = value.parse::<i32>().unwrap_or(500);
-                true
-            }
             "max_consecutive_mistakes" => {
-                state.max_consecutive_mistakes = value.parse::<i32>().unwrap_or(5);
+                state.max_consecutive_mistakes = value.parse().expect("validated above");
                 true
             }
-            "request_timeout_ms" => {
-                state.request_timeout_ms = value.parse::<i32>().ok();
-                true
-            }
-            // Boolean fields
             "enable_checkpoints_setting" => {
                 state.enable_checkpoints_setting =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "plan_act_separate_models_setting" => {
-                state.plan_act_separate_models_setting =
                     matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
@@ -1242,45 +765,13 @@ impl StateManager {
                     matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
-            "hooks_enabled" => {
-                state.hooks_enabled = matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "use_auto_condense" => {
-                state.use_auto_condense = matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "show_token_usage" => {
-                state.show_token_usage = matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
             "sned_web_tools_enabled" => {
                 state.sned_web_tools_enabled =
                     matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
-            "worktrees_enabled" => {
-                state.worktrees_enabled = matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "background_edit_enabled" => {
-                state.background_edit_enabled =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "opt_out_of_remote_config" => {
-                state.opt_out_of_remote_config =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "double_check_completion_enabled" => {
-                state.double_check_completion_enabled =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
-                true
-            }
-            "write_prompt_metadata_enabled" => {
-                state.write_prompt_metadata_enabled =
-                    matches!(value.to_lowercase().as_str(), "true" | "1");
+            "mode" => {
+                state.mode = value;
                 true
             }
             "enable_parallel_tool_calling" => {
@@ -1379,37 +870,9 @@ impl StateManager {
 
     /// Load global state from disk
     fn load_global_state(&self) -> io::Result<GlobalState> {
-        let file_path = self
-            .state_dir
-            .join("..")
-            .join("settings")
-            .join("global_settings.json");
-        if !file_path.exists() {
-            return Ok(GlobalState::default());
-        }
-
-        let contents = fs::read_to_string(&file_path)?;
-        match serde_json::from_str(&contents) {
-            Ok(state) => Ok(state),
-            Err(e) => {
-                // Create backup of corrupted file before discarding
-                if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
-                    tracing::warn!(
-                        file_path = %file_path.display(),
-                        backup_path = %backup_path.display(),
-                        error = %e,
-                        "Created backup of corrupted global settings JSON"
-                    );
-                } else {
-                    tracing::warn!(
-                        file_path = %file_path.display(),
-                        error = %e,
-                        "Failed to parse global settings JSON and backup failed"
-                    );
-                }
-                Ok(GlobalState::default())
-            }
-        }
+        crate::storage::global_state::load_global_state_from_path(
+            &crate::storage::global_state::global_settings_path(),
+        )
     }
 
     /// Load workspace state from disk
@@ -1740,16 +1203,13 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let temp_dir = TempDir::new().unwrap();
-        let data_dir = temp_dir.path().join("data");
         let sned_dir = temp_dir.path().join("sned");
-        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(sned_dir.join("data")).unwrap();
 
-        let previous_data_dir = std::env::var_os("SNED_DATA_DIR");
         let previous_sned_dir = std::env::var_os("SNED_DIR");
 
         // SAFETY: single-threaded test helper; env mutation scoped to this closure.
         unsafe {
-            std::env::set_var("SNED_DATA_DIR", &data_dir);
             std::env::set_var("SNED_DIR", &sned_dir);
         }
 
@@ -1757,11 +1217,6 @@ mod tests {
 
         // SAFETY: single-threaded test helper; restoring env after test.
         unsafe {
-            if let Some(previous_data_dir) = previous_data_dir {
-                std::env::set_var("SNED_DATA_DIR", previous_data_dir);
-            } else {
-                std::env::remove_var("SNED_DATA_DIR");
-            }
             if let Some(previous_sned_dir) = previous_sned_dir {
                 std::env::set_var("SNED_DIR", previous_sned_dir);
             } else {
@@ -2053,36 +1508,101 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_global_state_persist_single_key() {
+    fn test_global_state_persists_retained_keys() {
         with_temp_data_dir(|| {
             let manager = StateManager::new().unwrap();
             manager.initialize().unwrap();
 
             manager.set_global_state_key(
-                GlobalStateKey::TerminalReuseEnabled,
+                GlobalStateKey::SubagentsEnabled,
                 serde_json::Value::Bool(false),
             );
-            manager.set_global_state_key(GlobalStateKey::IsNewUser, serde_json::Value::Bool(false));
+            manager.set_global_state_key(
+                GlobalStateKey::StrictPlanModeEnabled,
+                serde_json::Value::Bool(true),
+            );
 
             manager.persist().unwrap();
 
             let manager2 = StateManager::new().unwrap();
             manager2.initialize().unwrap();
 
-            let terminal_reuse: Option<serde_json::Value> =
-                manager2.get_global_state_key(GlobalStateKey::TerminalReuseEnabled);
-            assert!(terminal_reuse.is_some());
-            assert_eq!(terminal_reuse.unwrap(), serde_json::Value::Bool(false));
+            let subagents_enabled: Option<serde_json::Value> =
+                manager2.get_global_state_key(GlobalStateKey::SubagentsEnabled);
+            assert_eq!(subagents_enabled, Some(serde_json::Value::Bool(false)));
 
-            let is_new_user: Option<serde_json::Value> =
-                manager2.get_global_state_key(GlobalStateKey::IsNewUser);
-            assert!(is_new_user.is_some());
-            assert_eq!(is_new_user.unwrap(), serde_json::Value::Bool(false));
+            let strict_plan: Option<serde_json::Value> =
+                manager2.get_global_state_key(GlobalStateKey::StrictPlanModeEnabled);
+            assert_eq!(strict_plan, Some(serde_json::Value::Bool(true)));
         });
     }
 
     #[test]
-    fn test_partial_global_state_persist_single_key_preserves_unrelated_fields() {
+    fn test_max_consecutive_mistakes_rejects_invalid_values() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+
+            for value in ["-1", "many"] {
+                let error = manager
+                    .set_global_state_string_field("max_consecutive_mistakes", value.to_string())
+                    .expect_err("invalid mistake limits must be rejected");
+                assert!(error.to_string().contains("0 disables the limit"));
+            }
+
+            manager
+                .set_global_state_string_field("max_consecutive_mistakes", "0".to_string())
+                .unwrap();
+            assert_eq!(
+                manager.get_config_value("max_consecutive_mistakes").as_deref(),
+                Some("0")
+            );
+        });
+    }
+
+    #[test]
+    fn test_invalid_persisted_mistake_limit_is_actionable() {
+        with_temp_data_dir(|| {
+            let settings_dir = crate::storage::disk::get_settings_dir();
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("global_settings.json"),
+                r#"{"max_consecutive_mistakes":"many"}"#,
+            )
+            .unwrap();
+
+            let error = StateManager::new().unwrap().initialize().unwrap_err();
+            assert!(error.to_string().contains("max_consecutive_mistakes"));
+            assert!(error.to_string().contains("0 disables the limit"));
+        });
+    }
+
+    #[test]
+    fn test_legacy_negative_mistake_limit_can_be_repaired() {
+        with_temp_data_dir(|| {
+            let settings_dir = crate::storage::disk::get_settings_dir();
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("global_settings.json"),
+                r#"{"max_consecutive_mistakes":-1}"#,
+            )
+            .unwrap();
+
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+            manager
+                .set_global_state_string_field("max_consecutive_mistakes", "3".to_string())
+                .unwrap();
+            manager.persist().unwrap();
+
+            let repaired = StateManager::new().unwrap();
+            repaired.initialize().unwrap();
+            assert_eq!(repaired.get_config_value("max_consecutive_mistakes").as_deref(), Some("3"));
+        });
+    }
+
+    #[test]
+    fn test_global_state_persist_removes_unused_fields() {
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().join("data");
         let state_dir = data_dir.join("state");
@@ -2091,8 +1611,8 @@ mod tests {
         fs::create_dir_all(&settings_dir).unwrap();
 
         let initial_state = serde_json::json!({
+            "subagents_enabled": false,
             "terminal_reuse_enabled": false,
-            "is_new_user": false,
         });
         let mut manager = StateManager::new().unwrap();
         manager.state_dir = state_dir;
@@ -2103,7 +1623,7 @@ mod tests {
             serde_json::from_value(initial_state).unwrap();
 
         manager.set_global_state_key(
-            GlobalStateKey::TerminalReuseEnabled,
+            GlobalStateKey::SubagentsEnabled,
             serde_json::Value::Bool(true),
         );
         manager.persist().unwrap();
@@ -2114,10 +1634,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            persisted["terminal_reuse_enabled"],
+            persisted["subagents_enabled"],
             serde_json::Value::Bool(true)
         );
-        assert_eq!(persisted["is_new_user"], serde_json::Value::Bool(false));
+        assert!(persisted.get("terminal_reuse_enabled").is_none());
     }
 
     #[test]
@@ -2145,7 +1665,7 @@ mod tests {
             let manager = StateManager::new().unwrap();
             manager.initialize().unwrap();
             manager.set_global_state_key(
-                GlobalStateKey::TerminalReuseEnabled,
+                GlobalStateKey::SubagentsEnabled,
                 serde_json::Value::Bool(true),
             );
 
@@ -2159,7 +1679,7 @@ mod tests {
             let _guard = tracing::subscriber::set_default(subscriber);
 
             let value: Option<String> =
-                manager.get_global_state_key(GlobalStateKey::TerminalReuseEnabled);
+                manager.get_global_state_key(GlobalStateKey::SubagentsEnabled);
             assert!(value.is_none());
 
             let log_output = String::from_utf8(
@@ -2170,73 +1690,19 @@ mod tests {
             )
             .unwrap();
             assert!(log_output.contains("failed to deserialize global state value"));
-            assert!(log_output.contains("key=terminalReuseEnabled"));
+            assert!(log_output.contains("key=subagentsEnabled"));
             assert!(log_output.contains("error="));
         });
     }
 
     #[test]
-    fn test_machine_id_generated_on_fresh_install() {
+    fn test_distinct_id_is_anonymous_without_machine_identity() {
         with_temp_data_dir(|| {
             let manager = StateManager::new().unwrap();
             manager.initialize().unwrap();
 
-            // Should have generated a machine ID
             let id = manager.get_distinct_id();
-            assert_ne!(
-                id, "anonymous",
-                "Machine ID should be generated on fresh install"
-            );
-            assert!(!id.is_empty(), "Machine ID should not be empty");
-
-            // Verify it's a valid ULID format (26 chars, base32)
-            assert_eq!(id.len(), 26, "ULID should be 26 characters");
-            assert!(
-                id.chars().all(|c| c.is_ascii_alphanumeric()),
-                "ULID should be alphanumeric"
-            );
-        });
-    }
-
-    #[test]
-    fn test_machine_id_persisted_and_reused() {
-        use std::fs;
-
-        with_temp_data_dir(|| {
-            let manager = StateManager::new().unwrap();
-            manager.initialize().unwrap();
-
-            // Get the generated ID
-            let first_id = manager.get_distinct_id();
-            assert_ne!(first_id, "anonymous");
-
-            // Verify it was persisted to disk
-            let settings_path = manager
-                .state_dir
-                .join("..")
-                .join("settings")
-                .join("global_settings.json");
-            assert!(
-                settings_path.exists(),
-                "global_settings.json should be created"
-            );
-
-            let contents = fs::read_to_string(&settings_path).unwrap();
-            assert!(
-                contents.contains(&first_id),
-                "Persisted file should contain the machine ID"
-            );
-
-            // Simulate a second run by creating a new StateManager with same data dir
-            let manager2 = StateManager::new().unwrap();
-            manager2.initialize().unwrap();
-            let second_id = manager2.get_distinct_id();
-
-            // Should read the same ID from disk
-            assert_eq!(
-                first_id, second_id,
-                "Machine ID should be reused across runs"
-            );
+            assert_eq!(id, "anonymous");
         });
     }
 
@@ -2254,8 +1720,9 @@ mod tests {
                 .join("..")
                 .join("settings")
                 .join("global_settings.json");
+            fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
 
-            let corrupted_content = r#"{"machine_id": "invalid json here"#;
+            let corrupted_content = r#"{"invalid json"#;
             fs::write(&settings_path, corrupted_content).unwrap();
 
             // Load global state - should create backup and return defaults
@@ -2263,10 +1730,7 @@ mod tests {
             assert!(result.is_ok(), "Should return Ok even with corrupted file");
 
             let state = result.unwrap();
-            assert!(
-                state.sned_generated_machine_id.is_none(),
-                "Should return default state with no machine_id"
-            );
+            assert_eq!(state.max_consecutive_mistakes, 3);
 
             // Verify backup was created
             let backup_path = settings_path.with_extension("json.bak");

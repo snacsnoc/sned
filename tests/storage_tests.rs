@@ -46,8 +46,6 @@ fn test_global_state_store() {
     // After deserializing from empty JSON, the defaults will apply
     let json = "{}";
     let deserialized: GlobalState = serde_json::from_str(json).unwrap();
-    assert!(deserialized.is_new_user);
-    assert!(deserialized.terminal_reuse_enabled);
     assert_eq!(deserialized.mode, "act");
     assert_eq!(deserialized.plan_mode_api_provider, "anthropic");
 }

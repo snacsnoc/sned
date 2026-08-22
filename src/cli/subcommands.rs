@@ -321,8 +321,6 @@ pub fn run_history(opts: &HistoryOptions) -> anyhow::Result<()> {
 }
 
 pub fn run_config(opts: ConfigOptions) -> anyhow::Result<()> {
-    use crate::storage::global_state::load_global_state;
-
     if let Some(config_path) = &opts.config {
         // SAFETY: called during CLI startup before any worker threads spawn
         unsafe {
@@ -374,7 +372,9 @@ pub fn run_config(opts: ConfigOptions) -> anyhow::Result<()> {
         return run_migration(source_dir, opts.dry_run);
     }
 
-    let state = load_global_state();
+    let state_manager = crate::storage::state_manager::StateManager::new()?;
+    state_manager.initialize()?;
+    let state = state_manager.global_state_snapshot();
 
     if opts.validate {
         println!("Validating Sned configuration...");
@@ -434,17 +434,7 @@ pub fn parse_config_assignment(assignment: &str) -> anyhow::Result<(&str, String
 pub fn run_migration(source_dir: &str, dry_run: bool) -> anyhow::Result<()> {
     use crate::storage::migration::{MigrationEngine, plan_dry_run_migration};
 
-    let destination_dir = std::env::var("SNED_DIR")
-        .ok()
-        .or_else(|| dirs::config_dir().map(|p| p.join("sned").to_string_lossy().into_owned()))
-        .unwrap_or_else(|| {
-            dirs::home_dir().map_or_else(
-                || ".config/sned".to_string(),
-                |h| h.join(".config/sned").to_string_lossy().into_owned(),
-            )
-        });
-
-    let destination_path = PathBuf::from(&destination_dir);
+    let destination_path = crate::storage::disk::get_sned_dir();
 
     println!("Migration Plan");
     println!("==============");
@@ -745,8 +735,8 @@ pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -
         String::new(),
     ];
 
-    lines.push(String::from("## Mode & Provider"));
-    lines.push(format!("  Mode:     {}", state.mode));
+    lines.push(String::from("## Providers"));
+    lines.push(format!("  Mode:             {}", state.mode));
     lines.push(format!(
         "  Act Provider:     {}",
         state.act_mode_api_provider
@@ -764,25 +754,9 @@ pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -
     } else {
         lines.push("  Enabled:   false".to_string());
     }
-    lines.push(format!(
-        "  Auto-Approve-All: {}",
-        if state.auto_approve_all_toggled {
-            "true"
-        } else {
-            "false"
-        }
-    ));
     lines.push(String::new());
 
-    lines.push("## Context".to_string());
-    lines.push(format!(
-        "  Auto-Condense: {}",
-        if state.use_auto_condense {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    ));
+    lines.push("## Execution".to_string());
     lines.push(format!(
         "  Strict Plan Mode: {}",
         if state.strict_plan_mode_enabled {
@@ -803,14 +777,6 @@ pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -
         }
     ));
     lines.push(format!(
-        "  Hooks: {}",
-        if state.hooks_enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    ));
-    lines.push(format!(
         "  Checkpoints: {}",
         if state.enable_checkpoints_setting {
             "enabled"
@@ -818,23 +784,6 @@ pub fn format_config_output(state: &crate::storage::global_state::GlobalState) -
             "disabled"
         }
     ));
-    lines.push(String::new());
-
-    lines.push("## Shell".to_string());
-    lines.push(format!("  Timeout: {}s", state.shell_integration_timeout));
-    lines.push(format!(
-        "  Terminal Line Limit: {}",
-        state.terminal_output_line_limit
-    ));
-    lines.push(String::new());
-
-    lines.push("## Recent Announcements".to_string());
-    if let Some(ref v) = state.last_shown_announcement_id {
-        lines.push(format!("  Last Shown: {v}"));
-    } else {
-        lines.push("  Last Shown: none".to_string());
-    }
-
     lines.join("\n")
 }
 
@@ -919,10 +868,8 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
     }
 
     if opts.verbose {
-        use crate::storage::global_state::load_global_state;
-        let state = load_global_state();
         println!("\nCurrent configuration:");
-        println!("{}", format_config_output(&state));
+        println!("{}", format_config_output(&state_manager.global_state_snapshot()));
     }
 
     Ok(())
@@ -963,34 +910,13 @@ pub fn run_doctor() -> anyhow::Result<i32> {
 
     // Check 2: Config file
     println!("\n[Configuration]");
-    let config_path = env::var("SNED_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            dirs::config_dir().map(|mut p| {
-                p.push("sned");
-                p
-            })
-        })
-        .or_else(|| {
-            env::var("HOME").ok().map(|p| {
-                let mut path = PathBuf::from(p);
-                path.push(".sned");
-                path
-            })
-        });
-
-    if let Some(config_path) = config_path {
-        if config_path.exists() {
-            println!("  [OK] Sned storage directory found");
-            println!("       {}", config_path.display());
-        } else {
-            println!("  [WARN] Sned storage directory not found (will be created on first use)");
-            println!("         {}", config_path.display());
-            has_warn = true;
-        }
+    let config_path = crate::storage::disk::get_sned_dir();
+    if config_path.exists() {
+        println!("  [OK] Sned storage directory found");
+        println!("       {}", config_path.display());
     } else {
-        println!("  [WARN] Cannot determine Sned storage directory");
+        println!("  [WARN] Sned storage directory not found (will be created on first use)");
+        println!("         {}", config_path.display());
         has_warn = true;
     }
 
@@ -1005,44 +931,25 @@ pub fn run_doctor() -> anyhow::Result<i32> {
         has_warn = true;
     }
 
-    // Check 4: ~/.sned/ directory structure
+    // Check 4: storage directory structure
     println!("\n[Storage Directory]");
-    let sned_dir = dirs::config_dir()
-        .map(|mut p| {
-            p.push("sned");
-            p
-        })
-        .or_else(|| {
-            env::var("HOME").ok().map(|p| {
-                let mut path = PathBuf::from(p);
-                path.push(".sned");
-                path
-            })
-        });
+    let sned_dir = crate::storage::disk::get_sned_dir();
+    if sned_dir.exists() {
+        println!("  [OK] Sned directory exists");
+        println!("       {}", sned_dir.display());
 
-    if let Some(sned_dir) = sned_dir {
-        if sned_dir.exists() {
-            println!("  [OK] Sned directory exists");
-            println!("       {}", sned_dir.display());
-
-            // Check subdirectories
-            let subdirs = ["tasks", "secrets", "state"];
-            for subdir in subdirs {
-                let subpath = sned_dir.join(subdir);
-                if subpath.exists() {
-                    println!("  [OK] {subdir} directory exists");
-                } else {
-                    println!("  [WARN] {subdir} directory missing (will be created on first use)");
-                    has_warn = true;
-                }
+        for subdir in ["tasks", "state", "settings"] {
+            let subpath = sned_dir.join("data").join(subdir);
+            if subpath.exists() {
+                println!("  [OK] data/{subdir} directory exists");
+            } else {
+                println!("  [WARN] data/{subdir} directory missing (will be created on first use)");
+                has_warn = true;
             }
-        } else {
-            println!("  [WARN] Sned directory not found (will be created on first use)");
-            println!("         {}", sned_dir.display());
-            has_warn = true;
         }
     } else {
-        println!("  [WARN] Cannot determine Sned directory");
+        println!("  [WARN] Sned directory not found (will be created on first use)");
+        println!("         {}", sned_dir.display());
         has_warn = true;
     }
 
@@ -1214,18 +1121,18 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
-        let tasks_dir = temp.path().join("tasks");
-        let settings_dir = temp.path().join("settings");
-        let state_dir = temp.path().join("state");
+        let data_dir = temp.path().join("data");
+        let tasks_dir = data_dir.join("tasks");
+        let settings_dir = data_dir.join("settings");
+        let state_dir = data_dir.join("state");
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::create_dir_all(&settings_dir).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
 
-        let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
         let original_sned_dir = std::env::var("SNED_DIR").ok();
         // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
         unsafe {
-            std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
+            std::env::set_var("SNED_DIR", temp.path().to_str().unwrap());
         }
 
         let opts = AuthOptions {
@@ -1261,17 +1168,6 @@ mod tests {
             Some("claude-sonnet-4-20250514")
         );
 
-        if let Some(val) = original_data_dir {
-            // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
-            unsafe {
-                std::env::set_var("SNED_DATA_DIR", val);
-            }
-        } else {
-            // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
-            unsafe {
-                std::env::remove_var("SNED_DATA_DIR");
-            }
-        }
         if let Some(val) = original_sned_dir {
             // SAFETY: serialized test restores the prior process environment.
             unsafe { std::env::set_var("SNED_DIR", val) };
@@ -1287,18 +1183,18 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
-        let tasks_dir = temp.path().join("tasks");
-        let settings_dir = temp.path().join("settings");
-        let state_dir = temp.path().join("state");
+        let data_dir = temp.path().join("data");
+        let tasks_dir = data_dir.join("tasks");
+        let settings_dir = data_dir.join("settings");
+        let state_dir = data_dir.join("state");
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::create_dir_all(&settings_dir).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
 
-        let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
         let original_sned_dir = std::env::var("SNED_DIR").ok();
         // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
         unsafe {
-            std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
+            std::env::set_var("SNED_DIR", temp.path().to_str().unwrap());
         }
 
         let opts = AuthOptions {
@@ -1322,17 +1218,6 @@ mod tests {
             Some("https://custom.anthropic.com")
         );
 
-        if let Some(val) = original_data_dir {
-            // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
-            unsafe {
-                std::env::set_var("SNED_DATA_DIR", val);
-            }
-        } else {
-            // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
-            unsafe {
-                std::env::remove_var("SNED_DATA_DIR");
-            }
-        }
         if let Some(val) = original_sned_dir {
             // SAFETY: serialized test restores the prior process environment.
             unsafe { std::env::set_var("SNED_DIR", val) };

@@ -11,7 +11,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 /// Maximum consecutive mistakes before asking user.
-pub const MAX_CONSECUTIVE_MISTAKES: u32 = 3;
+pub const DEFAULT_MAX_CONSECUTIVE_MISTAKES: u32 = 3;
 
 /// Maximum file content cache size (10MB) to prevent memory spikes.
 pub const MAX_FILE_CONTENT_CACHE_SIZE: usize = 10 * 1024 * 1024;
@@ -265,7 +265,7 @@ impl Default for AgentConfig {
             show_token_usage: false,
             json_output: false,
             max_turns: 100,
-            max_consecutive_mistakes: MAX_CONSECUTIVE_MISTAKES,
+            max_consecutive_mistakes: Some(DEFAULT_MAX_CONSECUTIVE_MISTAKES),
             double_check_completion: true,
             timeout_secs: 30,
             track_changes: false,
@@ -298,8 +298,8 @@ pub struct AgentConfig {
     pub json_output: bool,
     /// Maximum number of turns.
     pub max_turns: u32,
-    /// Maximum consecutive mistakes before escalation.
-    pub max_consecutive_mistakes: u32,
+    /// Maximum consecutive mistakes before escalation; `None` disables the cap.
+    pub max_consecutive_mistakes: Option<u32>,
     /// Whether to reject first completion attempt (double-check).
     pub double_check_completion: bool,
     /// Command timeout in seconds.

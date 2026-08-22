@@ -65,7 +65,6 @@ class PtySession:
         env.update(
             {
                 "SNED_DIR": self.tmp,
-                "SNED_DATA_DIR": os.path.join(self.tmp, "data"),
                 "TMPDIR": self.tmp,
                 "TMP": self.tmp,
                 "TEMP": self.tmp,
@@ -473,6 +472,7 @@ def approval_under_backpressure():
 
 def long_completion_navigation():
     sent_prompt = False
+    prompt_sent_at = None
     sent_scroll_up = False
     scroll_up_offset = None
     top_boundary_fell_through = False
@@ -488,7 +488,7 @@ def long_completion_navigation():
     scroll_down = b"\x1b[6~"
 
     def tick(session):
-        nonlocal sent_prompt, sent_scroll_up, scroll_up_offset, top_boundary_fell_through
+        nonlocal sent_prompt, prompt_sent_at, sent_scroll_up, scroll_up_offset, top_boundary_fell_through
         nonlocal scroll_down_count, next_scroll_down_at, completion_bottom_visible
         nonlocal sent_bottom_scroll, boundary_offset, boundary_fell_through
         nonlocal completion_stayed_visible, sent_exit
@@ -497,10 +497,14 @@ def long_completion_navigation():
         if "type a prompt" in clean and not sent_prompt:
             session.send(b"trigger long completion navigation\r")
             sent_prompt = True
-        # Completion opens pinned to its bottom. Start the boundary walk from
-        # there; waiting for the top marker cannot work once completion rows
-        # are counted as real transcript rows.
-        if "COMPLETION_NAV_BOTTOM" in tail and not sent_scroll_up:
+            prompt_sent_at = time.time()
+        # The mock completion is immediate. Avoid treating Ratatui's incremental
+        # cursor updates as a stable way to find its last rendered marker.
+        if (
+            prompt_sent_at is not None
+            and time.time() - prompt_sent_at >= 1.0
+            and not sent_scroll_up
+        ):
             scroll_up_offset = len(session.buf)
             time.sleep(0.2)
             session.send(scroll_up * 3 + b"\r")
@@ -509,14 +513,14 @@ def long_completion_navigation():
             sent_scroll_up = True
         if sent_scroll_up and not top_boundary_fell_through:
             phase = clean_output(session.buf[scroll_up_offset:])
-            if "TRANSCRIPT_NAV_OLDER" in phase:
+            if "TRANSCRIPTNAVOLDER" in compact_output(phase):
                 top_boundary_fell_through = True
                 next_scroll_down_at = time.time()
         if top_boundary_fell_through and not completion_bottom_visible and scroll_down_count < 8 and time.time() >= next_scroll_down_at:
             session.send(scroll_down + b"\r")
             scroll_down_count += 1
             next_scroll_down_at = time.time() + 0.15
-        if top_boundary_fell_through and "COMPLETION_NAV_BOTTOM" in tail:
+        if top_boundary_fell_through and "COMPLETIONNAVBOTTOM" in compact_output(tail):
             completion_bottom_visible = True
             if not sent_bottom_scroll:
                 boundary_offset = len(session.buf)
@@ -526,9 +530,9 @@ def long_completion_navigation():
                 sent_bottom_scroll = True
         if sent_bottom_scroll:
             boundary_phase = clean_output(session.buf[boundary_offset:])
-            if "TRANSCRIPT_NAV_RECENT" in boundary_phase:
+            if "TRANSCRIPTNAVRECENT" in compact_output(boundary_phase):
                 boundary_fell_through = True
-            if "COMPLETION_NAV_BOTTOM" in boundary_phase:
+            if "COMPLETIONNAVBOTTOM" in compact_output(boundary_phase):
                 completion_stayed_visible = True
             if boundary_fell_through and completion_stayed_visible and not sent_exit:
                 time.sleep(0.2)

@@ -991,6 +991,10 @@ pub(crate) fn create_provider(
         .map(String::from);
     let user_agent = task_opts.user_agent.clone();
     let extra_body = parse_extra_body(task_opts.extra_body.as_deref())?;
+    let stored_state = state_manager.map_or_else(
+        crate::storage::global_state::GlobalState::default,
+        crate::storage::state_manager::StateManager::global_state_snapshot,
+    );
 
     if extra_body.is_some()
         && !matches!(
@@ -1024,11 +1028,13 @@ pub(crate) fn create_provider(
                      Set the environment variable, pass --api-key, or run sned auth --provider anthropic."
                 )
             })?;
-            let state = crate::storage::global_state::load_global_state();
             let default_model = model_id
-                .or_else(|| state.act_mode_api_model_id.clone())
+                .or_else(|| stored_state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "claude-sonnet-5".to_string());
-            let base_url = state.anthropic_base_url.filter(|u| !u.is_empty());
+            let base_url = stored_state
+                .anthropic_base_url
+                .clone()
+                .filter(|u| !u.is_empty());
             Arc::new(crate::providers::Providers::Anthropic(
                 crate::providers::anthropic::AnthropicProvider::new(
                     crate::providers::anthropic::AnthropicConfig {
@@ -1052,10 +1058,7 @@ pub(crate) fn create_provider(
                 anyhow::bail!("--reasoning-effort is not supported by MiniMax.");
             }
             let default_model = model_id
-                .or_else(|| {
-                    let state = crate::storage::global_state::load_global_state();
-                    state.act_mode_api_model_id
-                })
+                .or_else(|| stored_state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "MiniMax-M3".to_string());
             let api_line = if std::env::var("MINIMAX_CN_API_KEY").is_ok() {
                 Some("china".to_string())
@@ -1125,10 +1128,7 @@ pub(crate) fn create_provider(
                 );
             }
             let default_model = model_id
-                .or_else(|| {
-                    let state = crate::storage::global_state::load_global_state();
-                    state.act_mode_api_model_id
-                })
+                .or_else(|| stored_state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "gpt-5.6".to_string());
             let model_info = Some(crate::providers::openai::get_openai_model_info(
                 &default_model,
@@ -1180,10 +1180,7 @@ pub(crate) fn create_provider(
                     })
                 });
             let default_model = model_id
-                .or_else(|| {
-                    let state = crate::storage::global_state::load_global_state();
-                    state.act_mode_api_model_id
-                })
+                .or_else(|| stored_state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "gemini-3.6-flash".to_string());
             let gemini_model_info = crate::providers::gemini::get_gemini_model_info(&default_model);
             // Reject flags that the selected Gemini generation cannot honour.
@@ -1562,6 +1559,20 @@ fn setup_hook_manager(
     Arc::new(hook_manager)
 }
 
+fn parse_max_consecutive_mistakes(value: &str, source: &str) -> anyhow::Result<Option<u32>> {
+    let parsed = value.parse::<i64>().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid {source}: expected a non-negative integer; use 0 to disable the limit"
+        )
+    })?;
+    if !(0..=i64::from(u32::MAX)).contains(&parsed) {
+        anyhow::bail!(
+            "invalid {source}: expected a non-negative integer; use 0 to disable the limit"
+        );
+    }
+    Ok(u32::try_from(parsed).ok().filter(|&limit| limit > 0))
+}
+
 #[allow(clippy::unused_async)]
 async fn build_task_components(
     task_opts: TaskOptions,
@@ -1569,6 +1580,7 @@ async fn build_task_components(
     output_writer: Option<crate::cli::output::OutputWriterArc>,
 ) -> anyhow::Result<TaskComponents> {
     use crate::core::agent_loop::{AgentConfig, AgentMode};
+    use crate::core::agent_types::DEFAULT_MAX_CONSECUTIVE_MISTAKES;
     use crate::core::context::SystemPromptContext;
     use crate::storage::state_manager::StateManager;
 
@@ -1581,6 +1593,19 @@ async fn build_task_components(
 
     let state_manager = Arc::new(StateManager::new()?);
     state_manager.initialize()?;
+
+    let stored_mistake_limit = state_manager
+        .get_global_state_key::<i32>(
+            crate::storage::state_manager::GlobalStateKey::MaxConsecutiveMistakes,
+        )
+        .unwrap_or(DEFAULT_MAX_CONSECUTIVE_MISTAKES as i32);
+    let max_consecutive_mistakes = match task_opts.max_consecutive_mistakes.as_deref() {
+        Some(value) => parse_max_consecutive_mistakes(value, "--max-consecutive-mistakes")?,
+        None => parse_max_consecutive_mistakes(
+            &stored_mistake_limit.to_string(),
+            "max_consecutive_mistakes in global_settings.json",
+        )?,
+    };
 
     let provider = create_provider(&task_opts, Some(&state_manager))?;
 
@@ -1626,11 +1651,7 @@ async fn build_task_components(
         show_token_usage: !task_opts.no_token_display,
         json_output: task_opts.json,
         max_turns: 100,
-        max_consecutive_mistakes: task_opts
-            .max_consecutive_mistakes
-            .clone()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3u32),
+        max_consecutive_mistakes,
         double_check_completion: task_opts.double_check_completion,
         timeout_secs: task_opts
             .timeout
@@ -1804,6 +1825,7 @@ fn combine_prompt_with_stdin(
 pub fn run() -> anyhow::Result<()> {
     let cli = parse();
     apply_config_override(&cli);
+    crate::storage::disk::validate_storage_environment()?;
 
     // The dispatch table for the `None` subcommand decides at runtime
     // whether to enter the interactive TUI shell. We mirror that
@@ -2519,9 +2541,30 @@ mod tests {
         let output = format_config_output(&state);
 
         assert!(output.contains("Current Sned Configuration"));
-        assert!(output.contains("Mode & Provider"));
+        assert!(output.contains("Providers"));
         assert!(output.contains("Auto-Approve"));
-        assert!(output.contains("Context"));
+        assert!(output.contains("Execution"));
+    }
+
+    #[test]
+    fn test_parse_max_consecutive_mistakes_zero_disables_limit() {
+        assert_eq!(
+            parse_max_consecutive_mistakes("0", "test").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_max_consecutive_mistakes("3", "test").unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_parse_max_consecutive_mistakes_rejects_negative_and_malformed_values() {
+        for value in ["-1", "many"] {
+            let error = parse_max_consecutive_mistakes(value, "--max-consecutive-mistakes")
+                .expect_err("invalid values must be rejected");
+            assert!(error.to_string().contains("0 to disable the limit"));
+        }
     }
 
     #[test]

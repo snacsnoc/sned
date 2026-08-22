@@ -2780,11 +2780,15 @@ impl AgentLoop {
             state.consecutive_mistakes += 1;
             tracing::warn!(
                 consecutive_mistakes = state.consecutive_mistakes,
-                max_allowed = self.config.max_consecutive_mistakes,
+                max_allowed = ?self.config.max_consecutive_mistakes,
                 "Model returned empty response (no text, no tool calls)"
             );
 
-            if state.consecutive_mistakes >= self.config.max_consecutive_mistakes {
+            if self
+                .config
+                .max_consecutive_mistakes
+                .is_some_and(|limit| state.consecutive_mistakes >= limit)
+            {
                 return TurnResult::Error("Max consecutive mistakes reached".to_string());
             }
 
@@ -3755,7 +3759,7 @@ impl AgentLoop {
                     state.consecutive_mistakes += 1;
                     tracing::warn!(
                         consecutive_mistakes = state.consecutive_mistakes,
-                        max_allowed = self.config.max_consecutive_mistakes,
+                        max_allowed = ?self.config.max_consecutive_mistakes,
                         tool_failures = tool_failure_count,
                         "Tool execution failures detected"
                     );
@@ -3786,8 +3790,10 @@ impl AgentLoop {
                         }
                     }
 
-                    let max_reached =
-                        state.consecutive_mistakes >= self.config.max_consecutive_mistakes;
+                    let max_reached = self
+                        .config
+                        .max_consecutive_mistakes
+                        .is_some_and(|limit| state.consecutive_mistakes >= limit);
                     drop(state);
 
                     if let Some(msg) = step_fail_msg {
@@ -3798,7 +3804,9 @@ impl AgentLoop {
                     if max_reached {
                         return TurnResult::Error(format!(
                             "Max consecutive mistakes ({}) reached. The model is repeatedly failing.",
-                            self.config.max_consecutive_mistakes
+                            self.config
+                                .max_consecutive_mistakes
+                                .expect("max_reached requires a configured limit")
                         ));
                     }
                 } else {
@@ -3847,7 +3855,11 @@ impl AgentLoop {
                 let state = self.state.lock().await;
                 mistakes_count = state.consecutive_mistakes;
             }
-            if mistakes_count >= self.config.max_consecutive_mistakes.saturating_sub(1) {
+            if self
+                .config
+                .max_consecutive_mistakes
+                .is_some_and(|limit| mistakes_count >= limit.saturating_sub(1))
+            {
                 let hint = {
                     let state = self.state.lock().await;
                     Self::reread_recovery_hint(&state)
@@ -5080,7 +5092,7 @@ mod tests {
             show_token_usage: false,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -6036,6 +6048,24 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    async fn test_unlimited_consecutive_mistakes_never_stops_empty_responses() {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            (0..4)
+                .map(|_| crate::providers::mock::MockResponse::Stream(vec![]))
+                .collect(),
+        )));
+        let mut config = test_agent_config(provider, "test-unlimited-consecutive-mistakes");
+        config.max_consecutive_mistakes = None;
+        let mut agent = AgentLoop::new(config);
+
+        for _ in 0..4 {
+            assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        }
+
+        assert_eq!(agent.state.lock().await.consecutive_mistakes, 4);
+    }
+
+    #[tokio::test]
     async fn test_successful_turn_clears_stale_retryable_failed_request() {
         let provider = Arc::new(Providers::Mock(
             crate::providers::mock::MockProvider::single_text_response("done"),
@@ -6525,10 +6555,10 @@ Irrespective of whether additional information or instructions are given, you ar
         let data_dir = temp_dir.path().join("data");
         std::fs::create_dir_all(data_dir.join("state")).unwrap();
         std::fs::create_dir_all(data_dir.join("settings")).unwrap();
-        let old_data_dir = std::env::var_os("SNED_DATA_DIR");
+        let old_sned_dir = std::env::var_os("SNED_DIR");
         // SAFETY: this test is intended to run with isolated validation commands.
         unsafe {
-            std::env::set_var("SNED_DATA_DIR", &data_dir);
+            std::env::set_var("SNED_DIR", temp_dir.path());
         }
 
         let provider = Arc::new(Providers::Mock(
@@ -6557,9 +6587,9 @@ Irrespective of whether additional information or instructions are given, you ar
 
         // SAFETY: restore the process environment for later tests.
         unsafe {
-            match old_data_dir {
-                Some(ref value) => std::env::set_var("SNED_DATA_DIR", value),
-                None => std::env::remove_var("SNED_DATA_DIR"),
+            match old_sned_dir {
+                Some(ref value) => std::env::set_var("SNED_DIR", value),
+                None => std::env::remove_var("SNED_DIR"),
             }
         }
     }
@@ -6638,7 +6668,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 1,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -6688,7 +6718,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 1,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -6728,7 +6758,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 1,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -6842,7 +6872,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 2,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -7256,7 +7286,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7428,7 +7458,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7478,7 +7508,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7513,7 +7543,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7553,7 +7583,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7708,7 +7738,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7750,7 +7780,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7791,7 +7821,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7838,7 +7868,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -7915,7 +7945,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -8005,7 +8035,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -8092,7 +8122,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -8150,7 +8180,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -8206,7 +8236,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -8244,7 +8274,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -8763,7 +8793,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -8810,7 +8840,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -8879,7 +8909,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: true,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: true,
             timeout_secs: 300,
             track_changes: false,
@@ -9937,7 +9967,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -9996,7 +10026,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -10066,7 +10096,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -10156,7 +10186,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -10267,7 +10297,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -10457,7 +10487,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,
@@ -10536,7 +10566,7 @@ Irrespective of whether additional information or instructions are given, you ar
             show_token_usage: false,
             json_output: false,
             max_turns: 10,
-            max_consecutive_mistakes: 3,
+            max_consecutive_mistakes: Some(3),
             double_check_completion: false,
             timeout_secs: 300,
             track_changes: false,

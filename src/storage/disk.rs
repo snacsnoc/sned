@@ -97,14 +97,21 @@ pub fn get_sned_dir() -> PathBuf {
     }
 }
 
-/// Get the Sned data directory (~/.sned/data or SNED_DATA_DIR)
+/// Get the Sned data directory below the single Sned storage root.
 #[must_use]
 pub fn get_data_dir() -> PathBuf {
-    if let Ok(dir) = env::var("SNED_DATA_DIR") {
-        PathBuf::from(dir)
-    } else {
-        get_sned_dir().join("data")
+    get_sned_dir().join("data")
+}
+
+/// Reject the removed split data-root override before state is initialized.
+pub fn validate_storage_environment() -> io::Result<()> {
+    if env::var_os("SNED_DATA_DIR").is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SNED_DATA_DIR is no longer supported; set SNED_DIR to the Sned storage root instead",
+        ));
     }
+    Ok(())
 }
 
 /// Get the tasks directory (data/tasks)

@@ -1,108 +1,40 @@
 use serde::{Deserialize, Serialize};
-use serde_json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 /// Global state and settings combined (mirrors TypeScript GlobalStateAndSettings)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sned_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sned_generated_machine_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_shown_announcement_id: Option<String>,
     #[serde(default)]
     pub task_history: Vec<HistoryItem>,
-    #[serde(default)]
-    pub favorited_model_ids: Vec<String>,
-    #[serde(default = "default_true")]
-    pub terminal_reuse_enabled: bool,
-    #[serde(default = "default_vscode_terminal")]
-    pub vscode_terminal_execution_mode: String,
-    #[serde(default = "default_true")]
-    pub is_new_user: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub welcome_view_completed: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_roots: Option<Vec<WorkspaceRoot>>,
-    #[serde(default)]
-    pub primary_root_index: i32,
-    #[serde(default = "default_true")]
-    pub multi_root_enabled: bool,
-    #[serde(default)]
-    pub last_dismissed_info_banner_version: i32,
-    #[serde(default)]
-    pub last_dismissed_model_banner_version: i32,
-    #[serde(default)]
-    pub last_dismissed_cli_banner_version: i32,
-    #[serde(default)]
-    pub remote_rules_toggles: HashMap<String, bool>,
-    #[serde(default)]
-    pub dismissed_banners: Vec<DismissedBanner>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worktree_auto_open_path: Option<String>,
 
-    // User settings fields (from USER_SETTINGS_FIELDS)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_approval_settings: Option<AutoApprovalSettings>,
     #[serde(default)]
     pub auto_approve_patterns: Vec<String>,
     #[serde(default)]
     pub global_sned_rules_toggles: HashMap<String, bool>,
-    #[serde(default)]
-    pub global_skills_toggles: HashMap<String, bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub browser_settings: Option<BrowserSettings>,
-    #[serde(default)]
-    pub plan_act_separate_models_setting: bool,
     #[serde(default = "default_true")]
     pub enable_checkpoints_setting: bool,
-    #[serde(default = "default_shell_timeout")]
-    pub shell_integration_timeout: i32,
-    #[serde(default = "default_default_terminal")]
-    pub default_terminal_profile: String,
-    #[serde(default = "default_terminal_line_limit")]
-    pub terminal_output_line_limit: i32,
-    #[serde(default = "default_max_mistakes")]
+    #[serde(
+        default = "default_max_mistakes",
+        deserialize_with = "deserialize_max_consecutive_mistakes"
+    )]
     pub max_consecutive_mistakes: i32,
     #[serde(default)]
     pub strict_plan_mode_enabled: bool,
-    #[serde(default = "default_true")]
-    pub hooks_enabled: bool,
-    #[serde(default)]
-    pub auto_approve_all_toggled: bool,
-    #[serde(default = "default_true")]
-    pub use_auto_condense: bool,
-    #[serde(default = "default_true")]
-    pub show_token_usage: bool,
     #[serde(default)]
     pub subagents_enabled: bool,
     #[serde(default = "default_true")]
     pub sned_web_tools_enabled: bool,
-    #[serde(default)]
-    pub worktrees_enabled: bool,
-    #[serde(default = "default_english")]
-    pub preferred_language: String,
     #[serde(default = "default_act_mode")]
     pub mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom_prompt: Option<String>,
-    #[serde(default)]
-    pub background_edit_enabled: bool,
-    #[serde(default)]
-    pub opt_out_of_remote_config: bool,
-    #[serde(default)]
-    pub double_check_completion_enabled: bool,
 
-    #[serde(default)]
-    pub write_prompt_metadata_enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub write_prompt_metadata_directory: Option<String>,
-
-    // API handler settings (selected fields, full set deferred)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lite_llm_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,8 +45,6 @@ pub struct GlobalState {
     pub open_router_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini_base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aws_region: Option<String>,
     #[serde(default = "default_anthropic")]
     pub plan_mode_api_provider: String,
     #[serde(default = "default_anthropic")]
@@ -127,37 +57,67 @@ pub struct GlobalState {
     pub azure_api_version: Option<String>,
     #[serde(default)]
     pub enable_parallel_tool_calling: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_timeout_ms: Option<i32>,
+}
+
+impl Default for GlobalState {
+    fn default() -> Self {
+        Self {
+            sned_version: None,
+            task_history: Vec::new(),
+            auto_approval_settings: None,
+            auto_approve_patterns: Vec::new(),
+            global_sned_rules_toggles: HashMap::new(),
+            enable_checkpoints_setting: default_true(),
+            max_consecutive_mistakes: default_max_mistakes(),
+            strict_plan_mode_enabled: false,
+            subagents_enabled: false,
+            sned_web_tools_enabled: default_true(),
+            mode: default_act_mode(),
+            lite_llm_base_url: None,
+            anthropic_base_url: None,
+            open_ai_base_url: None,
+            open_router_base_url: None,
+            gemini_base_url: None,
+            plan_mode_api_provider: default_anthropic(),
+            act_mode_api_provider: default_anthropic(),
+            act_mode_api_model_id: None,
+            plan_mode_api_model_id: None,
+            azure_api_version: None,
+            enable_parallel_tool_calling: false,
+        }
+    }
 }
 
 // Helper functions for defaults
 fn default_true() -> bool {
     true
 }
-fn default_vscode_terminal() -> String {
-    "vscodeTerminal".to_string()
-}
-fn default_shell_timeout() -> i32 {
-    4000
-}
-fn default_default_terminal() -> String {
-    "default".to_string()
-}
-fn default_terminal_line_limit() -> i32 {
-    500
-}
 fn default_max_mistakes() -> i32 {
-    5
+    3
 }
-fn default_english() -> String {
-    "English".to_string()
-}
-fn default_act_mode() -> String {
-    "act".to_string()
+
+fn deserialize_max_consecutive_mistakes<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(value) = value.as_i64() else {
+        return Err(serde::de::Error::custom(
+            "max_consecutive_mistakes must be a non-negative integer; 0 disables the limit",
+        ));
+    };
+    i32::try_from(value).map_err(|_| {
+        serde::de::Error::custom(
+            "max_consecutive_mistakes must be an integer; 0 disables the limit",
+        )
+    })
 }
 fn default_anthropic() -> String {
     "anthropic".to_string()
+}
+
+fn default_act_mode() -> String {
+    "act".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -194,18 +154,6 @@ pub struct HistoryItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceRoot {
-    pub path: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DismissedBanner {
-    pub banner_id: String,
-    pub dismissed_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoApprovalSettings {
     pub enabled: bool,
     pub actions: Vec<String>,
@@ -213,22 +161,15 @@ pub struct AutoApprovalSettings {
     pub enable_notifications: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrowserSettings {
-    pub enabled: bool,
-    pub viewport_size: String,
-    pub headless: bool,
-}
-
-/// Load global state from the default path (~/.sned/data/settings/global_settings.json)
-/// Uses integrity validation (SHA256 checksum) when available.
+/// Load global state from the active Sned storage root.
 #[must_use]
 pub fn load_global_state() -> GlobalState {
-    load_global_state_with_integrity()
+    load_global_state_from_path(&global_settings_path()).unwrap_or_default()
 }
 
-fn get_sned_home_path() -> PathBuf {
-    dirs::home_dir().map_or_else(|| PathBuf::from(".sned"), |h| h.join(".sned"))
+#[must_use]
+pub fn global_settings_path() -> PathBuf {
+    crate::storage::disk::get_settings_dir().join("global_settings.json")
 }
 
 /// Compute SHA256 checksum of data for integrity validation
@@ -243,14 +184,8 @@ fn validate_checksum(data: &str, expected_checksum: &str) -> bool {
     compute_checksum(data) == expected_checksum
 }
 
-/// Load global state with integrity validation
-/// Format: first line is checksum, rest is JSON
-pub fn load_global_state_with_integrity() -> GlobalState {
-    let path = get_sned_home_path()
-        .join("data")
-        .join("settings")
-        .join("global_settings.json");
-
+/// Load plain JSON settings, accepting the previous checksum-prefixed format.
+pub fn load_global_state_from_path(path: &Path) -> io::Result<GlobalState> {
     match fs::read_to_string(&path) {
         Ok(contents) => {
             // Parse checksum and data
@@ -282,13 +217,22 @@ pub fn load_global_state_with_integrity() -> GlobalState {
                         "Global state integrity check failed; backed up corrupted file"
                     );
                 }
-                return GlobalState::default();
+                return Ok(GlobalState::default());
             }
 
             // Parse JSON
             match serde_json::from_str(&json_data) {
-                Ok(state) => state,
+                Ok(state) => Ok(state),
                 Err(error) => {
+                    if error.to_string().contains("max_consecutive_mistakes") {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid max_consecutive_mistakes in {}: expected a non-negative integer; 0 disables the limit",
+                                path.display()
+                            ),
+                        ));
+                    }
                     // Create backup of corrupted file
                     if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
                         tracing::warn!(
@@ -298,11 +242,12 @@ pub fn load_global_state_with_integrity() -> GlobalState {
                             "Created backup of corrupted global state JSON"
                         );
                     }
-                    GlobalState::default()
+                    Ok(GlobalState::default())
                 }
             }
         }
-        Err(_) => GlobalState::default(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(GlobalState::default()),
+        Err(error) => Err(error),
     }
 }
 

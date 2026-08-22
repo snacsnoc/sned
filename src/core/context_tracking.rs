@@ -134,7 +134,7 @@ mod tests {
     use std::sync::OnceLock;
     use tempfile::TempDir;
 
-    // Static mutex to serialize tests that modify SNED_DATA_DIR
+    // Static mutex to serialize tests that modify SNED_DIR.
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[tokio::test]
@@ -147,14 +147,14 @@ mod tests {
         let task_id = format!("test-{}", std::process::id());
 
         // Create task directory
-        let task_dir = temp.path().join(&task_id);
+        let task_dir = temp.path().join("data").join("tasks").join(&task_id);
         fs::create_dir_all(&task_dir).unwrap();
 
-        // Override SNED_DATA_DIR for this test
-        let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        // Override SNED_DIR for this test.
+        let original_sned_dir = std::env::var("SNED_DIR").ok();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe {
-            std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
+            std::env::set_var("SNED_DIR", temp.path().to_str().unwrap());
         }
 
         let tracker = ModelContextTracker::new(&task_id);
@@ -171,15 +171,15 @@ mod tests {
         assert_eq!(metadata.model_usage[0].mode, "act");
 
         // Restore original env var
-        if let Some(val) = original_data_dir {
+        if let Some(val) = original_sned_dir {
             // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
-                std::env::set_var("SNED_DATA_DIR", val);
+                std::env::set_var("SNED_DIR", val);
             }
         } else {
             // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
-                std::env::remove_var("SNED_DATA_DIR");
+                std::env::remove_var("SNED_DIR");
             }
         }
     }
@@ -196,14 +196,14 @@ mod tests {
         let task_id = format!("test-concurrent-{}", std::process::id());
 
         // Create task directory
-        let task_dir = temp.path().join(&task_id);
+        let task_dir = temp.path().join("data").join("tasks").join(&task_id);
         fs::create_dir_all(&task_dir).unwrap();
 
-        // Override SNED_DATA_DIR for this test
-        let original_data_dir = std::env::var("SNED_DATA_DIR").ok();
+        // Override SNED_DIR for this test.
+        let original_sned_dir = std::env::var("SNED_DIR").ok();
         // SAFETY: single-threaded test; sequential env mutation
         unsafe {
-            std::env::set_var("SNED_DATA_DIR", temp.path().to_str().unwrap());
+            std::env::set_var("SNED_DIR", temp.path().to_str().unwrap());
         }
 
         // Run both trackers (now synchronous, but locking still prevents clobbering)
@@ -233,15 +233,15 @@ mod tests {
         );
 
         // Restore original env var
-        if let Some(val) = original_data_dir {
+        if let Some(val) = original_sned_dir {
             // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
-                std::env::set_var("SNED_DATA_DIR", val);
+                std::env::set_var("SNED_DIR", val);
             }
         } else {
             // SAFETY: single-threaded test; restoring env after assertion
             unsafe {
-                std::env::remove_var("SNED_DATA_DIR");
+                std::env::remove_var("SNED_DIR");
             }
         }
     }

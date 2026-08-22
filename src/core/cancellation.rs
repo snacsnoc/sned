@@ -358,10 +358,10 @@ mod tests {
         let settings_dir = data_dir.join("settings");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::create_dir_all(&settings_dir).unwrap();
-        let old_data_dir = std::env::var_os("SNED_DATA_DIR");
+        let old_sned_dir = std::env::var_os("SNED_DIR");
         // SAFETY: this test runs in isolation under the validation command.
         unsafe {
-            std::env::set_var("SNED_DATA_DIR", &data_dir);
+            std::env::set_var("SNED_DIR", temp_dir.path());
         }
 
         let state_manager = crate::storage::state_manager::StateManager::new().unwrap();
@@ -384,9 +384,9 @@ mod tests {
 
         // SAFETY: restore the process environment for later tests.
         unsafe {
-            match old_data_dir {
-                Some(ref value) => std::env::set_var("SNED_DATA_DIR", value),
-                None => std::env::remove_var("SNED_DATA_DIR"),
+            match old_sned_dir {
+                Some(ref value) => std::env::set_var("SNED_DIR", value),
+                None => std::env::remove_var("SNED_DIR"),
             }
         }
     }
@@ -410,10 +410,10 @@ mod tests {
         let settings_dir = data_dir.join("settings");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::create_dir_all(&settings_dir).unwrap();
-        let old_data_dir = std::env::var_os("SNED_DATA_DIR");
+        let old_sned_dir = std::env::var_os("SNED_DIR");
         // SAFETY: this test runs in isolation under the validation command.
         unsafe {
-            std::env::set_var("SNED_DATA_DIR", &data_dir);
+            std::env::set_var("SNED_DIR", temp_dir.path());
         }
 
         let state_manager = crate::storage::state_manager::StateManager::new().unwrap();
@@ -434,9 +434,9 @@ mod tests {
 
         // SAFETY: restore the process environment for later tests.
         unsafe {
-            match old_data_dir {
-                Some(ref value) => std::env::set_var("SNED_DATA_DIR", value),
-                None => std::env::remove_var("SNED_DATA_DIR"),
+            match old_sned_dir {
+                Some(ref value) => std::env::set_var("SNED_DIR", value),
+                None => std::env::remove_var("SNED_DIR"),
             }
         }
     }
