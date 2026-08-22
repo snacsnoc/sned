@@ -13,7 +13,8 @@ struct FileSearchCacheEntry {
 }
 
 /// Global cache for workspace file listings, keyed by workspace path
-/// TTL: 5 seconds - balances freshness vs performance for @-mention autocomplete
+/// TTL: 5 minutes - avoids repeating recursive walks on slow/NFS workspaces while
+/// still allowing external workspace changes to appear during a session.
 static FILE_SEARCH_CACHE: LazyLock<Arc<RwLock<HashMap<String, FileSearchCacheEntry>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::with_capacity(4))));
 
@@ -23,8 +24,14 @@ static FILE_SEARCH_CACHE: LazyLock<Arc<RwLock<HashMap<String, FileSearchCacheEnt
 static FILE_SEARCH_REFRESHING: LazyLock<Arc<Mutex<HashMap<String, watch::Sender<Option<bool>>>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-const CACHE_TTL: Duration = Duration::from_secs(5);
+const CACHE_TTL: Duration = Duration::from_secs(300);
 const WORKSPACE_INDEX_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceFileSearch {
+    pub results: Vec<FileSearchResult>,
+    pub refresh_pending: bool,
+}
 
 #[cfg(test)]
 struct RefreshTestBlocker {
@@ -269,31 +276,21 @@ async fn refresh_workspace_file_index(
     results
 }
 
-async fn workspace_file_index(workspace_path: &str) -> std::io::Result<Vec<FileSearchResult>> {
-    let workspace_path = workspace_path.to_string();
-    let cached = FILE_SEARCH_CACHE.read().await.get(&workspace_path).cloned();
-    if cached
-        .as_ref()
-        .is_some_and(|entry| entry.timestamp.elapsed() < CACHE_TTL)
-    {
-        return Ok(cached.expect("fresh cache entry").results);
-    }
-
-    let stale_results = cached.map(|entry| entry.results);
-    let (refresh_tx, mut refresh_rx, owns_refresh) = {
+async fn ensure_workspace_refresh(workspace_path: &str) -> watch::Receiver<Option<bool>> {
+    let (refresh_tx, refresh_rx, owns_refresh) = {
         let mut refreshing = FILE_SEARCH_REFRESHING.lock().await;
-        if let Some(sender) = refreshing.get(&workspace_path) {
+        if let Some(sender) = refreshing.get(workspace_path) {
             (sender.clone(), sender.subscribe(), false)
         } else {
             let (sender, _) = watch::channel(None);
             let receiver = sender.subscribe();
-            refreshing.insert(workspace_path.clone(), sender.clone());
+            refreshing.insert(workspace_path.to_string(), sender.clone());
             (sender, receiver, true)
         }
     };
 
     if owns_refresh {
-        let refresh_path = workspace_path.clone();
+        let refresh_path = workspace_path.to_string();
         tokio::spawn(async move {
             let result =
                 refresh_workspace_file_index(refresh_path.clone(), PathBuf::from(&refresh_path))
@@ -303,19 +300,54 @@ async fn workspace_file_index(workspace_path: &str) -> std::io::Result<Vec<FileS
         });
     }
 
+    refresh_rx
+}
+
+/// Start warming the workspace index without delaying TUI startup.
+pub fn preload_index(workspace_path: String) {
+    tokio::spawn(async move {
+        let _ = ensure_workspace_refresh(&workspace_path).await;
+    });
+}
+
+async fn workspace_file_index(
+    workspace_path: &str,
+) -> std::io::Result<(Vec<FileSearchResult>, bool)> {
+    let workspace_path = workspace_path.to_string();
+    let cached = FILE_SEARCH_CACHE.read().await.get(&workspace_path).cloned();
+    if cached
+        .as_ref()
+        .is_some_and(|entry| entry.timestamp.elapsed() < CACHE_TTL)
+    {
+        return Ok((cached.expect("fresh cache entry").results, false));
+    }
+
+    // A stale index is still much more useful than an empty picker on a slow
+    // filesystem. Refresh it in the background and let the next query observe
+    // the fresh cache when it becomes available.
+    if let Some(entry) = cached {
+        let _ = ensure_workspace_refresh(&workspace_path).await;
+        return Ok((entry.results, true));
+    }
+
+    let mut refresh_rx = ensure_workspace_refresh(&workspace_path).await;
     let refresh_completed = tokio::time::timeout(WORKSPACE_INDEX_TIMEOUT, refresh_rx.changed())
         .await
         .is_ok_and(|result| result.is_ok());
     if let Some(entry) = FILE_SEARCH_CACHE.read().await.get(&workspace_path)
         && entry.timestamp.elapsed() < CACHE_TTL
     {
-        return Ok(entry.results.clone());
+        return Ok((entry.results.clone(), false));
     }
     if !refresh_completed || *refresh_rx.borrow() != Some(true) {
         tracing::debug!(workspace = %workspace_path, "Workspace file index refresh did not complete");
     }
 
-    Ok(stale_results.unwrap_or_default())
+    let refresh_pending = FILE_SEARCH_REFRESHING
+        .lock()
+        .await
+        .contains_key(&workspace_path);
+    Ok((Vec::new(), refresh_pending))
 }
 
 pub async fn list_workspace_files(
@@ -324,6 +356,7 @@ pub async fn list_workspace_files(
 ) -> std::io::Result<Vec<FileSearchResult>> {
     Ok(workspace_file_index(workspace_path)
         .await?
+        .0
         .into_iter()
         .take(limit)
         .collect())
@@ -399,12 +432,23 @@ pub async fn search_workspace_files(
     workspace_path: &str,
     limit: usize,
 ) -> Vec<FileSearchResult> {
-    let Ok(items) = workspace_file_index(workspace_path).await else {
-        return Vec::new();
-    };
+    search_workspace_files_with_status(query, workspace_path, limit)
+        .await
+        .map_or_else(|_| Vec::new(), |search| search.results)
+}
+
+pub async fn search_workspace_files_with_status(
+    query: &str,
+    workspace_path: &str,
+    limit: usize,
+) -> std::io::Result<WorkspaceFileSearch> {
+    let (items, refresh_pending) = workspace_file_index(workspace_path).await?;
 
     if query.trim().is_empty() {
-        return items.into_iter().take(limit).collect();
+        return Ok(WorkspaceFileSearch {
+            results: items.into_iter().take(limit).collect(),
+            refresh_pending,
+        });
     }
 
     let query_lower = query.to_lowercase();
@@ -423,11 +467,15 @@ pub async fn search_workspace_files(
             .cmp(&left.0)
             .then_with(|| left.1.path.cmp(&right.1.path))
     });
-    scored
-        .into_iter()
-        .take(limit)
-        .map(|(_, item)| item)
-        .collect()
+
+    Ok(WorkspaceFileSearch {
+        results: scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, item)| item)
+            .collect(),
+        refresh_pending,
+    })
 }
 
 #[must_use]
@@ -866,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_searches_wait_for_one_refresh_and_receive_fresh_results() {
+    async fn test_concurrent_searches_return_stale_while_one_refresh_runs() {
         use std::fs;
         use tempfile::TempDir;
 
@@ -897,31 +945,53 @@ mod tests {
             .insert(workspace_path.clone(), blocker.clone());
         let started = blocker.started.notified();
         let first_path = workspace_path.clone();
-        let first =
-            tokio::spawn(async move { search_workspace_files("after", &first_path, 10).await });
+        let first = tokio::spawn(async move {
+            search_workspace_files_with_status("after", &first_path, 10).await
+        });
         tokio::time::timeout(Duration::from_secs(1), started)
             .await
             .expect("refresh should start");
 
         let second_path = workspace_path.clone();
-        let second =
-            tokio::spawn(async move { search_workspace_files("after", &second_path, 10).await });
-        release_tx.send(true).unwrap();
-
+        let second = tokio::spawn(async move {
+            search_workspace_files_with_status("after", &second_path, 10).await
+        });
         let first_results = tokio::time::timeout(Duration::from_secs(1), first)
             .await
             .expect("first search should finish")
+            .unwrap()
             .unwrap();
         let second_results = tokio::time::timeout(Duration::from_secs(1), second)
             .await
             .expect("second search should finish")
+            .unwrap()
             .unwrap();
-        REFRESH_TEST_BLOCKERS.lock().await.remove(&workspace_path);
+        assert!(first_results.results.is_empty());
+        assert!(first_results.refresh_pending);
+        assert!(second_results.results.is_empty());
+        assert!(second_results.refresh_pending);
 
-        for results in [first_results, second_results] {
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].path, "after.rs");
-        }
+        release_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let cached = FILE_SEARCH_CACHE.read().await;
+                if cached
+                    .get(&workspace_path)
+                    .is_some_and(|entry| entry.results.iter().any(|r| r.path == "after.rs"))
+                {
+                    break;
+                }
+                drop(cached);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background refresh should publish fresh results");
+
+        let fresh_results = search_workspace_files("after", &workspace_path, 10).await;
+        REFRESH_TEST_BLOCKERS.lock().await.remove(&workspace_path);
+        assert_eq!(fresh_results.len(), 1);
+        assert_eq!(fresh_results[0].path, "after.rs");
     }
 
     #[tokio::test]

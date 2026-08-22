@@ -653,6 +653,7 @@ fn clear_mention_search(app: &mut App, clear_results: bool) {
         app.picker_results.clear();
         app.picker_index = 0;
         app.picker_selection_explicit = false;
+        app.mention_search_refresh_pending = false;
     }
 }
 
@@ -680,17 +681,24 @@ fn spawn_mention_search(app: &mut App, query: String) {
     tokio::spawn(async move {
         #[cfg(test)]
         wait_for_mention_search_test_blocker().await;
-        let results = crate::core::file_search::search_workspace_files(&query, &cwd, 10).await;
+        let search =
+            crate::core::file_search::search_workspace_files_with_status(&query, &cwd, 10).await;
+        let (results, refresh_pending) = search.map_or_else(
+            |_| (Vec::new(), false),
+            |search| (search.results, search.refresh_pending),
+        );
         let _ = tx.send(crate::cli::tui::app::MentionSearchUpdate {
             generation,
             query,
             results,
+            refresh_pending,
         });
     });
 }
 
 fn schedule_immediate_mention_search(app: &mut App, query: String) {
     app.mention_search_deadline = Instant::now() + Duration::from_secs(3600);
+    app.mention_search_refresh_pending = true;
     spawn_mention_search(app, query);
 }
 
@@ -3569,6 +3577,13 @@ async fn run_main_loop(
             {
                 app.picker_active = true;
                 app.picker_results = update.results;
+                app.mention_search_refresh_pending =
+                    update.refresh_pending && app.picker_results.is_empty();
+                app.mention_search_deadline = if app.mention_search_refresh_pending {
+                    Instant::now() + Duration::from_millis(150)
+                } else {
+                    Instant::now() + Duration::from_secs(3600)
+                };
                 app.picker_index = 0;
                 app.picker_selection_explicit = false;
                 app.needs_redraw = true;
@@ -4172,10 +4187,7 @@ async fn run_main_loop(
         }
 
         // 3b. Fire debounced mention search if timer expired
-        if app.mention_search_active
-            && !app.mention_search_query.is_empty()
-            && std::time::Instant::now() >= app.mention_search_deadline
-        {
+        if app.mention_search_active && std::time::Instant::now() >= app.mention_search_deadline {
             let query = app.mention_search_query.clone();
             schedule_immediate_mention_search(app, query);
         }
@@ -4281,6 +4293,7 @@ pub async fn run_interactive_shell_inner(
     }
     if let Ok(cwd) = std::env::current_dir() {
         app.cwd = cwd.to_string_lossy().to_string();
+        crate::core::file_search::preload_index(app.cwd.clone());
     }
 
     // 2. Create output channel (bounded to prevent memory exhaustion during

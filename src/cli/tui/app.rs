@@ -44,6 +44,7 @@ pub struct MentionSearchUpdate {
     pub generation: u64,
     pub query: String,
     pub results: Vec<FileSearchResult>,
+    pub refresh_pending: bool,
 }
 
 /// Distinguishes model-streamed prose from tool-result or system lines
@@ -560,6 +561,8 @@ pub struct App {
     pub mention_search_generation: u64,
     /// Result channel for async mention searches.
     pub mention_search_tx: Option<tokio::sync::mpsc::UnboundedSender<MentionSearchUpdate>>,
+    /// Whether the current mention query is waiting for the initial file index.
+    pub mention_search_refresh_pending: bool,
     /// Last known context usage percentage from the API.
     pub context_pct: Option<f64>,
     /// Cached visible output window result (start_idx, take_count, start_row_offset).
@@ -986,6 +989,7 @@ impl App {
             in_scrollback: false,
             mention_search_generation: 0,
             mention_search_tx: None,
+            mention_search_refresh_pending: false,
         }
     }
 
@@ -3763,7 +3767,9 @@ impl App {
             Self::picker_viewport_start(selected, self.picker_results.len(), visible_rows);
         let query = self.mention_search_query.trim_start_matches('@');
         let rows: Vec<Line> = if result_count == 0 {
-            let message = if query.is_empty() {
+            let message = if self.mention_search_refresh_pending {
+                " Loading files…".to_string()
+            } else if query.is_empty() {
                 " No matches".to_string()
             } else {
                 format!(" No matches for @{query}")
@@ -5409,6 +5415,14 @@ mod tests {
         let rendered = render(&mut file_picker);
         assert!(rendered.contains("Files · @zzz"));
         assert!(rendered.contains("No matches for @zzz"));
+
+        let mut loading_picker = App::new();
+        loading_picker.picker_active = true;
+        loading_picker.mention_search_query = "claud".to_string();
+        loading_picker.mention_search_refresh_pending = true;
+        let rendered = render(&mut loading_picker);
+        assert!(rendered.contains("Loading files…"));
+        assert!(!rendered.contains("No matches for @claud"));
 
         let mut slash_picker = App::new();
         slash_picker.slash_command_active = true;
