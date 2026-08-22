@@ -60,7 +60,6 @@ static SYMBOL_INDEX_REFRESHING: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 const INDEX_BATCH_SIZE: usize = 64;
-const INDEX_PREFLIGHT_MIN_FILES: usize = 100;
 
 struct SymbolIndexRefreshGuard {
     project_root: String,
@@ -329,11 +328,10 @@ impl SymbolIndexService {
                 .is_some_and(|db| db.file_metadata(rel_path) == Some((mtime, size)))
     }
 
-    fn should_skip_initial_walk(&self, sampled_latest_mtime: u64) -> bool {
-        self.db.as_ref().is_some_and(|db| {
-            db.indexed_file_count() > INDEX_PREFLIGHT_MIN_FILES
-                && db.latest_file_mtime().unwrap_or(0) >= sampled_latest_mtime
-        })
+    fn has_usable_persisted_index(&self) -> bool {
+        self.db
+            .as_ref()
+            .is_some_and(|db| db.indexed_file_count() > 0)
     }
 
     fn begin_initial_walk(&mut self, workspace_file_count: usize) {
@@ -344,7 +342,10 @@ impl SymbolIndexService {
 
     pub(crate) fn finish_initial_walk(&mut self, workspace_file_count: usize) {
         self.status.workspace_file_count = workspace_file_count;
-        self.status.indexed_file_count = workspace_file_count;
+        self.status.indexed_file_count = self.db.as_ref().map_or(
+            self.files.len(),
+            db::SymbolIndexDatabase::indexed_file_count,
+        );
         self.status.initial_walk_complete = true;
         self.status.last_indexed_at = Some(SystemTime::now());
     }
@@ -435,22 +436,40 @@ fn run_initial_walk(
         return Ok(());
     }
 
-    let candidates = collect_index_candidates(project_root);
-    let latest_candidate_mtime = latest_candidate_mtime(&candidates);
+    let persisted_index_ready = service
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .has_usable_persisted_index();
+
+    let candidate_walk_started = Instant::now();
+    let mut candidates = collect_index_candidates(project_root);
+    let candidate_walk_ms = candidate_walk_started.elapsed().as_millis();
+    let parser_load_started = Instant::now();
+    let language_parsers = load_parsers_for_candidates(&candidates);
+    candidates.retain(|candidate| {
+        candidate
+            .absolute_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_lowercase)
+            .is_some_and(|extension| language_parsers.contains_key(&extension))
+    });
+    let parser_load_ms = parser_load_started.elapsed().as_millis();
 
     {
         let mut index = service
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if index.should_skip_initial_walk(latest_candidate_mtime) {
-            index.finish_initial_walk(candidates.len());
-            return Ok(());
+        if persisted_index_ready {
+            index.status.workspace_file_count = candidates.len();
+        } else {
+            index.begin_initial_walk(candidates.len());
         }
-        index.begin_initial_walk(candidates.len());
     }
 
     let mut pending = Vec::with_capacity(INDEX_BATCH_SIZE);
-    let mut processed = 0usize;
+    let parse_started = Instant::now();
+    let mut flush_elapsed = std::time::Duration::ZERO;
     for candidate in &candidates {
         let unchanged = service
             .lock()
@@ -459,7 +478,11 @@ fn run_initial_walk(
 
         if !unchanged {
             match std::fs::read_to_string(&candidate.absolute_path) {
-                Ok(content) => match parse_symbols(&candidate.absolute_path, &content) {
+                Ok(content) => match parse_symbols_with_parsers(
+                    &candidate.absolute_path,
+                    &content,
+                    &language_parsers,
+                ) {
                     Ok(Some(symbols)) => {
                         pending.push((
                             candidate.relative_path.clone(),
@@ -479,17 +502,20 @@ fn run_initial_walk(
             }
         }
 
-        processed += 1;
         if pending.len() == INDEX_BATCH_SIZE {
-            flush_initial_batch(service, &mut pending);
+            flush_elapsed += flush_initial_batch(service, &mut pending);
         }
-        service
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status
-            .indexed_file_count = processed;
     }
-    flush_initial_batch(service, &mut pending);
+    flush_elapsed += flush_initial_batch(service, &mut pending);
+    tracing::debug!(
+        candidates = candidates.len(),
+        candidate_walk_ms,
+        parser_load_ms,
+        parse_ms = parse_started.elapsed().as_millis(),
+        db_flush_ms = flush_elapsed.as_millis(),
+        persisted_index_ready,
+        "symbol index refresh phases"
+    );
     service
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -497,26 +523,20 @@ fn run_initial_walk(
     Ok(())
 }
 
-fn latest_candidate_mtime(candidates: &[IndexCandidate]) -> u64 {
-    candidates
-        .iter()
-        .map(|candidate| candidate.mtime)
-        .max()
-        .unwrap_or(0)
-}
-
 fn flush_initial_batch(
     service: &Arc<Mutex<SymbolIndexService>>,
     entries: &mut Vec<(String, u64, u64, Vec<SymbolLocation>)>,
-) {
+) -> std::time::Duration {
     if entries.is_empty() {
-        return;
+        return std::time::Duration::ZERO;
     }
     let entries = std::mem::take(entries);
+    let started = Instant::now();
     service
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .index_files_batch(&entries);
+    started.elapsed()
 }
 
 fn is_git_worktree(project_root: &Path) -> bool {
@@ -561,7 +581,6 @@ fn collect_index_candidates(project_root: &Path) -> Vec<IndexCandidate> {
                 return None;
             }
             let path = entry.into_path();
-            let _ = load_parser_for_path(&path)?;
             let relative_path = path
                 .strip_prefix(project_root)
                 .ok()?
@@ -580,6 +599,38 @@ fn collect_index_candidates(project_root: &Path) -> Vec<IndexCandidate> {
             })
         })
         .collect()
+}
+
+fn load_parsers_for_candidates(
+    candidates: &[IndexCandidate],
+) -> crate::services::tree_sitter::LanguageParserMap {
+    let mut parsers = crate::services::tree_sitter::LanguageParserMap::new();
+    let mut extensions = std::collections::HashSet::new();
+
+    for candidate in candidates {
+        let Some(extension) = candidate
+            .absolute_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_lowercase)
+        else {
+            continue;
+        };
+        if !extensions.insert(extension) {
+            continue;
+        }
+
+        if let Ok(loaded) =
+            crate::services::tree_sitter::load_required_language_parsers(&[candidate
+                .absolute_path
+                .to_string_lossy()
+                .as_ref()])
+        {
+            parsers.extend(loaded);
+        }
+    }
+
+    parsers
 }
 
 fn prepare_index_entry(
@@ -612,7 +663,23 @@ fn parse_symbols(path: &Path, content: &str) -> anyhow::Result<Option<Vec<Symbol
     let Some(parsers) = load_parser_for_path(path) else {
         return Ok(None);
     };
-    extract_symbols_for_indexing(path.to_string_lossy().as_ref(), content, &parsers).map(Some)
+    parse_symbols_with_parsers(path, content, &parsers)
+}
+
+fn parse_symbols_with_parsers(
+    path: &Path,
+    content: &str,
+    parsers: &crate::services::tree_sitter::LanguageParserMap,
+) -> anyhow::Result<Option<Vec<SymbolLocation>>> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    if !parsers.contains_key(&extension) {
+        return Ok(None);
+    }
+    extract_symbols_for_indexing(path.to_string_lossy().as_ref(), content, parsers).map(Some)
 }
 
 /// Extract symbols from file content for indexing.
@@ -862,50 +929,20 @@ mod tests {
     }
 
     #[test]
-    fn test_persisted_preflight_skips_recent_index() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut service = SymbolIndexService::new(temp.path().to_string_lossy().into_owned())
-            .with_index_root(temp.path().join("index").to_string_lossy().into_owned())
-            .with_persistence()
-            .unwrap();
-        let entries = (0..=INDEX_PREFLIGHT_MIN_FILES)
-            .map(|index| {
-                (
-                    format!("src/{index}.rs"),
-                    100,
-                    10,
-                    vec![make_symbol(
-                        "persisted_symbol",
-                        index,
-                        SymbolType::Definition,
-                    )],
-                )
-            })
-            .collect::<Vec<_>>();
-        service.index_files_batch(&entries);
+    fn test_initial_walk_status_counts_indexed_files_separately() {
+        let mut service = SymbolIndexService::new("/tmp/test".to_string());
+        service.index_file(
+            "src/main.rs",
+            123,
+            10,
+            &[make_symbol("main", 0, SymbolType::Definition)],
+        );
 
-        assert!(service.should_skip_initial_walk(100));
-        assert!(!service.should_skip_initial_walk(101));
-    }
+        service.finish_initial_walk(3);
+        let status = service.status();
 
-    #[test]
-    fn test_latest_candidate_mtime_considers_candidates_after_legacy_sample_boundary() {
-        let mut candidates: Vec<_> = (0..128)
-            .map(|index| IndexCandidate {
-                absolute_path: PathBuf::from(format!("src/{index}.rs")),
-                relative_path: format!("src/{index}.rs"),
-                mtime: 100,
-                size: 10,
-            })
-            .collect();
-        candidates.push(IndexCandidate {
-            absolute_path: PathBuf::from("src/newer.rs"),
-            relative_path: "src/newer.rs".to_string(),
-            mtime: 101,
-            size: 10,
-        });
-
-        assert_eq!(latest_candidate_mtime(&candidates), 101);
+        assert_eq!(status.workspace_file_count, 3);
+        assert_eq!(status.indexed_file_count, 1);
     }
 
     #[test]
