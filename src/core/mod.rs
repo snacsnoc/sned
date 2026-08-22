@@ -26,6 +26,7 @@ pub mod hash_utils;
 pub mod hooks;
 pub mod mentions;
 pub mod plan_state;
+pub mod process_output;
 pub mod provider_retry;
 pub mod shadow_git;
 pub mod stream_parsing;

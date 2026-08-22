@@ -2,12 +2,12 @@
 //!
 
 use crate::core::agent_loop::TaskState;
+use crate::core::process_output::{capture_async, configured_output_limit};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
-use std::io;
 use std::process::Output;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -32,46 +32,9 @@ const DEFAULT_SEARCH_MAX_LINES: u32 = 100;
 /// Environment variable to configure search result limit
 const SEARCH_MAX_LINES_ENV: &str = "SNED_SEARCH_MAX_LINES";
 const DEFAULT_SEARCH_OUTPUT_LIMIT: usize = 100 * 1024;
-const OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 fn search_output_limit() -> usize {
-    std::env::var("SNED_SEARCH_OUTPUT_LIMIT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0 && value <= 64 * 1024 * 1024)
-        .unwrap_or(DEFAULT_SEARCH_OUTPUT_LIMIT)
-}
-
-async fn read_limited_search_output<R>(mut reader: R, limit: usize) -> io::Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut output = Vec::with_capacity(limit.min(OUTPUT_READ_CHUNK_BYTES));
-    let mut total_bytes = 0_u64;
-    let mut chunk = [0_u8; OUTPUT_READ_CHUNK_BYTES];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            break;
-        }
-        total_bytes = total_bytes.saturating_add(read as u64);
-        let remaining = limit.saturating_sub(output.len());
-        output.extend_from_slice(&chunk[..read.min(remaining)]);
-    }
-
-    if total_bytes > limit as u64 {
-        output.extend_from_slice(
-            format!(
-                "\n\n(Search output truncated after retaining {} of {} bytes.)",
-                output.len(),
-                total_bytes
-            )
-            .as_bytes(),
-        );
-    }
-    Ok(output)
+    configured_output_limit("SNED_SEARCH_OUTPUT_LIMIT", DEFAULT_SEARCH_OUTPUT_LIMIT)
 }
 
 /// Cached ripgrep availability check (checked once per process lifetime)
@@ -304,8 +267,8 @@ async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyho
         .ok_or_else(|| anyhow::anyhow!("search command did not capture stderr"))?;
 
     let output_limit = search_output_limit();
-    let stdout_task = tokio::spawn(read_limited_search_output(stdout, output_limit));
-    let stderr_task = tokio::spawn(read_limited_search_output(stderr, output_limit));
+    let stdout_task = tokio::spawn(capture_async(stdout, output_limit));
+    let stderr_task = tokio::spawn(capture_async(stderr, output_limit));
 
     // Drop child's stdout/stderr so kill() + wait() returns promptly.
     // The reader tasks still hold their own handles and will drain remaining data.
@@ -337,8 +300,8 @@ async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyho
 
     Ok(Output {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.into_display_bytes(output_limit, "search stdout"),
+        stderr: stderr.into_display_bytes(output_limit, "search stderr"),
     })
 }
 
@@ -389,13 +352,18 @@ mod tests {
             writer.shutdown().await.unwrap();
         });
 
-        let output = read_limited_search_output(reader, 1024).await.unwrap();
+        let output = capture_async(reader, 1024).await.unwrap();
         writer_task.await.unwrap();
 
-        assert!(output.starts_with(&vec![b'x'; 1024]));
         assert!(
-            String::from_utf8_lossy(&output)
-                .contains("Search output truncated after retaining 1024 of 16384 bytes")
+            output
+                .display(1024, "search stdout")
+                .starts_with(&"x".repeat(1024))
+        );
+        assert!(
+            output
+                .display(1024, "search stdout")
+                .contains("retaining 1024 of 16384 bytes")
         );
     }
 

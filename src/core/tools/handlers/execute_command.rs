@@ -4,6 +4,7 @@
 use crate::cli::output::OutputEvent;
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
+use crate::core::process_output::{capture_async, configured_output_limit};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_string_array};
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
@@ -18,15 +19,7 @@ use tokio::sync::Mutex;
 const DEFAULT_COMMAND_COLLECT_LIMIT: usize = 10 * 1024 * 1024;
 const DEFAULT_SCRIPT_OUTPUT_LIMIT: usize = 1024 * 1024;
 const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
-const OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
-
-fn configured_output_limit(env_var: &str, default: usize) -> usize {
-    std::env::var(env_var)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0 && value <= 64 * 1024 * 1024)
-        .unwrap_or(default)
-}
+const COMMAND_STREAM_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 fn command_collect_limit() -> usize {
     configured_output_limit("SNED_COMMAND_COLLECT_LIMIT", DEFAULT_COMMAND_COLLECT_LIMIT)
@@ -34,61 +27,6 @@ fn command_collect_limit() -> usize {
 
 fn script_output_limit() -> usize {
     configured_output_limit("SNED_SCRIPT_OUTPUT_LIMIT", DEFAULT_SCRIPT_OUTPUT_LIMIT)
-}
-
-#[derive(Debug, Default)]
-struct CapturedOutput {
-    bytes: Vec<u8>,
-    total_bytes: u64,
-}
-
-impl CapturedOutput {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(limit.min(OUTPUT_READ_CHUNK_BYTES)),
-            total_bytes: 0,
-        }
-    }
-
-    fn is_truncated(&self, limit: usize) -> bool {
-        self.total_bytes > limit as u64
-    }
-
-    fn display(&self, limit: usize, stream: &str) -> String {
-        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
-        if self.is_truncated(limit) {
-            text.push_str(&format!(
-                "\n\n({stream} truncated after retaining {} of {} bytes.)",
-                self.bytes.len(),
-                self.total_bytes
-            ));
-        }
-        text
-    }
-
-    fn push(&mut self, chunk: &[u8], limit: usize) {
-        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
-        let remaining = limit.saturating_sub(self.bytes.len());
-        self.bytes
-            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-    }
-}
-
-async fn read_limited_output<R>(mut reader: R, limit: usize) -> std::io::Result<CapturedOutput>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut captured = CapturedOutput::new(limit);
-    let mut chunk = [0_u8; OUTPUT_READ_CHUNK_BYTES];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(captured);
-        }
-        captured.push(&chunk[..read], limit);
-    }
 }
 
 enum StreamLine {
@@ -122,8 +60,8 @@ where
     fn new(reader: R) -> Self {
         Self {
             reader,
-            pending: Vec::with_capacity(OUTPUT_READ_CHUNK_BYTES),
-            line: Vec::with_capacity(OUTPUT_READ_CHUNK_BYTES),
+            pending: Vec::with_capacity(COMMAND_STREAM_READ_CHUNK_BYTES),
+            line: Vec::with_capacity(COMMAND_STREAM_READ_CHUNK_BYTES),
             discarding_line: false,
         }
     }
@@ -133,7 +71,7 @@ where
 
         loop {
             if self.pending.is_empty() {
-                let mut chunk = [0_u8; OUTPUT_READ_CHUNK_BYTES];
+                let mut chunk = [0_u8; COMMAND_STREAM_READ_CHUNK_BYTES];
                 let read = self.reader.read(&mut chunk).await?;
                 if read == 0 {
                     if self.discarding_line {
@@ -186,7 +124,14 @@ where
     }
 }
 
-fn append_limited_output(output: &mut String, line: &str, limit: usize, truncated: &mut bool) {
+fn append_limited_output(
+    output: &mut String,
+    line: &str,
+    limit: usize,
+    truncated: &mut bool,
+    total_bytes: &mut u64,
+) {
+    *total_bytes = total_bytes.saturating_add(line.len().saturating_add(1) as u64);
     if *truncated {
         return;
     }
@@ -204,7 +149,14 @@ fn append_limited_output(output: &mut String, line: &str, limit: usize, truncate
     *truncated = true;
 }
 
-fn append_limited_text(output: &mut String, text: &str, limit: usize, truncated: &mut bool) {
+fn append_limited_text(
+    output: &mut String,
+    text: &str,
+    limit: usize,
+    truncated: &mut bool,
+    total_bytes: &mut u64,
+) {
+    *total_bytes = total_bytes.saturating_add(text.len() as u64);
     if *truncated {
         return;
     }
@@ -223,11 +175,12 @@ fn finalize_collected_output(
     mut output: String,
     truncated: bool,
     stream: &str,
-    limit: usize,
+    total_bytes: u64,
 ) -> String {
     if truncated {
         output.push_str(&format!(
-            "\n({stream} collection truncated at {limit} bytes; additional output was discarded.)\n"
+            "\n({stream} output truncated after retaining {} of {total_bytes} bytes.)\n",
+            output.len()
         ));
     }
     output
@@ -578,6 +531,7 @@ impl ExecuteCommandHandler {
         let mut combined_output = String::new();
         let combined_output_limit = command_collect_limit();
         let mut combined_output_truncated = false;
+        let mut combined_output_total_bytes = 0_u64;
         let mut sandbox_env_report = SandboxEnvReport::default();
         let mut command_failed = false;
 
@@ -663,6 +617,8 @@ impl ExecuteCommandHandler {
             let collect_limit = command_collect_limit();
             let mut stdout_collect_truncated = false;
             let mut stderr_collect_truncated = false;
+            let mut stdout_total_bytes = 0_u64;
+            let mut stderr_total_bytes = 0_u64;
 
             // Per-stream head+tail condensation.  Disabled by default (the env
             // var is opt-in) so the trailing context is always visible;
@@ -724,6 +680,7 @@ impl ExecuteCommandHandler {
                                     &line,
                                     collect_limit,
                                     &mut stdout_collect_truncated,
+                                    &mut stdout_total_bytes,
                                 );
                             }
                             Ok(None) => {}
@@ -776,6 +733,7 @@ impl ExecuteCommandHandler {
                                     &line,
                                     collect_limit,
                                     &mut stderr_collect_truncated,
+                                    &mut stderr_total_bytes,
                                 );
                             }
                             Ok(None) => {}
@@ -865,6 +823,7 @@ impl ExecuteCommandHandler {
                                         &line,
                                         collect_limit,
                                         &mut stdout_collect_truncated,
+                                        &mut stdout_total_bytes,
                                     );
                                 }
                                 while let Ok(Some(line)) = stderr_reader.next_line().await {
@@ -907,6 +866,7 @@ impl ExecuteCommandHandler {
                                         &line,
                                         collect_limit,
                                         &mut stderr_collect_truncated,
+                                        &mut stderr_total_bytes,
                                     );
                                 }
                                 std::process::Output {
@@ -915,14 +875,14 @@ impl ExecuteCommandHandler {
                                         stdout_collected,
                                         stdout_collect_truncated,
                                         "stdout",
-                                        collect_limit,
+                                        stdout_total_bytes,
                                     )
                                     .into_bytes(),
                                     stderr: finalize_collected_output(
                                         stderr_collected,
                                         stderr_collect_truncated,
                                         "stderr",
-                                        collect_limit,
+                                        stderr_total_bytes,
                                     )
                                     .into_bytes(),
                                 }
@@ -968,13 +928,13 @@ impl ExecuteCommandHandler {
                                         stdout_collected,
                                         stdout_collect_truncated,
                                         "stdout",
-                                        collect_limit,
+                                        stdout_total_bytes,
                                     ),
                                     finalize_collected_output(
                                         stderr_collected,
                                         stderr_collect_truncated,
                                         "stderr",
-                                        collect_limit,
+                                        stderr_total_bytes,
                                     )
                                 ));
                             }
@@ -1068,6 +1028,7 @@ impl ExecuteCommandHandler {
                     "\n---\n",
                     combined_output_limit,
                     &mut combined_output_truncated,
+                    &mut combined_output_total_bytes,
                 );
             }
 
@@ -1077,6 +1038,7 @@ impl ExecuteCommandHandler {
                     &stdout,
                     combined_output_limit,
                     &mut combined_output_truncated,
+                    &mut combined_output_total_bytes,
                 );
             }
             if !stderr.is_empty() {
@@ -1086,6 +1048,7 @@ impl ExecuteCommandHandler {
                         "\n",
                         combined_output_limit,
                         &mut combined_output_truncated,
+                        &mut combined_output_total_bytes,
                     );
                 }
                 append_limited_text(
@@ -1093,12 +1056,14 @@ impl ExecuteCommandHandler {
                     "Stderr:\n",
                     combined_output_limit,
                     &mut combined_output_truncated,
+                    &mut combined_output_total_bytes,
                 );
                 append_limited_text(
                     &mut combined_output,
                     &stderr,
                     combined_output_limit,
                     &mut combined_output_truncated,
+                    &mut combined_output_total_bytes,
                 );
             }
 
@@ -1112,6 +1077,7 @@ impl ExecuteCommandHandler {
                     &format!("\n{}", err.display()),
                     combined_output_limit,
                     &mut combined_output_truncated,
+                    &mut combined_output_total_bytes,
                 );
                 command_failed = true;
                 break;
@@ -1126,7 +1092,7 @@ impl ExecuteCommandHandler {
             combined_output,
             combined_output_truncated,
             "command result",
-            combined_output_limit,
+            combined_output_total_bytes,
         );
 
         sandbox_env_report.normalize();
@@ -1247,8 +1213,8 @@ impl ExecuteCommandHandler {
             .ok_or_else(|| anyhow::anyhow!("Script stderr was not captured"))?;
 
         let output_limit = script_output_limit();
-        let stdout_task = tokio::spawn(read_limited_output(stdout, output_limit));
-        let stderr_task = tokio::spawn(read_limited_output(stderr, output_limit));
+        let stdout_task = tokio::spawn(capture_async(stdout, output_limit));
+        let stderr_task = tokio::spawn(capture_async(stderr, output_limit));
 
         let output = match timeout(timeout_duration, child.wait()).await {
             Ok(Ok(status)) => {
@@ -1776,11 +1742,11 @@ mod tests {
             writer.shutdown().await.unwrap();
         });
 
-        let captured = read_limited_output(reader, 1024).await.unwrap();
+        let captured = capture_async(reader, 1024).await.unwrap();
         writer_task.await.unwrap();
 
-        assert_eq!(captured.bytes.len(), 1024);
-        assert_eq!(captured.total_bytes, 16 * 1024);
+        assert_eq!(captured.retained_len(), 1024);
+        assert_eq!(captured.total_bytes(), 16 * 1024);
         assert!(captured.is_truncated(1024));
     }
 
@@ -1832,7 +1798,7 @@ mod tests {
         }
 
         let result = result.unwrap();
-        assert!(result.contains("stdout truncated after retaining 1024 of 8192 bytes"));
+        assert!(result.contains("stdout output truncated after retaining 1024 of 8192 bytes"));
     }
 
     #[tokio::test]
@@ -1859,7 +1825,7 @@ mod tests {
         }
 
         let result = result.unwrap();
-        assert!(result.contains("command result collection truncated at 1024 bytes"));
+        assert!(result.contains("command result output truncated after retaining 1024 of"));
     }
 
     #[cfg(unix)]

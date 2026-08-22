@@ -5,6 +5,7 @@
 //! Supports: Rust (cargo check), JavaScript/TypeScript (npm run lint / eslint), Python (py_compile).
 
 use crate::core::agent_loop::TaskState;
+use crate::core::process_output::{capture_async, configured_output_limit};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use regex::Regex;
 use std::collections::HashMap;
@@ -33,6 +34,41 @@ static PYTHON_REGEX: LazyLock<Regex> =
 pub struct DiagnosticsScanHandler;
 
 const MAX_DIAGNOSTICS_SOURCE_BYTES: u64 = 512 * 1024;
+const DEFAULT_DIAGNOSTICS_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+fn diagnostics_output_limit() -> usize {
+    configured_output_limit(
+        "SNED_DIAGNOSTICS_OUTPUT_LIMIT",
+        DEFAULT_DIAGNOSTICS_OUTPUT_LIMIT,
+    )
+}
+
+async fn capture_diagnostics_command(
+    mut command: Command,
+    limit: usize,
+) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("diagnostics command did not capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("diagnostics command did not capture stderr"))?;
+    let stdout_task = tokio::spawn(capture_async(stdout, limit));
+    let stderr_task = tokio::spawn(capture_async(stderr, limit));
+    let status = child.wait().await?;
+    let stdout = stdout_task
+        .await
+        .map_err(|error| anyhow::anyhow!("diagnostics stdout task failed: {error}"))??
+        .display(limit, "diagnostics stdout");
+    let stderr = stderr_task
+        .await
+        .map_err(|error| anyhow::anyhow!("diagnostics stderr task failed: {error}"))??
+        .display(limit, "diagnostics stderr");
+    Ok((status, stdout, stderr))
+}
 
 /// Cache for detect_project_type results to avoid redundant filesystem walks.
 /// Keyed by (parent directory, file extension) to handle mixed file types in same dir.
@@ -130,16 +166,14 @@ impl DiagnosticsScanHandler {
                             .to_path_buf()
                     });
 
-                let output = Command::new("cargo")
+                let mut command = Command::new("cargo");
+                command
                     .args(["check", "--message-format=short", "--quiet"])
                     .current_dir(&cargo_dir)
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .await?;
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                    .stderr(Stdio::piped());
+                let (_, stdout, stderr) =
+                    capture_diagnostics_command(command, diagnostics_output_limit()).await?;
 
                 let mut result = String::new();
                 if !stdout.is_empty() {
@@ -170,17 +204,16 @@ impl DiagnosticsScanHandler {
                 // Try npm run lint first, then fall back to npx eslint
                 let mut result = String::new();
 
-                let lint_output = Command::new("npm")
+                let mut lint_command = Command::new("npm");
+                lint_command
                     .args(["run", "lint", "--if-present"])
                     .current_dir(&js_dir)
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .await;
+                    .stderr(Stdio::piped());
 
-                if let Ok(output) = lint_output {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                if let Ok((_, stdout, stderr)) =
+                    capture_diagnostics_command(lint_command, diagnostics_output_limit()).await
+                {
                     if !stdout.is_empty() {
                         result.push_str(&stdout);
                     }
@@ -192,7 +225,8 @@ impl DiagnosticsScanHandler {
                     }
                 } else {
                     // Fall back to eslint on the specific file
-                    let eslint_output = Command::new("npx")
+                    let mut eslint_command = Command::new("npx");
+                    eslint_command
                         .args([
                             "eslint",
                             "--format=compact",
@@ -200,12 +234,12 @@ impl DiagnosticsScanHandler {
                         ])
                         .current_dir(&js_dir)
                         .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .output()
-                        .await;
+                        .stderr(Stdio::piped());
 
-                    if let Ok(output) = eslint_output {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Ok((_, stdout, _)) =
+                        capture_diagnostics_command(eslint_command, diagnostics_output_limit())
+                            .await
+                    {
                         if !stdout.is_empty() {
                             result.push_str(&stdout);
                         }
@@ -219,18 +253,18 @@ impl DiagnosticsScanHandler {
                 }
             }
             ProjectType::Python => {
-                let output = Command::new("python3")
+                let mut command = Command::new("python3");
+                command
                     .args(["-m", "py_compile", file_path.to_string_lossy().as_ref()])
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .await?;
+                    .stderr(Stdio::piped());
+                let (status, _, stderr) =
+                    capture_diagnostics_command(command, diagnostics_output_limit()).await?;
 
-                if output.status.success() {
+                if status.success() {
                     Ok("No diagnostics issues found.".to_string())
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    Ok(stderr.to_string())
+                    Ok(stderr)
                 }
             }
             ProjectType::Generic => Ok(format!(
@@ -726,6 +760,21 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("paths"));
         assert_eq!(state.consecutive_mistakes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_command_output_is_capped_and_drained() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "yes x | head -c 8192"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let (status, stdout, stderr) = capture_diagnostics_command(command, 1024).await.unwrap();
+
+        assert!(status.success());
+        assert!(stdout.contains("retaining 1024 of 8192 bytes"));
+        assert!(stderr.is_empty());
     }
 
     #[tokio::test]

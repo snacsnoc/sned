@@ -1,7 +1,7 @@
+use crate::core::process_output::{CapturedOutput, capture_sync, configured_output_limit};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -59,6 +59,87 @@ pub struct HookInput {
 /// Callback type for streaming hook output line-by-line.
 /// Receives: (line, stream_type) where stream_type is "stdout" or "stderr".
 pub type HookStreamCallback = dyn FnMut(&str, &str) + Send;
+
+const DEFAULT_HOOK_OUTPUT_LIMIT: usize = 1024 * 1024;
+const MAX_HOOK_CALLBACK_LINE_BYTES: usize = 64 * 1024;
+
+fn hook_output_limit() -> usize {
+    configured_output_limit("SNED_HOOK_OUTPUT_LIMIT", DEFAULT_HOOK_OUTPUT_LIMIT)
+}
+
+struct HookLineFramer {
+    stream: &'static str,
+    callback: Option<Arc<Mutex<HookStreamCallback>>>,
+    line: Vec<u8>,
+    discarding_line: bool,
+}
+
+impl HookLineFramer {
+    fn new(stream: &'static str, callback: Option<Arc<Mutex<HookStreamCallback>>>) -> Self {
+        Self {
+            stream,
+            callback,
+            line: Vec::with_capacity(1024),
+            discarding_line: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if *byte == b'\n' {
+                if self.discarding_line {
+                    self.emit(format!(
+                        "({} line exceeded {} bytes and was discarded.)",
+                        self.stream, MAX_HOOK_CALLBACK_LINE_BYTES
+                    ));
+                } else {
+                    self.emit_current_line();
+                }
+                self.line.clear();
+                self.discarding_line = false;
+            } else if !self.discarding_line {
+                if self.line.len() == MAX_HOOK_CALLBACK_LINE_BYTES {
+                    self.line.clear();
+                    self.discarding_line = true;
+                } else {
+                    self.line.push(*byte);
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.discarding_line {
+            self.emit(format!(
+                "({} line exceeded {} bytes and was discarded.)",
+                self.stream, MAX_HOOK_CALLBACK_LINE_BYTES
+            ));
+        } else if !self.line.is_empty() {
+            self.emit_current_line();
+        }
+        self.line.clear();
+        self.discarding_line = false;
+    }
+
+    fn discard_pending(&mut self) {
+        self.line.clear();
+        self.discarding_line = false;
+    }
+
+    fn emit_current_line(&mut self) {
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+        self.emit(String::from_utf8_lossy(&self.line).into_owned());
+    }
+
+    fn emit(&self, line: String) {
+        if let Some(callback) = &self.callback {
+            let mut callback = callback.lock();
+            callback(&line, self.stream);
+        }
+    }
+}
 
 /// Metadata for hook stream callback
 #[derive(Debug, Clone)]
@@ -475,38 +556,55 @@ impl HookManager {
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
 
+        let output_limit = hook_output_limit();
         let stdout_callback = stream_callback.clone();
         let stdout_handle = std::thread::spawn(move || {
-            let mut output = String::new();
             if let Some(pipe) = stdout_pipe {
-                let reader = BufReader::new(pipe);
-                for line in reader.lines().map_while(Result::ok) {
-                    if let Some(cb) = stdout_callback.as_ref() {
-                        let mut callback = cb.lock();
-                        callback(&line, "stdout");
+                let mut framer = HookLineFramer::new("stdout", stdout_callback);
+                match capture_sync(pipe, output_limit, |chunk| framer.push(chunk)) {
+                    Ok(output) => {
+                        if let Some(marker) = output.truncation_marker(output_limit, "hook stdout")
+                        {
+                            framer.discard_pending();
+                            framer.emit(marker);
+                        } else {
+                            framer.finish();
+                        }
+                        output
                     }
-                    output.push_str(&line);
-                    output.push('\n');
+                    Err(error) => {
+                        tracing::warn!("failed to read hook stdout: {error}");
+                        CapturedOutput::default()
+                    }
                 }
+            } else {
+                CapturedOutput::default()
             }
-            output
         });
 
         let stderr_callback = stream_callback.clone();
         let stderr_handle = std::thread::spawn(move || {
-            let mut output = String::new();
             if let Some(pipe) = stderr_pipe {
-                let reader = BufReader::new(pipe);
-                for line in reader.lines().map_while(Result::ok) {
-                    if let Some(cb) = stderr_callback.as_ref() {
-                        let mut callback = cb.lock();
-                        callback(&line, "stderr");
+                let mut framer = HookLineFramer::new("stderr", stderr_callback);
+                match capture_sync(pipe, output_limit, |chunk| framer.push(chunk)) {
+                    Ok(output) => {
+                        if let Some(marker) = output.truncation_marker(output_limit, "hook stderr")
+                        {
+                            framer.discard_pending();
+                            framer.emit(marker);
+                        } else {
+                            framer.finish();
+                        }
+                        output
                     }
-                    output.push_str(&line);
-                    output.push('\n');
+                    Err(error) => {
+                        tracing::warn!("failed to read hook stderr: {error}");
+                        CapturedOutput::default()
+                    }
                 }
+            } else {
+                CapturedOutput::default()
             }
-            output
         });
 
         // Wait with timeout and cancellation support
@@ -530,8 +628,10 @@ impl HookManager {
                     *pid = None;
                 }
                 // Still collect output
-                let stdout = Self::join_thread_with_timeout(stdout_handle, "stdout");
-                let stderr = Self::join_thread_with_timeout(stderr_handle, "stderr");
+                let stdout = Self::join_thread_with_timeout(stdout_handle, "stdout")
+                    .display(output_limit, "hook stdout");
+                let stderr = Self::join_thread_with_timeout(stderr_handle, "stderr")
+                    .display(output_limit, "hook stderr");
                 return Err(format!("{e}\nStdout: {stdout}\nStderr: {stderr}"));
             }
         };
@@ -562,6 +662,17 @@ impl HookManager {
         }
 
         // Parse JSON output
+        if stdout.is_truncated(output_limit) {
+            return Err(format!(
+                "Hook stdout was truncated and cannot be parsed as JSON. {}\nStderr: {}",
+                stdout
+                    .truncation_marker(output_limit, "hook stdout")
+                    .unwrap_or_default(),
+                stderr.display(output_limit, "hook stderr")
+            ));
+        }
+        let stdout = stdout.display(output_limit, "hook stdout");
+        let stderr = stderr.display(output_limit, "hook stderr");
         if stdout.trim().is_empty() {
             // Empty output is valid (no modifications)
             return Ok(HookOutput::default());
@@ -967,6 +1078,29 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn test_hook_line_framer_reassembles_chunks_and_discards_oversized_lines() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let callback_lines = lines.clone();
+        let callback: Arc<Mutex<HookStreamCallback>> =
+            Arc::new(Mutex::new(Box::new(move |line: &str, stream: &str| {
+                callback_lines
+                    .lock()
+                    .push((line.to_string(), stream.to_string()));
+            })));
+        let mut framer = HookLineFramer::new("stdout", Some(callback));
+
+        framer.push(b"split ");
+        framer.push(b"line\n");
+        framer.push(&vec![b'x'; MAX_HOOK_CALLBACK_LINE_BYTES + 1]);
+        framer.push(b"\n");
+        framer.finish();
+
+        let lines = lines.lock();
+        assert_eq!(lines[0], ("split line".to_string(), "stdout".to_string()));
+        assert!(lines[1].0.contains("line exceeded"));
+    }
+
+    #[test]
     fn test_hook_name_as_str() {
         assert_eq!(HookName::PreToolUse.as_str(), "PreToolUse");
         assert_eq!(HookName::TaskComplete.as_str(), "TaskComplete");
@@ -1198,6 +1332,66 @@ mod tests {
         assert!(line_contents.contains(&"line 3"), "Should contain 'line 3'");
 
         // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_hook_truncated_stdout_reports_incomplete_json() {
+        let temp_dir = std::env::temp_dir().join("sned_test_hooks_truncated_stdout");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let hook_path = temp_dir.join("TaskStart");
+        fs::write(
+            &hook_path,
+            "#!/bin/sh\nhead -c 1048577 /dev/zero | tr '\\000' x",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&hook_path, perms).unwrap();
+        }
+
+        let mut manager = HookManager::new("test-user");
+        manager.set_runtime_hooks_dir(temp_dir.clone());
+        let result = manager.task_start("test-task", "Test task");
+
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("stdout was truncated"))
+        );
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_hook_truncated_stderr_keeps_valid_stdout() {
+        let temp_dir = std::env::temp_dir().join("sned_test_hooks_truncated_stderr");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let hook_path = temp_dir.join("TaskStart");
+        fs::write(
+            &hook_path,
+            "#!/bin/sh\nhead -c 1048577 /dev/zero | tr '\\000' x >&2\nprintf '{}\\n'",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&hook_path, perms).unwrap();
+        }
+
+        let mut manager = HookManager::new("test-user");
+        manager.set_runtime_hooks_dir(temp_dir.clone());
+        let result = manager.task_start("test-task", "Test task");
+
+        assert_eq!(result.exit_code, 0, "hook failed: {:?}", result.error);
+        assert!(result.error.is_none());
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
