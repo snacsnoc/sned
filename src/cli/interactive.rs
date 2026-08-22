@@ -1310,35 +1310,60 @@ fn tui_io_error(operation: &'static str, error: std::io::Error, debug: bool) -> 
     anyhow::Error::new(error).context(operation)
 }
 
-fn handle_tui_draw_error(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawFrameResult {
+    Rendered,
+    Retry,
+}
+
+fn handle_tui_frame_error(
     app: &mut App,
     error: std::io::Error,
     debug: bool,
-) -> anyhow::Result<bool> {
+    operation: &'static str,
+) -> anyhow::Result<DrawFrameResult> {
     if error.kind() == std::io::ErrorKind::WouldBlock {
         app.needs_redraw = true;
         if debug {
             tracing::debug!(
+                operation,
                 error_kind = ?error.kind(),
                 raw_os_error = ?error.raw_os_error(),
                 error = %error,
-                "TUI draw temporarily unavailable; retrying"
+                "TUI frame operation temporarily unavailable; retrying"
             );
         }
-        return Ok(false);
+        return Ok(DrawFrameResult::Retry);
     }
 
-    Err(tui_io_error("TUI draw failed", error, debug))
+    Err(tui_io_error(operation, error, debug))
 }
 
-fn draw_tui_frame(
-    terminal: &mut ratatui::DefaultTerminal,
+fn draw_tui_frame<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
     app: &mut App,
     debug: bool,
-) -> anyhow::Result<bool> {
+    terminal_desynced: &mut bool,
+) -> anyhow::Result<DrawFrameResult> {
+    let recovering = *terminal_desynced;
+    if recovering {
+        if let Err(error) = terminal.clear() {
+            return handle_tui_frame_error(app, error, debug, "TUI recovery clear failed");
+        }
+    }
+
     match terminal.draw(|f| app.render(f)) {
-        Ok(_) => Ok(true),
-        Err(error) => handle_tui_draw_error(app, error, debug),
+        Ok(_) => {
+            if recovering && debug {
+                tracing::debug!("TUI terminal resynchronized after a failed frame");
+            }
+            *terminal_desynced = false;
+            Ok(DrawFrameResult::Rendered)
+        }
+        Err(error) => {
+            *terminal_desynced = true;
+            handle_tui_frame_error(app, error, debug, "TUI draw failed")
+        }
     }
 }
 
@@ -1357,11 +1382,12 @@ fn drain_and_render_user_submit(
     output_rx: &mut mpsc::Receiver<OutputEvent>,
     storage: &TaskStorage,
     debug: bool,
+    terminal_desynced: &mut bool,
 ) -> anyhow::Result<()> {
     drain_output_queues(priority_output_rx, output_rx, app, Some(storage));
     app.force_bottom();
     sync_scroll_viewport(terminal, app, debug)?;
-    let _ = draw_tui_frame(terminal, app, debug)?;
+    let _ = draw_tui_frame(terminal, app, debug, terminal_desynced)?;
     Ok(())
 }
 
@@ -3494,6 +3520,7 @@ async fn run_main_loop(
     let mut last_draw_at: Option<std::time::Instant> = None;
     let mut draw_retry_delay = BUSY_REDRAW_INTERVAL;
     let mut draw_retry_at: Option<std::time::Instant> = None;
+    let mut terminal_desynced = false;
     let mut timing = TimingSummary {
         enabled: timing_enabled,
         session_start_time: app.start_time,
@@ -3631,7 +3658,10 @@ async fn run_main_loop(
         if should_render {
             {
                 let t = std::time::Instant::now();
-                if draw_tui_frame(terminal, app, task_opts.debug)? {
+                if matches!(
+                    draw_tui_frame(terminal, app, task_opts.debug, &mut terminal_desynced)?,
+                    DrawFrameResult::Rendered
+                ) {
                     last_draw_at = Some(std::time::Instant::now());
                     draw_retry_delay = BUSY_REDRAW_INTERVAL;
                     draw_retry_at = None;
@@ -3871,6 +3901,7 @@ async fn run_main_loop(
                                     output_rx,
                                     &task_storage,
                                     task_opts.debug,
+                                    &mut terminal_desynced,
                                 )?;
 
                                 // Save to command history without rereading the
@@ -3920,6 +3951,7 @@ async fn run_main_loop(
                                             output_rx,
                                             &task_storage,
                                             task_opts.debug,
+                                            &mut terminal_desynced,
                                         )?;
                                         // The busy check above guarantees this will not wait on
                                         // an AgentLoop currently held by another run.
@@ -4043,6 +4075,7 @@ async fn run_main_loop(
                                         output_rx,
                                         &task_storage,
                                         task_opts.debug,
+                                        &mut terminal_desynced,
                                     )?;
                                     spawn_agent_task(
                                         &session,
@@ -4458,8 +4491,101 @@ mod tests {
     use super::*;
     use crate::cli::slash_commands::CliOnlyCommand;
     use crate::cli::tui::BlockKind;
+    use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
     use ratatui::text::Line;
     use serde::ser::{Error as _, Serialize, Serializer};
+
+    struct FlushFailsOnceBackend {
+        inner: TestBackend,
+        fail_flushes: usize,
+        fail_clears: usize,
+        clear_calls: usize,
+        draw_cell_counts: Vec<usize>,
+    }
+
+    impl FlushFailsOnceBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                inner: TestBackend::new(width, height),
+                fail_flushes: 1,
+                fail_clears: 0,
+                clear_calls: 0,
+                draw_cell_counts: Vec::new(),
+            }
+        }
+    }
+
+    impl Backend for FlushFailsOnceBackend {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            let cells = content
+                .map(|(x, y, cell)| (x, y, cell.clone()))
+                .collect::<Vec<_>>();
+            self.draw_cell_counts.push(cells.len());
+            self.inner
+                .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.clear_region(ClearType::All)
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
+            if matches!(clear_type, ClearType::All) {
+                self.clear_calls += 1;
+                if self.fail_clears > 0 {
+                    self.fail_clears -= 1;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "clear temporarily unavailable",
+                    ));
+                }
+            }
+            self.inner.clear_region(clear_type)
+        }
+
+        fn size(&self) -> std::io::Result<Size> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> std::io::Result<WindowSize> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flushes > 0 {
+                self.fail_flushes -= 1;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "flush temporarily unavailable",
+                ));
+            }
+            self.inner.flush()
+        }
+    }
 
     fn reset_prompt_state() {
         crate::core::approval::clear_followup_prompt_scroll();
@@ -4492,30 +4618,69 @@ mod tests {
     }
 
     #[test]
-    fn test_would_block_draw_preserves_redraw_request() {
+    fn test_would_block_draw_resynchronizes_before_the_next_frame() {
+        let backend = FlushFailsOnceBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.needs_redraw = false;
+        app.push_plain("recovery marker");
+        let mut terminal_desynced = false;
 
-        let rendered = handle_tui_draw_error(
-            &mut app,
-            std::io::Error::new(std::io::ErrorKind::WouldBlock, "temporarily unavailable"),
-            false,
-        )
-        .expect("WouldBlock should be retryable");
-
-        assert!(!rendered);
+        let first = draw_tui_frame(&mut terminal, &mut app, false, &mut terminal_desynced)
+            .expect("WouldBlock should be retryable");
+        assert_eq!(first, DrawFrameResult::Retry);
         assert!(app.needs_redraw);
+        assert!(terminal_desynced);
+
+        let second = draw_tui_frame(&mut terminal, &mut app, false, &mut terminal_desynced)
+            .expect("recovery draw should succeed");
+        assert_eq!(second, DrawFrameResult::Rendered);
+        assert!(!terminal_desynced);
+
+        let backend = terminal.backend();
+        assert_eq!(backend.clear_calls, 1);
+        assert_eq!(backend.draw_cell_counts.len(), 2);
+        assert!(
+            backend.draw_cell_counts[1] >= backend.draw_cell_counts[0],
+            "recovery frame must redraw at least as much as the interrupted frame: {:?}",
+            backend.draw_cell_counts
+        );
+        assert!(format!("{}", backend.inner).contains("recovery marker"));
     }
 
     #[test]
-    fn test_non_would_block_draw_error_is_fatal() {
+    fn test_would_block_recovery_clear_preserves_desync_state() {
+        let backend = FlushFailsOnceBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = App::new();
-        let error = handle_tui_draw_error(
+        let mut terminal_desynced = false;
+
+        let first = draw_tui_frame(&mut terminal, &mut app, false, &mut terminal_desynced)
+            .expect("WouldBlock should be retryable");
+        assert_eq!(first, DrawFrameResult::Retry);
+        terminal.backend_mut().fail_clears = 1;
+
+        let retry = draw_tui_frame(&mut terminal, &mut app, false, &mut terminal_desynced)
+            .expect("WouldBlock clear should be retryable");
+        assert_eq!(retry, DrawFrameResult::Retry);
+        assert!(terminal_desynced);
+
+        let rendered = draw_tui_frame(&mut terminal, &mut app, false, &mut terminal_desynced)
+            .expect("next recovery draw should succeed");
+        assert_eq!(rendered, DrawFrameResult::Rendered);
+        assert!(!terminal_desynced);
+        assert_eq!(terminal.backend().clear_calls, 2);
+    }
+
+    #[test]
+    fn test_non_would_block_frame_error_is_fatal() {
+        let mut app = App::new();
+        let error = handle_tui_frame_error(
             &mut app,
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed terminal"),
             false,
+            "TUI draw failed",
         )
-        .expect_err("non-WouldBlock draw errors should remain fatal");
+        .expect_err("non-WouldBlock frame errors should remain fatal");
 
         assert!(format!("{error:#}").contains("TUI draw failed"));
     }
