@@ -1,9 +1,138 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tracing;
+
+const AGENTS_CACHE_TTL_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedAgentFile {
+    path: String,
+    modified_nanos: u128,
+    size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedAgentDirectory {
+    path: String,
+    modified_nanos: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentsCache {
+    scanned_at_secs: u64,
+    files: Vec<CachedAgentFile>,
+    directories: Option<Vec<CachedAgentDirectory>>,
+}
+
+fn agents_cache_path(cwd: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+
+    let key = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let digest = Sha256::digest(key.as_bytes());
+    let name = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    crate::storage::disk::get_state_dir()
+        .join("agents-cache")
+        .join(format!("{name}.json"))
+}
+
+fn file_modified_nanos(path: &Path) -> Option<u128> {
+    path.metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+fn cached_agents_files(cwd: &Path) -> Option<Vec<PathBuf>> {
+    let cache_path = agents_cache_path(cwd);
+    let cache: AgentsCache = serde_json::from_str(&fs::read_to_string(cache_path).ok()?).ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if now.saturating_sub(cache.scanned_at_secs) > AGENTS_CACHE_TTL_SECS {
+        return None;
+    }
+
+    // Directory mtimes change when entries are added or removed. Checking the
+    // cached directory set lets us detect a newly created nested AGENTS.md
+    // without repeating the full recursive walk on every startup.
+    let Some(directories) = cache.directories.as_ref() else {
+        return None;
+    };
+    if directories
+        .iter()
+        .any(|cached| file_modified_nanos(Path::new(&cached.path)) != Some(cached.modified_nanos))
+    {
+        return None;
+    }
+
+    let files = cache
+        .files
+        .iter()
+        .filter_map(|cached| {
+            let path = PathBuf::from(&cached.path);
+            let metadata = path.metadata().ok()?;
+            let modified_nanos = file_modified_nanos(&path)?;
+            (metadata.is_file()
+                && modified_nanos == cached.modified_nanos
+                && metadata.len() == cached.size)
+                .then_some(path)
+        })
+        .collect::<Vec<_>>();
+    (files.len() == cache.files.len()).then_some(files)
+}
+
+fn save_agents_cache(cwd: &Path, files: &[PathBuf], directories: &[PathBuf]) {
+    let Some(scanned_at_secs) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+    else {
+        return;
+    };
+    let cache = AgentsCache {
+        scanned_at_secs,
+        files: files
+            .iter()
+            .filter_map(|path| {
+                Some(CachedAgentFile {
+                    path: path.to_string_lossy().into_owned(),
+                    modified_nanos: file_modified_nanos(path)?,
+                    size: path.metadata().ok()?.len(),
+                })
+            })
+            .collect(),
+        directories: Some(
+            directories
+                .iter()
+                .filter_map(|path| {
+                    Some(CachedAgentDirectory {
+                        path: path.to_string_lossy().into_owned(),
+                        modified_nanos: file_modified_nanos(path)?,
+                    })
+                })
+                .collect(),
+        ),
+    };
+    let path = agents_cache_path(cwd);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(contents) = serde_json::to_string(&cache) {
+        let _ = fs::write(path, contents);
+    }
+}
 
 /// Rule toggles: maps rule file path to enabled/disabled state
 pub type RuleToggles = HashMap<String, bool>;
@@ -93,12 +222,23 @@ pub struct SkillSupportingFiles {
 /// Uses ignore::WalkBuilder for .gitignore-aware filtering and skips common heavy directories.
 #[must_use]
 pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
+    let started = Instant::now();
     let top_level = cwd.join("AGENTS.md");
     if !top_level.exists() {
         return Vec::new();
     }
 
+    if let Some(results) = cached_agents_files(cwd) {
+        tracing::debug!(
+            count = results.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "reused cached AGENTS.md discovery"
+        );
+        return results;
+    }
+
     let mut results = Vec::new();
+    let mut directories = Vec::new();
 
     // Use ignore::WalkBuilder for .gitignore-aware filtering
     // This automatically respects .gitignore and skips .git/, node_modules/, target/, etc.
@@ -107,6 +247,10 @@ pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
         .build();
 
     for entry in walker.flatten() {
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            directories.push(entry.path().to_path_buf());
+            continue;
+        }
         if entry.file_type().is_some_and(|ft| ft.is_file())
             && entry
                 .file_name()
@@ -116,6 +260,12 @@ pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
             results.push(entry.path().to_path_buf());
         }
     }
+    save_agents_cache(cwd, &results, &directories);
+    tracing::debug!(
+        count = results.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "completed AGENTS.md discovery"
+    );
     results
 }
 
@@ -726,6 +876,37 @@ mod tests {
 
         let files = find_agents_md_files(cwd);
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_find_agents_md_files_invalidates_changed_cache_entry() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path();
+        let top_level = cwd.join("AGENTS.md");
+        fs::write(&top_level, "top-level").unwrap();
+
+        assert_eq!(find_agents_md_files(cwd).len(), 1);
+        fs::write(&top_level, "changed rules with a different size").unwrap();
+
+        assert_eq!(find_agents_md_files(cwd).len(), 1);
+        assert_eq!(
+            fs::read_to_string(&top_level).unwrap(),
+            "changed rules with a different size"
+        );
+    }
+
+    #[test]
+    fn test_find_agents_md_files_invalidates_cache_when_nested_file_is_added() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path();
+        fs::write(cwd.join("AGENTS.md"), "top-level").unwrap();
+        let nested = cwd.join("nested");
+        fs::create_dir(&nested).unwrap();
+
+        assert_eq!(find_agents_md_files(cwd).len(), 1);
+        fs::write(nested.join("AGENTS.md"), "nested rules").unwrap();
+
+        assert_eq!(find_agents_md_files(cwd).len(), 2);
     }
 
     #[test]
