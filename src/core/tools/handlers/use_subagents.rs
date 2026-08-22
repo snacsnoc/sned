@@ -11,13 +11,24 @@ use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::AsyncRead;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 
 const MAX_SUBAGENT_PROMPTS: usize = 5;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_SUBAGENT_OUTPUT_LIMIT: usize = 1024 * 1024;
+const MAX_SUBAGENT_LINE_BYTES: usize = 64 * 1024;
+const OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+fn subagent_output_limit() -> usize {
+    std::env::var("SNED_SUBAGENT_OUTPUT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0 && value <= 64 * 1024 * 1024)
+        .unwrap_or(DEFAULT_SUBAGENT_OUTPUT_LIMIT)
+}
 
 #[derive(Debug, Clone)]
 pub struct SubagentResult {
@@ -97,6 +108,57 @@ impl UseSubagentsHandler {
             .map(|t| if t > 0 { t as u32 } else { 1 })
     }
 
+    fn append_stream_line(
+        collected: &mut String,
+        line: &str,
+        output_limit: usize,
+        truncated: &mut bool,
+    ) -> bool {
+        if *truncated {
+            return false;
+        }
+
+        let separator = usize::from(!collected.is_empty());
+        let available = output_limit.saturating_sub(collected.len());
+        if separator + line.len() <= available {
+            if separator > 0 {
+                collected.push('\n');
+            }
+            collected.push_str(line);
+            return true;
+        }
+
+        if separator > 0 && available > 0 {
+            collected.push('\n');
+        }
+        let remaining = output_limit.saturating_sub(collected.len());
+        collected.push_str(&line[..line.floor_char_boundary(remaining)]);
+        *truncated = true;
+        false
+    }
+
+    fn emit_stream_progress(
+        prefix: &str,
+        line: &str,
+        emit_progress: bool,
+        output_writer: &Option<crate::cli::output::OutputWriterArc>,
+        is_stderr: bool,
+    ) {
+        if !emit_progress {
+            return;
+        }
+        let Some(writer) = output_writer else {
+            return;
+        };
+
+        let formatted = format!("{prefix} {line}");
+        if is_stderr {
+            writer.emit(crate::cli::output::OutputEvent::dim_yellow(formatted));
+        } else {
+            writer.emit(crate::cli::output::OutputEvent::dim(formatted));
+        }
+    }
+
     async fn collect_stream_output<R>(
         reader: R,
         prefix: String,
@@ -107,29 +169,101 @@ impl UseSubagentsHandler {
     where
         R: AsyncRead + Unpin,
     {
-        let mut lines = BufReader::new(reader).lines();
+        use tokio::io::AsyncReadExt;
+
+        let mut reader = reader;
         let mut collected = String::new();
+        let output_limit = subagent_output_limit();
+        let mut truncated = false;
+        let mut line = Vec::with_capacity(OUTPUT_READ_CHUNK_BYTES);
+        let mut discarding_line = false;
+        let mut chunk = [0_u8; OUTPUT_READ_CHUNK_BYTES];
         let stream_prefix = if is_stderr {
             format!("{prefix} stderr")
         } else {
             prefix
         };
 
-        while let Ok(Some(line)) = lines.next_line().await {
-            let line = line.trim_end_matches('\r').to_string();
-            if !collected.is_empty() {
-                collected.push('\n');
+        loop {
+            let read = match reader.read(&mut chunk).await {
+                Ok(read) => read,
+                Err(error) => {
+                    tracing::warn!("failed to read subagent output: {error}");
+                    break;
+                }
+            };
+            if read == 0 {
+                break;
             }
-            collected.push_str(&line);
 
-            if emit_progress && let Some(ref writer) = output_writer {
-                let formatted = format!("{stream_prefix} {line}");
-                if is_stderr {
-                    writer.emit(crate::cli::output::OutputEvent::dim_yellow(formatted));
-                } else {
-                    writer.emit(crate::cli::output::OutputEvent::dim(formatted));
+            for byte in &chunk[..read] {
+                if *byte == b'\n' {
+                    let line_text = if discarding_line {
+                        format!(
+                            "(subagent output line exceeded {MAX_SUBAGENT_LINE_BYTES} bytes and was discarded.)"
+                        )
+                    } else {
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        String::from_utf8_lossy(&line).into_owned()
+                    };
+                    let retained = Self::append_stream_line(
+                        &mut collected,
+                        &line_text,
+                        output_limit,
+                        &mut truncated,
+                    );
+                    if retained {
+                        Self::emit_stream_progress(
+                            &stream_prefix,
+                            &line_text,
+                            emit_progress,
+                            &output_writer,
+                            is_stderr,
+                        );
+                    }
+                    line.clear();
+                    discarding_line = false;
+                } else if !discarding_line {
+                    if line.len() == MAX_SUBAGENT_LINE_BYTES {
+                        line.clear();
+                        discarding_line = true;
+                    } else {
+                        line.push(*byte);
+                    }
                 }
             }
+        }
+
+        if discarding_line || !line.is_empty() {
+            let line_text = if discarding_line {
+                format!(
+                    "(subagent output line exceeded {MAX_SUBAGENT_LINE_BYTES} bytes and was discarded.)"
+                )
+            } else {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                String::from_utf8_lossy(&line).into_owned()
+            };
+            let retained =
+                Self::append_stream_line(&mut collected, &line_text, output_limit, &mut truncated);
+            if retained {
+                Self::emit_stream_progress(
+                    &stream_prefix,
+                    &line_text,
+                    emit_progress,
+                    &output_writer,
+                    is_stderr,
+                );
+            }
+        }
+
+        if truncated {
+            collected.push_str(&format!(
+                "\n(subagent output truncated at {output_limit} bytes; additional output was discarded.)"
+            ));
         }
 
         collected
@@ -941,5 +1075,39 @@ mod tests {
                 .iter()
                 .any(|event| event.contains("[subagent 1] world"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_output_bounds_retained_bytes_and_drains() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let original = std::env::var_os("SNED_SUBAGENT_OUTPUT_LIMIT");
+        unsafe { std::env::set_var("SNED_SUBAGENT_OUTPUT_LIMIT", "1024") };
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let handle = tokio::spawn(async move {
+            UseSubagentsHandler::collect_stream_output(
+                reader,
+                "[subagent 1]".to_string(),
+                false,
+                None,
+                false,
+            )
+            .await
+        });
+        writer.write_all(&b"x\n".repeat(8 * 1024)).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let collected = handle.await.unwrap();
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("SNED_SUBAGENT_OUTPUT_LIMIT", value),
+                None => std::env::remove_var("SNED_SUBAGENT_OUTPUT_LIMIT"),
+            }
+        }
+
+        assert!(collected.contains("subagent output truncated at 1024 bytes"));
+        assert!(collected.len() < 1200, "collected output was not bounded");
     }
 }
