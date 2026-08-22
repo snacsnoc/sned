@@ -815,7 +815,10 @@ fn extract_and_emit_xml_tool_calls(
         let remaining = xml_buffer[block_end..].to_string();
         *xml_buffer = remaining;
 
-        let call_id = format!("minimax-{event_id}");
+        // An SSE event can contain multiple XML tool-call blocks, and the
+        // provider may reuse the same event ID across chunks. Keep the event
+        // ID for diagnostics but add a unique suffix for tool-call identity.
+        let call_id = format!("minimax-{event_id}-{}", ulid::Ulid::new());
         let (tool_name, tool_params) = parse_minimax_xml_tool_call(&block).unwrap_or_else(|| {
             (
                 "xml_tool_call".to_string(),
@@ -1191,18 +1194,6 @@ fn process_minimax_sse_line(
                         // Skip empty or whitespace-only argument chunks - MiniMax sends these
                         // before actual JSON content arrives. These aren't garbled, just partial.
                         if args.trim().is_empty() {
-                            continue;
-                        }
-                        if entry.2.is_empty()
-                            && !args.starts_with('{')
-                            && !args.starts_with('[')
-                            && !args.starts_with('"')
-                        {
-                            tracing::warn!(
-                                tool_index = idx,
-                                args_preview = args.chars().take(40).collect::<String>(),
-                                "MiniMax tool call arguments start with garbled content, discarding chunk"
-                            );
                             continue;
                         }
                         if entry.2.len() + args.len() <= crate::providers::MAX_TOOL_ARGUMENT_SIZE {
@@ -2622,6 +2613,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_xml_tool_calls_get_distinct_ids_with_one_event_id() {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut buffer = concat!(
+            r#"<minimax:tool_call><invoke name="read_file"><parameter name="paths">a.rs</parameter></invoke></minimax:tool_call>"#,
+            r#"<minimax:tool_call><invoke name="read_file"><parameter name="paths">b.rs</parameter></invoke></minimax:tool_call>"#,
+        )
+        .to_string();
+
+        extract_and_emit_xml_tool_calls(&mut buffer, &tx, "same-event");
+
+        let first = rx.recv().await.expect("first XML tool call");
+        let second = rx.recv().await.expect("second XML tool call");
+        let ids = [first, second]
+            .into_iter()
+            .map(|chunk| match chunk {
+                ApiStreamChunk::ToolCalls(chunk) => chunk.tool_call.call_id.unwrap(),
+                other => panic!("expected tool call chunk, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(ids[0], ids[1]);
+        assert!(buffer.is_empty());
+    }
+
     #[test]
     fn test_sse_parse_minimax_delta_ignores_name_and_role_fields() {
         let line = r#"{"id":"06606d9933ccdc19dddfa3af953a03d3","choices":[{"index":0,"delta":{"role":"assistant","name":"MiniMax AI","tool_calls":[{"function":{"arguments":"|event::\"}"},"index":0}]}}],"created":1779514009,"model":"MiniMax-M2.7","object":"chat.completion.chunk","usage":{"total_tokens":0,"total_characters":0},"input_sensitive":false,"output_sensitive":false,"input_sensitive_type":0,"output_sensitive_type":0,"output_sensitive_int":0}"#;
@@ -2674,9 +2691,10 @@ mod tests {
         let mut pending_text_signature = None;
         let mut reasoning_state = MinimaxReasoningState::default();
 
-        // Chunk 1: tool call id + name + first args fragment
+        // Chunk 1: tool call id + name + metadata before the first JSON byte.
+        // The shared validator strips the metadata once all fragments arrive.
         process_minimax_sse_line(
-            r#"data: {"id":"evt1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"pa"}}]}}],"model":"MiniMax-M2.7"}"#,
+            r#"data: {"id":"evt1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"metadata{\"pa"}}]}}],"model":"MiniMax-M2.7"}"#,
             &tx,
             &mut accumulated,
             &mut completed,
