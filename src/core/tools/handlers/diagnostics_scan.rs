@@ -32,6 +32,8 @@ static PYTHON_REGEX: LazyLock<Regex> =
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticsScanHandler;
 
+const MAX_DIAGNOSTICS_SOURCE_BYTES: u64 = 512 * 1024;
+
 /// Cache for detect_project_type results to avoid redundant filesystem walks.
 /// Keyed by (parent directory, file extension) to handle mixed file types in same dir.
 static PROJECT_TYPE_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), ProjectType>>> =
@@ -578,9 +580,22 @@ impl DiagnosticsScanHandler {
                 }
             };
 
-            // Try to read the file
-            let file_content = match tokio::fs::read_to_string(&abs_path).await {
-                Ok(content) => Some(content),
+            let file_content = match tokio::fs::metadata(&abs_path).await {
+                Ok(metadata) if metadata.len() > MAX_DIAGNOSTICS_SOURCE_BYTES => {
+                    error_results.push(format!(
+                        "- file: {rel_path}\n  source omitted: {}KB exceeds the {}KB diagnostics limit",
+                        metadata.len() / 1024,
+                        MAX_DIAGNOSTICS_SOURCE_BYTES / 1024
+                    ));
+                    None
+                }
+                Ok(_) => match tokio::fs::read_to_string(&abs_path).await {
+                    Ok(content) => Some(content),
+                    Err(e) => {
+                        error_results.push(format!("- file: {rel_path}\n  error: {e}"));
+                        continue;
+                    }
+                },
                 Err(e) => {
                     error_results.push(format!("- file: {rel_path}\n  error: {e}"));
                     continue;
@@ -770,6 +785,31 @@ mod tests {
                 || text.contains("error")
                 || text.contains("Error")
         );
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_scan_omits_oversized_source_context() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let py_file = temp.path().join("large.py");
+        std::fs::write(
+            &py_file,
+            vec![b'#'; MAX_DIAGNOSTICS_SOURCE_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let handler = DiagnosticsScanHandler::new();
+        let mut state = TaskState::default();
+        let result = handler
+            .execute(
+                &mut state,
+                temp.path(),
+                serde_json::json!({"paths": ["large.py"]}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("source omitted"));
+        assert!(result.contains("diagnostics limit"));
     }
 
     #[tokio::test]

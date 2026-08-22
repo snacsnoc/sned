@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 const MAX_AUTO_SYMBOL_MATCHES: usize = 3;
 const MAX_AUTO_SYMBOL_TOTAL_LINES: usize = 20;
 const MAX_AUTO_SYMBOL_LINE_LENGTH_BYTES: usize = 200;
+const MAX_AUTO_SYMBOL_FILE_BYTES: u64 = 512 * 1024;
 
 static CODE_FENCE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"```[\s\S]*?```").unwrap());
 static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\w+:\/\/[^\s]+").unwrap());
@@ -330,6 +331,7 @@ impl ContextLoader {
         // Read each file once, then extract all needed lines from cached content
         let mut file_contents: HashMap<String, Vec<String>> =
             HashMap::with_capacity(file_locations.len());
+        let mut skipped_large_files = 0_usize;
         for loc_path_str in file_locations.keys() {
             let abs_loc_path = if Path::new(loc_path_str).is_absolute() {
                 PathBuf::from(loc_path_str)
@@ -337,11 +339,19 @@ impl ContextLoader {
                 project_root.join(loc_path_str)
             };
 
-            if let Ok(content) = tokio::fs::read_to_string(&abs_loc_path).await {
-                file_contents.insert(
-                    loc_path_str.clone(),
-                    content.lines().map(String::from).collect(),
-                );
+            match tokio::fs::metadata(&abs_loc_path).await {
+                Ok(metadata) if metadata.len() > MAX_AUTO_SYMBOL_FILE_BYTES => {
+                    skipped_large_files += 1;
+                }
+                Ok(_) => {
+                    if let Ok(content) = tokio::fs::read_to_string(&abs_loc_path).await {
+                        file_contents.insert(
+                            loc_path_str.clone(),
+                            content.lines().map(String::from).collect(),
+                        );
+                    }
+                }
+                Err(_) => {}
             }
         }
 
@@ -442,6 +452,13 @@ impl ContextLoader {
             symbol_lines.extend(data.added_lines.iter().cloned());
 
             symbol_definitions.push(symbol_lines.join("\n"));
+        }
+
+        if skipped_large_files > 0 {
+            symbol_definitions.push(format!(
+                "Note: automatic symbol context skipped {skipped_large_files} file(s) larger than {}KB.",
+                MAX_AUTO_SYMBOL_FILE_BYTES / 1024
+            ));
         }
 
         symbol_definitions
@@ -561,6 +578,46 @@ mod tests {
         assert!(enriched.contains("symbol_context:"));
         assert!(enriched.contains("fooBar"));
         assert!(enriched.contains("src/lib.rs:1"));
+    }
+
+    #[tokio::test]
+    async fn test_load_initial_context_skips_oversized_symbol_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+        let file_path = root.join("src/lib.rs");
+        tokio::fs::create_dir_all(file_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &file_path,
+            vec![b'x'; MAX_AUTO_SYMBOL_FILE_BYTES as usize + 1],
+        )
+        .await
+        .unwrap();
+
+        let mut service = SymbolIndexService::new(root.to_string_lossy().to_string());
+        service.index_file(
+            "src/lib.rs",
+            1,
+            1,
+            &[SymbolLocation {
+                path: Some("src/lib.rs".to_string()),
+                name: "fooBar".to_string(),
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 6,
+                symbol_type: SymbolType::Definition,
+                kind: Some("function".to_string()),
+            }],
+        );
+
+        let loader = ContextLoader::new(root.to_string_lossy().to_string())
+            .with_symbol_index_service(Arc::new(Mutex::new(service)));
+        let (enriched, _) = loader.load_initial_context("Please inspect fooBar").await;
+
+        assert!(enriched.contains("automatic symbol context skipped 1 file"));
+        assert!(!enriched.contains("symbol_context:"));
     }
 
     #[tokio::test]

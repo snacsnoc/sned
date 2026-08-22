@@ -31,6 +31,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+fn max_edit_file_size() -> u64 {
+    crate::core::tools::handlers::read_file::max_file_read_size() as u64
+}
+
 /// Edit file tool handler.
 #[derive(Clone, Debug)]
 pub struct EditFileHandler {
@@ -654,8 +658,11 @@ impl EditFileHandler {
         let mut total_edits = 0usize;
         let mut total_glued_batches = 0usize;
         let mut diff_previews: Vec<String> = Vec::new();
-        let mut prepared_batches: Vec<(crate::core::edit_batch::FileEditBatch, PreparedEdits)> =
-            Vec::new();
+        let mut prepared_batches: Vec<(
+            crate::core::edit_batch::FileEditBatch,
+            PreparedEdits,
+            String,
+        )> = Vec::new();
         let mut file_text_formats: HashMap<String, FileTextFormat> = HashMap::new();
 
         // Phase 1: Prepare all batches and collect diff previews
@@ -726,6 +733,17 @@ impl EditFileHandler {
             let (raw_content, initial_mtime) = match tokio::fs::metadata(&batch.absolute_path).await
             {
                 Ok(metadata) => {
+                    let max_file_size = max_edit_file_size();
+                    if metadata.len() > max_file_size {
+                        all_results.push(format!(
+                            "File {} is too large to edit ({}KB, max {}KB)",
+                            batch.display_path,
+                            metadata.len() / 1024,
+                            max_file_size / 1024
+                        ));
+                        total_failed += batch.edits.len();
+                        continue;
+                    }
                     let mtime = metadata.modified().ok();
                     match tokio::fs::read_to_string(&batch.absolute_path).await {
                         Ok(content) => (content, mtime),
@@ -737,15 +755,14 @@ impl EditFileHandler {
                         }
                     }
                 }
-                Err(_) => match tokio::fs::read_to_string(&batch.absolute_path).await {
-                    Ok(content) => (content, None),
-                    Err(e) => {
-                        all_results
-                            .push(format!("Error reading file {}: {}", batch.display_path, e));
-                        total_failed += 1;
-                        continue;
-                    }
-                },
+                Err(e) => {
+                    all_results.push(format!(
+                        "Error inspecting file {}: {}",
+                        batch.display_path, e
+                    ));
+                    total_failed += batch.edits.len();
+                    continue;
+                }
             };
 
             if expected_content
@@ -845,7 +862,7 @@ impl EditFileHandler {
             }
 
             // Store for later (after approval)
-            prepared_batches.push((batch, prepared));
+            prepared_batches.push((batch, prepared, raw_content));
         }
 
         // Phase 2: Combined approval check (skip only when explicitly approved)
@@ -903,7 +920,7 @@ impl EditFileHandler {
         // Group files by (project_root, project_type) to handle mixed-language projects
         let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> =
             HashMap::with_capacity(prepared_batches.len());
-        for (batch, _) in &prepared_batches {
+        for (batch, _, _) in &prepared_batches {
             let path = PathBuf::from(&batch.absolute_path);
             let project_type = DiagnosticsScanHandler::detect_project_type(&path);
             let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
@@ -934,7 +951,7 @@ impl EditFileHandler {
             String,
             Vec<crate::core::tools::handlers::diagnostics_scan::Diagnostic>,
         > = std::collections::HashMap::with_capacity(prepared_batches.len());
-        for (batch, _) in &prepared_batches {
+        for (batch, _, _) in &prepared_batches {
             let diag_output = batch_diag_outputs
                 .get(&PathBuf::from(&batch.absolute_path))
                 .cloned()
@@ -979,11 +996,12 @@ impl EditFileHandler {
             absolute_path: String,
             display_path: String,
             final_content: String,
+            original_content: String,
             initial_mtime: Option<std::time::SystemTime>,
         }
         let mut write_items: Vec<WriteItem> = Vec::new();
 
-        for (batch, mut prepared) in prepared_batches {
+        for (batch, mut prepared, original_content) in prepared_batches {
             let result =
                 processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
 
@@ -1018,6 +1036,7 @@ impl EditFileHandler {
                         absolute_path: batch.absolute_path.clone(),
                         display_path: batch.display_path.clone(),
                         final_content: restore_file_content(final_content, text_format),
+                        original_content,
                         initial_mtime: prepared.initial_mtime,
                     });
                 }
@@ -1056,14 +1075,10 @@ impl EditFileHandler {
         // If any file fails to write, restore all previously written files to original content
         let mut write_failed_paths: HashSet<String> = HashSet::new();
         if !write_items.is_empty() {
-            // Snapshot original content for all files before any writes
-            let mut original_contents: std::collections::HashMap<String, String> =
-                std::collections::HashMap::with_capacity(write_items.len());
-            for item in &write_items {
-                if let Ok(c) = tokio::fs::read_to_string(&item.absolute_path).await {
-                    original_contents.insert(item.absolute_path.clone(), c);
-                }
-            }
+            let original_contents: std::collections::HashMap<&str, &str> = write_items
+                .iter()
+                .map(|item| (item.absolute_path.as_str(), item.original_content.as_str()))
+                .collect();
 
             // Track which files were successfully written for rollback
             let mut written_paths: Vec<String> = Vec::new();
@@ -1080,7 +1095,7 @@ impl EditFileHandler {
                         // Rollback all previously written files
                         // Note: previously written files were already unlocked after their atomic writes
                         for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path)
+                            if let Some(orig) = original_contents.get(path.as_str())
                                 && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
                             {
                                 rollback_errors.push(format!("Failed to rollback {path}: {re}"));
@@ -1103,7 +1118,7 @@ impl EditFileHandler {
 
                 if let Err(lock_error) = std_file.try_lock() {
                     for path in written_paths.iter().rev() {
-                        if let Some(orig) = original_contents.get(path)
+                        if let Some(orig) = original_contents.get(path.as_str())
                             && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
                         {
                             rollback_errors.push(format!("Failed to rollback {path}: {re}"));
@@ -1170,7 +1185,7 @@ impl EditFileHandler {
                         write_failed_paths.insert(item.absolute_path.clone());
                         write_failed_paths.extend(written_paths.iter().cloned());
                         for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path)
+                            if let Some(orig) = original_contents.get(path.as_str())
                                 && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
                             {
                                 rollback_errors.push(format!("Failed to rollback {path}: {re}"));
@@ -1640,6 +1655,40 @@ mod tests {
         assert_eq!(
             result.unwrap().as_str().unwrap(),
             "No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_rejects_oversized_target_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("large.txt");
+        std::fs::write(&file_path, vec![b'x'; max_edit_file_size() as usize + 1]).unwrap();
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({"files": [{"path": "large.txt", "edits": []}]}),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result
+                .as_str()
+                .is_some_and(|text| text.contains("too large to edit"))
         );
     }
 
