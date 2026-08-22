@@ -16,6 +16,9 @@ use crate::storage::disk::GlobalFileNames;
 pub const DEFAULT_TRANSCRIPT_CAP: usize = 1_000;
 pub const CURRENT_TRANSCRIPT_FORMAT_VERSION: u32 = 1;
 const ASYNC_LOCK_RETRY_DELAYS_MS: &[u64] = &[100, 200, 400, 800, 1_600, 3_200];
+const TASK_LOCK_FILE: &str = ".lock";
+const API_CONVERSATION_HISTORY_LOCK_FILE: &str = ".api-conversation-history.lock";
+const COMPACTED_SUMMARY_LOCK_FILE: &str = ".compacted-summary.lock";
 
 fn default_transcript_format_version() -> u32 {
     CURRENT_TRANSCRIPT_FORMAT_VERSION
@@ -323,7 +326,7 @@ impl TaskStorage {
 
     /// Write API conversation history
     pub fn write_api_conversation_history(&self, history: &[StorageMessage]) -> io::Result<()> {
-        self.with_lock(|| {
+        self.with_lock_file(API_CONVERSATION_HISTORY_LOCK_FILE, || {
             let data = serde_json::to_string(history)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let file_path = self
@@ -344,7 +347,9 @@ impl TaskStorage {
             .task_dir
             .join(GlobalFileNames::API_CONVERSATION_HISTORY);
 
-        let _guard = self.acquire_lock_with_retry().await?;
+        let _guard = self
+            .acquire_lock_with_retry_for(API_CONVERSATION_HISTORY_LOCK_FILE)
+            .await?;
         crate::storage::disk::atomic_write_file_async(&file_path, &data).await
     }
 
@@ -385,7 +390,7 @@ impl TaskStorage {
         &self,
         summary: &crate::core::context::context_manager::CompactedSummary,
     ) -> io::Result<()> {
-        self.with_lock(|| {
+        self.with_lock_file(COMPACTED_SUMMARY_LOCK_FILE, || {
             let data = serde_json::to_string(summary)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let file_path = self.task_dir.join(GlobalFileNames::COMPACTED_SUMMARY);
@@ -402,7 +407,9 @@ impl TaskStorage {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let file_path = self.task_dir.join(GlobalFileNames::COMPACTED_SUMMARY);
 
-        let _guard = self.acquire_lock_with_retry().await?;
+        let _guard = self
+            .acquire_lock_with_retry_for(COMPACTED_SUMMARY_LOCK_FILE)
+            .await?;
         crate::storage::disk::atomic_write_file_async(&file_path, &data).await
     }
 
@@ -591,7 +598,11 @@ impl TaskStorage {
     ///
     /// Returns a LockGuard that automatically releases the lock when dropped.
     pub fn acquire_lock(&self) -> io::Result<LockGuard> {
-        let lock_path = self.task_dir.join(".lock");
+        self.acquire_lock_for(TASK_LOCK_FILE)
+    }
+
+    fn acquire_lock_for(&self, lock_file: &str) -> io::Result<LockGuard> {
+        let lock_path = self.task_dir.join(lock_file);
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -600,7 +611,7 @@ impl TaskStorage {
             .open(&lock_path)?;
 
         file.try_lock().map_err(|e| {
-            let message = format!("Task is locked by another process: {e}");
+            let message = format!("Task storage lock is busy: {e}");
             match e {
                 std::fs::TryLockError::WouldBlock => {
                     io::Error::new(io::ErrorKind::WouldBlock, message)
@@ -612,10 +623,9 @@ impl TaskStorage {
         Ok(LockGuard { _file: file })
     }
 
-    /// Retry short-lived cross-process contention without blocking a Tokio worker.
-    async fn acquire_lock_with_retry(&self) -> io::Result<LockGuard> {
+    async fn acquire_lock_with_retry_for(&self, lock_file: &str) -> io::Result<LockGuard> {
         for attempt in 0..=ASYNC_LOCK_RETRY_DELAYS_MS.len() {
-            match self.acquire_lock() {
+            match self.acquire_lock_for(lock_file) {
                 Ok(guard) => return Ok(guard),
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock
@@ -631,11 +641,8 @@ impl TaskStorage {
         unreachable!("lock retry loop always returns after its final attempt")
     }
 
-    /// Acquire an exclusive lock on the task directory, blocking until available.
-    ///
-    /// Returns a LockGuard that automatically releases the lock when dropped.
-    fn acquire_lock_blocking(&self) -> io::Result<LockGuard> {
-        let lock_path = self.task_dir.join(".lock");
+    fn acquire_lock_blocking_for(&self, lock_file: &str) -> io::Result<LockGuard> {
+        let lock_path = self.task_dir.join(lock_file);
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -656,7 +663,14 @@ impl TaskStorage {
     where
         F: FnOnce() -> io::Result<T>,
     {
-        let _guard = self.acquire_lock_blocking()?;
+        self.with_lock_file(TASK_LOCK_FILE, f)
+    }
+
+    fn with_lock_file<T, F>(&self, lock_file: &str, f: F) -> io::Result<T>
+    where
+        F: FnOnce() -> io::Result<T>,
+    {
+        let _guard = self.acquire_lock_blocking_for(lock_file)?;
         f()
     }
 }
@@ -1299,7 +1313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_async_history_write_retries_short_lock_contention() {
+    async fn test_async_history_write_ignores_task_lock_contention() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1330,16 +1344,19 @@ mod tests {
                 .write_api_conversation_history_async(&[])
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(!write.is_finished(), "write should wait for the held lock");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), write)
+                .await
+                .expect("history write should not wait for the task lock")
+                .unwrap()
+                .is_ok()
+        );
         released.store(true, Ordering::Release);
-
-        assert!(write.await.unwrap().is_ok());
         holder.join().unwrap();
     }
 
     #[tokio::test]
-    async fn test_async_summary_write_retries_short_lock_contention() {
+    async fn test_async_summary_write_ignores_task_lock_contention() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1375,12 +1392,50 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(!write.is_finished(), "write should wait for the held lock");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), write)
+                .await
+                .expect("summary write should not wait for the task lock")
+                .unwrap()
+                .is_ok()
+        );
         released.store(true, Ordering::Release);
-
-        assert!(write.await.unwrap().is_ok());
         holder.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dedicated_file_locks_serialize_same_file_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("dedicated-file-locks");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        let history_guard = storage
+            .acquire_lock_for(API_CONVERSATION_HISTORY_LOCK_FILE)
+            .unwrap();
+
+        let waiting_storage = storage.clone();
+        let waiting_history = tokio::spawn(async move {
+            waiting_storage
+                .acquire_lock_with_retry_for(API_CONVERSATION_HISTORY_LOCK_FILE)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !waiting_history.is_finished(),
+            "same-file writers must serialize"
+        );
+
+        let summary_guard = tokio::time::timeout(
+            Duration::from_secs(1),
+            storage.acquire_lock_with_retry_for(COMPACTED_SUMMARY_LOCK_FILE),
+        )
+        .await
+        .expect("a different task file must not share the history lock")
+        .expect("summary lock should be available");
+        drop(summary_guard);
+
+        drop(history_guard);
+        drop(waiting_history.await.unwrap().expect("history lock should release"));
     }
 
     #[tokio::test]
@@ -1409,10 +1464,12 @@ mod tests {
         });
         ready_rx.recv().unwrap();
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(8), storage.acquire_lock_with_retry())
-                .await
-                .expect("lock retry should be bounded");
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            storage.acquire_lock_with_retry_for(TASK_LOCK_FILE),
+        )
+        .await
+        .expect("lock retry should be bounded");
         let error = match result {
             Ok(_) => panic!("held lock should exhaust retries"),
             Err(error) => error,
