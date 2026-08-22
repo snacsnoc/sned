@@ -92,13 +92,15 @@ impl ReplaceSymbolHandler {
         let mut any_error = None;
 
         for batch in batches.values() {
-            // Mark file as edited by Sned to suppress stale mtime detection
-            state
-                .file_context_tracker
-                .mark_file_as_edited_by_sned(std::path::Path::new(&batch.absolute_path));
-
             match process_batch(batch, self.symbol_index_service.as_ref(), state).await {
-                Ok(result) => file_results.push(result),
+                Ok(result) => {
+                    // Mark only after the write succeeds; failed batches must
+                    // remain eligible for stale-file detection.
+                    state
+                        .file_context_tracker
+                        .mark_file_as_edited_by_sned(std::path::Path::new(&batch.absolute_path));
+                    file_results.push(result);
+                }
                 Err(e) => {
                     // Continue processing remaining batches — don't discard
                     // successful results. Collect the error but keep going.
@@ -716,5 +718,35 @@ mod tests {
             .unwrap();
         assert!(new_content.contains("FOO"));
         assert!(!new_content.contains("fn foo()"));
+    }
+
+    #[tokio::test]
+    async fn test_failed_batch_does_not_mark_file_as_sned_edited() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_root = temp_dir.path();
+        let path = workspace_root.join("test.rs");
+        std::fs::write(&path, "fn foo() {}\n").unwrap();
+
+        let handler = ReplaceSymbolHandler::new();
+        let mut state = TaskState::default();
+        state.file_context_tracker.track_file_read(&path);
+        let params = serde_json::json!({
+            "replacements": [
+                {"path": "test.rs", "symbol": "missing", "text": "MISSING"}
+            ]
+        });
+
+        assert!(handler
+            .execute_with_workspace_root(&mut state, params, workspace_root)
+            .await
+            .is_err());
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        std::fs::write(&path, "fn changed() {}\n").unwrap();
+        let warning = state.file_context_tracker.check_stale(&path).await;
+        assert!(
+            warning.is_some(),
+            "a failed batch must not suppress later external modification detection"
+        );
     }
 }
