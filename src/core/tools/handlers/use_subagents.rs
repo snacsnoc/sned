@@ -327,10 +327,10 @@ impl UseSubagentsHandler {
         };
 
         #[cfg(unix)]
-        let child_pid = child.id().unwrap_or(0) as i32;
+        let child_pid = child.id().and_then(|pid| i32::try_from(pid).ok());
 
         #[cfg(unix)]
-        if child_pid != 0
+        if let Some(child_pid) = child_pid
             && let Some(ref state) = task_state
         {
             let mut state = state.lock().await;
@@ -364,11 +364,31 @@ impl UseSubagentsHandler {
         let wait_result = timeout(Duration::from_secs(timeout_secs), child.wait()).await;
 
         let stdout_buf = match stdout_handle {
-            Some(handle) => handle.await.unwrap_or_default(),
+            Some(handle) => match handle.await {
+                Ok(output) => output,
+                Err(error) => {
+                    tracing::error!(
+                        subagent = subagent_index + 1,
+                        error = %error,
+                        "subagent stdout collector task failed"
+                    );
+                    format!("[subagent stdout collection failed: {error}]")
+                }
+            },
             None => String::new(),
         };
         let stderr_buf = match stderr_handle {
-            Some(handle) => handle.await.unwrap_or_default(),
+            Some(handle) => match handle.await {
+                Ok(output) => output,
+                Err(error) => {
+                    tracing::error!(
+                        subagent = subagent_index + 1,
+                        error = %error,
+                        "subagent stderr collector task failed"
+                    );
+                    format!("[subagent stderr collection failed: {error}]")
+                }
+            },
             None => String::new(),
         };
 
@@ -413,6 +433,19 @@ impl UseSubagentsHandler {
                 }
             }
             Ok(Err(e)) => {
+                #[cfg(unix)]
+                if let Some(child_pid) = child_pid {
+                    crate::core::cancellation::terminate_process_group(
+                        child_pid,
+                        std::time::Duration::from_millis(100),
+                    )
+                    .await;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill().await;
+                }
+                let _ = child.wait().await;
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
                     use crate::cli::tui::theme::ERROR_FG;
@@ -431,11 +464,15 @@ impl UseSubagentsHandler {
             Err(_) => {
                 #[cfg(unix)]
                 {
-                    crate::core::cancellation::terminate_process_group(
-                        child_pid,
-                        std::time::Duration::from_millis(100),
-                    )
-                    .await;
+                    if let Some(child_pid) = child_pid {
+                        crate::core::cancellation::terminate_process_group(
+                            child_pid,
+                            std::time::Duration::from_millis(100),
+                        )
+                        .await;
+                    } else {
+                        let _ = child.kill().await;
+                    }
                 }
                 #[cfg(not(unix))]
                 {
@@ -464,7 +501,7 @@ impl UseSubagentsHandler {
         };
 
         #[cfg(unix)]
-        if child_pid != 0
+        if let Some(child_pid) = child_pid
             && let Some(ref state) = task_state
         {
             let mut state = state.lock().await;
