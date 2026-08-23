@@ -212,18 +212,18 @@ impl CheckpointTracker {
 
     /// List all checkpoint commits (newest first).
     pub fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, CheckpointError> {
-        let output = Command::new("git")
-            .args([
-                "--git-dir",
-                self.shadow_git_path.to_str().unwrap_or("."),
-                "--work-tree",
-                self.cwd.to_str().unwrap_or("."),
-                "log",
-                "--oneline",
-                "-n",
-                "50",
-            ])
-            .output()
+        let mut command = Command::new("git");
+        command.args([
+            "--git-dir",
+            self.shadow_git_path.to_str().unwrap_or("."),
+            "--work-tree",
+            self.cwd.to_str().unwrap_or("."),
+            "log",
+            "--oneline",
+            "-n",
+            "50",
+        ]);
+        let output = Self::run_git_command_with_timeout(&mut command)
             .map_err(|e| CheckpointError::CommandFailed(format!("git log failed: {e}")))?;
 
         if !output.status.success() {
@@ -263,17 +263,17 @@ impl CheckpointTracker {
             None => lhs_hash.to_string(),
         };
 
-        let output = Command::new("git")
-            .args([
-                "--git-dir",
-                self.shadow_git_path.to_str().unwrap_or("."),
-                "--work-tree",
-                self.cwd.to_str().unwrap_or("."),
-                "diff",
-                "--name-only",
-                &diff_range,
-            ])
-            .output()
+        let mut command = Command::new("git");
+        command.args([
+            "--git-dir",
+            self.shadow_git_path.to_str().unwrap_or("."),
+            "--work-tree",
+            self.cwd.to_str().unwrap_or("."),
+            "diff",
+            "--name-only",
+            &diff_range,
+        ]);
+        let output = Self::run_git_command_with_timeout(&mut command)
             .map_err(|e| CheckpointError::CommandFailed(format!("git diff failed: {e}")))?;
 
         if !output.status.success() {
@@ -310,9 +310,8 @@ impl CheckpointTracker {
         Ok(())
     }
 
-    /// Run Git with a hard wall-clock deadline. Tokio timeouts alone are not
-    /// sufficient here because this work is run in `spawn_blocking`; dropping
-    /// that future would leave the Git child alive and racing a later snapshot.
+    /// Run Git with a hard wall-clock deadline. This keeps both direct and
+    /// `spawn_blocking` callers bounded when Git or the workspace stalls.
     fn run_git_command_with_timeout(command: &mut Command) -> io::Result<Output> {
         Self::run_command_with_timeout(command, CHECKPOINT_GIT_TIMEOUT)
     }
@@ -320,6 +319,25 @@ impl CheckpointTracker {
     fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("git command stdout pipe was not captured"))?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("git command stderr pipe was not captured"))?;
+        // Drain both pipes while the child is running. Waiting for Git to exit
+        // before reading stdout can deadlock once a large diff fills the OS
+        // pipe buffer.
+        let stdout_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            stdout_pipe.read_to_end(&mut output).map(|_| output)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            stderr_pipe.read_to_end(&mut output).map(|_| output)
+        });
         let started = Instant::now();
 
         let status = loop {
@@ -329,6 +347,9 @@ impl CheckpointTracker {
             if started.elapsed() >= timeout {
                 let _ = child.kill();
                 let _ = child.wait();
+                drop(child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
@@ -340,15 +361,17 @@ impl CheckpointTracker {
             std::thread::sleep(Duration::from_millis(25));
         };
 
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            pipe.read_to_end(&mut stdout)?;
-        }
-        if let Some(mut pipe) = child.stderr.take() {
-            pipe.read_to_end(&mut stderr)?;
-        }
-        Ok(Output { status, stdout, stderr })
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| io::Error::other("git stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| io::Error::other("git stderr reader panicked"))??;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
     }
 
     /// Run a git command with --git-dir and --work-tree set.
@@ -642,6 +665,22 @@ mod tests {
         )
         .expect_err("checkpoint command should time out");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_checkpoint_command_drains_large_output_before_waiting() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 20000 ]; do printf 'changed-%s\\n' \"$i\"; i=$((i + 1)); done",
+        ]);
+
+        let output =
+            CheckpointTracker::run_command_with_timeout(&mut command, Duration::from_secs(2))
+                .expect("large Git-like output should not deadlock on the pipe buffer");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("changed-19999"));
     }
 
     #[tokio::test]
