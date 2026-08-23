@@ -153,6 +153,84 @@ struct ManualViewportAnchor {
     scroll_y: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutSource {
+    Output(usize),
+    Error(usize),
+    Separator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutEntry {
+    source: LayoutSource,
+    kind: BlockKind,
+    rows: usize,
+}
+
+#[derive(Debug, Default)]
+struct VisualLayoutIndex {
+    wrap_width: Option<usize>,
+    entries: Vec<LayoutEntry>,
+    offsets: Vec<usize>,
+    dirty: bool,
+}
+
+impl VisualLayoutIndex {
+    fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    fn is_valid_for(&self, wrap_width: usize) -> bool {
+        !self.dirty && self.wrap_width == Some(wrap_width)
+    }
+
+    fn total_rows(&self) -> usize {
+        self.offsets.last().copied().unwrap_or_default()
+    }
+
+    fn append_entry(&mut self, entry: LayoutEntry) {
+        let total = self
+            .offsets
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(entry.rows);
+        self.entries.push(entry);
+        self.offsets.push(total);
+    }
+
+    fn entry_start(&self, index: usize) -> usize {
+        index.checked_sub(1).map_or(0, |previous| self.offsets[previous])
+    }
+
+    fn locate(&self, scroll_y: usize, content_height: usize) -> (usize, usize, usize) {
+        if self.entries.is_empty() {
+            return (0, 0, 0);
+        }
+        let total_rows = self.total_rows();
+        let max_start = if content_height == 0 {
+            self.entry_start(self.entries.len().saturating_sub(1))
+        } else {
+            total_rows
+        };
+        let target_start = scroll_y.min(max_start);
+        let target_end = target_start.saturating_add(content_height.max(1));
+        let start = self.offsets.partition_point(|end| *end <= target_start);
+        let start = start.min(self.entries.len().saturating_sub(1));
+        let end_exclusive = self
+            .offsets
+            .partition_point(|end| *end < target_end)
+            .saturating_add(1)
+            .max(start.saturating_add(1))
+            .min(self.entries.len());
+        (
+            start,
+            end_exclusive.saturating_sub(start),
+            target_start.saturating_sub(self.entry_start(start)),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PasteChunk {
     pub marker: String,
@@ -578,6 +656,7 @@ pub struct App {
     pub cached_visible_window: Option<(usize, usize, usize)>,
     /// Fingerprint for the visible window cache (output_len, scroll_y, wrap_width, content_height, cached_visual_rows, scroll_mode).
     pub cached_window_fingerprint: (usize, usize, usize, usize, usize, ScrollMode),
+    visual_layout_index: VisualLayoutIndex,
     /// Whether the slash command picker is active.
     pub slash_command_active: bool,
     pub slash_command_help_active: bool,
@@ -624,6 +703,7 @@ pub struct App {
     /// Reasoning blocks awaiting a non-reasoning event or TurnEnd. Keeping
     /// the rendered blocks together preserves chunk coalescing on replay.
     pending_transcript_reasoning_lines: Option<Vec<Line<'static>>>,
+    pub(crate) deferred_priority_events: VecDeque<OutputEvent>,
     /// Whether the model picker is active.
     pub model_picker_active: bool,
     /// Model picker entries.
@@ -968,6 +1048,7 @@ impl App {
             turn_had_streamed_line: false,
             pending_transcript_model_line: None,
             pending_transcript_reasoning_lines: None,
+            deferred_priority_events: VecDeque::new(),
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
@@ -983,6 +1064,7 @@ impl App {
             error_lines: VecDeque::new(),
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
+            visual_layout_index: VisualLayoutIndex::default(),
             output_overflow: false,
             output_overflow_count: 0,
             output_overflow_summary: String::new(),
@@ -1060,6 +1142,9 @@ impl App {
         enforce_transcript_limit: bool,
     ) {
         let previous_kind = self.output_line_kinds.back().copied();
+        let can_extend_layout = self.visual_layout_index.is_valid_for(wrap_width)
+            && self.error_lines.is_empty()
+            && self.output_lines.len() < 10_000;
         self.needs_redraw = true;
         self.output_lines.push_back(line);
         self.output_line_kinds.push_back(kind);
@@ -1115,6 +1200,7 @@ impl App {
             }
             self.cached_wrap_width = None;
             self.cached_visible_window = None;
+            self.visual_layout_index.invalidate();
         } else if self.cached_wrap_width == Some(wrap_width) {
             // Hot path: keep the cached row count in sync for simple appends
             // so the next render does not need to rescan the whole transcript.
@@ -1128,6 +1214,29 @@ impl App {
                     as usize,
             );
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
+        }
+        if can_extend_layout {
+            if previous_kind.is_some_and(|previous| {
+                Self::should_insert_separator(previous, kind)
+            }) {
+                self.visual_layout_index.append_entry(LayoutEntry {
+                    source: LayoutSource::Separator,
+                    kind: BlockKind::Separator,
+                    rows: 1,
+                });
+            }
+            self.visual_layout_index.append_entry(LayoutEntry {
+                source: LayoutSource::Output(self.output_lines.len().saturating_sub(1)),
+                kind,
+                rows: Self::output_row_visual_rows(
+                    self.output_lines.back(),
+                    kind,
+                    wrap_width,
+                ),
+            });
+            self.cached_visual_rows = self.visual_layout_index.total_rows();
+        } else if !self.visual_layout_index.is_valid_for(wrap_width) {
+            self.visual_layout_index.invalidate();
         }
         match self.scroll_mode {
             ScrollMode::Auto => self.force_bottom(),
@@ -1246,6 +1355,7 @@ impl App {
         }
         self.cached_visible_window = None;
         self.cached_wrap_width = None;
+        self.visual_layout_index.invalidate();
 
         for _ in 0..visual_line_count {
             self.output_lines.pop_back();
@@ -2074,6 +2184,7 @@ impl App {
     pub fn push_error_line(&mut self, line: Line<'static>) {
         self.needs_redraw = true;
         self.error_lines.push_back(line);
+        self.visual_layout_index.invalidate();
         self.cached_wrap_width = None;
         self.cached_visible_window = None;
         self.force_bottom();
@@ -2084,6 +2195,7 @@ impl App {
         self.clear_text_selection();
         self.needs_redraw = true;
         self.error_lines.clear();
+        self.visual_layout_index.invalidate();
         self.cached_wrap_width = None;
         self.cached_visible_window = None;
     }
@@ -2378,6 +2490,7 @@ impl App {
             }
             self.output_lines = new_lines;
             self.output_line_kinds = new_kinds;
+            self.visual_layout_index.invalidate();
             self.cached_wrap_width = None;
             self.cached_visible_window = None;
         }
@@ -2396,6 +2509,7 @@ impl App {
         self.in_scrollback = false;
         self.needs_redraw = true;
         self.scrollback_count = 0;
+        self.visual_layout_index.invalidate();
         self.cached_wrap_width = None;
         self.cached_visible_window = None;
         self.scroll_mode = ScrollMode::Auto;
@@ -2423,10 +2537,12 @@ impl App {
         self.output_line_kinds.clear();
         self.last_completion_text = None;
         self.error_lines.clear();
+        self.visual_layout_index = VisualLayoutIndex::default();
         self.turn_stream_entries.clear();
         self.last_stream_group = None;
         self.pending_transcript_model_line = None;
         self.pending_transcript_reasoning_lines = None;
+        self.deferred_priority_events.clear();
         self.reasoning_partial_line.clear();
         self.turn_indicator = None;
         self.turn_had_streamed_line = false;
@@ -2449,6 +2565,7 @@ impl App {
         }
         self.output_lines.drain(start..);
         self.output_line_kinds.drain(start..);
+        self.visual_layout_index.invalidate();
         self.last_stream_group = None;
         self.reasoning_partial_line.clear();
         // Invalidate the visual-row cache: drain changes the line buffer,
@@ -2487,7 +2604,12 @@ impl App {
     }
 
     pub fn set_content_width(&mut self, content_width: usize) {
-        self.last_content_width = content_width;
+        if self.last_content_width != content_width {
+            self.last_content_width = content_width;
+            self.visual_layout_index.invalidate();
+            self.cached_wrap_width = None;
+            self.cached_visible_window = None;
+        }
     }
 
     /// Synchronize the cached plan panel state with the current task state.
@@ -2618,18 +2740,18 @@ impl App {
     }
 
     fn last_blocking_prompt_tail_row(&self, wrap_width: usize) -> Option<usize> {
-        let mut tail_row = None;
-        let mut rendered_rows = 0usize;
-
-        self.for_each_output_row(|line, kind| {
-            rendered_rows =
-                rendered_rows.saturating_add(Self::output_row_visual_rows(line, kind, wrap_width));
-            if kind == BlockKind::BlockingPrompt {
-                tail_row = Some(rendered_rows);
-            }
-        });
-
-        tail_row
+        self.visual_layout_index
+            .wrap_width
+            .filter(|width| *width == wrap_width)
+            .and_then(|_| {
+                self.visual_layout_index
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, entry)| entry.kind == BlockKind::BlockingPrompt)
+                    .map(|(index, _)| self.visual_layout_index.offsets[index])
+            })
     }
 
     fn last_wrap_width(&self) -> usize {
@@ -2678,133 +2800,92 @@ impl App {
             .max(1)
     }
 
-    fn visible_output_window(
-        &mut self,
-        wrap_width: usize,
-        scroll_y: usize,
-        content_height: usize,
-    ) -> (usize, usize, usize) {
-        if self.output_lines.is_empty() && self.error_lines.is_empty() {
-            return (0, 0, 0);
-        }
-
-        let fingerprint = (
-            self.output_lines.len(),
-            scroll_y,
-            wrap_width,
-            content_height,
-            self.cached_visual_rows,
-            self.scroll_mode,
+    fn rebuild_visual_layout_index(&mut self, wrap_width: usize) {
+        let mut entries = Vec::with_capacity(
+            self.output_lines
+                .len()
+                .saturating_add(self.error_lines.len()),
         );
+        let mut previous_kind = None;
 
-        if let Some(cached) = self.cached_visible_window
-            && self.cached_window_fingerprint == fingerprint
-        {
-            return cached;
-        }
-
-        let target_start = scroll_y.min(self.cached_visual_rows);
-        let target_end = target_start.saturating_add(content_height.max(1));
-
-        // Walk the same expanded (line, kind) list that the renderer
-        // uses, so separator rows are counted in scroll math and the
-        // returned indices reference the same list the renderer
-        // eventually slices.  `start_idx`/`end_idx` are indices into
-        // `expanded`, NOT into `self.output_lines` — the expanded list
-        // is longer when transition separators are present.
-        let mut expanded_len = 0usize;
-        let mut rows_before = 0usize;
-        let mut start_idx = usize::MAX;
-        let mut start_row_offset = 0usize;
-        let mut end_idx = 0usize;
-
-        let mut done = false;
-        self.for_each_output_row(|line, kind| {
-            if done {
-                return;
-            }
-            let idx = expanded_len;
-            expanded_len = expanded_len.saturating_add(1);
-            let rows = Self::output_row_visual_rows(line, kind, wrap_width);
-            let rows_after = rows_before.saturating_add(rows);
-
-            if start_idx == usize::MAX && rows_after > target_start {
-                start_idx = idx;
-                start_row_offset = target_start.saturating_sub(rows_before);
-            }
-
-            if rows_after >= target_end {
-                end_idx = idx;
-                rows_before = rows_after;
-                done = true;
-                return;
-            }
-
-            rows_before = rows_after;
-            end_idx = idx;
-        });
-
-        if expanded_len == 0 {
-            return (0, 0, 0);
-        }
-
-        if start_idx == usize::MAX {
-            start_idx = expanded_len.saturating_sub(1);
-            start_row_offset = 0;
-            end_idx = start_idx;
-        }
-
-        let take_count = end_idx.saturating_sub(start_idx).saturating_add(1);
-        let result = (start_idx, take_count, start_row_offset);
-
-        self.cached_visible_window = Some(result);
-        self.cached_window_fingerprint = fingerprint;
-
-        result
-    }
-
-    fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
-        let mut output_rows = 0usize;
-        self.for_each_output_row(|line, kind| {
-            output_rows =
-                output_rows.saturating_add(Self::output_row_visual_rows(line, kind, wrap_width));
-        });
-        self.cached_visual_rows = output_rows;
-        self.cached_wrap_width = Some(wrap_width);
-    }
-
-    fn for_each_output_row(&self, mut visitor: impl FnMut(Option<&Line<'static>>, BlockKind)) {
-        self.for_each_output_row_with_index(|line, kind, _| visitor(line, kind));
-    }
-
-    fn for_each_output_row_with_index(
-        &self,
-        mut visitor: impl FnMut(Option<&Line<'static>>, BlockKind, Option<usize>),
-    ) {
-        let mut prev: Option<BlockKind> = None;
         for (index, (line, kind)) in self
             .output_lines
             .iter()
             .zip(self.output_line_kinds.iter())
             .enumerate()
         {
-            if let Some(p) = prev
-                && Self::should_insert_separator(p, *kind)
+            if previous_kind
+                .is_some_and(|previous| Self::should_insert_separator(previous, *kind))
             {
-                visitor(None, BlockKind::Separator, None);
+                entries.push(LayoutEntry {
+                    source: LayoutSource::Separator,
+                    kind: BlockKind::Separator,
+                    rows: 1,
+                });
             }
-            visitor(Some(line), *kind, Some(index));
-            prev = Some(*kind);
+            entries.push(LayoutEntry {
+                source: LayoutSource::Output(index),
+                kind: *kind,
+                rows: Self::output_row_visual_rows(Some(line), *kind, wrap_width),
+            });
+            previous_kind = Some(*kind);
         }
-        for line in &self.error_lines {
-            if let Some(previous) = prev
-                && Self::should_insert_separator(previous, BlockKind::Error)
+
+        for (index, line) in self.error_lines.iter().enumerate() {
+            if previous_kind
+                .is_some_and(|previous| Self::should_insert_separator(previous, BlockKind::Error))
             {
-                visitor(None, BlockKind::Separator, None);
+                entries.push(LayoutEntry {
+                    source: LayoutSource::Separator,
+                    kind: BlockKind::Separator,
+                    rows: 1,
+                });
             }
-            visitor(Some(line), BlockKind::Error, None);
-            prev = Some(BlockKind::Error);
+            entries.push(LayoutEntry {
+                source: LayoutSource::Error(index),
+                kind: BlockKind::Error,
+                rows: Self::output_row_visual_rows(Some(line), BlockKind::Error, wrap_width),
+            });
+            previous_kind = Some(BlockKind::Error);
         }
+
+        let mut offsets = Vec::with_capacity(entries.len());
+        let mut total = 0usize;
+        for entry in &entries {
+            total = total.saturating_add(entry.rows);
+            offsets.push(total);
+        }
+        self.visual_layout_index = VisualLayoutIndex {
+            wrap_width: Some(wrap_width),
+            entries,
+            offsets,
+            dirty: false,
+        };
+        self.cached_visual_rows = total;
+        self.cached_wrap_width = Some(wrap_width);
+    }
+
+    fn ensure_visual_layout_index(&mut self, wrap_width: usize) {
+        if !self.visual_layout_index.is_valid_for(wrap_width) {
+            self.rebuild_visual_layout_index(wrap_width);
+        }
+    }
+
+    fn visible_output_window(
+        &mut self,
+        wrap_width: usize,
+        scroll_y: usize,
+        content_height: usize,
+    ) -> (usize, usize, usize) {
+        self.ensure_visual_layout_index(wrap_width);
+        if self.visual_layout_index.entries.is_empty() {
+            return (0, 0, 0);
+        }
+        self.visual_layout_index.locate(scroll_y, content_height)
+    }
+
+    fn rebuild_visual_row_cache(&mut self, wrap_width: usize) {
+        self.rebuild_visual_layout_index(wrap_width);
     }
 
     fn output_row_visual_rows(
@@ -2928,52 +3009,34 @@ impl App {
         if self.scroll_mode != ScrollMode::Manual || self.output_lines.is_empty() {
             return None;
         }
-
-        let total_rows = self.output_visual_rows(wrap_width);
+        self.ensure_visual_layout_index(wrap_width);
+        let total_rows = self.visual_layout_index.total_rows();
         let scroll_y = self.resolved_scroll_y_for(total_rows, self.last_content_height);
-        let mut rows_before = 0usize;
-        let mut previous_kind = None;
-
-        for (index, (line, kind)) in self
-            .output_lines
-            .iter()
-            .zip(self.output_line_kinds.iter())
-            .enumerate()
-        {
-            let separator_before = previous_kind
-                .is_some_and(|previous| Self::should_insert_separator(previous, *kind));
-            if separator_before {
-                if scroll_y == rows_before {
-                    let text = Self::line_to_string(line);
-                    return Some(ManualViewportAnchor {
-                        output_index: index,
-                        row_offset: 0,
-                        separator_before: true,
-                        normalized_text: Self::normalize_viewport_anchor_text(&text),
-                        text,
-                        scroll_y,
-                    });
-                }
-                rows_before = rows_before.saturating_add(1);
-            }
-
-            let row_count = Self::output_row_visual_rows(Some(line), *kind, wrap_width);
-            if scroll_y < rows_before.saturating_add(row_count) {
-                let text = Self::line_to_string(line);
-                return Some(ManualViewportAnchor {
-                    output_index: index,
-                    row_offset: scroll_y.saturating_sub(rows_before),
-                    separator_before: false,
-                    normalized_text: Self::normalize_viewport_anchor_text(&text),
-                    text,
-                    scroll_y,
-                });
-            }
-            rows_before = rows_before.saturating_add(row_count);
-            previous_kind = Some(*kind);
+        let (start, _, row_offset) = self.visual_layout_index.locate(scroll_y, 1);
+        let mut entry_index = start;
+        if self.visual_layout_index.entries[start].source == LayoutSource::Separator {
+            entry_index = entry_index.saturating_add(1);
         }
-
-        None
+        let entry = self.visual_layout_index.entries.get(entry_index)?;
+        let LayoutSource::Output(output_index) = entry.source else {
+            return None;
+        };
+        let line = self.output_lines.get(output_index)?;
+        let separator_before = entry_index > 0
+            && self.visual_layout_index.entries[entry_index - 1].source
+                == LayoutSource::Separator;
+        Some(ManualViewportAnchor {
+            output_index,
+            row_offset: if separator_before && entry_index != start {
+                0
+            } else {
+                row_offset
+            },
+            separator_before,
+            normalized_text: Self::normalize_viewport_anchor_text(&Self::line_to_string(line)),
+            text: Self::line_to_string(line),
+            scroll_y,
+        })
     }
 
     fn scroll_offset_for_manual_anchor(
@@ -2981,37 +3044,27 @@ impl App {
         anchor: &ManualViewportAnchor,
         wrap_width: usize,
     ) -> Option<usize> {
-        let mut rows_before = 0usize;
-        let mut previous_kind = None;
-
-        for (index, (line, kind)) in self
-            .output_lines
-            .iter()
-            .zip(self.output_line_kinds.iter())
-            .enumerate()
-        {
-            let separator_before = previous_kind
-                .is_some_and(|previous| Self::should_insert_separator(previous, *kind));
-            if index == anchor.output_index {
-                if anchor.separator_before && separator_before {
-                    return Some(rows_before);
-                }
-                let line_start = rows_before.saturating_add(separator_before as usize);
-                let line_rows = Self::output_row_visual_rows(Some(line), *kind, wrap_width);
-                return Some(
-                    line_start.saturating_add(anchor.row_offset.min(line_rows.saturating_sub(1))),
-                );
-            }
-            rows_before = rows_before.saturating_add(separator_before as usize);
-            rows_before = rows_before.saturating_add(Self::output_row_visual_rows(
-                Some(line),
-                *kind,
-                wrap_width,
-            ));
-            previous_kind = Some(*kind);
+        if !self.visual_layout_index.is_valid_for(wrap_width) {
+            return None;
         }
-
-        None
+        let (entry_index, entry) = self
+            .visual_layout_index
+            .entries
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.source == LayoutSource::Output(anchor.output_index))?;
+        let line_start = self.visual_layout_index.entry_start(entry_index);
+        let separator_before = entry_index > 0
+            && self.visual_layout_index.entries[entry_index - 1].source
+                == LayoutSource::Separator;
+        if anchor.separator_before && separator_before {
+            return Some(line_start.saturating_sub(1));
+        }
+        Some(line_start.saturating_add(
+            anchor
+                .row_offset
+                .min(entry.rows.saturating_sub(separator_before as usize).saturating_sub(1)),
+        ))
     }
 
     fn restore_manual_viewport_anchor(
@@ -3022,6 +3075,7 @@ impl App {
         if self.scroll_mode != ScrollMode::Manual {
             return false;
         }
+        self.ensure_visual_layout_index(wrap_width);
         let Some(offset) = self.scroll_offset_for_manual_anchor(anchor, wrap_width) else {
             return false;
         };
@@ -3053,20 +3107,24 @@ impl App {
         start_idx: usize,
         take_count: usize,
     ) -> Vec<Line<'static>> {
-        let end_idx = start_idx.saturating_add(take_count);
-        let mut expanded_idx = 0usize;
+        self.ensure_visual_layout_index(self.last_wrap_width());
+        let end_idx = start_idx
+            .saturating_add(take_count)
+            .min(self.visual_layout_index.entries.len());
         let mut visible_lines = Vec::with_capacity(take_count);
         let mut hyperlink_targets = Vec::new();
-        self.for_each_output_row(|line, kind| {
-            if expanded_idx >= start_idx && expanded_idx < end_idx {
-                visible_lines.push(Self::output_row_for_render(
-                    line,
-                    kind,
-                    &mut hyperlink_targets,
-                ));
-            }
-            expanded_idx = expanded_idx.saturating_add(1);
-        });
+        for entry in &self.visual_layout_index.entries[start_idx..end_idx] {
+            let line = match entry.source {
+                LayoutSource::Output(index) => self.output_lines.get(index),
+                LayoutSource::Error(index) => self.error_lines.get(index),
+                LayoutSource::Separator => None,
+            };
+            visible_lines.push(Self::output_row_for_render(
+                line,
+                entry.kind,
+                &mut hyperlink_targets,
+            ));
+        }
         self.rendered_hyperlink_targets = hyperlink_targets;
         visible_lines
     }
@@ -3077,30 +3135,30 @@ impl App {
         take_count: usize,
         visible_scroll_y: usize,
         content_height: usize,
-        wrap_width: usize,
+        _wrap_width: usize,
     ) -> Vec<Option<SelectionRowSource>> {
-        let end_idx = start_idx.saturating_add(take_count);
-        let mut expanded_idx = 0usize;
+        let end_idx = start_idx
+            .saturating_add(take_count)
+            .min(self.visual_layout_index.entries.len());
         let mut skipped_rows = visible_scroll_y;
         let mut row_sources = Vec::with_capacity(content_height);
-        self.for_each_output_row_with_index(|line, kind, output_line_index| {
-            if expanded_idx >= start_idx && expanded_idx < end_idx {
-                let row_count = Self::output_row_visual_rows(line, kind, wrap_width);
-                for row_in_line in 0..row_count {
-                    if skipped_rows > 0 {
-                        skipped_rows -= 1;
-                    } else if row_sources.len() < content_height {
-                        row_sources.push(output_line_index.map(|output_line_index| {
-                            SelectionRowSource {
+        for entry in &self.visual_layout_index.entries[start_idx..end_idx] {
+            for row_in_line in 0..entry.rows {
+                if skipped_rows > 0 {
+                    skipped_rows -= 1;
+                } else if row_sources.len() < content_height {
+                    row_sources.push(match entry.source {
+                        LayoutSource::Output(output_line_index) => {
+                            Some(SelectionRowSource {
                                 output_line_index,
                                 row_in_line,
-                            }
-                        }));
-                    }
+                            })
+                        }
+                        LayoutSource::Error(_) | LayoutSource::Separator => None,
+                    });
                 }
             }
-            expanded_idx = expanded_idx.saturating_add(1);
-        });
+        }
         row_sources.resize(content_height, None);
         row_sources
     }
@@ -3166,10 +3224,20 @@ impl App {
     }
 
     fn total_visual_rows(&mut self, wrap_width: usize) -> usize {
-        if self.cached_wrap_width != Some(wrap_width) {
-            self.rebuild_visual_row_cache(wrap_width);
+        // Preserve the lightweight cached total used by callers that supply a
+        // precomputed transcript size without materializing transcript lines.
+        // Normal transcript mutations invalidate the layout index and rebuild
+        // it from the actual buffers below.
+        if self.output_lines.is_empty()
+            && self.error_lines.is_empty()
+            && self.cached_wrap_width == Some(wrap_width)
+            && self.cached_visual_rows > 0
+            && self.visual_layout_index.wrap_width.is_none()
+        {
+            return self.cached_visual_rows;
         }
-        self.cached_visual_rows
+        self.ensure_visual_layout_index(wrap_width);
+        self.visual_layout_index.total_rows()
     }
 
     fn output_visual_rows(&mut self, wrap_width: usize) -> usize {
@@ -5013,6 +5081,23 @@ mod tests {
             scroll_y <= 3,
             "local scroll offset should stay within the viewport"
         );
+    }
+
+    #[test]
+    fn test_visible_output_window_zero_height_stays_on_transcript_tail() {
+        let mut app = App::new();
+        app.set_content_width(20);
+        app.push_plain("first");
+        app.push_plain("last");
+
+        let wrap_width = app.last_wrap_width();
+        let total_rows = app.total_visual_rows(wrap_width);
+        let (start_idx, take_count, row_offset) =
+            app.visible_output_window(wrap_width, total_rows, 0);
+
+        assert_eq!(start_idx, app.output_lines.len() - 1);
+        assert_eq!(take_count, 1);
+        assert_eq!(row_offset, 0);
     }
 
     #[test]
