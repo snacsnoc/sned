@@ -291,8 +291,8 @@ impl ScrollbackWriter {
             .send(ScrollbackCommand::Clear(sender))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "scrollback writer stopped"))?;
         receiver
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "scrollback writer stopped"))?
+            .recv_timeout(WRITER_RESPONSE_TIMEOUT)
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "scrollback clear timed out"))?
     }
 
     fn take_error(&self) -> Option<String> {
@@ -7834,6 +7834,33 @@ mod tests {
         app.clear_scrollback_storage().unwrap();
 
         assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn test_scrollback_clear_times_out_when_writer_does_not_respond() {
+        let (sender, receiver) = std_mpsc::channel();
+        let (error_sender, errors) = std_mpsc::channel();
+        let (release_sender, release_receiver) = std_mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            if let Ok(ScrollbackCommand::Clear(_response)) = receiver.recv() {
+                let _ = release_receiver.recv();
+            }
+        });
+        let writer = ScrollbackWriter {
+            path: PathBuf::from("unused"),
+            sender,
+            errors,
+            handle: Some(handle),
+        };
+
+        let started = Instant::now();
+        let error = writer.clear().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        release_sender.send(()).unwrap();
+        writer.handle.unwrap().join().unwrap();
+        drop(error_sender);
     }
 
     #[test]
