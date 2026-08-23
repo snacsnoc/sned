@@ -1355,7 +1355,7 @@ impl AgentLoop {
                                 .hook_manager
                                 .as_ref()
                                 .map(std::convert::AsRef::as_ref),
-                            &state_manager,
+                            Arc::clone(&state_manager),
                             &self.config.task_id,
                             Some(&self.anchor_mgr),
                         )

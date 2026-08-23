@@ -82,7 +82,7 @@ impl CancellationHandler {
     pub async fn abort_task(
         &self,
         hook_manager: Option<&HookManager>,
-        state_manager: &StateManager,
+        state_manager: Arc<StateManager>,
         task_id: &str,
         anchor_mgr: Option<&crate::core::file_editor::AnchorStateManager>,
     ) -> Result<(), CancellationError> {
@@ -153,7 +153,7 @@ impl CancellationHandler {
         }
 
         // 5. Save state immediately (force save)
-        if let Err(e) = state_manager.persist() {
+        if let Err(e) = StateManager::persist_async(state_manager).await {
             tracing::warn!("Failed to persist state on cancellation: {}", e);
             return Err(CancellationError::StateError(e.to_string()));
         }
@@ -369,7 +369,7 @@ mod tests {
         assert!(!handler.is_cancelled().await);
 
         let result = handler
-            .abort_task(None, &state_manager, "test-task", None)
+            .abort_task(None, Arc::new(state_manager), "test-task", None)
             .await;
         assert!(
             result.is_ok(),
@@ -419,7 +419,7 @@ mod tests {
         let state_manager = crate::storage::state_manager::StateManager::new().unwrap();
 
         let result = handler
-            .abort_task(None, &state_manager, "test-task", None)
+            .abort_task(None, Arc::new(state_manager), "test-task", None)
             .await;
         assert!(
             result.is_ok(),
