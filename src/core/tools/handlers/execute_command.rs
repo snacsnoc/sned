@@ -923,6 +923,46 @@ impl ExecuteCommandHandler {
                                     let _ = child.kill().await;
                                 }
                                 let _ = child.wait().await;
+
+                                // The process group may have buffered output
+                                // before it was killed. Drain both pipes with
+                                // a bound so timeout errors retain all output
+                                // that is available without hanging on a
+                                // descendant that inherited a pipe.
+                                let mut stdout_done = false;
+                                let mut stderr_done = false;
+                                let drain = async {
+                                    while !stdout_done || !stderr_done {
+                                        tokio::select! {
+                                            result = stdout_reader.next_line(), if !stdout_done => {
+                                                match result {
+                                                    Ok(Some(line)) => append_limited_output(
+                                                        &mut stdout_collected,
+                                                        &line.into_text("stdout"),
+                                                        collect_limit,
+                                                        &mut stdout_collect_truncated,
+                                                        &mut stdout_total_bytes,
+                                                    ),
+                                                    Ok(None) | Err(_) => stdout_done = true,
+                                                }
+                                            }
+                                            result = stderr_reader.next_line(), if !stderr_done => {
+                                                match result {
+                                                    Ok(Some(line)) => append_limited_output(
+                                                        &mut stderr_collected,
+                                                        &line.into_text("stderr"),
+                                                        collect_limit,
+                                                        &mut stderr_collect_truncated,
+                                                        &mut stderr_total_bytes,
+                                                    ),
+                                                    Ok(None) | Err(_) => stderr_done = true,
+                                                }
+                                            }
+                                        }
+                                    }
+                                };
+                                let _ = timeout(Duration::from_secs(1), drain).await;
+
                                 #[cfg(unix)]
                                 if child_pid != 0
                                     && let Some(ref state) = task_state
@@ -2008,6 +2048,29 @@ mod tests {
             state.running_command_pids.is_empty(),
             "timed-out command PID should be removed from cancellation tracking"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_commands_timeout_retains_buffered_output() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+
+        let result = handler
+            .execute_commands_with_timeout(
+                vec!["printf 'before-timeout\\n'; sleep 5".to_string()],
+                None,
+                Some(Duration::from_millis(100)),
+                false,
+                None,
+                None,
+                false,
+                &output_writer,
+            )
+            .await;
+
+        let err = result.expect_err("command should time out").to_string();
+        assert!(err.contains("before-timeout"), "timeout output: {err}");
     }
 
     #[tokio::test]
