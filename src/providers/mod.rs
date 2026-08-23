@@ -809,7 +809,11 @@ pub fn tool_arguments_error(value: &serde_json::Value) -> Option<&str> {
     value.as_object()?.get(TOOL_ARGUMENTS_ERROR_FIELD)?.as_str()
 }
 
-fn repair_json_args(args: &str) -> String {
+/// Repair common model-produced JSON defects in a structured argument value.
+///
+/// This is also used for legacy tool fields that carry JSON inside a string,
+/// such as `edit_file.files`.
+pub(crate) fn repair_json_args(args: &str) -> String {
     let trimmed = args.trim();
 
     let json_start = find_json_start(trimmed);
