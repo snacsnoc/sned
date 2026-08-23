@@ -510,7 +510,8 @@ impl EditFileHandler {
         Ok(())
     }
 
-    fn mark_must_reread(state: &mut TaskState, path: &str) {
+    async fn mark_must_reread(state: &Arc<Mutex<TaskState>>, path: &str) {
+        let mut state = state.lock().await;
         state.must_reread_before_edit.insert(path.to_string());
         state.file_content_cache.pop(path);
         state.consecutive_reads.remove(path);
@@ -563,7 +564,7 @@ impl EditFileHandler {
 impl EditFileHandler {
     async fn execute_with_workspace_root(
         &self,
-        state: &mut TaskState,
+        state: &Arc<Mutex<TaskState>>,
         params: serde_json::Value,
         workspace_root: &Path,
         allowed_external_roots: &[std::path::PathBuf],
@@ -667,7 +668,12 @@ impl EditFileHandler {
 
         // Phase 1: Prepare all batches and collect diff previews
         for batch in batches {
-            if state.must_reread_before_edit.contains(&batch.absolute_path) {
+            if state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&batch.absolute_path)
+            {
                 return Err(Self::reread_required_error(
                     &batch.display_path,
                     &batch.absolute_path,
@@ -677,12 +683,15 @@ impl EditFileHandler {
             // Acquire exclusive file lock to prevent concurrent edits
             let _file_guard = FileEditGuard::acquire(&batch.absolute_path).await;
 
-            let stale_warning = state
-                .file_context_tracker
-                .check_stale(Path::new(&batch.absolute_path))
-                .await;
+            let stale_warning = {
+                let mut state_guard = state.lock().await;
+                state_guard
+                    .file_context_tracker
+                    .check_stale(Path::new(&batch.absolute_path))
+                    .await
+            };
             if stale_warning.is_some() {
-                Self::mark_must_reread(state, &batch.absolute_path);
+                Self::mark_must_reread(state, &batch.absolute_path).await;
                 return Err(Self::external_modification_error(
                     &batch.display_path,
                     &batch.absolute_path,
@@ -690,11 +699,14 @@ impl EditFileHandler {
             }
 
             // Warn if editing a file not read this session
-            if !json_output
-                && !state
+            let was_read_this_session = {
+                state
+                    .lock()
+                    .await
                     .file_context_tracker
                     .was_read_this_session(&batch.display_path)
-            {
+            };
+            if !json_output && !was_read_this_session {
                 use crate::cli::output::OutputEvent;
                 use crate::cli::tui::theme::WARNING_FG;
                 use ratatui::style::Style;
@@ -707,7 +719,12 @@ impl EditFileHandler {
                 ));
             }
 
-            let expected_content = state.file_content_cache.get(&batch.absolute_path).cloned();
+            let expected_content = state
+                .lock()
+                .await
+                .file_content_cache
+                .get(&batch.absolute_path)
+                .cloned();
             if expected_content.is_some() {
                 match tokio::fs::symlink_metadata(&batch.absolute_path).await {
                     Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => {}
@@ -769,7 +786,7 @@ impl EditFileHandler {
                 .as_ref()
                 .is_some_and(|expected| expected != &raw_content)
             {
-                Self::mark_must_reread(state, &batch.absolute_path);
+                Self::mark_must_reread(state, &batch.absolute_path).await;
                 return Err(Self::external_modification_error(
                     &batch.display_path,
                     &batch.absolute_path,
@@ -781,6 +798,8 @@ impl EditFileHandler {
 
             // Track file read for stale context detection
             state
+                .lock()
+                .await
                 .file_context_tracker
                 .track_file_read(Path::new(&batch.absolute_path));
 
@@ -811,7 +830,7 @@ impl EditFileHandler {
                     }
                 }
                 if !stale_anchors.is_empty() {
-                    Self::mark_must_reread(state, &batch.absolute_path);
+                    Self::mark_must_reread(state, &batch.absolute_path).await;
                     let mut msg = String::from(
                         "Stale anchor detected: this anchor is from a previous read_file call. \
                          The file has changed since then. Call read_file to refresh anchors.\n\n",
@@ -840,7 +859,7 @@ impl EditFileHandler {
                 Ok(p) => p,
                 Err(e) => {
                     if matches!(e, FileEditorError::AllEditsFailed { .. }) {
-                        Self::mark_must_reread(state, &batch.absolute_path);
+                        Self::mark_must_reread(state, &batch.absolute_path).await;
                     }
                     all_results.push(format!(
                         "Error preparing edits for {}: {}",
@@ -1006,7 +1025,7 @@ impl EditFileHandler {
                 processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
 
             if !prepared.failed_edits.is_empty() {
-                Self::mark_must_reread(state, &batch.absolute_path);
+                Self::mark_must_reread(state, &batch.absolute_path).await;
             }
 
             if result.success {
@@ -1124,7 +1143,7 @@ impl EditFileHandler {
                             rollback_errors.push(format!("Failed to rollback {path}: {re}"));
                         }
                     }
-                    Self::mark_must_reread(state, &item.absolute_path);
+                    Self::mark_must_reread(state, &item.absolute_path).await;
                     if !rollback_errors.is_empty() {
                         return Err(ToolError::ExecutionFailed(format!(
                             "Failed to lock file {}: {}. Rollback incomplete: {}",
@@ -1155,7 +1174,7 @@ impl EditFileHandler {
 
                 if !mtime_ok {
                     let _ = std_file.unlock();
-                    Self::mark_must_reread(state, &item.absolute_path);
+                    Self::mark_must_reread(state, &item.absolute_path).await;
                     return Err(Self::external_modification_error(
                         &item.display_path,
                         &item.absolute_path,
@@ -1172,6 +1191,7 @@ impl EditFileHandler {
 
                 match write_result {
                     Ok(()) => {
+                        let mut state = state.lock().await;
                         state.insert_file_content(
                             item.absolute_path.clone(),
                             item.final_content.clone(),
@@ -1226,6 +1246,7 @@ impl EditFileHandler {
             }
 
             if file_result.had_success && file_result.applied_count > 0 {
+                let mut state = state.lock().await;
                 let entry = state
                     .session_file_changes
                     .entry(file_result.batch_absolute_path.clone())
@@ -1249,10 +1270,13 @@ impl EditFileHandler {
         }
 
         for path in &write_failed_paths {
-            Self::mark_must_reread(state, path);
+            Self::mark_must_reread(state, path).await;
         }
-        for item in &write_items {
-            state.consecutive_reads.remove(&item.absolute_path);
+        {
+            let mut state = state.lock().await;
+            for item in &write_items {
+                state.consecutive_reads.remove(&item.absolute_path);
+            }
         }
 
         if write_failed_paths.is_empty()
@@ -1517,10 +1541,33 @@ impl ToolHandler for EditFileHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            let mut state = ctx.state.lock().await;
+            let parsed_files = params
+                .get("files")
+                .and_then(|files| files.as_array().cloned().or_else(|| {
+                    files
+                        .as_str()
+                        .and_then(|value| serde_json::from_str(value).ok())
+                }));
+            let mut requested_paths = parsed_files
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if requested_paths.is_empty()
+                && let Some(path) = params.get("path").and_then(|path| path.as_str())
+            {
+                requested_paths.push(path.to_string());
+            }
+            let resolved_paths = requested_paths
+                .iter()
+                .filter_map(|path| ctx.resolve_path(path).ok())
+                .collect::<Vec<_>>();
+            let _file_locks = ctx.lock_file_paths(&resolved_paths).await;
             let result = handler
                 .execute_with_workspace_root(
-                    &mut state,
+                    &ctx.state,
                     params,
                     ctx.workspace_root.as_path(),
                     &ctx.allowed_external_roots,

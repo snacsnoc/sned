@@ -296,6 +296,16 @@ impl FileContextTracker {
     /// Records the file operation in the metadata and persists to disk if `task_id` is set.
     #[allow(clippy::unused_async)]
     pub async fn track_file_context(&mut self, path: &str, source: FileRecordSource) {
+        self.track_file_context_in_memory(path, source);
+        self.save_to_storage();
+    }
+
+    /// Record a file operation without performing synchronous persistence.
+    ///
+    /// Callers holding a shared task-state lock should use this method, copy
+    /// `files_in_context`, release the lock, and persist the snapshot outside
+    /// the critical section.
+    pub fn track_file_context_in_memory(&mut self, path: &str, source: FileRecordSource) {
         self.add_file_to_file_context_tracker(path, source);
         // Also track for mtime-based stale detection
         // Use canonicalize for existing files, but fall back to original path for
@@ -355,7 +365,6 @@ impl FileContextTracker {
         }
 
         self.files_in_context.push(new_entry);
-        self.save_to_storage();
     }
 
     /// Persist the current file context metadata to disk, if task_id is set.

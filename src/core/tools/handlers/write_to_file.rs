@@ -239,6 +239,10 @@ impl ToolHandler for WriteToFileHandler {
                 .to_string();
             let lines_added = content.lines().count() as u32;
 
+            // Keep reads and edits from observing this file while it is being
+            // written. The guard remains held through the state update below.
+            let _file_locks = ctx.lock_file_paths(std::slice::from_ref(&resolved_path)).await;
+
             if content.is_empty() {
                 let mut state = ctx.state.lock().await;
                 state.consecutive_mistakes += 1;
@@ -260,17 +264,19 @@ impl ToolHandler for WriteToFileHandler {
                 .await;
             match result {
                 Ok(_) => {
-                    {
+                    let file_context_metadata = {
                         let mut state = ctx.state.lock().await;
                         state.consecutive_mistakes = 0;
-                        // Track newly created file to suppress "not read this session" warning on subsequent edits
+                        // Update in memory while holding the state lock, but
+                        // defer the synchronous metadata write until after it
+                        // is released.
                         state
                             .file_context_tracker
-                            .track_file_context(
+                            .track_file_context_in_memory(
                                 &resolved_path.to_string_lossy(),
                                 crate::core::context::trackers::FileRecordSource::SnedEdited,
                             )
-                            .await;
+                            ;
                         // Mark file as edited by Sned to suppress stale mtime detection
                         state
                             .file_context_tracker
@@ -284,7 +290,16 @@ impl ToolHandler for WriteToFileHandler {
                                 action: "created".to_string(),
                             });
                         entry.lines_added = entry.lines_added.saturating_add(lines_added);
-                    }
+                        state.file_context_tracker.files_in_context().to_vec()
+                    };
+                    let task_id = ctx.task_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(storage) = crate::storage::task_storage::TaskStorage::new(&task_id)
+                        {
+                            let _ = storage.save_file_context_metadata(&file_context_metadata);
+                        }
+                    })
+                    .await;
                     if let Some(symbol_index_service) = &handler.symbol_index_service {
                         crate::services::symbol_index::index_file_after_write(
                             Arc::clone(symbol_index_service),

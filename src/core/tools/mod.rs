@@ -188,6 +188,11 @@ impl ToolRegistry {
 #[derive(Clone)]
 pub struct ToolContext {
     pub state: Arc<Mutex<TaskState>>,
+    /// Lock-free cancellation flag shared with long-running tool handlers.
+    pub cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-task path locks prevent reads and writes of the same file from racing.
+    file_operation_locks:
+        Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub approval_manager: Option<Arc<Mutex<ApprovalManager>>>,
     pub workspace_root: PathBuf,
     /// Canonical external directory roots authorized for this tool invocation.
@@ -220,6 +225,8 @@ impl ToolContext {
     ) -> Self {
         Self {
             state,
+            cancellation_flag: None,
+            file_operation_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             approval_manager,
             workspace_root,
             allowed_external_roots: Vec::new(),
@@ -231,6 +238,53 @@ impl ToolContext {
             session_command_scope_approved: false,
             output_writer,
         }
+    }
+
+    /// Attach the task's lock-free cancellation flag to this context.
+    #[must_use]
+    pub fn with_cancellation_flag(
+        mut self,
+        cancellation_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.cancellation_flag = Some(cancellation_flag);
+        self
+    }
+
+    /// Acquire all requested file locks in sorted order.
+    ///
+    /// Sorting prevents two multi-file operations from deadlocking while they
+    /// acquire overlapping path sets in different model-supplied orders.
+    pub async fn lock_file_paths(
+        &self,
+        paths: &[PathBuf],
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut keys: Vec<String> = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        keys.sort();
+        keys.dedup();
+
+        let locks: Vec<Arc<tokio::sync::Mutex<()>>> = {
+            let mut registry = self
+                .file_operation_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            keys.into_iter()
+                .map(|key| {
+                    registry
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                        .clone()
+                })
+                .collect()
+        };
+
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        guards
     }
 
     /// Resolve a path under the workspace or an external directory that was
@@ -770,6 +824,37 @@ mod tests {
         let params = serde_json::json!({});
         let result = coerce_string_array(&params, "paths", "path");
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_file_operation_locks_serialize_shared_paths() {
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            PathBuf::from("/workspace"),
+            AnchorStateManager::new(),
+            true,
+            "lock-test".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let path = PathBuf::from("/workspace/src/main.rs");
+        let guard = ctx.lock_file_paths(std::slice::from_ref(&path)).await;
+        let waiting_ctx = ctx.clone();
+        let mut waiting = tokio::spawn(async move {
+            let _guard = waiting_ctx.lock_file_paths(&[path]).await;
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "a second operation should wait for the shared path lock"
+        );
+        drop(guard);
+        waiting.await.unwrap();
     }
 
     #[cfg(unix)]

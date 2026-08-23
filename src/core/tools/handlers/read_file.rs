@@ -813,6 +813,12 @@ impl ToolHandler for ReadFileHandler {
                 .collect();
             let paths = sanitized?;
 
+            // Serialize reads with concurrent edits/writes of the same paths.
+            // The guards live through the read and state update below.
+            let _file_locks = ctx
+                .lock_file_paths(&paths.iter().map(std::path::PathBuf::from).collect::<Vec<_>>())
+                .await;
+
             let results = handler
                 .read_files_with_display_paths(
                     paths.clone(),
