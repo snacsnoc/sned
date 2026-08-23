@@ -236,6 +236,19 @@ impl SymbolIndexService {
         self.record_index_update(high_water_mtime);
     }
 
+    fn remove_missing_files(&mut self, existing_paths: &HashSet<String>) {
+        self.files.retain(|path, _| existing_paths.contains(path));
+        if let Some(ref mut db) = self.db
+            && let Err(error) = db.remove_missing_files(existing_paths)
+        {
+            tracing::warn!(%error, "symbol index failed to remove deleted files");
+        }
+        self.status.indexed_file_count = self.db.as_ref().map_or(
+            self.files.len(),
+            db::SymbolIndexDatabase::indexed_file_count,
+        );
+    }
+
     pub fn get_symbols(
         &self,
         symbol: &str,
@@ -334,6 +347,11 @@ impl SymbolIndexService {
             .is_some_and(|db| db.indexed_file_count() > 0)
     }
 
+    fn mark_persisted_index_ready(&mut self) {
+        self.status.workspace_file_count = self.status.indexed_file_count;
+        self.status.initial_walk_complete = true;
+    }
+
     fn begin_initial_walk(&mut self, workspace_file_count: usize) {
         self.status.workspace_file_count = workspace_file_count;
         self.status.indexed_file_count = 0;
@@ -362,6 +380,20 @@ pub fn start_initial_walk(service: Arc<Mutex<SymbolIndexService>>) {
         service.get_project_root().to_string()
     };
 
+    {
+        let mut service = service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if service.has_usable_persisted_index() {
+            service.mark_persisted_index_ready();
+            tracing::debug!(
+                root = %project_root,
+                files = service.status.indexed_file_count,
+                "using persisted symbol index; startup refresh is deferred"
+            );
+        }
+    }
+
     if !SYMBOL_INDEX_REFRESHING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -373,28 +405,41 @@ pub fn start_initial_walk(service: Arc<Mutex<SymbolIndexService>>) {
     let refresh_guard = SymbolIndexRefreshGuard {
         project_root: project_root.clone(),
     };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn_blocking(move || {
-                let _refresh_guard = refresh_guard;
-                let started = Instant::now();
-                let result = run_initial_walk(&service, Path::new(&project_root));
-                if let Err(error) = result {
-                    tracing::warn!(root = %project_root, %error, "symbol index initial walk failed");
-                }
-                let files = service
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .status()
-                    .indexed_file_count;
-                tracing::info!(root = %project_root, files, elapsed_ms = started.elapsed().as_millis(), "symbol index initial walk indexed files");
-            });
-        }
-        Err(error) => {
-            drop(refresh_guard);
-            tracing::warn!(%error, "symbol index walk was not started outside a Tokio runtime");
-        }
+    let thread_name = format!("sned-symbol-index-{}", sanitize_thread_name(&project_root));
+    let refresh_root = project_root.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let _refresh_guard = refresh_guard;
+            let started = Instant::now();
+            let result = run_initial_walk(&service, Path::new(&refresh_root));
+            if let Err(error) = result {
+                tracing::warn!(root = %refresh_root, %error, "symbol index initial walk failed");
+            }
+            let files = service
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status()
+                .indexed_file_count;
+            tracing::info!(root = %refresh_root, files, elapsed_ms = started.elapsed().as_millis(), "symbol index initial walk indexed files");
+        })
+    {
+        tracing::warn!(root = %project_root, %error, "symbol index walk thread was not started");
     }
+}
+
+fn sanitize_thread_name(project_root: &str) -> String {
+    project_root
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect()
 }
 
 pub async fn index_file_after_write(
@@ -507,6 +552,14 @@ fn run_initial_walk(
         }
     }
     flush_elapsed += flush_initial_batch(service, &mut pending);
+    let candidate_paths = candidates
+        .iter()
+        .map(|candidate| candidate.relative_path.clone())
+        .collect::<HashSet<_>>();
+    service
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove_missing_files(&candidate_paths);
     tracing::debug!(
         candidates = candidates.len(),
         candidate_walk_ms,
@@ -915,6 +968,48 @@ mod tests {
     }
 
     #[test]
+    fn test_persisted_index_reconciles_deleted_workspace_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        let source = temp.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn removed_symbol() {}\n").unwrap();
+
+        let first = Arc::new(Mutex::new(
+            SymbolIndexService::new(temp.path().to_string_lossy().into_owned())
+                .with_persistence()
+                .unwrap(),
+        ));
+        run_initial_walk(&first, temp.path()).unwrap();
+        assert_eq!(
+            first.lock().unwrap().get_definitions("removed_symbol", None).len(),
+            1
+        );
+        drop(first);
+
+        std::fs::remove_file(source).unwrap();
+        let reconciled = Arc::new(Mutex::new(
+            SymbolIndexService::new(temp.path().to_string_lossy().into_owned())
+                .with_persistence()
+                .unwrap(),
+        ));
+        run_initial_walk(&reconciled, temp.path()).unwrap();
+
+        assert!(
+            reconciled
+                .lock()
+                .unwrap()
+                .get_definitions("removed_symbol", None)
+                .is_empty(),
+            "reconciliation must prune symbols for deleted files"
+        );
+    }
+
+    #[test]
     fn test_non_git_root_finishes_without_walking() {
         let temp = tempfile::tempdir().unwrap();
         let service = Arc::new(Mutex::new(SymbolIndexService::new(
@@ -943,6 +1038,18 @@ mod tests {
 
         assert_eq!(status.workspace_file_count, 3);
         assert_eq!(status.indexed_file_count, 1);
+    }
+
+    #[test]
+    fn test_persisted_index_is_ready_before_workspace_refresh() {
+        let mut service = SymbolIndexService::new("/tmp/test".to_string());
+        service.status.indexed_file_count = 42;
+
+        service.mark_persisted_index_ready();
+
+        let status = service.status();
+        assert!(status.initial_walk_complete);
+        assert_eq!(status.workspace_file_count, 42);
     }
 
     #[test]

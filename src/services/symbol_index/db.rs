@@ -1,5 +1,6 @@
 use crate::services::symbol_index::{SymbolLocation, SymbolType};
 use rusqlite::{Connection, params};
+use std::collections::HashSet;
 
 const SCHEMA: &str = "
 PRAGMA foreign_keys = ON;
@@ -145,6 +146,33 @@ impl SymbolIndexDatabase {
         self.conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .unwrap_or(0)
+    }
+
+    /// Remove entries for files that were present in a previous workspace
+    /// snapshot but are absent from the current reconciliation walk.
+    pub fn remove_missing_files(&mut self, existing_paths: &HashSet<String>) -> rusqlite::Result<()> {
+        let mut statement = self.conn.prepare("SELECT path FROM files")?;
+        let indexed_paths = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let removed_paths: Vec<_> = indexed_paths
+            .into_iter()
+            .filter(|path| !existing_paths.contains(path))
+            .collect();
+        if removed_paths.is_empty() {
+            return Ok(());
+        }
+
+        let transaction = self.conn.transaction()?;
+        for path in removed_paths {
+            transaction.execute("DELETE FROM symbols WHERE file_path = ?1", params![path])?;
+            transaction.execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        }
+        transaction.commit()?;
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn latest_file_mtime(&self) -> Option<u64> {
