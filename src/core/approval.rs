@@ -1045,6 +1045,13 @@ impl ApprovalManager {
             return true;
         }
 
+        // Reading files inside the workspace is always non-destructive and
+        // must not enter the interactive approval path. External reads keep
+        // the boundary above so they still require explicit authorization.
+        if category == ToolCategory::ReadFiles && is_local {
+            return false;
+        }
+
         if self.auto_approve_all {
             return false;
         }
@@ -1142,12 +1149,21 @@ impl ApprovalManager {
                 path
             };
 
-            let p = Path::new(path);
             let r = Path::new(root);
+
+            // Relative tool paths are workspace-relative. Resolving them
+            // against the process cwd incorrectly classified `AGENTS.md` as
+            // external whenever Sned was launched from elsewhere.
+            let p = Path::new(path);
+            let workspace_path = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                r.join(p)
+            };
 
             // Normalize both paths by resolving . and .. components
             let mut normalized_path = std::path::PathBuf::new();
-            for component in p.components() {
+            for component in workspace_path.components() {
                 match component {
                     std::path::Component::ParentDir => {
                         normalized_path.pop();
@@ -2939,6 +2955,18 @@ mod tests {
         );
         // External read with read_files_externally=false: prompt
         assert!(manager.should_prompt_with_path(SnedTool::ReadFile, Some("/etc/hosts"),));
+    }
+
+    #[test]
+    fn test_relative_workspace_read_is_local_and_never_prompts() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "rules").unwrap();
+        let manager = ApprovalManager::new()
+            .with_workspace_root(workspace.path().to_string_lossy().into_owned());
+
+        assert!(!manager.should_prompt_with_path(SnedTool::ReadFile, Some("AGENTS.md")));
+        assert!(!manager.should_prompt_with_path(SnedTool::ReadFile, Some("./AGENTS.md")));
+        assert!(manager.should_prompt_with_path(SnedTool::ReadFile, Some("/etc/hosts")));
     }
 
     #[test]

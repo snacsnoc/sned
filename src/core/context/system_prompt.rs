@@ -1,7 +1,7 @@
 //! System prompt construction for sned CLI.
 //!
 
-use super::instructions::{SkillMetadata, SkillSource};
+use super::instructions::{RuleToggles, SkillMetadata, SkillSource};
 
 // ============================================================================
 // System Prompt Context
@@ -24,6 +24,8 @@ pub struct SystemPromptContext {
     pub local_cursor_rules_dir_instructions: Option<String>,
     pub local_windsurf_rules_file_instructions: Option<String>,
     pub local_agents_rules_file_instructions: Option<String>,
+    /// Rule toggles used for path-scoped AGENTS.md discovery after startup.
+    pub local_agents_rule_toggles: RuleToggles,
     pub enable_parallel_tool_calling: bool,
     pub user_instructions: Option<String>,
     pub sned_rules: Option<String>,

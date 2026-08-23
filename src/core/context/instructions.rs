@@ -1,138 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tracing;
-
-const AGENTS_CACHE_TTL_SECS: u64 = 300;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedAgentFile {
-    path: String,
-    modified_nanos: u128,
-    size: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedAgentDirectory {
-    path: String,
-    modified_nanos: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentsCache {
-    scanned_at_secs: u64,
-    files: Vec<CachedAgentFile>,
-    directories: Option<Vec<CachedAgentDirectory>>,
-}
-
-fn agents_cache_path(cwd: &Path) -> PathBuf {
-    use sha2::{Digest, Sha256};
-
-    let key = cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cwd.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    let digest = Sha256::digest(key.as_bytes());
-    let name = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    crate::storage::disk::get_state_dir()
-        .join("agents-cache")
-        .join(format!("{name}.json"))
-}
-
-fn file_modified_nanos(path: &Path) -> Option<u128> {
-    path.metadata()
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_nanos())
-}
-
-fn cached_agents_files(cwd: &Path) -> Option<Vec<PathBuf>> {
-    let cache_path = agents_cache_path(cwd);
-    let cache: AgentsCache = serde_json::from_str(&fs::read_to_string(cache_path).ok()?).ok()?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    if now.saturating_sub(cache.scanned_at_secs) > AGENTS_CACHE_TTL_SECS {
-        return None;
-    }
-
-    // Directory mtimes change when entries are added or removed. Checking the
-    // cached directory set lets us detect a newly created nested AGENTS.md
-    // without repeating the full recursive walk on every startup.
-    let Some(directories) = cache.directories.as_ref() else {
-        return None;
-    };
-    if directories
-        .iter()
-        .any(|cached| file_modified_nanos(Path::new(&cached.path)) != Some(cached.modified_nanos))
-    {
-        return None;
-    }
-
-    let files = cache
-        .files
-        .iter()
-        .filter_map(|cached| {
-            let path = PathBuf::from(&cached.path);
-            let metadata = path.metadata().ok()?;
-            let modified_nanos = file_modified_nanos(&path)?;
-            (metadata.is_file()
-                && modified_nanos == cached.modified_nanos
-                && metadata.len() == cached.size)
-                .then_some(path)
-        })
-        .collect::<Vec<_>>();
-    (files.len() == cache.files.len()).then_some(files)
-}
-
-fn save_agents_cache(cwd: &Path, files: &[PathBuf], directories: &[PathBuf]) {
-    let Some(scanned_at_secs) = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_secs())
-    else {
-        return;
-    };
-    let cache = AgentsCache {
-        scanned_at_secs,
-        files: files
-            .iter()
-            .filter_map(|path| {
-                Some(CachedAgentFile {
-                    path: path.to_string_lossy().into_owned(),
-                    modified_nanos: file_modified_nanos(path)?,
-                    size: path.metadata().ok()?.len(),
-                })
-            })
-            .collect(),
-        directories: Some(
-            directories
-                .iter()
-                .filter_map(|path| {
-                    Some(CachedAgentDirectory {
-                        path: path.to_string_lossy().into_owned(),
-                        modified_nanos: file_modified_nanos(path)?,
-                    })
-                })
-                .collect(),
-        ),
-    };
-    let path = agents_cache_path(cwd);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(contents) = serde_json::to_string(&cache) {
-        let _ = fs::write(path, contents);
-    }
-}
 
 /// Rule toggles: maps rule file path to enabled/disabled state
 pub type RuleToggles = HashMap<String, bool>;
@@ -217,107 +89,225 @@ pub struct SkillSupportingFiles {
     pub scripts: Vec<String>,
 }
 
-/// Scan directory for AGENTS.md files recursively.
-/// Only searches if a top-level AGENTS.md file exists.
-/// Uses ignore::WalkBuilder for .gitignore-aware filtering and skips common heavy directories.
+/// A readable AGENTS.md file discovered for a path-scoped target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRuleFile {
+    pub path: PathBuf,
+    pub content: String,
+}
+
+/// Check only the workspace-root AGENTS.md file.
 #[must_use]
 pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
     let started = Instant::now();
     let top_level = cwd.join("AGENTS.md");
-    if !top_level.exists() {
-        return Vec::new();
-    }
-
-    if let Some(results) = cached_agents_files(cwd) {
-        tracing::debug!(
-            count = results.len(),
-            elapsed_ms = started.elapsed().as_millis(),
-            "reused cached AGENTS.md discovery"
-        );
-        return results;
-    }
-
-    let mut results = Vec::new();
-    let mut directories = Vec::new();
-
-    // Use ignore::WalkBuilder for .gitignore-aware filtering
-    // This automatically respects .gitignore and skips .git/, node_modules/, target/, etc.
-    let walker = ignore::WalkBuilder::new(cwd)
-        .standard_filters(true) // Enable standard .gitignore filters
-        .build();
-
-    for entry in walker.flatten() {
-        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-            directories.push(entry.path().to_path_buf());
-            continue;
-        }
-        if entry.file_type().is_some_and(|ft| ft.is_file())
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md"))
-        {
-            results.push(entry.path().to_path_buf());
-        }
-    }
-    save_agents_cache(cwd, &results, &directories);
+    let results = top_level
+        .metadata()
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|_| vec![top_level.clone()])
+        .unwrap_or_default();
     tracing::debug!(
-        count = results.len(),
+        workspace = %cwd.display(),
+        discovered_files = ?results,
         elapsed_ms = started.elapsed().as_millis(),
-        "completed AGENTS.md discovery"
+        "loaded root AGENTS.md rules"
     );
     results
 }
 
-/// Read and combine all agents.md files into formatted instructions
-pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<String> {
-    let top_level = cwd.join("AGENTS.md");
-    let top_level_str = top_level.to_string_lossy().to_string();
+fn resolve_target_path(workspace_root: &Path, target: &Path) -> Option<PathBuf> {
+    let workspace_root = fs::canonicalize(workspace_root).ok()?;
+    let raw_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        workspace_root.join(target)
+    };
 
-    // Check if top-level file is explicitly disabled
-    if matches!(toggles.get(&top_level_str), Some(false)) {
-        return None;
+    // Canonicalize the nearest existing ancestor and restore any missing path
+    // components. This keeps relative paths and `..` components within the
+    // same path scope even when a write target has not been created yet.
+    let mut existing = raw_target.clone();
+    let mut missing_components = Vec::new();
+    while !existing.exists() {
+        missing_components.push(existing.file_name()?.to_os_string());
+        existing = existing.parent()?.to_path_buf();
+    }
+    let mut resolved = fs::canonicalize(existing).ok()?;
+    for component in missing_components.iter().rev() {
+        resolved.push(component);
     }
 
-    let agents_md_files = find_agents_md_files(cwd);
-    if agents_md_files.is_empty() {
-        return None;
-    }
+    resolved.starts_with(&workspace_root).then_some(resolved)
+}
 
-    let mut parts = Vec::new();
-    for file_path in agents_md_files {
-        let file_str = file_path.to_string_lossy().to_string();
+/// Inspect AGENTS.md files on the target's ancestor chain, from workspace root
+/// to the nearest directory. This performs only direct metadata checks.
+#[must_use]
+pub fn find_path_scoped_agents_md_files(workspace_root: &Path, target: &Path) -> Vec<PathBuf> {
+    let started = Instant::now();
+    let Some(workspace_root) = fs::canonicalize(workspace_root).ok() else {
+        tracing::debug!(
+            workspace = %workspace_root.display(),
+            target = %target.display(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "path-scoped AGENTS.md discovery could not resolve workspace"
+        );
+        return Vec::new();
+    };
+    let Some(resolved_target) = resolve_target_path(&workspace_root, target) else {
+        tracing::debug!(
+            workspace = %workspace_root.display(),
+            target = %target.display(),
+            discovered_files = ?Vec::<PathBuf>::new(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "path-scoped AGENTS.md discovery skipped target outside workspace"
+        );
+        return Vec::new();
+    };
 
-        // Skip if disabled
-        if matches!(toggles.get(&file_str), Some(false)) {
-            continue;
+    let mut directory = if resolved_target.is_dir() {
+        resolved_target.clone()
+    } else {
+        resolved_target
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| workspace_root.clone())
+    };
+    let mut files = Vec::new();
+
+    loop {
+        let candidate = directory.join("AGENTS.md");
+        if candidate
+            .metadata()
+            .ok()
+            .is_some_and(|metadata| metadata.is_file())
+        {
+            files.push(candidate);
         }
+        if directory == workspace_root {
+            break;
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        directory = parent.to_path_buf();
+    }
+    files.reverse();
 
-        match fs::read_to_string(&file_path) {
-            Ok(content) => {
-                let content = content.trim();
-                if !content.is_empty() {
-                    let relative = file_path.strip_prefix(cwd).unwrap_or(&file_path);
-                    parts.push(format!("## {}\n\n{}", relative.display(), content));
+    tracing::debug!(
+        workspace = %workspace_root.display(),
+        target = %target.display(),
+        resolved_target = %resolved_target.display(),
+        discovered_files = ?files,
+        elapsed_ms = started.elapsed().as_millis(),
+        "loaded path-scoped AGENTS.md rules"
+    );
+    files
+}
+
+fn load_agent_rule_files(
+    files: impl IntoIterator<Item = PathBuf>,
+    toggles: &RuleToggles,
+) -> Vec<AgentRuleFile> {
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let path_str = path.to_string_lossy().to_string();
+            let canonical_path_str = fs::canonicalize(&path)
+                .ok()
+                .map(|canonical| canonical.to_string_lossy().into_owned());
+            let canonical_toggle_disabled = canonical_path_str.as_ref().is_some_and(|canonical| {
+                toggles.iter().any(|(configured_path, enabled)| {
+                    !enabled
+                        && fs::canonicalize(configured_path)
+                            .ok()
+                            .is_some_and(|configured| {
+                                configured.to_string_lossy().as_ref() == canonical.as_str()
+                            })
+                })
+            });
+            if matches!(toggles.get(&path_str), Some(false))
+                || canonical_path_str
+                    .as_ref()
+                    .is_some_and(|canonical| matches!(toggles.get(canonical), Some(false)))
+                || canonical_toggle_disabled
+            {
+                return None;
+            }
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    let content = content.trim().to_string();
+                    if content.is_empty() {
+                        None
+                    } else {
+                        check_injection_patterns(&content, &path_str);
+                        Some(AgentRuleFile { path, content })
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "failed to read AGENTS.md file");
+                    None
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read agents.md file at {}: {}",
-                    file_path.display(),
-                    e
-                );
-            }
-        }
-    }
+        })
+        .collect()
+}
 
-    if parts.is_empty() {
+fn format_agent_rule_files(cwd: &Path, files: &[AgentRuleFile]) -> Option<String> {
+    if files.is_empty() {
         return None;
     }
-
+    let parts = files
+        .iter()
+        .map(|file| {
+            let relative = file
+                .path
+                .strip_prefix(cwd)
+                .ok()
+                .map(Path::to_path_buf)
+                .or_else(|| {
+                    cwd.canonicalize()
+                        .ok()
+                        .and_then(|canonical| file.path.strip_prefix(canonical).ok())
+                        .map(Path::to_path_buf)
+                })
+                .unwrap_or_else(|| file.path.clone());
+            format!("## {}\n\n{}", relative.display(), file.content)
+        })
+        .collect::<Vec<_>>();
     let combined = parts.join("\n\n");
     check_injection_patterns(&combined, "AGENTS.md");
     Some(format!("# AGENTS.md Rules\n\n{combined}"))
+}
+
+/// Read and combine only the workspace-root AGENTS.md file.
+pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<String> {
+    format_agent_rule_files(cwd, &load_agent_rule_files(find_agents_md_files(cwd), toggles))
+}
+
+/// Read applicable AGENTS.md files for one explicit file or directory target.
+/// Results are ordered from workspace root to the nearest ancestor.
+#[must_use]
+pub fn load_path_scoped_agents_rules(
+    workspace_root: &Path,
+    target: &Path,
+    toggles: &RuleToggles,
+) -> Vec<AgentRuleFile> {
+    load_agent_rule_files(find_path_scoped_agents_md_files(workspace_root, target), toggles)
+}
+
+/// Format path-scoped AGENTS.md rules for callers that need the complete chain.
+#[must_use]
+pub fn get_path_scoped_agents_rules(
+    workspace_root: &Path,
+    target: &Path,
+    toggles: &RuleToggles,
+) -> Option<String> {
+    format_agent_rule_files(
+        workspace_root,
+        &load_path_scoped_agents_rules(workspace_root, target, toggles),
+    )
 }
 
 /// Read local windsurf rules file
@@ -845,7 +835,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_find_agents_md_files_no_top_level() {
+    fn test_find_agents_md_files_reads_only_root_file() {
         let temp = TempDir::new().unwrap();
         let cwd = temp.path();
 
@@ -855,14 +845,11 @@ mod tests {
         fs::write(&nested, "nested").unwrap();
 
         let files = find_agents_md_files(cwd);
-        assert!(
-            files.is_empty(),
-            "Should not search recursively without top-level AGENTS.md"
-        );
+        assert!(files.is_empty(), "Nested rules are path-scoped, not startup rules");
     }
 
     #[test]
-    fn test_find_agents_md_files_with_top_level() {
+    fn test_find_agents_md_files_does_not_traverse_nested_directories() {
         let temp = TempDir::new().unwrap();
         let cwd = temp.path();
 
@@ -875,11 +862,11 @@ mod tests {
         fs::write(&nested, "nested").unwrap();
 
         let files = find_agents_md_files(cwd);
-        assert_eq!(files.len(), 2);
+        assert_eq!(files, vec![cwd.join("AGENTS.md")]);
     }
 
     #[test]
-    fn test_find_agents_md_files_invalidates_changed_cache_entry() {
+    fn test_find_agents_md_files_reads_current_root_content_without_cache() {
         let temp = TempDir::new().unwrap();
         let cwd = temp.path();
         let top_level = cwd.join("AGENTS.md");
@@ -896,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_agents_md_files_invalidates_cache_when_nested_file_is_added() {
+    fn test_path_scoped_discovery_finds_nested_file_created_after_startup() {
         let temp = TempDir::new().unwrap();
         let cwd = temp.path();
         fs::write(cwd.join("AGENTS.md"), "top-level").unwrap();
@@ -906,11 +893,18 @@ mod tests {
         assert_eq!(find_agents_md_files(cwd).len(), 1);
         fs::write(nested.join("AGENTS.md"), "nested rules").unwrap();
 
-        assert_eq!(find_agents_md_files(cwd).len(), 2);
+        let files = find_path_scoped_agents_md_files(cwd, &nested.join("file.rs"));
+        assert_eq!(
+            files,
+            vec![
+                cwd.join("AGENTS.md").canonicalize().unwrap(),
+                nested.join("AGENTS.md").canonicalize().unwrap()
+            ]
+        );
     }
 
     #[test]
-    fn test_find_agents_md_files_deep_nesting() {
+    fn test_path_scoped_discovery_preserves_root_to_nearest_precedence() {
         let temp = TempDir::new().unwrap();
         let cwd = temp.path();
 
@@ -922,13 +916,34 @@ mod tests {
         fs::create_dir_all(deep_path.parent().unwrap()).unwrap();
         fs::write(&deep_path, "deep-nested").unwrap();
 
-        let files = find_agents_md_files(cwd);
+        let files = find_path_scoped_agents_md_files(cwd, &deep_path.join("file.rs"));
         assert_eq!(
             files.len(),
             2,
             "Should discover both top-level and deeply nested AGENTS.md"
         );
         assert!(files.iter().any(|f| f.file_name().unwrap() == "AGENTS.md"));
+    }
+
+    #[test]
+    fn test_path_scoped_discovery_includes_nested_without_root_and_excludes_siblings() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path();
+        let src_rules = cwd.join("src/AGENTS.md");
+        let tests_rules = cwd.join("tests/AGENTS.md");
+        fs::create_dir_all(src_rules.parent().unwrap()).unwrap();
+        fs::create_dir_all(tests_rules.parent().unwrap()).unwrap();
+        fs::write(&src_rules, "src rules").unwrap();
+        fs::write(&tests_rules, "tests rules").unwrap();
+
+        let files = load_path_scoped_agents_rules(
+            cwd,
+            &cwd.join("src/new/deep/main.rs"),
+            &RuleToggles::new(),
+        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, src_rules.canonicalize().unwrap());
+        assert_eq!(files[0].content, "src rules");
     }
 
     #[test]
@@ -1249,18 +1264,28 @@ mod tests {
         fs::create_dir_all(nested.parent().unwrap()).unwrap();
         fs::write(&nested, "nested rules").unwrap();
 
-        // With all toggles enabled
+        // Startup loads only the root file.
         let rules = get_local_agents_rules(cwd, &RuleToggles::new());
         assert!(rules.is_some());
         let rules_str = rules.unwrap();
         assert!(rules_str.contains("top-level rules"));
-        assert!(rules_str.contains("nested rules"));
+        assert!(!rules_str.contains("nested rules"));
+
+        let scoped = get_path_scoped_agents_rules(cwd, &nested.join("file.rs"), &RuleToggles::new())
+            .unwrap();
+        assert!(scoped.contains("top-level rules"));
+        assert!(scoped.contains("nested rules"));
 
         // With top-level disabled
         let mut toggles = RuleToggles::new();
         toggles.insert(cwd.join("AGENTS.md").to_string_lossy().to_string(), false);
         let rules = get_local_agents_rules(cwd, &toggles);
         assert!(rules.is_none());
+
+        let scoped = get_path_scoped_agents_rules(cwd, &nested.join("file.rs"), &toggles)
+            .unwrap();
+        assert!(!scoped.contains("top-level rules"));
+        assert!(scoped.contains("nested rules"));
     }
 
     #[test]

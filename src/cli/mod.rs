@@ -1711,6 +1711,11 @@ async fn build_task_components(
         enable_parallel_tool_calling,
         skills,
         local_agents_rules_file_instructions: agents_rules,
+        local_agents_rule_toggles: state_manager
+            .get_global_state_key(
+                crate::storage::state_manager::GlobalStateKey::GlobalSnedRulesToggles,
+            )
+            .unwrap_or_default(),
         local_cursor_rules_file_instructions: cursor_rules_file,
         local_cursor_rules_dir_instructions: cursor_rules_dir,
         local_windsurf_rules_file_instructions: windsurf_rules,

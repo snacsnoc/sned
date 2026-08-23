@@ -11,10 +11,15 @@
 //! - Checkpoints are created before each tool turn that may modify files.
 //! - Restore resets the working directory to a previous checkpoint state.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// A checkpoint is a safety feature, never a reason to leave the agent stuck
+/// indefinitely behind a stalled filesystem or Git subprocess.
+const CHECKPOINT_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Tracks workspace state via a shadow git repository.
 #[derive(Clone)]
@@ -183,14 +188,14 @@ impl CheckpointTracker {
 
     /// Get the current HEAD commit hash.
     pub fn get_head_commit(&self) -> Result<Option<String>, CheckpointError> {
-        let output = Command::new("git")
-            .args([
+        let mut command = Command::new("git");
+        command.args([
                 "--git-dir",
                 self.shadow_git_path.to_str().unwrap_or("."),
                 "rev-parse",
                 "HEAD",
-            ])
-            .output()
+            ]);
+        let output = Self::run_git_command_with_timeout(&mut command)
             .map_err(|e| CheckpointError::CommandFailed(format!("git rev-parse failed: {e}")))?;
 
         if !output.status.success() {
@@ -289,10 +294,9 @@ impl CheckpointTracker {
 
     /// Run a git command and return an error if it fails.
     fn run_git_cmd(git_dir: &Path, args: &[&str]) -> Result<(), CheckpointError> {
-        let output = Command::new("git")
-            .current_dir(git_dir)
-            .args(args.iter().copied())
-            .output()
+        let mut command = Command::new("git");
+        command.current_dir(git_dir).args(args.iter().copied());
+        let output = Self::run_git_command_with_timeout(&mut command)
             .map_err(|e| CheckpointError::CommandFailed(format!("git command failed: {e}")))?;
 
         if !output.status.success() {
@@ -304,6 +308,47 @@ impl CheckpointTracker {
         }
 
         Ok(())
+    }
+
+    /// Run Git with a hard wall-clock deadline. Tokio timeouts alone are not
+    /// sufficient here because this work is run in `spawn_blocking`; dropping
+    /// that future would leave the Git child alive and racing a later snapshot.
+    fn run_git_command_with_timeout(command: &mut Command) -> io::Result<Output> {
+        Self::run_command_with_timeout(command, CHECKPOINT_GIT_TIMEOUT)
+    }
+
+    fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let started = Instant::now();
+
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "git checkpoint command exceeded {} seconds",
+                        timeout.as_secs_f64()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            pipe.read_to_end(&mut stdout)?;
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            pipe.read_to_end(&mut stderr)?;
+        }
+        Ok(Output { status, stdout, stderr })
     }
 
     /// Run a git command with --git-dir and --work-tree set.
@@ -583,6 +628,20 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_checkpoint_command_timeout_kills_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+
+        let error = CheckpointTracker::run_command_with_timeout(
+            &mut command,
+            Duration::from_millis(25),
+        )
+        .expect_err("checkpoint command should time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]

@@ -25,10 +25,12 @@ pub use context_manager::{
 };
 pub use context_window::get_context_window_info;
 pub use instructions::{
-    RuleToggles, SkillContent, SkillMetadata, SkillSource, SkillSupportingFiles,
-    combine_rule_toggles, discover_skills, find_agents_md_files, get_available_skills,
-    get_local_agents_rules, get_local_cursor_rules, get_local_windsurf_rules, get_skill_content,
-    list_supporting_files, scan_skills_directory, synchronize_rule_toggles,
+    AgentRuleFile, RuleToggles, SkillContent, SkillMetadata, SkillSource, SkillSupportingFiles,
+    combine_rule_toggles, discover_skills, find_agents_md_files,
+    find_path_scoped_agents_md_files, get_available_skills, get_local_agents_rules,
+    get_local_cursor_rules, get_local_windsurf_rules, get_path_scoped_agents_rules,
+    get_skill_content, list_supporting_files, load_path_scoped_agents_rules,
+    scan_skills_directory, synchronize_rule_toggles,
 };
 pub use model_detect::is_qwen_model;
 pub use system_prompt::{PromptBuilder, SystemPromptContext};

@@ -40,9 +40,9 @@ use futures::future::FutureExt;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hasher;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc};
@@ -443,6 +443,7 @@ struct AgentLoopDeps {
     registry: Option<Arc<ToolRegistry>>,
     system_prompt_context: Option<SystemPromptContext>,
     cached_system_prompt: Option<String>,
+    loaded_agents_rule_paths: HashSet<String>,
     context_loader: Option<crate::core::context::ContextLoader>,
     task_storage: Option<TaskStorage>,
     hook_manager: Option<Arc<crate::core::hooks::HookManager>>,
@@ -461,6 +462,7 @@ impl AgentLoopDeps {
             registry: None,
             system_prompt_context: None,
             cached_system_prompt: None,
+            loaded_agents_rule_paths: HashSet::new(),
             context_loader: None,
             task_storage: None,
             hook_manager: None,
@@ -1026,6 +1028,36 @@ impl AgentLoop {
     /// Set the system prompt context.
     #[must_use]
     pub fn with_system_prompt_context(mut self, context: SystemPromptContext) -> Self {
+        self.deps.loaded_agents_rule_paths.clear();
+        if let Some(cwd) = context.cwd.as_deref() {
+            let root_rule = Path::new(cwd).join("AGENTS.md");
+            let canonical_root_rule = root_rule
+                .canonicalize()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+            if root_rule
+                .metadata()
+                .ok()
+                .is_some_and(|metadata| metadata.is_file())
+                && !matches!(
+                    context
+                        .local_agents_rule_toggles
+                        .get(&root_rule.to_string_lossy().to_string()),
+                    Some(false)
+                )
+                && !canonical_root_rule.as_ref().is_some_and(|path| {
+                    matches!(context.local_agents_rule_toggles.get(path), Some(false))
+                })
+                && context.local_agents_rules_file_instructions.is_some()
+            {
+                self.deps
+                    .loaded_agents_rule_paths
+                    .insert(root_rule.to_string_lossy().into_owned());
+                if let Some(canonical_root_rule) = canonical_root_rule {
+                    self.deps.loaded_agents_rule_paths.insert(canonical_root_rule);
+                }
+            }
+        }
         self.deps.system_prompt_context = Some(context);
         self.deps.cached_system_prompt = None;
         self
@@ -1759,7 +1791,7 @@ impl AgentLoop {
         let tool_context = Arc::new(ToolContext::new(
             self.state.clone(),
             self.deps.approval_manager.clone(),
-            workspace_root,
+            workspace_root.clone(),
             self.anchor_mgr.clone(),
             self.config.json_output,
             self.config.task_id.clone(),
@@ -2763,6 +2795,15 @@ impl AgentLoop {
 
         let prepared_tool_calls = Self::prepare_tool_calls(&tool_call_order, &mut tool_calls_map);
 
+        // Discover applicable rules before any tool-path-related early return.
+        // A second pass after execution below catches AGENTS.md files created
+        // by a write in this same tool batch.
+        let scoped_rules_added = if prepared_tool_calls.is_empty() {
+            false
+        } else {
+            self.discover_agents_rules_for_tool_calls(&workspace_root, &prepared_tool_calls)
+        };
+
         // 5. Check for empty response
         // Log what we received from the model
         tracing::info!(
@@ -2939,11 +2980,23 @@ impl AgentLoop {
             }
         }
 
-        // 7. Save checkpoint before executing tools (if checkpoint manager is configured)
-        if !prepared_tool_calls.is_empty()
+        // 7. Save a checkpoint only before a batch that can change the workspace.
+        // Read-only turns used to run `git add --all` and `git commit` here too,
+        // which can take minutes on a large or remote workspace and prevented the
+        // first tool result from being emitted.
+        let checkpoint_required = prepared_tool_calls.iter().any(|prepared| {
+            SnedTool::from_name(&prepared.tool_name).is_some_and(Self::tool_may_modify_workspace)
+        });
+        if checkpoint_required
             && let Some(ref mut checkpoint_mgr) = self.deps.checkpoint_manager
         {
+            let checkpoint_started = std::time::Instant::now();
+            tracing::debug!("saving checkpoint before mutating tool batch");
             checkpoint_mgr.save_checkpoint().await;
+            tracing::debug!(
+                elapsed_ms = checkpoint_started.elapsed().as_millis(),
+                "saved checkpoint before mutating tool batch"
+            );
         }
 
         // Provider tool-call order must remain stable even when independent work overlaps.
@@ -2995,6 +3048,7 @@ impl AgentLoop {
 
             for prepared in &prepared_tool_calls {
                 let tool_name = prepared.tool_name.clone();
+                tracing::debug!(tool = %tool_name, "preparing tool execution");
 
                 // Skip tool calls with empty names (malformed provider response)
                 if tool_name.is_empty() {
@@ -3018,6 +3072,29 @@ impl AgentLoop {
                     }
                 };
 
+                // A write/edit generated without the applicable nested rules
+                // must not run under an incomplete prompt. The rules have now
+                // been loaded, so return a retryable tool result and let the
+                // next provider request make the informed decision.
+                if scoped_rules_added && Self::is_mutating_file_tool(&tool_name) {
+                    tracing::debug!(
+                        tool = %tool_name,
+                        "deferred mutating file tool until scoped AGENTS.md rules are visible"
+                    );
+                    tool_tasks.push((
+                        tool_id,
+                        tool_name,
+                        Some(ToolExecutionOutput::error(
+                            "Scoped AGENTS.md rules were loaded for this path. Retry the file operation so the updated instructions are applied.".to_string(),
+                            None,
+                        )),
+                        None,
+                        vec![],
+                        tool_params,
+                    ));
+                    continue;
+                }
+
                 let immediate_output = if let Some(tool) = SnedTool::from_name(&tool_name) {
                     // Reject tools that are not in the active profile so the model
                     // cannot call tools its current profile has filtered out.
@@ -3027,11 +3104,12 @@ impl AgentLoop {
                         .is_some_and(|p| !p.tools().contains(&tool));
 
                     // Check plan mode restrictions
-                    let is_restricted = {
+                    let is_restricted = if self.config.mode == AgentMode::Plan {
+                        tracing::debug!(tool = %tool_name, "checking plan-mode restriction");
                         let state = self.state.lock().await;
-                        self.config.mode == AgentMode::Plan
-                            && state.strict_plan_mode_enabled
-                            && Self::is_plan_mode_restricted(tool)
+                        state.strict_plan_mode_enabled && Self::is_plan_mode_restricted(tool)
+                    } else {
+                        false
                     };
 
                     if profile_denied {
@@ -3064,6 +3142,7 @@ impl AgentLoop {
                             &action_paths,
                         );
                         let params_fingerprint = Self::tool_params_fingerprint(&tool_params);
+                        tracing::debug!(tool = %tool_name, "checking prior tool denial");
                         let previously_denied = {
                             let state = self.state.lock().await;
                             state
@@ -3093,7 +3172,9 @@ impl AgentLoop {
                             let approval_result = if let Some(ref approval_mgr) =
                                 self.deps.approval_manager
                             {
+                                tracing::debug!(tool = %tool_name, "waiting for approval manager");
                                 let mgr = approval_mgr.lock().await;
+                                tracing::debug!(tool = %tool_name, "acquired approval manager");
                                 allowed_external_roots = mgr.external_directory_grants_for(
                                     tool.category(),
                                     &external_directories,
@@ -3997,6 +4078,13 @@ impl AgentLoop {
             }
         }
 
+        // Discover instruction files only for explicit file/directory targets.
+        // This runs after tool execution so a newly created nested AGENTS.md is
+        // available to the next provider request.
+        if !prepared_tool_calls.is_empty() {
+            self.discover_agents_rules_for_tool_calls(&workspace_root, &prepared_tool_calls);
+        }
+
         // 8. Save conversation history after each turn
         self.save_conversation_history().await;
 
@@ -4325,6 +4413,104 @@ impl AgentLoop {
             }
             _ => vec![],
         }
+    }
+
+    /// Load AGENTS.md files for explicit file-oriented tool targets so the
+    /// following provider request sees the rules governing the work just
+    /// inspected or changed.
+    fn is_mutating_file_tool(tool_name: &str) -> bool {
+        matches!(
+            SnedTool::from_name(tool_name),
+            Some(
+                SnedTool::WriteToFile
+                    | SnedTool::EditFile
+                    | SnedTool::ReplaceSymbol
+                    | SnedTool::RenameSymbol
+            )
+        )
+    }
+
+    /// Whether a tool can modify the workspace and therefore needs a rollback
+    /// checkpoint before it starts. Read-only tools must never wait for a full
+    /// workspace Git snapshot.
+    fn tool_may_modify_workspace(tool: SnedTool) -> bool {
+        matches!(tool.category(), crate::core::tools::ToolCategory::EditFiles)
+            || matches!(tool, SnedTool::ExecuteCommand | SnedTool::UseSubagents)
+    }
+
+    fn discover_agents_rules_for_tool_calls(
+        &mut self,
+        workspace_root: &Path,
+        prepared_tool_calls: &[PreparedToolCall],
+    ) -> bool {
+        let mut targets = HashSet::new();
+        for prepared in prepared_tool_calls {
+            let Some(tool) = SnedTool::from_name(&prepared.tool_name) else {
+                continue;
+            };
+            let Ok(params) = &prepared.parsed_args else {
+                continue;
+            };
+            targets.extend(Self::extract_action_path(tool, params));
+        }
+        if targets.is_empty() {
+            return false;
+        }
+
+        let toggles = self
+            .deps
+            .system_prompt_context
+            .as_ref()
+            .map(|context| context.local_agents_rule_toggles.clone())
+            .unwrap_or_default();
+        let mut additions = Vec::new();
+        for target in targets {
+            for rule_file in crate::core::context::load_path_scoped_agents_rules(
+                workspace_root,
+                Path::new(&target),
+                &toggles,
+            ) {
+                let key = rule_file.path.to_string_lossy().into_owned();
+                if self.deps.loaded_agents_rule_paths.insert(key) {
+                    additions.push(rule_file);
+                }
+            }
+        }
+        if additions.is_empty() {
+            return false;
+        }
+
+        let context = self
+            .deps
+            .system_prompt_context
+            .get_or_insert_with(|| SystemPromptContext {
+                cwd: Some(workspace_root.to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        let rules = context
+            .local_agents_rules_file_instructions
+            .get_or_insert_with(|| "# AGENTS.md Rules".to_string());
+        let canonical_workspace_root = workspace_root.canonicalize().ok();
+        for rule_file in &additions {
+            let relative = rule_file
+                .path
+                .strip_prefix(workspace_root)
+                .ok()
+                .or_else(|| {
+                    canonical_workspace_root
+                        .as_deref()
+                        .and_then(|root| rule_file.path.strip_prefix(root).ok())
+                })
+                .unwrap_or(&rule_file.path);
+            rules.push_str(&format!("\n\n## {}\n\n{}", relative.display(), rule_file.content));
+        }
+        self.deps.cached_system_prompt = None;
+        tracing::debug!(
+            workspace = %workspace_root.display(),
+            discovered_files = ?additions.iter().map(|file| &file.path).collect::<Vec<_>>(),
+            "added newly discovered path-scoped AGENTS.md rules and invalidated system prompt"
+        );
+        true
     }
 
     fn external_action_directories(
@@ -7028,6 +7214,103 @@ Irrespective of whether additional information or instructions are given, you ar
         // Environment info like CWD is now in context_loader, not system prompt
         assert!(requests[0].system_prompt.contains("You are Sned"));
         assert!(requests[0].system_prompt.contains("PRIME DIRECTIVES"));
+    }
+
+    #[test]
+    fn test_tool_path_discovery_merges_rules_once_and_ignores_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("AGENTS.md"), "root rule").unwrap();
+        std::fs::create_dir_all(root.join("src/frontend")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("src/AGENTS.md"), "src rule").unwrap();
+        std::fs::write(root.join("src/frontend/AGENTS.md"), "frontend rule").unwrap();
+        std::fs::write(root.join("tests/AGENTS.md"), "tests rule").unwrap();
+
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("done"),
+        ));
+        let root_rules = crate::core::context::get_local_agents_rules(
+            root,
+            &crate::core::context::RuleToggles::new(),
+        );
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-path-rules"))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(root.to_string_lossy().into_owned()),
+                local_agents_rules_file_instructions: root_rules,
+                ..Default::default()
+            });
+        let prepared = PreparedToolCall {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call-1".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: Some("tool-1".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments: Some(r#"{"paths":["src/frontend/main.rs"]}"#.to_string()),
+                },
+                signature: None,
+            },
+            tool_id: "tool-1".to_string(),
+            tool_name: "read_file".to_string(),
+            parsed_args: Ok(serde_json::json!({"paths": ["src/frontend/main.rs"]})),
+        };
+
+        agent.discover_agents_rules_for_tool_calls(root, &[prepared]);
+        let context = agent.deps.system_prompt_context.as_ref().unwrap();
+        let rules = context
+            .local_agents_rules_file_instructions
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(rules.contains("root rule"));
+        assert!(rules.contains("src rule"));
+        assert!(rules.contains("frontend rule"));
+        assert!(!rules.contains("tests rule"));
+
+        agent.deps.cached_system_prompt = Some("cached".to_string());
+        let prepared = PreparedToolCall {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call-2".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: Some("tool-2".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments: Some(r#"{"paths":["src/frontend/main.rs"]}"#.to_string()),
+                },
+                signature: None,
+            },
+            tool_id: "tool-2".to_string(),
+            tool_name: "read_file".to_string(),
+            parsed_args: Ok(serde_json::json!({"paths": ["src/frontend/main.rs"]})),
+        };
+        agent.discover_agents_rules_for_tool_calls(root, &[prepared]);
+        assert_eq!(agent.deps.cached_system_prompt.as_deref(), Some("cached"));
+        assert_eq!(
+            rules.matches("## src/AGENTS.md").count(),
+            1,
+            "repeated access must not duplicate rules"
+        );
+    }
+
+    #[test]
+    fn test_new_scoped_rules_defer_mutating_file_tools() {
+        assert!(AgentLoop::is_mutating_file_tool("write_to_file"));
+        assert!(AgentLoop::is_mutating_file_tool("edit_file"));
+        assert!(AgentLoop::is_mutating_file_tool("replace_symbol"));
+        assert!(AgentLoop::is_mutating_file_tool("rename_symbol"));
+        assert!(!AgentLoop::is_mutating_file_tool("read_file"));
+        assert!(!AgentLoop::is_mutating_file_tool("list_files"));
+        assert!(!AgentLoop::is_mutating_file_tool("execute_command"));
+    }
+
+    #[test]
+    fn test_checkpointing_is_limited_to_workspace_mutations() {
+        assert!(!AgentLoop::tool_may_modify_workspace(SnedTool::ReadFile));
+        assert!(!AgentLoop::tool_may_modify_workspace(SnedTool::SearchFiles));
+        assert!(!AgentLoop::tool_may_modify_workspace(SnedTool::WebFetch));
+        assert!(AgentLoop::tool_may_modify_workspace(SnedTool::WriteToFile));
+        assert!(AgentLoop::tool_may_modify_workspace(SnedTool::EditFile));
+        assert!(AgentLoop::tool_may_modify_workspace(SnedTool::ExecuteCommand));
+        assert!(AgentLoop::tool_may_modify_workspace(SnedTool::UseSubagents));
     }
 
     #[test]
