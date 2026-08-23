@@ -135,8 +135,15 @@ impl HookLineFramer {
 
     fn emit(&self, line: String) {
         if let Some(callback) = &self.callback {
-            let mut callback = callback.lock();
-            callback(&line, self.stream);
+            // Streaming callbacks are user/UI code. Never let a slow callback
+            // stop the pipe reader: blocking here can fill the child pipe and
+            // deadlock the hook process. The captured output remains available
+            // for the final hook result even when a live callback is skipped.
+            if let Some(mut callback) = callback.try_lock() {
+                callback(&line, self.stream);
+            } else {
+                tracing::debug!(stream = self.stream, "skipping blocked hook output callback");
+            }
         }
     }
 }
@@ -1098,6 +1105,20 @@ mod tests {
         let lines = lines.lock();
         assert_eq!(lines[0], ("split line".to_string(), "stdout".to_string()));
         assert!(lines[1].0.contains("line exceeded"));
+    }
+
+    #[test]
+    fn test_hook_line_framer_does_not_block_on_busy_callback() {
+        let callback: Arc<Mutex<HookStreamCallback>> =
+            Arc::new(Mutex::new(Box::new(|_: &str, _: &str| {})));
+        let callback_guard = callback.lock();
+        let mut framer = HookLineFramer::new("stdout", Some(callback.clone()));
+
+        let started = std::time::Instant::now();
+        framer.push(b"line\n");
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drop(callback_guard);
     }
 
     #[test]
