@@ -1223,12 +1223,12 @@ fn process_minimax_sse_line(
                     if !id.is_empty()
                         && !name.is_empty()
                         && !completed_tool_call_indices.contains(idx)
-                        && let Some(validated_args) = crate::providers::validate_tool_call_args(
+                    {
+                        let validated_args = crate::providers::validate_tool_call_args(
                             args,
                             "MiniMax",
                             "on finish_reason:tool_calls",
-                        )
-                    {
+                        );
                         completed_tool_call_indices.insert(*idx);
                         try_send_chunk(
                             tx,
@@ -1427,12 +1427,12 @@ impl Provider for MinimaxProvider {
                     if !id.is_empty()
                         && !name.is_empty()
                         && !completed_tool_call_indices.contains(idx)
-                        && let Some(validated_args) = crate::providers::validate_tool_call_args(
+                    {
+                        let validated_args = crate::providers::validate_tool_call_args(
                             args,
                             "MiniMax",
                             "at stream end",
-                        )
-                    {
+                        );
                         try_send_chunk(
                             &tx,
                             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {

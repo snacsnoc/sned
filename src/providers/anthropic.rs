@@ -1083,14 +1083,12 @@ async fn process_anthropic_event(
             }
         },
         AnthropicStreamEvent::ContentBlockStop => {
-            if !last_tool_call.id.is_empty()
-                && !last_tool_call.name.is_empty()
-                && let Some(validated_args) = crate::providers::validate_tool_call_args(
+            if !last_tool_call.id.is_empty() && !last_tool_call.name.is_empty() {
+                let validated_args = crate::providers::validate_tool_call_args(
                     &last_tool_call.arguments,
                     "Anthropic",
                     "at content_block_stop",
-                )
-            {
+                );
                 try_send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {

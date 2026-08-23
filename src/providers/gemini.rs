@@ -601,10 +601,9 @@ fn process_gemini_sse_line(
     // Emit tool calls when we have finish_reason or at stream end
     if last_stop_reason.is_some() && !*response_blocked {
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls.iter() {
-            if !completed_tool_call_ids.contains(call_id)
-                && let Some(validated_args) =
-                    crate::providers::validate_tool_call_args(args, "Gemini", "on finish")
-            {
+            if !completed_tool_call_ids.contains(call_id) {
+                let validated_args =
+                    crate::providers::validate_tool_call_args(args, "Gemini", "on finish");
                 completed_tool_call_ids.insert(call_id.clone());
                 try_send_chunk(
                     tx,
@@ -694,10 +693,9 @@ fn finish_gemini_sse_to_chunks(
     if !response_blocked {
         // Flush accumulated tool calls on stream end.
         for (call_id, (id, name, args, signature)) in accumulated_tool_calls {
-            if !completed_tool_call_ids.contains(call_id)
-                && let Some(validated_args) =
-                    crate::providers::validate_tool_call_args(args, "Gemini", "at stream end")
-            {
+            if !completed_tool_call_ids.contains(call_id) {
+                let validated_args =
+                    crate::providers::validate_tool_call_args(args, "Gemini", "at stream end");
                 completed_tool_call_ids.insert(call_id.clone());
                 try_send_chunk(
                     tx,

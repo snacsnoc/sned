@@ -686,7 +686,14 @@ impl AgentLoop {
             return Ok(serde_json::json!({}));
         }
         match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(parsed) => Ok(parsed),
+            Ok(parsed) => {
+                if let Some(parse_error) = crate::providers::tool_arguments_error(&parsed) {
+                    return Err(format!(
+                        "Tool '{tool_name}' arguments could not be repaired as JSON (id: {tool_id}): {parse_error} Please retry the same tool call with valid JSON arguments."
+                    ));
+                }
+                Ok(parsed)
+            }
             Err(err) => {
                 let preview: String = raw.chars().take(200).collect();
                 tracing::error!(
@@ -698,7 +705,7 @@ impl AgentLoop {
                     "failed to parse tool call arguments JSON"
                 );
                 Err(format!(
-                    "Tool '{tool_name}' arguments were invalid JSON and could not be parsed (id: {tool_id}). Please retry with valid JSON arguments."
+                    "Tool '{tool_name}' arguments were invalid JSON and could not be parsed (id: {tool_id}): {err}. Please retry with valid JSON arguments."
                 ))
             }
         }
@@ -8722,6 +8729,18 @@ Irrespective of whether additional information or instructions are given, you ar
         let invalid = "{\"path\":\"src/main.rs\",\"content\":\"unterminated".to_string();
         let parsed = AgentLoop::parse_tool_arguments("write_to_file", "abc123", Some(&invalid));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_reports_provider_repair_error() {
+        let invalid = serde_json::json!({
+            crate::providers::TOOL_ARGUMENTS_ERROR_FIELD: "invalid escape at line 1 column 23"
+        })
+        .to_string();
+        let error = AgentLoop::parse_tool_arguments("edit_file", "abc123", Some(&invalid))
+            .expect_err("provider repair marker must not reach a tool handler");
+        assert!(error.contains("could not be repaired"));
+        assert!(error.contains("invalid escape at line 1 column 23"));
     }
 
     #[test]

@@ -821,12 +821,12 @@ async fn process_openai_sse_line(
                         if !completed_tool_call_indices.contains(idx)
                             && !id.is_empty()
                             && !name.is_empty()
-                            && let Some(validated_args) = crate::providers::validate_tool_call_args(
+                        {
+                            let validated_args = crate::providers::validate_tool_call_args(
                                 args,
                                 "OpenAI",
                                 "on finish_reason:tool_calls",
-                            )
-                        {
+                            );
                             completed_tool_call_indices.insert(*idx);
                             try_send_chunk(
                                 tx,
@@ -972,12 +972,9 @@ pub async fn finish_openai_sse_to_chunks(
 
         for idx in sorted_indices {
             let (id, name, args) = &accumulated_tool_calls[idx];
-            if !completed_tool_call_indices.contains(idx)
-                && !id.is_empty()
-                && !name.is_empty()
-                && let Some(validated_args) =
-                    crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end")
-            {
+            if !completed_tool_call_indices.contains(idx) && !id.is_empty() && !name.is_empty() {
+                let validated_args =
+                    crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end");
                 completed_tool_call_indices.insert(*idx);
                 try_send_chunk(
                     tx,

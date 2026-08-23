@@ -758,17 +758,21 @@ impl Default for SseLineBuffer {
     }
 }
 
+/// Reserved field used to carry an unrepaired provider argument error through
+/// the stream to the agent loop. It is never passed to a tool handler.
+pub const TOOL_ARGUMENTS_ERROR_FIELD: &str = "__sned_tool_arguments_error";
+
 /// Validate and optionally repair tool call arguments JSON.
 ///
-/// Returns `Some(valid_json)` on success, or `None` when the JSON is
-/// unrepairable — the caller should skip the tool call rather than
-/// executing it with empty/semantically-wrong arguments.
-pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -> Option<String> {
+/// The return value is always valid JSON. When repair is impossible, it is a
+/// reserved error object so the agent loop can give the model a specific tool
+/// result instead of silently dropping the call.
+pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -> String {
     if args.is_empty() {
-        return Some("{}".to_string());
+        return "{}".to_string();
     }
     match serde_json::from_str::<serde_json::Value>(args) {
-        Ok(_) => Some(args.to_string()),
+        Ok(_) => args.to_string(),
         Err(e) => {
             tracing::warn!(
                 "{} tool call arguments JSON invalid {} ({}), attempting repair. args_preview={}",
@@ -781,17 +785,28 @@ pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -
             let repaired = repair_json_args(args);
 
             if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
-                Some(repaired)
+                repaired
             } else {
                 tracing::warn!(
-                    "{} tool call arguments JSON repair failed {}, skipping tool call",
+                    "{} tool call arguments JSON repair failed {}, returning a tool error",
                     provider_name,
                     context
                 );
-                None
+                serde_json::json!({
+                    TOOL_ARGUMENTS_ERROR_FIELD: format!(
+                        r#"{e}. Use valid JSON: escape backslashes as \\, quotes as \", and newlines or tabs as \n or \t."#
+                    )
+                })
+                .to_string()
             }
         }
     }
+}
+
+/// Returns the provider-side argument error encoded by
+/// [`validate_tool_call_args`], if any.
+pub fn tool_arguments_error(value: &serde_json::Value) -> Option<&str> {
+    value.as_object()?.get(TOOL_ARGUMENTS_ERROR_FIELD)?.as_str()
 }
 
 fn repair_json_args(args: &str) -> String {
@@ -823,34 +838,71 @@ fn repair_close_braces(args: &str) -> String {
     let mut brace_count: i32 = 0;
     let mut bracket_count: i32 = 0;
     let mut in_string = false;
-    let mut escape_next = false;
+    let chars: Vec<char> = args.chars().collect();
+    let mut index = 0;
 
-    for c in args.chars() {
-        if escape_next {
-            repaired.push(c);
-            escape_next = false;
+    while index < chars.len() {
+        let c = chars[index];
+        if in_string {
+            match c {
+                '\\' => {
+                    let next = chars.get(index + 1).copied();
+                    let valid_escape =
+                        matches!(next, Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't'));
+                    let valid_unicode_escape = next == Some('u')
+                        && chars.get(index + 2..index + 6).is_some_and(|digits| {
+                            digits.iter().all(|digit| digit.is_ascii_hexdigit())
+                        });
+                    if valid_escape {
+                        repaired.push('\\');
+                        repaired.push(next.expect("valid escape has next character"));
+                        index += 2;
+                        continue;
+                    }
+                    if valid_unicode_escape {
+                        repaired.push('\\');
+                        repaired.push('u');
+                        for digit in &chars[index + 2..index + 6] {
+                            repaired.push(*digit);
+                        }
+                        index += 6;
+                        continue;
+                    }
+
+                    // Preserve a model-produced literal backslash by escaping
+                    // it, then process the following character normally.
+                    repaired.push_str("\\\\");
+                }
+                '"' if quote_ends_json_string(&chars, index) => {
+                    in_string = false;
+                    repaired.push('"');
+                }
+                '"' => repaired.push_str("\\\""),
+                control if control.is_control() => {
+                    use std::fmt::Write;
+                    let _ = write!(repaired, "\\u{:04x}", control as u32);
+                }
+                _ => repaired.push(c),
+            }
+            index += 1;
             continue;
         }
-        if c == '\\' {
-            repaired.push(c);
-            escape_next = true;
-            continue;
-        }
+
         if c == '"' {
-            in_string = !in_string;
+            in_string = true;
             repaired.push(c);
+            index += 1;
             continue;
         }
         repaired.push(c);
-        if !in_string {
-            match c {
-                '{' => brace_count += 1,
-                '}' => brace_count -= 1,
-                '[' => bracket_count += 1,
-                ']' => bracket_count -= 1,
-                _ => {}
-            }
+        match c {
+            '{' => brace_count += 1,
+            '}' => brace_count -= 1,
+            '[' => bracket_count += 1,
+            ']' => bracket_count -= 1,
+            _ => {}
         }
+        index += 1;
     }
 
     if in_string {
@@ -868,6 +920,33 @@ fn repair_close_braces(args: &str) -> String {
     }
 
     repaired
+}
+
+/// Whether an unescaped quote can terminate the current JSON string. Quotes
+/// followed by ordinary text are model-produced literal quotes and must be
+/// escaped instead.
+fn quote_ends_json_string(chars: &[char], quote_index: usize) -> bool {
+    let Some((next_index, next)) = chars
+        .iter()
+        .enumerate()
+        .skip(quote_index + 1)
+        .find(|(_, c)| !c.is_whitespace())
+    else {
+        return true;
+    };
+
+    match next {
+        ':' | '}' | ']' => true,
+        ',' => chars
+            .iter()
+            .skip(next_index + 1)
+            .find(|c| !c.is_whitespace())
+            .is_none_or(|token| {
+                matches!(token, '"' | '{' | '[' | ']' | '}' | 't' | 'f' | 'n' | '-')
+                    || token.is_ascii_digit()
+            }),
+        _ => false,
+    }
 }
 
 /// Error types for model provider operations.
@@ -1349,14 +1428,14 @@ mod tests {
     fn test_validate_tool_call_args_ignores_braces_in_strings() {
         let args = r#"{"text": "hello {world}"}"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        assert_eq!(result, Some(args.to_string()));
+        assert_eq!(result, args);
     }
 
     #[test]
     fn test_validate_tool_call_args_repairs_missing_close_brace() {
         let args = r#"{"path": "/tmp/test"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["path"], "/tmp/test");
     }
 
@@ -1364,7 +1443,7 @@ mod tests {
     fn test_validate_tool_call_args_handles_braces_inside_string_values() {
         let args = r#"{"pattern": "{name} placeholder", "count": 5"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["pattern"], "{name} placeholder");
         assert_eq!(parsed["count"], 5);
     }
@@ -1373,31 +1452,26 @@ mod tests {
     fn test_validate_tool_call_args_fallback_on_unrepairable() {
         let args = r#"totally not json"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        assert!(result.is_none());
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(tool_arguments_error(&parsed).is_some());
     }
 
     #[test]
     fn test_validate_tool_call_args_empty_returns_empty_object() {
-        assert_eq!(
-            validate_tool_call_args("", "test", "unit"),
-            Some("{}".to_string())
-        );
+        assert_eq!(validate_tool_call_args("", "test", "unit"), "{}");
     }
 
     #[test]
     fn test_validate_tool_call_args_valid_json_passes_through() {
         let args = r#"{"a": 1, "b": [2, 3]}"#;
-        assert_eq!(
-            validate_tool_call_args(args, "test", "unit"),
-            Some(args.to_string())
-        );
+        assert_eq!(validate_tool_call_args(args, "test", "unit"), args);
     }
 
     #[test]
     fn test_validate_tool_call_args_repairs_unterminated_string() {
         let args = r#"{"path": "/tmp/test"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["path"], "/tmp/test");
     }
 
@@ -1405,7 +1479,7 @@ mod tests {
     fn test_validate_tool_call_args_strips_prefix_garbage() {
         let args = r#"garbage{"path": "/tmp/test"}"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["path"], "/tmp/test");
     }
 
@@ -1413,15 +1487,39 @@ mod tests {
     fn test_validate_tool_call_args_repairs_unterminated_string_with_close_brace() {
         let args = r#"{"path": "/tmp/test}"#;
         let result = validate_tool_call_args(args, "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["path"], "/tmp/test}");
     }
 
     #[test]
     fn test_validate_tool_call_args_just_open_brace_repairs() {
         let result = validate_tool_call_args("{", "test", "unit");
-        let parsed: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.is_object());
+    }
+
+    #[test]
+    fn test_validate_tool_call_args_repairs_assembly_style_backslashes() {
+        let args = r#"{"content":"mov \d0, \v0"}"#;
+        let result = validate_tool_call_args(args, "test", "unit");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], r#"mov \d0, \v0"#);
+    }
+
+    #[test]
+    fn test_validate_tool_call_args_repairs_literal_control_characters() {
+        let args = "{\"content\":\"first line\n\tsecond line\"}";
+        let result = validate_tool_call_args(args, "test", "unit");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "first line\n\tsecond line");
+    }
+
+    #[test]
+    fn test_validate_tool_call_args_repairs_unescaped_quotes_in_string_values() {
+        let args = r#"{"content":"asm("mov "eax", ebx")"}"#;
+        let result = validate_tool_call_args(args, "test", "unit");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "asm(\"mov \"eax\", ebx\")");
     }
 }
 
