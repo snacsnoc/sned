@@ -1175,13 +1175,16 @@ fn drain_output_queues(
     rx: &mut mpsc::Receiver<OutputEvent>,
     app: &mut App,
     storage: Option<&TaskStorage>,
-) {
+) -> usize {
+    const MAX_OUTPUT_EVENTS_PER_DRAIN: usize = 128;
+    let mut remaining_budget = MAX_OUTPUT_EVENTS_PER_DRAIN;
     let mut saw_output = false;
     let mut pending_model_update = app.take_pending_transcript_model_line();
     let mut pending_reasoning_lines = app.take_pending_transcript_reasoning_lines();
 
-    let mut deferred_priority = Vec::new();
-    while let Ok(event) = priority_rx.try_recv() {
+    let mut deferred_priority = std::mem::take(&mut app.deferred_priority_events);
+    while remaining_budget > 0 && let Ok(event) = priority_rx.try_recv() {
+        remaining_budget = remaining_budget.saturating_sub(1);
         if matches!(
             &event,
             OutputEvent::ApprovalRequested(_) | OutputEvent::ApprovalFinished { .. }
@@ -1195,7 +1198,7 @@ fn drain_output_queues(
                 storage,
             );
         } else {
-            deferred_priority.push(event);
+            deferred_priority.push_back(event);
         }
     }
 
@@ -1209,7 +1212,11 @@ fn drain_output_queues(
         )
     });
     if queued_prompt_boundary {
-        for event in std::mem::take(&mut deferred_priority) {
+        while remaining_budget > 0 {
+            let Some(event) = deferred_priority.pop_front() else {
+                break;
+            };
+            remaining_budget = remaining_budget.saturating_sub(1);
             saw_output = true;
             apply_output_event(
                 app,
@@ -1221,7 +1228,8 @@ fn drain_output_queues(
         }
     }
 
-    while let Ok(event) = rx.try_recv() {
+    while remaining_budget > 0 && let Ok(event) = rx.try_recv() {
+        remaining_budget = remaining_budget.saturating_sub(1);
         if matches!(
             &event,
             OutputEvent::TurnEnd { .. } | OutputEvent::UserPromptLine(_)
@@ -1231,7 +1239,11 @@ fn drain_output_queues(
             // before turn finalization clears the stream entries it compares.
             // A prompt also wins over older terminal panels when the prior
             // turn has no TurnEnd event (for example, a terminal provider error).
-            for deferred_event in std::mem::take(&mut deferred_priority) {
+            while remaining_budget > 0 {
+                let Some(deferred_event) = deferred_priority.pop_front() else {
+                    break;
+                };
+                remaining_budget = remaining_budget.saturating_sub(1);
                 apply_output_event(
                     app,
                     deferred_event,
@@ -1250,7 +1262,11 @@ fn drain_output_queues(
             storage,
         );
     }
-    for event in deferred_priority {
+    while remaining_budget > 0 {
+        let Some(event) = deferred_priority.pop_front() else {
+            break;
+        };
+        remaining_budget = remaining_budget.saturating_sub(1);
         saw_output = true;
         apply_output_event(
             app,
@@ -1260,6 +1276,7 @@ fn drain_output_queues(
             storage,
         );
     }
+    app.deferred_priority_events = deferred_priority;
     if let Some(line) = pending_model_update.take() {
         app.replace_last_stream_line(line.clone(), crate::cli::tui::StreamKind::Model);
         app.set_pending_transcript_model_line(line);
@@ -1289,6 +1306,7 @@ fn drain_output_queues(
     if let Some(err) = app.take_task_transcript_writer_error() {
         tracing::warn!("Failed to persist task transcript batch: {err}");
     }
+    MAX_OUTPUT_EVENTS_PER_DRAIN.saturating_sub(remaining_budget)
 }
 
 /// Drain the main output channel into the app buffer.
@@ -3511,6 +3529,8 @@ async fn run_main_loop(
         draw_count: u64,
         drain_total_us: u64,
         drain_count: u64,
+        drain_events_total: u64,
+        drain_events_peak: usize,
         output_lines_peak: usize,
     }
 
@@ -3532,6 +3552,10 @@ async fn run_main_loop(
                 self.drain_count,
                 self.drain_total_us.saturating_div(self.drain_count),
             );
+            eprintln!(
+                "[timing] drain_events: total={} peak={}",
+                self.drain_events_total, self.drain_events_peak,
+            );
             eprintln!("[timing] output_lines_peak={}", self.output_lines_peak);
 
             if let Some(session_start) = self.session_start_time {
@@ -3551,7 +3575,7 @@ async fn run_main_loop(
     }
 
     const BUSY_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
-    const BUSY_POLL_INTERVAL: Duration = BUSY_REDRAW_INTERVAL;
+    const LARGE_TRANSCRIPT_REDRAW_INTERVAL: Duration = Duration::from_millis(32);
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
     const MAX_DRAW_RETRY_DELAY: Duration = Duration::from_secs(1);
     let mouse_scroll_lines = mouse_scroll_lines();
@@ -3574,6 +3598,8 @@ async fn run_main_loop(
         draw_count: 0,
         drain_total_us: 0,
         drain_count: 0,
+        drain_events_total: 0,
+        drain_events_peak: 0,
         output_lines_peak: 0,
     };
 
@@ -3581,7 +3607,8 @@ async fn run_main_loop(
         // 1. Drain channel into app
         {
             let t = std::time::Instant::now();
-            drain_output_queues(priority_output_rx, output_rx, app, Some(&task_storage));
+            let drained_events =
+                drain_output_queues(priority_output_rx, output_rx, app, Some(&task_storage));
             // Lost transcript context remains visible because it may affect
             // whether the user can safely approve a pending operation.
             if output_writer.take_overflow_signal() {
@@ -3600,6 +3627,10 @@ async fn run_main_loop(
             let us = t.elapsed().as_micros() as u64;
             timing.drain_total_us += us;
             timing.drain_count += 1;
+            timing.drain_events_total = timing
+                .drain_events_total
+                .saturating_add(drained_events as u64);
+            timing.drain_events_peak = timing.drain_events_peak.max(drained_events);
         }
 
         while let Ok(update) = mention_search_rx.try_recv() {
@@ -3690,12 +3721,17 @@ async fn run_main_loop(
         }
 
         // 2. Render (skip if nothing changed)
+        let busy_redraw_interval = if app.output_lines.len() >= 2_000 {
+            LARGE_TRANSCRIPT_REDRAW_INTERVAL
+        } else {
+            BUSY_REDRAW_INTERVAL
+        };
         let retry_ready = draw_retry_at.is_none_or(|retry_at| retry_at <= Instant::now());
         let should_render = if (app.needs_redraw || app.has_resized) && retry_ready {
             if app.has_unrendered_approval() {
                 true
             } else if app.agent_busy {
-                last_draw_at.is_none_or(|last| last.elapsed() >= BUSY_REDRAW_INTERVAL)
+                last_draw_at.is_none_or(|last| last.elapsed() >= busy_redraw_interval)
             } else {
                 true
             }
@@ -3732,7 +3768,7 @@ async fn run_main_loop(
         // Crossterm wakes immediately for input, so idle sessions can wait longer
         // without adding typing latency while busy streams keep their redraw cadence.
         let poll_interval = if app.agent_busy {
-            BUSY_POLL_INTERVAL
+            busy_redraw_interval
         } else {
             IDLE_POLL_INTERVAL
         };
