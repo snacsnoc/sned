@@ -71,6 +71,10 @@ pub struct TaskState {
     /// Mirrors `is_cancelled` — set by cancellation handlers alongside `is_cancelled`.
     /// Clone the Arc and call `load(Acquire)` to check without mutex.
     pub is_cancelled_atomic: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-agent-run cancellation token for detached blocking checkpoint work.
+    /// It is replaced on each new run so a previous cancelled checkpoint
+    /// cannot observe a later task's reset and continue running.
+    pub checkpoint_cancellation: Arc<std::sync::atomic::AtomicBool>,
     /// PIDs of running background commands (for cancellation).
     pub running_command_pids: Vec<i32>,
     /// Whether we're waiting for the first chunk.
@@ -185,6 +189,7 @@ impl Default for TaskState {
             consecutive_mistakes: 0,
             is_cancelled: false,
             is_cancelled_atomic: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            checkpoint_cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             running_command_pids: Vec::new(),
             is_waiting_for_first_chunk: false,
             did_complete_reading_stream: false,

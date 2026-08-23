@@ -1831,6 +1831,9 @@ async fn cancel_agent(
         let pids = {
             let mut state = sh.lock().await;
             state.is_cancelled = true;
+            state
+                .checkpoint_cancellation
+                .store(true, Ordering::Release);
             state.is_cancelled_atomic.store(true, Ordering::Release);
 
             #[cfg(unix)]
@@ -8449,6 +8452,7 @@ mod tests {
             export: None,
             image: vec![],
             track_changes: false,
+            no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
             debug: false,
@@ -8805,6 +8809,7 @@ mod tests {
             export: None,
             image: vec![],
             track_changes: false,
+            no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
             debug: false,
@@ -9462,6 +9467,7 @@ mod tests {
             export: None,
             image: vec![],
             track_changes: false,
+            no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
             debug: false,
@@ -9595,6 +9601,7 @@ mod tests {
             export: None,
             image: vec![],
             track_changes: false,
+            no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
             debug: false,
@@ -9720,6 +9727,7 @@ mod tests {
             export: None,
             image: vec![],
             track_changes: false,
+            no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
             debug: false,
@@ -9855,6 +9863,7 @@ mod tests {
             export: None,
             image: vec![],
             track_changes: false,
+            no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
             debug: false,
@@ -9975,6 +9984,7 @@ mod tests {
             export: None,
             image: vec![],
             track_changes: false,
+            no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
             debug: false,
@@ -10098,6 +10108,7 @@ mod tests {
             export: None,
             image: vec![],
             track_changes: false,
+            no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
             debug: false,

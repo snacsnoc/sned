@@ -91,6 +91,9 @@ impl CancellationHandler {
             let mut state = self.state.lock().await;
             state.is_cancelled = true;
             state
+                .checkpoint_cancellation
+                .store(true, std::sync::atomic::Ordering::Release);
+            state
                 .is_cancelled_atomic
                 .store(true, std::sync::atomic::Ordering::Release);
         }
@@ -244,6 +247,9 @@ async fn handle_shutdown_signal(
         SignalAction::Cancel => {
             let mut state = state.lock().await;
             state.is_cancelled = true;
+            state
+                .checkpoint_cancellation
+                .store(true, std::sync::atomic::Ordering::Release);
             state
                 .is_cancelled_atomic
                 .store(true, std::sync::atomic::Ordering::Release);

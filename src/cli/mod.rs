@@ -347,6 +347,10 @@ pub struct TaskOptions {
     #[arg(long)]
     pub track_changes: bool,
 
+    /// Disable workspace checkpoints for this run.
+    #[arg(long)]
+    pub no_checkpoints: bool,
+
     /// Maximum number of context turns before pruning (default: 50)
     #[arg(long, value_name = "turns", hide_short_help = true)]
     pub max_context_turns: Option<String>,
@@ -1642,11 +1646,12 @@ async fn build_task_components(
         provider: Arc::new(std::sync::Mutex::new(provider)),
         mode,
         task_id: task_id.clone(),
-        enable_checkpoints: state_manager
-            .get_global_state_key::<bool>(
-                crate::storage::state_manager::GlobalStateKey::EnableCheckpoints,
-            )
-            .unwrap_or(true),
+        enable_checkpoints: !task_opts.no_checkpoints
+            && state_manager
+                .get_global_state_key::<bool>(
+                    crate::storage::state_manager::GlobalStateKey::EnableCheckpoints,
+                )
+                .unwrap_or(true),
         use_auto_condense: task_opts.auto_condense,
         show_token_usage: !task_opts.no_token_display,
         json_output: task_opts.json,
@@ -2262,6 +2267,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_no_checkpoints_flag() {
+        let cli = Cli::try_parse_from(["sned", "--no-checkpoints", "test"]).unwrap();
+        assert!(cli.task_opts.no_checkpoints);
+    }
+
+    #[test]
     fn parse_token_display_default() {
         let cli = Cli::try_parse_from(["sned", "test"]).unwrap();
         assert!(!cli.task_opts.no_token_display);
@@ -2813,6 +2824,7 @@ mod tests {
                 export: None,
                 image: vec![],
                 track_changes: false,
+                no_checkpoints: false,
                 max_context_turns: None,
                 max_tokens: None,
                 debug: false,
@@ -2883,6 +2895,7 @@ mod tests {
                 export: None,
                 image: vec![],
                 track_changes: false,
+                no_checkpoints: false,
                 max_context_turns: None,
                 max_tokens: None,
                 debug: false,
@@ -3005,6 +3018,7 @@ mod tests {
                 export: None,
                 image: vec![],
                 track_changes: false,
+                no_checkpoints: false,
                 max_context_turns: None,
                 max_tokens: None,
                 debug: false,

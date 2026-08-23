@@ -2996,9 +2996,12 @@ impl AgentLoop {
         if checkpoint_required
             && let Some(ref mut checkpoint_mgr) = self.deps.checkpoint_manager
         {
+            let checkpoint_cancellation = self.state.lock().await.checkpoint_cancellation.clone();
             let checkpoint_started = std::time::Instant::now();
             tracing::debug!("saving checkpoint before mutating tool batch");
-            checkpoint_mgr.save_checkpoint().await;
+            checkpoint_mgr
+                .save_checkpoint_with_cancellation(Some(checkpoint_cancellation))
+                .await;
             tracing::debug!(
                 elapsed_ms = checkpoint_started.elapsed().as_millis(),
                 "saved checkpoint before mutating tool batch"
@@ -4301,6 +4304,9 @@ impl AgentLoop {
     pub async fn cancel(&self) {
         let mut state = self.state.lock().await;
         state.is_cancelled = true;
+        state
+            .checkpoint_cancellation
+            .store(true, std::sync::atomic::Ordering::Release);
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -4309,6 +4315,10 @@ impl AgentLoop {
     pub async fn reset_cancellation(&self) {
         let mut state = self.state.lock().await;
         state.is_cancelled = false;
+        state
+            .checkpoint_cancellation
+            .store(true, std::sync::atomic::Ordering::Release);
+        state.checkpoint_cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.cancelled
             .store(false, std::sync::atomic::Ordering::Release);
     }
@@ -9284,6 +9294,22 @@ Irrespective of whether additional information or instructions are given, you ar
         // Verify the flag was set
         let state = agent.state.lock().await;
         assert!(state.is_cancelled, "Ctrl+C should set cancellation flag");
+    }
+
+    #[tokio::test]
+    async fn test_reset_cancellation_replaces_checkpoint_token() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::new(vec![]),
+        ));
+        let agent = AgentLoop::new(test_agent_config(provider, "checkpoint-cancellation"));
+        let previous = agent.state.lock().await.checkpoint_cancellation.clone();
+
+        agent.reset_cancellation().await;
+
+        let current = agent.state.lock().await.checkpoint_cancellation.clone();
+        assert!(previous.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!current.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!Arc::ptr_eq(&previous, &current));
     }
 
     #[tokio::test]

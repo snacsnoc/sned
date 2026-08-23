@@ -11,15 +11,80 @@
 //! - Checkpoints are created before each tool turn that may modify files.
 //! - Restore resets the working directory to a previous checkpoint state.
 
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// A checkpoint is a safety feature, never a reason to leave the agent stuck
 /// indefinitely behind a stalled filesystem or Git subprocess.
 const CHECKPOINT_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_INDEX_LOCK_AGE: Duration = Duration::from_secs(90);
+
+/// Cross-process guard for a workspace checkpoint repository. The lock file
+/// itself may remain on disk, but the advisory lock is released by the OS when
+/// the owning Sned process exits or is killed.
+#[derive(Debug)]
+struct CheckpointRepoLock {
+    _file: File,
+}
+
+impl CheckpointRepoLock {
+    fn acquire(path: &Path, cancelled: Option<&AtomicBool>) -> Result<Self, CheckpointError> {
+        Self::acquire_with_timeout(path, cancelled, CHECKPOINT_GIT_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(
+        path: &Path,
+        cancelled: Option<&AtomicBool>,
+        timeout: Duration,
+    ) -> Result<Self, CheckpointError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| CheckpointError::InvalidPath(path.to_path_buf()))?;
+        std::fs::create_dir_all(parent)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let started = Instant::now();
+            loop {
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result == 0 {
+                    return Ok(Self { _file: file });
+                }
+
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    return Err(CheckpointError::Io(error));
+                }
+                if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    return Err(CheckpointError::Cancelled);
+                }
+                if started.elapsed() >= timeout {
+                    return Err(CheckpointError::RepositoryBusy(path.to_path_buf()));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = cancelled;
+            Ok(Self { _file: file })
+        }
+    }
+}
 
 /// Tracks workspace state via a shadow git repository.
 #[derive(Clone)]
@@ -60,8 +125,9 @@ impl CheckpointTracker {
             shadow_git_path,
         };
 
-        // Initialize shadow git if needed
-        tracker.init_shadow_git()?;
+        // Initialization mutates the shared checkpoint repo too, so it needs
+        // the same cross-process guard as checkpoint commits.
+        tracker.with_repo_lock(None, || tracker.init_shadow_git())?;
 
         Ok(Some(tracker))
     }
@@ -106,13 +172,72 @@ impl CheckpointTracker {
         Ok(())
     }
 
+    fn repo_lock_path(&self) -> Result<PathBuf, CheckpointError> {
+        let parent = self
+            .shadow_git_path
+            .parent()
+            .ok_or_else(|| CheckpointError::InvalidPath(self.shadow_git_path.clone()))?;
+        Ok(parent.join("checkpoint.lock"))
+    }
+
+    fn with_repo_lock<T>(
+        &self,
+        cancelled: Option<&AtomicBool>,
+        operation: impl FnOnce() -> Result<T, CheckpointError>,
+    ) -> Result<T, CheckpointError> {
+        let lock_path = self.repo_lock_path()?;
+        let _lock = CheckpointRepoLock::acquire(&lock_path, cancelled)?;
+        self.remove_stale_index_lock()?;
+        operation()
+    }
+
+    fn remove_stale_index_lock(&self) -> Result<(), CheckpointError> {
+        let index_lock = self.shadow_git_path.join("index.lock");
+        let Ok(metadata) = std::fs::metadata(&index_lock) else {
+            return Ok(());
+        };
+        let age = metadata.modified()?.elapsed().unwrap_or_default();
+        if age < STALE_INDEX_LOCK_AGE {
+            return Ok(());
+        }
+
+        std::fs::remove_file(&index_lock)?;
+        warn!(
+            path = %index_lock.display(),
+            age_secs = age.as_secs(),
+            "[checkpoints] Removed stale Git index lock after acquiring checkpoint repository lock"
+        );
+        Ok(())
+    }
+
     /// Create a checkpoint commit of the current workspace state.
     ///
     /// Returns the commit hash, or `None` if the commit failed.
     pub fn commit(&self) -> Result<Option<String>, CheckpointError> {
+        self.commit_with_cancellation(None)
+    }
+
+    fn commit_with_cancellation(
+        &self,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Option<String>, CheckpointError> {
+        self.with_repo_lock(cancelled, || self.commit_locked(cancelled))
+    }
+
+    fn commit_locked(
+        &self,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Option<String>, CheckpointError> {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(CheckpointError::Cancelled);
+        }
         // Stage all changes (including deletions and files outside cwd)
-        let add_result =
-            Self::run_git_cmd_with_worktree(&self.shadow_git_path, &self.cwd, &["add", "--all"]);
+        let add_result = Self::run_git_cmd_with_worktree_cancellable(
+            &self.shadow_git_path,
+            &self.cwd,
+            &["add", "--all"],
+            cancelled,
+        );
 
         if let Err(e) = add_result {
             warn!("[checkpoints] Warning: failed to stage files: {}", e);
@@ -120,7 +245,10 @@ impl CheckpointTracker {
 
         let commit_message = format!("checkpoint-{}-{}", self.cwd_hash, self.task_id);
 
-        let commit_result = Self::run_git_cmd_with_worktree(
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(CheckpointError::Cancelled);
+        }
+        let commit_result = Self::run_git_cmd_with_worktree_cancellable(
             &self.shadow_git_path,
             &self.cwd,
             &[
@@ -130,6 +258,7 @@ impl CheckpointTracker {
                 "--allow-empty",
                 "--no-verify",
             ],
+            cancelled,
         );
 
         if let Err(e) = commit_result {
@@ -150,6 +279,10 @@ impl CheckpointTracker {
     /// Reset the working directory to a specific checkpoint commit.
     /// Fails if there are uncommitted changes in the working tree.
     pub fn restore(&self, commit_hash: &str) -> Result<(), CheckpointError> {
+        self.with_repo_lock(None, || self.restore_locked(commit_hash))
+    }
+
+    fn restore_locked(&self, commit_hash: &str) -> Result<(), CheckpointError> {
         // Check for uncommitted changes to prevent destructive reset
         let status_output = Command::new("git")
             .args([
@@ -190,11 +323,11 @@ impl CheckpointTracker {
     pub fn get_head_commit(&self) -> Result<Option<String>, CheckpointError> {
         let mut command = Command::new("git");
         command.args([
-                "--git-dir",
-                self.shadow_git_path.to_str().unwrap_or("."),
-                "rev-parse",
-                "HEAD",
-            ]);
+            "--git-dir",
+            self.shadow_git_path.to_str().unwrap_or("."),
+            "rev-parse",
+            "HEAD",
+        ]);
         let output = Self::run_git_command_with_timeout(&mut command)
             .map_err(|e| CheckpointError::CommandFailed(format!("git rev-parse failed: {e}")))?;
 
@@ -313,10 +446,19 @@ impl CheckpointTracker {
     /// Run Git with a hard wall-clock deadline. This keeps both direct and
     /// `spawn_blocking` callers bounded when Git or the workspace stalls.
     fn run_git_command_with_timeout(command: &mut Command) -> io::Result<Output> {
-        Self::run_command_with_timeout(command, CHECKPOINT_GIT_TIMEOUT)
+        Self::run_command_with_timeout_and_cancellation(command, CHECKPOINT_GIT_TIMEOUT, None)
     }
 
+    #[cfg(test)]
     fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+        Self::run_command_with_timeout_and_cancellation(command, timeout, None)
+    }
+
+    fn run_command_with_timeout_and_cancellation(
+        command: &mut Command,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> io::Result<Output> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let mut stdout_pipe = child
@@ -343,6 +485,17 @@ impl CheckpointTracker {
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
+            }
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "git checkpoint command cancelled",
+                ));
             }
             if started.elapsed() >= timeout {
                 let _ = child.kill();
@@ -380,6 +533,15 @@ impl CheckpointTracker {
         work_tree: &Path,
         args: &[&str],
     ) -> Result<(), CheckpointError> {
+        Self::run_git_cmd_with_worktree_cancellable(git_dir, work_tree, args, None)
+    }
+
+    fn run_git_cmd_with_worktree_cancellable(
+        git_dir: &Path,
+        work_tree: &Path,
+        args: &[&str],
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), CheckpointError> {
         let mut cmd_args = Vec::with_capacity(4 + args.len());
         cmd_args.push("--git-dir");
         cmd_args.push(git_dir.to_str().unwrap_or("."));
@@ -387,7 +549,22 @@ impl CheckpointTracker {
         cmd_args.push(work_tree.to_str().unwrap_or("."));
         cmd_args.extend_from_slice(args);
 
-        Self::run_git_cmd(git_dir, &cmd_args)
+        let mut command = Command::new("git");
+        command.current_dir(git_dir).args(cmd_args.iter().copied());
+        let output = Self::run_command_with_timeout_and_cancellation(
+            &mut command,
+            CHECKPOINT_GIT_TIMEOUT,
+            cancelled,
+        )
+        .map_err(|error| CheckpointError::CommandFailed(format!("git command failed: {error}")))?;
+        if !output.status.success() {
+            return Err(CheckpointError::CommandFailed(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -398,6 +575,10 @@ pub enum CheckpointError {
     GitNotInstalled,
     #[error("Invalid path: {0}")]
     InvalidPath(PathBuf),
+    #[error("Checkpoint operation cancelled")]
+    Cancelled,
+    #[error("Checkpoint repository is busy: {0}")]
+    RepositoryBusy(PathBuf),
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
     #[error("Command failed: {0}")]
@@ -463,11 +644,24 @@ impl TaskCheckpointManager {
     /// Save a checkpoint of the current workspace state.
     /// Runs git commands in a blocking thread to avoid stalling the async runtime.
     pub async fn save_checkpoint(&mut self) -> Option<String> {
+        self.save_checkpoint_with_cancellation(None).await
+    }
+
+    /// Save a checkpoint, terminating its Git subprocess promptly if the
+    /// enclosing agent task is cancelled.
+    pub async fn save_checkpoint_with_cancellation(
+        &mut self,
+        cancelled: Option<std::sync::Arc<AtomicBool>>,
+    ) -> Option<String> {
         let Some(tracker) = &self.tracker else {
             return None;
         };
         let tracker_for_commit = tracker.clone();
-        match tokio::task::spawn_blocking(move || tracker_for_commit.commit()).await {
+        match tokio::task::spawn_blocking(move || {
+            tracker_for_commit.commit_with_cancellation(cancelled.as_deref())
+        })
+        .await
+        {
             Ok(Ok(Some(hash))) => {
                 self.checkpoint_history.push(hash.clone());
                 Some(hash)
@@ -645,6 +839,21 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_checkpoint_repo_lock_serializes_independent_handles() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("checkpoint.lock");
+        let _first =
+            CheckpointRepoLock::acquire_with_timeout(&lock_path, None, Duration::from_millis(25))
+                .expect("first checkpoint lock should succeed");
+
+        let error =
+            CheckpointRepoLock::acquire_with_timeout(&lock_path, None, Duration::from_millis(25))
+                .expect_err("second independent checkpoint lock must wait");
+        assert!(matches!(error, CheckpointError::RepositoryBusy(path) if path == lock_path));
+    }
+
     fn git_available() -> bool {
         Command::new("git")
             .arg("--version")
@@ -659,12 +868,26 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 1"]);
 
-        let error = CheckpointTracker::run_command_with_timeout(
-            &mut command,
-            Duration::from_millis(25),
-        )
-        .expect_err("checkpoint command should time out");
+        let error =
+            CheckpointTracker::run_command_with_timeout(&mut command, Duration::from_millis(25))
+                .expect_err("checkpoint command should time out");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_checkpoint_command_cancellation_kills_child() {
+        let cancelled = AtomicBool::new(true);
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+
+        let error = CheckpointTracker::run_command_with_timeout_and_cancellation(
+            &mut command,
+            Duration::from_secs(2),
+            Some(&cancelled),
+        )
+        .expect_err("cancelled checkpoint command must stop");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     #[cfg(unix)]
