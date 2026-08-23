@@ -86,6 +86,8 @@ pub struct TaskTranscriptWriter {
     handle: Option<JoinHandle<()>>,
 }
 
+const TRANSCRIPT_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl TaskTranscriptWriter {
     pub fn start(storage: TaskStorage) -> io::Result<Self> {
         let (sender, receiver) = std_mpsc::channel();
@@ -132,7 +134,7 @@ impl TaskTranscriptWriter {
             .send(TranscriptWriterCommand::Flush(sender))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transcript writer stopped"))?;
         receiver
-            .recv()
+            .recv_timeout(TRANSCRIPT_WRITER_RESPONSE_TIMEOUT)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transcript writer stopped"))?
     }
 
@@ -149,22 +151,33 @@ impl TaskTranscriptWriter {
             return Ok(());
         };
         let (sender, receiver) = std_mpsc::channel();
-        let result = match self.sender.send(TranscriptWriterCommand::Shutdown(sender)) {
-            Ok(()) => receiver.recv().unwrap_or_else(|_| {
-                Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "transcript writer stopped",
-                ))
-            }),
+        let response = match self.sender.send(TranscriptWriterCommand::Shutdown(sender)) {
+            Ok(()) => receiver
+                .recv_timeout(TRANSCRIPT_WRITER_RESPONSE_TIMEOUT)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "transcript writer shutdown timed out",
+                    )
+                }),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "transcript writer stopped",
             )),
         };
-        if handle.join().is_err() {
-            return Err(io::Error::other("transcript writer panicked"));
+        match response {
+            Ok(result) => {
+                if handle.join().is_err() {
+                    return Err(io::Error::other("transcript writer panicked"));
+                }
+                result
+            }
+            Err(error) => {
+                // Detach a slow writer so it cannot hold process shutdown.
+                drop(handle);
+                Err(error)
+            }
         }
-        result
     }
 }
 
@@ -819,6 +832,7 @@ impl TaskStorage {
         let path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
         let file = fs::File::open(&path)?;
         let mut entries = VecDeque::with_capacity(DEFAULT_TRANSCRIPT_CAP);
+        let mut exceeded_capacity = false;
         for line in io::BufReader::new(file).lines() {
             let line = line?;
             let entry = match serde_json::from_str::<TranscriptEntry>(&line) {
@@ -826,14 +840,14 @@ impl TaskStorage {
                 Err(_) => return Ok(()),
             };
             if entries.len() == DEFAULT_TRANSCRIPT_CAP {
+                exceeded_capacity = true;
                 entries.pop_front();
             }
             entries.push_back(entry);
         }
 
         let line_count = entries.len();
-        let file_line_count = fs::read_to_string(&path)?.lines().count();
-        if file_line_count <= DEFAULT_TRANSCRIPT_CAP {
+        if !exceeded_capacity {
             return Ok(());
         }
 

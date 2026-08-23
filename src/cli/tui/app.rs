@@ -249,6 +249,8 @@ struct ScrollbackWriter {
     handle: Option<JoinHandle<()>>,
 }
 
+const WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl ScrollbackWriter {
     fn start(path: PathBuf) -> io::Result<Self> {
         let (sender, receiver) = std_mpsc::channel();
@@ -279,7 +281,7 @@ impl ScrollbackWriter {
             .send(ScrollbackCommand::Flush(sender))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "scrollback writer stopped"))?;
         receiver
-            .recv()
+            .recv_timeout(WRITER_RESPONSE_TIMEOUT)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "scrollback writer stopped"))?
     }
 
@@ -306,22 +308,29 @@ impl ScrollbackWriter {
             return Ok(());
         };
         let (sender, receiver) = std_mpsc::channel();
-        let result = match self.sender.send(ScrollbackCommand::Shutdown(sender)) {
-            Ok(()) => receiver.recv().unwrap_or_else(|_| {
-                Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "scrollback writer stopped",
-                ))
+        let response = match self.sender.send(ScrollbackCommand::Shutdown(sender)) {
+            Ok(()) => receiver.recv_timeout(WRITER_RESPONSE_TIMEOUT).map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "scrollback writer shutdown timed out")
             }),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "scrollback writer stopped",
             )),
         };
-        if handle.join().is_err() {
-            return Err(io::Error::other("scrollback writer panicked"));
+        match response {
+            Ok(result) => {
+                if handle.join().is_err() {
+                    return Err(io::Error::other("scrollback writer panicked"));
+                }
+                result
+            }
+            Err(error) => {
+                // Dropping a JoinHandle detaches the worker. A slow or stuck
+                // filesystem must not prevent the TUI process from exiting.
+                drop(handle);
+                Err(error)
+            }
         }
-        result
     }
 }
 

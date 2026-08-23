@@ -624,6 +624,12 @@ fn close_slash_command_mode(app: &mut App) {
     app.slash_command_completed_text = None;
 }
 
+fn clear_model_picker(app: &mut App) {
+    app.model_picker_active = false;
+    app.model_picker_results.clear();
+    app.model_picker_selected = 0;
+}
+
 fn resolve_interactive_model_input(
     text: &str,
     skills: &[crate::core::context::instructions::SkillMetadata],
@@ -655,6 +661,13 @@ fn clear_mention_search(app: &mut App, clear_results: bool) {
         app.picker_selection_explicit = false;
         app.mention_search_refresh_pending = false;
     }
+}
+
+/// Clear input-bound overlays whenever their input is discarded or cancelled.
+fn clear_input_overlays(app: &mut App) {
+    clear_mention_search(app, true);
+    close_slash_command_mode(app);
+    clear_model_picker(app);
 }
 
 fn textarea_cursor_byte_offset(lines: &[String], cursor: (usize, usize)) -> usize {
@@ -1529,6 +1542,9 @@ async fn refresh_input_completions(
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
 ) {
     let input_text = app.input.lines().join("\n");
+    // The model picker is not driven by arbitrary input text. Once the user
+    // edits the prompt, it is no longer a valid overlay for that input.
+    clear_model_picker(app);
     if app.slash_command_help_active {
         app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
             &app.slash_command_all_entries,
@@ -1782,29 +1798,40 @@ async fn cancel_agent(
     _agent_done: &Arc<tokio::sync::Notify>,
     agent_busy: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    if let Some(sh) = state_handle.lock().await.as_ref() {
-        let mut state = sh.lock().await;
-        state.is_cancelled = true;
-        state.is_cancelled_atomic.store(true, Ordering::Release);
-
-        #[cfg(unix)]
-        {
-            let pids = state.running_command_pids.clone();
-            for pid in &pids {
-                crate::core::cancellation::terminate_process_group(
-                    *pid,
-                    Duration::from_millis(100),
-                )
-                .await;
-            }
-        }
-
-        state.running_command_pids.clear();
-    }
-
+    // Abort first so cancellation never waits for the agent to release a
+    // state lock while it is blocked in tool preparation or filesystem I/O.
     let task_opt = agent_task.lock().await.take();
     if let Some(task) = task_opt {
         task.abort();
+    }
+
+    // Once the task is aborted, any Tokio mutex guards it held are released
+    // as the future unwinds. Await them here: skipping a busy state would
+    // leave its registered command process groups running after cancellation.
+    let state_arc = state_handle.lock().await.as_ref().cloned();
+    if let Some(sh) = state_arc {
+        let pids = {
+            let mut state = sh.lock().await;
+            state.is_cancelled = true;
+            state.is_cancelled_atomic.store(true, Ordering::Release);
+
+            #[cfg(unix)]
+            let pids = std::mem::take(&mut state.running_command_pids);
+
+            #[cfg(not(unix))]
+            state.running_command_pids.clear();
+
+            #[cfg(unix)]
+            { pids }
+            #[cfg(not(unix))]
+            { Vec::new() }
+        };
+
+        #[cfg(unix)]
+        for pid in pids {
+            crate::core::cancellation::terminate_process_group(pid, Duration::from_millis(100))
+                .await;
+        }
     }
 
     app.push_plain("Cancelled. Type /retry to resend.");
@@ -1819,6 +1846,7 @@ async fn cancel_agent(
 }
 
 fn handle_idle_ctrl_c(app: &mut App) {
+    clear_input_overlays(app);
     app.push_styled(
         "Press Ctrl+C again to quit.",
         Style::default().fg(theme::WARNING_FG),
@@ -2031,7 +2059,7 @@ async fn handle_key_event_inner(
                     );
                 }
                 app.input = App::new_textarea(Vec::new());
-                close_slash_command_mode(app);
+                clear_input_overlays(app);
             }
             return Ok(None);
         }
@@ -2055,7 +2083,7 @@ async fn handle_key_event_inner(
             if cli_cmd.as_ref().is_some_and(|cmd| cmd.is_shutdown()) {
                 app.input = App::new_textarea(Vec::new());
                 app.clear_pastes();
-                close_slash_command_mode(app);
+                clear_input_overlays(app);
                 return Ok(Some(Action::Submit { text, cli_cmd }));
             }
 
@@ -2079,7 +2107,7 @@ async fn handle_key_event_inner(
             }
             app.input = App::new_textarea(Vec::new());
             app.clear_pastes();
-            close_slash_command_mode(app);
+            clear_input_overlays(app);
             return Ok(Some(Action::Submit { text, cli_cmd }));
         }
         return Ok(None);
@@ -2332,6 +2360,10 @@ async fn handle_cli_only_command(
 
     match cli_cmd {
         CliOnlyCommand::Exit | CliOnlyCommand::Quit => {
+            if agent_busy.load(Ordering::Relaxed) {
+                cancel_agent(app, state_handle, agent_task, agent_done, agent_busy).await?;
+                app.agent_busy = false;
+            }
             return Ok(true);
         }
         CliOnlyCommand::Clear => {
@@ -3775,9 +3807,7 @@ async fn run_main_loop(
 
                         if is_double_tap {
                             // Force exit on second Ctrl+C
-                            if app.picker_active {
-                                clear_mention_search(app, true);
-                            }
+                            clear_input_overlays(app);
                             // Always export on exit, even if the agent errored out.
                             if let Some(ref export_path) = task_opts.export {
                                 let export_result =
@@ -3799,9 +3829,13 @@ async fn run_main_loop(
                             *last = Some(now);
                         }
 
-                        // Dismiss picker if active
-                        if app.picker_active {
-                            clear_mention_search(app, true);
+                        // Ctrl+C dismisses any input-bound overlay before it
+                        // begins agent cancellation or the exit gesture.
+                        if app.picker_active
+                            || app.slash_command_active
+                            || app.model_picker_active
+                        {
+                            clear_input_overlays(app);
                             continue;
                         }
 
@@ -7960,6 +7994,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_submit_clears_pending_mention_picker() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.set_input_text_and_cursor("read @QUICKSTART_AGENT.md", 24);
+        app.picker_active = true;
+        app.mention_search_active = true;
+        app.mention_search_query = "QUICKSTART_AGENT.md".to_string();
+        app.mention_search_refresh_pending = true;
+        app.model_picker_active = true;
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(matches!(action, Some(Action::Submit { .. })));
+        assert!(!app.picker_active);
+        assert!(!app.mention_search_active);
+        assert!(!app.mention_search_refresh_pending);
+        assert!(app.picker_results.is_empty());
+        assert!(!app.model_picker_active);
+        assert!(app.model_picker_results.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_followup_submit_clears_input_overlays() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let task_id = "followup-overlay-test";
+        crate::core::approval::set_followup_question_active(task_id, true);
+        let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
+        crate::core::approval::set_followup_sender(task_id, reply_tx);
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = file_picker_test_app();
+        app.picker_results.clear();
+        app.mention_search_active = true;
+        app.mention_search_refresh_pending = true;
+        app.model_picker_active = true;
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            task_id,
+        )
+        .await?;
+
+        assert!(!app.picker_active);
+        assert!(!app.mention_search_active);
+        assert!(!app.model_picker_active);
+        assert!(app.model_picker_results.is_empty());
+        crate::core::approval::set_followup_question_active(task_id, false);
+        crate::core::approval::clear_followup_sender(task_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_input_refresh_dismisses_model_picker() {
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.set_input_text("ordinary prompt");
+        app.model_picker_active = true;
+        app.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
+
+        refresh_input_completions(&mut app, &state_handle).await;
+
+        assert!(!app.model_picker_active);
+        assert!(app.model_picker_results.is_empty());
+    }
+
+    #[test]
+    fn test_idle_ctrl_c_clears_all_input_overlays() {
+        let mut app = slash_completion_test_app();
+        app.picker_active = true;
+        app.picker_results = file_picker_test_app().picker_results;
+        app.mention_search_active = true;
+        app.mention_search_refresh_pending = true;
+        app.model_picker_active = true;
+        app.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
+
+        handle_idle_ctrl_c(&mut app);
+
+        assert!(!app.picker_active);
+        assert!(!app.mention_search_active);
+        assert!(!app.slash_command_active);
+        assert!(!app.model_picker_active);
+    }
+
+    #[tokio::test]
     async fn test_handle_key_event_history_up_walks_most_recent_entries() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -10094,5 +10232,40 @@ mod tests {
         .unwrap();
 
         assert!(!agent_busy.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_agent_cleans_state_after_aborting_state_holder() {
+        use std::time::Duration;
+        use tokio::task::JoinHandle;
+
+        let task_state = Arc::new(Mutex::new(crate::core::agent_types::TaskState::default()));
+        let state_handle = Arc::new(Mutex::new(Some(Arc::clone(&task_state))));
+        let locked = Arc::new(tokio::sync::Notify::new());
+        let locked_task = Arc::clone(&locked);
+        let held_state = Arc::clone(&task_state);
+        let task_slot: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(Some(
+            tokio::spawn(async move {
+                let _guard = held_state.lock().await;
+                locked_task.notify_one();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }),
+        )));
+        locked.notified().await;
+
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let mut app = App::new();
+        cancel_agent(
+            &mut app,
+            &state_handle,
+            &task_slot,
+            &agent_done,
+            &agent_busy,
+        )
+        .await
+        .unwrap();
+
+        assert!(task_state.lock().await.is_cancelled_atomic.load(Ordering::Acquire));
     }
 }

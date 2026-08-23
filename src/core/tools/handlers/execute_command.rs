@@ -1123,7 +1123,7 @@ impl ExecuteCommandHandler {
     ) -> anyhow::Result<String> {
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
-        self.execute_script_with_timeout(script, language, cwd, None, false, &output_writer)
+        self.execute_script_with_timeout(script, language, cwd, None, false, None, &output_writer)
             .await
     }
 
@@ -1134,6 +1134,7 @@ impl ExecuteCommandHandler {
         cwd: Option<&Path>,
         timeout_override: Option<Duration>,
         explicitly_approved: bool,
+        task_state: Option<Arc<Mutex<TaskState>>>,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
@@ -1203,6 +1204,17 @@ impl ExecuteCommandHandler {
         #[cfg(unix)]
         let child_pid = child.id().unwrap_or(0) as i32;
 
+        // Scripts run in their own process group, just like command arrays.
+        // Register that group so Ctrl+C can terminate a script even though the
+        // agent task itself is aborted while it awaits the child.
+        #[cfg(unix)]
+        if child_pid != 0
+            && let Some(ref state) = task_state
+        {
+            state.lock().await.running_command_pids.push(child_pid);
+            tracing::debug!("Registered script PID {} for cancellation", child_pid);
+        }
+
         let stdout = child
             .stdout
             .take()
@@ -1229,7 +1241,10 @@ impl ExecuteCommandHandler {
 
                 (status, stdout, stderr)
             }
-            Ok(Err(e)) => return Err(anyhow::anyhow!("Script failed to execute: {e}")),
+            Ok(Err(e)) => {
+                Self::unregister_command_pid(&task_state, child_pid).await;
+                return Err(anyhow::anyhow!("Script failed to execute: {e}"));
+            }
             Err(_) => {
                 // Kill the entire process group to ensure grandchildren are terminated
                 #[cfg(unix)]
@@ -1247,6 +1262,7 @@ impl ExecuteCommandHandler {
                     let _ = child.kill().await;
                 }
                 let _ = child.wait().await;
+                Self::unregister_command_pid(&task_state, child_pid).await;
                 let stdout = stdout_task
                     .await
                     .ok()
@@ -1296,6 +1312,8 @@ impl ExecuteCommandHandler {
 
         let combined = assemble_sandboxed_output(combined, &env_report, command_output_limit());
 
+        Self::unregister_command_pid(&task_state, child_pid).await;
+
         if !combined.is_empty() {
             use crate::cli::output::OutputEvent;
             output_writer.emit(OutputEvent::RawAnsi(combined.clone()));
@@ -1305,6 +1323,22 @@ impl ExecuteCommandHandler {
             Err(anyhow::anyhow!(combined))
         } else {
             Ok(combined)
+        }
+    }
+
+    async fn unregister_command_pid(task_state: &Option<Arc<Mutex<TaskState>>>, child_pid: i32) {
+        #[cfg(unix)]
+        if child_pid != 0
+            && let Some(state) = task_state
+        {
+            let mut state = state.lock().await;
+            if let Some(position) = state
+                .running_command_pids
+                .iter()
+                .position(|pid| *pid == child_pid)
+            {
+                state.running_command_pids.remove(position);
+            }
         }
     }
     fn build_sandbox_env(
@@ -1466,6 +1500,7 @@ impl ExecuteCommandHandler {
                 cwd,
                 None,
                 explicitly_approved,
+                task_state,
                 output_writer,
             )
             .await
@@ -1894,6 +1929,48 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn test_execute_script_registers_process_group_for_cancellation() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let run_state = Arc::clone(&state);
+        let run = tokio::spawn(async move {
+            handler
+                .execute_script_with_timeout(
+                    "sleep 300",
+                    "bash",
+                    None,
+                    Some(Duration::from_secs(10)),
+                    false,
+                    Some(run_state),
+                    &output_writer,
+                )
+                .await
+        });
+
+        let pid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(pid) = state.lock().await.running_command_pids.first().copied() {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("script process group should be registered");
+
+        crate::core::cancellation::terminate_process_group(pid, Duration::from_millis(10)).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("terminated script should return")
+            .expect("script task should not panic");
+        assert!(result.is_err());
+        assert!(state.lock().await.running_command_pids.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_execute_script_timeout_kills_child() {
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1909,6 +1986,7 @@ mod tests {
                 None,
                 Some(Duration::from_millis(100)),
                 false,
+                None,
                 &output_writer,
             )
             .await;
@@ -2152,6 +2230,7 @@ mod tests {
                     None,
                     Some(Duration::from_millis(200)),
                     false,
+                    None,
                     &output_writer,
                 )
                 .await;
