@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use streaming_iterator::StreamingIterator;
 use tokio::fs;
+use tokio::sync::Mutex;
 
 pub struct RenameSymbolHandler {
     symbol_index_service: Option<Arc<std::sync::Mutex<SymbolIndexService>>>,
@@ -56,6 +57,12 @@ struct FileData {
 }
 
 impl RenameSymbolHandler {
+    async fn increment_mistakes(state: &Arc<Mutex<TaskState>>) -> u32 {
+        let mut state = state.lock().await;
+        state.consecutive_mistakes += 1;
+        state.consecutive_mistakes
+    }
+
     async fn execute_with_workspace_root(
         &self,
         state: &mut TaskState,
@@ -73,6 +80,28 @@ impl RenameSymbolHandler {
         workspace_root: &Path,
         allowed_external_roots: &[std::path::PathBuf],
     ) -> Result<String, ToolError> {
+        let shared_state = Arc::new(Mutex::new(std::mem::take(state)));
+        let result = self
+            .execute_with_shared_state(
+                shared_state.clone(),
+                params,
+                workspace_root,
+                allowed_external_roots,
+            )
+            .await;
+        *state = Arc::try_unwrap(shared_state)
+            .expect("rename symbol state should have no remaining owners")
+            .into_inner();
+        result
+    }
+
+    async fn execute_with_shared_state(
+        &self,
+        state: Arc<Mutex<TaskState>>,
+        params: serde_json::Value,
+        workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
+    ) -> Result<String, ToolError> {
         let paths = read_string_list(&params, "paths", "path");
         let existing_symbol = params
             .get("existing_symbol")
@@ -86,36 +115,36 @@ impl RenameSymbolHandler {
             .unwrap_or("");
 
         if paths.is_empty() {
-            state.consecutive_mistakes += 1;
+            let consecutive_mistakes = Self::increment_mistakes(&state).await;
             tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
+                consecutive_mistakes,
                 "rename_symbol: missing required parameter 'paths'"
             );
             return Err(ToolError::InvalidInput(error_guidance::missing_parameter(
                 "paths",
-                state.consecutive_mistakes,
+                consecutive_mistakes,
             )));
         }
         if existing_symbol.is_empty() {
-            state.consecutive_mistakes += 1;
+            let consecutive_mistakes = Self::increment_mistakes(&state).await;
             tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
+                consecutive_mistakes,
                 "rename_symbol: missing required parameter 'existing_symbol'"
             );
             return Err(ToolError::InvalidInput(error_guidance::missing_parameter(
                 "existing_symbol",
-                state.consecutive_mistakes,
+                consecutive_mistakes,
             )));
         }
         if new_symbol.is_empty() {
-            state.consecutive_mistakes += 1;
+            let consecutive_mistakes = Self::increment_mistakes(&state).await;
             tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
+                consecutive_mistakes,
                 "rename_symbol: missing required parameter 'new_symbol'"
             );
             return Err(ToolError::InvalidInput(error_guidance::missing_parameter(
                 "new_symbol",
-                state.consecutive_mistakes,
+                consecutive_mistakes,
             )));
         }
 
@@ -135,9 +164,9 @@ impl RenameSymbolHandler {
                     file_contents.insert(abs_path.clone(), content);
                 }
                 Err(e) => {
-                    state.consecutive_mistakes += 1;
+                    let consecutive_mistakes = Self::increment_mistakes(&state).await;
                     tracing::warn!(
-                        consecutive_mistakes = state.consecutive_mistakes,
+                        consecutive_mistakes,
                         error = %e,
                         "rename_symbol: failed to read file"
                     );
@@ -256,7 +285,7 @@ impl RenameSymbolHandler {
         }
 
         if locations_by_file.is_empty() {
-            state.consecutive_mistakes = 0;
+            state.lock().await.consecutive_mistakes = 0;
             return Ok(format!(
                 "No occurrences of symbol '{existing_symbol}' found in the specified paths.",
             ));
@@ -310,6 +339,8 @@ impl RenameSymbolHandler {
                     Ok(()) => {
                         // Mark file as edited by Sned to suppress stale mtime detection
                         state
+                            .lock()
+                            .await
                             .file_context_tracker
                             .mark_file_as_edited_by_sned(std::path::Path::new(&abs_path));
                         if let Some(symbol_index_service) = &self.symbol_index_service {
@@ -328,9 +359,9 @@ impl RenameSymbolHandler {
                         }
                     }
                     Err(e) => {
-                        state.consecutive_mistakes += 1;
+                        let consecutive_mistakes = Self::increment_mistakes(&state).await;
                         tracing::warn!(
-                            consecutive_mistakes = state.consecutive_mistakes,
+                            consecutive_mistakes,
                             error = %e,
                             "rename_symbol: failed to write file"
                         );
@@ -355,7 +386,7 @@ impl RenameSymbolHandler {
             ));
         }
 
-        state.consecutive_mistakes = 0;
+        state.lock().await.consecutive_mistakes = 0;
         Ok(format!(
             "Successfully renamed symbol '{}' to '{}' ({} occurrences in {} files).\n\n{}",
             existing_symbol,
@@ -393,10 +424,24 @@ impl ToolHandler for RenameSymbolHandler {
         let handler = self;
         let ctx = ctx.clone();
         Box::pin(async move {
-            let mut state = ctx.state.lock().await;
+            let requested_paths = read_string_list(&params, "paths", "path");
+            let expanded_paths = expand_paths_with_allowed_roots(
+                &requested_paths,
+                &ctx.workspace_root,
+                &ctx.allowed_external_roots,
+            )
+            .await?;
+            let _file_locks = ctx
+                .lock_file_paths(
+                    &expanded_paths
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>(),
+                )
+                .await;
             handler
-                .execute_with_path_roots(
-                    &mut state,
+                .execute_with_shared_state(
+                    ctx.state.clone(),
                     params,
                     ctx.workspace_root.as_path(),
                     &ctx.allowed_external_roots,

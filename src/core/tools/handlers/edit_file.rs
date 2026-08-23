@@ -683,12 +683,29 @@ impl EditFileHandler {
             // Acquire exclusive file lock to prevent concurrent edits
             let _file_guard = FileEditGuard::acquire(&batch.absolute_path).await;
 
-            let stale_warning = {
+            let stale_check = {
                 let mut state_guard = state.lock().await;
                 state_guard
                     .file_context_tracker
-                    .check_stale(Path::new(&batch.absolute_path))
+                    .begin_stale_check(Path::new(&batch.absolute_path))
+            };
+            let current_mtime = if stale_check.is_some() {
+                tokio::fs::metadata(&batch.absolute_path)
                     .await
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+            } else {
+                None
+            };
+            let stale_warning = if let Some(check) = stale_check {
+                let mut state_guard = state.lock().await;
+                state_guard.file_context_tracker.finish_stale_check(
+                    Path::new(&batch.absolute_path),
+                    check,
+                    current_mtime,
+                )
+            } else {
+                None
             };
             if stale_warning.is_some() {
                 Self::mark_must_reread(state, &batch.absolute_path).await;

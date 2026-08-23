@@ -1144,7 +1144,9 @@ impl AgentLoop {
 
         // Record environment snapshot for task metadata
         if let Some(ref tracker) = self.env_tracker {
-            let _ = tracker.record_environment();
+            if let Err(e) = tracker.record_environment() {
+                warn!(error = %e, "Failed to record environment snapshot");
+            }
         }
 
         // Initialize shadow git repo for change tracking
@@ -1822,7 +1824,9 @@ impl AgentLoop {
                 crate::core::agent_types::AgentMode::Plan => "plan",
                 crate::core::agent_types::AgentMode::Act => "act",
             };
-            let _ = tracker.record_model_usage(&provider_id, &model_id, mode);
+            if let Err(e) = tracker.record_model_usage(&provider_id, &model_id, mode) {
+                warn!(error = %e, "Failed to record model usage");
+            }
         }
 
         // 3. Select tool profile and build tool definitions
@@ -4110,21 +4114,21 @@ impl AgentLoop {
             })
         };
         let plan_active = self.plan_execution_active().await;
-        let is_completion = (prepared_tool_calls.iter().any(|prepared| {
+        let completion_candidate = prepared_tool_calls.iter().any(|prepared| {
             matches!(
                 SnedTool::from_name(&prepared.tool_name),
                 Some(SnedTool::AttemptCompletion)
             )
-        }) || text_only_completes_task)
+        }) || text_only_completes_task;
+        let plan_mode_responded = prepared_tool_calls.iter().any(|prepared| {
+            matches!(
+                SnedTool::from_name(&prepared.tool_name),
+                Some(SnedTool::PlanModeRespond)
+            )
+        });
+        let is_completion = (completion_candidate || (tool_failure_count == 0 && plan_mode_responded))
             && !plan_active
-            && !plan_blocks_completion
-            || (tool_failure_count == 0
-                && prepared_tool_calls.iter().any(|prepared| {
-                    matches!(
-                        SnedTool::from_name(&prepared.tool_name),
-                        Some(SnedTool::PlanModeRespond)
-                    )
-                }));
+            && !plan_blocks_completion;
 
         if self.config.json_output
             && let Some(event) = Self::synthetic_json_completion_event(
@@ -4492,7 +4496,17 @@ impl AgentLoop {
         let rules = context
             .local_agents_rules_file_instructions
             .get_or_insert_with(|| "# AGENTS.md Rules".to_string());
-        let canonical_workspace_root = workspace_root.canonicalize().ok();
+        let canonical_workspace_root = match workspace_root.canonicalize() {
+            Ok(root) => Some(root),
+            Err(error) => {
+                warn!(
+                    workspace = %workspace_root.display(),
+                    error = %error,
+                    "Failed to canonicalize workspace root while formatting AGENTS.md rules"
+                );
+                None
+            }
+        };
         for rule_file in &additions {
             let relative = rule_file
                 .path
@@ -4654,9 +4668,15 @@ impl AgentLoop {
         message_counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> ToolExecutionOutput {
         let mut params_for_execution = tool_params.clone();
-        let _ = if let Some(ref hook_mgr) = hook_manager {
+        if let Some(ref hook_mgr) = hook_manager {
             let pre_result = hook_mgr.pre_tool_use(&config.task_id, tool_name, tool_params);
+            if let Some(error) = pre_result.error.as_deref() {
+                warn!(tool = tool_name, error, "PreToolUse hook reported an error");
+            }
             if let Some(output) = pre_result.output {
+                if let Some(error) = output.error_message.as_deref() {
+                    warn!(tool = tool_name, error, "PreToolUse hook returned an error");
+                }
                 if output.cancel == Some(true) {
                     return ToolExecutionOutput::error(
                         format!("Tool '{tool_name}' was cancelled by PreToolUse hook."),
@@ -4679,13 +4699,8 @@ impl AgentLoop {
                     });
                     drop(history);
                 }
-                true
-            } else {
-                false
             }
-        } else {
-            false
-        };
+        }
 
         if tool_name == "condense" {
             let history = conversation_history.lock().await;
@@ -5164,14 +5179,39 @@ impl AgentLoop {
                         && let Ok(canonical) = full_path.canonicalize()
                         && let Some(path_str) = canonical.to_str()
                     {
-                        let mut state = self.state.lock().await;
-                        state
-                            .file_context_tracker
-                            .track_file_context(
+                        let (task_id, file_context_metadata) = {
+                            let mut state = self.state.lock().await;
+                            state.file_context_tracker.track_file_context_in_memory_at_path(
                                 path_str,
                                 crate::core::context::trackers::FileRecordSource::FileMentioned,
+                                &canonical,
+                            );
+                            (
+                                state.file_context_tracker.task_id().map(str::to_owned),
+                                state.file_context_tracker.files_in_context().to_vec(),
                             )
-                            .await;
+                        };
+
+                        if let Some(task_id) = task_id {
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let storage = crate::storage::task_storage::TaskStorage::new(
+                                        &task_id,
+                                    )?;
+                                    storage.save_file_context_metadata(&file_context_metadata)
+                                })
+                                .await;
+                                match result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        warn!(error = %e, "Failed to persist file context metadata")
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "File context metadata task failed")
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
             }

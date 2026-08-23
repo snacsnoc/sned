@@ -10,6 +10,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::sync::Mutex;
 
 struct FileBatch {
     absolute_path: String,
@@ -31,6 +32,12 @@ pub struct ReplaceSymbolHandler {
 }
 
 impl ReplaceSymbolHandler {
+    async fn increment_mistakes(state: &Arc<Mutex<TaskState>>) -> u32 {
+        let mut state = state.lock().await;
+        state.consecutive_mistakes += 1;
+        state.consecutive_mistakes
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -69,16 +76,38 @@ impl ReplaceSymbolHandler {
         workspace_root: &Path,
         allowed_external_roots: &[std::path::PathBuf],
     ) -> Result<String, ToolError> {
+        let shared_state = Arc::new(Mutex::new(std::mem::take(state)));
+        let result = self
+            .execute_with_shared_state(
+                shared_state.clone(),
+                params,
+                workspace_root,
+                allowed_external_roots,
+            )
+            .await;
+        *state = Arc::try_unwrap(shared_state)
+            .expect("replace symbol state should have no remaining owners")
+            .into_inner();
+        result
+    }
+
+    async fn execute_with_shared_state(
+        &self,
+        state: Arc<Mutex<TaskState>>,
+        params: serde_json::Value,
+        workspace_root: &Path,
+        allowed_external_roots: &[std::path::PathBuf],
+    ) -> Result<String, ToolError> {
         let replacements = read_replacements(&params);
         if replacements.is_empty() {
-            state.consecutive_mistakes += 1;
+            let consecutive_mistakes = Self::increment_mistakes(&state).await;
             tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
+                consecutive_mistakes,
                 "replace_symbol: no replacements provided"
             );
             return Err(ToolError::InvalidInput(error_guidance::missing_parameter(
                 "replacements",
-                state.consecutive_mistakes,
+                consecutive_mistakes,
             )));
         }
 
@@ -92,11 +121,13 @@ impl ReplaceSymbolHandler {
         let mut any_error = None;
 
         for batch in batches.values() {
-            match process_batch(batch, self.symbol_index_service.as_ref(), state).await {
+            match process_batch(batch, self.symbol_index_service.as_ref(), &state).await {
                 Ok(result) => {
                     // Mark only after the write succeeds; failed batches must
                     // remain eligible for stale-file detection.
                     state
+                        .lock()
+                        .await
                         .file_context_tracker
                         .mark_file_as_edited_by_sned(std::path::Path::new(&batch.absolute_path));
                     file_results.push(result);
@@ -115,9 +146,9 @@ impl ReplaceSymbolHandler {
         // If any error occurred, return an error that includes partial results
         if let Some(err) = any_error {
             if file_results.is_empty() {
-                state.consecutive_mistakes += 1;
+                let consecutive_mistakes = Self::increment_mistakes(&state).await;
                 tracing::warn!(
-                    consecutive_mistakes = state.consecutive_mistakes,
+                    consecutive_mistakes,
                     error = %err,
                     "replace_symbol: batch processing failed"
                 );
@@ -126,9 +157,9 @@ impl ReplaceSymbolHandler {
 
             // Partial success: return results for files that succeeded,
             // but also include the error so the model knows what failed.
-            state.consecutive_mistakes += 1;
+            let consecutive_mistakes = Self::increment_mistakes(&state).await;
             tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
+                consecutive_mistakes,
                 error = %err,
                 partial_results = file_results.len(),
                 "replace_symbol: partial batch success"
@@ -160,11 +191,8 @@ impl ReplaceSymbolHandler {
         }
 
         if file_results.is_empty() {
-            state.consecutive_mistakes += 1;
-            tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
-                "replace_symbol: no files processed"
-            );
+            let consecutive_mistakes = Self::increment_mistakes(&state).await;
+            tracing::warn!(consecutive_mistakes, "replace_symbol: no files processed");
             return Err(ToolError::ExecutionFailed(
                 "No replacements could be processed".to_string(),
             ));
@@ -174,15 +202,15 @@ impl ReplaceSymbolHandler {
         let total_failed: usize = file_results.iter().map(|r| r.replacements_failed).sum();
 
         if total_failed > 0 {
-            state.consecutive_mistakes += 1;
+            let consecutive_mistakes = Self::increment_mistakes(&state).await;
             tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
+                consecutive_mistakes,
                 total_failed = total_failed,
                 total_applied = total_applied,
                 "replace_symbol: replacements failed"
             );
         } else if total_applied > 0 {
-            state.consecutive_mistakes = 0;
+            state.lock().await.consecutive_mistakes = 0;
         }
 
         let summaries: Vec<String> = file_results
@@ -227,10 +255,22 @@ impl ToolHandler for ReplaceSymbolHandler {
         let handler = self;
         let ctx = ctx.clone();
         Box::pin(async move {
-            let mut state = ctx.state.lock().await;
+            let batches = group_replacements_by_file_with_allowed_roots(
+                read_replacements(&params),
+                &ctx.workspace_root,
+                &ctx.allowed_external_roots,
+            )?;
+            let _file_locks = ctx
+                .lock_file_paths(
+                    &batches
+                        .values()
+                        .map(|batch| std::path::PathBuf::from(&batch.absolute_path))
+                        .collect::<Vec<_>>(),
+                )
+                .await;
             handler
-                .execute_with_path_roots(
-                    &mut state,
+                .execute_with_shared_state(
+                    ctx.state.clone(),
                     params,
                     ctx.workspace_root.as_path(),
                     &ctx.allowed_external_roots,
@@ -353,7 +393,7 @@ fn group_replacements_by_file_with_allowed_roots(
 async fn process_batch(
     batch: &FileBatch,
     symbol_index_service: Option<&Arc<std::sync::Mutex<SymbolIndexService>>>,
-    state: &mut TaskState,
+    state: &Arc<Mutex<TaskState>>,
 ) -> Result<FileResult, ToolError> {
     let original_content = fs::read_to_string(&batch.absolute_path)
         .await
@@ -434,9 +474,9 @@ async fn process_batch(
         if let Some(range) = resolved_range {
             resolved_replacements.push((r.clone(), range));
         } else {
-            state.consecutive_mistakes += 1;
+            let consecutive_mistakes = ReplaceSymbolHandler::increment_mistakes(state).await;
             return Err(ToolError::ExecutionFailed(
-                error_guidance::symbol_not_found(&r.symbol, &r.path, state.consecutive_mistakes),
+                error_guidance::symbol_not_found(&r.symbol, &r.path, consecutive_mistakes),
             ));
         }
     }
@@ -445,7 +485,7 @@ async fn process_batch(
 
     for i in 0..resolved_replacements.len().saturating_sub(1) {
         if resolved_replacements[i].1.end_index > resolved_replacements[i + 1].1.start_index {
-            state.consecutive_mistakes += 1;
+            let consecutive_mistakes = ReplaceSymbolHandler::increment_mistakes(state).await;
             let symbols = vec![
                 resolved_replacements[i].0.symbol.as_str(),
                 resolved_replacements[i + 1].0.symbol.as_str(),
@@ -454,7 +494,7 @@ async fn process_batch(
                 error_guidance::overlapping_replacements(
                     &symbols,
                     &batch.display_path,
-                    state.consecutive_mistakes,
+                    consecutive_mistakes,
                 ),
             ));
         }
@@ -736,10 +776,12 @@ mod tests {
             ]
         });
 
-        assert!(handler
-            .execute_with_workspace_root(&mut state, params, workspace_root)
-            .await
-            .is_err());
+        assert!(
+            handler
+                .execute_with_workspace_root(&mut state, params, workspace_root)
+                .await
+                .is_err()
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         std::fs::write(&path, "fn changed() {}\n").unwrap();

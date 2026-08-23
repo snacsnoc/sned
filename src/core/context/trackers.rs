@@ -224,6 +224,13 @@ pub struct FileContextTracker {
     files_in_context: Vec<FileMetadataEntry>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StaleCheck {
+    RecentlyEdited,
+    WatcherModified,
+    Mtime { last_tracked: SystemTime },
+}
+
 impl Default for FileContextTracker {
     fn default() -> Self {
         Self {
@@ -270,7 +277,7 @@ impl FileContextTracker {
     /// Initialize the file watcher. Call this during agent loop startup.
     pub fn init_watcher(&mut self) -> Result<(), notify::Error> {
         if self.file_watcher.is_none() {
-            self.file_watcher = FileWatcher::new().ok();
+            self.file_watcher = Some(FileWatcher::new()?);
         }
         Ok(())
     }
@@ -314,6 +321,19 @@ impl FileContextTracker {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(path));
         self.track_file(&path_buf);
+    }
+
+    /// Record context metadata using an already-resolved path, avoiding a
+    /// second canonicalization for callers that already performed it outside
+    /// their state-lock critical section.
+    pub fn track_file_context_in_memory_at_path(
+        &mut self,
+        path: &str,
+        source: FileRecordSource,
+        watched_path: &Path,
+    ) {
+        self.add_file_to_file_context_tracker(path, source);
+        self.track_file(watched_path);
     }
 
     /// Add a file to the metadata tracker with the given source.
@@ -425,52 +445,66 @@ impl FileContextTracker {
     /// Check if a file has been modified externally since it was last read.
     /// Returns an optional warning message.
     pub async fn check_stale(&mut self, path: &Path) -> Option<String> {
-        let path_buf = path.to_path_buf();
-
-        // If we recently edited this file, clear the flag and skip the check
-        if self.recently_edited_by_sned.remove(&path_buf) {
-            // Update the tracked mtime to the current one so subsequent checks
-            // don't trigger on our own edit
-            if let Ok(metadata) = tokio::fs::metadata(path).await
-                && let Ok(mtime) = metadata.modified()
-            {
-                self.tracked_files.insert(path_buf.clone(), mtime);
-            }
-            // Also clear any watcher event for this file since we expect it to change
-            if let Some(ref watcher) = self.file_watcher {
-                let _ = watcher.take_modified(&path_buf);
-            }
-            return None;
-        }
-
-        // Check watcher-based real-time detection first
-        if let Some(ref watcher) = self.file_watcher
-            && watcher.take_modified(&path_buf)
-        {
-            // Update tracked mtime so subsequent checks don't re-trigger
-            if let Ok(metadata) = tokio::fs::metadata(path).await
-                && let Ok(mtime) = metadata.modified()
-            {
-                self.tracked_files.insert(path_buf.clone(), mtime);
-            }
-            return Some("Warning: File was modified externally since it was last read. \
-                     The file content may have changed. Consider re-reading the file before editing.\n\n".to_string());
-        }
-
-        // Fall back to mtime polling
-        let last_tracked = self.tracked_files.get(&path_buf)?;
-
+        let check = self.begin_stale_check(path)?;
         let current_mtime = tokio::fs::metadata(path)
             .await
             .ok()
-            .and_then(|m| m.modified().ok())?;
+            .and_then(|metadata| metadata.modified().ok());
+        self.finish_stale_check(path, check, current_mtime)
+    }
 
-        if current_mtime > *last_tracked {
-            // File was modified externally
-            Some("Warning: File was modified externally since it was last read. \
-                 The file content may have changed. Consider re-reading the file before editing.\n\n".to_string())
-        } else {
-            None
+    /// Begin a stale check while holding the tracker state briefly.
+    pub(crate) fn begin_stale_check(&mut self, path: &Path) -> Option<StaleCheck> {
+        let path_buf = path.to_path_buf();
+        if self.recently_edited_by_sned.remove(&path_buf) {
+            return Some(StaleCheck::RecentlyEdited);
+        }
+        if let Some(ref watcher) = self.file_watcher
+            && watcher.take_modified(&path_buf)
+        {
+            return Some(StaleCheck::WatcherModified);
+        }
+        self.tracked_files
+            .get(&path_buf)
+            .copied()
+            .map(|last_tracked| StaleCheck::Mtime { last_tracked })
+    }
+
+    /// Finish a stale check after metadata I/O has completed.
+    pub(crate) fn finish_stale_check(
+        &mut self,
+        path: &Path,
+        check: StaleCheck,
+        current_mtime: Option<SystemTime>,
+    ) -> Option<String> {
+        let path_buf = path.to_path_buf();
+        match check {
+            StaleCheck::RecentlyEdited => {
+                if let Some(mtime) = current_mtime {
+                    self.tracked_files.insert(path_buf.clone(), mtime);
+                }
+                if let Some(ref watcher) = self.file_watcher {
+                    let _ = watcher.take_modified(&path_buf);
+                }
+                None
+            }
+            StaleCheck::WatcherModified => {
+                if let Some(mtime) = current_mtime {
+                    self.tracked_files.insert(path_buf, mtime);
+                }
+                Some(
+                    "Warning: File was modified externally since it was last read. \
+                     The file content may have changed. Consider re-reading the file before editing.\n\n"
+                        .to_string(),
+                )
+            }
+            StaleCheck::Mtime { last_tracked } => current_mtime
+                .filter(|mtime| *mtime > last_tracked)
+                .map(|_| {
+                    "Warning: File was modified externally since it was last read. \
+                    The file content may have changed. Consider re-reading the file before editing.\n\n"
+                        .to_string()
+                }),
         }
     }
 

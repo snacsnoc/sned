@@ -13,7 +13,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
@@ -568,10 +568,17 @@ impl DiagnosticsScanHandler {
         workspace_root: &std::path::Path,
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
-        self.execute_with_external_roots(state, workspace_root, &[], params)
-            .await
+        let shared_state = Arc::new(tokio::sync::Mutex::new(std::mem::take(state)));
+        let result = self
+            .execute_with_shared_state(shared_state.clone(), workspace_root, &[], params)
+            .await;
+        *state = Arc::try_unwrap(shared_state)
+            .expect("diagnostics scan state should have no remaining owners")
+            .into_inner();
+        result
     }
 
+    #[cfg(test)]
     async fn execute_with_external_roots(
         &self,
         state: &mut TaskState,
@@ -579,8 +586,31 @@ impl DiagnosticsScanHandler {
         allowed_external_roots: &[PathBuf],
         params: serde_json::Value,
     ) -> Result<String, ToolError> {
+        let shared_state = Arc::new(tokio::sync::Mutex::new(std::mem::take(state)));
+        let result = self
+            .execute_with_shared_state(
+                shared_state.clone(),
+                workspace_root,
+                allowed_external_roots,
+                params,
+            )
+            .await;
+        *state = Arc::try_unwrap(shared_state)
+            .expect("diagnostics scan state should have no remaining owners")
+            .into_inner();
+        result
+    }
+
+    async fn execute_with_shared_state(
+        &self,
+        state: Arc<tokio::sync::Mutex<TaskState>>,
+        workspace_root: &std::path::Path,
+        allowed_external_roots: &[PathBuf],
+        params: serde_json::Value,
+    ) -> Result<String, ToolError> {
         let paths = crate::core::tools::coerce_string_array(&params, "paths", "path");
         if paths.is_empty() {
+            let mut state = state.lock().await;
             state.consecutive_mistakes += 1;
             tracing::warn!(
                 consecutive_mistakes = state.consecutive_mistakes,
@@ -591,7 +621,7 @@ impl DiagnosticsScanHandler {
             ));
         }
 
-        state.consecutive_mistakes = 0;
+        state.lock().await.consecutive_mistakes = 0;
 
         // Group files by (project_root, project_type) to handle mixed-language projects.
         // This ensures Rust and JS files at the same root both get their respective diagnostics.
@@ -720,10 +750,9 @@ impl ToolHandler for DiagnosticsScanHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            let mut state = ctx.state.lock().await;
-            Self::execute_with_external_roots(
+            Self::execute_with_shared_state(
                 &handler,
-                &mut state,
+                ctx.state.clone(),
                 &ctx.workspace_root,
                 &ctx.allowed_external_roots,
                 params,
