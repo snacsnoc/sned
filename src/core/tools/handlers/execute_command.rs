@@ -451,7 +451,16 @@ impl ExecuteCommandHandler {
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
         // Default: apply safety checks (not explicitly approved)
-        self.execute_commands_with_timeout(commands, cwd, None, false, None, false, &output_writer)
+        self.execute_commands_with_timeout(
+            commands,
+            cwd,
+            None,
+            false,
+            None,
+            None,
+            false,
+            &output_writer,
+        )
             .await
     }
 
@@ -467,6 +476,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         session_command_scope_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
@@ -486,6 +496,7 @@ impl ExecuteCommandHandler {
             None,
             explicitly_approved || session_command_scope_approved,
             task_state,
+            cancellation_flag,
             json_output,
             output_writer,
         )
@@ -499,6 +510,7 @@ impl ExecuteCommandHandler {
         timeout_override: Option<Duration>,
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
@@ -508,6 +520,7 @@ impl ExecuteCommandHandler {
             timeout_override,
             explicitly_approved,
             task_state,
+            cancellation_flag,
             json_output,
             output_writer,
         )
@@ -521,6 +534,7 @@ impl ExecuteCommandHandler {
         timeout_override: Option<Duration>,
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
@@ -743,10 +757,16 @@ impl ExecuteCommandHandler {
                     // Periodic cancellation check to allow Ctrl+C to interrupt long-running commands
                     () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                         // Check cancellation flag using try_lock (synchronous)
-                        let is_cancelled = task_state
-                            .as_ref()
-                            .and_then(|s| s.try_lock().ok())
-                            .is_some_and(|state| state.is_cancelled_atomic.load(std::sync::atomic::Ordering::Acquire));
+                        let is_cancelled = cancellation_flag.as_ref().is_some_and(|flag| {
+                            flag.load(std::sync::atomic::Ordering::Acquire)
+                        }) || cancellation_flag.is_none()
+                            && task_state.as_ref().is_some_and(|s| {
+                                s.try_lock().ok().is_some_and(|state| {
+                                    state.is_cancelled_atomic.load(
+                                        std::sync::atomic::Ordering::Acquire,
+                                    )
+                                })
+                            });
                         if is_cancelled {
                             // Kill the process group on cancellation
                             #[cfg(unix)]
@@ -1123,8 +1143,17 @@ impl ExecuteCommandHandler {
     ) -> anyhow::Result<String> {
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
-        self.execute_script_with_timeout(script, language, cwd, None, false, None, &output_writer)
-            .await
+        self.execute_script_with_timeout(
+            script,
+            language,
+            cwd,
+            None,
+            false,
+            None,
+            None,
+            &output_writer,
+        )
+        .await
     }
 
     async fn execute_script_with_timeout(
@@ -1135,6 +1164,7 @@ impl ExecuteCommandHandler {
         timeout_override: Option<Duration>,
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
@@ -1228,7 +1258,45 @@ impl ExecuteCommandHandler {
         let stdout_task = tokio::spawn(capture_async(stdout, output_limit));
         let stderr_task = tokio::spawn(capture_async(stderr, output_limit));
 
-        let output = match timeout(timeout_duration, child.wait()).await {
+        let wait_result = timeout(timeout_duration, async {
+            loop {
+                tokio::select! {
+                    result = child.wait() => break result.map_err(anyhow::Error::from),
+                    () = tokio::time::sleep(Duration::from_millis(500)) => {
+                        let is_cancelled = cancellation_flag.as_ref().is_some_and(|flag| {
+                            flag.load(std::sync::atomic::Ordering::Acquire)
+                        }) || cancellation_flag.is_none()
+                            && task_state.as_ref().is_some_and(|s| {
+                                s.try_lock().ok().is_some_and(|state| {
+                                    state.is_cancelled_atomic.load(
+                                        std::sync::atomic::Ordering::Acquire,
+                                    )
+                                })
+                            });
+                        if is_cancelled {
+                            #[cfg(unix)]
+                            if child_pid > 0 {
+                                crate::core::cancellation::terminate_process_group(
+                                    child_pid,
+                                    Duration::from_millis(100),
+                                )
+                                .await;
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = child.kill().await;
+                            }
+                            let _ = child.wait().await;
+                            Self::unregister_command_pid(&task_state, child_pid).await;
+                            return Err(anyhow::anyhow!("Script cancelled by user"));
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        let output = match wait_result {
             Ok(Ok(status)) => {
                 let stdout = stdout_task
                     .await
@@ -1242,6 +1310,9 @@ impl ExecuteCommandHandler {
                 (status, stdout, stderr)
             }
             Ok(Err(e)) => {
+                if e.to_string() == "Script cancelled by user" {
+                    return Err(e);
+                }
                 Self::unregister_command_pid(&task_state, child_pid).await;
                 return Err(anyhow::anyhow!("Script failed to execute: {e}"));
             }
@@ -1443,6 +1514,7 @@ impl ExecuteCommandHandler {
             false,
             false,
             None,
+            None,
             false,
             &output_writer,
         )
@@ -1457,6 +1529,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         session_command_scope_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
@@ -1488,6 +1561,7 @@ impl ExecuteCommandHandler {
                 explicitly_approved,
                 session_command_scope_approved,
                 task_state,
+                cancellation_flag.clone(),
                 json_output,
                 output_writer,
             )
@@ -1501,6 +1575,7 @@ impl ExecuteCommandHandler {
                 None,
                 explicitly_approved,
                 task_state,
+                cancellation_flag,
                 output_writer,
             )
             .await
@@ -1532,6 +1607,7 @@ impl ToolHandler for ExecuteCommandHandler {
                     ctx.explicitly_approved,
                     ctx.session_command_scope_approved,
                     Some(ctx.state.clone()),
+                    ctx.cancellation_flag.clone(),
                     ctx.json_output,
                     &ctx.output_writer,
                 )
@@ -1606,6 +1682,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
                 false,
                 &output_writer,
             )
@@ -1648,6 +1725,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
                 false,
                 &output_writer,
             )
@@ -1687,6 +1765,7 @@ mod tests {
                     false,
                     false,
                     None,
+                    None,
                     false,
                     &output_writer,
                 )
@@ -1709,6 +1788,7 @@ mod tests {
                 false,
                 true,
                 None,
+                None,
                 true,
                 &output_writer,
             )
@@ -1724,6 +1804,7 @@ mod tests {
                 None,
                 false,
                 true,
+                None,
                 None,
                 true,
                 &output_writer,
@@ -1891,6 +1972,7 @@ mod tests {
                 Some(Duration::from_millis(100)),
                 false,
                 Some(state.clone()),
+                None,
                 false,
                 &output_writer,
             )
@@ -1945,6 +2027,7 @@ mod tests {
                     Some(Duration::from_secs(10)),
                     false,
                     Some(run_state),
+                    None,
                     &output_writer,
                 )
                 .await
@@ -1971,6 +2054,55 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn test_execute_script_cancellation_kills_child_while_state_lock_is_held() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let cancellation_flag = state.lock().await.is_cancelled_atomic.clone();
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let run_state = Arc::clone(&state);
+        let run_flag = Arc::clone(&cancellation_flag);
+        let run = tokio::spawn(async move {
+            handler
+                .execute_script_with_timeout(
+                    "sleep 300",
+                    "bash",
+                    None,
+                    Some(Duration::from_secs(10)),
+                    false,
+                    Some(run_state),
+                    Some(run_flag),
+                    &output_writer,
+                )
+                .await
+        });
+
+        let _pid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.lock().await.running_command_pids.first().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("script process group should be registered");
+
+        let state_guard = state.lock().await;
+        cancellation_flag.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        drop(state_guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("cancelled script should return")
+            .expect("script task should not panic");
+        assert!(result.is_err());
+        assert!(state.lock().await.running_command_pids.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_execute_script_timeout_kills_child() {
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1986,6 +2118,7 @@ mod tests {
                 None,
                 Some(Duration::from_millis(100)),
                 false,
+                None,
                 None,
                 &output_writer,
             )
@@ -2115,6 +2248,7 @@ mod tests {
                 Some(Duration::from_millis(100)),
                 false,
                 None,
+                None,
                 false,
                 &output_writer,
             )
@@ -2173,6 +2307,7 @@ mod tests {
                     Some(Duration::from_millis(100)),
                     false,
                     None,
+                    None,
                     false,
                     &output_writer,
                 )
@@ -2230,6 +2365,7 @@ mod tests {
                     None,
                     Some(Duration::from_millis(200)),
                     false,
+                    None,
                     None,
                     &output_writer,
                 )
@@ -2441,6 +2577,7 @@ mod tests {
             None,
             true,
             None,
+            None,
             false,
             &output_writer,
         ));
@@ -2488,6 +2625,7 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
                 None,
                 false,
                 &output_writer,
@@ -2572,6 +2710,7 @@ mod tests {
                 None,
                 Some(Duration::from_secs(10)),
                 false,
+                None,
                 None,
                 false,
                 &writer,

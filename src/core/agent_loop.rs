@@ -1788,6 +1788,7 @@ impl AgentLoop {
             .cwd
             .clone()
             .map_or_else(|| self.resolve_workspace_root(), std::path::PathBuf::from);
+        let cancellation_flag = self.state.lock().await.is_cancelled_atomic.clone();
         let tool_context = Arc::new(ToolContext::new(
             self.state.clone(),
             self.deps.approval_manager.clone(),
@@ -1798,7 +1799,8 @@ impl AgentLoop {
             self.deps.hook_manager.clone(),
             false, // Initial context: not explicitly approved (approval happens per-tool)
             self.config.output_writer.clone(),
-        ));
+        )
+        .with_cancellation_flag(cancellation_flag));
         let system_prompt = if let Some(prompt) = self.deps.cached_system_prompt.clone() {
             prompt
         } else {
@@ -4701,7 +4703,27 @@ impl AgentLoop {
             }
         }
 
-        match handler.execute(&tool_context, params_for_execution).await {
+        let execute_future = handler.execute(&tool_context, params_for_execution);
+        let execution_result = if !matches!(
+            tool_name,
+            "edit_file" | "write_to_file" | "replace_symbol" | "rename_symbol"
+        ) && let Some(cancellation_flag) = tool_context.cancellation_flag.clone()
+        {
+            tokio::select! {
+                result = execute_future => result,
+                () = async {
+                    while !cancellation_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                } => Err(crate::core::tools::ToolError::ExecutionFailed(
+                    "Tool cancelled by user".to_string(),
+                )),
+            }
+        } else {
+            execute_future.await
+        };
+
+        match execution_result {
             Ok(res) => {
                 let res_text = tool_result_to_text(res);
 
