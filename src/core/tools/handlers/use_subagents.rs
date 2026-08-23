@@ -7,10 +7,13 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::pin::Pin;
+use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncRead;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -21,6 +24,14 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_SUBAGENT_OUTPUT_LIMIT: usize = 1024 * 1024;
 const MAX_SUBAGENT_LINE_BYTES: usize = 64 * 1024;
 const OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
+const COLLECTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const SUBAGENT_CANCELLATION_POLL: Duration = Duration::from_millis(100);
+
+enum SubagentWaitOutcome {
+    Exited(Result<ExitStatus, io::Error>),
+    TimedOut,
+    Cancelled,
+}
 
 fn subagent_output_limit() -> usize {
     std::env::var("SNED_SUBAGENT_OUTPUT_LIMIT")
@@ -269,6 +280,60 @@ impl UseSubagentsHandler {
         collected
     }
 
+    async fn wait_for_cancellation(flag: Arc<AtomicBool>) {
+        while !flag.load(Ordering::Acquire) {
+            tokio::time::sleep(SUBAGENT_CANCELLATION_POLL).await;
+        }
+    }
+
+    async fn stop_subagent(child: &mut tokio::process::Child, child_pid: Option<i32>) {
+        #[cfg(unix)]
+        if let Some(child_pid) = child_pid {
+            crate::core::cancellation::terminate_process_group(
+                child_pid,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        } else {
+            let _ = child.kill().await;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill().await;
+        }
+
+        let _ = timeout(Duration::from_secs(1), child.wait()).await;
+    }
+
+    async fn finish_stream_collector(
+        mut handle: tokio::task::JoinHandle<String>,
+        stream_name: &'static str,
+        subagent_index: usize,
+    ) -> (String, bool) {
+        match timeout(COLLECTOR_SHUTDOWN_TIMEOUT, &mut handle).await {
+            Ok(Ok(output)) => (output, false),
+            Ok(Err(error)) => {
+                tracing::error!(
+                    subagent = subagent_index + 1,
+                    stream = stream_name,
+                    error = %error,
+                    "subagent output collector task failed"
+                );
+                (format!("[subagent {stream_name} collection failed: {error}]"), false)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    subagent = subagent_index + 1,
+                    stream = stream_name,
+                    "subagent output collector did not stop after child exit"
+                );
+                handle.abort();
+                let _ = handle.await;
+                (format!("[subagent {stream_name} collection timed out]"), true)
+            }
+        }
+    }
+
     async fn run_subagent(
         subagent_index: usize,
         prompt: &str,
@@ -276,6 +341,7 @@ impl UseSubagentsHandler {
         max_turns: Option<u32>,
         cwd: &Path,
         task_state: Option<Arc<Mutex<TaskState>>>,
+        cancellation_flag: Option<Arc<AtomicBool>>,
         progress_writer: Option<crate::cli::output::OutputWriterArc>,
     ) -> SubagentResult {
         let mut cmd = Command::new("sned");
@@ -328,6 +394,8 @@ impl UseSubagentsHandler {
 
         #[cfg(unix)]
         let child_pid = child.id().and_then(|pid| i32::try_from(pid).ok());
+        #[cfg(not(unix))]
+        let child_pid = None;
 
         #[cfg(unix)]
         if let Some(child_pid) = child_pid
@@ -361,39 +429,48 @@ impl UseSubagentsHandler {
             ))
         });
 
-        let wait_result = timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+        let wait_result = if let Some(flag) = cancellation_flag {
+            tokio::select! {
+                result = timeout(Duration::from_secs(timeout_secs), child.wait()) => {
+                    match result {
+                        Ok(result) => SubagentWaitOutcome::Exited(result),
+                        Err(_) => SubagentWaitOutcome::TimedOut,
+                    }
+                }
+                _ = Self::wait_for_cancellation(flag) => {
+                    Self::stop_subagent(&mut child, child_pid).await;
+                    SubagentWaitOutcome::Cancelled
+                }
+            }
+        } else {
+            match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+                Ok(result) => SubagentWaitOutcome::Exited(result),
+                Err(_) => SubagentWaitOutcome::TimedOut,
+            }
+        };
 
-        let stdout_buf = match stdout_handle {
-            Some(handle) => match handle.await {
-                Ok(output) => output,
-                Err(error) => {
-                    tracing::error!(
-                        subagent = subagent_index + 1,
-                        error = %error,
-                        "subagent stdout collector task failed"
-                    );
-                    format!("[subagent stdout collection failed: {error}]")
-                }
-            },
-            None => String::new(),
+        if matches!(&wait_result, SubagentWaitOutcome::TimedOut) {
+            Self::stop_subagent(&mut child, child_pid).await;
+        }
+
+        let (stdout_buf, stdout_stalled) = match stdout_handle {
+            Some(handle) => Self::finish_stream_collector(handle, "stdout", subagent_index).await,
+            None => (String::new(), false),
         };
-        let stderr_buf = match stderr_handle {
-            Some(handle) => match handle.await {
-                Ok(output) => output,
-                Err(error) => {
-                    tracing::error!(
-                        subagent = subagent_index + 1,
-                        error = %error,
-                        "subagent stderr collector task failed"
-                    );
-                    format!("[subagent stderr collection failed: {error}]")
-                }
-            },
-            None => String::new(),
+        let (stderr_buf, stderr_stalled) = match stderr_handle {
+            Some(handle) => Self::finish_stream_collector(handle, "stderr", subagent_index).await,
+            None => (String::new(), false),
         };
+
+        if stdout_stalled || stderr_stalled {
+            // A descendant can keep an inherited pipe open after the direct
+            // child exits. Terminate the process group before returning so
+            // repeated subagent calls cannot accumulate orphaned descendants.
+            Self::stop_subagent(&mut child, child_pid).await;
+        }
 
         let result = match wait_result {
-            Ok(Ok(status)) => {
+            SubagentWaitOutcome::Exited(Ok(status)) => {
                 if status.success() {
                     if let Some(ref writer) = progress_writer {
                         use crate::cli::output::OutputEvent;
@@ -432,20 +509,8 @@ impl UseSubagentsHandler {
                     }
                 }
             }
-            Ok(Err(e)) => {
-                #[cfg(unix)]
-                if let Some(child_pid) = child_pid {
-                    crate::core::cancellation::terminate_process_group(
-                        child_pid,
-                        std::time::Duration::from_millis(100),
-                    )
-                    .await;
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = child.kill().await;
-                }
-                let _ = child.wait().await;
+            SubagentWaitOutcome::Exited(Err(e)) => {
+                Self::stop_subagent(&mut child, child_pid).await;
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
                     use crate::cli::tui::theme::ERROR_FG;
@@ -461,24 +526,7 @@ impl UseSubagentsHandler {
                     ..Default::default()
                 }
             }
-            Err(_) => {
-                #[cfg(unix)]
-                {
-                    if let Some(child_pid) = child_pid {
-                        crate::core::cancellation::terminate_process_group(
-                            child_pid,
-                            std::time::Duration::from_millis(100),
-                        )
-                        .await;
-                    } else {
-                        let _ = child.kill().await;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = child.kill().await;
-                }
-                let _ = child.wait().await;
+            SubagentWaitOutcome::TimedOut => {
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
                     use crate::cli::tui::theme::WARNING_FG;
@@ -498,6 +546,11 @@ impl UseSubagentsHandler {
                     ..Default::default()
                 }
             }
+            SubagentWaitOutcome::Cancelled => SubagentResult {
+                status: "cancelled".to_string(),
+                error: Some("Subagent cancelled by user".to_string()),
+                ..Default::default()
+            },
         };
 
         #[cfg(unix)]
@@ -546,6 +599,26 @@ impl UseSubagentsHandler {
         workspace_root: &Path,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
+    ) -> Result<String, ToolError> {
+        self.execute_with_workspace_root_and_cancellation(
+            state,
+            params,
+            workspace_root,
+            json_output,
+            output_writer,
+            None,
+        )
+        .await
+    }
+
+    async fn execute_with_workspace_root_and_cancellation(
+        &self,
+        state: Arc<Mutex<TaskState>>,
+        params: serde_json::Value,
+        workspace_root: &Path,
+        json_output: bool,
+        output_writer: &crate::cli::output::OutputWriterArc,
+        cancellation_flag: Option<Arc<AtomicBool>>,
     ) -> Result<String, ToolError> {
         {
             let mut state = state.lock().await;
@@ -611,45 +684,42 @@ impl UseSubagentsHandler {
                 prompt_count_in_json += 1;
             }
         }
-        if prompt_count_in_json > MAX_SUBAGENT_PROMPTS {
-            let mut state = state.lock().await;
-            state.consecutive_mistakes += 1;
-            tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
-                prompt_count = prompt_count_in_json,
-                max_allowed = MAX_SUBAGENT_PROMPTS,
-                "use_subagents: too many prompts in JSON"
-            );
-            return Err(ToolError::InvalidInput(format!(
-                "Too many subagent prompts provided ({prompt_count_in_json}). Maximum is {MAX_SUBAGENT_PROMPTS}."
-            )));
-        }
-
         let timeout_secs = Self::parse_timeout(&params);
         let max_turns = Self::parse_max_turns(&params);
 
-        if timeout_secs == 0 {
-            let mut state = state.lock().await;
-            state.consecutive_mistakes += 1;
-            tracing::warn!(
-                consecutive_mistakes = state.consecutive_mistakes,
-                "use_subagents: timeout is zero"
-            );
-            return Err(ToolError::InvalidInput(
-                "timeout must be a positive number.".to_string(),
-            ));
-        }
+        let validation_error = if prompt_count_in_json > MAX_SUBAGENT_PROMPTS {
+            Some((
+                format!(
+                    "too many prompts in JSON ({}; maximum {})",
+                    prompt_count_in_json, MAX_SUBAGENT_PROMPTS
+                ),
+                ToolError::InvalidInput(format!(
+                    "Too many subagent prompts provided ({prompt_count_in_json}). Maximum is {MAX_SUBAGENT_PROMPTS}."
+                )),
+            ))
+        } else if timeout_secs == 0 {
+            Some((
+                "timeout is zero".to_string(),
+                ToolError::InvalidInput("timeout must be a positive number.".to_string()),
+            ))
+        } else if max_turns == Some(0) {
+            Some((
+                "max_turns is zero".to_string(),
+                ToolError::InvalidInput("max_turns must be a positive number.".to_string()),
+            ))
+        } else {
+            None
+        };
 
-        if max_turns == Some(0) {
+        if let Some((reason, error)) = validation_error {
             let mut state = state.lock().await;
             state.consecutive_mistakes += 1;
             tracing::warn!(
                 consecutive_mistakes = state.consecutive_mistakes,
-                "use_subagents: max_turns is zero"
+                reason = %reason,
+                "use_subagents: invalid configuration"
             );
-            return Err(ToolError::InvalidInput(
-                "max_turns must be a positive number.".to_string(),
-            ));
+            return Err(error);
         }
 
         {
@@ -679,6 +749,7 @@ impl UseSubagentsHandler {
             let prompt_clone = prompt.clone();
             let cwd_clone = cwd.clone();
             let state_clone = Arc::clone(&state);
+            let cancellation_flag_clone = cancellation_flag.clone();
             let progress_writer_clone = progress_writer.clone();
 
             handles.push((
@@ -691,6 +762,7 @@ impl UseSubagentsHandler {
                         max_turns,
                         cwd_clone.as_path(),
                         Some(state_clone),
+                        cancellation_flag_clone,
                         progress_writer_clone,
                     )
                     .await
@@ -858,12 +930,13 @@ impl ToolHandler for UseSubagentsHandler {
             }
 
             handler
-                .execute_with_workspace_root(
+                .execute_with_workspace_root_and_cancellation(
                     ctx.state.clone(),
                     params,
                     ctx.workspace_root.as_path(),
                     ctx.json_output,
                     &ctx.output_writer,
+                    ctx.cancellation_flag.clone(),
                 )
                 .await
                 .map(serde_json::Value::String)
@@ -1146,5 +1219,25 @@ mod tests {
 
         assert!(collected.contains("subagent output truncated at 1024 bytes"));
         assert!(collected.len() < 1200, "collected output was not bounded");
+    }
+
+    #[tokio::test]
+    async fn test_finish_stream_collector_aborts_stalled_pipe() {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let handle = tokio::spawn(async move {
+            UseSubagentsHandler::collect_stream_output(
+                reader,
+                "[subagent 1]".to_string(),
+                false,
+                None,
+                false,
+            )
+            .await
+        });
+
+        let (output, stalled) =
+            UseSubagentsHandler::finish_stream_collector(handle, "stdout", 0).await;
+        assert!(stalled);
+        assert!(output.contains("stdout collection timed out"));
     }
 }
