@@ -187,15 +187,26 @@ impl EditFileHandler {
     ) -> Result<Vec<serde_json::Value>, serde_json::Error> {
         match serde_json::from_str::<Vec<serde_json::Value>>(raw) {
             Ok(files) => Ok(files),
-            Err(err) if err.classify() == serde_json::error::Category::Eof => {
-                if let Some(repaired) = Self::repair_truncated_files_json(raw)
+            Err(err) => {
+                // `files` is a legacy nested-JSON form. The provider-level
+                // argument repair cannot see defects inside this already-valid
+                // outer string, so repair its JSON value before parsing it.
+                let repaired = crate::providers::repair_json_args(raw);
+                if repaired != raw
                     && let Ok(files) = serde_json::from_str::<Vec<serde_json::Value>>(&repaired)
                 {
                     return Ok(files);
                 }
+
+                if err.classify() == serde_json::error::Category::Eof
+                    && let Some(repaired) = Self::repair_truncated_files_json(raw)
+                    && let Ok(files) = serde_json::from_str::<Vec<serde_json::Value>>(&repaired)
+                {
+                    return Ok(files);
+                }
+
                 Err(err)
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -220,6 +231,29 @@ impl EditFileHandler {
                 );
             }
         }
+    }
+
+    fn requested_paths_for_locking(params: &serde_json::Value) -> Vec<String> {
+        let parsed_files = params.get("files").and_then(|files| {
+            files.as_array().cloned().or_else(|| {
+                files
+                    .as_str()
+                    .and_then(|value| Self::parse_stringified_files_array(value).ok())
+            })
+        });
+        let mut requested_paths = parsed_files
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if requested_paths.is_empty()
+            && let Some(path) = params.get("path").and_then(|path| path.as_str())
+        {
+            requested_paths.push(path.to_string());
+        }
+        requested_paths
     }
 
     /// Parse edits from JSON params.
@@ -1558,25 +1592,7 @@ impl ToolHandler for EditFileHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            let parsed_files = params
-                .get("files")
-                .and_then(|files| files.as_array().cloned().or_else(|| {
-                    files
-                        .as_str()
-                        .and_then(|value| serde_json::from_str(value).ok())
-                }));
-            let mut requested_paths = parsed_files
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if requested_paths.is_empty()
-                && let Some(path) = params.get("path").and_then(|path| path.as_str())
-            {
-                requested_paths.push(path.to_string());
-            }
+            let requested_paths = Self::requested_paths_for_locking(&params);
             let resolved_paths = requested_paths
                 .iter()
                 .filter_map(|path| ctx.resolve_path(path).ok())
@@ -5095,6 +5111,39 @@ edition = "2021"
             msg.contains("files"),
             "error must name the 'files' parameter, got: {}",
             msg
+        );
+    }
+
+    /// Stringified `files` values are nested JSON. The outer tool arguments
+    /// can be valid even when a model placed literal Makefile tabs, newlines,
+    /// and continuation backslashes in the inner JSON string.
+    #[test]
+    fn test_parse_stringified_files_array_repairs_makefile_control_characters() {
+        let raw = concat!(
+            r#"[{"path":"Makefile.x86","edits":[{"anchor":"FootlooseFeedback§	$(SRC)/vga.c","edit_type":"replace","text":"	$(SRC)/vga.c \"#,
+            "\n",
+            "\t$(SRC)/portstub.c\"}]}]",
+        );
+
+        let files = EditFileHandler::parse_stringified_files_array(raw)
+            .expect("nested JSON with Makefile control characters should be repaired");
+        let edit = &files[0]["edits"][0];
+        assert_eq!(edit["anchor"], "FootlooseFeedback§\t$(SRC)/vga.c");
+        assert_eq!(edit["text"], "\t$(SRC)/vga.c \\\n\t$(SRC)/portstub.c");
+    }
+
+    #[test]
+    fn test_lock_paths_repair_stringified_files_before_extracting_paths() {
+        let raw = concat!(
+            r#"[{"path":"src/board.c","edits":[{"anchor":"x§	foo","text":"	foo \"#,
+            "\n",
+            "\tbar\"}]}]",
+        );
+        let params = serde_json::json!({ "files": raw });
+
+        assert_eq!(
+            EditFileHandler::requested_paths_for_locking(&params),
+            vec!["src/board.c"]
         );
     }
 
