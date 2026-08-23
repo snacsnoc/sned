@@ -74,6 +74,7 @@ Other useful flags:
 --export <path>          # write the full session transcript to <path>
 --double-check-completion # re-read the changes after the model claims done
 --track-changes          # snapshot files into shadow git for undo
+--no-checkpoints         # disable pre-edit workspace checkpoints for this run
 --verbose                # surface internal events to the TUI/log
 --no-token-display       # suppress the 50/80/95% context-window warnings
 --thinking <budget>      # ask the model to spend up to <budget> tokens thinking first
