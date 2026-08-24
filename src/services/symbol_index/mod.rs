@@ -643,7 +643,9 @@ fn collect_index_candidates(project_root: &Path) -> Vec<IndexCandidate> {
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_secs());
+                .map_or(0, |duration| {
+                    duration.as_nanos().min(u64::MAX as u128) as u64
+                });
             Some(IndexCandidate {
                 absolute_path: path,
                 relative_path,
@@ -703,7 +705,9 @@ fn prepare_index_entry(
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_secs());
+        .map_or(0, |duration| {
+            duration.as_nanos().min(u64::MAX as u128) as u64
+        });
     Ok(Some((rel_path.to_string(), mtime, metadata.len(), symbols)))
 }
 
