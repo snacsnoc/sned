@@ -155,12 +155,21 @@ impl CancellationHandler {
             tracing::info!("TaskCancel hook executed");
         }
 
-        // 5. Save state immediately (force save)
-        if let Err(e) = StateManager::persist_async(state_manager).await {
-            tracing::warn!("Failed to persist state on cancellation: {}", e);
-            return Err(CancellationError::StateError(e.to_string()));
+        // 5. Persist state on a bounded best-effort path. Cancellation must
+        // not wait indefinitely on a slow filesystem or a contended state
+        // lock; the next periodic/startup persistence attempt can retry it.
+        const CANCELLATION_PERSIST_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(2);
+        match tokio::time::timeout(
+            CANCELLATION_PERSIST_TIMEOUT,
+            StateManager::persist_async(state_manager),
+        )
+        .await
+        {
+            Ok(Ok(())) => tracing::info!("State persisted on cancellation"),
+            Ok(Err(error)) => tracing::warn!(%error, "Failed to persist state on cancellation"),
+            Err(_) => tracing::warn!("Timed out persisting state on cancellation"),
         }
-        tracing::info!("State persisted on cancellation");
 
         // 6. Cleanup resources (file watcher, anchor state, caches)
         {
