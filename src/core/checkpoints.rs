@@ -185,6 +185,12 @@ impl CheckpointTracker {
         cancelled: Option<&AtomicBool>,
         operation: impl FnOnce() -> Result<T, CheckpointError>,
     ) -> Result<T, CheckpointError> {
+        // The checkpoint repository is distinct from workspace shadow git,
+        // but both use the workspace as a Git worktree. Acquire the shared
+        // workspace guard first, then this repository's guard, to prevent a
+        // checkpoint restore/snapshot from racing a shadow-git operation.
+        let _workspace_lock = crate::core::shadow_git::acquire_workspace_git_lock(&self.cwd)
+            .map_err(|error| CheckpointError::CommandFailed(error.to_string()))?;
         let lock_path = self.repo_lock_path()?;
         let _lock = CheckpointRepoLock::acquire(&lock_path, cancelled)?;
         self.remove_stale_index_lock()?;

@@ -11,17 +11,105 @@
 //! - /commit to finalize changes to user's real git
 
 use anyhow::{Context, Result};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const SHADOW_GIT_DIR: &str = ".sned/.git-agent";
 const SHADOW_GIT_AUTHOR_NAME: &str = "Sned";
 const SHADOW_GIT_AUTHOR_EMAIL: &str = "sned@localhost";
+const SHADOW_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_INDEX_LOCK_AGE: Duration = Duration::from_secs(90);
+
+pub(crate) struct ShadowGitLock {
+    _file: File,
+}
+
+impl ShadowGitLock {
+    fn acquire(workspace_root: &Path) -> Result<Self> {
+        Self::acquire_path(&workspace_root.join(".sned/.git-agent/sned.lock"))
+    }
+
+    fn acquire_path(lock_path: &Path) -> Result<Self> {
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let started = Instant::now();
+            loop {
+                let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result == 0 {
+                    return Ok(Self { _file: file });
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(error.into());
+                }
+                if started.elapsed() >= SHADOW_LOCK_TIMEOUT {
+                    anyhow::bail!("shadow git repository is busy: {}", lock_path.display());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self { _file: file })
+        }
+    }
+}
+
+fn cleanup_stale_index_lock(workspace_root: &Path) -> Result<()> {
+    let path = workspace_root.join(SHADOW_GIT_DIR).join("index.lock");
+    let Ok(metadata) = fs::metadata(&path) else {
+        return Ok(());
+    };
+    let age = metadata.modified()?.elapsed().unwrap_or_default();
+    if age >= STALE_INDEX_LOCK_AGE {
+        fs::remove_file(&path)?;
+        tracing::warn!(path = %path.display(), age_secs = age.as_secs(), "removed stale shadow git index lock");
+    }
+    Ok(())
+}
+
+/// Serialize Sned operations that read or mutate a workspace through Git.
+///
+/// Checkpoint repositories use a separate Git directory, but share the same
+/// worktree. They must acquire this guard before their repository-specific
+/// lock so a checkpoint restore cannot race a shadow-git snapshot.
+pub(crate) fn acquire_workspace_git_lock(workspace_root: &Path) -> Result<ShadowGitLock> {
+    let _lock = ShadowGitLock::acquire(workspace_root)?;
+    cleanup_stale_index_lock(workspace_root)?;
+    Ok(_lock)
+}
+
+fn with_shadow_lock<T>(workspace_root: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _lock = acquire_workspace_git_lock(workspace_root)?;
+    operation()
+}
+
+fn with_real_git_lock<T>(workspace_root: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock_path = workspace_root.join(".sned/.git-agent/real-git.lock");
+    let _lock = ShadowGitLock::acquire_path(&lock_path)?;
+    operation()
+}
 
 /// Initialize the shadow git repository if it doesn't exist.
 pub fn init_shadow_repo(workspace_root: &Path) -> Result<()> {
+    with_shadow_lock(workspace_root, || init_shadow_repo_locked(workspace_root))
+}
+
+fn init_shadow_repo_locked(workspace_root: &Path) -> Result<()> {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 
     if shadow_git_path.join("HEAD").exists() {
@@ -58,7 +146,7 @@ pub fn init_shadow_repo(workspace_root: &Path) -> Result<()> {
 
 /// Commit the current state to the shadow repo.
 pub fn commit_turn(workspace_root: &Path, message: &str) -> Result<()> {
-    commit_turn_internal(workspace_root, message, false)
+    with_shadow_lock(workspace_root, || commit_turn_internal(workspace_root, message, false))
 }
 
 fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Result<()> {
@@ -182,6 +270,10 @@ fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Re
 /// Undo the last turn by reverting to the previous shadow commit.
 /// Returns a list of files that were reverted.
 pub fn undo_last_turn(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    with_shadow_lock(workspace_root, || undo_last_turn_locked(workspace_root))
+}
+
+fn undo_last_turn_locked(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>)> {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 
     if !shadow_git_path.join("HEAD").exists() {
@@ -332,6 +424,10 @@ pub fn undo_last_turn(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>
 
 /// Show diff between two turns.
 pub fn diff_turns(workspace_root: &Path, from: usize, to: usize) -> Result<String> {
+    with_shadow_lock(workspace_root, || diff_turns_locked(workspace_root, from, to))
+}
+
+fn diff_turns_locked(workspace_root: &Path, from: usize, to: usize) -> Result<String> {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 
     if !shadow_git_path.join("HEAD").exists() {
@@ -367,6 +463,10 @@ pub fn diff_turns(workspace_root: &Path, from: usize, to: usize) -> Result<Strin
 
 /// Show the shadow git log.
 pub fn log(workspace_root: &Path, limit: Option<usize>) -> Result<String> {
+    with_shadow_lock(workspace_root, || log_locked(workspace_root, limit))
+}
+
+fn log_locked(workspace_root: &Path, limit: Option<usize>) -> Result<String> {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 
     if !shadow_git_path.join("HEAD").exists() {
@@ -398,6 +498,12 @@ pub fn log(workspace_root: &Path, limit: Option<usize>) -> Result<String> {
 
 /// Commit shadow changes to the user's real git repo.
 pub fn commit_to_real_git(workspace_root: &Path, message: &str) -> Result<Vec<String>> {
+    with_shadow_lock(workspace_root, || {
+        with_real_git_lock(workspace_root, || commit_to_real_git_locked(workspace_root, message))
+    })
+}
+
+fn commit_to_real_git_locked(workspace_root: &Path, message: &str) -> Result<Vec<String>> {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
     let real_git_path = workspace_root.join(".git");
 
@@ -476,6 +582,10 @@ pub fn is_initialized(workspace_root: &Path) -> bool {
 /// Get files that were modified by the user since the last shadow commit.
 /// Excludes files that were already modified by the agent in the last turn.
 pub fn get_user_edits_since_last_turn(workspace_root: &Path) -> Result<Vec<String>> {
+    with_shadow_lock(workspace_root, || get_user_edits_since_last_turn_locked(workspace_root))
+}
+
+fn get_user_edits_since_last_turn_locked(workspace_root: &Path) -> Result<Vec<String>> {
     let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
 
     if !shadow_git_path.join("HEAD").exists() {
