@@ -752,26 +752,32 @@ impl TaskStorage {
 
         let mut entries = VecDeque::with_capacity(cap.min(DEFAULT_TRANSCRIPT_CAP));
         let mut truncated = false;
+        let mut corrupted_lines = 0usize;
+        let mut backup_created = false;
         for line in io::BufReader::new(file).lines() {
             let line = line?;
             let entry = match serde_json::from_str::<TranscriptEntry>(&line) {
                 Ok(entry) => entry,
                 Err(error) => {
-                    if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
+                    corrupted_lines += 1;
+                    if !backup_created
+                        && let Ok(backup_path) = crate::storage::disk::create_backup(&path)
+                    {
+                        backup_created = true;
                         tracing::warn!(
                             file_path = %path.display(),
                             backup_path = %backup_path.display(),
                             error = %error,
                             "Created backup of corrupted transcript JSONL"
                         );
-                    } else {
+                    } else if !backup_created {
                         tracing::warn!(
                             file_path = %path.display(),
                             error = %error,
                             "Failed to parse transcript JSONL and backup failed"
                         );
                     }
-                    return Ok(Vec::new());
+                    continue;
                 }
             };
 
@@ -783,6 +789,14 @@ impl TaskStorage {
                 truncated = true;
             }
             entries.push_back(entry);
+        }
+
+        if corrupted_lines > 0 {
+            tracing::warn!(
+                file_path = %path.display(),
+                corrupted_lines,
+                "Recovered valid transcript entries around corrupted JSONL records"
+            );
         }
 
         if truncated {
@@ -833,11 +847,20 @@ impl TaskStorage {
         let file = fs::File::open(&path)?;
         let mut entries = VecDeque::with_capacity(DEFAULT_TRANSCRIPT_CAP);
         let mut exceeded_capacity = false;
+        let mut corrupted_lines = 0usize;
         for line in io::BufReader::new(file).lines() {
             let line = line?;
             let entry = match serde_json::from_str::<TranscriptEntry>(&line) {
                 Ok(entry) => entry,
-                Err(_) => return Ok(()),
+                Err(error) => {
+                    corrupted_lines += 1;
+                    tracing::warn!(
+                        file_path = %path.display(),
+                        error = %error,
+                        "Skipping corrupted transcript record during compaction"
+                    );
+                    continue;
+                }
             };
             if entries.len() == DEFAULT_TRANSCRIPT_CAP {
                 exceeded_capacity = true;
@@ -847,8 +870,18 @@ impl TaskStorage {
         }
 
         let line_count = entries.len();
-        if !exceeded_capacity {
+        if !exceeded_capacity && corrupted_lines == 0 {
             return Ok(());
+        }
+
+        if corrupted_lines > 0 {
+            let backup_path = crate::storage::disk::create_backup(&path)?;
+            tracing::warn!(
+                file_path = %path.display(),
+                backup_path = %backup_path.display(),
+                corrupted_lines,
+                "Created backup before repairing corrupted transcript JSONL"
+            );
         }
 
         let temp_path = path.with_extension(format!("jsonl.tmp.{}", std::process::id()));
@@ -1730,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn test_corrupt_transcript_returns_empty_and_creates_backup() {
+    fn test_corrupt_transcript_preserves_valid_entries_and_creates_backup() {
         let temp_dir = TempDir::new().unwrap();
         let task_dir = temp_dir.path().join("transcript-corrupt");
         fs::create_dir_all(&task_dir).unwrap();
@@ -1738,15 +1771,66 @@ mod tests {
             task_dir: task_dir.clone(),
         };
         let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
-        fs::write(&path, "not json\n").unwrap();
+        let before = TranscriptEntry {
+            kind: BlockKind::Model,
+            ts: 1,
+            markdown: "before".to_string(),
+        };
+        let after = TranscriptEntry {
+            kind: BlockKind::ToolOutput,
+            ts: 2,
+            markdown: "after".to_string(),
+        };
+        fs::write(
+            &path,
+            format!(
+                "{}\nnot json\n{}\n",
+                serde_json::to_string(&before).unwrap(),
+                serde_json::to_string(&after).unwrap()
+            ),
+        )
+        .unwrap();
 
-        assert!(
-            storage
-                .read_transcript(DEFAULT_TRANSCRIPT_CAP)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap(),
+            vec![before, after]
         );
         assert!(path.with_extension("jsonl.bak").exists());
+    }
+
+    #[test]
+    fn test_compaction_repairs_corrupt_transcript_records() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-compact-corrupt");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let entries = (0..DEFAULT_TRANSCRIPT_CAP + 2)
+            .map(|index| TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: index as u64,
+                markdown: format!("line {index}"),
+            })
+            .collect::<Vec<_>>();
+        let mut contents = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>();
+        contents.insert(3, "broken record".to_string());
+        let original = format!("{}\n", contents.join("\n"));
+        fs::write(&path, &original).unwrap();
+
+        storage.compact_transcript_unlocked().unwrap();
+
+        let recovered = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(recovered.len(), DEFAULT_TRANSCRIPT_CAP);
+        assert_eq!(recovered.last().unwrap().ts, (DEFAULT_TRANSCRIPT_CAP + 1) as u64);
+        assert_eq!(
+            fs::read_to_string(path.with_extension("jsonl.bak")).unwrap(),
+            original
+        );
     }
 
     #[test]
