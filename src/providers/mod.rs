@@ -23,11 +23,24 @@ pub use openrouter::OpenRouterProvider;
 
 use reqwest::StatusCode;
 // Rust 1.93+ supports async traits natively; no #[async_trait] needed
+use std::time::Duration;
 
 /// Maximum size for tool call arguments (128KB).
 /// Cap arguments to prevent a single tool call from exhausting memory while
 /// still allowing large but legitimate payloads.
 pub const MAX_TOOL_ARGUMENT_SIZE: usize = 131_072;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderTransport {
+    Streaming,
+    Buffered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreoutputPolicy {
+    pub budget: Duration,
+    pub transport: ProviderTransport,
+}
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 
@@ -1019,6 +1032,14 @@ pub trait Provider: Send {
     fn get_model(&self) -> ProviderModel;
 
     fn name(&self) -> &str;
+
+    /// Maximum time allowed for a provider request to produce usable output.
+    fn preoutput_policy(&self) -> PreoutputPolicy {
+        PreoutputPolicy {
+            budget: Duration::from_secs(180),
+            transport: ProviderTransport::Streaming,
+        }
+    }
 }
 
 /// Concrete enum wrapping all provider types.
@@ -1141,6 +1162,16 @@ impl Provider for Providers {
             Providers::TinyContext(p) => p.name(),
             #[cfg(test)]
             Providers::Error(p) => p.name(),
+        }
+    }
+
+    fn preoutput_policy(&self) -> PreoutputPolicy {
+        match self {
+            Self::OpenAi(p) => p.preoutput_policy(),
+            _ => PreoutputPolicy {
+                budget: Duration::from_secs(180),
+                transport: ProviderTransport::Streaming,
+            },
         }
     }
 }

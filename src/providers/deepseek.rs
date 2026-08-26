@@ -49,6 +49,7 @@ impl DeepSeekProvider {
             extra_body: config.extra_body,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
             provider_name: Some("deepseek".to_string()),
         };
 

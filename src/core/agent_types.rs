@@ -258,6 +258,7 @@ impl Default for AgentConfig {
                             custom_headers: None,
                             endpoint_kind:
                                 crate::providers::openai::OpenAiEndpointKind::Official,
+                            stream: true,
                             provider_name: None, // Use default "OpenAI"
                         }
                     ).expect("OpenAiProvider::new() should never fail with empty config; reqwest::Client build failure indicates system resource exhaustion")

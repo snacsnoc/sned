@@ -67,6 +67,7 @@ impl OpenRouterProvider {
             extra_body: config.extra_body,
             custom_headers: Some(custom_headers),
             endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
             provider_name: Some(
                 config
                     .provider_name

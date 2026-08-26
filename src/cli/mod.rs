@@ -266,6 +266,12 @@ pub struct TaskOptions {
     #[arg(long, value_name = "JSON", hide_short_help = true)]
     pub extra_body: Option<String>,
 
+    /// Disable incremental SSE output for custom OpenAI-compatible endpoints.
+    /// Responses are buffered until completion (up to approximately 600 seconds)
+    /// and a full-length timeout leaves no practical automatic retry budget.
+    #[arg(long)]
+    pub no_stream: bool,
+
     /// Show verbose output
     #[arg(short = 'v', long)]
     pub verbose: bool,
@@ -1009,6 +1015,12 @@ pub(crate) fn create_provider(
         anyhow::bail!("--extra-body is only supported by OpenAI-compatible providers.");
     }
 
+    if task_opts.no_stream && provider_name != "openai" {
+        anyhow::bail!(
+            "--no-stream is only supported for custom OpenAI-compatible endpoints."
+        );
+    }
+
     // ── Per-provider flag support checks ──────────────────────────────
     // Each provider rejects flags that have no effect on its API.
 
@@ -1124,6 +1136,13 @@ pub(crate) fn create_provider(
                     })
                 });
             let endpoint_kind = openai_endpoint_kind(&provider_name, base_url.as_deref());
+            if task_opts.no_stream
+                && endpoint_kind != crate::providers::openai::OpenAiEndpointKind::Compatible
+            {
+                anyhow::bail!(
+                    "--no-stream is only supported for custom OpenAI-compatible endpoints."
+                );
+            }
             if extra_body.is_some()
                 && endpoint_kind == crate::providers::openai::OpenAiEndpointKind::Official
             {
@@ -1152,6 +1171,7 @@ pub(crate) fn create_provider(
                             headers
                         }),
                         endpoint_kind,
+                        stream: !task_opts.no_stream,
                         provider_name: (endpoint_kind
                             == crate::providers::openai::OpenAiEndpointKind::Compatible)
                             .then(|| "openai-compatible".to_string()),
@@ -2806,6 +2826,7 @@ mod tests {
                 base_url: None,
                 api_key: None,
                 extra_body: None,
+                no_stream: false,
                 verbose: false,
                 cwd: None,
                 allow_dir: Vec::new(),
@@ -2877,6 +2898,7 @@ mod tests {
                 base_url: None,
                 api_key: None,
                 extra_body: None,
+                no_stream: false,
                 verbose: false,
                 cwd: None,
                 allow_dir: Vec::new(),
@@ -3000,6 +3022,7 @@ mod tests {
                 base_url: None,
                 api_key: Some("deepseek-key".to_string()),
                 extra_body: None,
+                no_stream: false,
                 verbose: false,
                 cwd: None,
                 allow_dir: Vec::new(),
@@ -3139,6 +3162,22 @@ mod tests {
             openai_endpoint_kind("openai-native", Some("https://proxy.example.com/v1")),
             OpenAiEndpointKind::Official
         );
+    }
+
+    #[test]
+    fn test_no_stream_flag_is_available_for_custom_openai_tasks() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--base-url",
+            "https://gateway.example.com/v1",
+            "--api-key",
+            "test-key",
+            "--no-stream",
+            "test prompt",
+        ])
+        .unwrap();
+
+        assert!(cli.task_opts.no_stream);
     }
 
     #[test]

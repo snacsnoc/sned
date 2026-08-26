@@ -83,11 +83,19 @@ const DEFAULT_TOOL_CONCURRENCY: usize = 12;
 /// DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES so the user-facing
 /// behavior matches the request-level cap.
 const MAX_STREAM_RETRY_ATTEMPTS: usize = DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES as usize;
-const MAX_PREOUTPUT_STREAM_RETRY_DURATION: std::time::Duration =
-    std::time::Duration::from_secs(180);
 const PARTIAL_MODEL_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
+
+async fn wait_for_cancellation(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        if flag.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        interval.tick().await;
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ToolExecutionOutput {
@@ -1912,6 +1920,12 @@ impl AgentLoop {
 
         let mut stream_retry_attempt = 0usize;
         let preoutput_retry_started_at = std::time::Instant::now();
+        let preoutput_policy = provider.preoutput_policy();
+        let preoutput_budget = preoutput_policy.budget;
+        let output_kind = match preoutput_policy.transport {
+            crate::providers::ProviderTransport::Streaming => "stream",
+            crate::providers::ProviderTransport::Buffered => "response",
+        };
         let mut preoutput_elapsed_at_first_chunk: Option<std::time::Duration> = None;
         let (
             accumulated_text,
@@ -1935,37 +1949,64 @@ impl AgentLoop {
             // consumer processes (e.g. during very long responses).
             let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(10_000);
 
-            let Some(remaining_preoutput_budget) = MAX_PREOUTPUT_STREAM_RETRY_DURATION
+            let Some(remaining_preoutput_budget) = preoutput_budget
                 .checked_sub(preoutput_retry_started_at.elapsed())
             else {
                 let error = ProviderError::NetworkError(format!(
-                    "provider stream produced no output within {}s",
-                    MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs()
+                    "provider {output_kind} produced no output within {}s",
+                    preoutput_budget.as_secs()
                 ));
                 let actionable = crate::cli::actionable_errors::provider_error(&error);
                 return TurnResult::Error(format!(
-                    "Provider request did not begin streaming within {}s: {}",
-                    MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs(),
+                    "Provider request did not produce a {output_kind} within {}s: {}",
+                    preoutput_budget.as_secs(),
                     actionable.display()
                 ));
             };
 
-            let stream = match tokio::time::timeout(
-                remaining_preoutput_budget,
-                create_message_with_retry(
-                    provider.clone(),
-                    request.clone(),
-                    state_clone.clone(),
-                    retry_config,
-                    self.config.json_output,
-                    Some(self.config.output_writer.clone()),
-                    Some(self.cancelled.clone()),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
+            let provider_request = create_message_with_retry(
+                provider.clone(),
+                request.clone(),
+                state_clone.clone(),
+                retry_config,
+                self.config.json_output,
+                Some(self.config.output_writer.clone()),
+                Some(self.cancelled.clone()),
+            );
+            tokio::pin!(provider_request);
+            let cancellation = wait_for_cancellation(self.cancelled.clone());
+            tokio::pin!(cancellation);
+            let request_result = tokio::select! {
+                biased;
+                _ = &mut cancellation => None,
+                result = tokio::time::timeout(remaining_preoutput_budget, &mut provider_request) => Some(result),
+            };
+            let Some(request_result) = request_result else {
+                if let Some(ref retry_message) = self.current_turn_retry_candidate {
+                    let mut state = self.state.lock().await;
+                    state.retryable_failed_request = Some(retry_message.clone());
+                }
+                return TurnResult::Cancelled;
+            };
+            let stream = match request_result {
+                Ok(Ok(stream)) => {
+                    if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        if let Some(ref retry_message) = self.current_turn_retry_candidate {
+                            let mut state = self.state.lock().await;
+                            state.retryable_failed_request = Some(retry_message.clone());
+                        }
+                        return TurnResult::Cancelled;
+                    }
+                    stream
+                }
                 Ok(Err(e)) => {
+                    if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        if let Some(ref retry_message) = self.current_turn_retry_candidate {
+                            let mut state = self.state.lock().await;
+                            state.retryable_failed_request = Some(retry_message.clone());
+                        }
+                        return TurnResult::Cancelled;
+                    }
                     error!(error = %e, "provider request failed");
                     if let Some(ref retry_message) = self.current_turn_retry_candidate {
                         let mut state = self.state.lock().await;
@@ -1990,14 +2031,21 @@ impl AgentLoop {
                     return TurnResult::Error(message);
                 }
                 Err(_) => {
+                    if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        if let Some(ref retry_message) = self.current_turn_retry_candidate {
+                            let mut state = self.state.lock().await;
+                            state.retryable_failed_request = Some(retry_message.clone());
+                        }
+                        return TurnResult::Cancelled;
+                    }
                     let error = ProviderError::NetworkError(format!(
-                        "provider request did not begin streaming within {}s",
-                        MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs()
+                        "provider request did not produce a {output_kind} within {}s",
+                        preoutput_budget.as_secs()
                     ));
                     let actionable = crate::cli::actionable_errors::provider_error(&error);
                     return TurnResult::Error(format!(
-                        "Provider request did not begin streaming within {}s: {}",
-                        MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs(),
+                        "Provider request did not produce a {output_kind} within {}s: {}",
+                        preoutput_budget.as_secs(),
                         actionable.display()
                     ));
                 }
@@ -2087,13 +2135,13 @@ impl AgentLoop {
                 let next_chunk = if first_chunk_received {
                     rx.recv().await
                 } else {
-                    let Some(remaining) = MAX_PREOUTPUT_STREAM_RETRY_DURATION
+                    let Some(remaining) = preoutput_budget
                         .checked_sub(preoutput_retry_started_at.elapsed())
                     else {
                         preoutput_deadline_exceeded = true;
                         retryable_stream_error_before_output = Some(format!(
-                            "provider stream produced no output within {}s",
-                            MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs()
+                            "provider {output_kind} produced no output within {}s",
+                            preoutput_budget.as_secs()
                         ));
                         break;
                     };
@@ -2102,8 +2150,8 @@ impl AgentLoop {
                         Err(_) => {
                             preoutput_deadline_exceeded = true;
                             retryable_stream_error_before_output = Some(format!(
-                                "provider stream produced no output within {}s",
-                                MAX_PREOUTPUT_STREAM_RETRY_DURATION.as_secs()
+                                "provider {output_kind} produced no output within {}s",
+                                preoutput_budget.as_secs()
                             ));
                             break;
                         }
@@ -2726,7 +2774,7 @@ impl AgentLoop {
                     let error = ProviderError::NetworkError(err);
                     let actionable = crate::cli::actionable_errors::provider_error(&error);
                     return TurnResult::Error(format!(
-                        "Provider stream failed after {} attempts: {}",
+                        "Provider {output_kind} failed after {} attempts: {}",
                         stream_retry_attempt + 1,
                         actionable.display()
                     ));
@@ -2736,7 +2784,7 @@ impl AgentLoop {
                     state.did_automatically_retry_failed_api_request = true;
                 }
                 stream_retry_attempt += 1;
-                let remaining_preoutput_budget = MAX_PREOUTPUT_STREAM_RETRY_DURATION
+                let remaining_preoutput_budget = preoutput_budget
                     .checked_sub(preoutput_retry_started_at.elapsed())
                     .unwrap_or_default();
                 let delay =

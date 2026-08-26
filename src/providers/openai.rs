@@ -7,8 +7,8 @@ use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, MessageRole,
     ModelInfo, OpenAiCompatibleModelInfo, Provider, ProviderError, ProviderHttpError,
-    ProviderModel, ProviderRequest, apply_qwen_model_profile, is_retryable_stream_transport_error,
-    normalize_reasoning_delta,
+    ProviderModel, ProviderRequest, ProviderTransport, PreoutputPolicy, apply_qwen_model_profile,
+    is_retryable_stream_transport_error, normalize_reasoning_delta,
 };
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -18,6 +18,7 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 
 const OPENAI_CLIENT_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+const OPENAI_NON_STREAM_PREOUTPUT_GRACE: Duration = Duration::from_secs(5);
 const OPENAI_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENAI_SSE_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(90);
 const OPENAI_SSE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -39,6 +40,9 @@ pub struct OpenAiConfig {
     pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     pub custom_headers: Option<std::collections::HashMap<String, String>>,
     pub endpoint_kind: OpenAiEndpointKind,
+    /// Whether to request an SSE response. OpenAI-compatible custom endpoints
+    /// may opt into a normal chat completion response for long generations.
+    pub stream: bool,
     /// Provider name for error messages (defaults to "OpenAI" if not set).
     /// Used by OpenAI-compatible providers (OpenRouter, DeepSeek) to identify themselves in errors.
     pub provider_name: Option<String>,
@@ -58,6 +62,7 @@ impl std::fmt::Debug for OpenAiConfig {
             .field("extra_body", &self.extra_body)
             .field("custom_headers", &self.custom_headers)
             .field("endpoint_kind", &self.endpoint_kind)
+            .field("stream", &self.stream)
             .field("provider_name", &self.provider_name)
             .finish()
     }
@@ -256,9 +261,11 @@ impl OpenAiProvider {
         let mut body = json!({
             "model": model_id,
             "messages": messages,
-            "stream": true,
-            "stream_options": {"include_usage": true},
+            "stream": self.config.stream,
         });
+        if self.config.stream {
+            body["stream_options"] = json!({"include_usage": true});
+        }
 
         if let Some(sort) = &self.provider_sort {
             body["provider"] = json!({"sort": sort});
@@ -589,6 +596,42 @@ struct OpenAiStreamChunk {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpenAiCompletionResponse {
+    id: Option<String>,
+    #[serde(default)]
+    choices: Vec<OpenAiCompletionChoice>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompletionChoice {
+    #[serde(default)]
+    message: Option<OpenAiCompletionMessage>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiCompletionMessage {
+    content: Option<String>,
+    #[serde(rename = "reasoning_content")]
+    reasoning_content: Option<String>,
+    refusal: Option<String>,
+    tool_calls: Option<Vec<OpenAiCompletionToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompletionToolCall {
+    id: Option<String>,
+    function: Option<OpenAiCompletionFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompletionFunction {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     delta: OpenAiDelta,
     finish_reason: Option<String>,
@@ -635,6 +678,156 @@ struct OpenAiPromptTokenDetails {
 #[derive(Debug, Deserialize)]
 struct OpenAiCompletionTokenDetails {
     reasoning_tokens: Option<u32>,
+}
+
+fn openai_usage_chunk(
+    usage: &OpenAiUsage,
+    id: Option<String>,
+    stop_reason: Option<String>,
+    model_info: Option<&OpenAiCompatibleModelInfo>,
+) -> ApiStreamUsageChunk {
+    let cached_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .map_or(0, |details| details.cached_tokens);
+    let cache_write_tokens = usage.prompt_cache_miss_tokens.unwrap_or(0);
+    let uncached_input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
+    let total_cost = model_info.and_then(|info| {
+        let input_price = info.base.input_price?;
+        let output_price = info.base.output_price?;
+        let cache_reads_price = info.base.cache_reads_price.unwrap_or(0.0);
+        let cache_writes_price = info.base.cache_writes_price.unwrap_or(0.0);
+        let input_cost = input_price * (uncached_input_tokens as f64 / 1_000_000.0);
+        let output_cost = output_price * (usage.completion_tokens as f64 / 1_000_000.0);
+        let cache_read_cost = cache_reads_price * (cached_tokens as f64 / 1_000_000.0);
+        let cache_write_cost = cache_writes_price * (cache_write_tokens as f64 / 1_000_000.0);
+        Some(input_cost + output_cost + cache_read_cost + cache_write_cost)
+    });
+
+    ApiStreamUsageChunk {
+        input_tokens: uncached_input_tokens,
+        output_tokens: usage.completion_tokens,
+        cache_write_tokens: usage.prompt_cache_miss_tokens,
+        cache_read_tokens: Some(cached_tokens),
+        reasoning_tokens: usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens),
+        thoughts_token_count: None,
+        total_cost,
+        stop_reason,
+        id,
+    }
+}
+
+fn decode_openai_completion(
+    completion: OpenAiCompletionResponse,
+    model_info: Option<&OpenAiCompatibleModelInfo>,
+) -> Vec<ApiStreamChunk> {
+    let mut chunks = Vec::new();
+    let Some(choice) = completion.choices.into_iter().next() else {
+        chunks.push(ApiStreamChunk::Usage(ApiStreamUsageChunk {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_write_tokens: Some(0),
+            cache_read_tokens: None,
+            reasoning_tokens: None,
+            thoughts_token_count: None,
+            total_cost: None,
+            stop_reason: None,
+            id: completion.id,
+        }));
+        return chunks;
+    };
+
+    let stop_reason = choice.finish_reason.clone();
+    let message = choice.message.unwrap_or_default();
+    let completion_id = completion.id.clone();
+    if let Some(reasoning) = message.reasoning_content.filter(|text| !text.is_empty()) {
+        chunks.push(ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+            reasoning,
+            details: None,
+            signature: None,
+            redacted_data: None,
+            id: completion_id.clone(),
+        }));
+    }
+    if let Some(content) = message.content.filter(|text| !text.is_empty()) {
+        chunks.push(ApiStreamChunk::Text(ApiStreamTextChunk {
+            text: content,
+            id: completion_id.clone(),
+            signature: None,
+        }));
+    }
+    if let Some(refusal) = message.refusal.filter(|text| !text.is_empty()) {
+        chunks.push(ApiStreamChunk::Error(format!(
+            "OpenAI model refused: {refusal}"
+        )));
+    }
+
+    if stop_reason.as_deref() != Some("content_filter")
+        && let Some(tool_calls) = message.tool_calls
+    {
+        for tool_call in tool_calls {
+            let Some(call_id) = tool_call.id.filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let Some(function) = tool_call.function else {
+                continue;
+            };
+            let Some(raw_name) = function.name.filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let name = normalize_qwen_thinking_tool_name(&raw_name).unwrap_or(raw_name);
+            if !is_safe_tool_name(&name) {
+                continue;
+            }
+            chunks.push(ApiStreamChunk::ToolCallStarted {
+                call_id: call_id.clone(),
+                name: name.clone(),
+            });
+            let arguments = crate::providers::validate_tool_call_args(
+                function.arguments.as_deref().unwrap_or_default(),
+                "OpenAI",
+                "non-stream response",
+            );
+            chunks.push(ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some(call_id.clone()),
+                    function: ApiStreamToolCallFunction {
+                        id: Some(call_id),
+                        name: Some(name),
+                        arguments: Some(arguments),
+                    },
+                    signature: None,
+                },
+                id: completion_id.clone(),
+                signature: None,
+            }));
+        }
+    }
+
+    if let Some(usage) = completion.usage.as_ref() {
+        chunks.push(ApiStreamChunk::Usage(openai_usage_chunk(
+            usage,
+            completion.id.clone(),
+            stop_reason,
+            model_info,
+        )));
+    } else {
+        chunks.push(ApiStreamChunk::Usage(ApiStreamUsageChunk {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_write_tokens: Some(0),
+            cache_read_tokens: None,
+            reasoning_tokens: None,
+            thoughts_token_count: None,
+            total_cost: None,
+            stop_reason,
+            id: completion.id,
+        }));
+    }
+    chunks
 }
 
 fn try_send_chunk(
@@ -853,61 +1046,68 @@ async fn process_openai_sse_line(
 
         if let Some(usage) = chunk.usage {
             *usage_sent = true;
-            // Calculate cache tokens and avoid double-counting in input_tokens
-            let cached_tokens = usage
-                .prompt_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cached_tokens);
-            let cache_write_tokens = usage.prompt_cache_miss_tokens.unwrap_or(0);
-            // OpenAI counts cached tokens in prompt_tokens, so subtract to get uncached input
-            let uncached_input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
-
-            // Calculate total cost using model pricing
-            let total_cost = model_info.and_then(|info| {
-                let input_price = info.base.input_price?;
-                let output_price = info.base.output_price?;
-                let cache_reads_price = info.base.cache_reads_price.unwrap_or(0.0);
-                let cache_writes_price = info.base.cache_writes_price.unwrap_or(0.0);
-
-                // Cost for uncached input tokens
-                let input_cost = input_price * (uncached_input_tokens as f64 / 1_000_000.0);
-                // Cost for output tokens — completion_tokens already includes reasoning tokens
-                let output_cost = output_price * (usage.completion_tokens as f64 / 1_000_000.0);
-                // Cost for cache reads (discounted)
-                let cache_read_cost = if cached_tokens > 0 {
-                    cache_reads_price * (cached_tokens as f64 / 1_000_000.0)
-                } else {
-                    0.0
-                };
-                // Cost for cache writes
-                let cache_write_cost = if cache_write_tokens > 0 {
-                    cache_writes_price * (cache_write_tokens as f64 / 1_000_000.0)
-                } else {
-                    0.0
-                };
-
-                Some(input_cost + output_cost + cache_read_cost + cache_write_cost)
-            });
-
             try_send_chunk(
                 tx,
-                ApiStreamChunk::Usage(ApiStreamUsageChunk {
-                    input_tokens: uncached_input_tokens,
-                    output_tokens: usage.completion_tokens,
-                    cache_write_tokens: usage.prompt_cache_miss_tokens,
-                    cache_read_tokens: Some(cached_tokens),
-                    reasoning_tokens: usage
-                        .completion_tokens_details
-                        .and_then(|d| d.reasoning_tokens),
-                    thoughts_token_count: None,
-                    total_cost,
-                    stop_reason: last_stop_reason.clone(),
-                    id: Some(chunk.id),
-                }),
+                ApiStreamChunk::Usage(openai_usage_chunk(
+                    &usage,
+                    Some(chunk.id),
+                    last_stop_reason.clone(),
+                    model_info,
+                )),
                 "usage",
             );
         }
     }
+}
+
+fn body_looks_like_sse(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .lines()
+        .any(|line| line.trim_start().starts_with("data:"))
+}
+
+async fn decode_openai_sse_body(
+    body: &[u8],
+    model_info: Option<&OpenAiCompatibleModelInfo>,
+) -> Vec<ApiStreamChunk> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
+    let mut buffer = crate::providers::SseLineBuffer::default();
+    let mut delta_state = OpenAiStreamDeltaState::default();
+    let mut accumulated_tool_calls = std::collections::HashMap::new();
+    let mut completed_tool_call_indices = std::collections::HashSet::new();
+    let mut last_stop_reason = None;
+    let mut usage_sent = false;
+
+    parse_openai_sse_to_chunks(
+        body,
+        &mut buffer,
+        &tx,
+        &mut delta_state,
+        &mut accumulated_tool_calls,
+        &mut completed_tool_call_indices,
+        &mut last_stop_reason,
+        model_info,
+        &mut usage_sent,
+    )
+    .await;
+    finish_openai_sse_to_chunks(
+        &mut buffer,
+        &tx,
+        &mut delta_state,
+        &mut accumulated_tool_calls,
+        &mut completed_tool_call_indices,
+        &mut last_stop_reason,
+        model_info,
+        &mut usage_sent,
+    )
+    .await;
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 /// Parse OpenAI SSE chunk bytes into stream chunks. Extracted for testability.
@@ -1098,6 +1298,42 @@ impl Provider for OpenAiProvider {
         }
 
         let response_headers = response.headers().clone();
+        let is_sse_response = header_value(&response_headers, "content-type")
+            .is_some_and(|content_type| {
+                content_type
+                    .to_ascii_lowercase()
+                    .contains("text/event-stream")
+            });
+        if !self.config.stream && !is_sse_response {
+            let response_body = response.bytes().await.map_err(ProviderError::from)?;
+            match serde_json::from_slice::<OpenAiCompletionResponse>(&response_body) {
+                Ok(completion) => {
+                    let chunks =
+                        decode_openai_completion(completion, self.config.model_info.as_ref());
+                    return Ok(Box::pin(tokio_stream::iter(chunks)));
+                }
+                Err(error) if body_looks_like_sse(&response_body) => {
+                    tracing::debug!(
+                        error = %error,
+                        "OpenAI endpoint returned an SSE body without an SSE content type; using the SSE decoder"
+                    );
+                    let chunks =
+                        decode_openai_sse_body(&response_body, self.config.model_info.as_ref())
+                            .await;
+                    return Ok(Box::pin(tokio_stream::iter(chunks)));
+                }
+                Err(error) => {
+                    return Err(ProviderError::InvalidRequest(format!(
+                        "OpenAI non-stream response was not valid chat.completion JSON: {error}"
+                    )));
+                }
+            }
+        }
+        if !self.config.stream && is_sse_response {
+            tracing::debug!(
+                "OpenAI endpoint returned SSE despite stream:false; using the SSE decoder"
+            );
+        }
         let stream_started_at = Instant::now();
         let stream = response.bytes_stream();
         let first_byte_timeout = stream_timeout_from_env(
@@ -1262,6 +1498,20 @@ impl Provider for OpenAiProvider {
 
     fn name(&self) -> &'static str {
         "openai"
+    }
+
+    fn preoutput_policy(&self) -> PreoutputPolicy {
+        if self.config.stream {
+            PreoutputPolicy {
+                budget: Duration::from_secs(180),
+                transport: ProviderTransport::Streaming,
+            }
+        } else {
+            PreoutputPolicy {
+                budget: OPENAI_CLIENT_TOTAL_TIMEOUT + OPENAI_NON_STREAM_PREOUTPUT_GRACE,
+                transport: ProviderTransport::Buffered,
+            }
+        }
     }
 }
 
@@ -1492,6 +1742,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1509,10 +1760,35 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
         assert_eq!(provider.base_url(), "https://custom.example.com/v1");
+    }
+
+    #[test]
+    fn test_non_stream_preoutput_policy_allows_full_http_generation() {
+        let provider = OpenAiProvider::new(OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some("https://custom.example.com/v1".to_string()),
+            model_id: "custom-model".to_string(),
+            model_info: None,
+            reasoning_effort: None,
+            extra_body: None,
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: false,
+            provider_name: None,
+        })
+        .unwrap();
+
+        let policy = provider.preoutput_policy();
+        assert_eq!(
+            policy.budget,
+            OPENAI_CLIENT_TOTAL_TIMEOUT + OPENAI_NON_STREAM_PREOUTPUT_GRACE
+        );
+        assert_eq!(policy.transport, ProviderTransport::Buffered);
     }
 
     #[test]
@@ -1526,6 +1802,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1543,6 +1820,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1584,6 +1862,134 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_body_non_stream_omits_stream_options() {
+        let provider = OpenAiProvider::new(OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some("https://custom.example.com/v1".to_string()),
+            model_id: "custom-model".to_string(),
+            model_info: None,
+            reasoning_effort: None,
+            extra_body: Some(serde_json::Map::from_iter([
+                ("stream".to_string(), json!(true)),
+                (
+                    "stream_options".to_string(),
+                    json!({"include_usage": true}),
+                ),
+            ])),
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: false,
+            provider_name: None,
+        })
+        .unwrap();
+        let request = ProviderRequest {
+            system_prompt: "Be concise.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn test_decode_non_stream_completion_preserves_chunks_and_usage() {
+        let completion = serde_json::from_value::<OpenAiCompletionResponse>(json!({
+            "id": "chatcmpl-nonstream",
+            "choices": [{
+                "message": {
+                    "reasoning_content": "thinking",
+                    "content": "answer",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": r#"{"path":"README.md"}"#
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 40},
+                "completion_tokens_details": {"reasoning_tokens": 5},
+                "prompt_cache_miss_tokens": 10
+            }
+        }))
+        .unwrap();
+
+        let chunks = decode_openai_completion(completion, None);
+        assert!(matches!(chunks[0], ApiStreamChunk::Reasoning(_)));
+        assert!(matches!(chunks[1], ApiStreamChunk::Text(_)));
+        assert!(matches!(
+            chunks[2],
+            ApiStreamChunk::ToolCallStarted { ref call_id, ref name }
+                if call_id == "call-1" && name == "read_file"
+        ));
+        assert!(matches!(chunks[3], ApiStreamChunk::ToolCalls(_)));
+        assert!(matches!(
+            chunks[4],
+            ApiStreamChunk::Usage(ref usage)
+                if usage.input_tokens == 60
+                    && usage.cache_read_tokens == Some(40)
+                    && usage.cache_write_tokens == Some(10)
+                    && usage.reasoning_tokens == Some(5)
+                    && usage.stop_reason.as_deref() == Some("tool_calls")
+        ));
+    }
+
+    #[test]
+    fn test_decode_non_stream_completion_tolerates_missing_optional_fields() {
+        let completion = serde_json::from_value::<OpenAiCompletionResponse>(json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [
+                        {},
+                        {"id": "call-valid", "function": {"name": "read_file"}}
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+
+        let chunks = decode_openai_completion(completion, None);
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, ApiStreamChunk::ToolCallStarted { .. }))
+                .count(),
+            1
+        );
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::ToolCalls(tool_calls)
+                if tool_calls.tool_call.call_id.as_deref() == Some("call-valid")
+        )));
+        assert!(matches!(chunks.last(), Some(ApiStreamChunk::Usage(usage))
+            if usage.stop_reason.as_deref() == Some("tool_calls")));
+    }
+
+    #[test]
+    fn test_decode_non_stream_completion_tolerates_missing_message_and_id() {
+        let completion = serde_json::from_value::<OpenAiCompletionResponse>(json!({
+            "choices": [{}]
+        }))
+        .unwrap();
+
+        let chunks = decode_openai_completion(completion, None);
+        assert!(matches!(chunks.as_slice(), [ApiStreamChunk::Usage(usage)]
+            if usage.input_tokens == 0 && usage.output_tokens == 0));
+    }
+
+    #[test]
     fn test_build_request_body_merges_extra_body_without_overriding_core_fields() {
         let provider = OpenAiProvider::new(OpenAiConfig {
             api_key: "test-key".to_string(),
@@ -1601,6 +2007,7 @@ mod tests {
             ])),
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
             provider_name: None,
         })
         .unwrap();
@@ -1634,6 +2041,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1686,6 +2094,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1839,6 +2248,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1875,6 +2285,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
             provider_name: Some("openai-compatible".to_string()),
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1909,6 +2320,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
             provider_name: Some("openai-compatible".to_string()),
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -1966,6 +2378,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2028,6 +2441,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2065,6 +2479,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2098,6 +2513,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2156,6 +2572,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2214,6 +2631,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2319,6 +2737,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2369,6 +2788,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: None,
         };
         let provider = OpenAiProvider::new(config).unwrap();
@@ -2394,6 +2814,7 @@ mod tests {
             extra_body: None,
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
             provider_name: Some("openai".to_string()),
         };
         let _provider = OpenAiProvider::new(config).unwrap();
@@ -2737,10 +3158,12 @@ mod tests {
 }
 #[cfg(test)]
 mod debug_test {
+    use futures::StreamExt;
     use crate::providers::openai::{
-        OpenAiStreamDeltaState, finish_openai_sse_to_chunks, parse_openai_sse_to_chunks,
+        OpenAiConfig, OpenAiEndpointKind, OpenAiProvider, OpenAiStreamDeltaState,
+        finish_openai_sse_to_chunks, parse_openai_sse_to_chunks,
     };
-    use crate::providers::{ApiStreamChunk, SseLineBuffer};
+    use crate::providers::{ApiStreamChunk, Provider, ProviderRequest, SseLineBuffer};
 
     #[tokio::test]
     async fn debug_openai_text_only_stream() {
@@ -2794,6 +3217,114 @@ data: [DONE]
         }
 
         println!("Total chunks: {}", chunks.len());
+    }
+
+    #[tokio::test]
+    async fn test_sse_fallback_without_usage_emits_synthetic_usage() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(16);
+        let mut buffer = SseLineBuffer::default();
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason = None;
+        let mut usage_sent = false;
+        let sse = br#"data: {"id":"chatcmpl-fallback","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}
+"#;
+
+        parse_openai_sse_to_chunks(
+            sse,
+            &mut buffer,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+        finish_openai_sse_to_chunks(
+            &mut buffer,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+        drop(tx);
+
+        let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::Usage(usage)
+                if usage.input_tokens == 0
+                    && usage.output_tokens == 0
+                    && usage.stop_reason.as_deref() == Some("stop")
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_non_stream_create_message_sniffs_sse_without_sse_content_type() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let sse_body =
+            br#"data: {"id":"chatcmpl-fallback","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+"#;
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                sse_body.len()
+            )
+            .unwrap();
+            socket.write_all(sse_body).unwrap();
+        });
+
+        let provider = OpenAiProvider::new(OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some(format!("http://{address}")),
+            model_id: "custom-model".to_string(),
+            model_info: None,
+            reasoning_effort: None,
+            extra_body: None,
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: false,
+            provider_name: None,
+        })
+        .unwrap();
+        let request = ProviderRequest {
+            system_prompt: "Be concise.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let mut stream = provider.create_message(request).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+        server.join().unwrap();
+
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::Usage(usage)
+                if usage.output_tokens == 0
+                    && usage.stop_reason.as_deref() == Some("stop")
+        )));
     }
 
     #[tokio::test]

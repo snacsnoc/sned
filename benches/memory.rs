@@ -48,6 +48,7 @@ fn benchmark_provider_creation(c: &mut Criterion) {
                 extra_body: None,
                 custom_headers: None,
                 endpoint_kind: sned::providers::openai::OpenAiEndpointKind::Official,
+                stream: true,
                 provider_name: None,
             };
             black_box(config);
