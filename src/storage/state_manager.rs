@@ -396,7 +396,9 @@ impl std::str::FromStr for GlobalStateKey {
             "globalSnedRulesToggles" | "global_sned_rules_toggles" => {
                 Ok(Self::GlobalSnedRulesToggles)
             }
-            "enableCheckpoints" | "enable_checkpoints" | "enableCheckpointsSetting"
+            "enableCheckpoints"
+            | "enable_checkpoints"
+            | "enableCheckpointsSetting"
             | "enable_checkpoints_setting" => Ok(Self::EnableCheckpoints),
             "actModeApiProvider" | "act_mode_api_provider" => Ok(Self::ActModeApiProvider),
             "planModeApiProvider" | "plan_mode_api_provider" => Ok(Self::PlanModeApiProvider),
@@ -2146,17 +2148,16 @@ mod tests {
             let manager = StateManager::new().unwrap();
             manager.initialize().unwrap();
             manager
-                .set_global_state_string_field(
-                    "enable_checkpoints_setting",
-                    "false".to_string(),
-                )
+                .set_global_state_string_field("enable_checkpoints_setting", "false".to_string())
                 .unwrap();
             manager.persist().unwrap();
 
             let reloaded = StateManager::new().unwrap();
             reloaded.initialize().unwrap();
             assert_eq!(
-                reloaded.get_config_value("enable_checkpoints_setting").as_deref(),
+                reloaded
+                    .get_config_value("enable_checkpoints_setting")
+                    .as_deref(),
                 Some("false")
             );
         });
