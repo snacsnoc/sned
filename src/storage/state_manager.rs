@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use std::time::Instant;
@@ -12,6 +12,75 @@ use std::time::Instant;
 use crate::storage::disk;
 use crate::storage::global_state::{GlobalState, HistoryItem};
 use crate::storage::secrets::SecretsStore;
+
+const STATE_PERSIST_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+type PendingGeneration = u64;
+
+/// Cross-process guard for the shared Sned state directory.
+///
+/// Atomic replacement protects individual files from partial writes, but it
+/// does not prevent two processes from reading stale state and then replacing
+/// each other's updates. The advisory lock serializes the full persistence
+/// transaction. The lock file is intentionally fixed in the state directory;
+/// its presence on disk is harmless because the OS releases the advisory lock
+/// when the owner exits.
+#[derive(Debug)]
+struct StatePersistenceLock {
+    _file: fs::File,
+}
+
+impl StatePersistenceLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "state lock path has no parent")
+        })?;
+        fs::create_dir_all(parent)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let started = Instant::now();
+            loop {
+                // SAFETY: file remains open for the lifetime of this guard.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    return Ok(Self { _file: file });
+                }
+
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+                if started.elapsed() >= STATE_PERSIST_LOCK_TIMEOUT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting for state persistence lock {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self { _file: file })
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum HistoryOperation {
+    Replace(Vec<HistoryItem>),
+    Upsert(HistoryItem),
+    Remove(String),
+}
 
 /// Information about a valid config key.
 #[derive(Debug, Clone)]
@@ -327,7 +396,8 @@ impl std::str::FromStr for GlobalStateKey {
             "globalSnedRulesToggles" | "global_sned_rules_toggles" => {
                 Ok(Self::GlobalSnedRulesToggles)
             }
-            "enableCheckpoints" | "enable_checkpoints" => Ok(Self::EnableCheckpoints),
+            "enableCheckpoints" | "enable_checkpoints" | "enableCheckpointsSetting"
+            | "enable_checkpoints_setting" => Ok(Self::EnableCheckpoints),
             "actModeApiProvider" | "act_mode_api_provider" => Ok(Self::ActModeApiProvider),
             "planModeApiProvider" | "plan_mode_api_provider" => Ok(Self::PlanModeApiProvider),
             "actModeApiModelId" | "act_mode_api_model_id" => Ok(Self::ActModeApiModelId),
@@ -385,8 +455,8 @@ impl std::fmt::Display for GlobalStateKey {
 /// Key behaviors preserved:
 /// - In-memory cache for fast reads (no disk I/O on reads after init)
 /// - Async disk persistence with debouncing (1-second delay)
-/// - Separate persistence paths for global state, task history, task state, secrets, workspace state
-/// - Task history routed to its own file (`~/.sned/data/state/taskHistory.json`)
+/// - Separate persistence paths for global state, task state, secrets, workspace state
+/// - Task history is stored in the shared global settings file
 /// - Per-task settings routed to task directories
 pub struct StateManager {
     /// Global state + settings cache
@@ -401,10 +471,21 @@ pub struct StateManager {
     /// Workspace state cache
     workspace_state: RwLock<WorkspaceState>,
 
-    /// Pending keys to persist (debounced)
-    pending_global_keys: Mutex<HashSet<String>>,
-    pending_task_states: Mutex<HashMap<String, HashSet<String>>>,
-    pending_secrets: Mutex<HashSet<String>>,
+    /// Pending keys to persist (debounced). The generation lets persistence
+    /// clear only the marker it actually wrote, preserving mutations that
+    /// arrived while disk I/O was in progress.
+    pending_global_keys: Mutex<HashMap<String, PendingGeneration>>,
+    pending_task_states: Mutex<HashMap<String, HashMap<String, PendingGeneration>>>,
+    pending_secrets: Mutex<HashMap<String, PendingGeneration>>,
+
+    /// Ordered history operations allow a process with stale in-memory
+    /// history to merge its changes into the latest on-disk history.
+    pending_history_operations: Mutex<BTreeMap<PendingGeneration, HistoryOperation>>,
+    next_pending_generation: AtomicU64,
+
+    /// Prevent concurrent persistence tasks in this process from taking
+    /// overlapping snapshots and clearing each other's pending markers.
+    persist_lock: Mutex<()>,
 
     /// Last persistence time
     last_persist: Mutex<Option<Instant>>,
@@ -433,9 +514,12 @@ impl StateManager {
             task_state: RwLock::new(HashMap::with_capacity(8)),
             secrets: RwLock::new(HashMap::with_capacity(4)),
             workspace_state: RwLock::new(HashMap::with_capacity(8)),
-            pending_global_keys: Mutex::new(HashSet::new()),
+            pending_global_keys: Mutex::new(HashMap::new()),
             pending_task_states: Mutex::new(HashMap::with_capacity(4)),
-            pending_secrets: Mutex::new(HashSet::new()),
+            pending_secrets: Mutex::new(HashMap::new()),
+            pending_history_operations: Mutex::new(BTreeMap::new()),
+            next_pending_generation: AtomicU64::new(1),
+            persist_lock: Mutex::new(()),
             last_persist: Mutex::new(None),
             workspace_state_dirty: AtomicBool::new(false),
             secrets_store,
@@ -443,10 +527,16 @@ impl StateManager {
         })
     }
 
+    fn persistence_lock_path(&self) -> PathBuf {
+        self.state_dir.join("persistence.lock")
+    }
+
     /// Initialize the state manager from disk.
     /// Loads global state, task history, secrets, and workspace state.
     /// Cleans up orphaned atomic write temp files older than 24 hours.
     pub fn initialize(&self) -> io::Result<()> {
+        let _disk_lock = StatePersistenceLock::acquire(&self.persistence_lock_path())?;
+
         // Clean up orphaned temp files from crashed atomic writes
         let settings_dir = self.state_dir.join("..").join("settings");
         let _ = crate::storage::disk::cleanup_orphaned_temp_files(
@@ -477,11 +567,20 @@ impl StateManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = secrets;
 
         // Load workspace state (if exists)
-        if let Ok(workspace_state) = self.load_workspace_state() {
-            *self
-                .workspace_state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = workspace_state;
+        match self.load_workspace_state() {
+            Ok(workspace_state) => {
+                *self
+                    .workspace_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = workspace_state;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    file_path = %self.state_dir.join("workspace_state.json").display(),
+                    error = %error,
+                    "Failed to load workspace state; using an empty state"
+                );
+            }
         }
 
         // Load task states from disk (SM4 fix)
@@ -510,13 +609,14 @@ impl StateManager {
                             // Convert Map to HashMap to match task_state type
                             let task_state_map: HashMap<String, serde_json::Value> =
                                 parsed.into_iter().collect();
-                            let keys: HashSet<String> = task_state_map.keys().cloned().collect();
                             task_states.insert(task_id.to_string(), task_state_map);
                             // Mark all loaded keys as pending to ensure they're persisted
-                            pending_task_states
-                                .entry(task_id.to_string())
-                                .or_default()
-                                .extend(keys);
+                            let pending_keys =
+                                pending_task_states.entry(task_id.to_string()).or_default();
+                            for key in task_states.get(task_id).into_iter().flat_map(HashMap::keys)
+                            {
+                                pending_keys.insert(key.clone(), self.next_pending_generation());
+                            }
                         }
                     }
                 }
@@ -549,11 +649,15 @@ impl StateManager {
 
     /// Set task history in cache and mark for persistence
     pub fn set_task_history(&self, history: Vec<HistoryItem>) {
-        self.global_state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .task_history = history;
-        self.mark_global_key_pending("taskHistory".to_string());
+        {
+            self.global_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .task_history = history.clone();
+        }
+        let generation = self.next_pending_generation();
+        self.record_history_operation(generation, HistoryOperation::Replace(history));
+        self.mark_global_key_pending_at("taskHistory".to_string(), generation);
     }
 
     /// Add a task to history (or update existing)
@@ -564,11 +668,13 @@ impl StateManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         state.task_history.retain(|h| h.id != item.id);
-        state.task_history.push(item);
+        state.task_history.push(item.clone());
         state.task_history.sort_by_key(|b| std::cmp::Reverse(b.ts));
 
         drop(state);
-        self.mark_global_key_pending("taskHistory".to_string());
+        let generation = self.next_pending_generation();
+        self.record_history_operation(generation, HistoryOperation::Upsert(item));
+        self.mark_global_key_pending_at("taskHistory".to_string(), generation);
     }
 
     /// Remove a task from history
@@ -579,7 +685,9 @@ impl StateManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.task_history.retain(|h| h.id != task_id);
         drop(state);
-        self.mark_global_key_pending("taskHistory".to_string());
+        let generation = self.next_pending_generation();
+        self.record_history_operation(generation, HistoryOperation::Remove(task_id.to_string()));
+        self.mark_global_key_pending_at("taskHistory".to_string(), generation);
     }
 
     /// Find a task in history by ID
@@ -664,7 +772,17 @@ impl StateManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             key.set_json_value(&mut state, value);
         }
-        self.mark_global_key_pending(key.to_string());
+        let generation = self.next_pending_generation();
+        if key == GlobalStateKey::TaskHistory {
+            let history = self
+                .global_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .task_history
+                .clone();
+            self.record_history_operation(generation, HistoryOperation::Replace(history));
+        }
+        self.mark_global_key_pending_at(key.to_string(), generation);
     }
 
     /// Set a string-backed global config field by its JSON field name.
@@ -765,6 +883,10 @@ impl StateManager {
                     matches!(value.to_lowercase().as_str(), "true" | "1");
                 true
             }
+            "subagents_enabled" => {
+                state.subagents_enabled = matches!(value.to_lowercase().as_str(), "true" | "1");
+                true
+            }
             "sned_web_tools_enabled" => {
                 state.sned_web_tools_enabled =
                     matches!(value.to_lowercase().as_str(), "true" | "1");
@@ -821,6 +943,7 @@ impl StateManager {
             drop(task_states);
         }
 
+        let generation = self.next_pending_generation();
         let mut pending = self
             .pending_task_states
             .lock()
@@ -828,7 +951,7 @@ impl StateManager {
         pending
             .entry(task_id.to_string())
             .or_default()
-            .insert(key.to_string());
+            .insert(key.to_string(), generation);
         drop(pending);
     }
 
@@ -871,7 +994,11 @@ impl StateManager {
     /// Load global state from disk
     fn load_global_state(&self) -> io::Result<GlobalState> {
         crate::storage::global_state::load_global_state_from_path(
-            &crate::storage::global_state::global_settings_path(),
+            &self
+                .state_dir
+                .join("..")
+                .join("settings")
+                .join("global_settings.json"),
         )
     }
 
@@ -907,21 +1034,93 @@ impl StateManager {
     }
 
     /// Mark a global key as pending persistence
-    fn mark_global_key_pending(&self, key: String) {
+    fn next_pending_generation(&self) -> PendingGeneration {
+        self.next_pending_generation.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn mark_global_key_pending(&self, key: String) -> PendingGeneration {
+        let generation = self.next_pending_generation();
+        self.mark_global_key_pending_at(key, generation);
+        generation
+    }
+
+    fn mark_global_key_pending_at(&self, key: String, generation: PendingGeneration) {
         let mut pending = self
             .pending_global_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.insert(key);
+        pending.insert(key, generation);
     }
 
     /// Mark a secret as pending persistence
-    fn mark_secret_pending(&self, key: String) {
+    fn mark_secret_pending(&self, key: String) -> PendingGeneration {
+        let generation = self.next_pending_generation();
         let mut pending = self
             .pending_secrets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.insert(key);
+        pending.insert(key, generation);
+        generation
+    }
+
+    fn record_history_operation(&self, generation: PendingGeneration, operation: HistoryOperation) {
+        self.pending_history_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(generation, operation);
+    }
+
+    fn clear_global_pending(&self, snapshot: &HashMap<String, PendingGeneration>) {
+        let mut pending = self
+            .pending_global_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (key, generation) in snapshot {
+            if pending.get(key) == Some(generation) {
+                pending.remove(key);
+            }
+        }
+    }
+
+    fn clear_task_pending(&self, snapshot: &HashMap<String, HashMap<String, PendingGeneration>>) {
+        let mut pending = self
+            .pending_task_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (task_id, keys) in snapshot {
+            if let Some(current_keys) = pending.get_mut(task_id) {
+                for (key, generation) in keys {
+                    if current_keys.get(key) == Some(generation) {
+                        current_keys.remove(key);
+                    }
+                }
+                if current_keys.is_empty() {
+                    pending.remove(task_id);
+                }
+            }
+        }
+    }
+
+    fn clear_secret_pending(&self, snapshot: &HashMap<String, PendingGeneration>) {
+        let mut pending = self
+            .pending_secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (key, generation) in snapshot {
+            if pending.get(key) == Some(generation) {
+                pending.remove(key);
+            }
+        }
+    }
+
+    fn clear_history_pending(&self, snapshot: &BTreeMap<PendingGeneration, HistoryOperation>) {
+        let mut pending = self
+            .pending_history_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for generation in snapshot.keys() {
+            pending.remove(generation);
+        }
     }
 
     #[allow(clippy::unused_self)]
@@ -958,28 +1157,36 @@ impl StateManager {
     /// Persist all pending changes to disk.
     /// This is called periodically or on explicit flush.
     pub fn persist(&self) -> io::Result<()> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _disk_lock = StatePersistenceLock::acquire(&self.persistence_lock_path())?;
+
         // Persist global state
-        let global_keys: HashSet<String> = {
+        let global_keys: HashMap<String, PendingGeneration> = {
             let pending = self
                 .pending_global_keys
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.clone()
         };
-
-        if !global_keys.is_empty() {
-            self.persist_global_state(&global_keys)?;
-            let mut pending = self
-                .pending_global_keys
+        let history_operations = {
+            let pending = self
+                .pending_history_operations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for key in &global_keys {
-                pending.remove(key);
-            }
+            pending.clone()
+        };
+
+        if !global_keys.is_empty() {
+            self.persist_global_state(&global_keys, &history_operations)?;
+            self.clear_global_pending(&global_keys);
+            self.clear_history_pending(&history_operations);
         }
 
         // Persist task states
-        let task_states: HashMap<String, HashSet<String>> = {
+        let task_states: HashMap<String, HashMap<String, PendingGeneration>> = {
             let pending = self
                 .pending_task_states
                 .lock()
@@ -989,17 +1196,11 @@ impl StateManager {
 
         if !task_states.is_empty() {
             self.persist_task_states(&task_states)?;
-            let mut pending = self
-                .pending_task_states
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for task_id in task_states.keys() {
-                pending.remove(task_id);
-            }
+            self.clear_task_pending(&task_states);
         }
 
         // Persist secrets
-        let secrets: HashSet<String> = {
+        let secrets: HashMap<String, PendingGeneration> = {
             let pending = self
                 .pending_secrets
                 .lock()
@@ -1009,13 +1210,7 @@ impl StateManager {
 
         if !secrets.is_empty() {
             self.persist_secrets(&secrets)?;
-            let mut pending = self
-                .pending_secrets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for key in &secrets {
-                pending.remove(key);
-            }
+            self.clear_secret_pending(&secrets);
         }
 
         // Persist workspace state
@@ -1039,14 +1234,48 @@ impl StateManager {
             .map_err(io::Error::other)?
     }
 
-    fn persist_global_state(&self, _keys: &HashSet<String>) -> io::Result<()> {
-        let state = self
+    fn persist_global_state(
+        &self,
+        keys: &HashMap<String, PendingGeneration>,
+        history_operations: &BTreeMap<PendingGeneration, HistoryOperation>,
+    ) -> io::Result<()> {
+        let local_state = self
             .global_state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let settings_dir = self.state_dir.join("..").join("settings");
         fs::create_dir_all(&settings_dir)?;
+
+        let file_path = settings_dir.join("global_settings.json");
+        let mut state = crate::storage::global_state::load_global_state_from_path(&file_path)?;
+        for key_name in keys.keys() {
+            let Ok(key) = key_name.parse::<GlobalStateKey>() else {
+                continue;
+            };
+
+            if key == GlobalStateKey::TaskHistory && !history_operations.is_empty() {
+                for operation in history_operations.values() {
+                    match operation {
+                        HistoryOperation::Replace(history) => state.task_history = history.clone(),
+                        HistoryOperation::Upsert(item) => {
+                            state.task_history.retain(|entry| entry.id != item.id);
+                            state.task_history.push(item.clone());
+                        }
+                        HistoryOperation::Remove(task_id) => {
+                            state
+                                .task_history
+                                .retain(|entry| entry.id.as_str() != task_id.as_str());
+                        }
+                    }
+                }
+                state
+                    .task_history
+                    .sort_by_key(|entry| std::cmp::Reverse(entry.ts));
+            } else if let Some(value) = key.get_json_value(&local_state) {
+                key.set_json_value(&mut state, value);
+            }
+        }
 
         self.persist_full_global_state(&state, &settings_dir)
     }
@@ -1068,12 +1297,13 @@ impl StateManager {
     /// Persist task states to disk
     fn persist_task_states(
         &self,
-        task_states: &HashMap<String, HashSet<String>>,
+        task_states: &HashMap<String, HashMap<String, PendingGeneration>>,
     ) -> io::Result<()> {
         let states = self
             .task_state
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
 
         for (task_id, keys) in task_states {
             if let Some(task_state) = states.get(task_id) {
@@ -1091,7 +1321,7 @@ impl StateManager {
                 };
 
                 // Merge pending keys into existing settings
-                for key in keys {
+                for key in keys.keys() {
                     if let Some(value) = task_state.get(key) {
                         existing_settings.insert(key.clone(), value.clone());
                     }
@@ -1109,7 +1339,7 @@ impl StateManager {
     }
 
     /// Persist secrets to disk
-    fn persist_secrets(&self, keys: &HashSet<String>) -> io::Result<()> {
+    fn persist_secrets(&self, keys: &HashMap<String, PendingGeneration>) -> io::Result<()> {
         let secrets = self
             .secrets
             .read()
@@ -1117,7 +1347,7 @@ impl StateManager {
 
         // Use secrets_store.set() for each key to do proper read-merge-write
         // This prevents overwriting the entire file with only pending keys (S7 fix)
-        for key in keys {
+        for key in keys.keys() {
             if let Some(value) = secrets.get(key) {
                 self.secrets_store.set(key, value)?;
             }
@@ -1129,7 +1359,7 @@ impl StateManager {
     /// Writes the entire workspace state atomically. Skips the write
     /// when the dirty flag is false (no mutations since last persist).
     fn persist_workspace_state(&self) -> io::Result<()> {
-        if !self.workspace_state_dirty.swap(false, Ordering::AcqRel) {
+        if !self.workspace_state_dirty.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -1137,13 +1367,23 @@ impl StateManager {
             .workspace_state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace_state_snapshot = workspace_state.clone();
 
         let file_path = self.state_dir.join("workspace_state.json");
-        let data = serde_json::to_string_pretty(&*workspace_state)
+        let data = serde_json::to_string_pretty(&workspace_state_snapshot)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         drop(workspace_state);
 
         crate::storage::disk::atomic_write_file(&file_path, &data)?;
+        // Do not clear a mutation that arrived while the snapshot was being
+        // serialized or written. A future persist must retry that newer state.
+        let current_workspace_state = self
+            .workspace_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current_workspace_state == workspace_state_snapshot {
+            self.workspace_state_dirty.store(false, Ordering::Release);
+        }
         Ok(())
     }
 }
@@ -1153,6 +1393,9 @@ impl StateManager {
 #[must_use]
 pub fn list_tasks(items: &[HistoryItem], page: usize, limit: usize) -> (Vec<HistoryItem>, usize) {
     let total = items.len();
+    if page == 0 || limit == 0 {
+        return (Vec::new(), total);
+    }
     let start = (page - 1) * limit;
     let end = (start + limit).min(total);
 
@@ -1192,6 +1435,7 @@ fn workspace_paths_match(history_path: &str, workspace_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
 
@@ -1554,7 +1798,9 @@ mod tests {
                 .set_global_state_string_field("max_consecutive_mistakes", "0".to_string())
                 .unwrap();
             assert_eq!(
-                manager.get_config_value("max_consecutive_mistakes").as_deref(),
+                manager
+                    .get_config_value("max_consecutive_mistakes")
+                    .as_deref(),
                 Some("0")
             );
         });
@@ -1597,7 +1843,12 @@ mod tests {
 
             let repaired = StateManager::new().unwrap();
             repaired.initialize().unwrap();
-            assert_eq!(repaired.get_config_value("max_consecutive_mistakes").as_deref(), Some("3"));
+            assert_eq!(
+                repaired
+                    .get_config_value("max_consecutive_mistakes")
+                    .as_deref(),
+                Some("3")
+            );
         });
     }
 
@@ -1804,5 +2055,135 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
             assert_eq!(persisted["mode"], serde_json::Value::String("plan".into()));
         });
+    }
+
+    #[test]
+    fn test_stale_managers_merge_task_history_updates() {
+        with_temp_data_dir(|| {
+            let first = StateManager::new().unwrap();
+            first.initialize().unwrap();
+            let second = StateManager::new().unwrap();
+            second.initialize().unwrap();
+
+            first.add_task_to_history(HistoryItem {
+                id: "task-from-first-process".to_string(),
+                ts: 1,
+                ..Default::default()
+            });
+            first.persist().unwrap();
+
+            // `second` was initialized before the first write and therefore
+            // has a stale in-memory history. Its operation must merge with,
+            // rather than replace, the first process's update.
+            second.add_task_to_history(HistoryItem {
+                id: "task-from-second-process".to_string(),
+                ts: 2,
+                ..Default::default()
+            });
+            second.persist().unwrap();
+
+            let reloaded = StateManager::new().unwrap();
+            reloaded.initialize().unwrap();
+            let ids: HashSet<String> = reloaded
+                .get_task_history()
+                .into_iter()
+                .map(|item| item.id)
+                .collect();
+            assert!(ids.contains("task-from-first-process"));
+            assert!(ids.contains("task-from-second-process"));
+        });
+    }
+
+    #[test]
+    fn test_new_pending_generation_survives_old_persist_snapshot() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+            manager.set_global_state_key(
+                GlobalStateKey::SubagentsEnabled,
+                serde_json::Value::Bool(true),
+            );
+            let old_snapshot = manager
+                .pending_global_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+
+            manager.set_global_state_key(
+                GlobalStateKey::SubagentsEnabled,
+                serde_json::Value::Bool(false),
+            );
+            manager.clear_global_pending(&old_snapshot);
+
+            assert!(
+                manager
+                    .pending_global_keys
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key("subagentsEnabled")
+            );
+        });
+    }
+
+    #[test]
+    fn test_subagents_enabled_string_config_is_supported() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+            manager
+                .set_global_state_string_field("subagents_enabled", "true".to_string())
+                .unwrap();
+            assert_eq!(
+                manager.get_config_value("subagents_enabled").as_deref(),
+                Some("true")
+            );
+        });
+    }
+
+    #[test]
+    fn test_enable_checkpoints_setting_persists_through_string_config() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+            manager
+                .set_global_state_string_field(
+                    "enable_checkpoints_setting",
+                    "false".to_string(),
+                )
+                .unwrap();
+            manager.persist().unwrap();
+
+            let reloaded = StateManager::new().unwrap();
+            reloaded.initialize().unwrap();
+            assert_eq!(
+                reloaded.get_config_value("enable_checkpoints_setting").as_deref(),
+                Some("false")
+            );
+        });
+    }
+
+    #[test]
+    fn test_workspace_dirty_flag_survives_write_failure() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+            let workspace_state_path = manager.state_dir.join("workspace_state.json");
+            fs::create_dir(&workspace_state_path).unwrap();
+            manager.workspace_state_dirty.store(true, Ordering::Release);
+
+            assert!(manager.persist_workspace_state().is_err());
+            assert!(manager.workspace_state_dirty.load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn test_list_tasks_rejects_zero_page_and_limit() {
+        let items = vec![HistoryItem::default()];
+        let (page, total) = list_tasks(&items, 0, 10);
+        assert!(page.is_empty());
+        assert_eq!(total, 1);
+        let (page, total) = list_tasks(&items, 1, 0);
+        assert!(page.is_empty());
+        assert_eq!(total, 1);
     }
 }

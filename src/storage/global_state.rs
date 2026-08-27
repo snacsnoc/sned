@@ -184,6 +184,19 @@ fn validate_checksum(data: &str, expected_checksum: &str) -> bool {
     compute_checksum(data) == expected_checksum
 }
 
+fn repair_corrupt_global_state(path: &Path) {
+    let Ok(data) = serde_json::to_string_pretty(&GlobalState::default()) else {
+        return;
+    };
+    if let Err(error) = crate::storage::disk::atomic_write_file(path, &data) {
+        tracing::warn!(
+            file_path = %path.display(),
+            error = %error,
+            "Failed to replace corrupted global state with defaults"
+        );
+    }
+}
+
 /// Load plain JSON settings, accepting the previous checksum-prefixed format.
 pub fn load_global_state_from_path(path: &Path) -> io::Result<GlobalState> {
     match fs::read_to_string(&path) {
@@ -216,6 +229,12 @@ pub fn load_global_state_from_path(path: &Path) -> io::Result<GlobalState> {
                         backup_path = %backup_path.display(),
                         "Global state integrity check failed; backed up corrupted file"
                     );
+                    repair_corrupt_global_state(&path);
+                } else {
+                    tracing::warn!(
+                        file_path = %path.display(),
+                        "Global state integrity check failed and backup failed; leaving original file"
+                    );
                 }
                 return Ok(GlobalState::default());
             }
@@ -241,6 +260,13 @@ pub fn load_global_state_from_path(path: &Path) -> io::Result<GlobalState> {
                             error = %error,
                             "Created backup of corrupted global state JSON"
                         );
+                        repair_corrupt_global_state(&path);
+                    } else {
+                        tracing::warn!(
+                            file_path = %path.display(),
+                            error = %error,
+                            "Failed to back up corrupted global state JSON; leaving original file"
+                        );
                     }
                     Ok(GlobalState::default())
                 }
@@ -254,12 +280,10 @@ pub fn load_global_state_from_path(path: &Path) -> io::Result<GlobalState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use tracing::subscriber::with_default;
     use tracing_subscriber::filter::LevelFilter;
-
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[derive(Clone, Default)]
     struct TestWriter {
@@ -289,30 +313,6 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
-    }
-
-    fn with_temp_home<R>(f: impl FnOnce(&TempDir) -> R) -> R {
-        let _guard = TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let temp_home = TempDir::new().unwrap();
-        let old_home = std::env::var_os("HOME");
-
-        // SAFETY: env mutation guarded by mutex; no concurrent access to HOME
-        unsafe {
-            std::env::set_var("HOME", temp_home.path());
-        }
-
-        let result = f(&temp_home);
-
-        // SAFETY: env mutation guarded by mutex; restoring previous value
-        unsafe {
-            if let Some(old_home) = old_home {
-                std::env::set_var("HOME", old_home);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-
-        result
     }
 
     #[test]
@@ -349,35 +349,31 @@ mod tests {
 
     #[test]
     fn test_load_global_state_warns_on_corrupt_json() {
-        with_temp_home(|temp_home| {
-            let settings_dir = temp_home.path().join(".sned").join("data").join("settings");
-            fs::create_dir_all(&settings_dir).unwrap();
-            fs::write(
-                settings_dir.join("global_settings.json"),
-                b"{ this is not valid json",
-            )
-            .unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let settings_path = temp_dir.path().join("global_settings.json");
+        fs::write(&settings_path, b"{ this is not valid json").unwrap();
 
-            let writer = TestWriter::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(writer.clone())
-                .without_time()
-                .with_ansi(false)
-                .with_level(false)
-                .with_target(false)
-                .with_max_level(LevelFilter::TRACE)
-                .finish();
+        let writer = TestWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .without_time()
+            .with_ansi(false)
+            .with_level(false)
+            .with_target(false)
+            .with_max_level(LevelFilter::TRACE)
+            .finish();
 
-            let state = with_default(subscriber, load_global_state);
-
-            assert_eq!(
-                serde_json::to_value(&state).unwrap(),
-                serde_json::to_value(GlobalState::default()).unwrap()
-            );
-
-            let output = writer.output();
-            assert!(output.contains("corrupted global state JSON"), "{output}");
-            assert!(output.contains("global_settings.json"), "{output}");
+        let state = with_default(subscriber, || {
+            load_global_state_from_path(&settings_path).unwrap()
         });
+
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            serde_json::to_value(GlobalState::default()).unwrap()
+        );
+
+        let output = writer.output();
+        assert!(output.contains("corrupted global state JSON"), "{output}");
+        assert!(output.contains("global_settings.json"), "{output}");
     }
 }
