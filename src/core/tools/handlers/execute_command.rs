@@ -51,18 +51,25 @@ struct BoundedLineReader<R> {
     pending: Vec<u8>,
     line: Vec<u8>,
     discarding_line: bool,
+    raw_output: bool,
 }
 
 impl<R> BoundedLineReader<R>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    #[cfg(test)]
     fn new(reader: R) -> Self {
+        Self::with_raw_output(reader, false)
+    }
+
+    fn with_raw_output(reader: R, raw_output: bool) -> Self {
         Self {
             reader,
             pending: Vec::with_capacity(COMMAND_STREAM_READ_CHUNK_BYTES),
             line: Vec::with_capacity(COMMAND_STREAM_READ_CHUNK_BYTES),
             discarding_line: false,
+            raw_output,
         }
     }
 
@@ -117,7 +124,7 @@ where
     }
 
     fn take_line(&mut self) -> String {
-        if self.line.last() == Some(&b'\r') {
+        if !self.raw_output && self.line.last() == Some(&b'\r') {
             self.line.pop();
         }
         String::from_utf8_lossy(&std::mem::take(&mut self.line)).into_owned()
@@ -459,9 +466,10 @@ impl ExecuteCommandHandler {
             None,
             None,
             false,
+            false,
             &output_writer,
         )
-            .await
+        .await
     }
 
     /// Execute commands with optional safety checking.
@@ -478,6 +486,7 @@ impl ExecuteCommandHandler {
         task_state: Option<Arc<Mutex<TaskState>>>,
         cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
         json_output: bool,
+        raw_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         if session_command_scope_approved {
@@ -498,6 +507,7 @@ impl ExecuteCommandHandler {
             task_state,
             cancellation_flag,
             json_output,
+            raw_output,
             output_writer,
         )
         .await
@@ -512,6 +522,7 @@ impl ExecuteCommandHandler {
         task_state: Option<Arc<Mutex<TaskState>>>,
         cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
         json_output: bool,
+        raw_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         self.execute_commands_tokio(
@@ -522,6 +533,7 @@ impl ExecuteCommandHandler {
             task_state,
             cancellation_flag,
             json_output,
+            raw_output,
             output_writer,
         )
         .await
@@ -536,6 +548,7 @@ impl ExecuteCommandHandler {
         task_state: Option<Arc<Mutex<TaskState>>>,
         cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
         json_output: bool,
+        raw_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
@@ -623,8 +636,8 @@ impl ExecuteCommandHandler {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("Command stderr was not captured"))?;
 
-            let mut stdout_reader = BoundedLineReader::new(stdout);
-            let mut stderr_reader = BoundedLineReader::new(stderr);
+            let mut stdout_reader = BoundedLineReader::with_raw_output(stdout, raw_output);
+            let mut stderr_reader = BoundedLineReader::with_raw_output(stderr, raw_output);
 
             let mut stdout_collected = String::new();
             let mut stderr_collected = String::new();
@@ -1191,6 +1204,7 @@ impl ExecuteCommandHandler {
             false,
             None,
             None,
+            false,
             &output_writer,
         )
         .await
@@ -1205,6 +1219,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+        _raw_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
@@ -1593,6 +1608,7 @@ impl ExecuteCommandHandler {
 
         let script = params["script"].as_str();
         let language = params["language"].as_str().unwrap_or("bash");
+        let raw_output = params["raw_output"].as_bool().unwrap_or(false);
 
         let result = if let Some(cmds) = commands {
             self.execute_commands_with_safety(
@@ -1603,6 +1619,7 @@ impl ExecuteCommandHandler {
                 task_state,
                 cancellation_flag.clone(),
                 json_output,
+                raw_output,
                 output_writer,
             )
             .await
@@ -1616,6 +1633,7 @@ impl ExecuteCommandHandler {
                 explicitly_approved,
                 task_state,
                 cancellation_flag,
+                raw_output,
                 output_writer,
             )
             .await
@@ -1830,6 +1848,7 @@ mod tests {
                 None,
                 None,
                 true,
+                false,
                 &output_writer,
             )
             .await;
@@ -1847,6 +1866,7 @@ mod tests {
                 None,
                 None,
                 true,
+                false,
                 &output_writer,
             )
             .await;
@@ -1934,6 +1954,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_line_reader_raw_output_preserves_trailing_carriage_return() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"progress\r\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut normalized_reader = BoundedLineReader::new(reader);
+        let normalized = normalized_reader
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text("stdout");
+        assert_eq!(normalized, "progress");
+        writer_task.await.unwrap();
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"progress\r\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut raw_reader = BoundedLineReader::with_raw_output(reader, true);
+        let raw = raw_reader
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text("stdout");
+        assert_eq!(raw, "progress\r");
+        writer_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_execute_script_limits_captured_output() {
         let _guard = crate::test_support::env_lock()
             .lock()
@@ -2014,6 +2071,7 @@ mod tests {
                 Some(state.clone()),
                 None,
                 false,
+                false,
                 &output_writer,
             )
             .await;
@@ -2065,6 +2123,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
                 &output_writer,
             )
             .await;
@@ -2091,6 +2150,7 @@ mod tests {
                     false,
                     Some(run_state),
                     None,
+                    false,
                     &output_writer,
                 )
                 .await
@@ -2136,6 +2196,7 @@ mod tests {
                     false,
                     Some(run_state),
                     Some(run_flag),
+                    false,
                     &output_writer,
                 )
                 .await
@@ -2183,6 +2244,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
                 &output_writer,
             )
             .await;
@@ -2313,6 +2375,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
                 &output_writer,
             )
             .await;
@@ -2372,6 +2435,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                     &output_writer,
                 )
                 .await;
@@ -2430,6 +2494,7 @@ mod tests {
                     false,
                     None,
                     None,
+                    false,
                     &output_writer,
                 )
                 .await;
@@ -2642,6 +2707,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             &output_writer,
         ));
 
@@ -2690,6 +2756,7 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
                 false,
                 &output_writer,
             )
@@ -2775,6 +2842,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
                 false,
                 &writer,
             )

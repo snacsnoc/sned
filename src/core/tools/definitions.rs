@@ -302,7 +302,7 @@ pub fn execute_command_schema() -> ToolSchema {
                 name: "raw_output",
                 required: false,
                 param_type: "boolean",
-                description: "If true, return raw output without stripping progress bar artifacts. Defaults to false.",
+                description: "If true, preserve carriage-return progress output in command results. Defaults to false.",
                 items: None,
                 extra: None,
             },
@@ -1051,9 +1051,13 @@ mod tests {
         let required = edit["required"].as_array().expect("required fields");
 
         assert_eq!(properties["content"]["type"], "array");
-        assert!(properties["end_anchor"]["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("Optional for a single-line replace")));
+        assert!(
+            properties["end_anchor"]["description"]
+                .as_str()
+                .is_some_and(
+                    |description| description.contains("Optional for a single-line replace")
+                )
+        );
         assert!(!required.iter().any(|field| field == "edit_type"));
         assert!(required.iter().any(|field| field == "anchor"));
         assert!(schema.description.contains("call read_file"));
