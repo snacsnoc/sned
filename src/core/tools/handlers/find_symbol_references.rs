@@ -1,4 +1,5 @@
 use crate::core::hash_utils::format_line_with_hash;
+use crate::core::tools::handlers::read_file::record_complete_file_read;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
 use crate::services::tree_sitter::load_required_language_parsers;
@@ -23,10 +24,11 @@ struct Hit {
 }
 
 /// Stores file lines and parsed hits to avoid re-reading during formatting.
-#[derive(Clone)]
 struct FileData {
+    canonical_path: String,
     lines: Vec<String>,
     hits: Vec<Hit>,
+    _file_locks: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl FindSymbolReferencesHandler {
@@ -65,12 +67,23 @@ impl FindSymbolReferencesHandler {
         let mut file_data: BTreeMap<String, FileData> = BTreeMap::new();
         let mut any_error = None;
         let mut index_warnings = Vec::new();
+        let canonical_workspace = fs::canonicalize(&ctx.workspace_root)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("Unable to resolve workspace: {error}"))
+            })?;
 
         for path in &paths {
             let abs_path = ctx.resolve_path(path)?;
-            let abs_path_str = abs_path.to_string_lossy();
+            let canonical_path = fs::canonicalize(&abs_path).await.map_err(|error| {
+                ToolError::ExecutionFailed(format!("Error reading file {path}: {error}"))
+            })?;
+            let file_locks = ctx
+                .lock_file_paths(std::slice::from_ref(&canonical_path))
+                .await;
+            let abs_path_str = canonical_path.to_string_lossy();
 
-            let content = match fs::read_to_string(&abs_path).await {
+            let content = match fs::read_to_string(&canonical_path).await {
                 Ok(content) => content,
                 Err(e) => {
                     any_error = Some(ToolError::ExecutionFailed(format!(
@@ -85,9 +98,9 @@ impl FindSymbolReferencesHandler {
                     ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
                 })?;
 
-            let display_path = abs_path
-                .strip_prefix(&ctx.workspace_root)
-                .unwrap_or(&abs_path)
+            let display_path = canonical_path
+                .strip_prefix(&canonical_workspace)
+                .unwrap_or(&canonical_path)
                 .to_string_lossy()
                 .into_owned();
             let hits =
@@ -100,7 +113,20 @@ impl FindSymbolReferencesHandler {
                 .lines()
                 .map(std::string::ToString::to_string)
                 .collect();
-            file_data.insert(display_path, FileData { lines, hits });
+            {
+                let mut state = ctx.state.lock().await;
+                record_complete_file_read(&mut state, &canonical_path);
+                state.consecutive_reads.remove(abs_path_str.as_ref());
+            }
+            file_data.insert(
+                display_path,
+                FileData {
+                    canonical_path: abs_path_str.into_owned(),
+                    lines,
+                    hits,
+                    _file_locks: file_locks,
+                },
+            );
         }
 
         if let Some(err) = any_error {
@@ -112,7 +138,7 @@ impl FindSymbolReferencesHandler {
         if !indexed_locations.is_empty() {
             merge_index_locations(
                 &mut file_data,
-                &ctx.workspace_root,
+                ctx,
                 &project_root,
                 indexed_locations,
                 &mut index_warnings,
@@ -163,7 +189,11 @@ impl FindSymbolReferencesHandler {
             }
 
             let anchor_mgr = ctx.anchor_mgr.clone();
-            let anchors = anchor_mgr.reconcile(&path, &data.lines, Some(ctx.task_id.as_str()));
+            let anchors = anchor_mgr.reconcile(
+                &data.canonical_path,
+                &data.lines,
+                Some(ctx.task_id.as_str()),
+            );
 
             let mut merged: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
             for hit in data.hits {
@@ -289,12 +319,12 @@ impl ToolHandler for FindSymbolReferencesHandler {
 
 async fn merge_index_locations(
     file_data: &mut BTreeMap<String, FileData>,
-    workspace_root: &Path,
+    ctx: &ToolContext,
     project_root: &str,
     locations: Vec<SymbolLocation>,
     warnings: &mut Vec<String>,
 ) {
-    let canonical_workspace = match fs::canonicalize(workspace_root).await {
+    let canonical_workspace = match fs::canonicalize(&ctx.workspace_root).await {
         Ok(path) => path,
         Err(error) => {
             warnings.push(format!(
@@ -322,6 +352,9 @@ async fn merge_index_locations(
         }
         let display_path = rel_path.to_string();
         if !file_data.contains_key(&display_path) {
+            let file_locks = ctx
+                .lock_file_paths(std::slice::from_ref(&resolved_path))
+                .await;
             let content = match fs::read_to_string(&resolved_path).await {
                 Ok(content) => content,
                 Err(error) => {
@@ -329,14 +362,22 @@ async fn merge_index_locations(
                     continue;
                 }
             };
+            let canonical_path = resolved_path.to_string_lossy().into_owned();
+            {
+                let mut state = ctx.state.lock().await;
+                record_complete_file_read(&mut state, &resolved_path);
+                state.consecutive_reads.remove(&canonical_path);
+            }
             file_data.insert(
                 display_path.clone(),
                 FileData {
+                    canonical_path,
                     lines: content
                         .lines()
                         .map(std::string::ToString::to_string)
                         .collect(),
                     hits: Vec::new(),
+                    _file_locks: file_locks,
                 },
             );
         }
@@ -509,6 +550,7 @@ mod tests {
     use crate::core::agent_loop::TaskState;
     use crate::core::file_editor::AnchorStateManager;
     use crate::core::tools::ToolContext;
+    use crate::core::tools::handlers::edit_file::EditFileHandler;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -549,6 +591,88 @@ mod tests {
         let result_str = result.as_str().unwrap();
         assert!(result_str.contains("test.rs"));
         assert!(result_str.contains("fn foo()"));
+    }
+
+    #[tokio::test]
+    async fn test_returned_anchor_is_editable_and_records_complete_read() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            temp_dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let references = FindSymbolReferencesHandler::new()
+            .execute(&ctx, serde_json::json!({"path": "test.rs", "name": "foo"}))
+            .await
+            .unwrap();
+        let anchor = references
+            .as_str()
+            .unwrap()
+            .lines()
+            .find_map(|line| line.split_once(") ").map(|(_, anchor)| anchor))
+            .expect("reference output should contain an editable anchor");
+
+        let edit = EditFileHandler::new()
+            .execute(
+                &ctx,
+                serde_json::json!({
+                    "files": [{
+                        "path": "test.rs",
+                        "edits": [{"anchor": anchor, "text": "fn foo() { println!(\"ok\"); }"}]
+                    }]
+                }),
+            )
+            .await
+            .expect("anchor emitted by find_symbol_references must work in edit_file");
+
+        assert!(!edit.as_str().unwrap().contains("not read this session"));
+        assert!(
+            std::fs::read_to_string(file_path)
+                .unwrap()
+                .contains("println!")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_direct_reference_read_waits_for_shared_path_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(Mutex::new(TaskState::default())),
+            None,
+            temp_dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let canonical = std::fs::canonicalize(file_path).unwrap();
+        let held = ctx.lock_file_paths(std::slice::from_ref(&canonical)).await;
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            FindSymbolReferencesHandler::new()
+                .execute(&ctx, serde_json::json!({"path": "test.rs", "name": "foo"})),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "structural read bypassed the shared path lock"
+        );
+        drop(held);
     }
 
     #[tokio::test]

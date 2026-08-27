@@ -74,16 +74,47 @@ pub async fn capture_async<R>(mut reader: R, limit: usize) -> io::Result<Capture
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    capture_async_with_raw_output(&mut reader, limit, true).await
+}
+
+/// Capture asynchronous output while optionally removing carriage returns
+/// used by terminal progress updates. Command handlers use the normalized
+/// form by default and preserve those bytes only when `raw_output` is true.
+pub async fn capture_async_with_raw_output<R>(
+    mut reader: R,
+    limit: usize,
+    raw_output: bool,
+) -> io::Result<CapturedOutput>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
 
     let mut captured = CapturedOutput::new(limit);
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
+    let mut pending_carriage_return = false;
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
             return Ok(captured);
         }
-        captured.push(&chunk[..read], limit);
+        if raw_output {
+            captured.push(&chunk[..read], limit);
+            continue;
+        }
+
+        let mut normalized = Vec::with_capacity(read);
+        for byte in &chunk[..read] {
+            if pending_carriage_return {
+                pending_carriage_return = false;
+            }
+            if *byte == b'\r' {
+                pending_carriage_return = true;
+            } else {
+                normalized.push(*byte);
+            }
+        }
+        captured.push(&normalized, limit);
     }
 }
 
@@ -133,6 +164,45 @@ mod tests {
                 .display(1024, "stdout")
                 .contains("retaining 1024 of 8192 bytes")
         );
+    }
+
+    #[tokio::test]
+    async fn async_capture_can_strip_or_preserve_carriage_returns() {
+        use tokio::io::AsyncWriteExt;
+
+        for raw_output in [false, true] {
+            let (mut writer, reader) = tokio::io::duplex(64);
+            let writer_task = tokio::spawn(async move {
+                writer.write_all(b"progress\r\n").await.unwrap();
+                writer.shutdown().await.unwrap();
+            });
+
+            let output = capture_async_with_raw_output(reader, 1024, raw_output)
+                .await
+                .unwrap();
+            writer_task.await.unwrap();
+
+            let expected = if raw_output {
+                "progress\r\n"
+            } else {
+                "progress\n"
+            };
+            assert_eq!(output.display(1024, "stdout"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn async_capture_strips_standalone_carriage_returns_when_normalized() {
+        let output = capture_async_with_raw_output(
+            tokio::io::BufReader::new(std::io::Cursor::new(
+                b"progress 10%\rprogress 20%\n".to_vec(),
+            )),
+            1024,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.display(1024, "stdout"), "progress 10%progress 20%\n");
     }
 
     #[test]

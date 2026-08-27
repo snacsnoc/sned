@@ -343,7 +343,7 @@ impl ReadFileHandler {
                         content,
                         lines.clone(),
                         Some(format!(
-                            "[Note: File truncated to {max_kb}KB (file is {size_kb}KB). Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE for a full read. For a supported definition, get_function or get_file_skeleton can return anchors only for the lines they show.]"
+                            "[Note: File truncated to {max_kb}KB (file is {size_kb}KB). These anchors are for inspection only because edit_file cannot safely edit a file above this limit. For a targeted edit, ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE. Use write_to_file only when you have the complete replacement content; do not use shell or ad-hoc scripts to bypass this limit.]"
                         )),
                         Some(lines.clone()),
                         0,
@@ -705,7 +705,7 @@ impl ReadFileHandler {
             ))
         } else {
             Some(
-                "[Note: This file exceeds the full-read limit. Anchors are registered only for the returned line range.]"
+                "[Note: This file exceeds the full-read limit. These range-local anchors are for inspection only and do not authorize edit_file. For a targeted edit, ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE. Use write_to_file only with complete replacement content; do not use shell or ad-hoc scripts to bypass this limit.]"
                     .to_string(),
             )
         };
@@ -1287,6 +1287,15 @@ mod tests {
         .await
         .unwrap();
 
+        let canonical = std::fs::canonicalize(&file_path).unwrap();
+        assert!(
+            state
+                .lock()
+                .await
+                .file_context_tracker
+                .was_read_this_session(canonical.to_str().unwrap()),
+            "a dispatched full read must be visible to edit_file's read-session guard"
+        );
         assert!(
             !state
                 .lock()
@@ -1457,7 +1466,7 @@ mod tests {
         assert!(
             result
                 .content
-                .contains("Anchors are registered only for the returned line range")
+                .contains("range-local anchors are for inspection only")
         );
     }
 

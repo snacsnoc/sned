@@ -3,7 +3,7 @@
 //! This module handles formatting of tool results, summaries, heat maps,
 //! and edit statistics for display to the user.
 
-use crate::core::tools::SnedTool;
+use crate::core::tools::{SnedTool, coerce_command_array};
 use std::collections::HashSet;
 
 /// Format a dispatched tool call for the interactive transcript.
@@ -82,16 +82,7 @@ pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> Strin
                 .and_then(|p| p.as_str())
                 .map(String::from),
         ),
-        Some(SnedTool::EditFile) => (
-            "edited",
-            params
-                .get("files")
-                .and_then(|f| f.as_array())
-                .and_then(|a| a.first())
-                .and_then(|f| f.get("path"))
-                .and_then(|p| p.as_str())
-                .map(String::from),
-        ),
+        Some(SnedTool::EditFile) => ("edited", first_edit_file_path(params)),
         Some(SnedTool::ReplaceSymbol) => (
             "replaced",
             params
@@ -118,19 +109,15 @@ pub fn format_tool_summary(tool_name: &str, params: &serde_json::Value) -> Strin
                 .map(String::from),
         ),
         Some(SnedTool::ExecuteCommand) => {
-            // Handle all three parameter forms: "commands" (array), "command" (singular), "script"
-            let cmd_text = if let Some(commands) = params.get("commands").and_then(|v| v.as_array())
-            {
-                // Primary form: array of commands, join with " && "
-                let cmds: Vec<&str> = commands
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                cmds.join(" && ")
-            } else if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
-                // Legacy fallback: singular command string
-                cmd.to_string()
+            // Handle all three parameter forms: "commands" (array or a
+            // valid JSON-stringified array), "command" (singular), "script"
+            let commands = coerce_command_array(params);
+            let cmd_text = if !commands.is_empty() {
+                commands
+                    .into_iter()
+                    .filter(|command| !command.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" && ")
             } else if let Some(script) = params.get("script").and_then(|v| v.as_str()) {
                 // Alternative: script field
                 if script.len() > 120 {
@@ -227,10 +214,7 @@ pub fn format_tool_result_digest(
             }]
         }
         Some(SnedTool::ListFiles) => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let entry_count = count_non_blank_lines(result_text);
             let label = if is_error { "failed" } else { "listed" };
             vec![DigestLine {
@@ -243,10 +227,7 @@ pub fn format_tool_result_digest(
             }]
         }
         Some(SnedTool::SearchFiles) => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let match_count = count_non_blank_lines(result_text);
             let label = if is_error { "failed" } else { "searched" };
             vec![DigestLine {
@@ -259,16 +240,13 @@ pub fn format_tool_result_digest(
             }]
         }
         Some(SnedTool::ExecuteCommand) => {
-            let cmd_text = if let Some(commands) = params.get("commands").and_then(|v| v.as_array())
-            {
-                let cmds: Vec<&str> = commands
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                cmds.join(" && ")
-            } else if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
-                cmd.to_string()
+            let commands = coerce_command_array(params);
+            let cmd_text = if !commands.is_empty() {
+                commands
+                    .into_iter()
+                    .filter(|command| !command.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" && ")
             } else if let Some(script) = params.get("script").and_then(|v| v.as_str()) {
                 script.to_string()
             } else {
@@ -280,11 +258,21 @@ pub fn format_tool_result_digest(
             } else {
                 cmd_text
             };
-            vec![DigestLine {
+            let mut lines = vec![DigestLine {
                 text: format!("  {status_glyph} {truncated}"),
                 fg: Some(status_fg),
                 dim: false,
-            }]
+            }];
+            if is_error {
+                if let Some(detail) = first_error_detail(result_text) {
+                    lines.push(DigestLine {
+                        text: format!("    {detail}"),
+                        fg: Some(dim_fg),
+                        dim: true,
+                    });
+                }
+            }
+            lines
         }
         _ => {
             // Generic fallback: first body line + at most one dim
@@ -311,6 +299,41 @@ pub fn format_tool_result_digest(
             out
         }
     }
+}
+
+fn first_error_detail(result_text: &str) -> Option<String> {
+    let detail = result_text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("Error:").map(str::trim))
+        .filter(|detail| !detail.is_empty())?;
+    if detail.len() > 180 {
+        let end = detail.floor_char_boundary(177);
+        Some(format!("{}...", &detail[..end]))
+    } else {
+        Some(detail.to_string())
+    }
+}
+
+fn first_edit_file_path(params: &serde_json::Value) -> Option<String> {
+    let files = params.get("files")?;
+    if let Some(files) = files.as_array() {
+        return files
+            .first()
+            .and_then(|file| file.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+    }
+
+    files
+        .as_str()
+        .and_then(|serialized| serde_json::from_str::<Vec<serde_json::Value>>(serialized).ok())
+        .and_then(|files| files.into_iter().next())
+        .and_then(|file| {
+            file.get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        })
 }
 
 fn count_non_blank_lines(text: &str) -> usize {
@@ -528,9 +551,7 @@ fn format_heat_map_with_paths(
 
     let files_str: Vec<String> = display
         .iter()
-        .map(|(path, added, removed)| {
-            format!("{} (+{added}, -{removed})", format_path(path))
-        })
+        .map(|(path, added, removed)| format!("{} (+{added}, -{removed})", format_path(path)))
         .collect();
 
     let more_str = if sorted.len() > 5 {
@@ -650,6 +671,15 @@ mod tests {
     }
 
     #[test]
+    fn test_format_tool_summary_execute_command_stringified_array() {
+        let params = serde_json::json!({
+            "commands": "[\"cargo build\", \"cargo test\"]"
+        });
+        let summary = format_tool_summary("execute_command", &params);
+        assert!(summary.contains("cargo build && cargo test"));
+    }
+
+    #[test]
     fn test_format_tool_summary_execute_command_script() {
         let params = serde_json::json!({
             "script": "for i in 1 2 3; do echo $i; done"
@@ -700,6 +730,15 @@ mod tests {
         let summary = format_tool_summary("edit_file", &params);
         assert!(summary.contains("▶"));
         assert!(summary.contains("edited"));
+        assert!(summary.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_format_tool_summary_edit_file_stringified_files() {
+        let params = serde_json::json!({
+            "files": "[{\"path\":\"src/lib.rs\",\"edits\":[]}]"
+        });
+        let summary = format_tool_summary("edit_file", &params);
         assert!(summary.contains("src/lib.rs"));
     }
 
@@ -838,10 +877,7 @@ mod tests {
             ratatui::style::Color::Red,
             ratatui::style::Color::Gray,
         );
-        assert_eq!(
-            digest_text(&lines),
-            vec!["  ✗ read missing.txt (1 line)"]
-        );
+        assert_eq!(digest_text(&lines), vec!["  ✗ read missing.txt (1 line)"]);
     }
 
     #[test]
@@ -861,6 +897,28 @@ mod tests {
         assert_eq!(
             digest_text(&lines),
             vec!["  ✗ rm -rf data/normalized && python scripts/rollup.py"]
+        );
+    }
+
+    #[test]
+    fn test_format_tool_result_digest_execute_command_decodes_stringified_array_and_error() {
+        let params = serde_json::json!({
+            "commands": "[\"cat > /tmp/fix.py << 'PYEOF'\"]",
+        });
+        let lines = format_tool_result_digest(
+            "execute_command",
+            &params,
+            "Error: Command unsafe: Heredoc is not allowed",
+            true,
+            ratatui::style::Color::Red,
+            ratatui::style::Color::Gray,
+        );
+        assert_eq!(
+            digest_text(&lines),
+            vec![
+                "  ✗ cat > /tmp/fix.py << 'PYEOF'",
+                "    Command unsafe: Heredoc is not allowed",
+            ]
         );
     }
 
@@ -897,10 +955,7 @@ mod tests {
             ratatui::style::Color::Green,
             ratatui::style::Color::Gray,
         );
-        assert_eq!(
-            digest_text(&lines),
-            vec!["  ✓ listed src/core (3 entries)"]
-        );
+        assert_eq!(digest_text(&lines), vec!["  ✓ listed src/core (3 entries)"]);
     }
 
     #[test]
@@ -915,10 +970,7 @@ mod tests {
             ratatui::style::Color::Green,
             ratatui::style::Color::Gray,
         );
-        assert_eq!(
-            digest_text(&lines),
-            vec!["  ✓ searched src (2 matches)"]
-        );
+        assert_eq!(digest_text(&lines), vec!["  ✓ searched src (2 matches)"]);
     }
 
     #[test]

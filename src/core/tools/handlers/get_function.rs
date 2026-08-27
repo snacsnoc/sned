@@ -109,6 +109,14 @@ impl ToolHandler for GetFunctionHandler {
         let handler = self;
         let ctx = ctx.clone();
         Box::pin(async move {
+            let paths = params
+                .get("path")
+                .and_then(|path| path.as_str())
+                .map(|path| ctx.resolve_path(path))
+                .transpose()?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let _file_locks = ctx.lock_file_paths(&paths).await;
             Self::run(handler, &ctx, params)
                 .await
                 .map(serde_json::Value::String)
@@ -201,6 +209,31 @@ mod tests {
                 .unwrap()
                 .contains("updated")
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_function_waits_for_shared_path_lock() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("example.rs");
+        std::fs::write(&file_path, "fn example() {}\n").unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = test_context(workspace.path(), state);
+        let canonical = std::fs::canonicalize(file_path).unwrap();
+        let held = ctx.lock_file_paths(std::slice::from_ref(&canonical)).await;
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            GetFunctionHandler.execute(
+                &ctx,
+                serde_json::json!({"path": "example.rs", "name": "example"}),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "get_function bypassed the shared path lock"
+        );
+        drop(held);
     }
 
     #[tokio::test]

@@ -269,9 +269,12 @@ impl FileContextTracker {
 
     #[must_use]
     pub fn was_read_this_session(&self, path: &str) -> bool {
-        self.files_in_context
-            .iter()
-            .any(|entry| entry.path == path && entry.sned_read_date.is_some())
+        let path = Path::new(path);
+        self.tracked_files.contains_key(path)
+            || self
+                .files_in_context
+                .iter()
+                .any(|entry| Path::new(&entry.path) == path && entry.sned_read_date.is_some())
     }
 
     /// Initialize the file watcher. Call this during agent loop startup.

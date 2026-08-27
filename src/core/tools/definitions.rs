@@ -95,7 +95,7 @@ impl ToolSchema {
 pub fn read_file_schema() -> ToolSchema {
     ToolSchema {
         name: "read_file",
-        description: "Reads complete source files or line ranges and returns hash-anchored lines (format: Word§line content) for edit_file. Copy anchors exactly as shown. The read limit defaults to 512KB and is configured when Sned starts with SNED_MAX_FILE_READ_SIZE. For a supported named definition that exceeds this limit, get_function or get_file_skeleton can return anchors only for the lines they show. Examples: { paths: [\"src/main.ts\", \"package.json\"] }, { paths: [\"src/main.ts\"], start_line: 10, end_line: 50 }.",
+        description: "Reads files or line ranges and returns hash-anchored lines (Word§line content) for edit_file. Copy anchors exactly. The read/edit limit defaults to 512KB and is set at startup with SNED_MAX_FILE_READ_SIZE. Ranged, truncated, get_function, and get_file_skeleton output above that limit is inspection-only: restart Sned with a higher limit before editing. Examples: { paths: [\"src/main.ts\", \"package.json\"] }, { paths: [\"src/main.ts\"], start_line: 10, end_line: 50 }.",
         parameters: vec![
             ToolParameter {
                 name: "paths",
@@ -129,7 +129,7 @@ pub fn read_file_schema() -> ToolSchema {
 pub fn write_to_file_schema() -> ToolSchema {
     ToolSchema {
         name: "write_to_file",
-        description: "Write content to a file at the specified path. If the file exists, it will be overwritten. Creates parent directories if needed. PREFERRED ESCAPE HATCH for files with many duplicate lines where hash-anchored edits would refuse — the model should fall back to write_to_file (with the entire new contents) when anchor uniqueness cannot be guaranteed.",
+        description: "Write complete file content at the specified path. Overwrites existing files and creates parent directories. Use for new files or complete rewrites. For targeted existing-file changes, use edit_file after reading; do not substitute shell redirection, heredocs, or ad-hoc Python/sed rewrites.",
         parameters: vec![
             ToolParameter {
                 name: "path",
@@ -215,7 +215,7 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit existing files by replacing, inserting after, or inserting before lines. edit_file does not create files; use write_to_file for new files or broad rewrites. WORKFLOW: call read_file (or get_function/get_file_skeleton), copy exact current anchors, edit, then re-read after a stale or unknown-anchor failure. Bracketed duplicate notes are metadata, not source text. replace (default) covers an inclusive anchor-to-end_anchor range; omit end_anchor for one line. insert_after and insert_before use one anchor. For duplicate lines, use replace with unique boundaries and exact interior content.",
+        description: "Edit existing files by replacing or inserting lines; it does not create files. Workflow: call read_file, get_function, or get_file_skeleton first and copy one exact Word§line content anchor including its prefix. Never invent an anchor or use a line number alone. Put replacement text in text; optional content is only an exact interior-line array for duplicate-anchor disambiguation. Re-read after stale, unknown, malformed, or ambiguous-anchor errors. Files above SNED_MAX_FILE_READ_SIZE require restarting Sned with a higher limit; do not bypass that safety limit with execute_command. Use write_to_file for new files or complete rewrites only when you have all desired content.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
@@ -272,13 +272,13 @@ pub fn edit_file_schema() -> ToolSchema {
 pub fn execute_command_schema() -> ToolSchema {
     ToolSchema {
         name: "execute_command",
-        description: "Executes CLI commands or scripts. Use 'commands' for simple sequences of shell operations. Use 'script' for complex multi-line logic. Provide exactly one of {commands, script}.",
+        description: "Executes CLI commands or scripts. Use commands as a literal JSON array of strings for simple sequences, not a string containing an array. Use script for complex run-only logic. Use file tools for workspace changes rather than shell redirection, heredocs, or ad-hoc Python/sed rewrites. Provide exactly one of {commands, script}.",
         parameters: vec![
             ToolParameter {
                 name: "commands",
                 required: false,
                 param_type: "array",
-                description: "An array of CLI commands to execute in sequence.",
+                description: "A literal JSON array of CLI command strings to execute in sequence. Do not encode the array as a string.",
                 items: Some(serde_json::json!({"type": "string"})),
                 extra: None,
             },
@@ -286,7 +286,7 @@ pub fn execute_command_schema() -> ToolSchema {
                 name: "script",
                 required: false,
                 param_type: "string",
-                description: "A script to execute. Use this for complex multi-line logic or non-shell languages.",
+                description: "A script to execute for complex run-only logic or non-shell languages. Use write_to_file or edit_file for workspace file changes.",
                 items: None,
                 extra: None,
             },
@@ -424,7 +424,7 @@ pub fn get_file_skeleton_schema() -> ToolSchema {
 pub fn find_symbol_references_schema() -> ToolSchema {
     ToolSchema {
         name: "find_symbol_references",
-        description: "Find symbol definitions and references. Supply path or paths for direct parsing, or omit both to search a ready workspace symbol index.",
+        description: "Find symbol definitions/references. Returned lines have canonical edit_file anchors and mark files read within the edit limit. Supply paths for direct parsing, or omit both to use a ready index.",
         parameters: vec![
             ToolParameter {
                 name: "path",

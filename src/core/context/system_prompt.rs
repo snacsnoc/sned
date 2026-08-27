@@ -2,6 +2,8 @@
 //!
 
 use super::instructions::{RuleToggles, SkillMetadata, SkillSource};
+use crate::core::tools::SnedTool;
+use crate::core::tools::definitions::ToolProfile;
 
 // ============================================================================
 // System Prompt Context
@@ -32,6 +34,9 @@ pub struct SystemPromptContext {
     /// Active model identifier (e.g. "qwen3.6-35b-a3b", "gpt-4o", "qwen/qwen3.6-35b-a3b").
     /// Used for model-specific prompt routing. None = generic behavior.
     pub model_id: Option<String>,
+    /// Tool inventory active for this request. Examples are omitted when the
+    /// profile is unknown so prompts cannot advertise unavailable tools.
+    pub tool_profile: Option<ToolProfile>,
     pub active_shell_type: Option<String>,
     pub active_shell_path: Option<String>,
     pub active_shell_is_posix: bool,
@@ -94,20 +99,41 @@ impl PromptBuilder {
 
     fn model_specific_section(&self) -> String {
         match self.context.model_id.as_deref() {
-            Some(m) if super::model_detect::is_qwen_model(m) => Self::qwen_section(),
+            Some(m) if super::model_detect::is_qwen_model(m) => {
+                Self::qwen_section(self.context.tool_profile)
+            }
             _ => String::new(),
         }
     }
 
-    fn qwen_section() -> String {
-        "\
-QWEN MODEL GUIDANCE
-- Call a tool explicitly when the task advances by inspecting, editing, running, or searching; do not describe plans in prose instead of acting.
-- Tool arguments must be valid JSON that matches the tool's schema; double-check field names and required keys before submitting.
-- Execute in small, verifiable steps: re-read a file with read_file before edit_file so the anchor matches the current line exactly.
-- When a tool returns an error, read the error text, fix the failing argument, and call the same tool again. Do not guess a corrected result.
-"
-        .to_string()
+    fn qwen_section(profile: Option<ToolProfile>) -> String {
+        let mut section = String::from(
+            "QWEN MODEL GUIDANCE\n\
+- Call an available tool explicitly when the task advances by inspecting, editing, running, or searching; do not describe execution in prose instead of acting.\n\
+- Tool arguments must be valid JSON that matches the tool's schema; double-check field names and required keys before submitting.\n",
+        );
+        if let Some(profile) = profile {
+            let has = |tool| profile.tools().contains(&tool);
+            if has(SnedTool::ReadFile) && has(SnedTool::EditFile) {
+                section.push_str(
+                    "- Execute file changes in small, verifiable steps: re-read with read_file before edit_file so the anchor matches the current line exactly.\n",
+                );
+            } else if has(SnedTool::ReadFile) {
+                section.push_str(
+                    "- Execute inspection in small, verifiable steps and use the available read/search tools for current workspace state.\n",
+                );
+            }
+        }
+        section.push_str(
+            "- When a tool returns an error, read the error text, fix the failing argument, and call the same tool again. Do not guess a corrected result.\n",
+        );
+        section
+    }
+
+    fn has_tool(&self, tool: SnedTool) -> bool {
+        self.context
+            .tool_profile
+            .is_some_and(|profile| profile.tools().contains(&tool))
     }
 
     fn render_template(&self) -> String {
@@ -143,18 +169,75 @@ QWEN MODEL GUIDANCE
             prompt.push_str("- Use tools sequentially.\n");
         }
 
+        prompt
+            .push_str("- Use subagents or skills only when they clearly improve result quality.\n");
+        if self.context.tool_profile == Some(ToolProfile::DirectAnswer) {
+            prompt.push_str("- No tools are available for this turn; answer directly in text.\n");
+        } else {
+            prompt.push_str("- Workspace reads and writes must use tools, not prose.");
+            if self.has_tool(SnedTool::ReadFile) {
+                prompt.push_str(" Read files with `read_file`.");
+            }
+            if self.has_tool(SnedTool::WriteToFile) {
+                prompt.push_str(" Create or overwrite complete files with `write_to_file`.");
+            }
+            if self.has_tool(SnedTool::EditFile) {
+                prompt.push_str(
+                    " Change existing files with `edit_file` or an available AST-aware tool.",
+                );
+            }
+            prompt.push('\n');
+        }
+        if self.context.tool_profile.is_some() {
+            prompt.push_str("- Use only tools supplied for this turn; unavailable tools must not be simulated in prose.\n");
+        }
+        if self.has_tool(SnedTool::ReadFile)
+            || self.has_tool(SnedTool::WriteToFile)
+            || self.has_tool(SnedTool::EditFile)
+        {
+            prompt.push_str(
+                "- Use relative paths from the working directory for workspace tools. Absolute paths outside the workspace require explicit user approval; request the needed external directory rather than retrying after a denial.\n",
+            );
+        }
+        if self.has_tool(SnedTool::EditFile) {
+            prompt.push_str(
+                "- For `edit_file`, read the current file first and copy one exact, complete `Word§line content` anchor from that tool output, including its prefix; never invent an anchor prefix or use a line number alone.\n\
+                 - In an `edit_file` edit, put replacement text in `text`; the optional `content` field is only an exact array of interior lines for duplicate-anchor disambiguation, never a replacement string.\n\
+                 - After a stale, unknown, malformed, or ambiguous edit error, call `read_file` again before retrying. Do not repeat the same anchor.\n",
+            );
+        }
+        if self.has_tool(SnedTool::WriteToFile) {
+            prompt.push_str(
+                "- Use `write_to_file` when creating a file or when replacing a complete file and you have the complete desired contents.\n",
+            );
+        }
+        if self.has_tool(SnedTool::ExecuteCommand) {
+            prompt.push_str(
+                "- Use `execute_command` for inspection, builds, tests, and other execution; do not use shell redirection, heredocs, or ad-hoc Python/sed scripts as a substitute for workspace file tools.\n\
+                 - For `execute_command`, send `commands` as a JSON array of strings, not a string containing an array; use `script` for complex run-only logic.\n",
+            );
+        }
+        if self.has_tool(SnedTool::WriteToFile) && self.has_tool(SnedTool::EditFile) {
+            prompt.push_str(
+                "- For large generated files, write a small skeleton first and fill sections with `edit_file` instead of sending one huge payload.\n",
+            );
+        }
+        if self.has_tool(SnedTool::AttemptCompletion) {
+            prompt.push_str(
+                "- In ACT mode, perform the task and finish with `attempt_completion`.\n",
+            );
+        }
+        if self.has_tool(SnedTool::PlanModeRespond) {
+            prompt.push_str(
+                "- In PLAN mode, gather needed context and finish with `plan_mode_respond` without modifying files.\n",
+            );
+        }
         prompt.push_str(
-            "- Use subagents or skills only when they clearly improve result quality.\n\
-             - Workspace reads and writes must use tools, not prose: read files with `read_file`; create or overwrite files with `write_to_file`; change existing files with `edit_file` or AST-aware tools.\n\
-             - Use relative paths from the working directory for workspace tools. Absolute paths outside the workspace require explicit user approval; request the needed external directory rather than retrying after a denial.\n\
-             - For `edit_file`, read the current file first and copy the exact `Word§line content` anchors from tool output, including the prefix.\n\
-             - For large generated files, write a small skeleton first and fill sections with `edit_file` instead of sending one huge payload.\n\
-             - In ACT mode, perform the task and finish with `attempt_completion`; in PLAN mode, gather needed context and respond with `plan_mode_respond` without modifying files.\n\
-             - Keep validation focused, but run the checks needed for code/workspace changes or required by project instructions.\n\
+            "- Keep validation focused, but run the checks needed for code/workspace changes or required by project instructions.\n\
              - Avoid planning text, broad validation, and extra file reads unless they are necessary, cheap, or user-requested.\n\n\
              SAFETY AND REFUSAL\n\
              - Refuse unsafe or disallowed requests.\n\
-             - Do not delete, reset, overwrite user work, expose secrets, or run destructive commands unless the user explicitly requested it and tool approvals allow it.\n\
+             - Do not delete, reset, overwrite user work, or run destructive commands unless the user explicitly requested it and tool approvals allow it.\n\
              - If required information is missing and available tools cannot get it, ask one focused follow-up question.\n",
         );
 
@@ -188,9 +271,10 @@ QWEN MODEL GUIDANCE
             }
         }
 
-        if let Some(examples) =
-            super::tool_examples::tool_examples_for_model(self.context.model_id.as_deref())
-        {
+        if let Some(examples) = super::tool_examples::tool_examples_for_model(
+            self.context.model_id.as_deref(),
+            self.context.tool_profile,
+        ) {
             prompt.push_str("\n\n");
             prompt.push_str(examples);
         }
@@ -302,6 +386,7 @@ mod tests {
             cwd: Some("/tmp/test".to_string()),
             ide: "vscode".to_string(),
             enable_parallel_tool_calling: true,
+            tool_profile: Some(ToolProfile::Full),
             ..Default::default()
         };
 
@@ -505,7 +590,10 @@ mod tests {
 
     #[test]
     fn test_prompt_builder_large_file_guidance() {
-        let context = SystemPromptContext::default();
+        let context = SystemPromptContext {
+            tool_profile: Some(ToolProfile::Full),
+            ..Default::default()
+        };
         let builder = PromptBuilder::new(context);
         let prompt = builder.build();
 
@@ -559,17 +647,18 @@ mod tests {
         };
         let prompt = PromptBuilder::new(context).build();
         assert!(prompt.contains("QWEN MODEL GUIDANCE"));
-        assert!(prompt.contains("Call a tool explicitly"));
+        assert!(prompt.contains("Call an available tool explicitly"));
     }
 
     #[test]
     fn test_qwen_model_id_injects_tool_examples() {
         let context = SystemPromptContext {
             model_id: Some("qwen3.5-27b".to_string()),
+            tool_profile: Some(ToolProfile::Full),
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();
-        assert!(prompt.contains("EXAMPLE TOOL CALLS (Qwen)"));
+        assert!(prompt.contains("EXAMPLE TOOL CALLS"));
         assert!(prompt.contains("tool=read_file"));
     }
 
@@ -577,26 +666,29 @@ mod tests {
     fn test_qwen_routed_model_id_injects() {
         let context = SystemPromptContext {
             model_id: Some("openrouter/qwen/qwen3.6-35b-a3b".to_string()),
+            tool_profile: Some(ToolProfile::Full),
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();
         assert!(prompt.contains("QWEN MODEL GUIDANCE"));
-        assert!(prompt.contains("EXAMPLE TOOL CALLS (Qwen)"));
+        assert!(prompt.contains("EXAMPLE TOOL CALLS"));
     }
 
     #[test]
     fn test_non_qwen_model_id_no_section() {
         let context = SystemPromptContext {
             model_id: Some("gpt-4o".to_string()),
+            tool_profile: Some(ToolProfile::Full),
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();
         assert!(!prompt.contains("QWEN MODEL GUIDANCE"));
-        assert!(!prompt.contains("EXAMPLE TOOL CALLS"));
+        assert!(prompt.contains("EXAMPLE TOOL CALLS"));
+        assert!(prompt.contains("tool=edit_file"));
     }
 
     #[test]
-    fn test_model_id_none_no_section_no_examples() {
+    fn test_model_id_none_no_section_without_active_profile() {
         let context = SystemPromptContext::default();
         let prompt = PromptBuilder::new(context).build();
         assert!(!prompt.contains("QWEN MODEL GUIDANCE"));
@@ -604,13 +696,12 @@ mod tests {
     }
 
     #[test]
-    fn test_non_qwen_prompt_byte_identical_to_pre_patch() {
-        // Critical invariant: non-Qwen prompts must be byte-identical
-        // whether model_id is None or Some(non-Qwen).
+    fn test_non_qwen_prompts_share_common_tool_examples() {
         let ctx_none = SystemPromptContext {
             cwd: Some("/tmp/test".to_string()),
             ide: "vscode".to_string(),
             enable_parallel_tool_calling: true,
+            tool_profile: Some(ToolProfile::Full),
             ..Default::default()
         };
         let ctx_gpt = SystemPromptContext {
@@ -618,11 +709,13 @@ mod tests {
             ide: "vscode".to_string(),
             enable_parallel_tool_calling: true,
             model_id: Some("gpt-4o".to_string()),
+            tool_profile: Some(ToolProfile::Full),
             ..Default::default()
         };
         let prompt_none = PromptBuilder::new(ctx_none).build();
         let prompt_gpt = PromptBuilder::new(ctx_gpt).build();
-        assert_eq!(prompt_none, prompt_gpt);
+        assert!(prompt_none.contains("EXAMPLE TOOL CALLS"));
+        assert!(prompt_gpt.contains("EXAMPLE TOOL CALLS"));
     }
 
     /// Process-global mutex to serialize env var tests. `cargo test` runs

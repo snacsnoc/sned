@@ -197,8 +197,7 @@ pub struct ToolContext {
     /// competing retry counter.
     pub consecutive_failures: u32,
     /// Per-task path locks prevent reads and writes of the same file from racing.
-    file_operation_locks:
-        Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    file_operation_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub approval_manager: Option<Arc<Mutex<ApprovalManager>>>,
     pub workspace_root: PathBuf,
     /// Canonical external directory roots authorized for this tool invocation.
@@ -615,10 +614,13 @@ pub fn tool_result_to_text(value: serde_json::Value) -> String {
 
 /// Coerce a JSON value to a `Vec<String>`.
 ///
-/// Accepts both arrays and single strings, so tool handlers work correctly
-/// regardless of whether the provider sends `{"paths": ["file.rs"]}` (proper
-/// array) or `{"paths": "file.rs"}` (scalar from XML-limited providers like
-/// MiniMax M2). Also falls back to a singular key (e.g. `"path"` vs `"paths"`).
+/// Accepts arrays, JSON-stringified arrays of strings, and single strings, so
+/// tool handlers work correctly regardless of whether the provider sends
+/// `{"paths": ["file.rs"]}` (proper array), `{"paths": "[\"file.rs\"]"}`
+/// (a valid array encoded as a string), or `{"paths": "file.rs"}` (scalar
+/// from XML-limited providers like MiniMax M2). Also falls back to a singular
+/// key (e.g. `"path"` vs `"paths"`). Malformed JSON strings remain scalar
+/// values so the handler can return a useful validation error.
 pub fn coerce_string_array(
     params: &serde_json::Value,
     plural_key: &str,
@@ -633,6 +635,14 @@ pub fn coerce_string_array(
     }
 
     if let Some(s) = params.get(plural_key).and_then(|v| v.as_str()) {
+        if let Ok(serde_json::Value::Array(values)) = serde_json::from_str(s) {
+            if values.iter().all(serde_json::Value::is_string) {
+                return values
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect();
+            }
+        }
         return vec![s.to_string()];
     }
 
@@ -641,6 +651,56 @@ pub fn coerce_string_array(
         .and_then(|v| v.as_str())
         .map(|s| vec![s.to_string()])
         .unwrap_or_default()
+}
+
+/// Coerce `execute_command.commands` without reinterpreting shell syntax that
+/// also happens to be valid JSON-array text. A stringified command array is
+/// accepted only when the first array element immediately follows `[` (for
+/// example, `["cargo test", "cargo clippy"]`), while shell commands such as
+/// `[ "foo" ]` remain one scalar command.
+pub fn coerce_command_array(params: &serde_json::Value) -> Vec<String> {
+    if let Some(values) = params.get("commands").and_then(|value| value.as_array()) {
+        return values
+            .iter()
+            .filter_map(|value| value.as_str().map(String::from))
+            .collect();
+    }
+
+    if let Some(value) = params.get("commands").and_then(|value| value.as_str()) {
+        if let Some(values) = parse_unambiguous_stringified_string_array(value) {
+            return values;
+        }
+        return vec![value.to_string()];
+    }
+
+    params
+        .get("command")
+        .and_then(|value| value.as_str())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+/// Parse a stringified JSON array only when its opening is unambiguous. JSON
+/// formatting with spaces after `[` is also common shell test syntax and must
+/// not be silently converted into a different command. Whitespace between
+/// later array elements remains supported for provider compatibility.
+pub fn parse_unambiguous_stringified_string_array(value: &str) -> Option<Vec<String>> {
+    let trimmed = value.trim();
+    if trimmed != "[]" && !trimmed.starts_with("[\"") {
+        return None;
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    let array = parsed.as_array()?;
+    if !array.iter().all(serde_json::Value::is_string) {
+        return None;
+    }
+
+    Some(
+        array
+            .iter()
+            .filter_map(|value| value.as_str().map(String::from))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -824,6 +884,32 @@ mod tests {
         let params = serde_json::json!({"paths": "tetris.c"});
         let result = coerce_string_array(&params, "paths", "path");
         assert_eq!(result, vec!["tetris.c"]);
+    }
+
+    #[test]
+    fn test_coerce_string_array_from_stringified_json_array() {
+        let params = serde_json::json!({"paths": "[\"src/main.rs\", \"src/lib.rs\"]"});
+        let result = coerce_string_array(&params, "paths", "path");
+        assert_eq!(result, vec!["src/main.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn test_coerce_string_array_keeps_malformed_string_as_scalar() {
+        let params = serde_json::json!({"paths": "[\"src/main.rs\""});
+        let result = coerce_string_array(&params, "paths", "path");
+        assert_eq!(result, vec!["[\"src/main.rs\""]);
+    }
+
+    #[test]
+    fn test_coerce_command_array_preserves_ambiguous_shell_test() {
+        let params = serde_json::json!({"commands": "[ \"foo\" ]"});
+        assert_eq!(coerce_command_array(&params), vec!["[ \"foo\" ]"]);
+    }
+
+    #[test]
+    fn test_coerce_command_array_accepts_canonical_stringified_array() {
+        let params = serde_json::json!({"commands": "[\"echo one\", \"echo two\"]"});
+        assert_eq!(coerce_command_array(&params), vec!["echo one", "echo two"]);
     }
 
     #[test]

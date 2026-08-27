@@ -4,8 +4,8 @@
 use crate::cli::output::OutputEvent;
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
-use crate::core::process_output::{capture_async, configured_output_limit};
-use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_string_array};
+use crate::core::process_output::{capture_async_with_raw_output, configured_output_limit};
+use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_command_array};
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -346,7 +346,7 @@ impl Default for ExecuteCommandHandler {
 }
 
 fn is_serialized_command_container(value: &str) -> bool {
-    let value = value.trim_start();
+    let value = value.trim();
 
     if let Some(rest) = value.strip_prefix('{') {
         let rest = rest.trim_start();
@@ -359,9 +359,23 @@ fn is_serialized_command_container(value: &str) -> bool {
         }
     }
 
-    value
-        .strip_prefix('[')
-        .is_some_and(|rest| matches!(rest.trim_start().as_bytes().first(), Some(b'\'' | b'\"')))
+    let Some(rest) = value.strip_prefix('[') else {
+        return false;
+    };
+
+    // A JSON array containing only strings is never rejected here, including
+    // formatted JSON such as `[ "foo" ]`: that is also valid shell test
+    // syntax and must remain one scalar command. `coerce_command_array` only
+    // decodes an array whose first element immediately follows `[`, so this
+    // distinction is preserved at execution time. Arrays containing
+    // non-string values remain rejected as malformed command containers.
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value)
+        && let Some(items) = parsed.as_array()
+    {
+        return !items.iter().all(serde_json::Value::is_string);
+    }
+
+    matches!(rest.trim_start().as_bytes().first(), Some(b'\'' | b'\"'))
 }
 
 impl ExecuteCommandHandler {
@@ -1219,7 +1233,7 @@ impl ExecuteCommandHandler {
         explicitly_approved: bool,
         task_state: Option<Arc<Mutex<TaskState>>>,
         cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-        _raw_output: bool,
+        raw_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
         use std::process::Stdio;
@@ -1310,8 +1324,16 @@ impl ExecuteCommandHandler {
             .ok_or_else(|| anyhow::anyhow!("Script stderr was not captured"))?;
 
         let output_limit = script_output_limit();
-        let stdout_task = tokio::spawn(capture_async(stdout, output_limit));
-        let stderr_task = tokio::spawn(capture_async(stderr, output_limit));
+        let stdout_task = tokio::spawn(capture_async_with_raw_output(
+            stdout,
+            output_limit,
+            raw_output,
+        ));
+        let stderr_task = tokio::spawn(capture_async_with_raw_output(
+            stderr,
+            output_limit,
+            raw_output,
+        ));
 
         let wait_result = timeout(timeout_duration, async {
             loop {
@@ -1599,7 +1621,7 @@ impl ExecuteCommandHandler {
             ));
         }
 
-        let commands = coerce_string_array(&params, "commands", "command");
+        let commands = coerce_command_array(&params);
         let commands = if commands.is_empty() {
             None
         } else {
@@ -1690,6 +1712,7 @@ mod tests {
     use super::*;
     use crate::core::agent_loop::TaskState;
     use crate::core::file_editor::AnchorStateManager;
+    use crate::core::process_output::capture_async;
     use crate::core::tools::{ToolContext, ToolHandler};
     use std::sync::Arc;
 
@@ -1709,7 +1732,8 @@ mod tests {
             "{'command': \"echo invalid\"}",
             "{ \"command\" : \"echo invalid\"}",
             "['echo invalid']",
-            "[ \"echo invalid\" ]",
+            "[\"echo invalid\", 42]",
+            "[\"echo invalid\"",
         ] {
             assert!(
                 is_serialized_command_container(value),
@@ -1717,6 +1741,9 @@ mod tests {
             );
         }
 
+        assert!(!is_serialized_command_container("[\"echo valid\"]"));
+        assert!(!is_serialized_command_container("[ \"echo valid\" ]"));
+        assert!(!is_serialized_command_container("[]"));
         assert!(!is_serialized_command_container("echo valid"));
         assert!(!is_serialized_command_container("{ echo valid; }"));
     }
@@ -1772,7 +1799,7 @@ mod tests {
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
         let params = serde_json::json!({
-            "commands": "[\"python3.11 -m pytest tests/\"]"
+            "commands": "['python3.11 -m pytest tests/']"
         });
 
         let err = handler
@@ -1803,6 +1830,33 @@ mod tests {
             err_text.contains("[\"ls\"]"),
             "error must include a correct-shape example, got: {err_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_accepts_stringified_json_array_commands() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let params = serde_json::json!({
+            "commands": "[\"printf stringified-json-array\"]"
+        });
+
+        let result = handler
+            .execute_without_state(
+                None,
+                params,
+                None,
+                false,
+                false,
+                None,
+                None,
+                false,
+                &output_writer,
+            )
+            .await
+            .expect("valid JSON-stringified command arrays should execute");
+
+        assert!(result.contains("stringified-json-array"), "got: {result}");
     }
 
     #[tokio::test]
@@ -1906,6 +1960,46 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("hello from python"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_script_raw_output_controls_carriage_returns() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+
+        let normalized = handler
+            .execute_script_with_timeout(
+                "printf 'progress\\r\\n'",
+                "bash",
+                None,
+                Some(Duration::from_secs(5)),
+                false,
+                None,
+                None,
+                false,
+                &output_writer,
+            )
+            .await
+            .unwrap();
+        assert!(normalized.contains("progress\n"));
+        assert!(!normalized.contains("progress\r"));
+
+        let raw = handler
+            .execute_script_with_timeout(
+                "printf 'progress\\r\\n'",
+                "bash",
+                None,
+                Some(Duration::from_secs(5)),
+                false,
+                None,
+                None,
+                true,
+                &output_writer,
+            )
+            .await
+            .unwrap();
+        assert!(raw.contains("progress\r\n"));
     }
 
     #[tokio::test]

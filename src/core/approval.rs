@@ -430,7 +430,7 @@ pub(crate) fn command_approval_scopes(
         return None;
     }
 
-    let commands = crate::core::tools::coerce_string_array(params, "commands", "command");
+    let commands = crate::core::tools::coerce_command_array(params);
     if commands.is_empty() {
         return None;
     }
@@ -1540,7 +1540,7 @@ fn format_tool_parameters_in_workspace(
         "execute_command" => {
             let mut output = String::new();
 
-            let commands = crate::core::tools::coerce_string_array(params, "commands", "command");
+            let commands = crate::core::tools::coerce_command_array(params);
             if !commands.is_empty() {
                 output.push_str("\n    ");
                 output.push_str(&commands.join(" && "));

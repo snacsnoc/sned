@@ -236,7 +236,7 @@ impl EditFileHandler {
         }
     }
 
-    fn requested_paths_for_locking(params: &serde_json::Value) -> Vec<String> {
+    pub(crate) fn requested_paths_for_locking(params: &serde_json::Value) -> Vec<String> {
         let parsed_files = params.get("files").and_then(|files| {
             files.as_array().cloned().or_else(|| {
                 files
@@ -601,6 +601,19 @@ impl EditFileHandler {
         state.consecutive_reads.remove(path);
     }
 
+    fn failure_requires_reread(diagnostic: &str) -> bool {
+        EditFailureReason::from_diagnostics(diagnostic)
+            .into_iter()
+            .any(|reason| {
+                matches!(
+                    reason,
+                    EditFailureReason::MissingAnchor
+                        | EditFailureReason::UnknownAnchor
+                        | EditFailureReason::GluedAnchor
+                )
+            })
+    }
+
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
         ToolError::ExecutionFailedWithMetadata(
             format!(
@@ -678,22 +691,22 @@ impl EditFileHandler {
         if files.is_empty() {
             return if let Some(value) = files_value {
                 if value.as_array().is_some_and(std::vec::Vec::is_empty) {
-                    Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())
+                    Err(ToolError::InvalidInput("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string()))
                 } else if value.as_str().is_some() {
                     match parsed_stringified_files.unwrap() {
-                        Ok(parsed) if parsed.is_empty() => Ok("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string()),
+                        Ok(parsed) if parsed.is_empty() => Err(ToolError::InvalidInput("No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields.".to_string())),
                         Ok(_) => unreachable!("files vec is empty but parse succeeded with non-empty"),
-                        Err(e) => Ok(format!(
+                        Err(e) => Err(ToolError::InvalidInput(format!(
                             "Failed to parse 'files' parameter as a JSON array string. The 'files' parameter must be a JSON array of {{path, edits}} objects, e.g. [{{\"path\":\"file.rs\",\"edits\":[...]}}]. Parse error: {e}"
-                        )),
+                        ))),
                     }
                 } else {
-                    Ok(format!(
+                    Err(ToolError::InvalidInput(format!(
                         "Failed to parse 'files' parameter. Expected an array of {{path, edits}} objects, got: {value}. The 'files' parameter must be a JSON array like: [{{\"path\":\"file.rs\",\"edits\":[...]}}]."
-                    ))
+                    )))
                 }
             } else {
-                Ok("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string())
+                Err(ToolError::InvalidInput("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string()))
             };
         }
 
@@ -740,6 +753,10 @@ impl EditFileHandler {
         let batches =
             processor.group_edits_by_path(&parsed, &|path| resolved_paths.get(path).cloned());
         let unique_file_count = batches.len();
+        let affected_paths = batches
+            .iter()
+            .map(|batch| batch.absolute_path.clone())
+            .collect::<Vec<_>>();
 
         let mut all_results: Vec<String> = Vec::new();
         let mut total_applied = 0usize;
@@ -758,6 +775,25 @@ impl EditFileHandler {
 
         // Phase 1: Prepare all batches and collect diff previews
         for batch in batches {
+            if let Ok(metadata) = tokio::fs::metadata(&batch.absolute_path).await {
+                let max_file_size = max_edit_file_size();
+                if metadata.len() > max_file_size {
+                    return Err(ToolError::ExecutionFailedWithMetadata(
+                        format!(
+                            "File {} is too large for edit_file ({}KB, max {}KB). A ranged read can inspect this file but cannot make an anchored edit safe. Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE for a targeted edit. Use write_to_file only if you have the complete replacement content; do not use shell, Python, sed, or another out-of-band writer to bypass this limit.",
+                            batch.display_path,
+                            metadata.len() / 1024,
+                            max_file_size / 1024
+                        ),
+                        ToolFailureMetadata {
+                            class: ToolFailureClass::RangeInsufficient,
+                            affected_paths: vec![batch.absolute_path.clone()],
+                            required_next_step: Some(ToolRequiredNextStep::AskUser),
+                        },
+                    ));
+                }
+            }
+
             if state
                 .lock()
                 .await
@@ -811,7 +847,7 @@ impl EditFileHandler {
                     .lock()
                     .await
                     .file_context_tracker
-                    .was_read_this_session(&batch.display_path)
+                    .was_read_this_session(&batch.absolute_path)
             };
             if !json_output && !was_read_this_session {
                 let warning = format!(
@@ -859,17 +895,6 @@ impl EditFileHandler {
             let (raw_content, initial_mtime) = match tokio::fs::metadata(&batch.absolute_path).await
             {
                 Ok(metadata) => {
-                    let max_file_size = max_edit_file_size();
-                    if metadata.len() > max_file_size {
-                        all_results.push(format!(
-                            "File {} is too large to edit ({}KB, max {}KB)",
-                            batch.display_path,
-                            metadata.len() / 1024,
-                            max_file_size / 1024
-                        ));
-                        total_failed += batch.edits.len();
-                        continue;
-                    }
                     let mtime = metadata.modified().ok();
                     match tokio::fs::read_to_string(&batch.absolute_path).await {
                         Ok(content) => (content, mtime),
@@ -967,10 +992,12 @@ impl EditFileHandler {
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    if matches!(e, FileEditorError::AllEditsFailed { .. }) {
+                    let error_message = e.to_string();
+                    if matches!(e, FileEditorError::AllEditsFailed { .. })
+                        && Self::failure_requires_reread(&error_message)
+                    {
                         Self::mark_must_reread(state, &batch.absolute_path).await;
                     }
-                    let error_message = e.to_string();
                     let recovery = error_guidance::edit_failure_for_diagnostic(
                         &error_message,
                         consecutive_failures,
@@ -1138,7 +1165,11 @@ impl EditFileHandler {
             let result =
                 processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
 
-            if !prepared.failed_edits.is_empty() {
+            if prepared
+                .failed_edits
+                .iter()
+                .any(|failed| Self::failure_requires_reread(&failed.error))
+            {
                 Self::mark_must_reread(state, &batch.absolute_path).await;
             }
 
@@ -1635,11 +1666,31 @@ impl EditFileHandler {
             summary_counts.join(", ")
         );
 
-        Ok(format!(
-            "{}\n\n{}",
-            summary,
-            all_results.join("\n\n---\n\n")
-        ))
+        let output = format!("{}\n\n{}", summary, all_results.join("\n\n---\n\n"));
+
+        if total_applied == 0 && (total_failed > 0 || total_overlap > 0) {
+            let reread_paths = {
+                let state = state.lock().await;
+                affected_paths
+                    .iter()
+                    .filter(|path| state.must_reread_before_edit.contains(*path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            if !reread_paths.is_empty() {
+                return Err(ToolError::ExecutionFailedWithMetadata(
+                    output,
+                    ToolFailureMetadata {
+                        class: ToolFailureClass::AnchorInvalid,
+                        affected_paths: reread_paths,
+                        required_next_step: Some(ToolRequiredNextStep::ReadFile),
+                    },
+                ));
+            }
+            return Err(ToolError::ExecutionFailed(output));
+        }
+
+        Ok(output)
     }
 
     #[must_use]
@@ -1729,12 +1780,10 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
-        assert!(result.is_ok());
         assert!(
             result
-                .unwrap()
-                .as_str()
-                .unwrap()
+                .unwrap_err()
+                .to_string()
                 .contains("No files specified")
         );
     }
@@ -1755,12 +1804,10 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
-        assert!(result.is_ok());
         assert!(
             result
-                .unwrap()
-                .as_str()
-                .unwrap()
+                .unwrap_err()
+                .to_string()
                 .contains("No files specified")
         );
     }
@@ -1781,10 +1828,9 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
-        assert!(result.is_ok());
         assert_eq!(
-            result.unwrap().as_str().unwrap(),
-            "No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields."
+            result.unwrap_err().to_string(),
+            "Invalid input: No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields."
         );
     }
 
@@ -1804,10 +1850,9 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
-        assert!(result.is_ok());
         assert_eq!(
-            result.unwrap().as_str().unwrap(),
-            "No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields."
+            result.unwrap_err().to_string(),
+            "Invalid input: No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields."
         );
     }
 
@@ -1819,6 +1864,11 @@ mod tests {
 
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let canonical = std::fs::canonicalize(&file_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        state.lock().await.must_reread_before_edit.insert(canonical);
         let ctx = ToolContext::new(
             state,
             None,
@@ -1830,18 +1880,25 @@ mod tests {
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
-        let result = ToolHandler::execute(
+        let error = ToolHandler::execute(
             &handler,
             &ctx,
             serde_json::json!({"files": [{"path": "large.txt", "edits": []}]}),
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert!(
-            result
-                .as_str()
-                .is_some_and(|text| text.contains("too large to edit"))
+        assert!(error.to_string().contains("too large for edit_file"));
+        assert_eq!(
+            error.metadata().map(|metadata| &metadata.class),
+            Some(&ToolFailureClass::RangeInsufficient),
+            "the size limit must win over a stale reread latch so the model gets an achievable next step"
+        );
+        assert_eq!(
+            error
+                .metadata()
+                .and_then(|metadata| metadata.required_next_step.as_ref()),
+            Some(&ToolRequiredNextStep::AskUser)
         );
     }
 
@@ -1861,10 +1918,9 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": "[]"})).await;
-        assert!(result.is_ok());
         assert_eq!(
-            result.unwrap().as_str().unwrap(),
-            "No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields."
+            result.unwrap_err().to_string(),
+            "Invalid input: No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields."
         );
     }
 
@@ -1883,12 +1939,12 @@ mod tests {
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
-        let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": 42})).await;
-        assert!(result.is_ok());
-        let result_val = result.unwrap();
-        let msg = result_val.as_str().unwrap();
+        let msg = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": 42}))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            msg.starts_with("Failed to parse 'files' parameter."),
+            msg.contains("Failed to parse 'files' parameter."),
             "Should get parse failure message, got: {}",
             msg
         );
@@ -2638,9 +2694,12 @@ mod tests {
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok());
-        let result_str = result.unwrap().as_str().unwrap().to_string();
+        let result_str = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect("valid edit should succeed")
+            .as_str()
+            .expect("edit result should be text")
+            .to_string();
         println!("Edit result: {}", result_str);
         // consecutive_mistakes is tracked centrally in agent_loop.rs, not by edit_file handler
         assert_eq!(
@@ -2764,8 +2823,10 @@ mod tests {
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
-        let result = ToolHandler::execute(&handler, &ctx, params).await.unwrap();
-        assert!(result.as_str().unwrap().contains("Error preparing edits"));
+        let result = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("stale anchor must be a tool failure");
+        assert!(result.to_string().contains("Error preparing edits"));
         assert!(
             state
                 .lock()
@@ -2944,7 +3005,11 @@ mod tests {
 
         let result = ToolHandler::execute(&handler, &ctx, params).await;
 
-        assert!(result.is_ok(), "{:?}", result.err());
+        let result = result.expect("read-then-edit should succeed");
+        assert!(
+            !result.as_str().unwrap().contains("not read this session"),
+            "a dispatched read_file call must suppress the false unread warning"
+        );
         assert_eq!(
             std::fs::read_to_string(file_path).unwrap(),
             "\u{feff}alpha\r\ngamma\r\n"
@@ -2991,7 +3056,10 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "an empty edit list remains a successful no-op"
+        );
         assert_eq!(
             state.lock().await.consecutive_mistakes,
             3,
@@ -3236,7 +3304,7 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok());
+        assert!(result.is_err(), "rejected edit must be a tool failure");
 
         let _ = tokio::fs::remove_file(&file_path).await;
     }
@@ -3608,9 +3676,9 @@ edition = "2021"
 
         let result = ToolHandler::execute(&handler, &ctx, params).await;
 
-        assert!(result.is_ok(), "Edit should succeed: {:?}", result);
-
-        let output = result.unwrap().as_str().unwrap().to_string();
+        let output = result
+            .expect_err("zero-applied batch must be a tool failure")
+            .to_string();
         assert!(output.contains("Edited 2 file(s)"));
 
         // Clean up
@@ -3827,12 +3895,10 @@ edition = "2021"
             }]
         });
 
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(
-            result.is_ok(),
-            "overlap failure should still return a summary"
-        );
-        let output = result.unwrap().as_str().unwrap().to_string();
+        let output = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("overlap must be a tool failure")
+            .to_string();
         assert!(output.contains("0 edit(s) applied"), "got: {}", output);
         assert!(output.contains("0 edit(s) failed"), "got: {}", output);
         assert!(output.contains("2 edit(s) overlapped"), "got: {}", output);
@@ -3878,9 +3944,10 @@ edition = "2021"
             }]
         });
 
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok(), "Should not panic, should report failures");
-        let output = result.unwrap().as_str().unwrap().to_string();
+        let output = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("zero-applied edit must be a tool failure")
+            .to_string();
         assert!(
             output.contains("0 edit(s) applied") || output.contains("failed"),
             "Summary should report 0 applied or mention failures, got: {}",
@@ -4430,17 +4497,16 @@ edition = "2021"
             }]
         });
 
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(
-            result.is_ok(),
-            "Execute should return Ok with error in body: {:?}",
-            result
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("stale anchors must be a tool failure");
+        let body = error.to_string();
+        assert_eq!(
+            error
+                .metadata()
+                .and_then(|metadata| metadata.required_next_step.as_ref()),
+            Some(&ToolRequiredNextStep::ReadFile)
         );
-        let body = result
-            .unwrap()
-            .as_str()
-            .map(String::from)
-            .unwrap_or_default();
         assert!(
             body.contains("Stale anchor detected"),
             "Result should mention stale anchor detection, got: {}",
@@ -5207,12 +5273,10 @@ edition = "2021"
         let params = serde_json::json!({
             "files": "this is not valid json {["
         });
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(
-            result.is_ok(),
-            "invalid stringified JSON should return Ok with error message"
-        );
-        let msg = result.unwrap().as_str().unwrap().to_string();
+        let msg = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("invalid stringified JSON must be a tool failure")
+            .to_string();
         assert!(
             msg.contains("Parse error") || msg.contains("parse error"),
             "stringified JSON parse failure must surface the actual parse error, got: {}",
@@ -5268,9 +5332,7 @@ edition = "2021"
 
         let output = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
             .await
-            .expect("edit failures should be returned as model-visible output")
-            .as_str()
-            .expect("edit output should be text")
+            .expect_err("edit failures should be returned as tool errors")
             .to_string();
         assert!(
             output.contains("Multiple edit failure types were detected"),
@@ -5625,10 +5687,10 @@ edition = "2021"
             "files": "[{\"path\": \"utils.py\", \"edits\": [{\"anchor\": \"SomeWord§    return f\"{result:.4f}\".rstrip('0').rstrip('.'), \"edit_type\": \"insert_after\", \"text\": \"\\n\\ndef clamp_result()\"}]}]"
         });
 
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        // Should return Ok with error message, not panic
-        assert!(result.is_ok());
-        let msg = result.unwrap().as_str().unwrap().to_string();
+        let msg = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             msg.contains("Parse error") || msg.contains("parse error"),
             "should surface the JSON parse error, got: {msg}"
@@ -5660,9 +5722,10 @@ edition = "2021"
             "files": "[{\"edits\": [{\"anchor\": \"Word§line\", \"edit_type\": \"replace\", \"text\": \"new\"}] \"path\": \"test.py\"}]"
         });
 
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(result.is_ok());
-        let msg = result.unwrap().as_str().unwrap().to_string();
+        let msg = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             msg.contains("Parse error") || msg.contains("parse error"),
             "should surface the JSON parse error, got: {msg}"
@@ -6181,8 +6244,8 @@ edition = "2021"
         });
 
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
-        let output = result.unwrap();
-        let msg = output.as_str().unwrap();
+        let error = result.unwrap_err();
+        let msg = error.to_string();
         // Whitespace mismatch is distinct from a stale anchor — the
         // quoted content matches a line modulo whitespace, so the
         // model gets a targeted "copy the line EXACTLY" diagnostic
@@ -6268,8 +6331,9 @@ edition = "2021"
         });
 
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
-        let output = result.expect("tool must report outcome");
-        let msg = output.as_str().unwrap();
+        let msg = result
+            .expect_err("rejected edit must be a tool failure")
+            .to_string();
         assert!(
             msg.contains("not found in the file"),
             "ambiguous insert_before must surface anchor-not-found guidance: {msg}"

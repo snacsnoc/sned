@@ -25,7 +25,7 @@ use crate::core::provider_retry::{
 use crate::core::tools::SnedTool;
 use crate::core::tools::{
     ToolContext, ToolFailureClass, ToolFailureMetadata, ToolRegistry, ToolRequiredNextStep,
-    coerce_string_array, tool_result_to_text,
+    coerce_command_array, coerce_string_array, tool_result_to_text,
 };
 use crate::providers::{
     ApiStreamChunk, ApiStreamToolCall, AssistantContentBlock, MessageContent, MessageRole,
@@ -1786,9 +1786,35 @@ impl AgentLoop {
             state.retryable_failed_request = None;
         }
 
-        // 3. Create provider request
-        // Build system prompt with context
-        let context =
+        // 3. Select the tool profile before building the system prompt. The
+        // prompt's examples and the request's schemas must describe the same
+        // inventory, especially for reduced profiles such as DirectAnswer.
+        let profile = {
+            let mode_str = match self.config.mode {
+                crate::core::agent_types::AgentMode::Plan => "plan",
+                crate::core::agent_types::AgentMode::Act => "act",
+            };
+            let prompt = self
+                .current_turn_retry_candidate
+                .as_ref()
+                .and_then(|m| match &m.content {
+                    crate::providers::MessageContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            let profile =
+                resolve_tool_profile(self.deps.tool_profile, self.deps.yolo, prompt, mode_str);
+            let profile_changed = self.deps.tool_profile != Some(profile);
+            self.deps.tool_profile = Some(profile);
+            if profile_changed {
+                self.deps.cached_system_prompt = None;
+            }
+            tracing::info!(profile = ?profile, prompt_len = prompt.len(), "selected tool profile");
+            profile
+        };
+
+        // 3.1 Create provider request and build the matching system prompt.
+        let mut context =
             self.deps
                 .system_prompt_context
                 .clone()
@@ -1807,6 +1833,7 @@ impl AgentLoop {
                     model_id: self.resolve_active_model_id(),
                     ..Default::default()
                 });
+        context.tool_profile = Some(profile);
         let workspace_root = context
             .cwd
             .clone()
@@ -1859,26 +1886,7 @@ impl AgentLoop {
             }
         }
 
-        // 3. Select tool profile and build tool definitions
-        let profile = {
-            let mode_str = match self.config.mode {
-                crate::core::agent_types::AgentMode::Plan => "plan",
-                crate::core::agent_types::AgentMode::Act => "act",
-            };
-            let prompt = self
-                .current_turn_retry_candidate
-                .as_ref()
-                .and_then(|m| match &m.content {
-                    crate::providers::MessageContent::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .unwrap_or("");
-            let profile =
-                resolve_tool_profile(self.deps.tool_profile, self.deps.yolo, prompt, mode_str);
-            tracing::info!(profile = ?profile, prompt_len = prompt.len(), "selected tool profile");
-            self.deps.tool_profile = Some(profile);
-            profile
-        };
+        // 3.2 Build the tool schemas from that same profile.
         let tool_definitions =
             crate::core::tools::definitions::get_tool_definitions_for_profile(profile);
         let tools = if tool_definitions.is_empty() {
@@ -3055,6 +3063,10 @@ impl AgentLoop {
                             "escalating tool profile after text-only response"
                         );
                         self.deps.tool_profile = Some(next);
+                        // The cached prompt was built for `profile`. Keep the
+                        // next request's instructions aligned with the newly
+                        // escalated tool schemas.
+                        self.deps.cached_system_prompt = None;
                     }
                     history.push(StorageMessage {
                         id: Some(Self::next_message_id(&self.message_counter)),
@@ -3399,8 +3411,7 @@ impl AgentLoop {
                                     // safety before auto-approving. If the command is
                                     // unsafe, prompt the user instead (matching TS:
                                     // shouldAutoApprove = isSafe && autoApproveEnabled).
-                                    let commands =
-                                        coerce_string_array(&tool_params, "commands", "command");
+                                    let commands = coerce_command_array(&tool_params);
                                     let script = tool_params.get("script").and_then(|s| s.as_str());
                                     let yolo = mgr.is_yolo_mode();
                                     let user_safe = mgr.get_user_safe_commands().clone();
@@ -3877,6 +3888,14 @@ impl AgentLoop {
                 {
                     result_output.text.push_str(
                         "\n\nNext step: call read_file on this path again before retrying edit_file.",
+                    );
+                }
+                if tool_name == "edit_file"
+                    && let Some(metadata) = &result_output.metadata
+                    && metadata.required_next_step == Some(ToolRequiredNextStep::AskUser)
+                {
+                    result_output.text.push_str(
+                        "\n\nNext step: call ask_followup_question. Do not bypass this edit_file safety limit with execute_command.",
                     );
                 }
 
@@ -4449,20 +4468,7 @@ impl AgentLoop {
             | SnedTool::GetFileSkeleton
             | SnedTool::FindSymbolReferences
             | SnedTool::DiagnosticsScan
-            | SnedTool::RenameSymbol => {
-                if let Some(arr) = params.get("paths").and_then(|p| p.as_array()) {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(String::from)
-                        .collect()
-                } else if let Some(s) = params.get("paths").and_then(|p| p.as_str()) {
-                    vec![String::from(s)]
-                } else if let Some(s) = params.get("path").and_then(|p| p.as_str()) {
-                    vec![String::from(s)]
-                } else {
-                    vec![]
-                }
-            }
+            | SnedTool::RenameSymbol => coerce_string_array(params, "paths", "path"),
             SnedTool::WriteToFile
             | SnedTool::SearchFiles
             | SnedTool::ListFiles
@@ -4472,26 +4478,7 @@ impl AgentLoop {
                 .map(|s| vec![String::from(s)])
                 .unwrap_or_default(),
             SnedTool::EditFile => {
-                let paths: Vec<String> = params
-                    .get("files")
-                    .and_then(|f| f.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|f| f.get("path"))
-                            .filter_map(|p| p.as_str())
-                            .map(String::from)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if paths.is_empty() {
-                    params
-                        .get("path")
-                        .and_then(|p| p.as_str())
-                        .map(|p| vec![p.to_string()])
-                        .unwrap_or_default()
-                } else {
-                    paths
-                }
+                crate::core::tools::handlers::edit_file::EditFileHandler::requested_paths_for_locking(params)
             }
             SnedTool::ReplaceSymbol => {
                 if let Some(s) = params.get("path").and_then(|p| p.as_str()) {
@@ -7384,6 +7371,67 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(requests[0].system_prompt.contains("PRIME DIRECTIVES"));
     }
 
+    #[tokio::test]
+    async fn test_profile_escalation_rebuilds_cached_system_prompt() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = vec![
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "I should finish this through the tool.".to_string(),
+                id: None,
+                signature: None,
+            })],
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Done.".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(
+            provider,
+            "test-profile-escalation-prompt-cache",
+        ));
+        agent.deps.tool_profile = Some(crate::core::tools::definitions::ToolProfile::DirectAnswer);
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert_eq!(
+            agent.deps.tool_profile,
+            Some(crate::core::tools::definitions::ToolProfile::AnswerOnly)
+        );
+        assert!(
+            agent.deps.cached_system_prompt.is_none(),
+            "escalation must invalidate the prompt built for DirectAnswer"
+        );
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools.is_none());
+        assert!(
+            requests[0]
+                .system_prompt
+                .contains("No tools are available for this turn")
+        );
+        let second_tools = requests[1]
+            .tools
+            .as_ref()
+            .expect("AnswerOnly request should include completion tools");
+        assert!(
+            second_tools
+                .iter()
+                .any(|tool| tool.function.name == "attempt_completion")
+        );
+        assert!(
+            !requests[1]
+                .system_prompt
+                .contains("No tools are available for this turn")
+        );
+        assert_ne!(requests[0].system_prompt, requests[1].system_prompt);
+    }
+
     #[test]
     fn test_tool_path_discovery_merges_rules_once_and_ignores_siblings() {
         let temp = tempfile::tempdir().unwrap();
@@ -8802,6 +8850,21 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[test]
+    fn test_extract_action_path_read_file_stringified_array() {
+        let params = serde_json::json!({
+            "paths": "[\"/tmp/outside-a.rs\",\"/tmp/outside-b.rs\"]"
+        });
+        let paths = AgentLoop::extract_action_path(SnedTool::ReadFile, &params);
+        assert_eq!(
+            paths,
+            vec![
+                "/tmp/outside-a.rs".to_string(),
+                "/tmp/outside-b.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn test_extract_action_path_diagnostics_scan() {
         let params = serde_json::json!({"paths": ["/tmp/outside.rs"]});
         let paths = AgentLoop::extract_action_path(SnedTool::DiagnosticsScan, &params);
@@ -9016,6 +9079,17 @@ Irrespective of whether additional information or instructions are given, you ar
             serde_json::json!({"files": [{"path": "/home/user/project/src/lib.rs", "edits": []}]});
         let paths = AgentLoop::extract_action_path(SnedTool::EditFile, &params);
         assert_eq!(paths, vec!["/home/user/project/src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_action_path_edit_file_stringified_files() {
+        let params = serde_json::json!({
+            "files": "[{\"path\":\"src/a.rs\",\"edits\":[]},{\"path\":\"src/b.rs\",\"edits\":[]}]"
+        });
+        assert_eq!(
+            AgentLoop::extract_action_path(SnedTool::EditFile, &params),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
     }
 
     #[test]

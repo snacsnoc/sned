@@ -36,7 +36,11 @@ impl GetFileSkeletonHandler {
             let canonical_path = match tokio::fs::canonicalize(&abs_path).await {
                 Ok(path) => path,
                 Err(error) => {
-                    results.push((index, format!("Error reading file {rel_path}: {error}")));
+                    results.push((
+                        index,
+                        format!("Error reading file {rel_path}: {error}"),
+                        true,
+                    ));
                     continue;
                 }
             };
@@ -48,21 +52,23 @@ impl GetFileSkeletonHandler {
                         metadata.len().div_ceil(1024),
                         MAX_STRUCTURAL_FILE_READ_SIZE / 1024,
                     ),
+                    true,
                 )),
                 Ok(_) => readable_paths.push((index, rel_path.clone(), canonical_path)),
                 Err(error) => {
-                    results.push((index, format!("Error reading file {rel_path}: {error}")));
+                    results.push((index, format!("Error reading file {rel_path}: {error}"), true));
                 }
             }
         }
 
         if readable_paths.is_empty() {
-            results.sort_by_key(|(index, _)| *index);
-            return Ok(results
+            results.sort_by_key(|(index, _, _)| *index);
+            let output = results
                 .into_iter()
-                .map(|(_, result)| result)
+                .map(|(_, result, _)| result)
                 .collect::<Vec<_>>()
-                .join("\n\n"));
+                .join("\n\n");
+            return Err(ToolError::ExecutionFailed(output));
         }
         let language_parsers = Arc::new(
             load_required_language_parsers(
@@ -105,23 +111,30 @@ impl GetFileSkeletonHandler {
                                     format!(
                                         "--- {rel_path} ---\nStable Anchors are provided with each line.\n{skeleton}"
                                     ),
+                                    false,
                                 )
                             }
-                            Ok(None) => (index, format!("No definitions found in {rel_path}")),
-                            Err(e) => (index, format!("Error parsing {rel_path}: {e}")),
+                            Ok(None) => (index, format!("No definitions found in {rel_path}"), false),
+                            Err(e) => (index, format!("Error parsing {rel_path}: {e}"), true),
                         },
-                        Err(e) => (index, format!("Error reading file {rel_path}: {e}")),
+                        Err(e) => (index, format!("Error reading file {rel_path}: {e}"), true),
                     }
                 }
             });
 
         results.extend(join_all(futures).await);
-        results.sort_by_key(|(index, _)| *index);
-        Ok(results
+        results.sort_by_key(|(index, _, _)| *index);
+        let had_errors = results.iter().any(|(_, _, is_error)| *is_error);
+        let output = results
             .into_iter()
-            .map(|(_, result)| result)
+            .map(|(_, result, _)| result)
             .collect::<Vec<_>>()
-            .join("\n\n"))
+            .join("\n\n");
+        if had_errors {
+            Err(ToolError::ExecutionFailed(output))
+        } else {
+            Ok(output)
+        }
     }
 
     fn description(&self, _params: &serde_json::Value) -> String {
@@ -138,6 +151,11 @@ impl ToolHandler for GetFileSkeletonHandler {
         let handler = self;
         let ctx = ctx.clone();
         Box::pin(async move {
+            let paths = crate::core::tools::coerce_string_array(&params, "paths", "path")
+                .into_iter()
+                .map(|path| ctx.resolve_path(&path))
+                .collect::<Result<Vec<_>, _>>()?;
+            let _file_locks = ctx.lock_file_paths(&paths).await;
             Self::run(handler, &ctx, params)
                 .await
                 .map(serde_json::Value::String)
@@ -192,5 +210,89 @@ mod tests {
                 .must_reread_before_edit
                 .contains(&canonical_path.to_string_lossy().into_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_skeleton_total_read_failure_is_tool_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let error = ToolHandler::execute(
+            &GetFileSkeletonHandler,
+            &ctx,
+            serde_json::json!({"path": "missing.rs"}),
+        )
+        .await
+        .expect_err("missing files must not produce a successful tool result");
+        assert!(error.to_string().contains("Error reading file missing.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_get_file_skeleton_partial_failure_preserves_successful_output_in_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("good.rs"), "struct Widget;\n").unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let error = ToolHandler::execute(
+            &GetFileSkeletonHandler,
+            &ctx,
+            serde_json::json!({"paths": ["good.rs", "missing.rs"]}),
+        )
+        .await
+        .expect_err("incomplete multi-file context must be marked as a tool failure");
+        let output = error.to_string();
+        assert!(output.contains("Stable Anchors"));
+        assert!(output.contains("Error reading file missing.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_get_file_skeleton_waits_for_shared_path_lock() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("example.rs");
+        std::fs::write(&file_path, "struct Widget;\n").unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let canonical = std::fs::canonicalize(file_path).unwrap();
+        let held = ctx.lock_file_paths(std::slice::from_ref(&canonical)).await;
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            GetFileSkeletonHandler.execute(&ctx, serde_json::json!({"path": "example.rs"})),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "get_file_skeleton bypassed the shared path lock"
+        );
+        drop(held);
     }
 }
