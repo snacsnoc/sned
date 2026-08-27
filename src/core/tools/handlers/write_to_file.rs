@@ -536,6 +536,193 @@ mod tests {
         assert!(workspace_root.path().join("nested/output.go").exists());
     }
 
+    fn test_ctx(workspace_root: &Path) -> ToolContext {
+        ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            workspace_root.to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_parent_traversal() {
+        let handler = WriteToFileHandler::new();
+        let workspace_root = TempDir::new().unwrap();
+        let ctx = test_ctx(workspace_root.path());
+        let outside_filename = format!(
+            "escape-{}.txt",
+            workspace_root
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace")
+        );
+        let outside_path = workspace_root
+            .path()
+            .parent()
+            .unwrap()
+            .join(&outside_filename);
+
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({
+                "path": format!("../{outside_filename}"),
+                "content": "escaped"
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "traversal above workspace must fail");
+        assert!(
+            !outside_path.exists(),
+            "no file may be created outside the workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_absolute_path_outside_workspace() {
+        let handler = WriteToFileHandler::new();
+        let workspace_root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let ctx = test_ctx(workspace_root.path());
+        let outside_path = outside.path().join("escape.txt");
+
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({
+                "path": outside_path.to_string_lossy(),
+                "content": "escaped"
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "absolute path outside workspace must fail");
+        assert!(!outside_path.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_execute_rejects_symlinked_parent_escaping_workspace() {
+        let handler = WriteToFileHandler::new();
+        let workspace_root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let link = workspace_root.path().join("linked_dir");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let ctx = test_ctx(workspace_root.path());
+
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({
+                "path": "linked_dir/escape.txt",
+                "content": "escaped"
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "symlinked parent escaping workspace must fail"
+        );
+        assert!(
+            !outside.path().join("escape.txt").exists(),
+            "no file may be created via symlink escape"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_execute_rejects_symlink_file_pointing_outside_workspace() {
+        let handler = WriteToFileHandler::new();
+        let workspace_root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("target.txt");
+        std::fs::write(&outside_file, "original").unwrap();
+        let link = workspace_root.path().join("link.txt");
+        std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+        let ctx = test_ctx(workspace_root.path());
+
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({
+                "path": "link.txt",
+                "content": "overwritten"
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "writing through an escaping symlink must fail"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "original",
+            "external target must remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_execute_rejects_dangling_symlink_escaping_workspace() {
+        let handler = WriteToFileHandler::new();
+        let workspace_root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        // Dangling: the symlink target does not exist.
+        let link = workspace_root.path().join("dangling.txt");
+        std::os::unix::fs::symlink(outside.path().join("missing.txt"), &link).unwrap();
+        let ctx = test_ctx(workspace_root.path());
+
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({
+                "path": "dangling.txt",
+                "content": "escaped"
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "dangling symlink escape must fail");
+        assert!(
+            !outside.path().join("missing.txt").exists(),
+            "no file may be created via dangling symlink"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_external_root_without_authorization() {
+        // Defense-in-depth at the execute() layer: even though ToolContext
+        // with no allowed_external_roots, an absolute external path must fail.
+        let handler = WriteToFileHandler::new();
+        let workspace_root = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let ctx = test_ctx(workspace_root.path());
+        let external_path = external.path().join("unauthorized.txt");
+
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({
+                "path": external_path.to_string_lossy(),
+                "content": "escaped"
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!external_path.exists());
+    }
+
     #[tokio::test]
     async fn test_execute_refreshes_symbol_index() {
         let workspace_root = TempDir::new().unwrap();
