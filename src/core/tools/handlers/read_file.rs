@@ -112,6 +112,20 @@ impl ReadFileHandler {
         }
     }
 
+    fn invalid_line_range(path: &str, start_line: usize, end_line: usize) -> FileReadResult {
+        FileReadResult {
+            path: path.to_string(),
+            canonical_path: None,
+            content: String::new(),
+            hash: String::new(),
+            success: false,
+            refreshes_edit_context: false,
+            error: Some(format!(
+                "Invalid line range: start_line ({start_line}) must be less than or equal to end_line ({end_line}). Re-issue read_file with start_line <= end_line."
+            )),
+        }
+    }
+
     /// Read one or more files.
     ///
     async fn read_files(
@@ -265,13 +279,10 @@ impl ReadFileHandler {
 
         let max_read_size = max_file_read_size();
         let has_line_range = start_line.is_some() || end_line.is_some();
-        if has_line_range && metadata.len() > max_read_size as u64 {
-            return Self::ranged_read_too_large(
-                display_path,
-                &canonical_path,
-                metadata.len(),
-                max_read_size,
-            );
+        if let (Some(start), Some(end)) = (start_line, end_line)
+            && start > end
+        {
+            return Self::invalid_line_range(display_path, start, end);
         }
 
         let (
@@ -283,15 +294,25 @@ impl ReadFileHandler {
             range_end,
             refreshes_edit_context,
         ) = if has_line_range {
-            match self
-                .read_lines_range(
+            let large_file_range = metadata.len() > max_read_size as u64;
+            let range_result = if large_file_range {
+                self.read_large_lines_range(
                     &canonical_path.to_string_lossy(),
                     start_line,
                     end_line,
                     max_read_size,
                 )
                 .await
-            {
+            } else {
+                self.read_lines_range(
+                    &canonical_path.to_string_lossy(),
+                    start_line,
+                    end_line,
+                    max_read_size,
+                )
+                .await
+            };
+            match range_result {
                 Ok((
                     content_for_hash,
                     sliced_lines,
@@ -306,7 +327,7 @@ impl ReadFileHandler {
                     full_lines,
                     range_start,
                     range_end,
-                    true,
+                    !large_file_range,
                 ),
                 Err(e) => return e.with_display_path(display_path),
             }
@@ -560,6 +581,147 @@ impl ReadFileHandler {
         ))
     }
 
+    /// Read only the requested line range from a file larger than the full-read
+    /// cap. For these files, anchors are registered only for the returned range.
+    async fn read_large_lines_range(
+        &self,
+        path: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        max_bytes: usize,
+    ) -> Result<
+        (
+            String,
+            Vec<String>,
+            Option<String>,
+            Option<Vec<String>>,
+            usize,
+            usize,
+        ),
+        FileReadResult,
+    > {
+        if let (Some(start), Some(end)) = (start_line, end_line)
+            && start > end
+        {
+            return Err(Self::invalid_line_range(path, start, end));
+        }
+
+        let canonical_path = match tokio::fs::canonicalize(path).await {
+            Ok(p) => p,
+            Err(e) => {
+                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                return Err(FileReadResult {
+                    path: path.to_string(),
+                    canonical_path: None,
+                    content: String::new(),
+                    hash: String::new(),
+                    success: false,
+                    refreshes_edit_context: false,
+                    error: Some(err.display()),
+                });
+            }
+        };
+
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let file = match tokio::fs::File::open(&canonical_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                return Err(FileReadResult {
+                    path: path.to_string(),
+                    canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
+                    content: String::new(),
+                    hash: String::new(),
+                    success: false,
+                    refreshes_edit_context: false,
+                    error: Some(err.display()),
+                });
+            }
+        };
+
+        let requested_start = start_line.unwrap_or(1).max(1);
+        let requested_end = end_line.unwrap_or(usize::MAX);
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut line_no = 0usize;
+        let mut selected_lines = Vec::new();
+        let mut selected_bytes = 0usize;
+
+        loop {
+            line.clear();
+            let read = match reader.read_line(&mut line).await {
+                Ok(read) => read,
+                Err(e) => {
+                    let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
+                    return Err(FileReadResult {
+                        path: path.to_string(),
+                        canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
+                        content: String::new(),
+                        hash: String::new(),
+                        success: false,
+                        refreshes_edit_context: false,
+                        error: Some(err.display()),
+                    });
+                }
+            };
+            if read == 0 {
+                break;
+            }
+
+            line_no = line_no.saturating_add(1);
+            if line_no < requested_start {
+                continue;
+            }
+            if line_no > requested_end {
+                break;
+            }
+
+            selected_bytes = selected_bytes.saturating_add(read);
+            if selected_bytes > max_bytes {
+                return Err(Self::ranged_read_too_large(
+                    path,
+                    &canonical_path,
+                    selected_bytes as u64,
+                    max_bytes,
+                ));
+            }
+
+            if line.ends_with('\n') {
+                line.pop();
+            }
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            if line_no == 1 {
+                line = line.strip_prefix('\u{feff}').unwrap_or(&line).to_string();
+            }
+            selected_lines.push(line.clone());
+        }
+
+        let clamping_note = if requested_start > line_no && line_no > 0 {
+            Some(format!(
+                "[Note: start_line was beyond the end of this large file (file has {line_no} lines); no requested lines were available.]"
+            ))
+        } else {
+            Some(
+                "[Note: This file exceeds the full-read limit. Anchors are registered only for the returned line range.]"
+                    .to_string(),
+            )
+        };
+
+        let hash_content = selected_lines.join("\n");
+        let range_end = selected_lines.len();
+        Ok((
+            hash_content,
+            selected_lines.clone(),
+            clamping_note,
+            Some(selected_lines),
+            0,
+            range_end,
+        ))
+    }
+
     /// Read the entire file using BufReader for reduced peak memory.
     /// Reads the full file content and splits it into lines using `split_content_lines()`.
     /// Files at this point are known to be within the configured read limit.
@@ -716,41 +878,26 @@ impl ReadFileHandler {
             .execute_with_results(params, anchor_mgr, task_id, output_writer)
             .await?;
         Self::track_read_files(state, &paths, &results);
+        let warnings = Self::read_loop_warnings(state, &paths, &results);
 
         // Read-loop detection: if a file was read 3+ times in a row with no
         // intervening edit, surface a hint so the model doesn't loop forever.
         if let Some(writer) = output_writer {
-            for (path_str, res) in paths.iter().zip(results.iter()) {
-                // Look up the count under the canonical key (the key
-                // track_read_files uses to increment) so the warning
-                // fires when the model reads the same file repeatedly
-                // via different path representations (relative vs
-                // absolute, or with/without ./).
-                if !res.success || !res.refreshes_edit_context {
-                    continue;
-                }
-                let lookup_key = res.canonical_path.as_deref().unwrap_or(path_str);
-                let count = state
-                    .consecutive_reads
-                    .get(lookup_key)
-                    .copied()
-                    .unwrap_or(0);
-                if count >= 3 {
-                    use crate::cli::output::OutputEvent;
-                    use crate::cli::tui::theme::WARNING_FG;
-                    use ratatui::style::Style;
-                    writer.emit(OutputEvent::tool_output_line(
-                        format!(
-                            "⚠ {path_str} has been read {count} times consecutively with no edit. \
-                             If you have the anchors you need, call edit_file now."
-                        ),
-                        Style::default().fg(WARNING_FG),
-                    ));
-                }
+            for warning in &warnings {
+                use crate::cli::output::OutputEvent;
+                use crate::cli::tui::theme::WARNING_FG;
+                use ratatui::style::Style;
+                writer.emit(OutputEvent::tool_output_line(
+                    warning.clone(),
+                    Style::default().fg(WARNING_FG),
+                ));
             }
         }
 
-        Ok(Self::format_results(results))
+        Ok(Self::append_warnings(
+            Self::format_results(results),
+            &warnings,
+        ))
     }
 
     fn parse_params(
@@ -765,7 +912,37 @@ impl ReadFileHandler {
 
         let start_line = params["start_line"].as_u64().map(|n| n as usize);
         let end_line = params["end_line"].as_u64().map(|n| n as usize);
+        if let (Some(start), Some(end)) = (start_line, end_line)
+            && start > end
+        {
+            return Err(ToolError::InvalidInput(format!(
+                "Invalid line range: start_line ({start}) must be less than or equal to end_line ({end})."
+            )));
+        }
         Ok((paths, start_line, end_line))
+    }
+
+    fn read_loop_warnings(
+        state: &TaskState,
+        paths: &[String],
+        results: &[FileReadResult],
+    ) -> Vec<String> {
+        paths
+            .iter()
+            .zip(results.iter())
+            .filter_map(|(path_str, res)| {
+                if !res.success || !res.refreshes_edit_context {
+                    return None;
+                }
+                let lookup_key = res.canonical_path.as_deref().unwrap_or(path_str);
+                let count = state.consecutive_reads.get(lookup_key).copied().unwrap_or(0);
+                (count >= 3).then(|| {
+                    format!(
+                        "Warning: {path_str} has been read {count} times consecutively with no edit. If you have the anchors you need, call edit_file now."
+                    )
+                })
+            })
+            .collect()
     }
 
     fn format_results(results: Vec<FileReadResult>) -> String {
@@ -785,6 +962,16 @@ impl ReadFileHandler {
             }
         }
 
+        output
+    }
+
+    fn append_warnings(mut output: String, warnings: &[String]) -> String {
+        for warning in warnings {
+            if !output.is_empty() {
+                output.push_str("\n---\n");
+            }
+            output.push_str(warning);
+        }
         output
     }
 }
@@ -816,7 +1003,12 @@ impl ToolHandler for ReadFileHandler {
             // Serialize reads with concurrent edits/writes of the same paths.
             // The guards live through the read and state update below.
             let _file_locks = ctx
-                .lock_file_paths(&paths.iter().map(std::path::PathBuf::from).collect::<Vec<_>>())
+                .lock_file_paths(
+                    &paths
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>(),
+                )
                 .await;
 
             let results = handler
@@ -833,8 +1025,12 @@ impl ToolHandler for ReadFileHandler {
             {
                 let mut state = ctx.state.lock().await;
                 Self::track_read_files(&mut state, &paths, &results);
+                let warnings = Self::read_loop_warnings(&state, &paths, &results);
+                return Ok(serde_json::Value::String(Self::append_warnings(
+                    Self::format_results(results),
+                    &warnings,
+                )));
             }
-            Ok(serde_json::Value::String(Self::format_results(results)))
         })
     }
 
@@ -1233,6 +1429,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_file_allows_small_line_range_in_oversized_file() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 1..=60_000 {
+            writeln!(temp_file, "line {i}").unwrap();
+        }
+
+        let result = ReadFileHandler::new()
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                Some(10),
+                Some(12),
+                &AnchorStateManager::new(),
+                Some("test-task"),
+                None,
+            )
+            .await;
+
+        assert!(result.success, "range read failed: {:?}", result.error);
+        assert!(result.content.contains("line 10"));
+        assert!(result.content.contains("line 12"));
+        assert!(!result.content.contains("line 9"));
+        assert!(
+            !result.refreshes_edit_context,
+            "partial large-file reads must not clear whole-file reread guards"
+        );
+        assert!(
+            result
+                .content
+                .contains("Anchors are registered only for the returned line range")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_line_range_does_not_clear_reread_requirement() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("large.txt");
+        let mut content = String::new();
+        for i in 1..=60_000 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(&file_path, content).unwrap();
+        let canonical_path = std::fs::canonicalize(&file_path).unwrap();
+        let canonical = canonical_path.to_string_lossy().into_owned();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(canonical.clone());
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = ToolHandler::execute(
+            &ReadFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "path": "large.txt",
+                "start_line": 10,
+                "end_line": 12,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.as_str().unwrap().contains("line 10"));
+        assert!(
+            state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&canonical),
+            "partial large-file read must preserve the whole-file reread latch"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_file_allows_104kb_line_range_with_default_limit() {
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(&vec![b'x'; 104 * 1024]).unwrap();
@@ -1540,9 +1821,54 @@ mod tests {
             .await;
 
         assert!(
-            result.success,
-            "invalid range (start > end) must not panic, got error: {:?}",
-            result.error
+            !result.success,
+            "invalid range (start > end) must be rejected"
+        );
+        assert!(result.error.as_deref().is_some_and(|error| {
+            error.contains("start_line (450) must be less than or equal to end_line (300)")
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_read_loop_warning_is_returned_to_model() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("loop.txt");
+        std::fs::write(&file_path, "content\n").unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        for _ in 0..2 {
+            let _ = ToolHandler::execute(
+                &ReadFileHandler::new(),
+                &ctx,
+                serde_json::json!({"path": "loop.txt"}),
+            )
+            .await
+            .unwrap();
+        }
+        let result = ToolHandler::execute(
+            &ReadFileHandler::new(),
+            &ctx,
+            serde_json::json!({"path": "loop.txt"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result
+                .as_str()
+                .unwrap()
+                .contains("has been read 3 times consecutively with no edit")
         );
     }
 

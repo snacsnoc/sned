@@ -3,8 +3,8 @@
 //! and `dirac/src/core/task/tools/handlers/edit-file/EditFormatter.ts`.
 
 use crate::core::file_editor::{
-    AppliedEdit, ApplyOutcome, Edit, EditExecutor, FailedEdit,
-    FileEditorError, ResolvedEdit, UnchangedSite, split_content_lines,
+    AppliedEdit, ApplyOutcome, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit,
+    UnchangedSite, split_content_lines,
 };
 use crate::core::hash_utils::format_line_with_hash;
 use crate::core::tools::handlers::error_guidance;
@@ -31,7 +31,11 @@ fn highlight_diff_content(content: &str, language: &str, colored: bool) -> Strin
 }
 
 fn highlighted_line_with_hash(content: &str, hash: &str, language: &str, colored: bool) -> String {
-    format_line_with_hash(&highlight_diff_content(content, language, colored), hash, &[])
+    format_line_with_hash(
+        &highlight_diff_content(content, language, colored),
+        hash,
+        &[],
+    )
 }
 
 // ============================================================================
@@ -247,7 +251,8 @@ impl BatchProcessor {
             let failure_messages: Vec<String> = failed_edits
                 .iter()
                 .map(|f| {
-                    self.executor.format_failure_message(&f.edit, Some(&f.error))
+                    self.executor
+                        .format_failure_message(&f.edit, Some(&f.error))
                 })
                 .collect();
             return Err(FileEditorError::AllEditsFailed {
@@ -492,7 +497,7 @@ impl BatchProcessor {
 
         let mut results: Vec<String> = Vec::new();
 
-        if use_full_file {
+        if self.diff_mode == DiffMode::Full && use_full_file {
             results.push(format!(
                 "Because the changes were extensive, the full updated file content with anchors is provided below to ensure clarity:\n\n{}",
                 final_lines

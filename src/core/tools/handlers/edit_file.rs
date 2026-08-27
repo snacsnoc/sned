@@ -12,8 +12,8 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
 use crate::core::edit_batch::{
-    BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits, MAX_FINGERPRINT_CONTENT_BYTES,
-    MAX_FINGERPRINT_CONTENT_LINES,
+    BatchProcessor, DiagnosticsResult, DiffMode, MAX_FINGERPRINT_CONTENT_BYTES,
+    MAX_FINGERPRINT_CONTENT_LINES, PreparedEdits,
 };
 use crate::core::file_editor::{
     AnchorStateManager, Edit, EditFailureReason, FileEditGuard, FileEditorError, FileTextFormat,
@@ -705,7 +705,7 @@ impl EditFileHandler {
         )?;
 
         let parsed = self.parse_edits(&files)?;
-        let processor = BatchProcessor::new(DiffMode::Full);
+        let processor = BatchProcessor::new(DiffMode::AdditionsOnly);
 
         let silent = params
             .get("silent")
@@ -814,16 +814,18 @@ impl EditFileHandler {
                     .was_read_this_session(&batch.display_path)
             };
             if !json_output && !was_read_this_session {
+                let warning = format!(
+                    "Warning: editing {} (not read this session; anchors or assumptions may be stale). Call read_file first when an edit depends on current file contents.",
+                    batch.display_path
+                );
                 use crate::cli::output::OutputEvent;
                 use crate::cli::tui::theme::WARNING_FG;
                 use ratatui::style::Style;
                 output_writer.emit(OutputEvent::tool_output_line(
-                    format!(
-                        "⚠ editing {} (not read this session — may have stale assumptions)",
-                        batch.display_path
-                    ),
+                    warning.clone(),
                     Style::default().fg(WARNING_FG),
                 ));
+                all_results.push(warning);
             }
 
             let expected_content = state
@@ -975,9 +977,7 @@ impl EditFileHandler {
                     );
                     all_results.push(format!(
                         "Error preparing edits for {}: {}\n\nRecovery: {}",
-                        batch.display_path,
-                        error_message,
-                        recovery,
+                        batch.display_path, error_message, recovery,
                     ));
                     total_failed += batch.edits.len();
                     continue;
@@ -5301,6 +5301,103 @@ edition = "2021"
         );
     }
 
+    #[tokio::test]
+    async fn test_not_read_warning_is_returned_to_model() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let raw_content = "alpha\nbeta\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(raw_content);
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "files": [{
+                    "path": "test.txt",
+                    "edits": [{
+                        "anchor": format!("{}§alpha", anchors[0]),
+                        "text": "updated"
+                    }]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result
+                .as_str()
+                .unwrap()
+                .contains("not read this session; anchors or assumptions may be stale")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_broad_edit_does_not_dump_full_updated_file() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let raw_content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &raw_content).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(&raw_content);
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("wide-edit"));
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "wide-edit".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let edits = (0..8)
+            .map(|idx| {
+                serde_json::json!({
+                    "anchor": format!("{}§line {}", anchors[idx], idx + 1),
+                    "text": format!("updated {}", idx + 1)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let result = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "files": [{
+                    "path": "test.txt",
+                    "edits": edits
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        let output = result.as_str().unwrap();
+
+        assert!(!output.contains("full updated file content with anchors"));
+        assert!(output.contains("updated 1"));
+    }
+
     // =====================================================================
     // Model-simulation tests
     //
@@ -5966,8 +6063,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_missing_text_with_string_content_is_rejected_without_mutation() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("keep this\nremove this\nkeep this too\n", "sim-missing-text").await;
+        let (dir, file_path, anchors) = setup_test_file(
+            "keep this\nremove this\nkeep this too\n",
+            "sim-missing-text",
+        )
+        .await;
         let ctx = ctx_for_dir(&dir, "sim-missing-text");
 
         let anchor = format!("{}§remove this", anchors[1]);
@@ -5996,8 +6096,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_string_content_with_text_is_rejected_without_mutation() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("keep this\nreplace this\nkeep this too\n", "sim-string-content").await;
+        let (dir, file_path, anchors) = setup_test_file(
+            "keep this\nreplace this\nkeep this too\n",
+            "sim-string-content",
+        )
+        .await;
         let ctx = ctx_for_dir(&dir, "sim-string-content");
 
         let anchor = format!("{}§replace this", anchors[1]);
@@ -6027,8 +6130,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_non_string_text_is_rejected_without_mutation() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("keep this\nreplace this\nkeep this too\n", "sim-non-string-text").await;
+        let (dir, file_path, anchors) = setup_test_file(
+            "keep this\nreplace this\nkeep this too\n",
+            "sim-non-string-text",
+        )
+        .await;
         let ctx = ctx_for_dir(&dir, "sim-non-string-text");
 
         let anchor = format!("{}§replace this", anchors[1]);
