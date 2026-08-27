@@ -122,6 +122,149 @@ pub enum FileEditorError {
     OverlappingEdits { message: String },
 }
 
+/// Classifies an edit failure so the tool can give the model a deterministic
+/// recovery strategy instead of another generic anchor error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditFailureReason {
+    MissingAnchor,
+    UnknownAnchor,
+    DuplicateContent,
+    WhitespaceMismatch,
+    RangeOverlap,
+    GluedAnchor,
+}
+
+impl EditFailureReason {
+    /// Classify one edit diagnostic emitted by anchor resolution or assembly.
+    ///
+    /// Keep the phrases here synchronized with the diagnostics produced by
+    /// [`EditExecutor`]. Unknown phrases intentionally fall back to
+    /// `UnknownAnchor`; callers handling a joined `AllEditsFailed` diagnostic
+    /// should use [`Self::from_diagnostics`] so mixed failures are preserved.
+    pub(crate) fn from_diagnostic(diagnostic: &str) -> Self {
+        let lower = diagnostic.to_ascii_lowercase();
+        if lower.contains("overlap") {
+            Self::RangeOverlap
+        } else if lower.contains("glued") || lower.contains("word§/hex§ fragments") {
+            Self::GluedAnchor
+        } else if lower.contains("matches ") && lower.contains("identical content") {
+            Self::DuplicateContent
+        } else if lower.contains("only after trimming whitespace") {
+            Self::WhitespaceMismatch
+        } else if lower.contains("missing")
+            || lower.contains("multiple lines")
+            || lower.contains("incorrectly formatted")
+        {
+            Self::MissingAnchor
+        } else {
+            Self::UnknownAnchor
+        }
+    }
+
+    /// Classify every recognizable failure strategy in a possibly joined
+    /// diagnostic, preserving mixed failures from `AllEditsFailed`.
+    pub(crate) fn from_diagnostics(diagnostic: &str) -> Vec<Self> {
+        let lower = diagnostic.to_ascii_lowercase();
+        let mut reasons = Vec::with_capacity(3);
+
+        let mut add = |reason| {
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        };
+
+        if lower.contains("overlap") {
+            add(Self::RangeOverlap);
+        }
+        if lower.contains("glued") || lower.contains("word§/hex§ fragments") {
+            add(Self::GluedAnchor);
+        }
+        if lower.contains("matches ") && lower.contains("identical content") {
+            add(Self::DuplicateContent);
+        }
+        if lower.contains("only after trimming whitespace") {
+            add(Self::WhitespaceMismatch);
+        }
+        if lower.contains("missing")
+            || lower.contains("multiple lines")
+            || lower.contains("incorrectly formatted")
+        {
+            add(Self::MissingAnchor);
+        }
+        if lower.contains("not found in the file")
+            || lower.contains("anchor is stale")
+            || lower.contains("does not match the line")
+        {
+            add(Self::UnknownAnchor);
+        }
+
+        if reasons.is_empty() {
+            reasons.push(Self::from_diagnostic(diagnostic));
+        }
+        reasons
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::MissingAnchor => "missing or malformed anchor",
+            Self::UnknownAnchor => "unknown or stale anchor",
+            Self::DuplicateContent => "duplicate anchor content",
+            Self::WhitespaceMismatch => "whitespace mismatch",
+            Self::RangeOverlap => "overlapping edit ranges",
+            Self::GluedAnchor => "glued anchor fragments",
+        }
+    }
+}
+
+#[cfg(test)]
+mod edit_failure_reason_tests {
+    use super::EditFailureReason;
+
+    #[test]
+    fn classifies_anchor_diagnostics_by_recovery_strategy() {
+        assert_eq!(
+            EditFailureReason::from_diagnostic("anchor is missing"),
+            EditFailureReason::MissingAnchor
+        );
+        assert_eq!(
+            EditFailureReason::from_diagnostic("anchor matches 2 lines with identical content"),
+            EditFailureReason::DuplicateContent
+        );
+        assert_eq!(
+            EditFailureReason::from_diagnostic("matches only after trimming whitespace"),
+            EditFailureReason::WhitespaceMismatch
+        );
+        assert_eq!(
+            EditFailureReason::from_diagnostic("anchor is stale"),
+            EditFailureReason::UnknownAnchor
+        );
+        assert_eq!(
+            EditFailureReason::from_diagnostic("Overlapping edit ranges detected"),
+            EditFailureReason::RangeOverlap
+        );
+        assert_eq!(
+            EditFailureReason::from_diagnostic(
+                "Assembled content has Word§/hex§ fragments at line 4"
+            ),
+            EditFailureReason::GluedAnchor
+        );
+    }
+
+    #[test]
+    fn classifies_mixed_diagnostics_without_dropping_categories() {
+        let reasons = EditFailureReason::from_diagnostics(
+            "anchor matches 2 lines with identical content\n\nanchor matches only after trimming whitespace",
+        );
+        assert_eq!(
+            reasons,
+            vec![
+                EditFailureReason::DuplicateContent,
+                EditFailureReason::WhitespaceMismatch
+            ]
+        );
+    }
+}
+
 impl FileEditorError {
     /// Return an actionable display string with a suggestion for fixing the error.
     #[must_use]

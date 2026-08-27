@@ -241,7 +241,9 @@ fn streaming_model_line(text: String, style_markdown: bool) -> Line<'static> {
     if style_markdown {
         let mut rendered = crate::cli::markdown::render_markdown(None, &text);
         if rendered.len() == 1 {
-            let mut line = rendered.pop().expect("markdown renderer returned empty output");
+            let mut line = rendered
+                .pop()
+                .expect("markdown renderer returned empty output");
             for span in &mut line.spans {
                 if span.style.fg.is_none() {
                     span.style.fg = Some(crate::cli::tui::theme::ACCENT);
@@ -951,7 +953,11 @@ impl AgentLoop {
 
     /// Get the underlying provider as a cloned Arc.
     pub fn get_provider(&self) -> Arc<Providers> {
-        self.config.provider.lock().expect("provider poisoned").clone()
+        self.config
+            .provider
+            .lock()
+            .expect("provider poisoned")
+            .clone()
     }
 
     /// Get the current agent mode.
@@ -1069,7 +1075,9 @@ impl AgentLoop {
                     .loaded_agents_rule_paths
                     .insert(root_rule.to_string_lossy().into_owned());
                 if let Some(canonical_root_rule) = canonical_root_rule {
-                    self.deps.loaded_agents_rule_paths.insert(canonical_root_rule);
+                    self.deps
+                        .loaded_agents_rule_paths
+                        .insert(canonical_root_rule);
                 }
             }
         }
@@ -1089,6 +1097,39 @@ impl AgentLoop {
     /// 6. Append tool results
     /// 7. Repeat until complete, cancelled, or max turns reached
     ///
+    async fn record_task_history(&self, state_manager: &Arc<StateManager>, task_text: &str) {
+        let workspace_root_str = self.resolve_workspace_root().to_str().map(String::from);
+        let state_guard = self.state.lock().await;
+        let history_item = HistoryItem {
+            id: self.config.task_id.clone(),
+            ulid: Some(self.config.task_id.clone()),
+            number: 0,
+            ts: chrono::Utc::now().timestamp_millis(),
+            task: task_text.to_string(),
+            tokens_in: state_guard.cumulative_tokens_in as i32,
+            tokens_out: state_guard.cumulative_tokens_out as i32,
+            cache_writes: Some(state_guard.cumulative_cache_writes as i32),
+            cache_reads: Some(state_guard.cumulative_cache_reads as i32),
+            total_cost: state_guard.cumulative_cost,
+            size: None,
+            shadow_git_config_work_tree: None,
+            cwd_on_task_initialization: workspace_root_str.clone(),
+            conversation_history_deleted_range: state_guard
+                .conversation_history_deleted_range
+                .map(|(start, end)| vec![start as i32, end as i32]),
+            is_favorited: None,
+            workspace_root_path: workspace_root_str,
+            checkpoint_manager_error_message: None,
+            model_id: None,
+        };
+        drop(state_guard);
+
+        state_manager.add_task_to_history(history_item);
+        if let Err(error) = StateManager::persist_async(Arc::clone(state_manager)).await {
+            error!("Failed to persist task history: {}", error);
+        }
+    }
+
     /// Initialize the agent loop with tool handlers.
     #[must_use]
     pub fn with_tools(mut self, registry: Arc<ToolRegistry>) -> Self {
@@ -1280,6 +1321,8 @@ impl AgentLoop {
                     drop(history);
                 }
                 if output.cancel == Some(true) {
+                    self.record_task_history(&state_manager, task_text.as_deref().unwrap_or(""))
+                        .await;
                     // Persist state on hook cancellation
                     if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                         error!("Failed to persist state manager on hook cancel: {}", e);
@@ -1334,6 +1377,8 @@ impl AgentLoop {
             }
 
             if turn_count >= self.config.max_turns {
+                self.record_task_history(&state_manager, task_text.as_deref().unwrap_or(""))
+                    .await;
                 // Persist state on max turns exceeded
                 if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                     error!("Failed to persist state manager on max turns: {}", e);
@@ -1401,6 +1446,8 @@ impl AgentLoop {
                             );
                         }
                     }
+                    self.record_task_history(&state_manager, task_text.as_deref().unwrap_or(""))
+                        .await;
                     return Ok(());
                 }
             }
@@ -1588,46 +1635,9 @@ impl AgentLoop {
                         }
                     }
 
-                    // Record task in history for `sned history` and `--continue` support
-                    let task = task_text.as_deref().unwrap_or("");
-                    let state_guard = self.state.lock().await;
-                    // Use cumulative tokens/cost for the entire session, not just last turn
-                    let tokens_in = state_guard.cumulative_tokens_in as i32;
-                    let tokens_out = state_guard.cumulative_tokens_out as i32;
-                    let cache_writes = Some(state_guard.cumulative_cache_writes as i32);
-                    let cache_reads = Some(state_guard.cumulative_cache_reads as i32);
-                    let cost = state_guard.cumulative_cost;
-                    drop(state_guard);
-
-                    let workspace_root = self.resolve_workspace_root();
-                    let workspace_root_str = workspace_root.to_str().map(String::from);
-                    let history_item = HistoryItem {
-                        id: self.config.task_id.clone(),
-                        ulid: Some(self.config.task_id.clone()),
-                        number: 0,
-                        ts: chrono::Utc::now().timestamp_millis(),
-                        task: task.to_string(),
-                        tokens_in,
-                        tokens_out,
-                        cache_writes,
-                        cache_reads,
-                        total_cost: cost,
-                        size: None,
-                        shadow_git_config_work_tree: None,
-                        cwd_on_task_initialization: workspace_root_str.clone(),
-                        conversation_history_deleted_range: None,
-                        is_favorited: None,
-                        workspace_root_path: workspace_root_str,
-                        checkpoint_manager_error_message: None,
-                        model_id: None,
-                    };
-
-                    state_manager.add_task_to_history(history_item);
-
-                    // Persist state to disk before exiting
-                    if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
-                        error!("Failed to persist state manager: {}", e);
-                    }
+                    // Record task in history for `sned history` and `--continue` support.
+                    self.record_task_history(&state_manager, task_text.as_deref().unwrap_or(""))
+                        .await;
 
                     return Ok(());
                 }
@@ -1655,22 +1665,10 @@ impl AgentLoop {
                         {
                             error!("Failed to save compacted summary on cancel: {}", e);
                         }
-
-                        // Persist deleted range to history item
-                        let state = self.state.lock().await;
-                        if let Some(deleted_range) = state.conversation_history_deleted_range
-                            && let Some(ref state_mgr) = self.state_manager
-                            && let Some(mut history_item) =
-                                state_mgr.find_task_in_history(&self.config.task_id)
-                        {
-                            history_item.conversation_history_deleted_range =
-                                Some(vec![deleted_range.0 as i32, deleted_range.1 as i32]);
-                            state_mgr.add_task_to_history(history_item);
-                            if let Err(e) = state_mgr.persist() {
-                                warn!("Failed to persist task history on cancel: {}", e);
-                            }
-                        }
                     }
+
+                    self.record_task_history(&state_manager, task_text.as_deref().unwrap_or(""))
+                        .await;
 
                     // Persist state manager (global state, task states, secrets)
                     if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
@@ -1697,6 +1695,9 @@ impl AgentLoop {
                             );
                         }
                     }
+
+                    self.record_task_history(&state_manager, task_text.as_deref().unwrap_or(""))
+                        .await;
 
                     // Persist state on error
                     if let Err(e_persist) =
@@ -1739,7 +1740,12 @@ impl AgentLoop {
                 deleted_range,
                 self.config.use_auto_condense,
                 compacted_summary.as_ref(),
-                self.config.provider.lock().expect("provider poisoned").as_ref().name(),
+                self.config
+                    .provider
+                    .lock()
+                    .expect("provider poisoned")
+                    .as_ref()
+                    .name(),
             );
             drop(conversation_guard);
 
@@ -1805,19 +1811,28 @@ impl AgentLoop {
             .cwd
             .clone()
             .map_or_else(|| self.resolve_workspace_root(), std::path::PathBuf::from);
-        let cancellation_flag = self.state.lock().await.is_cancelled_atomic.clone();
-        let tool_context = Arc::new(ToolContext::new(
-            self.state.clone(),
-            self.deps.approval_manager.clone(),
-            workspace_root.clone(),
-            self.anchor_mgr.clone(),
-            self.config.json_output,
-            self.config.task_id.clone(),
-            self.deps.hook_manager.clone(),
-            false, // Initial context: not explicitly approved (approval happens per-tool)
-            self.config.output_writer.clone(),
-        )
-        .with_cancellation_flag(cancellation_flag));
+        let (cancellation_flag, consecutive_failures) = {
+            let state = self.state.lock().await;
+            (
+                state.is_cancelled_atomic.clone(),
+                state.consecutive_mistakes,
+            )
+        };
+        let tool_context = Arc::new(
+            ToolContext::new(
+                self.state.clone(),
+                self.deps.approval_manager.clone(),
+                workspace_root.clone(),
+                self.anchor_mgr.clone(),
+                self.config.json_output,
+                self.config.task_id.clone(),
+                self.deps.hook_manager.clone(),
+                false, // Initial context: not explicitly approved (approval happens per-tool)
+                self.config.output_writer.clone(),
+            )
+            .with_cancellation_flag(cancellation_flag)
+            .with_consecutive_failures(consecutive_failures),
+        );
         let system_prompt = if let Some(prompt) = self.deps.cached_system_prompt.clone() {
             prompt
         } else {
@@ -1886,7 +1901,12 @@ impl AgentLoop {
         // because the compact instruction itself pushes the request over the limit).
         // This is a last-resort fallback after context_manager truncation.
         let validation_result = {
-            let provider = self.config.provider.lock().expect("provider poisoned").clone();
+            let provider = self
+                .config
+                .provider
+                .lock()
+                .expect("provider poisoned")
+                .clone();
             context_window::validate_context_window(&request, provider.as_ref())
         };
         if let Err(msg) = validation_result {
@@ -1906,7 +1926,12 @@ impl AgentLoop {
 
         let state_clone = self.state.clone();
         let history_clone = self.conversation_history.clone();
-        let provider = self.config.provider.lock().expect("provider poisoned").clone();
+        let provider = self
+            .config
+            .provider
+            .lock()
+            .expect("provider poisoned")
+            .clone();
 
         let retry_config = if provider.name() == "gemini" {
             RetryConfig {
@@ -1949,8 +1974,8 @@ impl AgentLoop {
             // consumer processes (e.g. during very long responses).
             let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(10_000);
 
-            let Some(remaining_preoutput_budget) = preoutput_budget
-                .checked_sub(preoutput_retry_started_at.elapsed())
+            let Some(remaining_preoutput_budget) =
+                preoutput_budget.checked_sub(preoutput_retry_started_at.elapsed())
             else {
                 let error = ProviderError::NetworkError(format!(
                     "provider {output_kind} produced no output within {}s",
@@ -2135,8 +2160,8 @@ impl AgentLoop {
                 let next_chunk = if first_chunk_received {
                     rx.recv().await
                 } else {
-                    let Some(remaining) = preoutput_budget
-                        .checked_sub(preoutput_retry_started_at.elapsed())
+                    let Some(remaining) =
+                        preoutput_budget.checked_sub(preoutput_retry_started_at.elapsed())
                     else {
                         preoutput_deadline_exceeded = true;
                         retryable_stream_error_before_output = Some(format!(
@@ -2422,10 +2447,14 @@ impl AgentLoop {
                         }
                         let prev_info = stream_usage.as_ref();
                         let context_window_info = crate::core::context::get_context_window_info(
-                            self.config.provider.lock().expect("provider poisoned").as_ref(),
+                            self.config
+                                .provider
+                                .lock()
+                                .expect("provider poisoned")
+                                .as_ref(),
                         );
                         let context_window = context_window_info.context_window;
-            let guard = self.config.provider.lock().expect("provider lock poisoned");
+                        let guard = self.config.provider.lock().expect("provider lock poisoned");
                         let provider_name = guard.name().to_string();
                         drop(guard);
                         let tokens_in = if usage_chunk.input_tokens > 0 {
@@ -3048,9 +3077,7 @@ impl AgentLoop {
         let checkpoint_required = prepared_tool_calls.iter().any(|prepared| {
             SnedTool::from_name(&prepared.tool_name).is_some_and(Self::tool_may_modify_workspace)
         });
-        if checkpoint_required
-            && let Some(ref mut checkpoint_mgr) = self.deps.checkpoint_manager
-        {
+        if checkpoint_required && let Some(ref mut checkpoint_mgr) = self.deps.checkpoint_manager {
             let checkpoint_cancellation = self.state.lock().await.checkpoint_cancellation.clone();
             let checkpoint_started = std::time::Instant::now();
             tracing::debug!("saving checkpoint before mutating tool batch");
@@ -4184,7 +4211,8 @@ impl AgentLoop {
                 Some(SnedTool::PlanModeRespond)
             )
         });
-        let is_completion = (completion_candidate || (tool_failure_count == 0 && plan_mode_responded))
+        let is_completion = (completion_candidate
+            || (tool_failure_count == 0 && plan_mode_responded))
             && !plan_active
             && !plan_blocks_completion;
 
@@ -4583,7 +4611,11 @@ impl AgentLoop {
                         .and_then(|root| rule_file.path.strip_prefix(root).ok())
                 })
                 .unwrap_or(&rule_file.path);
-            rules.push_str(&format!("\n\n## {}\n\n{}", relative.display(), rule_file.content));
+            rules.push_str(&format!(
+                "\n\n## {}\n\n{}",
+                relative.display(),
+                rule_file.content
+            ));
         }
         self.deps.cached_system_prompt = None;
         tracing::debug!(
@@ -4787,7 +4819,8 @@ impl AgentLoop {
         let execution_result = if !matches!(
             tool_name,
             "edit_file" | "write_to_file" | "replace_symbol" | "rename_symbol"
-        ) && let Some(cancellation_flag) = tool_context.cancellation_flag.clone()
+        ) && let Some(cancellation_flag) =
+            tool_context.cancellation_flag.clone()
         {
             tokio::select! {
                 result = execute_future => result,
@@ -5009,7 +5042,11 @@ impl AgentLoop {
 
             let value = context_window::validate_context_window(
                 request,
-                self.config.provider.lock().expect("provider poisoned").as_ref(),
+                self.config
+                    .provider
+                    .lock()
+                    .expect("provider poisoned")
+                    .as_ref(),
             );
             match value {
                 Ok(()) => break Ok(()),
@@ -5246,11 +5283,13 @@ impl AgentLoop {
                     {
                         let (task_id, file_context_metadata) = {
                             let mut state = self.state.lock().await;
-                            state.file_context_tracker.track_file_context_in_memory_at_path(
-                                path_str,
-                                crate::core::context::trackers::FileRecordSource::FileMentioned,
-                                &canonical,
-                            );
+                            state
+                                .file_context_tracker
+                                .track_file_context_in_memory_at_path(
+                                    path_str,
+                                    crate::core::context::trackers::FileRecordSource::FileMentioned,
+                                    &canonical,
+                                );
                             (
                                 state.file_context_tracker.task_id().map(str::to_owned),
                                 state.file_context_tracker.files_in_context().to_vec(),
@@ -5260,9 +5299,8 @@ impl AgentLoop {
                         if let Some(task_id) = task_id {
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
-                                    let storage = crate::storage::task_storage::TaskStorage::new(
-                                        &task_id,
-                                    )?;
+                                    let storage =
+                                        crate::storage::task_storage::TaskStorage::new(&task_id)?;
                                     storage.save_file_context_metadata(&file_context_metadata)
                                 })
                                 .await;
@@ -6455,7 +6493,10 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let result = agent.execute_turn().await;
 
-        assert!(matches!(result, TurnResult::Continue | TurnResult::Complete));
+        assert!(matches!(
+            result,
+            TurnResult::Continue | TurnResult::Complete
+        ));
         assert!(agent.state.lock().await.last_full_response.is_none());
     }
 
@@ -7436,7 +7477,9 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(!AgentLoop::tool_may_modify_workspace(SnedTool::WebFetch));
         assert!(AgentLoop::tool_may_modify_workspace(SnedTool::WriteToFile));
         assert!(AgentLoop::tool_may_modify_workspace(SnedTool::EditFile));
-        assert!(AgentLoop::tool_may_modify_workspace(SnedTool::ExecuteCommand));
+        assert!(AgentLoop::tool_may_modify_workspace(
+            SnedTool::ExecuteCommand
+        ));
         assert!(AgentLoop::tool_may_modify_workspace(SnedTool::UseSubagents));
     }
 
@@ -9365,9 +9408,9 @@ Irrespective of whether additional information or instructions are given, you ar
 
     #[tokio::test]
     async fn test_reset_cancellation_replaces_checkpoint_token() {
-        let provider = Arc::new(Providers::Mock(
-            crate::providers::mock::MockProvider::new(vec![]),
-        ));
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![],
+        )));
         let agent = AgentLoop::new(test_agent_config(provider, "checkpoint-cancellation"));
         let previous = agent.state.lock().await.checkpoint_cancellation.clone();
 

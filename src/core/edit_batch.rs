@@ -3,11 +3,17 @@
 //! and `dirac/src/core/task/tools/handlers/edit-file/EditFormatter.ts`.
 
 use crate::core::file_editor::{
-    AppliedEdit, ApplyOutcome, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit,
-    UnchangedSite, split_content_lines,
+    AppliedEdit, ApplyOutcome, Edit, EditExecutor, FailedEdit,
+    FileEditorError, ResolvedEdit, UnchangedSite, split_content_lines,
 };
 use crate::core::hash_utils::format_line_with_hash;
+use crate::core::tools::handlers::error_guidance;
 use std::path::Path;
+
+/// Bounds for the optional multi-line fingerprint supplied to `edit_file`.
+/// Fingerprints should identify a focused range, not carry an entire file.
+pub(crate) const MAX_FINGERPRINT_CONTENT_LINES: usize = 4096;
+pub(crate) const MAX_FINGERPRINT_CONTENT_BYTES: usize = 1024 * 1024;
 
 fn syntax_language_for_path(path: &str) -> &str {
     Path::new(path)
@@ -169,12 +175,6 @@ impl BatchProcessor {
         let has_end_anchor = edit.end_anchor.is_some();
         let is_replace = edit_type == "replace" || edit_type.is_empty();
 
-        if edit_type.is_empty() {
-            return Err(FileEditorError::ValidationError(
-                "Each edit must contain 'edit_type'.".to_string(),
-            ));
-        }
-
         if edit.anchor.is_empty() {
             return Err(FileEditorError::ValidationError(
                 "Each edit must contain 'anchor'.".to_string(),
@@ -195,6 +195,25 @@ impl BatchProcessor {
             return Err(FileEditorError::ValidationError(
                 "The 'content' field is only valid for replace edits with an 'end_anchor' (multi-line fingerprint shape). Remove 'content', or add 'end_anchor' to make it a multi-line replace.".to_string(),
             ));
+        }
+
+        if let Some(content) = edit.content.as_ref() {
+            if content.len() > MAX_FINGERPRINT_CONTENT_LINES {
+                return Err(FileEditorError::ValidationError(format!(
+                    "The 'content' fingerprint is limited to {MAX_FINGERPRINT_CONTENT_LINES} lines; use a narrower anchor range or write_to_file for a broad rewrite."
+                )));
+            }
+            let content_bytes = content
+                .iter()
+                .map(String::len)
+                .try_fold(0usize, usize::checked_add)
+                .unwrap_or(usize::MAX);
+            if content_bytes > MAX_FINGERPRINT_CONTENT_BYTES {
+                return Err(FileEditorError::ValidationError(format!(
+                    "The 'content' fingerprint is limited to {} bytes; use a narrower anchor range or write_to_file for a broad rewrite.",
+                    MAX_FINGERPRINT_CONTENT_BYTES
+                )));
+            }
         }
 
         if edit.text.is_empty() && edit_type == "replace" {
@@ -228,8 +247,7 @@ impl BatchProcessor {
             let failure_messages: Vec<String> = failed_edits
                 .iter()
                 .map(|f| {
-                    self.executor
-                        .format_failure_message(&f.edit, Some(&f.error))
+                    self.executor.format_failure_message(&f.edit, Some(&f.error))
                 })
                 .collect();
             return Err(FileEditorError::AllEditsFailed {
@@ -411,6 +429,27 @@ impl BatchProcessor {
         final_hashes: &[String],
         diagnostics: Option<&DiagnosticsResult>,
     ) -> String {
+        self.format_result_with_failures(
+            display_path,
+            prepared,
+            final_lines,
+            final_hashes,
+            diagnostics,
+            0,
+        )
+    }
+
+    /// Formats the final result with retry-aware recovery guidance.
+    #[must_use]
+    pub fn format_result_with_failures(
+        &self,
+        display_path: &str,
+        prepared: &PreparedEdits,
+        final_lines: &[String],
+        final_hashes: &[String],
+        diagnostics: Option<&DiagnosticsResult>,
+        consecutive_failures: u32,
+    ) -> String {
         let colored = !crate::cli::colors::stdout_colors_disabled();
         let language = syntax_language_for_path(display_path);
         let mut total_added = 0;
@@ -471,10 +510,12 @@ impl BatchProcessor {
 
         // Add failure messages
         for failed in &prepared.failed_edits {
-            results.push(
+            results.push(format!(
+                "{}\nRecovery: {}",
                 self.executor
                     .format_failure_message(&failed.edit, Some(&failed.error)),
-            );
+                error_guidance::edit_failure_for_diagnostic(&failed.error, consecutive_failures)
+            ));
         }
 
         let unchanged_count = prepared
@@ -768,15 +809,15 @@ mod tests {
         };
         assert!(processor.validate_edit(&valid).is_ok());
 
-        // Missing edit_type
-        let invalid = Edit {
+        // Omitted edit_type defaults to replace at the tool boundary.
+        let default_replace = Edit {
             anchor: "Apple§content".to_string(),
             end_anchor: Some("Banana§content".to_string()),
             edit_type: "".to_string(),
             text: "new".to_string(),
             content: None,
         };
-        assert!(processor.validate_edit(&invalid).is_err());
+        assert!(processor.validate_edit(&default_replace).is_ok());
 
         // Missing anchor
         let invalid = Edit {
@@ -826,6 +867,21 @@ mod tests {
             content: Some(vec!["middle".to_string()]),
         };
         assert!(processor.validate_edit(&valid_fingerprint).is_ok());
+
+        let oversized_fingerprint = Edit {
+            anchor: "Apple§content".to_string(),
+            end_anchor: Some("Banana§content".to_string()),
+            edit_type: "replace".to_string(),
+            text: "new".to_string(),
+            content: Some(vec![
+                "middle".to_string();
+                MAX_FINGERPRINT_CONTENT_LINES + 1
+            ]),
+        };
+        let error = processor
+            .validate_edit(&oversized_fingerprint)
+            .expect_err("oversized fingerprints must be rejected");
+        assert!(error.to_string().contains("limited to"));
     }
 
     #[test]

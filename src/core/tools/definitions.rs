@@ -215,7 +215,7 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit one or more existing files by replacing, inserting after, or inserting before specific lines. edit_file does not create files; use write_to_file for a new file. CRITICAL: use current hash-anchored lines from read_file, get_function, or get_file_skeleton. Only exact anchors shown by the tool that read the file are usable. Each file contains an array of edits. EDIT TYPES: 1. replace (default): Replaces an inclusive range of lines from anchor to end_anchor. If end_anchor is omitted, defaults to anchor (single-line replace). 2. insert_after: Inserts the provided text immediately after the line specified by anchor. 3. insert_before: Inserts the provided text immediately before the line specified by anchor.",
+        description: "Edit existing files by replacing, inserting after, or inserting before lines. edit_file does not create files; use write_to_file for new files or broad rewrites. WORKFLOW: call read_file (or get_function/get_file_skeleton), copy exact current anchors, edit, then re-read after a stale or unknown-anchor failure. Bracketed duplicate notes are metadata, not source text. replace (default) covers an inclusive anchor-to-end_anchor range; omit end_anchor for one line. insert_after and insert_before use one anchor. For duplicate lines, use replace with unique boundaries and exact interior content.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
@@ -245,14 +245,19 @@ pub fn edit_file_schema() -> ToolSchema {
                                 },
                                 "end_anchor": {
                                     "type": "string",
-                                    "description": "Anchor for the end of the edit (required for 'replace'). MUST be copied exactly from read_file, get_function, or get_file_skeleton output (format: Word§line content). Example: \"Crawler§void draw_game_over() {\". Must be a single line only, no newline char."
+                                    "description": "Optional for a single-line replace; required for a range or duplicate-line fingerprint. Inclusive range. Copy exactly from a reading tool as one physical Word§line content line."
+                                },
+                                "content": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Optional exact interior lines for a duplicate-line fingerprint. Use only with replace and end_anchor; include every line between them in exact order and whitespace. Limited to 4096 lines and 1 MiB."
                                 },
                                 "text": {
                                     "type": "string",
                                     "description": "The new text content for the edit. Use \\n for new lines."
                                 }
                             },
-                            "required": ["edit_type", "anchor", "text"]
+                            "required": ["anchor", "text"]
                         }
                     }
                 },
@@ -1027,6 +1032,31 @@ mod tests {
 
         let files_param = properties["files"].as_object().unwrap();
         assert_eq!(files_param["type"], "array");
+    }
+
+    #[test]
+    fn edit_file_schema_describes_optional_single_line_and_fingerprint_fields() {
+        let schema = edit_file_schema();
+        let files = schema
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "files")
+            .expect("edit_file should expose files");
+        let edit = files
+            .items
+            .as_ref()
+            .and_then(|items| items.pointer("/properties/edits/items"))
+            .expect("edit_file should expose edit items");
+        let properties = edit["properties"].as_object().expect("edit properties");
+        let required = edit["required"].as_array().expect("required fields");
+
+        assert_eq!(properties["content"]["type"], "array");
+        assert!(properties["end_anchor"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("Optional for a single-line replace")));
+        assert!(!required.iter().any(|field| field == "edit_type"));
+        assert!(required.iter().any(|field| field == "anchor"));
+        assert!(schema.description.contains("call read_file"));
     }
 
     #[test]

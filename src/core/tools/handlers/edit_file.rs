@@ -11,9 +11,12 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::{ApprovalManager, prompt_for_combined_approval};
-use crate::core::edit_batch::{BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits};
+use crate::core::edit_batch::{
+    BatchProcessor, DiagnosticsResult, DiffMode, PreparedEdits, MAX_FINGERPRINT_CONTENT_BYTES,
+    MAX_FINGERPRINT_CONTENT_LINES,
+};
 use crate::core::file_editor::{
-    AnchorStateManager, Edit, FileEditGuard, FileEditorError, FileTextFormat,
+    AnchorStateManager, Edit, EditFailureReason, FileEditGuard, FileEditorError, FileTextFormat,
     normalize_file_content, restore_file_content,
 };
 use crate::core::hash_utils::{ANCHOR_DELIMITER, split_anchor, strip_hashes};
@@ -321,19 +324,60 @@ impl EditFileHandler {
                     .transpose()
                     .map_err(ToolError::InvalidInput)?;
 
+                let text_value = edit_raw.get("text").ok_or_else(|| {
+                    ToolError::InvalidInput(format!(
+                        "Missing 'text' in edit for file '{path}'. 'text' is the replacement text and is required even when intentionally empty; use \"text\": \"\" only to delete the anchored content. The optional 'content' field is an array fingerprint, not replacement text."
+                    ))
+                })?;
+                let text_raw = text_value.as_str().ok_or_else(|| {
+                    ToolError::InvalidInput(format!(
+                        "Invalid 'text' in edit for file '{path}': expected a string containing the replacement text. The optional 'content' field is an array fingerprint, not replacement text."
+                    ))
+                })?;
+
                 // Multi-line fingerprint: lets the model disambiguate
                 // identical-content lines when both anchor and end_anchor resolve.
-                let content = edit_raw
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|v| !v.is_empty());
+                let content = if let Some(content_value) = edit_raw.get("content") {
+                    let arr = content_value.as_array().ok_or_else(|| {
+                        ToolError::InvalidInput(format!(
+                            "Invalid 'content' in edit for file '{path}': expected an array of exact interior fingerprint lines. Put replacement text in the required 'text' string; do not use 'content' as a replacement-text alias."
+                        ))
+                    })?;
+                    if arr.len() > MAX_FINGERPRINT_CONTENT_LINES {
+                        return Err(ToolError::InvalidInput(format!(
+                            "The 'content' fingerprint for '{path}' is limited to {MAX_FINGERPRINT_CONTENT_LINES} lines; use a narrower anchor range or write_to_file for a broad rewrite."
+                        )));
+                    }
 
-                let text_raw = edit_raw.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    let mut content_lines = Vec::with_capacity(arr.len());
+                    let mut content_bytes = 0usize;
+                    for (index, value) in arr.iter().enumerate() {
+                        let line = value.as_str().ok_or_else(|| {
+                            ToolError::InvalidInput(format!(
+                                "Invalid 'content' in edit for file '{path}': fingerprint item {} must be a string containing an exact interior line.",
+                                index + 1
+                            ))
+                        })?;
+                        content_bytes = content_bytes
+                            .checked_add(line.len())
+                            .ok_or_else(|| {
+                                ToolError::InvalidInput(format!(
+                                    "The 'content' fingerprint for '{path}' is too large; use a narrower anchor range or write_to_file for a broad rewrite."
+                                ))
+                            })?;
+                        if content_bytes > MAX_FINGERPRINT_CONTENT_BYTES {
+                            return Err(ToolError::InvalidInput(format!(
+                                "The 'content' fingerprint for '{path}' is limited to {} bytes; use a narrower anchor range or write_to_file for a broad rewrite.",
+                                MAX_FINGERPRINT_CONTENT_BYTES
+                            )));
+                        }
+                        content_lines.push(line.to_string());
+                    }
+                    (!content_lines.is_empty()).then_some(content_lines)
+                } else {
+                    None
+                };
+
                 // Strip leaked anchor prefixes that the model may have
                 // copy-pasted from the diff output (e.g. `QualitySocial§...`
                 // or `deadbeef§...`). Do NOT interpret `\n` as a real
@@ -397,6 +441,7 @@ impl EditFileHandler {
         files: &[serde_json::Value],
         workspace_root: &Path,
         allowed_external_roots: &[std::path::PathBuf],
+        consecutive_failures: u32,
     ) -> Result<(), ToolError> {
         let mut invalid_anchors = Vec::new();
         let mut path_errors = Vec::new();
@@ -529,6 +574,11 @@ impl EditFileHandler {
             message.push_str(&invalid_anchors.join("\n"));
             message.push_str("\n\nExample of CORRECT anchor: \"Crawler§void draw_game_over() {\"");
             message.push_str("\nExample of WRONG anchor: \"void draw_game_over() {\"");
+            message.push_str("\n\nRecovery: ");
+            message.push_str(&error_guidance::edit_failure(
+                EditFailureReason::MissingAnchor,
+                consecutive_failures,
+            ));
             affected_paths.sort();
             affected_paths.dedup();
             return Err(ToolError::InvalidInputWithMetadata(
@@ -607,6 +657,7 @@ impl EditFileHandler {
         explicitly_approved: bool,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
+        consecutive_failures: u32,
     ) -> Result<String, ToolError> {
         let files_value = params.get("files");
         let top_level_path = params.get("path").and_then(|p| p.as_str());
@@ -646,7 +697,12 @@ impl EditFileHandler {
             };
         }
 
-        self.validate_anchors(&files, workspace_root, allowed_external_roots)?;
+        self.validate_anchors(
+            &files,
+            workspace_root,
+            allowed_external_roots,
+            consecutive_failures,
+        )?;
 
         let parsed = self.parse_edits(&files)?;
         let processor = BatchProcessor::new(DiffMode::Full);
@@ -912,9 +968,16 @@ impl EditFileHandler {
                     if matches!(e, FileEditorError::AllEditsFailed { .. }) {
                         Self::mark_must_reread(state, &batch.absolute_path).await;
                     }
+                    let error_message = e.to_string();
+                    let recovery = error_guidance::edit_failure_for_diagnostic(
+                        &error_message,
+                        consecutive_failures,
+                    );
                     all_results.push(format!(
-                        "Error preparing edits for {}: {}",
-                        batch.display_path, e
+                        "Error preparing edits for {}: {}\n\nRecovery: {}",
+                        batch.display_path,
+                        error_message,
+                        recovery,
                     ));
                     total_failed += batch.edits.len();
                     continue;
@@ -1486,12 +1549,13 @@ impl EditFileHandler {
                 None
             };
 
-            let formatted = processor.format_result(
+            let formatted = processor.format_result_with_failures(
                 &file_result.batch_display_path,
                 &file_result.prepared,
                 &file_result.final_lines,
                 &file_result.final_hashes,
                 diagnostics.as_ref(),
+                consecutive_failures,
             );
             all_results.push(formatted);
         }
@@ -1552,11 +1616,19 @@ impl EditFileHandler {
             summary_counts.push(format!(
                 "{total_failed} edit(s) failed (across {total_glued_batches} batch(es) rejected for Word§/hex§ fragments; re-read file with read_file and retry)"
             ));
+            summary_counts.push(error_guidance::edit_failure(
+                EditFailureReason::GluedAnchor,
+                consecutive_failures,
+            ));
         } else {
             summary_counts.push(format!("{total_failed} edit(s) failed"));
         }
         if total_overlap > 0 {
             summary_counts.push(format!("{total_overlap} edit(s) overlapped"));
+            summary_counts.push(error_guidance::edit_failure(
+                EditFailureReason::RangeOverlap,
+                consecutive_failures,
+            ));
         }
         let summary = format!(
             "Edited {unique_file_count} file(s): {}.",
@@ -1609,6 +1681,7 @@ impl ToolHandler for EditFileHandler {
                     ctx.explicitly_approved,
                     ctx.json_output,
                     &ctx.output_writer,
+                    ctx.consecutive_failures,
                 )
                 .await;
 
@@ -4443,6 +4516,44 @@ edition = "2021"
         assert!(updated.contains("/* updated */"));
     }
 
+    /// The handler defaults an omitted edit_type to `replace`, matching the
+    /// schema and BatchProcessor validation contract.
+    #[tokio::test]
+    async fn test_edit_file_omitted_edit_type_defaults_to_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("default-edit-type.txt");
+        let raw_content = "before\nafter\n";
+        std::fs::write(&file_path, raw_content).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(raw_content);
+        let anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &lines,
+            Some("default-edit-type-task"),
+        );
+        let ctx = ctx_for_dir(&dir, "default-edit-type-task");
+        let params = serde_json::json!({
+            "files": [{
+                "path": "default-edit-type.txt",
+                "edits": [{
+                    "anchor": format!("{}§before", anchors[0]),
+                    "text": "changed"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "omitted edit_type should default to replace: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "changed\nafter\n"
+        );
+    }
+
     /// Contract test: the `text` field must be written verbatim to the
     /// file. JSON-level escaping already happened in the JSON parser
     /// (serde decoded `\n` to a real newline). The model sends a
@@ -5132,6 +5243,49 @@ edition = "2021"
         assert_eq!(edit["text"], "\t$(SRC)/vga.c \\\n\t$(SRC)/portstub.c");
     }
 
+    #[tokio::test]
+    async fn test_mixed_edit_failures_preserve_model_visible_recovery_categories() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, _file_path, anchors) =
+            setup_test_file("first\n  spaced\nthird\n", "mixed-failures").await;
+        let ctx = ctx_for_dir(&dir, "mixed-failures");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [
+                    {
+                        "anchor": format!("{}§stale content", anchors[0]),
+                        "text": "replacement"
+                    },
+                    {
+                        "anchor": format!("{}§spaced", anchors[1]),
+                        "text": "replacement"
+                    }
+                ]
+            }]
+        });
+
+        let output = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .expect("edit failures should be returned as model-visible output")
+            .as_str()
+            .expect("edit output should be text")
+            .to_string();
+        assert!(
+            output.contains("Multiple edit failure types were detected"),
+            "mixed diagnostics need composite recovery guidance: {output}"
+        );
+        assert!(
+            output.contains("unknown or stale anchor"),
+            "stale category must be preserved: {output}"
+        );
+        assert!(
+            output.contains("whitespace mismatch"),
+            "whitespace category must be preserved: {output}"
+        );
+    }
+
     #[test]
     fn test_lock_paths_repair_stringified_files_before_extracting_paths() {
         let raw = concat!(
@@ -5807,6 +5961,97 @@ edition = "2021"
             "anchor line should be deleted"
         );
         assert!(content.contains("keep this"), "other lines should remain");
+    }
+
+    #[tokio::test]
+    async fn model_sim_missing_text_with_string_content_is_rejected_without_mutation() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("keep this\nremove this\nkeep this too\n", "sim-missing-text").await;
+        let ctx = ctx_for_dir(&dir, "sim-missing-text");
+
+        let anchor = format!("{}§remove this", anchors[1]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "content": "replacement text"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let error = result.expect_err("missing text must not be interpreted as deletion");
+        let message = error.to_string();
+        assert!(message.contains("Missing 'text'"), "got: {message}");
+        assert!(message.contains("replacement text"), "got: {message}");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "keep this\nremove this\nkeep this too\n",
+            "invalid edit arguments must not mutate the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_sim_string_content_with_text_is_rejected_without_mutation() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("keep this\nreplace this\nkeep this too\n", "sim-string-content").await;
+        let ctx = ctx_for_dir(&dir, "sim-string-content");
+
+        let anchor = format!("{}§replace this", anchors[1]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "text": "replacement",
+                    "content": "not an array"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let error = result.expect_err("string content must not be silently ignored");
+        let message = error.to_string();
+        assert!(message.contains("Invalid 'content'"), "got: {message}");
+        assert!(message.contains("array"), "got: {message}");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "keep this\nreplace this\nkeep this too\n",
+            "invalid content metadata must not mutate the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_sim_non_string_text_is_rejected_without_mutation() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("keep this\nreplace this\nkeep this too\n", "sim-non-string-text").await;
+        let ctx = ctx_for_dir(&dir, "sim-non-string-text");
+
+        let anchor = format!("{}§replace this", anchors[1]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": anchor,
+                    "text": 42
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let error = result.expect_err("non-string text must not be coerced into an edit");
+        let message = error.to_string();
+        assert!(message.contains("Invalid 'text'"), "got: {message}");
+        assert!(message.contains("string"), "got: {message}");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "keep this\nreplace this\nkeep this too\n",
+            "invalid text values must not mutate the file"
+        );
     }
 
     #[tokio::test]

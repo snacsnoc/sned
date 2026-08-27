@@ -190,6 +190,12 @@ pub struct ToolContext {
     pub state: Arc<Mutex<TaskState>>,
     /// Lock-free cancellation flag shared with long-running tool handlers.
     pub cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Number of consecutive tool failures observed before this tool call.
+    ///
+    /// The agent loop owns and updates the counter. Handlers only use this
+    /// snapshot to make recovery guidance more specific without maintaining a
+    /// competing retry counter.
+    pub consecutive_failures: u32,
     /// Per-task path locks prevent reads and writes of the same file from racing.
     file_operation_locks:
         Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -226,6 +232,7 @@ impl ToolContext {
         Self {
             state,
             cancellation_flag: None,
+            consecutive_failures: 0,
             file_operation_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             approval_manager,
             workspace_root,
@@ -247,6 +254,13 @@ impl ToolContext {
         cancellation_flag: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         self.cancellation_flag = Some(cancellation_flag);
+        self
+    }
+
+    /// Attach the agent loop's current consecutive-failure count.
+    #[must_use]
+    pub fn with_consecutive_failures(mut self, consecutive_failures: u32) -> Self {
+        self.consecutive_failures = consecutive_failures;
         self
     }
 
