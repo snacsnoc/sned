@@ -51,7 +51,9 @@ impl AnthropicProvider {
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
-            .pool_max_idle_per_host(10)
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(2)
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self { config, client })
     }

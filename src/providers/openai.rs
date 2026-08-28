@@ -81,9 +81,11 @@ impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(OPENAI_CLIENT_TOTAL_TIMEOUT)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
-            .pool_max_idle_per_host(10)
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(2)
+            .pool_idle_timeout(Duration::from_secs(30))
             .build()?;
         let provider_name = config
             .provider_name
