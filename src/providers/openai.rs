@@ -6,8 +6,8 @@
 use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, MessageRole,
-    ModelInfo, OpenAiCompatibleModelInfo, Provider, ProviderError, ProviderHttpError,
-    ProviderModel, ProviderRequest, ProviderTransport, PreoutputPolicy, apply_qwen_model_profile,
+    ModelInfo, OpenAiCompatibleModelInfo, PreoutputPolicy, Provider, ProviderError,
+    ProviderHttpError, ProviderModel, ProviderRequest, ProviderTransport, apply_qwen_model_profile,
     is_retryable_stream_transport_error, normalize_reasoning_delta,
 };
 use futures::StreamExt;
@@ -423,6 +423,21 @@ fn response_headers_timeout() -> Duration {
         "SNED_RESPONSE_HEADERS_TIMEOUT_SECS",
         OPENAI_RESPONSE_HEADERS_TIMEOUT,
     )
+}
+
+fn buffered_response_headers_timeout() -> Duration {
+    stream_timeout_from_env(
+        "SNED_NON_STREAM_RESPONSE_TIMEOUT_SECS",
+        OPENAI_CLIENT_TOTAL_TIMEOUT,
+    )
+}
+
+fn response_headers_timeout_for_request(stream: bool) -> Duration {
+    if stream {
+        response_headers_timeout()
+    } else {
+        buffered_response_headers_timeout()
+    }
 }
 
 async fn next_stream_item_until_receiver_closed<S>(
@@ -1240,7 +1255,7 @@ impl Provider for OpenAiProvider {
         }
 
         let request_started_at = Instant::now();
-        let headers_timeout = response_headers_timeout();
+        let headers_timeout = response_headers_timeout_for_request(self.config.stream);
         let response = match tokio::time::timeout(
             headers_timeout,
             self.client.post(&url).headers(headers).json(&body).send(),
@@ -1248,9 +1263,15 @@ impl Provider for OpenAiProvider {
         .await
         {
             Ok(response) => response?,
-            Err(_) => {
+            Err(_) if self.config.stream => {
                 return Err(ProviderError::NetworkError(format!(
                     "OpenAI response headers timed out after {}s",
+                    headers_timeout.as_secs()
+                )));
+            }
+            Err(_) => {
+                return Err(ProviderError::NetworkError(format!(
+                    "OpenAI buffered response timed out before headers after {}s. stream:false requests may not receive response headers until generation completes; remove --no-stream or raise SNED_NON_STREAM_RESPONSE_TIMEOUT_SECS for this endpoint.",
                     headers_timeout.as_secs()
                 )));
             }
@@ -1300,8 +1321,8 @@ impl Provider for OpenAiProvider {
         }
 
         let response_headers = response.headers().clone();
-        let is_sse_response = header_value(&response_headers, "content-type")
-            .is_some_and(|content_type| {
+        let is_sse_response =
+            header_value(&response_headers, "content-type").is_some_and(|content_type| {
                 content_type
                     .to_ascii_lowercase()
                     .contains("text/event-stream")
@@ -1732,6 +1753,36 @@ mod tests {
     use crate::providers::{
         FunctionDefinition, MessageRole, SseLineBuffer, StorageMessage, ToolDefinition,
     };
+    use std::sync::{LazyLock, Mutex as StdMutex};
+
+    static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(ref original) = self.original {
+                    std::env::set_var(self.key, original);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_openai_config() {
@@ -1791,6 +1842,22 @@ mod tests {
             OPENAI_CLIENT_TOTAL_TIMEOUT + OPENAI_NON_STREAM_PREOUTPUT_GRACE
         );
         assert_eq!(policy.transport, ProviderTransport::Buffered);
+    }
+
+    #[test]
+    fn test_non_stream_requests_use_buffered_header_timeout() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _stream_guard = EnvVarGuard::set("SNED_RESPONSE_HEADERS_TIMEOUT_SECS", "7");
+        let _buffered_guard = EnvVarGuard::set("SNED_NON_STREAM_RESPONSE_TIMEOUT_SECS", "123");
+
+        assert_eq!(
+            response_headers_timeout_for_request(true),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            response_headers_timeout_for_request(false),
+            Duration::from_secs(123)
+        );
     }
 
     #[test]
@@ -1873,10 +1940,7 @@ mod tests {
             reasoning_effort: None,
             extra_body: Some(serde_json::Map::from_iter([
                 ("stream".to_string(), json!(true)),
-                (
-                    "stream_options".to_string(),
-                    json!({"include_usage": true}),
-                ),
+                ("stream_options".to_string(), json!({"include_usage": true})),
             ])),
             custom_headers: None,
             endpoint_kind: OpenAiEndpointKind::Compatible,
@@ -3160,12 +3224,12 @@ mod tests {
 }
 #[cfg(test)]
 mod debug_test {
-    use futures::StreamExt;
     use crate::providers::openai::{
         OpenAiConfig, OpenAiEndpointKind, OpenAiProvider, OpenAiStreamDeltaState,
         finish_openai_sse_to_chunks, parse_openai_sse_to_chunks,
     };
     use crate::providers::{ApiStreamChunk, Provider, ProviderRequest, SseLineBuffer};
+    use futures::StreamExt;
 
     #[tokio::test]
     async fn debug_openai_text_only_stream() {
