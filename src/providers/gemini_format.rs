@@ -531,6 +531,75 @@ mod tests {
     }
 
     #[test]
+    fn test_hook_context_stays_in_tool_response_turn() {
+        let tool_use = |id: &str| {
+            AssistantContentBlock::ToolUse(ToolUseBlock {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": id}),
+                shared: SharedContentFields {
+                    call_id: None,
+                    signature: None,
+                },
+                reasoning_details: None,
+            })
+        };
+        let tool_result = |id: &str| {
+            UserContentBlock::ToolResult(ToolResultBlock {
+                tool_use_id: id.to_string(),
+                content: ToolResultContent::Text(format!("result-{id}")),
+                shared: SharedContentFields {
+                    call_id: None,
+                    signature: None,
+                },
+            })
+        };
+        let hook_text = |text: &str| {
+            UserContentBlock::Text(crate::providers::TextContentBlock {
+                text: text.to_string(),
+                shared: SharedContentFields {
+                    call_id: None,
+                    signature: None,
+                },
+                reasoning_details: None,
+            })
+        };
+
+        let gemini = convert_to_gemini_contents(&[
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    tool_use("call-1"),
+                    tool_use("call-2"),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![
+                    tool_result("call-1"),
+                    hook_text("hook for call-1"),
+                    tool_result("call-2"),
+                    hook_text("hook for call-2"),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ]);
+
+        assert_eq!(gemini.len(), 2);
+        assert!(gemini[1].parts[0].function_response.is_some());
+        assert_eq!(gemini[1].parts[1].text.as_deref(), Some("hook for call-1"));
+        assert!(gemini[1].parts[2].function_response.is_some());
+        assert_eq!(gemini[1].parts[3].text.as_deref(), Some("hook for call-2"));
+    }
+
+    #[test]
     fn test_convert_thinking_block() {
         let thinking = AssistantContentBlock::Thinking(crate::providers::ThinkingBlock {
             thinking: "Let me think about this...".to_string(),

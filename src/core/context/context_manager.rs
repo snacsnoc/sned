@@ -356,16 +356,18 @@ fn get_and_alter_truncated_messages(
         return messages.to_vec();
     }
 
-    // Fast path: no truncation or summary needed, return clone
-    if deleted_range.is_none() && compacted_summary.is_none() {
-        return messages.to_vec();
+    let needs_context_updates = deleted_range.is_some() || compacted_summary.is_some();
+    let mut updated_messages = if needs_context_updates {
+        let start_from_index = deleted_range.map_or(2, |r| r.1 + 1);
+        apply_context_history_updates(messages, start_from_index, compacted_summary)
+    } else {
+        messages.to_vec()
+    };
+
+    normalize_legacy_hook_messages(&mut updated_messages);
+    if needs_context_updates {
+        ensure_tool_results_follow_tool_use(&mut updated_messages);
     }
-
-    let start_from_index = deleted_range.map_or(2, |r| r.1 + 1);
-    let mut updated_messages =
-        apply_context_history_updates(messages, start_from_index, compacted_summary);
-
-    ensure_tool_results_follow_tool_use(&mut updated_messages);
 
     updated_messages
 }
@@ -456,6 +458,91 @@ fn apply_context_history_updates(
     }
 
     messages_to_update
+}
+
+const LEGACY_HOOK_CONTEXT_PREFIXES: [&str; 2] = [
+    "[Hook context from PreToolUse]: ",
+    "[Hook context from PostToolUse]: ",
+];
+
+fn legacy_hook_context_text(text: &str) -> bool {
+    LEGACY_HOOK_CONTEXT_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
+fn assistant_tool_use_ids(message: &StorageMessage) -> Vec<String> {
+    if let MessageContent::AssistantBlocks(blocks) = &message.content {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContentBlock::ToolUse(tool_use) if !tool_use.id.is_empty() => {
+                    Some(tool_use.id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn user_message_has_tool_result_for(message: &StorageMessage, tool_use_ids: &[String]) -> bool {
+    message.role == MessageRole::User
+        && matches!(&message.content, MessageContent::UserBlocks(blocks)
+        if blocks.iter().any(|block| matches!(
+            block,
+            UserContentBlock::ToolResult(result)
+                if tool_use_ids.iter().any(|id| id == &result.tool_use_id)
+        )))
+}
+
+fn normalize_legacy_hook_messages(messages: &mut Vec<StorageMessage>) {
+    let mut assistant_index = 0;
+    while assistant_index < messages.len() {
+        let tool_use_ids = assistant_tool_use_ids(&messages[assistant_index]);
+        if tool_use_ids.is_empty() {
+            assistant_index += 1;
+            continue;
+        }
+
+        let mut hook_index = assistant_index + 1;
+        let mut hook_blocks = Vec::new();
+        while hook_index < messages.len() {
+            if messages[hook_index].role != MessageRole::User {
+                break;
+            }
+            let text = match &messages[hook_index].content {
+                MessageContent::Text(text) if legacy_hook_context_text(text) => text.clone(),
+                _ => {
+                    break;
+                }
+            };
+
+            hook_blocks.push(UserContentBlock::Text(TextContentBlock {
+                text,
+                shared: crate::providers::SharedContentFields {
+                    call_id: None,
+                    signature: None,
+                },
+                reasoning_details: None,
+            }));
+            hook_index += 1;
+        }
+
+        if hook_blocks.is_empty()
+            || hook_index >= messages.len()
+            || !user_message_has_tool_result_for(&messages[hook_index], &tool_use_ids)
+        {
+            assistant_index += 1;
+            continue;
+        }
+
+        if let MessageContent::UserBlocks(blocks) = &mut messages[hook_index].content {
+            blocks.extend(hook_blocks);
+        }
+        messages.drain(assistant_index + 1..hook_index);
+    }
 }
 
 fn ensure_tool_results_follow_tool_use(messages: &mut [StorageMessage]) {
@@ -721,6 +808,134 @@ mod tests {
 
         let truncated = get_truncated_messages(&messages, Some((2, 5)), None);
         assert_eq!(truncated.len(), 6);
+    }
+
+    #[test]
+    fn test_fast_path_repairs_legacy_hook_messages_between_tool_turns() {
+        let tool_use = |id: &str| {
+            AssistantContentBlock::ToolUse(crate::providers::ToolUseBlock {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": id}),
+                shared: crate::providers::SharedContentFields {
+                    call_id: None,
+                    signature: None,
+                },
+                reasoning_details: None,
+            })
+        };
+        let tool_result = |id: &str| {
+            UserContentBlock::ToolResult(crate::providers::ToolResultBlock {
+                tool_use_id: id.to_string(),
+                content: crate::providers::ToolResultContent::Text(format!("result-{id}")),
+                shared: crate::providers::SharedContentFields {
+                    call_id: None,
+                    signature: None,
+                },
+            })
+        };
+        let messages = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    tool_use("call-1"),
+                    tool_use("call-2"),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(
+                    "[Hook context from PreToolUse]: before tools".to_string(),
+                ),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(
+                    "[Hook context from PostToolUse]: after tools".to_string(),
+                ),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![
+                    tool_result("call-1"),
+                    tool_result("call-2"),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+
+        let normalized = get_truncated_messages(&messages, None, None);
+
+        assert_eq!(normalized.len(), 2);
+        let MessageContent::UserBlocks(blocks) = &normalized[1].content else {
+            panic!("expected the tool result user message");
+        };
+        assert!(matches!(blocks[0], UserContentBlock::ToolResult(_)));
+        assert!(matches!(blocks[1], UserContentBlock::ToolResult(_)));
+        assert!(matches!(
+            &blocks[2],
+            UserContentBlock::Text(text) if text.text.contains("before tools")
+        ));
+        assert!(matches!(
+            &blocks[3],
+            UserContentBlock::Text(text) if text.text.contains("after tools")
+        ));
+    }
+
+    #[test]
+    fn test_fast_path_preserves_unrelated_user_message_between_tool_turns() {
+        let messages = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                    crate::providers::ToolUseBlock {
+                        id: "call-1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({}),
+                        shared: crate::providers::SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("ordinary user message".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+
+        let normalized = get_truncated_messages(&messages, None, None);
+
+        assert_eq!(normalized.len(), messages.len());
+        assert!(matches!(
+            &normalized[1].content,
+            MessageContent::Text(text) if text == "ordinary user message"
+        ));
     }
 
     #[test]

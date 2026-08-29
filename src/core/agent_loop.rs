@@ -102,6 +102,7 @@ struct ToolExecutionOutput {
     text: String,
     metadata: Option<ToolFailureMetadata>,
     is_error: bool,
+    hook_context: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,20 +116,63 @@ fn stream_retry_delay(retry_attempt: usize) -> std::time::Duration {
 }
 
 impl ToolExecutionOutput {
-    fn success(text: String) -> Self {
-        Self {
-            text,
-            metadata: None,
-            is_error: false,
-        }
-    }
-
     fn error(text: String, metadata: Option<ToolFailureMetadata>) -> Self {
         Self {
             text,
             metadata,
             is_error: true,
+            hook_context: Vec::new(),
         }
+    }
+
+    fn success_with_hook_context(text: String, hook_context: Vec<String>) -> Self {
+        Self {
+            text,
+            metadata: None,
+            is_error: false,
+            hook_context,
+        }
+    }
+
+    fn error_with_hook_context(
+        text: String,
+        metadata: Option<ToolFailureMetadata>,
+        hook_context: Vec<String>,
+    ) -> Self {
+        Self {
+            text,
+            metadata,
+            is_error: true,
+            hook_context,
+        }
+    }
+}
+
+fn append_tool_result_blocks(
+    blocks: &mut Vec<UserContentBlock>,
+    tool_id: String,
+    result_output: ToolExecutionOutput,
+) {
+    let truncated_text = truncate_tool_result(&result_output.text);
+    blocks.push(UserContentBlock::ToolResult(
+        crate::providers::ToolResultBlock {
+            tool_use_id: tool_id.clone(),
+            content: ToolResultContent::Text(truncated_text),
+            shared: SharedContentFields {
+                call_id: Some(tool_id),
+                signature: None,
+            },
+        },
+    ));
+    for context in result_output.hook_context {
+        blocks.push(UserContentBlock::Text(TextContentBlock {
+            text: context,
+            shared: SharedContentFields {
+                call_id: None,
+                signature: None,
+            },
+            reasoning_details: None,
+        }));
     }
 }
 
@@ -3564,9 +3608,8 @@ impl AgentLoop {
                                         vec![]
                                     };
 
-                                // Clone conversation history for hook context injection
+                                // Condense reads the current history while the tool runs.
                                 let conversation_history = self.conversation_history.clone();
-                                let message_counter = self.message_counter.clone();
 
                                 let tool_params_for_task = tool_params.clone();
                                 tool_tasks.push((
@@ -3589,7 +3632,6 @@ impl AgentLoop {
                                                 handler,
                                                 task_storage,
                                                 conversation_history,
-                                                message_counter,
                                             )
                                             .await;
                                             tracing::debug!(
@@ -3911,19 +3953,7 @@ impl AgentLoop {
                     completion_result = Some(result_output.text.clone());
                 }
 
-                // Truncate tool result before storing in history to prevent context bloat
-                let truncated_text = truncate_tool_result(&result_output.text);
-
-                tool_result_blocks.push(UserContentBlock::ToolResult(
-                    crate::providers::ToolResultBlock {
-                        tool_use_id: tool_id.clone(),
-                        content: ToolResultContent::Text(truncated_text),
-                        shared: SharedContentFields {
-                            call_id: Some(tool_id),
-                            signature: None,
-                        },
-                    },
-                ));
+                append_tool_result_blocks(&mut tool_result_blocks, tool_id, result_output);
             }
             if !tool_result_blocks.is_empty() {
                 if !self.config.json_output {
@@ -4749,9 +4779,9 @@ impl AgentLoop {
         handler: Arc<dyn crate::core::tools::ToolHandler>,
         task_storage: Option<Arc<crate::storage::task_storage::TaskStorage>>,
         conversation_history: Arc<Mutex<Vec<StorageMessage>>>,
-        message_counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> ToolExecutionOutput {
         let mut params_for_execution = tool_params.clone();
+        let mut hook_context = Vec::new();
         if let Some(ref hook_mgr) = hook_manager {
             let pre_result = hook_mgr.pre_tool_use(&config.task_id, tool_name, tool_params);
             if let Some(error) = pre_result.error.as_deref() {
@@ -4769,19 +4799,7 @@ impl AgentLoop {
                 }
                 if let Some(modification) = output.context_modification {
                     info!("[PreToolUse hook] {}", modification);
-                    // Inject context modification into conversation history
-                    let mut history = conversation_history.lock().await;
-                    history.push(StorageMessage {
-                        id: Some(Self::next_message_id(&message_counter)),
-                        role: MessageRole::User,
-                        content: MessageContent::Text(format!(
-                            "[Hook context from PreToolUse]: {modification}"
-                        )),
-                        model_info: None,
-                        metrics: None,
-                        ts: None,
-                    });
-                    drop(history);
+                    hook_context.push(format!("[Hook context from PreToolUse]: {modification}"));
                 }
             }
         }
@@ -4791,9 +4809,10 @@ impl AgentLoop {
             let history = match serde_json::to_value(&*history) {
                 Ok(history) => history,
                 Err(error) => {
-                    return ToolExecutionOutput::error(
+                    return ToolExecutionOutput::error_with_hook_context(
                         format!("Failed to prepare conversation history for condense: {error}"),
                         None,
+                        hook_context,
                     );
                 }
             };
@@ -4847,24 +4866,17 @@ impl AgentLoop {
                         && let Some(modification) = post_output.context_modification
                     {
                         info!("[PostToolUse hook] {}", modification);
-                        // Inject context modification into conversation history
-                        let mut history = conversation_history.lock().await;
-                        history.push(StorageMessage {
-                            id: Some(Self::next_message_id(&message_counter)),
-                            role: MessageRole::User,
-                            content: MessageContent::Text(format!(
-                                "[Hook context from PostToolUse]: {modification}"
-                            )),
-                            model_info: None,
-                            metrics: None,
-                            ts: None,
-                        });
-                        drop(history);
+                        hook_context
+                            .push(format!("[Hook context from PostToolUse]: {modification}"));
                     }
                 }
-                ToolExecutionOutput::success(res_text)
+                ToolExecutionOutput::success_with_hook_context(res_text, hook_context)
             }
-            Err(e) => ToolExecutionOutput::error(format!("Error: {e}"), e.metadata().cloned()),
+            Err(e) => ToolExecutionOutput::error_with_hook_context(
+                format!("Error: {e}"),
+                e.metadata().cloned(),
+                hook_context,
+            ),
         }
     }
 
@@ -5537,6 +5549,39 @@ mod tests {
         fn description(&self, _params: &serde_json::Value) -> String {
             "static result".to_string()
         }
+    }
+
+    #[test]
+    fn test_parallel_tool_results_keep_hook_context_in_the_tool_turn() {
+        let mut blocks = Vec::new();
+        for (tool_id, context) in [("call_1", "context 1"), ("call_2", "context 2")] {
+            append_tool_result_blocks(
+                &mut blocks,
+                tool_id.to_string(),
+                ToolExecutionOutput::success_with_hook_context(
+                    format!("result for {tool_id}"),
+                    vec![format!("[Hook context from PreToolUse]: {context}")],
+                ),
+            );
+        }
+
+        assert_eq!(blocks.len(), 4);
+        assert!(matches!(
+            &blocks[0],
+            UserContentBlock::ToolResult(result) if result.tool_use_id == "call_1"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            UserContentBlock::Text(text) if text.text.contains("context 1")
+        ));
+        assert!(matches!(
+            &blocks[2],
+            UserContentBlock::ToolResult(result) if result.tool_use_id == "call_2"
+        ));
+        assert!(matches!(
+            &blocks[3],
+            UserContentBlock::Text(text) if text.text.contains("context 2")
+        ));
     }
 
     #[test]
