@@ -257,6 +257,10 @@ export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
 | `SNED_ALLOW_ENV` | Comma-separated env vars to pass through sandbox | none |
 | `SNED_SAFE_COMMANDS` | Comma-separated commands to auto-approve | none |
 | `SNED_STREAM_OUTPUT_LINES` | Live streaming output line limit | `20` |
+| `SNED_RESPONSE_HEADERS_TIMEOUT_SECS` | Streaming response-header timeout | `30` |
+| `SNED_NON_STREAM_RESPONSE_TIMEOUT_SECS` | Buffered response-header timeout | `600` |
+| `SNED_SSE_FIRST_BYTE_TIMEOUT_SECS` | Optional time allowed before the first SSE bytes; unset or `0` disables the guard; invalid values fail the request | disabled |
+| `SNED_SSE_INACTIVITY_TIMEOUT_SECS` | Optional maximum quiet period between SSE reads; unset or `0` disables the guard; invalid values fail the request | disabled |
 | `SNED_MOUSE_SCROLL_LINES` | Lines scrolled per mouse-wheel step | `3` |
 | `SNED_COMMAND_OUTPUT_LIMIT` | Command output truncation limit in bytes | `10240` |
 | `SNED_SEARCH_TIMEOUT_SECS` | File search timeout | `30` |

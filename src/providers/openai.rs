@@ -20,8 +20,6 @@ use std::time::{Duration, Instant};
 const OPENAI_CLIENT_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 const OPENAI_NON_STREAM_PREOUTPUT_GRACE: Duration = Duration::from_secs(5);
 const OPENAI_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
-const OPENAI_SSE_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(90);
-const OPENAI_SSE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiEndpointKind {
@@ -418,6 +416,21 @@ fn stream_timeout_from_env(name: &str, default: Duration) -> Duration {
         .unwrap_or(default)
 }
 
+fn optional_stream_timeout_from_env(name: &str) -> Result<Option<Duration>, String> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{name} must contain UTF-8 seconds (0 disables the guard)"))?;
+    let seconds = value.parse::<u64>().map_err(|_| {
+        format!(
+            "Invalid {name}={value:?}; expected a non-negative integer number of seconds (0 disables the guard)"
+        )
+    })?;
+    Ok((seconds > 0).then_some(Duration::from_secs(seconds)))
+}
+
 fn response_headers_timeout() -> Duration {
     stream_timeout_from_env(
         "SNED_RESPONSE_HEADERS_TIMEOUT_SECS",
@@ -443,14 +456,21 @@ fn response_headers_timeout_for_request(stream: bool) -> Duration {
 async fn next_stream_item_until_receiver_closed<S>(
     stream: &mut S,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
-    timeout: Duration,
-) -> Option<Result<Option<S::Item>, ()>>
+    timeout: Option<Duration>,
+) -> Option<Result<Option<S::Item>, Duration>>
 where
     S: futures::Stream + Unpin,
 {
     tokio::select! {
         _ = tx.closed() => None,
-        item = next_stream_item_with_timeout(stream, timeout) => Some(item),
+        item = async {
+            match timeout {
+                Some(timeout) => next_stream_item_with_timeout(stream, timeout)
+                    .await
+                    .map_err(|_| timeout),
+                None => Ok(stream.next().await),
+            }
+        } => Some(item),
     }
 }
 
@@ -1254,6 +1274,12 @@ impl Provider for OpenAiProvider {
             );
         }
 
+        let configured_sse_timeouts = (
+            optional_stream_timeout_from_env("SNED_SSE_FIRST_BYTE_TIMEOUT_SECS")
+                .map_err(ProviderError::InvalidRequest)?,
+            optional_stream_timeout_from_env("SNED_SSE_INACTIVITY_TIMEOUT_SECS")
+                .map_err(ProviderError::InvalidRequest)?,
+        );
         let request_started_at = Instant::now();
         let headers_timeout = response_headers_timeout_for_request(self.config.stream);
         let response = match tokio::time::timeout(
@@ -1327,6 +1353,11 @@ impl Provider for OpenAiProvider {
                     .to_ascii_lowercase()
                     .contains("text/event-stream")
             });
+        let (first_byte_timeout, inactivity_timeout) = if self.config.stream || is_sse_response {
+            configured_sse_timeouts
+        } else {
+            (None, None)
+        };
         if !self.config.stream && !is_sse_response {
             let response_body = response.bytes().await.map_err(ProviderError::from)?;
             match serde_json::from_slice::<OpenAiCompletionResponse>(&response_body) {
@@ -1359,14 +1390,11 @@ impl Provider for OpenAiProvider {
         }
         let stream_started_at = Instant::now();
         let stream = response.bytes_stream();
-        let first_byte_timeout = stream_timeout_from_env(
-            "SNED_SSE_FIRST_BYTE_TIMEOUT_SECS",
-            OPENAI_SSE_FIRST_BYTE_TIMEOUT,
-        );
-        let inactivity_timeout = stream_timeout_from_env(
-            "SNED_SSE_INACTIVITY_TIMEOUT_SECS",
-            OPENAI_SSE_INACTIVITY_TIMEOUT,
-        );
+        // Do not infer a dead response from a quiet SSE body. Reasoning-capable
+        // endpoints may pause for an arbitrary period while keeping the same
+        // response open. The client total timeout and agent pre-output budget
+        // remain the liveness bounds; these per-read guards are opt-in for
+        // endpoints that require a stricter policy.
         // Use large buffer (10_000) to match agent_loop channel and prevent backpressure deadlocks
         // when the consumer is slow (same pattern as agent_loop.rs:726)
         let (tx, rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(10_000);
@@ -1406,7 +1434,7 @@ impl Provider for OpenAiProvider {
                 let result = match result {
                     Ok(Some(result)) => result,
                     Ok(None) => break,
-                    Err(()) => {
+                    Err(timeout) => {
                         let phase = if first_byte_elapsed.is_some() {
                             "inactivity"
                         } else {
@@ -1426,7 +1454,7 @@ impl Provider for OpenAiProvider {
                         try_send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
-                                "OpenAI SSE {phase} timeout after {}ms; diagnostics: {} (retryable)",
+                                "OpenAI SSE {phase} timeout after {}ms; diagnostics: {} (retryable). Increase or unset the corresponding SNED_SSE_*_TIMEOUT_SECS setting for long reasoning gaps.",
                                 timeout.as_millis(),
                                 diagnostics,
                             )),
@@ -1770,6 +1798,14 @@ mod tests {
             }
             Self { key, original }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, original }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -1858,6 +1894,43 @@ mod tests {
             response_headers_timeout_for_request(false),
             Duration::from_secs(123)
         );
+    }
+
+    #[test]
+    fn test_sse_read_timeouts_are_opt_in() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        {
+            let _first_byte_guard = EnvVarGuard::unset("SNED_SSE_FIRST_BYTE_TIMEOUT_SECS");
+            let _inactivity_guard = EnvVarGuard::unset("SNED_SSE_INACTIVITY_TIMEOUT_SECS");
+
+            assert_eq!(
+                optional_stream_timeout_from_env("SNED_SSE_FIRST_BYTE_TIMEOUT_SECS"),
+                Ok(None)
+            );
+            assert_eq!(
+                optional_stream_timeout_from_env("SNED_SSE_INACTIVITY_TIMEOUT_SECS"),
+                Ok(None)
+            );
+        }
+        {
+            let _first_byte_guard = EnvVarGuard::set("SNED_SSE_FIRST_BYTE_TIMEOUT_SECS", "0");
+            let _inactivity_guard = EnvVarGuard::set("SNED_SSE_INACTIVITY_TIMEOUT_SECS", "17");
+
+            assert_eq!(
+                optional_stream_timeout_from_env("SNED_SSE_FIRST_BYTE_TIMEOUT_SECS"),
+                Ok(None)
+            );
+            assert_eq!(
+                optional_stream_timeout_from_env("SNED_SSE_INACTIVITY_TIMEOUT_SECS"),
+                Ok(Some(Duration::from_secs(17)))
+            );
+        }
+        {
+            let _guard = EnvVarGuard::set("SNED_SSE_INACTIVITY_TIMEOUT_SECS", "sixty");
+            let error = optional_stream_timeout_from_env("SNED_SSE_INACTIVITY_TIMEOUT_SECS")
+                .expect_err("invalid timeout values must be rejected");
+            assert!(error.contains("SNED_SSE_INACTIVITY_TIMEOUT_SECS"));
+        }
     }
 
     #[test]
@@ -2954,13 +3027,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_next_stream_item_until_receiver_closed_returns_timeout_duration() {
+        let mut stream = futures::stream::pending::<usize>();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let timeout = Duration::from_secs(1);
+
+        let result = next_stream_item_until_receiver_closed(&mut stream, &tx, Some(timeout)).await;
+
+        assert_eq!(result, Some(Err(timeout)));
+    }
+
+    #[tokio::test]
     async fn test_next_stream_item_until_receiver_closed_stops_pending_read() {
         let mut stream = futures::stream::pending::<usize>();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
 
         let result =
-            next_stream_item_until_receiver_closed(&mut stream, &tx, Duration::from_secs(1)).await;
+            next_stream_item_until_receiver_closed(&mut stream, &tx, Some(Duration::from_secs(1)))
+                .await;
 
         assert!(result.is_none());
     }
