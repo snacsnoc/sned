@@ -608,8 +608,8 @@ impl Provider for AnthropicProvider {
         }
 
         let stream = response.bytes_stream();
-        // Use large buffer (10_000) to match agent_loop channel and prevent backpressure deadlocks
-        // when the consumer is slow (same pattern as agent_loop.rs:726)
+        // Keep a large burst buffer; send_chunk applies cancellation-aware
+        // backpressure if the consumer still falls behind.
         let (tx, rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(10_000);
 
         tokio::spawn(async move {
@@ -635,7 +635,7 @@ impl Provider for AnthropicProvider {
                         let error_msg = format!("Anthropic SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "Anthropic SSE bytes_stream error");
-                        try_send_chunk(
+                        send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
@@ -643,7 +643,7 @@ impl Provider for AnthropicProvider {
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
                             "error",
-                        );
+                        ).await;
                         break;
                     }
                 }
@@ -684,8 +684,6 @@ pub struct AnthropicToolCallState {
     last_was_text: bool,
 }
 
-/// Send a stream chunk via try_send to avoid blocking on full channel.
-/// Logs a warning if the channel is full and drops the chunk.
 fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
     // Model-specific defaults based on Anthropic's pricing and specs
     if model_id.contains("claude-fable-5") {
@@ -830,12 +828,12 @@ fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
     }
 }
 
-fn try_send_chunk(
+async fn send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
     chunk_type: &str,
 ) -> bool {
-    crate::providers::try_send_chunk(tx, chunk, "Anthropic", chunk_type)
+    crate::providers::send_chunk(tx, chunk, "Anthropic", chunk_type).await
 }
 
 async fn process_anthropic_sse_line(
@@ -870,7 +868,7 @@ pub async fn parse_anthropic_sse_to_chunks(
         process_anthropic_sse_line(&line, tx, last_tool_call).await;
     }
     if let Some(err) = buffer.take_error() {
-        try_send_chunk(tx, ApiStreamChunk::Error(err), "error");
+        send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
     }
 }
 
@@ -892,7 +890,7 @@ async fn process_anthropic_event(
 ) {
     match event {
         AnthropicStreamEvent::MessageStart { message } => {
-            try_send_chunk(
+            send_chunk(
                 tx,
                 ApiStreamChunk::Usage(ApiStreamUsageChunk {
                     input_tokens: message.usage.input_tokens,
@@ -906,13 +904,13 @@ async fn process_anthropic_event(
                     id: None,
                 }),
                 "usage",
-            );
+            ).await;
         }
         AnthropicStreamEvent::MessageDelta { delta, usage } => {
             // Emit final output_tokens from MessageDelta — MessageStart only
             // provides initial counts (often output_tokens=0). Without this,
             // Anthropic token accounting and cost tracking are wrong.
-            try_send_chunk(
+            send_chunk(
                 tx,
                 ApiStreamChunk::Usage(ApiStreamUsageChunk {
                     input_tokens: 0,
@@ -926,20 +924,20 @@ async fn process_anthropic_event(
                     id: None,
                 }),
                 "usage_delta",
-            );
+            ).await;
         }
         AnthropicStreamEvent::MessageStop | AnthropicStreamEvent::Ping => {
             // Both are terminal/keepalive events, no action needed
         }
         AnthropicStreamEvent::Error { error } => {
-            try_send_chunk(
+            send_chunk(
                 tx,
                 ApiStreamChunk::Error(format!(
                     "Anthropic API error ({}): {}",
                     error.error_type, error.message
                 )),
                 "error",
-            );
+            ).await;
         }
         AnthropicStreamEvent::ContentBlockStart { content_block } => match content_block {
             AnthropicContentBlock::Thinking {
@@ -947,7 +945,7 @@ async fn process_anthropic_event(
                 signature,
             } => {
                 last_tool_call.last_was_text = false;
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning: thinking,
@@ -957,11 +955,11 @@ async fn process_anthropic_event(
                         id: None,
                     }),
                     "reasoning",
-                );
+                ).await;
             }
             AnthropicContentBlock::RedactedThinking { data } => {
                 last_tool_call.last_was_text = false;
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning: "[Redacted thinking block]".to_string(),
@@ -971,7 +969,7 @@ async fn process_anthropic_event(
                         id: None,
                     }),
                     "reasoning",
-                );
+                ).await;
             }
             AnthropicContentBlock::ToolUse { id, name } => {
                 last_tool_call.id.clone_from(&id);
@@ -979,7 +977,7 @@ async fn process_anthropic_event(
                 last_tool_call.arguments.clear();
                 last_tool_call.last_was_text = false;
 
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -995,12 +993,12 @@ async fn process_anthropic_event(
                         signature: None,
                     }),
                     "tool_calls",
-                );
+                ).await;
             }
             AnthropicContentBlock::Text { text } => {
                 // Emit newline between consecutive text blocks
                 if last_tool_call.last_was_text {
-                    try_send_chunk(
+                    send_chunk(
                         tx,
                         ApiStreamChunk::Text(ApiStreamTextChunk {
                             text: "\n".to_string(),
@@ -1008,10 +1006,10 @@ async fn process_anthropic_event(
                             signature: None,
                         }),
                         "text_newline",
-                    );
+                    ).await;
                 }
                 last_tool_call.last_was_text = true;
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Text(ApiStreamTextChunk {
                         text,
@@ -1019,12 +1017,12 @@ async fn process_anthropic_event(
                         signature: None,
                     }),
                     "text",
-                );
+                ).await;
             }
         },
         AnthropicStreamEvent::ContentBlockDelta { delta } => match delta {
             AnthropicContentDelta::ThinkingDelta { thinking } => {
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning: thinking,
@@ -1034,10 +1032,10 @@ async fn process_anthropic_event(
                         id: None,
                     }),
                     "reasoning",
-                );
+                ).await;
             }
             AnthropicContentDelta::SignatureDelta { signature } => {
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning: String::new(),
@@ -1047,10 +1045,10 @@ async fn process_anthropic_event(
                         id: None,
                     }),
                     "reasoning",
-                );
+                ).await;
             }
             AnthropicContentDelta::TextDelta { text } => {
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Text(ApiStreamTextChunk {
                         text,
@@ -1058,7 +1056,7 @@ async fn process_anthropic_event(
                         signature: None,
                     }),
                     "text",
-                );
+                ).await;
             }
             AnthropicContentDelta::InputJsonDelta { partial_json } => {
                 if !last_tool_call.id.is_empty() && !last_tool_call.name.is_empty() {
@@ -1091,7 +1089,7 @@ async fn process_anthropic_event(
                     "Anthropic",
                     "at content_block_stop",
                 );
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -1107,7 +1105,7 @@ async fn process_anthropic_event(
                         signature: None,
                     }),
                     "tool_calls",
-                );
+                ).await;
             }
             last_tool_call.id.clear();
             last_tool_call.name.clear();
@@ -1421,10 +1419,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_send_prevents_deadlock_with_slow_consumer() {
+    async fn test_send_chunk_waits_for_slow_consumer() {
         use crate::providers::ApiStreamChunk;
         use tokio::sync::mpsc;
-        use tokio::time::{Duration, timeout};
 
         let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(10);
 
@@ -1438,44 +1435,26 @@ mod tests {
             .unwrap();
         }
 
-        // Verify channel is full
-        assert!(
-            tx.try_send(ApiStreamChunk::Text(ApiStreamTextChunk {
-                text: "test".to_string(),
-                id: None,
-                signature: None,
-            }))
-            .is_err()
-        );
+        let send_task = tokio::spawn(async move {
+            send_chunk(
+                &tx,
+                ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "delivered".to_string(),
+                    id: None,
+                    signature: None,
+                }),
+                "text",
+            )
+            .await
+        });
 
-        // Try to send with try_send_chunk - should not block
-        let send_result = timeout(
-            Duration::from_millis(100),
-            tokio::spawn(async move {
-                try_send_chunk(
-                    &tx,
-                    ApiStreamChunk::Text(ApiStreamTextChunk {
-                        text: "dropped".to_string(),
-                        id: None,
-                        signature: None,
-                    }),
-                    "text",
-                );
-            }),
-        )
-        .await;
-
-        // Should complete immediately (not deadlock)
-        assert!(send_result.is_ok());
-
-        // Consumer should still be able to receive the original messages
         let mut count = 0;
-        while timeout(Duration::from_millis(10), rx.recv()).await.is_ok() {
+        while count < 10 {
+            rx.recv().await.expect("original message should remain");
             count += 1;
-            if count >= 10 {
-                break;
-            }
         }
         assert_eq!(count, 10);
+        assert!(send_task.await.unwrap());
+        assert!(matches!(rx.recv().await, Some(ApiStreamChunk::Text(chunk)) if chunk.text == "delivered"));
     }
 }

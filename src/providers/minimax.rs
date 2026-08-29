@@ -752,12 +752,12 @@ struct OpenAIStreamFunction {
     arguments: Option<String>,
 }
 
-fn try_send_chunk(
+async fn send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
     chunk_type: &str,
 ) -> bool {
-    crate::providers::try_send_chunk(tx, chunk, "MiniMax", chunk_type)
+    crate::providers::send_chunk(tx, chunk, "MiniMax", chunk_type).await
 }
 
 const MAX_XML_TOOL_CALL_BUFFER: usize = 64 * 1024;
@@ -783,7 +783,7 @@ fn minimax_text_buffer_should_flush(buffer: &str) -> bool {
     )
 }
 
-fn flush_minimax_text_buffer(
+async fn flush_minimax_text_buffer(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     pending_text: &mut String,
     pending_text_signature: &mut Option<String>,
@@ -794,7 +794,7 @@ fn flush_minimax_text_buffer(
     }
 
     let text = std::mem::take(pending_text);
-    try_send_chunk(
+    send_chunk(
         tx,
         ApiStreamChunk::Text(ApiStreamTextChunk {
             text,
@@ -802,11 +802,12 @@ fn flush_minimax_text_buffer(
             signature: pending_text_signature.take(),
         }),
         "text",
-    );
+    )
+    .await;
 }
 
 /// Extract and emit all complete XML tool call blocks from the buffer.
-fn extract_and_emit_xml_tool_calls(
+async fn extract_and_emit_xml_tool_calls(
     xml_buffer: &mut String,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     event_id: &str,
@@ -827,7 +828,7 @@ fn extract_and_emit_xml_tool_calls(
                 serde_json::to_value(&block).unwrap_or_default(),
             )
         });
-        try_send_chunk(
+        send_chunk(
             tx,
             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                 tool_call: ApiStreamToolCall {
@@ -845,7 +846,8 @@ fn extract_and_emit_xml_tool_calls(
                 signature: None,
             }),
             "tool_calls",
-        );
+        )
+        .await;
     }
 }
 
@@ -913,7 +915,7 @@ fn partial_marker_suffix_len(text: &str, markers: &[&str]) -> usize {
     0
 }
 
-fn emit_minimax_reasoning(
+async fn emit_minimax_reasoning(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     reasoning_state: &mut MinimaxReasoningState,
     event_id: &str,
@@ -923,7 +925,7 @@ fn emit_minimax_reasoning(
     if let Some(reasoning) =
         normalize_reasoning_delta(&mut reasoning_state.emitted_reasoning, reasoning)
     {
-        try_send_chunk(
+        send_chunk(
             tx,
             ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                 reasoning,
@@ -933,7 +935,8 @@ fn emit_minimax_reasoning(
                 id: Some(event_id.to_string()),
             }),
             chunk_type,
-        );
+        )
+        .await;
     }
 }
 
@@ -971,7 +974,7 @@ fn find_next_think_close(text: &str) -> Option<(usize, usize)> {
     }
 }
 
-fn process_minimax_content_delta(
+async fn process_minimax_content_delta(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     event_id: &str,
     content_ref: &str,
@@ -990,7 +993,7 @@ fn process_minimax_content_delta(
                 let abs_start = pos + tag_start;
                 pending_text.push_str(&content[pos..abs_start]);
                 *pending_text_signature = Some(event_id.to_string());
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id);
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id).await;
                 reasoning_state.in_thinking_tag = true;
                 pos = abs_start + tag_len;
                 continue;
@@ -1012,7 +1015,8 @@ fn process_minimax_content_delta(
                 event_id,
                 content[pos..abs_start].to_string(),
                 "reasoning_from_content",
-            );
+            )
+            .await;
             reasoning_state.in_thinking_tag = false;
             force_flush_visible = true;
             pos = abs_start + tag_len;
@@ -1027,21 +1031,22 @@ fn process_minimax_content_delta(
             event_id,
             content[pos..emit_end].to_string(),
             "reasoning_from_content",
-        );
+        )
+        .await;
         reasoning_state.tag_carry.push_str(&content[emit_end..]);
         break;
     }
 
     if !reasoning_state.in_thinking_tag {
         if force_flush_visible && !pending_text.is_empty() {
-            flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id);
+            flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id).await;
         } else if minimax_text_buffer_should_flush(pending_text) {
-            flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id);
+            flush_minimax_text_buffer(tx, pending_text, pending_text_signature, event_id).await;
         }
     }
 }
 
-fn flush_minimax_tag_carry(
+async fn flush_minimax_tag_carry(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     event_id: &str,
     pending_text: &mut String,
@@ -1059,14 +1064,15 @@ fn flush_minimax_tag_carry(
             event_id,
             carry,
             "reasoning_from_content",
-        );
+        )
+        .await;
     } else {
         pending_text.push_str(&carry);
         *pending_text_signature = Some(event_id.to_string());
     }
 }
 
-fn process_minimax_sse_line(
+async fn process_minimax_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &mut std::collections::HashMap<usize, (String, String, String)>,
@@ -1092,31 +1098,33 @@ fn process_minimax_sse_line(
         if let Some(choice) = event.choices.first() {
             // Handle reasoning_content (MiniMax M2.7+ interleaved thinking)
             if let Some(reasoning) = &choice.delta.reasoning_content {
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
                 emit_minimax_reasoning(
                     tx,
                     reasoning_state,
                     &event.id,
                     reasoning.clone(),
                     "reasoning",
-                );
+                )
+                .await;
             }
             // Handle reasoning_details array (MiniMax with reasoning_split=true)
             for detail in &choice.delta.reasoning_details {
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
                 emit_minimax_reasoning(
                     tx,
                     reasoning_state,
                     &event.id,
                     detail.text.clone(),
                     "reasoning_details",
-                );
+                )
+                .await;
             }
 
             // Handle content: check for MiniMax-M2 XML tool calls
             if let Some(content) = &choice.delta.content {
                 if content.contains("<minimax:tool_call>") {
-                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
+                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
                     // Buffer XML content (bounded to prevent unbounded memory growth)
                     if xml_buffer.len() + content.len() <= MAX_XML_TOOL_CALL_BUFFER {
                         xml_buffer.push_str(content);
@@ -1129,10 +1137,10 @@ fn process_minimax_sse_line(
                     }
 
                     // Extract and emit ALL complete XML tool call blocks
-                    extract_and_emit_xml_tool_calls(xml_buffer, tx, &event.id);
+                    extract_and_emit_xml_tool_calls(xml_buffer, tx, &event.id).await;
                     // Don't emit XML as text
                 } else if !xml_buffer.is_empty() {
-                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
+                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
                     // Continue buffering (bounded)
                     if xml_buffer.len() + content.len() <= MAX_XML_TOOL_CALL_BUFFER {
                         xml_buffer.push_str(content);
@@ -1143,7 +1151,7 @@ fn process_minimax_sse_line(
                         );
                         xml_buffer.clear();
                     }
-                    extract_and_emit_xml_tool_calls(xml_buffer, tx, &event.id);
+                    extract_and_emit_xml_tool_calls(xml_buffer, tx, &event.id).await;
                 } else {
                     process_minimax_content_delta(
                         tx,
@@ -1152,7 +1160,8 @@ fn process_minimax_sse_line(
                         pending_text,
                         pending_text_signature,
                         reasoning_state,
-                    );
+                    )
+                    .await;
                 }
             }
 
@@ -1163,7 +1172,7 @@ fn process_minimax_sse_line(
                     continue;
                 }
 
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
 
                 if let Some(id) = &tool_call.id {
                     let entry = accumulated_tool_calls
@@ -1220,7 +1229,7 @@ fn process_minimax_sse_line(
             if let Some(finish_reason) = &choice.finish_reason
                 && (finish_reason == "tool_calls" || finish_reason == "tool_call")
             {
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id);
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
                 for (idx, (id, name, args)) in accumulated_tool_calls.iter() {
                     if !id.is_empty()
                         && !name.is_empty()
@@ -1232,7 +1241,7 @@ fn process_minimax_sse_line(
                             "on finish_reason:tool_calls",
                         );
                         completed_tool_call_indices.insert(*idx);
-                        try_send_chunk(
+                        send_chunk(
                             tx,
                             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                                 tool_call: ApiStreamToolCall {
@@ -1248,7 +1257,8 @@ fn process_minimax_sse_line(
                                 signature: None,
                             }),
                             "tool_calls",
-                        );
+                        )
+                        .await;
                     }
                 }
             }
@@ -1265,7 +1275,7 @@ fn process_minimax_sse_line(
                 .as_ref()
                 .map_or(0, |d| d.cached_tokens);
             let input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
-            try_send_chunk(
+            send_chunk(
                 tx,
                 ApiStreamChunk::Usage(ApiStreamUsageChunk {
                     input_tokens,
@@ -1279,21 +1289,23 @@ fn process_minimax_sse_line(
                     id: Some(event.id.clone()),
                 }),
                 "usage",
-            );
+            )
+            .await;
         }
     } else {
         tracing::warn!(
             "MiniMax SSE parse failure for line: {}",
             data.unwrap_or("").chars().take(500).collect::<String>()
         );
-        try_send_chunk(
+        send_chunk(
             tx,
             ApiStreamChunk::Error(format!(
                 "MiniMax SSE parse failure: {}",
                 data.unwrap_or("").chars().take(200).collect::<String>()
             )),
             "error",
-        );
+        )
+        .await;
     }
 }
 
@@ -1328,8 +1340,8 @@ impl Provider for MinimaxProvider {
         }
 
         let stream = response.bytes_stream();
-        // Use large buffer (10_000) to match agent_loop channel and prevent backpressure deadlocks
-        // when the consumer is slow (same pattern as agent_loop.rs:726)
+        // Keep a large burst buffer; send_chunk applies cancellation-aware
+        // backpressure if the consumer still falls behind.
         let (tx, rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(10_000);
 
         tokio::spawn(async move {
@@ -1365,17 +1377,18 @@ impl Provider for MinimaxProvider {
                                 &mut pending_text,
                                 &mut pending_text_signature,
                                 &mut reasoning_state,
-                            );
+                            )
+                            .await;
                         }
                         if let Some(err) = sse_buffer.take_error() {
-                            try_send_chunk(&tx, ApiStreamChunk::Error(err), "error");
+                            send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
                         }
                     }
                     Err(e) => {
                         let error_msg = format!("MiniMax SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "MiniMax SSE bytes_stream error");
-                        try_send_chunk(
+                        send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
@@ -1383,7 +1396,8 @@ impl Provider for MinimaxProvider {
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
                             "error",
-                        );
+                        )
+                        .await;
                         stream_errored = true;
                         break;
                     }
@@ -1401,13 +1415,14 @@ impl Provider for MinimaxProvider {
                         &mut pending_text,
                         &mut pending_text_signature,
                         &mut reasoning_state,
-                    );
+                    )
+                    .await;
                 }
 
                 // Flush any remaining XML tool calls from the buffer
                 // Use helper function with "flush" as event ID
                 if !xml_buffer.is_empty() && xml_buffer.contains("<minimax:tool_call>") {
-                    extract_and_emit_xml_tool_calls(&mut xml_buffer, &tx, "flush");
+                    extract_and_emit_xml_tool_calls(&mut xml_buffer, &tx, "flush").await;
                 }
                 flush_minimax_tag_carry(
                     &tx,
@@ -1415,13 +1430,15 @@ impl Provider for MinimaxProvider {
                     &mut pending_text,
                     &mut pending_text_signature,
                     &mut reasoning_state,
-                );
+                )
+                .await;
                 flush_minimax_text_buffer(
                     &tx,
                     &mut pending_text,
                     &mut pending_text_signature,
                     "flush",
-                );
+                )
+                .await;
 
                 // Flush any accumulated native tool calls that were never emitted
                 // (some providers send finish_reason:"stop" instead of "tool_calls")
@@ -1435,7 +1452,7 @@ impl Provider for MinimaxProvider {
                             "MiniMax",
                             "at stream end",
                         );
-                        try_send_chunk(
+                        send_chunk(
                             &tx,
                             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                                 tool_call: ApiStreamToolCall {
@@ -1451,7 +1468,8 @@ impl Provider for MinimaxProvider {
                                 signature: None,
                             }),
                             "tool_calls",
-                        );
+                        )
+                        .await;
                     }
                 }
             }
@@ -2173,7 +2191,8 @@ mod tests {
                 &mut pending_text,
                 &mut pending_text_signature,
                 &mut reasoning_state,
-            );
+            )
+            .await;
         }
 
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -2215,7 +2234,8 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        );
+        )
+        .await;
         assert!(rx.try_recv().is_err(), "partial text should stay buffered");
 
         let second =
@@ -2230,7 +2250,8 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        );
+        )
+        .await;
 
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
@@ -2270,7 +2291,8 @@ mod tests {
                 &mut pending_text,
                 &mut pending_text_signature,
                 &mut reasoning_state,
-            );
+            )
+            .await;
         }
 
         let mut reasoning = String::new();
@@ -2411,7 +2433,7 @@ mod tests {
         );
     }
 
-    fn collect_minimax_content_deltas(chunks: &[String]) -> (String, String) {
+    async fn collect_minimax_content_deltas(chunks: &[String]) -> (String, String) {
         let (tx, mut rx) = mpsc::channel(32);
         let mut pending_text = String::new();
         let mut pending_text_signature = None;
@@ -2425,7 +2447,8 @@ mod tests {
                 &mut pending_text,
                 &mut pending_text_signature,
                 &mut reasoning_state,
-            );
+            )
+            .await;
         }
         flush_minimax_tag_carry(
             &tx,
@@ -2433,8 +2456,10 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        );
-        flush_minimax_text_buffer(&tx, &mut pending_text, &mut pending_text_signature, "flush");
+        )
+        .await;
+        flush_minimax_text_buffer(&tx, &mut pending_text, &mut pending_text_signature, "flush")
+            .await;
 
         let mut visible = String::new();
         let mut reasoning = String::new();
@@ -2450,8 +2475,8 @@ mod tests {
         (visible, reasoning)
     }
 
-    #[test]
-    fn test_minimax_content_think_markers_survive_every_chunk_boundary() {
+    #[tokio::test]
+    async fn test_minimax_content_think_markers_survive_every_chunk_boundary() {
         for (open, close) in [
             ("<think>", "</think>"),
             ("<!-- think -->", "<!-- /think -->"),
@@ -2461,7 +2486,7 @@ mod tests {
                     format!("before {}", &open[..split]),
                     format!("{}hidden{close} after", &open[split..]),
                 ];
-                let (visible, reasoning) = collect_minimax_content_deltas(&chunks);
+                let (visible, reasoning) = collect_minimax_content_deltas(&chunks).await;
                 assert_eq!(visible, "before  after", "open marker split at {split}");
                 assert_eq!(reasoning, "hidden", "open marker split at {split}");
             }
@@ -2471,21 +2496,22 @@ mod tests {
                     format!("before {open}hidden{}", &close[..split]),
                     format!("{} after", &close[split..]),
                 ];
-                let (visible, reasoning) = collect_minimax_content_deltas(&chunks);
+                let (visible, reasoning) = collect_minimax_content_deltas(&chunks).await;
                 assert_eq!(visible, "before  after", "close marker split at {split}");
                 assert_eq!(reasoning, "hidden", "close marker split at {split}");
             }
         }
     }
 
-    #[test]
-    fn test_minimax_incomplete_think_marker_carry_flushes_to_current_stream() {
-        let (visible, reasoning) = collect_minimax_content_deltas(&["visible <thi".to_string()]);
+    #[tokio::test]
+    async fn test_minimax_incomplete_think_marker_carry_flushes_to_current_stream() {
+        let (visible, reasoning) =
+            collect_minimax_content_deltas(&["visible <thi".to_string()]).await;
         assert_eq!(visible, "visible <thi");
         assert!(reasoning.is_empty());
 
         let (visible, reasoning) =
-            collect_minimax_content_deltas(&["<think>hidden</thi".to_string()]);
+            collect_minimax_content_deltas(&["<think>hidden</thi".to_string()]).await;
         assert!(visible.is_empty());
         assert_eq!(reasoning, "hidden</thi");
     }
@@ -2511,8 +2537,10 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        );
-        flush_minimax_text_buffer(&tx, &mut pending_text, &mut pending_text_signature, "flush");
+        )
+        .await;
+        flush_minimax_text_buffer(&tx, &mut pending_text, &mut pending_text_signature, "flush")
+            .await;
 
         let mut visible = String::new();
         let mut reasoning = String::new();
@@ -2551,7 +2579,8 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        );
+        )
+        .await;
 
         let first_chunk = rx
             .try_recv()
@@ -2571,7 +2600,8 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        );
+        )
+        .await;
 
         let mut reasoning = String::new();
         let mut answer = String::new();
@@ -2626,7 +2656,7 @@ mod tests {
         )
         .to_string();
 
-        extract_and_emit_xml_tool_calls(&mut buffer, &tx, "same-event");
+        extract_and_emit_xml_tool_calls(&mut buffer, &tx, "same-event").await;
 
         let first = rx.recv().await.expect("first XML tool call");
         let second = rx.recv().await.expect("second XML tool call");
@@ -2705,7 +2735,8 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        );
+        )
+        .await;
 
         // Chunk 2: remaining args + finish_reason: "tool_call" (singular)
         process_minimax_sse_line(
@@ -2718,7 +2749,8 @@ mod tests {
             &mut pending_text,
             &mut pending_text_signature,
             &mut reasoning_state,
-        );
+        )
+        .await;
 
         drop(tx);
 

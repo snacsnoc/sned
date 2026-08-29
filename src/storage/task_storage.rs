@@ -15,6 +15,13 @@ use crate::storage::disk::GlobalFileNames;
 
 pub const DEFAULT_TRANSCRIPT_CAP: usize = 1_000;
 pub const CURRENT_TRANSCRIPT_FORMAT_VERSION: u32 = 1;
+// Keep the append path cheap. The background writer compacts after this many
+// appended entries, when the file exceeds 1 MiB, and once during startup
+// recovery so retention/corruption repair is not performed for every line.
+const TRANSCRIPT_COMPACTION_APPEND_THRESHOLD: usize = 500;
+const TRANSCRIPT_COMPACTION_MAX_BYTES: u64 = 1_048_576;
+const TRANSCRIPT_WRITER_BATCH_SIZE: usize = 64;
+const TRANSCRIPT_WRITER_BATCH_INTERVAL: Duration = Duration::from_millis(25);
 const ASYNC_LOCK_RETRY_DELAYS_MS: &[u64] = &[100, 200, 400, 800, 1_600, 3_200];
 const TASK_LOCK_FILE: &str = ".lock";
 const API_CONVERSATION_HISTORY_LOCK_FILE: &str = ".api-conversation-history.lock";
@@ -95,18 +102,63 @@ impl TaskTranscriptWriter {
         let handle = std::thread::Builder::new()
             .name("sned-task-transcript-writer".to_string())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
+                if let Err(error) = storage.recover_transcript() {
+                    let _ = error_sender.send(error.to_string());
+                }
+
+                let mut pending = Vec::new();
+                let mut appends_since_compaction = 0usize;
+                loop {
+                    let command = if pending.is_empty() {
+                        match receiver.recv() {
+                            Ok(command) => command,
+                            Err(_) => break,
+                        }
+                    } else {
+                        match receiver.recv_timeout(TRANSCRIPT_WRITER_BATCH_INTERVAL) {
+                            Ok(command) => command,
+                            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                                if let Err(error) = flush_transcript_batch(
+                                    &storage,
+                                    &mut pending,
+                                    &mut appends_since_compaction,
+                                ) {
+                                    let _ = error_sender.send(error.to_string());
+                                }
+                                continue;
+                            }
+                            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    };
+
                     match command {
                         TranscriptWriterCommand::Append(entries) => {
-                            if let Err(error) = storage.write_transcript_entries(&entries) {
+                            pending.extend(entries);
+                            if pending.len() >= TRANSCRIPT_WRITER_BATCH_SIZE
+                                && let Err(error) = flush_transcript_batch(
+                                    &storage,
+                                    &mut pending,
+                                    &mut appends_since_compaction,
+                                )
+                            {
                                 let _ = error_sender.send(error.to_string());
                             }
                         }
                         TranscriptWriterCommand::Flush(response) => {
-                            let _ = response.send(Ok(()));
+                            let result = flush_transcript_batch(
+                                &storage,
+                                &mut pending,
+                                &mut appends_since_compaction,
+                            );
+                            let _ = response.send(result);
                         }
                         TranscriptWriterCommand::Shutdown(response) => {
-                            let _ = response.send(Ok(()));
+                            let result = flush_transcript_batch(
+                                &storage,
+                                &mut pending,
+                                &mut appends_since_compaction,
+                            );
+                            let _ = response.send(result);
                             return;
                         }
                     }
@@ -179,6 +231,27 @@ impl TaskTranscriptWriter {
             }
         }
     }
+}
+
+fn flush_transcript_batch(
+    storage: &TaskStorage,
+    pending: &mut Vec<TranscriptEntry>,
+    appends_since_compaction: &mut usize,
+) -> io::Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let batch = std::mem::take(pending);
+    let file_size = storage.append_transcript_entries(&batch)?;
+    *appends_since_compaction = appends_since_compaction.saturating_add(batch.len());
+    if *appends_since_compaction >= TRANSCRIPT_COMPACTION_APPEND_THRESHOLD
+        || file_size > TRANSCRIPT_COMPACTION_MAX_BYTES
+    {
+        storage.compact_transcript()?;
+        *appends_since_compaction = 0;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -812,8 +885,18 @@ impl TaskStorage {
 
     /// Append visible transcript entries in one locked, durable batch.
     pub fn write_transcript_entries(&self, entries: &[TranscriptEntry]) -> io::Result<()> {
+        let file_size = self.append_transcript_entries(entries)?;
+        if entries.len() >= TRANSCRIPT_COMPACTION_APPEND_THRESHOLD
+            || file_size > TRANSCRIPT_COMPACTION_MAX_BYTES
+        {
+            self.compact_transcript()?;
+        }
+        Ok(())
+    }
+
+    fn append_transcript_entries(&self, entries: &[TranscriptEntry]) -> io::Result<u64> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         if entries
             .iter()
@@ -838,13 +921,30 @@ impl TaskStorage {
                 file.write_all(&line)?;
             }
             file.sync_data()?;
-            self.compact_transcript_unlocked()
+            file.metadata().map(|metadata| metadata.len())
         })
+    }
+
+    fn compact_transcript(&self) -> io::Result<()> {
+        self.with_lock(|| self.compact_transcript_unlocked())
+    }
+
+    fn recover_transcript(&self) -> io::Result<()> {
+        let path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
+        match fs::metadata(path) {
+            Ok(_) => self.compact_transcript(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn compact_transcript_unlocked(&self) -> io::Result<()> {
         let path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
-        let file = fs::File::open(&path)?;
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let mut entries = VecDeque::with_capacity(DEFAULT_TRANSCRIPT_CAP);
         let mut exceeded_capacity = false;
         let mut corrupted_lines = 0usize;
@@ -1760,6 +1860,67 @@ mod tests {
         let retained = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
         assert_eq!(retained.first().unwrap().ts, 5);
         assert_eq!(retained.last().unwrap().ts, 1004);
+    }
+
+    #[test]
+    fn test_background_transcript_writer_batches_and_compacts_after_append_threshold() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-writer-threshold");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        let mut writer = TaskTranscriptWriter::start(storage.clone()).unwrap();
+
+        for index in 0..=DEFAULT_TRANSCRIPT_CAP {
+            writer
+                .append(vec![TranscriptEntry {
+                    kind: BlockKind::Model,
+                    ts: index as u64,
+                    markdown: format!("line {index}"),
+                }])
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let retained = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(retained.len(), DEFAULT_TRANSCRIPT_CAP);
+        assert_eq!(retained.first().unwrap().ts, 1);
+        assert_eq!(retained.last().unwrap().ts, DEFAULT_TRANSCRIPT_CAP as u64);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_background_transcript_writer_recovers_at_startup() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-writer-recovery");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let entries = (0..=DEFAULT_TRANSCRIPT_CAP)
+            .map(|index| TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: index as u64,
+                markdown: format!("line {index}"),
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &path,
+            entries
+                .iter()
+                .map(|entry| serde_json::to_string(entry).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let mut writer = TaskTranscriptWriter::start(storage.clone()).unwrap();
+        writer.flush().unwrap();
+        let recovered = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(recovered.len(), DEFAULT_TRANSCRIPT_CAP);
+        assert_eq!(recovered.first().unwrap().ts, 1);
+        writer.shutdown().unwrap();
     }
 
     #[test]

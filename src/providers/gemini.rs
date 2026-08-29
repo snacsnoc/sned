@@ -415,15 +415,15 @@ fn gemini_candidate_block_error(finish_reason: &str) -> Option<String> {
     })
 }
 
-fn try_send_chunk(
+async fn send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
     chunk_type: &str,
 ) -> bool {
-    crate::providers::try_send_chunk(tx, chunk, "Gemini", chunk_type)
+    crate::providers::send_chunk(tx, chunk, "Gemini", chunk_type).await
 }
 
-fn process_gemini_sse_line(
+async fn process_gemini_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &mut HashMap<String, (String, String, String, Option<String>)>,
@@ -461,13 +461,13 @@ fn process_gemini_sse_line(
     {
         *last_stop_reason = Some(block_reason.clone());
         if !*response_blocked {
-            try_send_chunk(
+            send_chunk(
                 tx,
                 ApiStreamChunk::Error(format!(
                     "Gemini blocked the prompt (reason: {block_reason}). Rephrase the prompt and try again."
                 )),
                 "blocked_prompt",
-            );
+            ).await;
         }
         *response_blocked = true;
     }
@@ -492,7 +492,7 @@ fn process_gemini_sse_line(
                 // Handle thinking content
                 if part.thought == Some(true) {
                     if let Some(text) = &part.text {
-                        try_send_chunk(
+                        send_chunk(
                             tx,
                             ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                                 reasoning: text.clone(),
@@ -502,13 +502,13 @@ fn process_gemini_sse_line(
                                 id: Some(response_id.clone()),
                             }),
                             "reasoning",
-                        );
+                        ).await;
                         emitted_chunk = true;
                     }
                 }
                 // Handle text content
                 else if let Some(text) = &part.text {
-                    try_send_chunk(
+                    send_chunk(
                         tx,
                         ApiStreamChunk::Text(ApiStreamTextChunk {
                             text: text.clone(),
@@ -516,7 +516,7 @@ fn process_gemini_sse_line(
                             signature: signature.clone(),
                         }),
                         "text",
-                    );
+                    ).await;
                     emitted_chunk = true;
                 }
 
@@ -565,7 +565,7 @@ fn process_gemini_sse_line(
 
                 // Emit signature-only chunk if we have a signature but no text/function_call
                 if part_signature.is_some() && !emitted_chunk && part.text.is_none() {
-                    try_send_chunk(
+                    send_chunk(
                         tx,
                         ApiStreamChunk::Text(ApiStreamTextChunk {
                             text: String::new(),
@@ -573,7 +573,7 @@ fn process_gemini_sse_line(
                             signature: part_signature.clone(),
                         }),
                         "signature_only",
-                    );
+                    ).await;
                 }
 
                 // Reset carry-forward after functionCall - parallel FCs should NOT inherit signature
@@ -589,7 +589,7 @@ fn process_gemini_sse_line(
         {
             *last_stop_reason = Some(finish.clone());
             if let Some(error) = gemini_candidate_block_error(&finish) {
-                try_send_chunk(tx, ApiStreamChunk::Error(error), "blocked_response");
+                send_chunk(tx, ApiStreamChunk::Error(error), "blocked_response").await;
                 *response_blocked = true;
             }
         }
@@ -607,7 +607,7 @@ fn process_gemini_sse_line(
                 let validated_args =
                     crate::providers::validate_tool_call_args(args, "Gemini", "on finish");
                 completed_tool_call_ids.insert(call_id.clone());
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -623,7 +623,7 @@ fn process_gemini_sse_line(
                         signature: signature.clone(),
                     }),
                     "tool_calls",
-                );
+                ).await;
             }
         }
     }
@@ -667,7 +667,7 @@ fn process_gemini_sse_line(
             Some(input_cost + output_cost + cache_cost)
         });
 
-        try_send_chunk(
+        send_chunk(
             tx,
             ApiStreamChunk::Usage(ApiStreamUsageChunk {
                 input_tokens: input_tokens.saturating_sub(cache_read_tokens.unwrap_or(0)),
@@ -681,11 +681,11 @@ fn process_gemini_sse_line(
                 id: Some(response_id),
             }),
             "usage",
-        );
+        ).await;
     }
 }
 
-fn finish_gemini_sse_to_chunks(
+async fn finish_gemini_sse_to_chunks(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     accumulated_tool_calls: &HashMap<String, (String, String, String, Option<String>)>,
     completed_tool_call_ids: &mut HashSet<String>,
@@ -699,7 +699,7 @@ fn finish_gemini_sse_to_chunks(
                 let validated_args =
                     crate::providers::validate_tool_call_args(args, "Gemini", "at stream end");
                 completed_tool_call_ids.insert(call_id.clone());
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -715,7 +715,7 @@ fn finish_gemini_sse_to_chunks(
                         signature: signature.clone(),
                     }),
                     "tool_calls",
-                );
+                ).await;
             }
         }
     }
@@ -736,7 +736,7 @@ fn finish_gemini_sse_to_chunks(
             }
         }
         if sources.len() > 17 {
-            try_send_chunk(
+            send_chunk(
                 tx,
                 ApiStreamChunk::Text(ApiStreamTextChunk {
                     text: sources,
@@ -744,7 +744,7 @@ fn finish_gemini_sse_to_chunks(
                     signature: None,
                 }),
                 "grounding_sources",
-            );
+            ).await;
         }
     }
 }
@@ -812,17 +812,17 @@ impl Provider for GeminiProvider {
                                 &mut response_blocked,
                                 &mut last_grounding_metadata,
                                 model_info.as_ref(),
-                            );
+                            ).await;
                         }
                         if let Some(err) = sse_buffer.take_error() {
-                            try_send_chunk(&tx, ApiStreamChunk::Error(err), "error");
+                            send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
                         }
                     }
                     Err(e) => {
                         let error_msg = format!("Gemini SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "Gemini SSE bytes_stream error");
-                        try_send_chunk(
+                        send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
@@ -830,7 +830,7 @@ impl Provider for GeminiProvider {
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
                             "error",
-                        );
+                        ).await;
                         stream_errored = true;
                         break;
                     }
@@ -844,7 +844,7 @@ impl Provider for GeminiProvider {
                     &mut completed_tool_call_ids,
                     response_blocked,
                     &mut last_grounding_metadata,
-                );
+                ).await;
             }
         });
 
@@ -1875,8 +1875,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_candidate_safety_and_recitation_emit_errors_without_tool_calls() {
+    #[tokio::test]
+    async fn test_candidate_safety_and_recitation_emit_errors_without_tool_calls() {
         for finish_reason in ["SAFETY", "RECITATION"] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(8);
             let mut accumulated_tool_calls = HashMap::new();
@@ -1897,7 +1897,8 @@ mod tests {
                 &mut response_blocked,
                 &mut last_grounding_metadata,
                 None,
-            );
+            )
+            .await;
 
             let ApiStreamChunk::Error(error) = rx
                 .try_recv()
@@ -1915,8 +1916,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_prompt_safety_block_emits_error_without_candidates() {
+    #[tokio::test]
+    async fn test_prompt_safety_block_emits_error_without_candidates() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(4);
         let mut accumulated_tool_calls = HashMap::new();
         let mut completed_tool_call_ids = HashSet::new();
@@ -1934,7 +1935,8 @@ mod tests {
             &mut response_blocked,
             &mut last_grounding_metadata,
             None,
-        );
+        )
+        .await;
 
         let ApiStreamChunk::Error(error) =
             rx.try_recv().expect("blocked prompt should emit an error")
@@ -1949,8 +1951,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[test]
-    fn test_later_candidate_does_not_overwrite_blocked_stop_reason() {
+    #[tokio::test]
+    async fn test_later_candidate_does_not_overwrite_blocked_stop_reason() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(4);
         let mut accumulated_tool_calls = HashMap::new();
         let mut completed_tool_call_ids = HashSet::new();
@@ -1968,7 +1970,8 @@ mod tests {
             &mut response_blocked,
             &mut last_grounding_metadata,
             None,
-        );
+        )
+        .await;
 
         assert!(matches!(rx.try_recv(), Ok(ApiStreamChunk::Error(_))));
         let ApiStreamChunk::Usage(usage) = rx
@@ -2005,7 +2008,8 @@ mod tests {
             &mut completed_tool_call_ids,
             true,
             &mut last_grounding_metadata,
-        );
+        )
+        .await;
 
         assert!(
             rx.try_recv().is_err(),

@@ -23,7 +23,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "windows", unix))]
 use std::process::{Command as ProcessCommand, Stdio};
@@ -1168,85 +1168,118 @@ fn handle_copy_command(app: &mut App, copy: impl FnOnce(&str) -> std::io::Result
     }
 }
 
-/// Drain output channels into the app buffer, giving reliable priority
-/// events a chance to bypass a saturated main queue.
+/// Service control lanes before normal output so approvals stay actionable and
+/// critical terminal events cannot be starved by a saturated main queue.
 fn drain_output_queues(
+    approval_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     rx: &mut mpsc::Receiver<OutputEvent>,
     app: &mut App,
     storage: Option<&TaskStorage>,
 ) -> usize {
-    const MAX_OUTPUT_EVENTS_PER_DRAIN: usize = 128;
-    let mut remaining_budget = MAX_OUTPUT_EVENTS_PER_DRAIN;
+    const MAX_MAIN_EVENTS_PER_DRAIN: usize = 128;
+    const MAX_CRITICAL_EVENTS_PER_DRAIN: usize = 512;
+    const MAX_DEFERRED_PRIORITY_EVENTS: usize = 1_024;
+    let mut drained_events = 0usize;
     let mut saw_output = false;
+    let mut saw_turn_end = false;
     let mut pending_model_update = app.take_pending_transcript_model_line();
     let mut pending_reasoning_lines = app.take_pending_transcript_reasoning_lines();
 
     let mut deferred_priority = std::mem::take(&mut app.deferred_priority_events);
-    while remaining_budget > 0 && let Ok(event) = priority_rx.try_recv() {
-        remaining_budget = remaining_budget.saturating_sub(1);
+    // Approvals have no per-frame budget: a prompt must become visible even
+    // when the model output queue is saturated.
+    while let Ok(event) = approval_rx.try_recv() {
+        drained_events = drained_events.saturating_add(1);
+        saw_output = true;
+        apply_output_event(
+            app,
+            event,
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            storage,
+        );
+    }
+
+    // Limit critical work independently so it cannot monopolize a render frame.
+    let mut priority_receive_budget = MAX_CRITICAL_EVENTS_PER_DRAIN;
+    while priority_receive_budget > 0
+        && let Ok(event) = priority_rx.try_recv()
+    {
+        priority_receive_budget = priority_receive_budget.saturating_sub(1);
+        drained_events = drained_events.saturating_add(1);
+        if deferred_priority.len() < MAX_DEFERRED_PRIORITY_EVENTS {
+            deferred_priority.push_back(event);
+        } else {
+            tracing::warn!(
+                limit = MAX_DEFERRED_PRIORITY_EVENTS,
+                "critical output backlog exceeded deferred priority limit"
+            );
+            saw_output = true;
+            saw_turn_end |= matches!(&event, OutputEvent::TurnEnd { .. });
+            apply_output_event(
+                app,
+                event,
+                &mut pending_model_update,
+                &mut pending_reasoning_lines,
+                storage,
+            );
+        }
+    }
+
+    let mut pre_main_priority = VecDeque::new();
+    let mut post_main_priority = VecDeque::new();
+    for event in deferred_priority {
         if matches!(
             &event,
-            OutputEvent::ApprovalRequested(_) | OutputEvent::ApprovalFinished { .. }
+            OutputEvent::ReasoningChunk(_)
+                | OutputEvent::Completion(_)
+                | OutputEvent::TurnEnd { .. }
+                | OutputEvent::ErrorBox(_)
         ) {
-            saw_output = true;
-            apply_output_event(
-                app,
-                event,
-                &mut pending_model_update,
-                &mut pending_reasoning_lines,
-                storage,
-            );
+            post_main_priority.push_back(event);
         } else {
-            deferred_priority.push_back(event);
+            pre_main_priority.push_back(event);
         }
     }
 
-    // A queued turn begins with a prompt. If either half of that boundary
-    // bypassed a full main channel, apply the deferred priority events first
-    // so an older response cannot appear before the prompt that follows it.
-    let queued_prompt_boundary = deferred_priority.iter().any(|event| {
-        matches!(
+    let mut critical_budget = MAX_CRITICAL_EVENTS_PER_DRAIN;
+    while critical_budget > 0 {
+        let Some(event) = pre_main_priority.pop_front() else {
+            break;
+        };
+        critical_budget = critical_budget.saturating_sub(1);
+        saw_output = true;
+        saw_turn_end |= matches!(&event, OutputEvent::TurnEnd { .. });
+        apply_output_event(
+            app,
             event,
-            OutputEvent::QueuedMessageStarted { .. } | OutputEvent::UserPromptLine(_)
-        )
-    });
-    if queued_prompt_boundary {
-        while remaining_budget > 0 {
-            let Some(event) = deferred_priority.pop_front() else {
-                break;
-            };
-            remaining_budget = remaining_budget.saturating_sub(1);
-            saw_output = true;
-            apply_output_event(
-                app,
-                event,
-                &mut pending_model_update,
-                &mut pending_reasoning_lines,
-                storage,
-            );
-        }
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            storage,
+        );
     }
 
-    while remaining_budget > 0 && let Ok(event) = rx.try_recv() {
-        remaining_budget = remaining_budget.saturating_sub(1);
+    let mut main_budget = MAX_MAIN_EVENTS_PER_DRAIN;
+    while main_budget > 0 && let Ok(event) = rx.try_recv() {
+        main_budget = main_budget.saturating_sub(1);
+        drained_events = drained_events.saturating_add(1);
         if matches!(
             &event,
             OutputEvent::TurnEnd { .. } | OutputEvent::UserPromptLine(_)
         ) {
-            // Completion is emitted before its turn-end marker. If completion
-            // spilled into the priority lane, apply it after streamed prose but
-            // before turn finalization clears the stream entries it compares.
-            // A prompt also wins over older terminal panels when the prior
-            // turn has no TurnEnd event (for example, a terminal provider error).
-            while remaining_budget > 0 {
-                let Some(deferred_event) = deferred_priority.pop_front() else {
+            // A completion/error that spilled into the critical lane must be
+            // applied after streamed prose but before turn finalization or a
+            // new prompt clears the previous terminal state.
+            while critical_budget > 0 {
+                let Some(priority_event) = post_main_priority.pop_front() else {
                     break;
                 };
-                remaining_budget = remaining_budget.saturating_sub(1);
+                critical_budget = critical_budget.saturating_sub(1);
+                saw_turn_end |= matches!(&priority_event, OutputEvent::TurnEnd { .. });
                 apply_output_event(
                     app,
-                    deferred_event,
+                    priority_event,
                     &mut pending_model_update,
                     &mut pending_reasoning_lines,
                     storage,
@@ -1254,6 +1287,7 @@ fn drain_output_queues(
             }
         }
         saw_output = true;
+        saw_turn_end |= matches!(&event, OutputEvent::TurnEnd { .. });
         apply_output_event(
             app,
             event,
@@ -1262,12 +1296,13 @@ fn drain_output_queues(
             storage,
         );
     }
-    while remaining_budget > 0 {
-        let Some(event) = deferred_priority.pop_front() else {
+    while critical_budget > 0 {
+        let Some(event) = post_main_priority.pop_front() else {
             break;
         };
-        remaining_budget = remaining_budget.saturating_sub(1);
+        critical_budget = critical_budget.saturating_sub(1);
         saw_output = true;
+        saw_turn_end |= matches!(&event, OutputEvent::TurnEnd { .. });
         apply_output_event(
             app,
             event,
@@ -1276,7 +1311,8 @@ fn drain_output_queues(
             storage,
         );
     }
-    app.deferred_priority_events = deferred_priority;
+    pre_main_priority.append(&mut post_main_priority);
+    app.deferred_priority_events = pre_main_priority;
     if let Some(line) = pending_model_update.take() {
         app.replace_last_stream_line(line.clone(), crate::cli::tui::StreamKind::Model);
         app.set_pending_transcript_model_line(line);
@@ -1306,17 +1342,19 @@ fn drain_output_queues(
     if let Some(err) = app.take_task_transcript_writer_error() {
         tracing::warn!("Failed to persist task transcript batch: {err}");
     }
-    MAX_OUTPUT_EVENTS_PER_DRAIN.saturating_sub(remaining_budget)
+    if saw_turn_end
+        && let Err(err) = app.flush_task_transcript()
+    {
+        tracing::warn!("Failed to flush completed task transcript: {err}");
+    }
+    drained_events
 }
 
-/// Drain the main output channel into the app buffer.
-///
-/// Tests and non-priority codepaths can use this wrapper; the interactive
-/// loop uses `drain_output_queues` so critical fallback events are preserved.
 #[cfg(test)]
 fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
+    let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut priority_rx, rx, app, None);
+    drain_output_queues(&mut approval_rx, &mut priority_rx, rx, app, None);
 }
 
 fn sync_scroll_viewport(
@@ -1417,13 +1455,20 @@ fn next_draw_retry_delay(current: Duration, maximum: Duration) -> Duration {
 fn drain_and_render_user_submit(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
+    approval_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     output_rx: &mut mpsc::Receiver<OutputEvent>,
     storage: &TaskStorage,
     debug: bool,
     terminal_desynced: &mut bool,
 ) -> anyhow::Result<()> {
-    drain_output_queues(priority_output_rx, output_rx, app, Some(storage));
+    drain_output_queues(
+        approval_output_rx,
+        priority_output_rx,
+        output_rx,
+        app,
+        Some(storage),
+    );
     app.force_bottom();
     sync_scroll_viewport(terminal, app, debug)?;
     let _ = draw_tui_frame(terminal, app, debug, terminal_desynced)?;
@@ -1458,8 +1503,9 @@ fn echo_agent_prompt(app: &mut App, text: &str, output_writer: &OutputWriterArc)
 /// `ChannelOutputWriter` without standing up a full `ratatui::DefaultTerminal`.
 #[cfg(test)]
 pub(crate) fn drain_output_for_test(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
+    let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut priority_rx, rx, app, None);
+    drain_output_queues(&mut approval_rx, &mut priority_rx, rx, app, None);
 }
 
 #[cfg(test)]
@@ -1468,7 +1514,18 @@ pub(crate) fn drain_output_for_test_with_priority(
     rx: &mut mpsc::Receiver<OutputEvent>,
     app: &mut App,
 ) {
-    drain_output_queues(priority_rx, rx, app, None);
+    let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+    drain_output_queues(&mut approval_rx, priority_rx, rx, app, None);
+}
+
+#[cfg(test)]
+pub(crate) fn drain_output_for_test_with_lanes(
+    approval_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    rx: &mut mpsc::Receiver<OutputEvent>,
+    app: &mut App,
+) {
+    drain_output_queues(approval_rx, priority_rx, rx, app, None);
 }
 
 #[cfg(test)]
@@ -1477,8 +1534,9 @@ pub(crate) fn drain_output_for_test_with_storage(
     app: &mut App,
     storage: &TaskStorage,
 ) {
+    let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut priority_rx, rx, app, Some(storage));
+    drain_output_queues(&mut approval_rx, &mut priority_rx, rx, app, Some(storage));
 }
 
 fn approval_result_for_key(app: &App, key: &KeyEvent) -> Option<ApprovalResult> {
@@ -1856,6 +1914,9 @@ async fn cancel_agent(
     }
 
     app.push_plain("Cancelled. Type /retry to resend.");
+    if let Err(error) = app.flush_task_transcript() {
+        tracing::warn!("Failed to flush cancelled task transcript: {error}");
+    }
 
     // Reset unconditionally: covers both abort (epilogue never runs) and
     // natural completion (epilogue may have run before abort, setting the
@@ -3499,6 +3560,7 @@ async fn export_agent_conversation(
 async fn run_main_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
+    approval_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     mention_search_rx: &mut mpsc::UnboundedReceiver<crate::cli::tui::app::MentionSearchUpdate>,
     output_rx: &mut mpsc::Receiver<OutputEvent>,
@@ -3610,8 +3672,13 @@ async fn run_main_loop(
         // 1. Drain channel into app
         {
             let t = std::time::Instant::now();
-            let drained_events =
-                drain_output_queues(priority_output_rx, output_rx, app, Some(&task_storage));
+            let drained_events = drain_output_queues(
+                approval_output_rx,
+                priority_output_rx,
+                output_rx,
+                app,
+                Some(&task_storage),
+            );
             // Lost transcript context remains visible because it may affect
             // whether the user can safely approve a pending operation.
             if output_writer.take_overflow_signal() {
@@ -3770,7 +3837,16 @@ async fn run_main_loop(
 
         // Crossterm wakes immediately for input, so idle sessions can wait longer
         // without adding typing latency while busy streams keep their redraw cadence.
-        let poll_interval = if app.agent_busy {
+        let output_backlogged = !output_rx.is_empty()
+            || !approval_output_rx.is_empty()
+            || !priority_output_rx.is_empty()
+            || !app.deferred_priority_events.is_empty();
+        let poll_interval = if output_backlogged {
+            // Keep draining while a producer is ahead of the renderer. The
+            // drain budgets remain bounded so this increases service
+            // frequency without allowing one frame to monopolize the TUI.
+            Duration::from_millis(1)
+        } else if app.agent_busy {
             busy_redraw_interval
         } else {
             IDLE_POLL_INTERVAL
@@ -3985,6 +4061,7 @@ async fn run_main_loop(
                                 drain_and_render_user_submit(
                                     terminal,
                                     app,
+                                    approval_output_rx,
                                     priority_output_rx,
                                     output_rx,
                                     &task_storage,
@@ -4035,6 +4112,7 @@ async fn run_main_loop(
                                         drain_and_render_user_submit(
                                             terminal,
                                             app,
+                                            approval_output_rx,
                                             priority_output_rx,
                                             output_rx,
                                             &task_storage,
@@ -4159,6 +4237,7 @@ async fn run_main_loop(
                                     drain_and_render_user_submit(
                                         terminal,
                                         app,
+                                        approval_output_rx,
                                         priority_output_rx,
                                         output_rx,
                                         &task_storage,
@@ -4373,6 +4452,9 @@ pub async fn run_interactive_shell_inner(
     // output floods while absorbing larger streaming bursts before overflow).
     let (output_tx, mut output_rx) = mpsc::channel(output_channel_capacity());
     let channel_output_writer = ChannelOutputWriter::new(output_tx);
+    let mut approval_output_rx = channel_output_writer
+        .take_approval_rx()
+        .expect("approval output receiver must be available before sharing writer");
     let mut priority_output_rx = channel_output_writer
         .take_priority_rx()
         .expect("priority output receiver must be available before sharing writer");
@@ -4517,6 +4599,7 @@ pub async fn run_interactive_shell_inner(
     let run_result = run_main_loop(
         &mut terminal,
         &mut app,
+        &mut approval_output_rx,
         &mut priority_output_rx,
         &mut mention_search_rx,
         &mut output_rx,
@@ -5180,6 +5263,9 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
         let mut priority_rx = writer
             .take_priority_rx()
             .expect("priority receiver should be available");
@@ -5194,7 +5280,12 @@ mod tests {
 
         let mut app = App::new();
         app.set_content_width(80);
-        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+        drain_output_for_test_with_lanes(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut rx,
+            &mut app,
+        );
 
         assert!(app.has_pending_approval());
         assert_eq!(writer.dropped_count(), 0);
@@ -5302,6 +5393,9 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(20);
         let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
         let mut priority_rx = writer
             .take_priority_rx()
             .expect("priority receiver should be available");
@@ -5323,7 +5417,12 @@ mod tests {
             app.push_plain(format!("old line {index:02}"));
         }
 
-        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+        drain_output_for_test_with_lanes(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut rx,
+            &mut app,
+        );
         terminal
             .draw(|frame| app.render(frame))
             .expect("render should succeed");

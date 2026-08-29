@@ -282,23 +282,28 @@ pub enum ApiStreamChunk {
     Error(String),
 }
 
-pub(crate) fn try_send_chunk(
+pub(crate) async fn send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
     provider_name: &str,
     chunk_type: &str,
 ) -> bool {
-    match tx.try_send(chunk) {
-        Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!("{provider_name} provider channel full, dropping {chunk_type} chunk");
-            false
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+    tokio::select! {
+        biased;
+        _ = tx.closed() => {
             tracing::debug!(
                 "{provider_name} provider channel closed, cannot send {chunk_type} chunk"
             );
             false
+        }
+        result = tx.send(chunk) => match result {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::debug!(
+                    "{provider_name} provider channel closed, cannot send {chunk_type} chunk"
+                );
+                false
+            }
         }
     }
 }

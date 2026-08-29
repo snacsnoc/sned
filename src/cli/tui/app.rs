@@ -1333,7 +1333,34 @@ impl App {
             StreamKind::ToolOutput => BlockKind::ToolOutput,
         };
         let wrap_width = self.last_wrap_width();
-        if self.cached_wrap_width == Some(wrap_width) {
+        let can_update_layout_incrementally = visual_line_count == 1
+            && self.error_lines.is_empty()
+            && self.visual_layout_index.is_valid_for(wrap_width);
+        if can_update_layout_incrementally {
+            // Avoid rebuilding the full transcript index for this common live
+            // stream update.
+            if self
+                .visual_layout_index
+                .entries
+                .last()
+                .is_some_and(|entry| matches!(entry.source, LayoutSource::Output(_)))
+            {
+                self.visual_layout_index.entries.pop();
+                self.visual_layout_index.offsets.pop();
+                if self
+                    .visual_layout_index
+                    .entries
+                    .last()
+                    .is_some_and(|entry| entry.source == LayoutSource::Separator)
+                {
+                    self.visual_layout_index.entries.pop();
+                    self.visual_layout_index.offsets.pop();
+                }
+                self.cached_visual_rows = self.visual_layout_index.total_rows();
+            } else {
+                self.visual_layout_index.invalidate();
+            }
+        } else if self.cached_wrap_width == Some(wrap_width) {
             let tail_start = self.output_lines.len() - visual_line_count;
             let mut removed_rows: usize = self
                 .output_lines
@@ -1354,8 +1381,10 @@ impl App {
             self.cached_visual_rows = self.cached_visual_rows.saturating_sub(removed_rows);
         }
         self.cached_visible_window = None;
-        self.cached_wrap_width = None;
-        self.visual_layout_index.invalidate();
+        if !can_update_layout_incrementally {
+            self.cached_wrap_width = None;
+            self.visual_layout_index.invalidate();
+        }
 
         for _ in 0..visual_line_count {
             self.output_lines.pop_back();
@@ -6374,10 +6403,34 @@ mod tests {
             before.len() >= 2,
             "expected the two pushed lines to each occupy one logical entry"
         );
+        let wrap_width = app.last_wrap_width();
+        let _ = app.output_visual_rows(wrap_width);
+        assert!(app.visual_layout_index.is_valid_for(wrap_width));
 
         app.replace_last_stream_line(
             Line::from("updated streamed line wraps differently"),
             StreamKind::Model,
+        );
+
+        let mut expected_rows = 0;
+        let mut previous_kind = None;
+        for (line, kind) in app
+            .output_lines
+            .iter()
+            .zip(app.output_line_kinds.iter())
+        {
+            if previous_kind.is_some_and(|previous| App::should_insert_separator(previous, *kind))
+            {
+                expected_rows += 1;
+            }
+            expected_rows += App::output_row_visual_rows(Some(line), *kind, wrap_width);
+            previous_kind = Some(*kind);
+        }
+        assert_eq!(app.output_visual_rows(wrap_width), expected_rows);
+        assert_eq!(app.visual_layout_index.total_rows(), expected_rows);
+        assert!(
+            app.visual_layout_index.is_valid_for(wrap_width),
+            "tail replacement should keep the layout index valid"
         );
 
         assert_eq!(app.turn_stream_entries[0], (0, StreamKind::Model));

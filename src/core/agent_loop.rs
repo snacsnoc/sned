@@ -5798,9 +5798,9 @@ mod tests {
         ));
         let (tx, _rx) = mpsc::channel(32);
         let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
-        let mut priority_rx = writer
-            .take_priority_rx()
-            .expect("priority output receiver should be available");
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval output receiver should be available");
         let mut config = test_agent_config(provider, "test-approval-timeout-batch");
         config.output_writer = writer;
 
@@ -5820,7 +5820,7 @@ mod tests {
         });
 
         let first_request = loop {
-            let event = timeout(Duration::from_secs(2), priority_rx.recv())
+            let event = timeout(Duration::from_secs(2), approval_rx.recv())
                 .await
                 .expect("first approval prompt should arrive")
                 .expect("priority output should stay open");
@@ -5830,7 +5830,7 @@ mod tests {
         };
 
         let second_request = loop {
-            let event = timeout(Duration::from_secs(2), priority_rx.recv())
+            let event = timeout(Duration::from_secs(2), approval_rx.recv())
                 .await
                 .expect("second approval prompt should arrive after timeout")
                 .expect("priority output should stay open");

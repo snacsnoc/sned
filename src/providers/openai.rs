@@ -867,12 +867,12 @@ fn decode_openai_completion(
     chunks
 }
 
-fn try_send_chunk(
+async fn send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
     chunk_type: &str,
 ) -> bool {
-    crate::providers::try_send_chunk(tx, chunk, "OpenAI", chunk_type)
+    crate::providers::send_chunk(tx, chunk, "OpenAI", chunk_type).await
 }
 
 #[derive(Debug, Default)]
@@ -925,7 +925,7 @@ async fn process_openai_sse_line(
             if let Some(content) = delta.content
                 && !content.is_empty()
             {
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Text(ApiStreamTextChunk {
                         text: content,
@@ -933,14 +933,14 @@ async fn process_openai_sse_line(
                         signature: None,
                     }),
                     "text",
-                );
+                ).await;
             }
 
             if let Some(reasoning) = delta.reasoning_content
                 && let Some(reasoning) =
                     normalize_reasoning_delta(&mut delta_state.emitted_reasoning, reasoning)
             {
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning,
@@ -950,18 +950,18 @@ async fn process_openai_sse_line(
                         id: Some(chunk.id.clone()),
                     }),
                     "reasoning",
-                );
+                ).await;
             }
 
             // Handle OpenAI refusal responses (content policy violations)
             if let Some(refusal) = delta.refusal
                 && !refusal.is_empty()
             {
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::Error(format!("OpenAI model refused: {refusal}")),
                     "refusal",
-                );
+                ).await;
             }
 
             // Accumulate tool call deltas by index. Do not send immediately —
@@ -1022,14 +1022,14 @@ async fn process_openai_sse_line(
                         && let Some((id, name, _)) = accumulated_tool_calls.get(&tool_index)
                         && !id.is_empty()
                         && is_safe_tool_name(name)
-                        && try_send_chunk(
+                        && send_chunk(
                             tx,
                             ApiStreamChunk::ToolCallStarted {
                                 call_id: id.clone(),
                                 name: name.clone(),
                             },
                             "tool_call_started",
-                        )
+                        ).await
                     {
                         delta_state.started_tool_call_indices.insert(tool_index);
                     }
@@ -1058,7 +1058,7 @@ async fn process_openai_sse_line(
                                 "on finish_reason:tool_calls",
                             );
                             completed_tool_call_indices.insert(*idx);
-                            try_send_chunk(
+                            send_chunk(
                                 tx,
                                 ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                                     tool_call: ApiStreamToolCall {
@@ -1074,7 +1074,7 @@ async fn process_openai_sse_line(
                                     signature: None,
                                 }),
                                 "tool_calls",
-                            );
+                            ).await;
                         }
                     }
                 }
@@ -1083,7 +1083,7 @@ async fn process_openai_sse_line(
 
         if let Some(usage) = chunk.usage {
             *usage_sent = true;
-            try_send_chunk(
+            send_chunk(
                 tx,
                 ApiStreamChunk::Usage(openai_usage_chunk(
                     &usage,
@@ -1092,7 +1092,7 @@ async fn process_openai_sse_line(
                     model_info,
                 )),
                 "usage",
-            );
+            ).await;
         }
     }
 }
@@ -1173,7 +1173,7 @@ pub async fn parse_openai_sse_to_chunks(
         .await;
     }
     if let Some(err) = buffer.take_error() {
-        try_send_chunk(tx, ApiStreamChunk::Error(err), "error");
+        send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
     }
 }
 
@@ -1213,7 +1213,7 @@ pub async fn finish_openai_sse_to_chunks(
                 let validated_args =
                     crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end");
                 completed_tool_call_indices.insert(*idx);
-                try_send_chunk(
+                send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -1229,14 +1229,14 @@ pub async fn finish_openai_sse_to_chunks(
                         signature: None,
                     }),
                     "tool_calls",
-                );
+                ).await;
             }
         }
     }
 
     // Emit synthetic Usage chunk if no usage chunk was sent
     if !*usage_sent {
-        try_send_chunk(
+        send_chunk(
             tx,
             ApiStreamChunk::Usage(ApiStreamUsageChunk {
                 input_tokens: 0,
@@ -1250,7 +1250,7 @@ pub async fn finish_openai_sse_to_chunks(
                 id: None,
             }),
             "usage",
-        );
+        ).await;
     }
 }
 
@@ -1395,8 +1395,8 @@ impl Provider for OpenAiProvider {
         // response open. The client total timeout and agent pre-output budget
         // remain the liveness bounds; these per-read guards are opt-in for
         // endpoints that require a stricter policy.
-        // Use large buffer (10_000) to match agent_loop channel and prevent backpressure deadlocks
-        // when the consumer is slow (same pattern as agent_loop.rs:726)
+        // Keep a large burst buffer; send_chunk applies cancellation-aware
+        // backpressure if the consumer still falls behind.
         let (tx, rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(10_000);
 
         // Capture model_info for cost calculation in the spawned task
@@ -1451,7 +1451,7 @@ impl Provider for OpenAiProvider {
                             diagnostics = %diagnostics,
                             "OpenAI SSE stream timeout"
                         );
-                        try_send_chunk(
+                        send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "OpenAI SSE {phase} timeout after {}ms; diagnostics: {} (retryable). Increase or unset the corresponding SNED_SSE_*_TIMEOUT_SECS setting for long reasoning gaps.",
@@ -1459,7 +1459,7 @@ impl Provider for OpenAiProvider {
                                 diagnostics,
                             )),
                             "timeout",
-                        );
+                        ).await;
                         stream_errored = true;
                         break;
                     }
@@ -1501,7 +1501,7 @@ impl Provider for OpenAiProvider {
                             diagnostics = %diagnostics,
                             "OpenAI SSE bytes_stream error"
                         );
-                        try_send_chunk(
+                        send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "OpenAI SSE stream error: {}; diagnostics: {}{}",
@@ -1510,7 +1510,7 @@ impl Provider for OpenAiProvider {
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
                             "error",
-                        );
+                        ).await;
                         stream_errored = true;
                         break;
                     }

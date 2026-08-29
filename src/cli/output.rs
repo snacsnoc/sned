@@ -395,15 +395,17 @@ impl DropCounters {
 
 /// Output writer that sends events through an mpsc channel.
 ///
-/// The channel is bounded (default 262144 entries; override with
-/// `SNED_OUTPUT_CHANNEL_CAPACITY` in `run_interactive_shell_inner`). When
-/// the buffer is full, events spill to the priority lane. If the priority
-/// lane is also unreachable (receiver dropped), events are durably dropped
-/// and per-category counters are incremented.
+/// The main channel is bounded (default 262144 entries; override with
+/// `SNED_OUTPUT_CHANNEL_CAPACITY` in `run_interactive_shell_inner`). Approval
+/// requests and critical overflow events use separate control lanes so the
+/// drain loop can service approvals first and bound critical work separately.
 pub struct ChannelOutputWriter {
     tx: mpsc::Sender<OutputEvent>,
+    approval_tx: mpsc::UnboundedSender<OutputEvent>,
+    approval_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
     priority_tx: mpsc::UnboundedSender<OutputEvent>,
     priority_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
+    approval_attached: std::sync::atomic::AtomicBool,
     priority_attached: std::sync::atomic::AtomicBool,
     drop_counters: DropCounters,
     overflow_signaled: std::sync::atomic::AtomicBool,
@@ -413,15 +415,33 @@ impl ChannelOutputWriter {
     /// Create a new ChannelOutputWriter with a bounded channel.
     #[must_use]
     pub fn new(tx: mpsc::Sender<OutputEvent>) -> Self {
+        let (approval_tx, approval_rx) = mpsc::unbounded_channel();
         let (priority_tx, priority_rx) = mpsc::unbounded_channel();
         Self {
             tx,
+            approval_tx,
+            approval_rx: std::sync::Mutex::new(Some(approval_rx)),
             priority_tx,
             priority_rx: std::sync::Mutex::new(Some(priority_rx)),
+            approval_attached: std::sync::atomic::AtomicBool::new(false),
             priority_attached: std::sync::atomic::AtomicBool::new(false),
             drop_counters: DropCounters::default(),
             overflow_signaled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[must_use]
+    pub fn take_approval_rx(&self) -> Option<mpsc::UnboundedReceiver<OutputEvent>> {
+        let receiver = self
+            .approval_rx
+            .lock()
+            .expect("approval rx mutex poisoned")
+            .take();
+        if receiver.is_some() {
+            self.approval_attached
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        receiver
     }
 
     #[must_use]
@@ -497,13 +517,13 @@ impl OutputWriter for ChannelOutputWriter {
             // Approval bypasses transcript backlog so the panel is rendered
             // before the user can accidentally act on an unseen request.
             if !self
-                .priority_attached
+                .approval_attached
                 .load(std::sync::atomic::Ordering::Acquire)
             {
                 self.fail_control_delivery(event, "interactive approval receiver is not attached");
                 return;
             }
-            if let Err(err) = self.priority_tx.send(event) {
+            if let Err(err) = self.approval_tx.send(event) {
                 self.fail_control_delivery(err.0, "interactive approval receiver is closed");
             }
             return;
@@ -531,7 +551,7 @@ impl OutputWriter for ChannelOutputWriter {
 
             if is_critical {
                 // Critical events survive channel saturation: send them
-                // into the unbounded priority lane so the TUI always sees
+                // into the unbounded critical lane so the TUI always sees
                 // them even when the main queue is backed up.
                 if let Err(err) = self.priority_tx.send(dropped) {
                     self.record_dropped_event(&err.0);
@@ -809,16 +829,16 @@ mod tests {
         assert!(!message.contains("Execute this tool?"));
     }
 
-    /// Critical non-lossy events must survive a saturated main output
-    /// queue by spilling into the reliable priority lane instead of
-    /// being dropped.
     #[test]
-    fn test_channel_overflow_preserves_approval_prompt_via_priority_lane() {
+    fn test_channel_overflow_preserves_approval_prompt_via_approval_lane() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
         let writer = ChannelOutputWriter::new(tx);
-        let mut priority_rx = writer
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let _priority_rx = writer
             .take_priority_rx()
             .expect("priority receiver should be available");
 
@@ -830,7 +850,7 @@ mod tests {
         );
         writer.emit(OutputEvent::ApprovalRequested(request));
 
-        let event = priority_rx
+        let event = approval_rx
             .try_recv()
             .expect("approval should bypass the saturated transcript queue");
         let OutputEvent::ApprovalRequested(request) = event else {
@@ -904,10 +924,10 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
         let writer = ChannelOutputWriter::new(tx);
-        let priority_rx = writer
-            .take_priority_rx()
-            .expect("priority receiver should be available");
-        drop(priority_rx);
+        let approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        drop(approval_rx);
         let (request, response_rx) = crate::core::approval::approval_request_for_test(
             52,
             "Approval required · execute_command",
