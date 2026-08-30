@@ -3736,7 +3736,11 @@ async fn run_main_loop(
         priority_queue_peak: usize,
         approval_queue_peak: usize,
         deferred_priority_peak: usize,
-        reasoning_pending_peak: usize,
+        reasoning_pending_bytes_peak: usize,
+        reasoning_chunks_received: u64,
+        layout_rebuild_total_us: u64,
+        layout_rebuild_count: u64,
+        layout_rebuild_peak_us: u64,
     }
 
     impl Drop for TimingSummary {
@@ -3763,12 +3767,22 @@ async fn run_main_loop(
             );
             eprintln!("[timing] output_lines_peak={}", self.output_lines_peak);
             eprintln!(
-                "[timing] queue_peaks: main={} priority={} approval={} deferred_priority={} reasoning_pending={}",
+                "[timing] queue_peaks: main={} priority={} approval={} deferred_priority={}",
                 self.main_queue_peak,
                 self.priority_queue_peak,
                 self.approval_queue_peak,
                 self.deferred_priority_peak,
-                self.reasoning_pending_peak,
+            );
+            eprintln!(
+                "[timing] reasoning: chunks_received={} pending_bytes_peak={}",
+                self.reasoning_chunks_received,
+                self.reasoning_pending_bytes_peak,
+            );
+            eprintln!(
+                "[timing] layout_rebuild: total={}us count={} peak={}us",
+                self.layout_rebuild_total_us,
+                self.layout_rebuild_count,
+                self.layout_rebuild_peak_us,
             );
             eprintln!(
                 "[timing] turn_render: worker_total={}us syntax_highlight={}us apply_total={}us count={} apply_peak={}us",
@@ -3826,7 +3840,11 @@ async fn run_main_loop(
         priority_queue_peak: 0,
         approval_queue_peak: 0,
         deferred_priority_peak: 0,
-        reasoning_pending_peak: 0,
+        reasoning_pending_bytes_peak: 0,
+        reasoning_chunks_received: 0,
+        layout_rebuild_total_us: 0,
+        layout_rebuild_count: 0,
+        layout_rebuild_peak_us: 0,
         turn_render_total_us: 0,
         turn_render_syntax_highlight_us: 0,
         turn_render_apply_total_us: 0,
@@ -3845,6 +3863,10 @@ async fn run_main_loop(
             timing.turn_render_apply_total_us.saturating_add(apply_us);
         timing.turn_render_count = timing.turn_render_count.saturating_add(render_count);
         timing.turn_render_apply_peak_us = timing.turn_render_apply_peak_us.max(apply_peak_us);
+        timing.reasoning_pending_bytes_peak = timing
+            .reasoning_pending_bytes_peak
+            .max(reasoning_mailbox.pending_len());
+        timing.reasoning_chunks_received = reasoning_mailbox.received_chunks();
 
         // 1. Drain channel into app
         {
@@ -3886,9 +3908,10 @@ async fn run_main_loop(
             timing.deferred_priority_peak = timing
                 .deferred_priority_peak
                 .max(app.deferred_priority_events.len());
-            timing.reasoning_pending_peak = timing
-                .reasoning_pending_peak
+            timing.reasoning_pending_bytes_peak = timing
+                .reasoning_pending_bytes_peak
                 .max(reasoning_mailbox.pending_len());
+            timing.reasoning_chunks_received = reasoning_mailbox.received_chunks();
         }
 
         while let Ok(update) = mention_search_rx.try_recv() {
@@ -4022,6 +4045,13 @@ async fn run_main_loop(
                 }
             }
         }
+
+        let (layout_total_us, layout_count, layout_peak_us) = app.take_layout_rebuild_timing();
+        timing.layout_rebuild_total_us = timing
+            .layout_rebuild_total_us
+            .saturating_add(layout_total_us);
+        timing.layout_rebuild_count = timing.layout_rebuild_count.saturating_add(layout_count);
+        timing.layout_rebuild_peak_us = timing.layout_rebuild_peak_us.max(layout_peak_us);
 
         // Crossterm wakes immediately for input, so idle sessions can wait longer
         // without adding typing latency while busy streams keep their redraw cadence.

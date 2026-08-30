@@ -672,6 +672,9 @@ pub struct App {
     /// Fingerprint for the visible window cache (output_len, scroll_y, wrap_width, content_height, cached_visual_rows, scroll_mode).
     pub cached_window_fingerprint: (usize, usize, usize, usize, usize, ScrollMode),
     visual_layout_index: VisualLayoutIndex,
+    layout_rebuild_total_us: u64,
+    layout_rebuild_count: u64,
+    layout_rebuild_peak_us: u64,
     /// Whether the slash command picker is active.
     pub slash_command_active: bool,
     pub slash_command_help_active: bool,
@@ -1115,6 +1118,9 @@ impl App {
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
             visual_layout_index: VisualLayoutIndex::default(),
+            layout_rebuild_total_us: 0,
+            layout_rebuild_count: 0,
+            layout_rebuild_peak_us: 0,
             output_overflow: false,
             output_overflow_count: 0,
             output_overflow_summary: String::new(),
@@ -1622,19 +1628,32 @@ impl App {
         // entirely.  This prevents the visual flash where streamed plain
         // text vanishes for a frame while render_markdown runs, then
         // reappears styled.
-        let mut rendered = rendered_override
-            .take()
-            .unwrap_or_else(|| crate::cli::markdown::render_streamed_markdown(markdown_text, true));
-        let can_skip_reinsert = rendered.len() == model_entry_indices.len()
-            && rendered.iter().zip(model_entry_indices.iter()).all(
-                |(rendered_line, popped_idx)| {
-                    self.output_lines
-                        .get(*popped_idx)
-                        .is_some_and(|popped| rendered_line == popped)
-                },
-            );
+        let estimated_lines = markdown_text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        let mut rendered = rendered_override.take();
+        if rendered.is_none() && estimated_lines == model_entry_indices.len() {
+            rendered = Some(crate::cli::markdown::render_streamed_markdown(
+                markdown_text,
+                true,
+            ));
+        }
+        let can_skip_reinsert = rendered.as_ref().is_some_and(|rendered| {
+            rendered.len() == model_entry_indices.len()
+                && rendered.iter().zip(model_entry_indices.iter()).all(
+                    |(rendered_line, popped_idx)| {
+                        self.output_lines
+                            .get(*popped_idx)
+                            .is_some_and(|popped| rendered_line == popped)
+                    },
+                )
+        });
 
         if can_skip_reinsert {
+            let mut rendered = rendered
+                .take()
+                .expect("no-op finalization must have rendered lines");
             // Prepend the turn indicator to the first rendered line's
             // first span instead of doing a full pop+reinsert.
             let mut prefixed_turn_indicator = false;
@@ -1739,9 +1758,9 @@ impl App {
         // Prepending as a span keeps the indicator on the same line as
         // the start of the response.
         let have_indicator = self.turn_indicator.take().is_some();
-        let mut rendered = rendered_override
-            .take()
-            .unwrap_or_else(|| crate::cli::markdown::render_streamed_markdown(markdown_text, true));
+        let mut rendered = rendered.unwrap_or_else(|| {
+            crate::cli::markdown::render_streamed_markdown(markdown_text, true)
+        });
         if have_indicator && let Some(first) = rendered.first_mut() {
             let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
             new_spans.push(Span::styled(
@@ -3070,6 +3089,7 @@ impl App {
     }
 
     fn rebuild_visual_layout_index(&mut self, wrap_width: usize) {
+        let started = Instant::now();
         let mut entries = Vec::with_capacity(
             self.output_lines
                 .len()
@@ -3132,6 +3152,22 @@ impl App {
         };
         self.cached_visual_rows = total;
         self.cached_wrap_width = Some(wrap_width);
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        self.layout_rebuild_total_us = self.layout_rebuild_total_us.saturating_add(elapsed_us);
+        self.layout_rebuild_count = self.layout_rebuild_count.saturating_add(1);
+        self.layout_rebuild_peak_us = self.layout_rebuild_peak_us.max(elapsed_us);
+    }
+
+    pub(crate) fn take_layout_rebuild_timing(&mut self) -> (u64, u64, u64) {
+        let timing = (
+            self.layout_rebuild_total_us,
+            self.layout_rebuild_count,
+            self.layout_rebuild_peak_us,
+        );
+        self.layout_rebuild_total_us = 0;
+        self.layout_rebuild_count = 0;
+        self.layout_rebuild_peak_us = 0;
+        timing
     }
 
     fn ensure_visual_layout_index(&mut self, wrap_width: usize) {
@@ -7895,6 +7931,70 @@ mod tests {
         let rendered = crate::cli::markdown::render_streamed_markdown("stale", true);
         assert!(!app.apply_async_turn_render(request, rendered));
         assert!(app.output_lines.is_empty());
+    }
+
+    #[test]
+    fn test_async_turn_render_respects_viewport_revision() {
+        let mut changed = make_scrolling_app(40, 5);
+        changed.scroll_lines(-3);
+        changed.push_stream_line(Line::from("**streamed**"), StreamKind::Model);
+        let request = changed
+            .begin_async_turn_render("**streamed**".to_string())
+            .expect("non-empty streamed turn should produce a render request");
+        let captured_anchor = request
+            .anchor
+            .clone()
+            .expect("manual scrolling should capture an anchor");
+
+        changed.scroll_lines(-1);
+        let changed_scroll_offset = changed.scroll_offset;
+        let changed_anchor = changed
+            .manual_viewport_anchor(changed.last_wrap_width())
+            .expect("the user scroll should remain anchored");
+        let rendered = crate::cli::markdown::render_streamed_markdown("**streamed**", true);
+        assert!(changed.apply_async_turn_render(request, rendered));
+        assert_eq!(changed.scroll_offset, changed_scroll_offset);
+        let preserved_anchor = changed
+            .manual_viewport_anchor(changed.last_wrap_width())
+            .expect("the changed viewport should remain anchored");
+        assert_eq!(preserved_anchor.output_index, changed_anchor.output_index);
+        assert_eq!(preserved_anchor.row_offset, changed_anchor.row_offset);
+        assert_eq!(preserved_anchor.text, changed_anchor.text);
+        assert_ne!(captured_anchor.scroll_y, preserved_anchor.scroll_y);
+
+        let mut unchanged = make_scrolling_app(40, 5);
+        unchanged.scroll_lines(-3);
+        unchanged.push_stream_line(Line::from("**streamed**"), StreamKind::Model);
+        let request = unchanged
+            .begin_async_turn_render("**streamed**".to_string())
+            .expect("non-empty streamed turn should produce a render request");
+        let captured_anchor = request
+            .anchor
+            .clone()
+            .expect("manual scrolling should capture an anchor");
+        let rendered = crate::cli::markdown::render_streamed_markdown("**streamed**", true);
+        assert!(unchanged.apply_async_turn_render(request, rendered));
+
+        let restored_anchor = unchanged
+            .manual_viewport_anchor(unchanged.last_wrap_width())
+            .expect("the unchanged viewport should remain anchored");
+        assert_eq!(restored_anchor.output_index, captured_anchor.output_index);
+        assert_eq!(restored_anchor.row_offset, captured_anchor.row_offset);
+        assert_eq!(restored_anchor.text, captured_anchor.text);
+        assert_eq!(restored_anchor.scroll_y, captured_anchor.scroll_y);
+    }
+
+    #[test]
+    fn test_layout_rebuild_timing_records_full_rebuilds() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        app.push_plain("layout timing");
+        let _ = app.output_visual_rows(80);
+
+        let (total_us, count, peak_us) = app.take_layout_rebuild_timing();
+        assert_eq!(count, 1);
+        assert_eq!(peak_us, total_us);
+        assert_eq!(app.take_layout_rebuild_timing(), (0, 0, 0));
     }
 
     #[test]

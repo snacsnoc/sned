@@ -16,12 +16,15 @@ use tokio::sync::mpsc;
 #[derive(Clone, Default)]
 pub(crate) struct ReasoningMailbox {
     pending: Arc<std::sync::Mutex<Option<String>>>,
+    received_chunks: Arc<std::sync::atomic::AtomicU64>,
 }
 
 const MAX_REASONING_SNAPSHOT_BYTES: usize = 64 * 1024;
 
 impl ReasoningMailbox {
     fn append(&self, chunk: String) {
+        self.received_chunks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if chunk.is_empty() {
             return;
         }
@@ -70,6 +73,11 @@ impl ReasoningMailbox {
             .expect("reasoning mailbox poisoned")
             .as_ref()
             .map_or(0, String::len)
+    }
+
+    pub(crate) fn received_chunks(&self) -> u64 {
+        self.received_chunks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1008,6 +1016,7 @@ mod tests {
         let snapshot = mailbox.take().expect("reasoning snapshot should exist");
         assert!(snapshot.len() <= MAX_REASONING_SNAPSHOT_BYTES);
         assert!(snapshot.ends_with(&"終".repeat(1024)));
+        assert_eq!(mailbox.received_chunks(), 2);
     }
 
     #[test]
