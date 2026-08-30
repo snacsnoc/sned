@@ -7191,7 +7191,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
-    async fn test_reasoning_stream_emits_raw_chunks_without_flattening() {
+    async fn test_reasoning_stream_coalesces_display_snapshot_without_flattening() {
         let responses = vec![vec![
             ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                 reasoning: "first".to_string(),
@@ -7242,7 +7242,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 _ => None,
             })
             .collect();
-        assert_eq!(reasoning, ["first", " thought\n\n", "third"]);
+        assert_eq!(reasoning, ["first thought\n\nthird"]);
     }
 
     #[tokio::test]

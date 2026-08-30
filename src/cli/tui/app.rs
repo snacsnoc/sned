@@ -144,13 +144,25 @@ pub enum ScrollMode {
 /// `scroll_offset` is a visual-row coordinate, so it becomes invalid when a
 /// resize changes wrapping or a streamed block is re-rendered as Markdown.
 #[derive(Debug, Clone)]
-struct ManualViewportAnchor {
+pub(crate) struct ManualViewportAnchor {
     output_index: usize,
     row_offset: usize,
     separator_before: bool,
     text: String,
     normalized_text: String,
     scroll_y: usize,
+}
+
+pub(crate) type OutputLineId = u64;
+
+pub(crate) struct TurnRenderRequest {
+    pub(crate) generation: u64,
+    pub(crate) markdown_text: String,
+    pub(crate) target_line_ids: Vec<OutputLineId>,
+    pub(crate) append: bool,
+    pub(crate) turn_indicator: Option<Line<'static>>,
+    pub(crate) viewport_revision: u64,
+    anchor: Option<ManualViewportAnchor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,6 +544,8 @@ fn read_scrollback_tail(path: &Path) -> io::Result<Option<String>> {
 pub struct App {
     /// Output lines buffer (agent output, submitted prompts, etc.)
     pub output_lines: VecDeque<Line<'static>>,
+    output_line_ids: VecDeque<OutputLineId>,
+    next_output_line_id: OutputLineId,
     /// Per-line visual category.  Always the same length as
     /// `output_lines`; used by `render_output` to insert blank-line
     /// separators between different block kinds.
@@ -551,6 +565,7 @@ pub struct App {
     /// Current output scroll behavior
     pub scroll_mode: ScrollMode,
     pub unseen_output_count: usize,
+    viewport_revision: u64,
     pending_manual_viewport_anchor: Option<ManualViewportAnchor>,
     /// Whether the next draw should re-sync layout from the terminal size.
     pub has_resized: bool,
@@ -696,6 +711,8 @@ pub struct App {
     /// `finalize_turn_stream` to decide whether to replace or append
     /// the markdown-rendered output.
     pub turn_had_streamed_line: bool,
+    pending_turn_model_text: Option<String>,
+    next_turn_render_generation: u64,
     /// The last displayed streaming model line awaiting a finalized event.
     /// Keeping it across drain cycles lets transcript persistence wait for a
     /// real displacement or TurnEnd instead of writing every delta.
@@ -733,6 +750,34 @@ impl App {
             out.push_str(&span.content);
         }
         out
+    }
+
+    fn allocate_output_line_id(&mut self) -> OutputLineId {
+        let id = self.next_output_line_id;
+        self.next_output_line_id = self.next_output_line_id.wrapping_add(1).max(1);
+        id
+    }
+
+    fn output_index_for_id(&self, id: OutputLineId) -> Option<usize> {
+        self.output_line_ids
+            .iter()
+            .position(|candidate| *candidate == id)
+    }
+
+    pub(crate) fn model_text_for_completion(&self) -> String {
+        let current = self
+            .turn_stream_entries
+            .iter()
+            .filter(|(_, kind)| *kind == StreamKind::Model)
+            .filter_map(|(index, _)| self.output_lines.get(*index))
+            .map(Self::line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if current.trim().is_empty() {
+            self.pending_turn_model_text.clone().unwrap_or_default()
+        } else {
+            current
+        }
     }
     /// Create a new TextArea with default styling (no underline on cursor line).
     #[must_use]
@@ -989,6 +1034,8 @@ impl App {
     pub fn new() -> Self {
         Self {
             output_lines: VecDeque::new(),
+            output_line_ids: VecDeque::new(),
+            next_output_line_id: 1,
             output_line_kinds: VecDeque::new(),
             input: Self::new_textarea(Vec::new()),
             pending_approval: None,
@@ -999,6 +1046,7 @@ impl App {
             scroll_offset: 0,
             scroll_mode: ScrollMode::Auto,
             unseen_output_count: 0,
+            viewport_revision: 0,
             pending_manual_viewport_anchor: None,
             has_resized: true,
             needs_redraw: true,
@@ -1046,6 +1094,8 @@ impl App {
             last_stream_group: None,
             turn_indicator: None,
             turn_had_streamed_line: false,
+            pending_turn_model_text: None,
+            next_turn_render_generation: 0,
             pending_transcript_model_line: None,
             pending_transcript_reasoning_lines: None,
             deferred_priority_events: VecDeque::new(),
@@ -1146,7 +1196,9 @@ impl App {
             && self.error_lines.is_empty()
             && self.output_lines.len() < 10_000;
         self.needs_redraw = true;
+        let line_id = self.allocate_output_line_id();
         self.output_lines.push_back(line);
+        self.output_line_ids.push_back(line_id);
         self.output_line_kinds.push_back(kind);
         self.cached_visible_window = None;
         if enforce_transcript_limit && self.output_lines.len() > 10_000 {
@@ -1178,6 +1230,7 @@ impl App {
                     .min(MAX_SCROLLBACK_LOAD_LINES as u64);
             }
             self.output_lines.pop_front();
+            self.output_line_ids.pop_front();
             self.output_line_kinds.pop_front();
             if self.text_selection.as_ref().is_some_and(|selection| {
                 selection.pane == SelectionPane::Transcript
@@ -1216,9 +1269,9 @@ impl App {
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
         if can_extend_layout {
-            if previous_kind.is_some_and(|previous| {
-                Self::should_insert_separator(previous, kind)
-            }) {
+            if previous_kind
+                .is_some_and(|previous| Self::should_insert_separator(previous, kind))
+            {
                 self.visual_layout_index.append_entry(LayoutEntry {
                     source: LayoutSource::Separator,
                     kind: BlockKind::Separator,
@@ -1388,6 +1441,7 @@ impl App {
 
         for _ in 0..visual_line_count {
             self.output_lines.pop_back();
+            self.output_line_ids.pop_back();
             self.output_line_kinds.pop_back();
             self.turn_stream_entries.pop();
         }
@@ -1436,6 +1490,7 @@ impl App {
 
         for index in model_indices.iter().rev() {
             self.output_lines.remove(*index);
+            self.output_line_ids.remove(*index);
             self.output_line_kinds.remove(*index);
         }
 
@@ -1479,6 +1534,24 @@ impl App {
     /// flash where the streamed text is popped and re-inserted with
     /// different styling.
     pub fn finalize_turn_stream(&mut self, markdown_text: &str) {
+        self.finalize_turn_stream_inner(markdown_text, None, None);
+    }
+
+    pub(crate) fn finalize_turn_stream_with_rendered(
+        &mut self,
+        markdown_text: &str,
+        rendered: Vec<Line<'static>>,
+        anchor: Option<ManualViewportAnchor>,
+    ) {
+        self.finalize_turn_stream_inner(markdown_text, Some(rendered), anchor);
+    }
+
+    fn finalize_turn_stream_inner(
+        &mut self,
+        markdown_text: &str,
+        mut rendered_override: Option<Vec<Line<'static>>>,
+        anchor_override: Option<ManualViewportAnchor>,
+    ) {
         self.finish_reasoning_stream();
         let entries = std::mem::take(&mut self.turn_stream_entries);
         self.last_stream_group = None;
@@ -1495,21 +1568,38 @@ impl App {
         if model_indices.is_empty() || markdown_text.trim().is_empty() {
             // Drop any pending indicator so it does not linger as an
             // orphaned line if this turn produced no markdown.
-            self.turn_indicator = None;
+            let pending_indicator = self.turn_indicator.take();
             // When no Model entries were recorded but streamed lines were
             // emitted (direct push), append the re-rendered markdown
             // after the existing lines instead of replacing them.
             // This avoids a visual flash on the first turn.
             if model_indices.is_empty() && had_streamed_line && !markdown_text.trim().is_empty() {
-                let prefixed_markdown = if self.turn_indicator.take().is_some() {
-                    format!("\u{2666} {markdown_text}")
-                } else {
-                    markdown_text.to_string()
-                };
-                let rendered: Vec<Line<'static>> =
-                    crate::cli::markdown::render_streamed_markdown(&prefixed_markdown, true);
+                let have_indicator = pending_indicator.is_some();
+                let used_override = rendered_override.is_some();
+                let mut rendered = rendered_override.take().unwrap_or_else(|| {
+                    let text = if have_indicator {
+                        format!("\u{2666} {markdown_text}")
+                    } else {
+                        markdown_text.to_string()
+                    };
+                    crate::cli::markdown::render_streamed_markdown(&text, true)
+                });
+                if have_indicator
+                    && used_override
+                    && let Some(first) = rendered.first_mut()
+                {
+                    let mut spans = Vec::with_capacity(first.spans.len() + 1);
+                    spans.push(Span::styled(
+                        "\u{2666} ",
+                        Style::default().fg(crate::cli::tui::theme::ACCENT),
+                    ));
+                    spans.extend(first.spans.iter().cloned());
+                    first.spans = spans;
+                }
                 for line in rendered {
+                    let line_id = self.allocate_output_line_id();
                     self.output_lines.push_back(line);
+                    self.output_line_ids.push_back(line_id);
                     self.output_line_kinds.push_back(BlockKind::Model);
                 }
                 self.needs_redraw = true;
@@ -1524,7 +1614,7 @@ impl App {
         // and for popping/insertion.
         let model_entry_indices: Vec<usize> = model_indices.iter().map(|(idx, _)| *idx).collect();
         let wrap_width = self.last_wrap_width();
-        let manual_anchor = self.manual_viewport_anchor(wrap_width);
+        let manual_anchor = anchor_override.or_else(|| self.manual_viewport_anchor(wrap_width));
 
         // No-op-reinsert optimization: if the rendered line count equals
         // the popped Model line count and every rendered line has the same
@@ -1532,8 +1622,9 @@ impl App {
         // entirely.  This prevents the visual flash where streamed plain
         // text vanishes for a frame while render_markdown runs, then
         // reappears styled.
-        let mut rendered: Vec<Line<'static>> =
-            crate::cli::markdown::render_streamed_markdown(markdown_text, true);
+        let mut rendered = rendered_override
+            .take()
+            .unwrap_or_else(|| crate::cli::markdown::render_streamed_markdown(markdown_text, true));
         let can_skip_reinsert = rendered.len() == model_entry_indices.len()
             && rendered.iter().zip(model_entry_indices.iter()).all(
                 |(rendered_line, popped_idx)| {
@@ -1621,6 +1712,7 @@ impl App {
         // popped in lockstep so render-time grouping stays valid.
         for &idx in model_entry_indices.iter().rev() {
             self.output_lines.remove(idx);
+            self.output_line_ids.remove(idx);
             if idx < self.output_line_kinds.len() {
                 self.output_line_kinds.remove(idx);
             }
@@ -1647,8 +1739,9 @@ impl App {
         // Prepending as a span keeps the indicator on the same line as
         // the start of the response.
         let have_indicator = self.turn_indicator.take().is_some();
-        let mut rendered: Vec<Line<'static>> =
-            crate::cli::markdown::render_streamed_markdown(markdown_text, true);
+        let mut rendered = rendered_override
+            .take()
+            .unwrap_or_else(|| crate::cli::markdown::render_streamed_markdown(markdown_text, true));
         if have_indicator && let Some(first) = rendered.first_mut() {
             let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
             new_spans.push(Span::styled(
@@ -1660,7 +1753,9 @@ impl App {
         }
         let rendered_len = rendered.len();
         for line in rendered.into_iter().rev() {
+            let line_id = self.allocate_output_line_id();
             self.output_lines.insert(insert_at, line);
+            self.output_line_ids.insert(insert_at, line_id);
             self.output_line_kinds.insert(insert_at, BlockKind::Model);
         }
         // Sanity: lengths should match exactly. If they ever diverge
@@ -1683,6 +1778,19 @@ impl App {
         // changed, so the cached row count is stale.
         self.cached_wrap_width = None;
         self.rebuild_visual_row_cache(wrap_width);
+
+        if self.output_line_ids.len() != self.output_lines.len() {
+            debug_assert_eq!(
+                self.output_line_ids.len(),
+                self.output_lines.len(),
+                "output_line_ids drifted from output_lines after finalize"
+            );
+            self.output_line_ids.truncate(self.output_lines.len());
+            while self.output_line_ids.len() < self.output_lines.len() {
+                let line_id = self.allocate_output_line_id();
+                self.output_line_ids.push_back(line_id);
+            }
+        }
 
         let Some(mut anchor) = manual_anchor else {
             self.refresh_pending_manual_viewport_anchor(wrap_width);
@@ -1768,6 +1876,124 @@ impl App {
             self.clamp_to_content();
         }
         self.refresh_pending_manual_viewport_anchor(wrap_width);
+    }
+
+    pub(crate) fn begin_async_turn_render(
+        &mut self,
+        markdown_text: String,
+    ) -> Option<TurnRenderRequest> {
+        self.finish_reasoning_stream();
+        let anchor = self.manual_viewport_anchor(self.last_wrap_width());
+        let entries = std::mem::take(&mut self.turn_stream_entries);
+        self.last_stream_group = None;
+        let had_streamed_line = std::mem::take(&mut self.turn_had_streamed_line);
+        let model_indices = entries
+            .iter()
+            .filter(|(_, kind)| *kind == StreamKind::Model)
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+
+        if markdown_text.trim().is_empty() {
+            self.turn_indicator = None;
+            return None;
+        }
+        if model_indices.is_empty() && !had_streamed_line {
+            self.turn_indicator = None;
+            return None;
+        }
+
+        let model_text = model_indices
+            .iter()
+            .filter_map(|index| self.output_lines.get(*index))
+            .map(Self::line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let target_line_ids = model_indices
+            .iter()
+            .filter_map(|index| self.output_line_ids.get(*index).copied())
+            .collect();
+        self.pending_turn_model_text = Some(model_text);
+        self.next_turn_render_generation = self.next_turn_render_generation.wrapping_add(1);
+
+        Some(TurnRenderRequest {
+            generation: self.next_turn_render_generation,
+            markdown_text,
+            target_line_ids,
+            append: model_indices.is_empty(),
+            turn_indicator: self.turn_indicator.take(),
+            viewport_revision: self.viewport_revision,
+            anchor,
+        })
+    }
+
+    pub(crate) fn apply_async_turn_render(
+        &mut self,
+        request: TurnRenderRequest,
+        rendered: Vec<Line<'static>>,
+    ) -> bool {
+        let target_indices = request
+            .target_line_ids
+            .iter()
+            .filter_map(|id| self.output_index_for_id(*id))
+            .collect::<Vec<_>>();
+        if target_indices.len() != request.target_line_ids.len() {
+            self.pending_turn_model_text = None;
+            return false;
+        }
+
+        let saved_entries = self
+            .turn_stream_entries
+            .iter()
+            .filter_map(|(index, kind)| {
+                self.output_line_ids
+                    .get(*index)
+                    .copied()
+                    .map(|id| (id, *kind))
+            })
+            .collect::<Vec<_>>();
+        let saved_last_group = self.last_stream_group.map(|(start, count, kind)| {
+            (
+                (start..start.saturating_add(count))
+                    .filter_map(|index| self.output_line_ids.get(index).copied())
+                    .collect::<Vec<_>>(),
+                kind,
+            )
+        });
+        let saved_indicator = self.turn_indicator.take();
+        let saved_had_streamed_line = self.turn_had_streamed_line;
+        let anchor = (request.viewport_revision == self.viewport_revision)
+            .then_some(request.anchor)
+            .flatten();
+
+        self.turn_stream_entries = target_indices
+            .iter()
+            .map(|index| (*index, StreamKind::Model))
+            .collect();
+        self.last_stream_group = None;
+        self.turn_had_streamed_line = request.append || !target_indices.is_empty();
+        self.turn_indicator = request.turn_indicator;
+        self.finalize_turn_stream_with_rendered(&request.markdown_text, rendered, anchor);
+
+        self.turn_stream_entries = saved_entries
+            .into_iter()
+            .filter_map(|(id, kind)| self.output_index_for_id(id).map(|index| (index, kind)))
+            .collect();
+        self.last_stream_group = saved_last_group.and_then(|(ids, kind)| {
+            let indices = ids
+                .iter()
+                .filter_map(|id| self.output_index_for_id(*id))
+                .collect::<Vec<_>>();
+            let start = *indices.first()?;
+            (indices
+                .iter()
+                .enumerate()
+                .all(|(offset, index)| *index == start.saturating_add(offset)))
+            .then_some((start, indices.len(), kind))
+        });
+        self.turn_indicator = saved_indicator;
+        self.turn_had_streamed_line = saved_had_streamed_line;
+        self.pending_turn_model_text = None;
+        true
     }
 
     /// Push a completion line into the durable transcript.
@@ -2341,6 +2567,7 @@ impl App {
 
     pub fn force_bottom(&mut self) {
         self.needs_redraw = true;
+        self.viewport_revision = self.viewport_revision.saturating_add(1);
         self.scroll_mode = ScrollMode::Auto;
         self.scroll_offset = 0;
         self.unseen_output_count = 0;
@@ -2496,6 +2723,7 @@ impl App {
 
         if let Some(content) = scrollback_content {
             let mut new_lines: VecDeque<Line<'static>> = VecDeque::new();
+            let mut new_ids: VecDeque<OutputLineId> = VecDeque::new();
             let mut new_kinds: VecDeque<BlockKind> = VecDeque::new();
             let scrollback_lines: Vec<&str> = content
                 .lines()
@@ -2504,20 +2732,26 @@ impl App {
                 .collect();
             for line in scrollback_lines.into_iter().rev() {
                 new_lines.push_back(Line::from(line.to_string()));
+                new_ids.push_back(self.allocate_output_line_id());
                 new_kinds.push_back(BlockKind::ToolOutput);
             }
             if !self.output_lines.is_empty() {
                 let divider = Line::from("─".repeat(40));
                 new_lines.push_back(divider);
+                new_ids.push_back(self.allocate_output_line_id());
                 new_kinds.push_back(BlockKind::Separator);
             }
             for line in &self.output_lines {
                 new_lines.push_back(line.clone());
             }
+            for id in &self.output_line_ids {
+                new_ids.push_back(*id);
+            }
             for kind in &self.output_line_kinds {
                 new_kinds.push_back(*kind);
             }
             self.output_lines = new_lines;
+            self.output_line_ids = new_ids;
             self.output_line_kinds = new_kinds;
             self.visual_layout_index.invalidate();
             self.cached_wrap_width = None;
@@ -2563,6 +2797,7 @@ impl App {
         self.clear_text_selection();
         self.needs_redraw = true;
         self.output_lines.clear();
+        self.output_line_ids.clear();
         self.output_line_kinds.clear();
         self.last_completion_text = None;
         self.error_lines.clear();
@@ -2575,6 +2810,7 @@ impl App {
         self.reasoning_partial_line.clear();
         self.turn_indicator = None;
         self.turn_had_streamed_line = false;
+        self.pending_turn_model_text = None;
         self.cached_visual_rows = 0;
         self.cached_wrap_width = Some(self.last_wrap_width());
         self.cached_visible_window = None;
@@ -2593,6 +2829,7 @@ impl App {
             return;
         }
         self.output_lines.drain(start..);
+        self.output_line_ids.drain(start..);
         self.output_line_kinds.drain(start..);
         self.visual_layout_index.invalidate();
         self.last_stream_group = None;
@@ -2606,6 +2843,7 @@ impl App {
 
     pub fn pin_approval_bottom(&mut self) {
         self.needs_redraw = true;
+        self.viewport_revision = self.viewport_revision.saturating_add(1);
         self.scroll_mode = ScrollMode::ApprovalPinned;
         self.scroll_offset = 0;
         self.unseen_output_count = 0;
@@ -2635,6 +2873,7 @@ impl App {
     pub fn set_content_width(&mut self, content_width: usize) {
         if self.last_content_width != content_width {
             self.last_content_width = content_width;
+            self.viewport_revision = self.viewport_revision.saturating_add(1);
             self.visual_layout_index.invalidate();
             self.cached_wrap_width = None;
             self.cached_visible_window = None;
@@ -2695,6 +2934,7 @@ impl App {
     pub fn scroll_lines(&mut self, delta: isize) {
         self.clear_text_selection();
         self.needs_redraw = true;
+        self.viewport_revision = self.viewport_revision.saturating_add(1);
         let total_rows = self.output_visual_rows(self.last_wrap_width());
         if !self.enter_manual_mode(total_rows) {
             return;
@@ -7616,6 +7856,45 @@ mod tests {
 
         // turn_stream_entries must be cleared after finalize.
         assert!(app.turn_stream_entries.is_empty());
+    }
+
+    #[test]
+    fn test_async_turn_render_keeps_later_stream_indices_valid() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        app.push_stream_line(Line::from("**first**"), StreamKind::Model);
+        let request = app
+            .begin_async_turn_render("**first**".to_string())
+            .expect("non-empty streamed turn should produce a render request");
+
+        app.push_stream_line(Line::from("later turn"), StreamKind::Model);
+        let rendered = crate::cli::markdown::render_streamed_markdown("**first**", true);
+        assert!(app.apply_async_turn_render(request, rendered));
+
+        let text = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("first"));
+        assert!(text.contains("later turn"));
+        assert_eq!(app.turn_stream_entries.len(), 1);
+    }
+
+    #[test]
+    fn test_async_turn_render_discards_evicted_target() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        app.push_stream_line(Line::from("stale"), StreamKind::Model);
+        let request = app
+            .begin_async_turn_render("stale".to_string())
+            .expect("non-empty streamed turn should produce a render request");
+        app.clear_output().unwrap();
+
+        let rendered = crate::cli::markdown::render_streamed_markdown("stale", true);
+        assert!(!app.apply_async_turn_render(request, rendered));
+        assert!(app.output_lines.is_empty());
     }
 
     #[test]

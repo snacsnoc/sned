@@ -104,10 +104,48 @@ pub fn render_streamed_markdown(text: &str, interactive_mode: bool) -> Vec<Line<
     )
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MarkdownRenderTiming {
+    pub(crate) total_us: u64,
+    pub(crate) syntax_highlight_us: u64,
+}
+
+pub(crate) fn render_streamed_markdown_timed(
+    text: &str,
+    interactive_mode: bool,
+) -> (Vec<Line<'static>>, MarkdownRenderTiming) {
+    let started = std::time::Instant::now();
+    let mut syntax_highlight_us = 0;
+    let rendered = render_markdown_with_code_limit_timed(
+        None,
+        text,
+        Some(crate::core::agent_types::code_block_display_limit(
+            interactive_mode,
+        )),
+        Some(&mut syntax_highlight_us),
+    );
+    (
+        rendered,
+        MarkdownRenderTiming {
+            total_us: started.elapsed().as_micros() as u64,
+            syntax_highlight_us,
+        },
+    )
+}
+
 fn render_markdown_with_code_limit(
     prefix: Option<&str>,
     text: &str,
     code_line_limit: Option<usize>,
+) -> Vec<Line<'static>> {
+    render_markdown_with_code_limit_timed(prefix, text, code_line_limit, None)
+}
+
+fn render_markdown_with_code_limit_timed(
+    prefix: Option<&str>,
+    text: &str,
+    code_line_limit: Option<usize>,
+    mut syntax_highlight_us: Option<&mut u64>,
 ) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
         let banner = prefix.unwrap_or("");
@@ -312,10 +350,15 @@ fn render_markdown_with_code_limit(
                             .copied()
                             .collect::<Vec<_>>()
                             .join("\n");
+                        let highlight_started = std::time::Instant::now();
                         let highlighted = crate::cli::syntax_highlight::highlight_code(
                             &displayed,
                             &code_block_language,
                         );
+                        if let Some(total) = syntax_highlight_us.as_deref_mut() {
+                            *total = total
+                                .saturating_add(highlight_started.elapsed().as_micros() as u64);
+                        }
                         for line in
                             crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&highlighted)
                         {

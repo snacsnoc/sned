@@ -4,7 +4,7 @@
 //! file picker, input queuing, and agent lifecycle.
 
 use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
-use crate::cli::tui::app::{NotificationKind, PasteOutcome, PendingModelSwitch};
+use crate::cli::tui::app::{NotificationKind, PasteOutcome, PendingModelSwitch, TurnRenderRequest};
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
@@ -27,8 +27,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "windows", unix))]
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 
@@ -810,6 +810,7 @@ fn apply_output_event(
     pending_model_update: &mut Option<ratatui::text::Line<'static>>,
     pending_reasoning_lines: &mut Option<Vec<Line<'static>>>,
     storage: Option<&TaskStorage>,
+    turn_render_worker: Option<&TurnRenderWorker>,
 ) {
     if !matches!(&event, OutputEvent::ReasoningChunk(_)) {
         let reasoning_lines = app.reasoning_stream_lines();
@@ -916,14 +917,7 @@ fn apply_output_event(
             flush_pending_model_update(app, pending_model_update, storage);
             app.set_last_completion_text(result.clone());
             // Historical model blocks must not suppress a result from the current turn.
-            let model_text = app
-                .turn_stream_entries
-                .iter()
-                .filter(|(_, kind)| *kind == crate::cli::tui::StreamKind::Model)
-                .filter_map(|(index, _)| app.output_lines.get(*index))
-                .map(App::line_to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let model_text = app.model_text_for_completion();
             let result_matches_model =
                 !model_text.trim().is_empty() && model_text.trim() == result.trim();
             app.set_completion_needs_transcript_copy(!result_matches_model);
@@ -961,7 +955,13 @@ fn apply_output_event(
         }
         OutputEvent::TurnEnd { accumulated_text } => {
             flush_pending_model_update(app, pending_model_update, storage);
-            app.finalize_turn_stream(&accumulated_text);
+            if let Some(worker) = turn_render_worker {
+                if let Some(request) = app.begin_async_turn_render(accumulated_text) {
+                    worker.submit(request);
+                }
+            } else {
+                app.finalize_turn_stream(&accumulated_text);
+            }
         }
         OutputEvent::TurnIndicator(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
@@ -1176,15 +1176,23 @@ fn drain_output_queues(
     rx: &mut mpsc::Receiver<OutputEvent>,
     app: &mut App,
     storage: Option<&TaskStorage>,
+    reasoning_mailbox: Option<&crate::cli::output::ReasoningMailbox>,
+    turn_render_worker: Option<&TurnRenderWorker>,
 ) -> usize {
     const MAX_MAIN_EVENTS_PER_DRAIN: usize = 128;
     const MAX_CRITICAL_EVENTS_PER_DRAIN: usize = 512;
     const MAX_DEFERRED_PRIORITY_EVENTS: usize = 1_024;
+    #[cfg(not(test))]
+    const MAX_DRAIN_DURATION: Duration = Duration::from_millis(2);
+    #[cfg(test)]
+    const MAX_DRAIN_DURATION: Duration = Duration::from_secs(1);
+    let drain_started = Instant::now();
     let mut drained_events = 0usize;
     let mut saw_output = false;
     let mut saw_turn_end = false;
     let mut pending_model_update = app.take_pending_transcript_model_line();
     let mut pending_reasoning_lines = app.take_pending_transcript_reasoning_lines();
+    let pending_reasoning_snapshot = reasoning_mailbox.and_then(|mailbox| mailbox.take());
 
     let mut deferred_priority = std::mem::take(&mut app.deferred_priority_events);
     // Approvals have no per-frame budget: a prompt must become visible even
@@ -1198,12 +1206,14 @@ fn drain_output_queues(
             &mut pending_model_update,
             &mut pending_reasoning_lines,
             storage,
+            turn_render_worker,
         );
     }
 
     // Limit critical work independently so it cannot monopolize a render frame.
     let mut priority_receive_budget = MAX_CRITICAL_EVENTS_PER_DRAIN;
     while priority_receive_budget > 0
+        && drain_started.elapsed() < MAX_DRAIN_DURATION
         && let Ok(event) = priority_rx.try_recv()
     {
         priority_receive_budget = priority_receive_budget.saturating_sub(1);
@@ -1223,6 +1233,7 @@ fn drain_output_queues(
                 &mut pending_model_update,
                 &mut pending_reasoning_lines,
                 storage,
+                turn_render_worker,
             );
         }
     }
@@ -1242,9 +1253,12 @@ fn drain_output_queues(
             pre_main_priority.push_back(event);
         }
     }
+    if let Some(snapshot) = pending_reasoning_snapshot {
+        post_main_priority.push_front(OutputEvent::ReasoningChunk(snapshot));
+    }
 
     let mut critical_budget = MAX_CRITICAL_EVENTS_PER_DRAIN;
-    while critical_budget > 0 {
+    while critical_budget > 0 && drain_started.elapsed() < MAX_DRAIN_DURATION {
         let Some(event) = pre_main_priority.pop_front() else {
             break;
         };
@@ -1257,11 +1271,15 @@ fn drain_output_queues(
             &mut pending_model_update,
             &mut pending_reasoning_lines,
             storage,
+            turn_render_worker,
         );
     }
 
     let mut main_budget = MAX_MAIN_EVENTS_PER_DRAIN;
-    while main_budget > 0 && let Ok(event) = rx.try_recv() {
+    while main_budget > 0
+        && drain_started.elapsed() < MAX_DRAIN_DURATION
+        && let Ok(event) = rx.try_recv()
+    {
         main_budget = main_budget.saturating_sub(1);
         drained_events = drained_events.saturating_add(1);
         if matches!(
@@ -1283,6 +1301,7 @@ fn drain_output_queues(
                     &mut pending_model_update,
                     &mut pending_reasoning_lines,
                     storage,
+                    turn_render_worker,
                 );
             }
         }
@@ -1294,9 +1313,10 @@ fn drain_output_queues(
             &mut pending_model_update,
             &mut pending_reasoning_lines,
             storage,
+            turn_render_worker,
         );
     }
-    while critical_budget > 0 {
+    while critical_budget > 0 && drain_started.elapsed() < MAX_DRAIN_DURATION {
         let Some(event) = post_main_priority.pop_front() else {
             break;
         };
@@ -1309,6 +1329,7 @@ fn drain_output_queues(
             &mut pending_model_update,
             &mut pending_reasoning_lines,
             storage,
+            turn_render_worker,
         );
     }
     pre_main_priority.append(&mut post_main_priority);
@@ -1354,7 +1375,15 @@ fn drain_output_queues(
 fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut approval_rx, &mut priority_rx, rx, app, None);
+    drain_output_queues(
+        &mut approval_rx,
+        &mut priority_rx,
+        rx,
+        app,
+        None,
+        None,
+        None,
+    );
 }
 
 fn sync_scroll_viewport(
@@ -1468,6 +1497,8 @@ fn drain_and_render_user_submit(
         output_rx,
         app,
         Some(storage),
+        None,
+        None,
     );
     app.force_bottom();
     sync_scroll_viewport(terminal, app, debug)?;
@@ -1505,7 +1536,15 @@ fn echo_agent_prompt(app: &mut App, text: &str, output_writer: &OutputWriterArc)
 pub(crate) fn drain_output_for_test(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
     let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut approval_rx, &mut priority_rx, rx, app, None);
+    drain_output_queues(
+        &mut approval_rx,
+        &mut priority_rx,
+        rx,
+        app,
+        None,
+        None,
+        None,
+    );
 }
 
 #[cfg(test)]
@@ -1515,7 +1554,7 @@ pub(crate) fn drain_output_for_test_with_priority(
     app: &mut App,
 ) {
     let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut approval_rx, priority_rx, rx, app, None);
+    drain_output_queues(&mut approval_rx, priority_rx, rx, app, None, None, None);
 }
 
 #[cfg(test)]
@@ -1525,7 +1564,7 @@ pub(crate) fn drain_output_for_test_with_lanes(
     rx: &mut mpsc::Receiver<OutputEvent>,
     app: &mut App,
 ) {
-    drain_output_queues(approval_rx, priority_rx, rx, app, None);
+    drain_output_queues(approval_rx, priority_rx, rx, app, None, None, None);
 }
 
 #[cfg(test)]
@@ -1536,7 +1575,15 @@ pub(crate) fn drain_output_for_test_with_storage(
 ) {
     let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut approval_rx, &mut priority_rx, rx, app, Some(storage));
+    drain_output_queues(
+        &mut approval_rx,
+        &mut priority_rx,
+        rx,
+        app,
+        Some(storage),
+        None,
+        None,
+    );
 }
 
 fn approval_result_for_key(app: &App, key: &KeyEvent) -> Option<ApprovalResult> {
@@ -3556,7 +3603,88 @@ async fn export_agent_conversation(
     write_conversation_export(export_path, &export_data)
 }
 
-/// Main ratatui event loop.
+struct TurnRenderWorker {
+    request_tx: Option<std_mpsc::Sender<TurnRenderRequest>>,
+    result_rx: std_mpsc::Receiver<(
+        TurnRenderRequest,
+        Vec<Line<'static>>,
+        crate::cli::markdown::MarkdownRenderTiming,
+    )>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TurnRenderWorker {
+    fn start() -> std::io::Result<Self> {
+        let (request_tx, request_rx) = std_mpsc::channel::<TurnRenderRequest>();
+        let (result_tx, result_rx) = std_mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("sned-turn-renderer".to_string())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    let (rendered, timing) = crate::cli::markdown::render_streamed_markdown_timed(
+                        &request.markdown_text,
+                        true,
+                    );
+                    if result_tx.send((request, rendered, timing)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            request_tx: Some(request_tx),
+            result_rx,
+            handle: Some(handle),
+        })
+    }
+
+    fn submit(&self, request: TurnRenderRequest) {
+        if let Some(sender) = self.request_tx.as_ref()
+            && sender.send(request).is_err()
+        {
+            tracing::debug!("turn render worker stopped before accepting a request");
+        }
+    }
+
+    fn apply_ready(&self, app: &mut App) -> (u64, u64, u64, u64, u64) {
+        let mut render_total_us: u64 = 0;
+        let mut syntax_highlight_total_us: u64 = 0;
+        let mut apply_total_us: u64 = 0;
+        let mut apply_peak_us: u64 = 0;
+        let mut count: u64 = 0;
+        while let Ok((request, rendered, render_timing)) = self.result_rx.try_recv() {
+            render_total_us = render_total_us.saturating_add(render_timing.total_us);
+            syntax_highlight_total_us =
+                syntax_highlight_total_us.saturating_add(render_timing.syntax_highlight_us);
+            let apply_started = Instant::now();
+            let generation = request.generation;
+            let applied = app.apply_async_turn_render(request, rendered);
+            let apply_us = apply_started.elapsed().as_micros() as u64;
+            apply_total_us = apply_total_us.saturating_add(apply_us);
+            apply_peak_us = apply_peak_us.max(apply_us);
+            count += 1;
+            if !applied {
+                tracing::debug!(generation, "discarded a stale asynchronous turn render");
+            }
+        }
+        (
+            render_total_us,
+            syntax_highlight_total_us,
+            apply_total_us,
+            count,
+            apply_peak_us,
+        )
+    }
+
+    fn shutdown(&mut self) {
+        self.request_tx.take();
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::warn!("turn render worker panicked during shutdown");
+        }
+    }
+}
+
 async fn run_main_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -3564,6 +3692,8 @@ async fn run_main_loop(
     priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
     mention_search_rx: &mut mpsc::UnboundedReceiver<crate::cli::tui::app::MentionSearchUpdate>,
     output_rx: &mut mpsc::Receiver<OutputEvent>,
+    reasoning_mailbox: crate::cli::output::ReasoningMailbox,
+    turn_render_worker: &TurnRenderWorker,
     output_writer: OutputWriterArc,
     session: Arc<Mutex<InteractiveSession>>,
     task_id: String,
@@ -3597,6 +3727,16 @@ async fn run_main_loop(
         drain_events_total: u64,
         drain_events_peak: usize,
         output_lines_peak: usize,
+        turn_render_total_us: u64,
+        turn_render_syntax_highlight_us: u64,
+        turn_render_apply_total_us: u64,
+        turn_render_count: u64,
+        turn_render_apply_peak_us: u64,
+        main_queue_peak: usize,
+        priority_queue_peak: usize,
+        approval_queue_peak: usize,
+        deferred_priority_peak: usize,
+        reasoning_pending_peak: usize,
     }
 
     impl Drop for TimingSummary {
@@ -3622,6 +3762,22 @@ async fn run_main_loop(
                 self.drain_events_total, self.drain_events_peak,
             );
             eprintln!("[timing] output_lines_peak={}", self.output_lines_peak);
+            eprintln!(
+                "[timing] queue_peaks: main={} priority={} approval={} deferred_priority={} reasoning_pending={}",
+                self.main_queue_peak,
+                self.priority_queue_peak,
+                self.approval_queue_peak,
+                self.deferred_priority_peak,
+                self.reasoning_pending_peak,
+            );
+            eprintln!(
+                "[timing] turn_render: worker_total={}us syntax_highlight={}us apply_total={}us count={} apply_peak={}us",
+                self.turn_render_total_us,
+                self.turn_render_syntax_highlight_us,
+                self.turn_render_apply_total_us,
+                self.turn_render_count,
+                self.turn_render_apply_peak_us,
+            );
 
             if let Some(session_start) = self.session_start_time {
                 for line in crate::cli::output::format_timing_phases(
@@ -3666,9 +3822,30 @@ async fn run_main_loop(
         drain_events_total: 0,
         drain_events_peak: 0,
         output_lines_peak: 0,
+        main_queue_peak: 0,
+        priority_queue_peak: 0,
+        approval_queue_peak: 0,
+        deferred_priority_peak: 0,
+        reasoning_pending_peak: 0,
+        turn_render_total_us: 0,
+        turn_render_syntax_highlight_us: 0,
+        turn_render_apply_total_us: 0,
+        turn_render_count: 0,
+        turn_render_apply_peak_us: 0,
     };
 
     loop {
+        let (render_us, syntax_highlight_us, apply_us, render_count, apply_peak_us) =
+            turn_render_worker.apply_ready(app);
+        timing.turn_render_total_us = timing.turn_render_total_us.saturating_add(render_us);
+        timing.turn_render_syntax_highlight_us = timing
+            .turn_render_syntax_highlight_us
+            .saturating_add(syntax_highlight_us);
+        timing.turn_render_apply_total_us =
+            timing.turn_render_apply_total_us.saturating_add(apply_us);
+        timing.turn_render_count = timing.turn_render_count.saturating_add(render_count);
+        timing.turn_render_apply_peak_us = timing.turn_render_apply_peak_us.max(apply_peak_us);
+
         // 1. Drain channel into app
         {
             let t = std::time::Instant::now();
@@ -3678,6 +3855,8 @@ async fn run_main_loop(
                 output_rx,
                 app,
                 Some(&task_storage),
+                Some(&reasoning_mailbox),
+                Some(turn_render_worker),
             );
             // Lost transcript context remains visible because it may affect
             // whether the user can safely approve a pending operation.
@@ -3701,6 +3880,15 @@ async fn run_main_loop(
                 .drain_events_total
                 .saturating_add(drained_events as u64);
             timing.drain_events_peak = timing.drain_events_peak.max(drained_events);
+            timing.main_queue_peak = timing.main_queue_peak.max(output_rx.len());
+            timing.priority_queue_peak = timing.priority_queue_peak.max(priority_output_rx.len());
+            timing.approval_queue_peak = timing.approval_queue_peak.max(approval_output_rx.len());
+            timing.deferred_priority_peak = timing
+                .deferred_priority_peak
+                .max(app.deferred_priority_events.len());
+            timing.reasoning_pending_peak = timing
+                .reasoning_pending_peak
+                .max(reasoning_mailbox.pending_len());
         }
 
         while let Ok(update) = mention_search_rx.try_recv() {
@@ -3840,6 +4028,7 @@ async fn run_main_loop(
         let output_backlogged = !output_rx.is_empty()
             || !approval_output_rx.is_empty()
             || !priority_output_rx.is_empty()
+            || reasoning_mailbox.is_pending()
             || !app.deferred_priority_events.is_empty();
         let poll_interval = if output_backlogged {
             // Keep draining while a producer is ahead of the renderer. The
@@ -4452,6 +4641,7 @@ pub async fn run_interactive_shell_inner(
     // output floods while absorbing larger streaming bursts before overflow).
     let (output_tx, mut output_rx) = mpsc::channel(output_channel_capacity());
     let channel_output_writer = ChannelOutputWriter::new(output_tx);
+    let reasoning_mailbox = channel_output_writer.reasoning_mailbox();
     let mut approval_output_rx = channel_output_writer
         .take_approval_rx()
         .expect("approval output receiver must be available before sharing writer");
@@ -4596,6 +4786,7 @@ pub async fn run_interactive_shell_inner(
 
     // 6. Main loop
     let auto_approve = task_opts.yolo || task_opts.auto_approve_all;
+    let mut turn_render_worker = TurnRenderWorker::start()?;
     let run_result = run_main_loop(
         &mut terminal,
         &mut app,
@@ -4603,6 +4794,8 @@ pub async fn run_interactive_shell_inner(
         &mut priority_output_rx,
         &mut mention_search_rx,
         &mut output_rx,
+        reasoning_mailbox,
+        &turn_render_worker,
         output_writer,
         session,
         task_id.clone(),
@@ -4617,6 +4810,7 @@ pub async fn run_interactive_shell_inner(
         auto_approve,
     )
     .await;
+    turn_render_worker.shutdown();
     if let Err(err) = app.shutdown_scrollback_writer() {
         tracing::warn!("Failed to shut down scrollback writer: {err}");
     }
@@ -5340,7 +5534,17 @@ mod tests {
 
         let mut app = App::new();
         app.set_content_width(80);
-        drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
+        let mailbox = writer.reasoning_mailbox();
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        drain_output_queues(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut rx,
+            &mut app,
+            None,
+            Some(&mailbox),
+            None,
+        );
 
         let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
         assert_eq!(
@@ -5438,6 +5642,37 @@ mod tests {
         assert!(rendered.contains("Execute this tool?"));
         assert_eq!(writer.dropped_count(), 0);
         assert!(!writer.take_overflow_signal());
+    }
+
+    #[test]
+    fn test_approval_lane_preempts_large_main_backlog() {
+        use crate::cli::output::{OutputEvent, OutputWriter};
+
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        for index in 0..10_000 {
+            writer.emit(OutputEvent::plain(format!("backlog line {index}")));
+        }
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            43,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        writer.emit(OutputEvent::ApprovalRequested(request));
+
+        let mut app = App::new();
+        drain_output_for_test_with_lanes(&mut approval_rx, &mut priority_rx, &mut rx, &mut app);
+
+        assert!(app.has_pending_approval());
+        assert!(writer.dropped_count() > 0);
+        assert!(writer.take_overflow_signal());
     }
 
     #[test]

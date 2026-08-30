@@ -13,6 +13,66 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+#[derive(Clone, Default)]
+pub(crate) struct ReasoningMailbox {
+    pending: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+const MAX_REASONING_SNAPSHOT_BYTES: usize = 64 * 1024;
+
+impl ReasoningMailbox {
+    fn append(&self, chunk: String) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        let mut chunk = chunk;
+        Self::retain_tail(&mut chunk);
+        let mut pending = self.pending.lock().expect("reasoning mailbox poisoned");
+        match pending.as_mut() {
+            Some(existing) => {
+                existing.push_str(&chunk);
+                Self::retain_tail(existing);
+            }
+            None => *pending = Some(chunk),
+        }
+    }
+
+    fn retain_tail(value: &mut String) {
+        if value.len() <= MAX_REASONING_SNAPSHOT_BYTES {
+            return;
+        }
+        let minimum_start = value.len() - MAX_REASONING_SNAPSHOT_BYTES;
+        let start = value
+            .char_indices()
+            .find_map(|(index, _)| (index >= minimum_start).then_some(index))
+            .unwrap_or(value.len());
+        value.drain(..start);
+    }
+
+    pub(crate) fn take(&self) -> Option<String> {
+        self.pending
+            .lock()
+            .expect("reasoning mailbox poisoned")
+            .take()
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending
+            .lock()
+            .expect("reasoning mailbox poisoned")
+            .is_some()
+    }
+
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .expect("reasoning mailbox poisoned")
+            .as_ref()
+            .map_or(0, String::len)
+    }
+}
+
 /// An output event that can be rendered by the TUI or forwarded to stderr.
 #[derive(Clone, Debug)]
 pub enum OutputEvent {
@@ -351,6 +411,7 @@ impl OutputWriter for StderrOutputWriter {
 struct DropCounters {
     model_text: std::sync::atomic::AtomicU64,
     tool_output: std::sync::atomic::AtomicU64,
+    reasoning: std::sync::atomic::AtomicU64,
     approval_prompt: std::sync::atomic::AtomicU64,
     other: std::sync::atomic::AtomicU64,
 }
@@ -359,6 +420,7 @@ impl DropCounters {
     fn total(&self) -> u64 {
         self.model_text.load(std::sync::atomic::Ordering::Relaxed)
             + self.tool_output.load(std::sync::atomic::Ordering::Relaxed)
+            + self.reasoning.load(std::sync::atomic::Ordering::Relaxed)
             + self
                 .approval_prompt
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -368,6 +430,7 @@ impl DropCounters {
     fn format_summary(&self) -> String {
         let m = self.model_text.load(std::sync::atomic::Ordering::Relaxed);
         let t = self.tool_output.load(std::sync::atomic::Ordering::Relaxed);
+        let r = self.reasoning.load(std::sync::atomic::Ordering::Relaxed);
         let a = self
             .approval_prompt
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -378,6 +441,9 @@ impl DropCounters {
         }
         if t > 0 {
             parts.push(format!("{t} tools"));
+        }
+        if r > 0 {
+            parts.push(format!("{r} reasoning"));
         }
         if a > 0 {
             parts.push(format!("{a} approvals"));
@@ -401,6 +467,7 @@ impl DropCounters {
 /// drain loop can service approvals first and bound critical work separately.
 pub struct ChannelOutputWriter {
     tx: mpsc::Sender<OutputEvent>,
+    reasoning_mailbox: ReasoningMailbox,
     approval_tx: mpsc::UnboundedSender<OutputEvent>,
     approval_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
     priority_tx: mpsc::UnboundedSender<OutputEvent>,
@@ -419,6 +486,7 @@ impl ChannelOutputWriter {
         let (priority_tx, priority_rx) = mpsc::unbounded_channel();
         Self {
             tx,
+            reasoning_mailbox: ReasoningMailbox::default(),
             approval_tx,
             approval_rx: std::sync::Mutex::new(Some(approval_rx)),
             priority_tx,
@@ -428,6 +496,11 @@ impl ChannelOutputWriter {
             drop_counters: DropCounters::default(),
             overflow_signaled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn reasoning_mailbox(&self) -> ReasoningMailbox {
+        self.reasoning_mailbox.clone()
     }
 
     #[must_use]
@@ -472,7 +545,7 @@ impl ChannelOutputWriter {
     fn record_dropped_event(&self, event: &OutputEvent) {
         let counters = &self.drop_counters;
         match event {
-            OutputEvent::Line(_) => {
+            OutputEvent::Line(_) | OutputEvent::ModelUpdateLine(_) => {
                 counters
                     .model_text
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -483,6 +556,11 @@ impl ChannelOutputWriter {
             | OutputEvent::CommandOutputLine(_) => {
                 counters
                     .tool_output
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            OutputEvent::ReasoningChunk(_) => {
+                counters
+                    .reasoning
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             _ => {
@@ -506,10 +584,26 @@ impl ChannelOutputWriter {
             );
         }
     }
+
+    fn flush_reasoning_snapshot(&self) {
+        let Some(snapshot) = self.reasoning_mailbox.take() else {
+            return;
+        };
+        if let Err(error) = self.tx.try_send(OutputEvent::ReasoningChunk(snapshot)) {
+            self.record_dropped_event(&error.into_inner());
+        }
+    }
 }
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
+        if let OutputEvent::ReasoningChunk(chunk) = event {
+            self.reasoning_mailbox.append(chunk);
+            return;
+        }
+
+        self.flush_reasoning_snapshot();
+
         if matches!(
             &event,
             OutputEvent::ApprovalRequested(_) | OutputEvent::ApprovalFinished { .. }
@@ -532,6 +626,8 @@ impl OutputWriter for ChannelOutputWriter {
         let is_lossy_update = matches!(event, OutputEvent::ModelUpdateLine(_));
         if let Err(err) = self.tx.try_send(event) {
             if is_lossy_update {
+                let dropped = err.into_inner();
+                self.record_dropped_event(&dropped);
                 return;
             }
 
@@ -546,7 +642,6 @@ impl OutputWriter for ChannelOutputWriter {
                     | OutputEvent::ErrorBox(_)
                     | OutputEvent::QueuedMessageStarted { .. }
                     | OutputEvent::UserPromptLine(_)
-                    | OutputEvent::ReasoningChunk(_)
             );
 
             if is_critical {
@@ -794,15 +889,8 @@ mod tests {
             None,
             None,
         );
-        let compatibility_lines = format_timing_phases(
-            start,
-            request_sent,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let compatibility_lines =
+            format_timing_phases(start, request_sent, None, None, None, None, None);
 
         for lines in [&lines, &compatibility_lines] {
             assert!(
@@ -870,29 +958,72 @@ mod tests {
     }
 
     #[test]
-    fn test_channel_overflow_preserves_reasoning_chunks_via_priority_lane() {
+    fn test_channel_overflow_coalesces_reasoning_chunks_in_bounded_mailbox() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
         let writer = ChannelOutputWriter::new(tx);
-        let mut priority_rx = writer
-            .take_priority_rx()
-            .expect("priority receiver should be available");
 
         writer.emit(OutputEvent::plain("line 1"));
         writer.emit(OutputEvent::reasoning_chunk("first\n"));
         writer.emit(OutputEvent::reasoning_chunk("second"));
 
-        let mut reasoning = Vec::new();
-        while let Ok(event) = priority_rx.try_recv() {
-            match event {
-                OutputEvent::ReasoningChunk(chunk) => reasoning.push(chunk),
-                other => panic!("expected reasoning chunk, got {other:?}"),
-            }
-        }
-        assert_eq!(reasoning, ["first\n", "second"]);
+        assert_eq!(
+            writer.reasoning_mailbox().take().as_deref(),
+            Some("first\nsecond")
+        );
         assert_eq!(writer.dropped_count(), 0);
         assert!(!writer.take_overflow_signal());
+    }
+
+    #[test]
+    fn test_reasoning_snapshot_is_queued_before_following_output() {
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutputEvent>(4);
+        let writer = ChannelOutputWriter::new(tx);
+
+        writer.emit(OutputEvent::reasoning_chunk("thinking"));
+        writer.emit(OutputEvent::plain("answer"));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(OutputEvent::ReasoningChunk(chunk)) if chunk == "thinking"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(OutputEvent::Line(line)) if line.to_string() == "answer"
+        ));
+        assert!(!writer.reasoning_mailbox().is_pending());
+    }
+
+    #[test]
+    fn test_reasoning_snapshot_has_a_bounded_tail() {
+        use super::{MAX_REASONING_SNAPSHOT_BYTES, ReasoningMailbox};
+
+        let mailbox = ReasoningMailbox::default();
+        mailbox.append("a".repeat(MAX_REASONING_SNAPSHOT_BYTES + 1024));
+        mailbox.append("終".repeat(1024));
+
+        let snapshot = mailbox.take().expect("reasoning snapshot should exist");
+        assert!(snapshot.len() <= MAX_REASONING_SNAPSHOT_BYTES);
+        assert!(snapshot.ends_with(&"終".repeat(1024)));
+    }
+
+    #[test]
+    fn test_dropped_reasoning_snapshot_is_counted_when_main_queue_is_full() {
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let writer = ChannelOutputWriter::new(tx);
+
+        writer.emit(OutputEvent::plain("line 1"));
+        writer.emit(OutputEvent::reasoning_chunk("thinking"));
+        writer.emit(OutputEvent::plain("line 2"));
+
+        assert_eq!(writer.dropped_count(), 2);
+        assert_eq!(writer.drop_summary(), "1 model, 1 reasoning");
+        assert!(writer.take_overflow_signal());
     }
 
     #[test]
@@ -964,13 +1095,17 @@ mod tests {
         writer.emit(OutputEvent::ErrorBox("failed".to_string()));
         writer.emit(OutputEvent::ReasoningChunk("thinking".to_string()));
 
-        assert_eq!(writer.dropped_count(), 4);
-        assert_eq!(writer.drop_summary(), "4 other");
+        assert_eq!(writer.dropped_count(), 3);
+        assert_eq!(writer.drop_summary(), "3 other");
         assert!(writer.take_overflow_signal());
+        assert_eq!(
+            writer.reasoning_mailbox().take().as_deref(),
+            Some("thinking")
+        );
     }
 
     #[test]
-    fn test_channel_overflow_ignores_lossy_model_updates() {
+    fn test_channel_overflow_counts_lossy_model_updates() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
         use ratatui::text::Line;
 
@@ -980,15 +1115,9 @@ mod tests {
         writer.emit(OutputEvent::plain("line 1"));
         writer.emit(OutputEvent::ModelUpdateLine(Line::from("partial")));
 
-        assert!(
-            !writer.take_overflow_signal(),
-            "lossy model updates should not trigger the global overflow warning"
-        );
-        assert_eq!(
-            writer.dropped_count(),
-            0,
-            "lossy model updates should not count as dropped durable output"
-        );
+        assert!(writer.take_overflow_signal());
+        assert_eq!(writer.dropped_count(), 1);
+        assert_eq!(writer.drop_summary(), "1 model");
     }
 
     #[test]
