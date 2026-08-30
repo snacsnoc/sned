@@ -1020,6 +1020,19 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_mailbox_counts_bursts_without_growing_unbounded() {
+        use super::{MAX_REASONING_SNAPSHOT_BYTES, ReasoningMailbox};
+
+        let mailbox = ReasoningMailbox::default();
+        for _ in 0..100_000 {
+            mailbox.append("reasoning chunk\n".to_string());
+        }
+
+        assert_eq!(mailbox.received_chunks(), 100_000);
+        assert!(mailbox.pending_len() <= MAX_REASONING_SNAPSHOT_BYTES);
+    }
+
+    #[test]
     fn test_dropped_reasoning_snapshot_is_counted_when_main_queue_is_full() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 

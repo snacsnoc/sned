@@ -1,6 +1,9 @@
 //! Lightweight ANSI syntax highlighting for rendered code blocks.
 
 use crate::cli::colors::style;
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use std::sync::{Mutex, OnceLock};
 use tree_sitter::{Language, Node, Parser};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,19 +35,129 @@ struct HighlightSpan {
     style: TokenStyle,
 }
 
+const HIGHLIGHT_CACHE_ENTRIES: usize = 64;
+const HIGHLIGHT_CACHE_SOURCE_BYTES: usize = 1024 * 1024;
+const HIGHLIGHT_CACHE_RESIDENT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HighlightCacheKey {
+    code: String,
+    language: String,
+    no_color: bool,
+}
+
+struct HighlightCacheValue {
+    rendered: String,
+    source_bytes: usize,
+    resident_bytes: usize,
+}
+
+struct HighlightCache {
+    entries: LruCache<HighlightCacheKey, HighlightCacheValue>,
+    source_bytes: usize,
+    resident_bytes: usize,
+}
+
+impl HighlightCache {
+    fn new() -> Self {
+        Self {
+            entries: LruCache::new(
+                NonZeroUsize::new(HIGHLIGHT_CACHE_ENTRIES)
+                    .expect("highlight cache capacity must be nonzero"),
+            ),
+            source_bytes: 0,
+            resident_bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &HighlightCacheKey) -> Option<String> {
+        self.entries.get(key).map(|value| value.rendered.clone())
+    }
+
+    fn insert(&mut self, key: HighlightCacheKey, rendered: String) {
+        let source_bytes = key.code.len();
+        let resident_bytes = source_bytes
+            .saturating_add(key.language.len())
+            .saturating_add(rendered.len());
+        if source_bytes > HIGHLIGHT_CACHE_SOURCE_BYTES
+            || resident_bytes > HIGHLIGHT_CACHE_RESIDENT_BYTES
+        {
+            return;
+        }
+
+        if let Some(previous) = self.entries.put(
+            key,
+            HighlightCacheValue {
+                rendered,
+                source_bytes,
+                resident_bytes,
+            },
+        ) {
+            self.source_bytes = self.source_bytes.saturating_sub(previous.source_bytes);
+            self.resident_bytes = self.resident_bytes.saturating_sub(previous.resident_bytes);
+        }
+        self.source_bytes = self.source_bytes.saturating_add(source_bytes);
+        self.resident_bytes = self.resident_bytes.saturating_add(resident_bytes);
+
+        while self.source_bytes > HIGHLIGHT_CACHE_SOURCE_BYTES
+            || self.resident_bytes > HIGHLIGHT_CACHE_RESIDENT_BYTES
+        {
+            let Some((_key, value)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.source_bytes = self.source_bytes.saturating_sub(value.source_bytes);
+            self.resident_bytes = self.resident_bytes.saturating_sub(value.resident_bytes);
+        }
+    }
+}
+
+fn highlight_cache() -> &'static Mutex<HighlightCache> {
+    static CACHE: OnceLock<Mutex<HighlightCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HighlightCache::new()))
+}
+
+static HIGHLIGHT_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static HIGHLIGHT_CACHE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn highlight_cache_stats() -> (u64, u64) {
+    (
+        HIGHLIGHT_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        HIGHLIGHT_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Highlight a code block with ANSI color sequences when a matching grammar is available.
 ///
 /// Unsupported languages, disabled grammar features, parse failures, and `NO_COLOR` all fall back
 /// to returning the original code unchanged.
 #[must_use]
 pub fn highlight_code(code: &str, lang: &str) -> String {
-    if std::env::var_os("NO_COLOR").is_some() || code.is_empty() {
+    let no_color = std::env::var_os("NO_COLOR").is_some();
+    if no_color || code.is_empty() {
         return code.to_string();
     }
 
-    let Some(language) = language_for(lang) else {
+    let normalized_language = normalize_lang(lang);
+    let Some(language) = language_for(&normalized_language) else {
         return code.to_string();
     };
+
+    let key = HighlightCacheKey {
+        code: code.to_string(),
+        language: normalized_language,
+        no_color,
+    };
+    if let Some(rendered) = highlight_cache()
+        .lock()
+        .expect("highlight cache poisoned")
+        .get(&key)
+    {
+        HIGHLIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return rendered;
+    }
+    HIGHLIGHT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let mut parser = Parser::new();
     if parser.set_language(&language).is_err() {
@@ -57,7 +170,12 @@ pub fn highlight_code(code: &str, lang: &str) -> String {
 
     let mut spans = Vec::new();
     collect_spans(tree.root_node(), code.as_bytes(), &mut spans);
-    render_highlights(code, &spans).unwrap_or_else(|| render_lexical_highlights(code))
+    let rendered = render_highlights(code, &spans).unwrap_or_else(|| render_lexical_highlights(code));
+    highlight_cache()
+        .lock()
+        .expect("highlight cache poisoned")
+        .insert(key, rendered.clone());
+    rendered
 }
 
 #[cfg(feature = "lang-rust")]
@@ -409,6 +527,33 @@ mod tests {
     #[test]
     fn highlights_rust() {
         assert_colored("pub fn main() { let count = 42; }", "rust");
+    }
+
+    #[cfg(feature = "lang-rust")]
+    #[test]
+    fn repeated_highlight_returns_equivalent_cached_output() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let previous = std::env::var_os("NO_COLOR");
+        // SAFETY: env mutation guarded by mutex; restoring it before return
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+        }
+
+        let code = "fn cache_regression_unique() -> usize { 42 }";
+        let first = highlight_code(code, "rust");
+        let second = highlight_code(code, "rust");
+
+        // SAFETY: env mutation guarded by mutex; restoring the prior value
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("NO_COLOR", value),
+                None => std::env::remove_var("NO_COLOR"),
+            }
+        }
+
+        assert_eq!(first, second);
     }
 
     #[cfg(feature = "lang-python")]

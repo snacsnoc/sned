@@ -8,6 +8,9 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use std::sync::{Mutex, OnceLock};
 
 /// Render a completion result as terminal-friendly lines.
 ///
@@ -95,13 +98,7 @@ pub fn render_markdown(prefix: Option<&str>, text: &str) -> Vec<Line<'static>> {
 
 #[must_use]
 pub fn render_streamed_markdown(text: &str, interactive_mode: bool) -> Vec<Line<'static>> {
-    render_markdown_with_code_limit(
-        None,
-        text,
-        Some(crate::core::agent_types::code_block_display_limit(
-            interactive_mode,
-        )),
-    )
+    render_streamed_markdown_cached(text, interactive_mode, None)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -110,18 +107,137 @@ pub(crate) struct MarkdownRenderTiming {
     pub(crate) syntax_highlight_us: u64,
 }
 
+const MARKDOWN_CACHE_ENTRIES: usize = 16;
+const MARKDOWN_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MarkdownCacheKey {
+    text: String,
+    interactive_mode: bool,
+    code_line_limit: Option<usize>,
+    no_color: bool,
+}
+
+struct MarkdownCacheValue {
+    rendered: Vec<Line<'static>>,
+    resident_bytes: usize,
+}
+
+struct MarkdownCache {
+    entries: LruCache<MarkdownCacheKey, MarkdownCacheValue>,
+    resident_bytes: usize,
+}
+
+impl MarkdownCache {
+    fn new() -> Self {
+        Self {
+            entries: LruCache::new(
+                NonZeroUsize::new(MARKDOWN_CACHE_ENTRIES)
+                    .expect("markdown cache capacity must be nonzero"),
+            ),
+            resident_bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &MarkdownCacheKey) -> Option<Vec<Line<'static>>> {
+        self.entries
+            .get(key)
+            .map(|value| value.rendered.clone())
+    }
+
+    fn insert(&mut self, key: MarkdownCacheKey, rendered: Vec<Line<'static>>) {
+        let resident_bytes = key.text.len().saturating_add(
+            rendered
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.content.len()).sum::<usize>())
+                .sum::<usize>(),
+        );
+        if resident_bytes > MARKDOWN_CACHE_BYTES {
+            return;
+        }
+
+        if let Some(previous) = self.entries.put(
+            key,
+            MarkdownCacheValue {
+                rendered,
+                resident_bytes,
+            },
+        ) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(previous.resident_bytes);
+        }
+        self.resident_bytes = self.resident_bytes.saturating_add(resident_bytes);
+
+        while self.resident_bytes > MARKDOWN_CACHE_BYTES {
+            let Some((_key, value)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.resident_bytes = self.resident_bytes.saturating_sub(value.resident_bytes);
+        }
+    }
+}
+
+fn markdown_cache() -> &'static Mutex<MarkdownCache> {
+    static CACHE: OnceLock<Mutex<MarkdownCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(MarkdownCache::new()))
+}
+
+static MARKDOWN_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MARKDOWN_CACHE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn markdown_cache_stats() -> (u64, u64) {
+    (
+        MARKDOWN_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        MARKDOWN_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn render_streamed_markdown_cached(
+    text: &str,
+    interactive_mode: bool,
+    mut syntax_highlight_us: Option<&mut u64>,
+) -> Vec<Line<'static>> {
+    let code_line_limit = Some(crate::core::agent_types::code_block_display_limit(
+        interactive_mode,
+    ));
+    let key = MarkdownCacheKey {
+        text: text.to_string(),
+        interactive_mode,
+        code_line_limit,
+        no_color: std::env::var_os("NO_COLOR").is_some(),
+    };
+    if let Some(rendered) = markdown_cache()
+        .lock()
+        .expect("markdown cache poisoned")
+        .get(&key)
+    {
+        MARKDOWN_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return rendered;
+    }
+    MARKDOWN_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rendered = render_markdown_with_code_limit_timed(
+        None,
+        text,
+        code_line_limit,
+        syntax_highlight_us.as_deref_mut(),
+    );
+    markdown_cache()
+        .lock()
+        .expect("markdown cache poisoned")
+        .insert(key, rendered.clone());
+    rendered
+}
+
 pub(crate) fn render_streamed_markdown_timed(
     text: &str,
     interactive_mode: bool,
 ) -> (Vec<Line<'static>>, MarkdownRenderTiming) {
     let started = std::time::Instant::now();
     let mut syntax_highlight_us = 0;
-    let rendered = render_markdown_with_code_limit_timed(
-        None,
+    let rendered = render_streamed_markdown_cached(
         text,
-        Some(crate::core::agent_types::code_block_display_limit(
-            interactive_mode,
-        )),
+        interactive_mode,
         Some(&mut syntax_highlight_us),
     );
     (
@@ -569,6 +685,16 @@ mod tests {
         let text = collect_text(&lines);
         assert!(text.contains("Created the file."));
         assert!(text.contains("🚀 Task Completed:"));
+    }
+
+    #[test]
+    fn repeated_streamed_markdown_render_uses_equivalent_cached_lines() {
+        let text = "cache-regression-unique\n\n**styled**\n\n```rust\nlet cache_value = 42;\n```";
+        let (first, _) = render_streamed_markdown_timed(text, true);
+        let (second, second_timing) = render_streamed_markdown_timed(text, true);
+
+        assert_eq!(first, second);
+        assert_eq!(second_timing.syntax_highlight_us, 0);
     }
 
     #[test]

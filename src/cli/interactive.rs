@@ -54,8 +54,20 @@ fn format_context_window(tokens: u64) -> String {
 }
 
 const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 262_144;
+const MAX_MAIN_EVENTS_PER_DRAIN: usize = 128;
+const MAX_ADAPTIVE_MAIN_EVENTS_PER_DRAIN: usize = 1_024;
 const DEFAULT_MOUSE_SCROLL_LINES: isize = 3;
 const MAX_MOUSE_SCROLL_LINES: isize = 100;
+
+fn adaptive_main_event_budget(backlog: usize) -> usize {
+    if backlog <= MAX_MAIN_EVENTS_PER_DRAIN {
+        return MAX_MAIN_EVENTS_PER_DRAIN;
+    }
+
+    (backlog / 4)
+        .max(MAX_MAIN_EVENTS_PER_DRAIN)
+        .min(MAX_ADAPTIVE_MAIN_EVENTS_PER_DRAIN)
+}
 
 fn parse_output_channel_capacity(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.parse::<usize>().ok())
@@ -1179,7 +1191,6 @@ fn drain_output_queues(
     reasoning_mailbox: Option<&crate::cli::output::ReasoningMailbox>,
     turn_render_worker: Option<&TurnRenderWorker>,
 ) -> usize {
-    const MAX_MAIN_EVENTS_PER_DRAIN: usize = 128;
     const MAX_CRITICAL_EVENTS_PER_DRAIN: usize = 512;
     const MAX_DEFERRED_PRIORITY_EVENTS: usize = 1_024;
     #[cfg(not(test))]
@@ -1275,7 +1286,7 @@ fn drain_output_queues(
         );
     }
 
-    let mut main_budget = MAX_MAIN_EVENTS_PER_DRAIN;
+    let mut main_budget = adaptive_main_event_budget(rx.len());
     while main_budget > 0
         && drain_started.elapsed() < MAX_DRAIN_DURATION
         && let Ok(event) = rx.try_recv()
@@ -3733,6 +3744,8 @@ async fn run_main_loop(
         turn_render_count: u64,
         turn_render_apply_peak_us: u64,
         main_queue_peak: usize,
+        main_queue_backlog_peak: usize,
+        main_queue_backlog_cycles: u64,
         priority_queue_peak: usize,
         approval_queue_peak: usize,
         deferred_priority_peak: usize,
@@ -3767,8 +3780,10 @@ async fn run_main_loop(
             );
             eprintln!("[timing] output_lines_peak={}", self.output_lines_peak);
             eprintln!(
-                "[timing] queue_peaks: main={} priority={} approval={} deferred_priority={}",
+                "[timing] queue_peaks: main={} main_backlog={} backlog_cycles={} priority={} approval={} deferred_priority={}",
                 self.main_queue_peak,
+                self.main_queue_backlog_peak,
+                self.main_queue_backlog_cycles,
                 self.priority_queue_peak,
                 self.approval_queue_peak,
                 self.deferred_priority_peak,
@@ -3791,6 +3806,16 @@ async fn run_main_loop(
                 self.turn_render_apply_total_us,
                 self.turn_render_count,
                 self.turn_render_apply_peak_us,
+            );
+            let (markdown_hits, markdown_misses) = crate::cli::markdown::markdown_cache_stats();
+            let (highlight_hits, highlight_misses) =
+                crate::cli::syntax_highlight::highlight_cache_stats();
+            eprintln!(
+                "[timing] render_cache: markdown_hits={} markdown_misses={} highlight_hits={} highlight_misses={}",
+                markdown_hits,
+                markdown_misses,
+                highlight_hits,
+                highlight_misses,
             );
 
             if let Some(session_start) = self.session_start_time {
@@ -3837,6 +3862,8 @@ async fn run_main_loop(
         drain_events_peak: 0,
         output_lines_peak: 0,
         main_queue_peak: 0,
+        main_queue_backlog_peak: 0,
+        main_queue_backlog_cycles: 0,
         priority_queue_peak: 0,
         approval_queue_peak: 0,
         deferred_priority_peak: 0,
@@ -3871,6 +3898,11 @@ async fn run_main_loop(
         // 1. Drain channel into app
         {
             let t = std::time::Instant::now();
+            let main_queue_before = output_rx.len();
+            timing.main_queue_backlog_peak = timing.main_queue_backlog_peak.max(main_queue_before);
+            if main_queue_before > 0 {
+                timing.main_queue_backlog_cycles = timing.main_queue_backlog_cycles.saturating_add(1);
+            }
             let drained_events = drain_output_queues(
                 approval_output_rx,
                 priority_output_rx,
@@ -3902,7 +3934,8 @@ async fn run_main_loop(
                 .drain_events_total
                 .saturating_add(drained_events as u64);
             timing.drain_events_peak = timing.drain_events_peak.max(drained_events);
-            timing.main_queue_peak = timing.main_queue_peak.max(output_rx.len());
+            let main_queue_len = output_rx.len();
+            timing.main_queue_peak = timing.main_queue_peak.max(main_queue_len);
             timing.priority_queue_peak = timing.priority_queue_peak.max(priority_output_rx.len());
             timing.approval_queue_peak = timing.approval_queue_peak.max(approval_output_rx.len());
             timing.deferred_priority_peak = timing
@@ -5723,6 +5756,24 @@ mod tests {
         assert_eq!(
             parse_output_channel_capacity(Some("invalid")),
             DEFAULT_OUTPUT_CHANNEL_CAPACITY
+        );
+    }
+
+    #[test]
+    fn test_adaptive_main_event_budget_scales_only_for_backlog() {
+        assert_eq!(adaptive_main_event_budget(0), MAX_MAIN_EVENTS_PER_DRAIN);
+        assert_eq!(
+            adaptive_main_event_budget(MAX_MAIN_EVENTS_PER_DRAIN),
+            MAX_MAIN_EVENTS_PER_DRAIN
+        );
+        assert_eq!(adaptive_main_event_budget(1_024), 256);
+        assert_eq!(
+            adaptive_main_event_budget(10_000),
+            MAX_ADAPTIVE_MAIN_EVENTS_PER_DRAIN
+        );
+        assert_eq!(
+            adaptive_main_event_budget(usize::MAX),
+            MAX_ADAPTIVE_MAIN_EVENTS_PER_DRAIN
         );
     }
 
