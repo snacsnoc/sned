@@ -2,6 +2,7 @@ use crate::core::process_output::{CapturedOutput, capture_sync, configured_outpu
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -72,6 +73,7 @@ struct HookLineFramer {
     callback: Option<Arc<Mutex<HookStreamCallback>>>,
     line: Vec<u8>,
     discarding_line: bool,
+    pending_callback_lines: VecDeque<String>,
 }
 
 impl HookLineFramer {
@@ -81,6 +83,7 @@ impl HookLineFramer {
             callback,
             line: Vec::with_capacity(1024),
             discarding_line: false,
+            pending_callback_lines: VecDeque::new(),
         }
     }
 
@@ -119,6 +122,7 @@ impl HookLineFramer {
         }
         self.line.clear();
         self.discarding_line = false;
+        self.flush_pending_callbacks();
     }
 
     fn discard_pending(&mut self) {
@@ -133,17 +137,26 @@ impl HookLineFramer {
         self.emit(String::from_utf8_lossy(&self.line).into_owned());
     }
 
-    fn emit(&self, line: String) {
-        if let Some(callback) = &self.callback {
-            // Streaming callbacks are user/UI code. Never let a slow callback
-            // stop the pipe reader: blocking here can fill the child pipe and
-            // deadlock the hook process. The captured output remains available
-            // for the final hook result even when a live callback is skipped.
-            if let Some(mut callback) = callback.try_lock() {
-                callback(&line, self.stream);
-            } else {
-                tracing::debug!(stream = self.stream, "skipping blocked hook output callback");
-            }
+    fn emit(&mut self, line: String) {
+        self.pending_callback_lines.push_back(line);
+        self.flush_pending_callbacks();
+    }
+
+    fn flush_pending_callbacks(&mut self) {
+        let Some(callback) = &self.callback else {
+            self.pending_callback_lines.clear();
+            return;
+        };
+        let Some(mut callback) = callback.try_lock() else {
+            tracing::debug!(
+                stream = self.stream,
+                pending = self.pending_callback_lines.len(),
+                "deferring hook output callback while callback is busy"
+            );
+            return;
+        };
+        while let Some(line) = self.pending_callback_lines.pop_front() {
+            callback(&line, self.stream);
         }
     }
 }
