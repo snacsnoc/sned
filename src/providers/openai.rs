@@ -27,6 +27,10 @@ pub enum OpenAiEndpointKind {
     Compatible,
 }
 
+#[cfg(test)]
+pub static OPENAI_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// Configuration for the OpenAI provider.
 #[derive(Clone)]
 pub struct OpenAiConfig {
@@ -875,10 +879,69 @@ async fn send_chunk(
     crate::providers::send_chunk(tx, chunk, "OpenAI", chunk_type).await
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+enum OpenAiTextStreamMode {
+    #[default]
+    Incremental,
+    Cumulative,
+}
+
 #[derive(Debug, Default)]
 pub struct OpenAiStreamDeltaState {
     emitted_reasoning: String,
+    emitted_text: String,
+    text_mode: OpenAiTextStreamMode,
     started_tool_call_indices: std::collections::HashSet<usize>,
+}
+
+impl OpenAiStreamDeltaState {
+    fn for_cumulative_text_stream(enabled: bool) -> Self {
+        Self {
+            text_mode: if enabled {
+                OpenAiTextStreamMode::Cumulative
+            } else {
+                OpenAiTextStreamMode::Incremental
+            },
+            ..Self::default()
+        }
+    }
+}
+
+fn normalize_openai_text_delta(
+    emitted_text: &mut String,
+    mode: &mut OpenAiTextStreamMode,
+    content: String,
+) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+
+    match mode {
+        OpenAiTextStreamMode::Incremental => {
+            emitted_text.push_str(&content);
+            Some(content)
+        }
+        OpenAiTextStreamMode::Cumulative => {
+            if content == *emitted_text {
+                return None;
+            }
+
+            if let Some(delta) = content.strip_prefix(emitted_text.as_str()) {
+                let delta = delta.to_string();
+                *emitted_text = content;
+                Some(delta)
+            } else {
+                tracing::warn!(
+                    previous_text_len = emitted_text.len(),
+                    incoming_text_len = content.len(),
+                    "OpenAI cumulative text stream was not an extension; treating the chunk as incremental"
+                );
+                *mode = OpenAiTextStreamMode::Incremental;
+                emitted_text.push_str(&content);
+                Some(content)
+            }
+        }
+    }
 }
 
 fn normalize_qwen_thinking_tool_name(name: &str) -> Option<String> {
@@ -923,7 +986,11 @@ async fn process_openai_sse_line(
             let delta = choice.delta;
 
             if let Some(content) = delta.content
-                && !content.is_empty()
+                && let Some(content) = normalize_openai_text_delta(
+                    &mut delta_state.emitted_text,
+                    &mut delta_state.text_mode,
+                    content,
+                )
             {
                 send_chunk(
                     tx,
@@ -1103,13 +1170,29 @@ fn body_looks_like_sse(body: &[u8]) -> bool {
         .any(|line| line.trim_start().starts_with("data:"))
 }
 
+fn cumulative_openai_text_stream_from_env() -> Result<bool, String> {
+    let Some(value) = std::env::var_os("SNED_OPENAI_CUMULATIVE_TEXT_STREAM") else {
+        return Ok(false);
+    };
+    let value = value.to_string_lossy().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        value => Err(format!(
+            "SNED_OPENAI_CUMULATIVE_TEXT_STREAM must be 0 or 1, got {value:?}"
+        )),
+    }
+}
+
 async fn decode_openai_sse_body(
     body: &[u8],
     model_info: Option<&OpenAiCompatibleModelInfo>,
+    cumulative_text_stream: bool,
 ) -> Vec<ApiStreamChunk> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
     let mut buffer = crate::providers::SseLineBuffer::default();
-    let mut delta_state = OpenAiStreamDeltaState::default();
+    let mut delta_state =
+        OpenAiStreamDeltaState::for_cumulative_text_stream(cumulative_text_stream);
     let mut accumulated_tool_calls = std::collections::HashMap::new();
     let mut completed_tool_call_indices = std::collections::HashSet::new();
     let mut last_stop_reason = None;
@@ -1280,6 +1363,8 @@ impl Provider for OpenAiProvider {
             optional_stream_timeout_from_env("SNED_SSE_INACTIVITY_TIMEOUT_SECS")
                 .map_err(ProviderError::InvalidRequest)?,
         );
+        let cumulative_text_stream =
+            cumulative_openai_text_stream_from_env().map_err(ProviderError::InvalidRequest)?;
         let request_started_at = Instant::now();
         let headers_timeout = response_headers_timeout_for_request(self.config.stream);
         let response = match tokio::time::timeout(
@@ -1372,8 +1457,12 @@ impl Provider for OpenAiProvider {
                         "OpenAI endpoint returned an SSE body without an SSE content type; using the SSE decoder"
                     );
                     let chunks =
-                        decode_openai_sse_body(&response_body, self.config.model_info.as_ref())
-                            .await;
+                        decode_openai_sse_body(
+                            &response_body,
+                            self.config.model_info.as_ref(),
+                            cumulative_text_stream,
+                        )
+                        .await;
                     return Ok(Box::pin(tokio_stream::iter(chunks)));
                 }
                 Err(error) => {
@@ -1405,7 +1494,8 @@ impl Provider for OpenAiProvider {
         tokio::spawn(async move {
             let mut stream = stream;
             let mut sse_buffer = crate::providers::SseLineBuffer::default();
-            let mut delta_state = OpenAiStreamDeltaState::default();
+            let mut delta_state =
+                OpenAiStreamDeltaState::for_cumulative_text_stream(cumulative_text_stream);
             let mut accumulated_tool_calls: std::collections::HashMap<
                 usize,
                 (String, String, String),
@@ -1781,10 +1871,6 @@ mod tests {
     use crate::providers::{
         FunctionDefinition, MessageRole, SseLineBuffer, StorageMessage, ToolDefinition,
     };
-    use std::sync::{LazyLock, Mutex as StdMutex};
-
-    static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
-
     struct EnvVarGuard {
         key: &'static str,
         original: Option<String>,
@@ -1882,7 +1968,7 @@ mod tests {
 
     #[test]
     fn test_non_stream_requests_use_buffered_header_timeout() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
         let _stream_guard = EnvVarGuard::set("SNED_RESPONSE_HEADERS_TIMEOUT_SECS", "7");
         let _buffered_guard = EnvVarGuard::set("SNED_NON_STREAM_RESPONSE_TIMEOUT_SECS", "123");
 
@@ -1898,7 +1984,7 @@ mod tests {
 
     #[test]
     fn test_sse_read_timeouts_are_opt_in() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
         {
             let _first_byte_guard = EnvVarGuard::unset("SNED_SSE_FIRST_BYTE_TIMEOUT_SECS");
             let _inactivity_guard = EnvVarGuard::unset("SNED_SSE_INACTIVITY_TIMEOUT_SECS");
@@ -3076,6 +3162,138 @@ mod tests {
         assert_eq!(state.emitted_reasoning, "The user wants me");
     }
 
+    #[test]
+    fn test_normalize_openai_text_delta_supports_incremental_and_cumulative_streams() {
+        let mut emitted = String::new();
+        let mut mode = OpenAiTextStreamMode::Cumulative;
+
+        assert_eq!(
+            normalize_openai_text_delta(&mut emitted, &mut mode, "the quick".to_string())
+                .as_deref(),
+            Some("the quick")
+        );
+        assert_eq!(
+            normalize_openai_text_delta(&mut emitted, &mut mode, "the quick brown".to_string())
+                .as_deref(),
+            Some(" brown")
+        );
+        assert_eq!(
+            normalize_openai_text_delta(
+                &mut emitted,
+                &mut mode,
+                "the quick brown fox".to_string()
+            )
+            .as_deref(),
+            Some(" fox")
+        );
+        assert_eq!(
+            normalize_openai_text_delta(
+                &mut emitted,
+                &mut mode,
+                "the quick brown fox".to_string()
+            ),
+            None
+        );
+        assert_eq!(emitted, "the quick brown fox");
+        assert_eq!(mode, OpenAiTextStreamMode::Cumulative);
+
+        let mut emitted = String::new();
+        let mut mode = OpenAiTextStreamMode::default();
+        let mut result = String::new();
+        for chunk in ["the quick", " brown", " fox"] {
+            result.push_str(
+                normalize_openai_text_delta(&mut emitted, &mut mode, chunk.to_string())
+                    .as_deref()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(result, "the quick brown fox");
+        assert_eq!(emitted, "the quick brown fox");
+        assert_eq!(mode, OpenAiTextStreamMode::Incremental);
+    }
+
+    #[test]
+    fn test_normalize_openai_text_delta_preserves_incremental_prefix_chunks() {
+        let mut emitted = String::new();
+        let mut mode = OpenAiTextStreamMode::default();
+        let mut result = String::new();
+
+        for chunk in ["a", "ab"] {
+            result.push_str(
+                normalize_openai_text_delta(&mut emitted, &mut mode, chunk.to_string())
+                    .as_deref()
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(result, "aab");
+        assert_eq!(emitted, "aab");
+        assert_eq!(mode, OpenAiTextStreamMode::Incremental);
+    }
+
+    #[test]
+    fn test_normalize_openai_text_delta_handles_unicode_prefixes() {
+        let mut emitted = String::new();
+        let mut mode = OpenAiTextStreamMode::Cumulative;
+
+        assert_eq!(
+            normalize_openai_text_delta(&mut emitted, &mut mode, "café".to_string())
+                .as_deref(),
+            Some("café")
+        );
+        assert_eq!(
+            normalize_openai_text_delta(&mut emitted, &mut mode, "café au lait".to_string())
+                .as_deref(),
+            Some(" au lait")
+        );
+        assert_eq!(emitted, "café au lait");
+    }
+
+    #[test]
+    fn test_normalize_openai_text_delta_falls_back_after_cumulative_rewrite() {
+        let mut emitted = String::new();
+        let mut mode = OpenAiTextStreamMode::Cumulative;
+
+        assert_eq!(
+            normalize_openai_text_delta(&mut emitted, &mut mode, "the quick".to_string())
+                .as_deref(),
+            Some("the quick")
+        );
+        assert_eq!(
+            normalize_openai_text_delta(&mut emitted, &mut mode, "the quick brown".to_string())
+                .as_deref(),
+            Some(" brown")
+        );
+        assert_eq!(
+            normalize_openai_text_delta(&mut emitted, &mut mode, "the fast brown".to_string())
+                .as_deref(),
+            Some("the fast brown")
+        );
+        assert_eq!(mode, OpenAiTextStreamMode::Incremental);
+    }
+
+    #[test]
+    fn test_cumulative_openai_text_stream_setting_defaults_to_incremental() {
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::unset("SNED_OPENAI_CUMULATIVE_TEXT_STREAM");
+        assert!(!cumulative_openai_text_stream_from_env().unwrap());
+    }
+
+    #[test]
+    fn test_cumulative_openai_text_stream_setting_accepts_true_values() {
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("SNED_OPENAI_CUMULATIVE_TEXT_STREAM", "true");
+        assert!(cumulative_openai_text_stream_from_env().unwrap());
+    }
+
+    #[test]
+    fn test_cumulative_openai_text_stream_setting_rejects_invalid_values() {
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("SNED_OPENAI_CUMULATIVE_TEXT_STREAM", "maybe");
+        let error = cumulative_openai_text_stream_from_env().unwrap_err();
+        assert!(error.contains("SNED_OPENAI_CUMULATIVE_TEXT_STREAM"));
+    }
+
     #[tokio::test]
     async fn test_process_openai_sse_line_normalizes_overlapping_reasoning_chunks() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -3368,6 +3586,60 @@ data: [DONE]
         }
 
         println!("Total chunks: {}", chunks.len());
+    }
+
+    #[tokio::test]
+    async fn test_cumulative_openai_text_stream_emits_each_text_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(16);
+        let mut buffer = SseLineBuffer::default();
+        let mut delta_state = OpenAiStreamDeltaState::for_cumulative_text_stream(true);
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason = None;
+        let mut usage_sent = false;
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl-cumulative\",\"choices\":[{\"delta\":{\"content\":\"the quick\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-cumulative\",\"choices\":[{\"delta\":{\"content\":\"the quick brown\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-cumulative\",\"choices\":[{\"delta\":{\"content\":\"the quick brown\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-cumulative\",\"choices\":[{\"delta\":{\"content\":\"the quick brown fox\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+
+        parse_openai_sse_to_chunks(
+            sse.as_bytes(),
+            &mut buffer,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+        finish_openai_sse_to_chunks(
+            &mut buffer,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+        drop(tx);
+
+        let text_chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|chunk| match chunk {
+                ApiStreamChunk::Text(text) => Some(text.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_chunks,
+            vec!["the quick", " brown", " fox"],
+            "cumulative snapshots must become incremental text chunks"
+        );
     }
 
     #[tokio::test]

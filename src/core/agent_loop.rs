@@ -9590,6 +9590,114 @@ Irrespective of whether additional information or instructions are given, you ar
         );
     }
 
+    #[tokio::test]
+    async fn test_cumulative_openai_stream_reaches_agent_loop_without_duplicate_text() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let _openai_env_lock = crate::providers::openai::OPENAI_ENV_LOCK.lock().unwrap();
+        let old_cumulative_text_stream =
+            std::env::var_os("SNED_OPENAI_CUMULATIVE_TEXT_STREAM");
+        // SAFETY: this test holds the shared OpenAI environment lock.
+        unsafe {
+            std::env::set_var("SNED_OPENAI_CUMULATIVE_TEXT_STREAM", "1");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let (header_end, content_length) = loop {
+                let bytes_read = socket.read(&mut buffer).unwrap();
+                assert!(bytes_read > 0, "provider request ended before its headers");
+                request.extend_from_slice(&buffer[..bytes_read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                break (header_end + 4, content_length);
+            };
+            while request.len() < header_end + content_length {
+                let bytes_read = socket.read(&mut buffer).unwrap();
+                assert!(bytes_read > 0, "provider request ended before its body");
+                request.extend_from_slice(&buffer[..bytes_read]);
+            }
+            let body = concat!(
+                "data: {\"id\":\"chatcmpl-agent-loop\",\"choices\":[{\"delta\":{\"content\":\"the quick\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-agent-loop\",\"choices\":[{\"delta\":{\"content\":\"the quick brown\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-agent-loop\",\"choices\":[{\"delta\":{\"content\":\"the quick brown fox\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body.as_bytes()).unwrap();
+        });
+
+        let provider = Arc::new(Providers::OpenAi(
+            crate::providers::openai::OpenAiProvider::new(
+                crate::providers::openai::OpenAiConfig {
+                    api_key: "test-key".to_string(),
+                    base_url: Some(format!("http://{address}")),
+                    model_id: "custom-model".to_string(),
+                    model_info: None,
+                    reasoning_effort: None,
+                    extra_body: None,
+                    custom_headers: None,
+                    endpoint_kind: crate::providers::openai::OpenAiEndpointKind::Compatible,
+                    stream: true,
+                    provider_name: None,
+                },
+            )
+            .unwrap(),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-cumulative-openai-stream");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        let result = agent.execute_turn().await;
+        assert!(
+            matches!(result, TurnResult::Continue | TurnResult::Complete),
+            "unexpected agent result: {result:?}"
+        );
+        server.join().unwrap();
+
+        // SAFETY: restore the process environment while still holding the lock.
+        unsafe {
+            match old_cumulative_text_stream {
+                Some(value) => {
+                    std::env::set_var("SNED_OPENAI_CUMULATIVE_TEXT_STREAM", value);
+                }
+                None => std::env::remove_var("SNED_OPENAI_CUMULATIVE_TEXT_STREAM"),
+            }
+        }
+
+        let accumulated_text = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
+            if let crate::cli::output::OutputEvent::TurnEnd { accumulated_text } = event {
+                Some(accumulated_text)
+            } else {
+                None
+            }
+        });
+        assert_eq!(accumulated_text.as_deref(), Some("the quick brown fox"));
+    }
+
     #[test]
     fn test_path_from_read_file_header() {
         assert_eq!(

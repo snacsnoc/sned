@@ -92,6 +92,10 @@ sned "fix the bug" \
   --extra-body '{"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true}}'
 ```
 
+OpenAI-compatible endpoints are expected to send incremental `delta.content` values. If a
+known endpoint sends the full accumulated text in every SSE chunk instead, set
+`SNED_OPENAI_CUMULATIVE_TEXT_STREAM=1` for that run.
+
 ## Overview
 
 ### Hash-anchored edits
@@ -261,6 +265,7 @@ export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
 | `SNED_NON_STREAM_RESPONSE_TIMEOUT_SECS` | Buffered response-header timeout | `600` |
 | `SNED_SSE_FIRST_BYTE_TIMEOUT_SECS` | Optional time allowed before the first SSE bytes; unset or `0` disables the guard; invalid values fail the request | disabled |
 | `SNED_SSE_INACTIVITY_TIMEOUT_SECS` | Optional maximum quiet period between SSE reads; unset or `0` disables the guard; invalid values fail the request | disabled |
+| `SNED_OPENAI_CUMULATIVE_TEXT_STREAM` | Normalize cumulative text snapshots from a non-conforming OpenAI-compatible SSE endpoint | unset |
 | `SNED_MOUSE_SCROLL_LINES` | Lines scrolled per mouse-wheel step | `3` |
 | `SNED_COMMAND_OUTPUT_LIMIT` | Command output truncation limit in bytes | `10240` |
 | `SNED_SEARCH_TIMEOUT_SECS` | File search timeout | `30` |
