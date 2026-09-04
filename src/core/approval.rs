@@ -933,6 +933,10 @@ impl ApprovalManager {
         category: ToolCategory,
         directories: &[PathBuf],
     ) -> Vec<PathBuf> {
+        // YOLO intentionally bypasses the external-directory approval boundary.
+        if self.yolo_mode {
+            return directories.to_vec();
+        }
         self.external_directory_grants
             .iter()
             .filter(|grant| grant.category == category)
@@ -947,6 +951,9 @@ impl ApprovalManager {
         category: ToolCategory,
         directories: &[PathBuf],
     ) -> bool {
+        if self.yolo_mode {
+            return true;
+        }
         directories.iter().all(|directory| {
             self.external_directory_grants
                 .iter()
@@ -2875,6 +2882,18 @@ mod tests {
         // External write: yolo skips prompt
         assert!(!manager.should_prompt_with_path(SnedTool::EditFile, Some("/tmp/external.rs"),));
         assert!(!manager.should_prompt_with_path(SnedTool::WriteToFile, Some("/etc/config.yaml"),));
+    }
+
+    #[test]
+    fn test_yolo_authorizes_external_directories_without_session_grants() {
+        let manager = ApprovalManager::new().with_yolo(true);
+        let directories = vec![PathBuf::from("/tmp/external")];
+
+        assert!(manager.external_directories_are_granted(ToolCategory::EditFiles, &directories));
+        assert_eq!(
+            manager.external_directory_grants_for(ToolCategory::EditFiles, &directories),
+            directories
+        );
     }
 
     #[test]
