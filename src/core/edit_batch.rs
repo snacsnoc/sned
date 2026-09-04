@@ -79,6 +79,7 @@ pub struct BatchResult {
     pub final_content: Option<String>,
     pub resolved_count: usize,
     pub failed_count: usize,
+    pub withheld_count: usize,
     pub overlap: bool,
     /// Net lines added (additions minus removals) for session summary.
     pub lines_added: u32,
@@ -93,6 +94,9 @@ pub struct BatchResult {
     /// applied cleanly; populated (with `success: false`) when the
     /// post-assembly § check rejects the batch.
     pub glued_anchor_lines: Vec<usize>,
+    /// Insertions rejected because they would duplicate an exact adjacent
+    /// block or repeat the anchored line.
+    pub duplicate_insertions: Vec<FailedEdit>,
 }
 
 // ============================================================================
@@ -239,15 +243,29 @@ impl BatchProcessor {
     ) -> Result<PreparedEdits, FileEditorError> {
         let lines = split_content_lines(content);
 
-        // Validate all edits first
-        for edit in edits {
-            self.validate_edit(edit)?;
+        let validation_failures = edits
+            .iter()
+            .filter_map(|edit| {
+                self.validate_edit(edit)
+                    .err()
+                    .map(|error| {
+                        self.executor
+                            .format_failure_message(edit, Some(&error.to_string()))
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !validation_failures.is_empty() {
+            return Err(FileEditorError::validation_batch_rejected(
+                validation_failures.join("\n\n"),
+                validation_failures.len(),
+                edits.len().saturating_sub(validation_failures.len()),
+            ));
         }
 
         let (resolved_edits, failed_edits) =
             self.executor.resolve_edits(edits, &lines, line_hashes);
 
-        if resolved_edits.is_empty() {
+        if !failed_edits.is_empty() {
             let failure_messages: Vec<String> = failed_edits
                 .iter()
                 .map(|f| {
@@ -255,9 +273,11 @@ impl BatchProcessor {
                         .format_failure_message(&f.edit, Some(&f.error))
                 })
                 .collect();
-            return Err(FileEditorError::AllEditsFailed {
-                message: failure_messages.join("\n\n"),
-            });
+            return Err(FileEditorError::atomic_batch_rejected(
+                failure_messages.join("\n\n"),
+                failed_edits.len(),
+                resolved_edits.len(),
+            ));
         }
 
         Ok(PreparedEdits {
@@ -290,23 +310,40 @@ impl BatchProcessor {
                 success: false,
                 final_content: None,
                 resolved_count: batch.resolved_edits.len(),
-                failed_count: batch.failed_edits.len(),
+                failed_count: batch.resolved_edits.len(),
+                withheld_count: 0,
                 overlap: true,
                 lines_added: 0,
                 lines_removed: 0,
                 unchanged_sites: Vec::new(),
                 glued_anchor_lines: Vec::new(),
+                duplicate_insertions: Vec::new(),
             },
             ApplyOutcome::GluedAnchor(lines) => BatchResult {
                 success: false,
                 final_content: None,
                 resolved_count: batch.resolved_edits.len(),
-                failed_count: batch.failed_edits.len(),
+                failed_count: batch.resolved_edits.len(),
+                withheld_count: 0,
                 overlap: false,
                 lines_added: 0,
                 lines_removed: 0,
                 unchanged_sites: Vec::new(),
                 glued_anchor_lines: lines,
+                duplicate_insertions: Vec::new(),
+            },
+            ApplyOutcome::DuplicateInsertion(failed) => BatchResult {
+                success: false,
+                final_content: None,
+                resolved_count: batch.resolved_edits.len(),
+                failed_count: failed.len(),
+                withheld_count: batch.resolved_edits.len().saturating_sub(failed.len()),
+                overlap: false,
+                lines_added: 0,
+                lines_removed: 0,
+                unchanged_sites: Vec::new(),
+                glued_anchor_lines: Vec::new(),
+                duplicate_insertions: failed,
             },
             ApplyOutcome::Applied(
                 final_lines,
@@ -328,11 +365,13 @@ impl BatchProcessor {
                     final_content: Some(batch.final_content.clone()),
                     resolved_count,
                     failed_count: batch.failed_edits.len(),
+                    withheld_count: 0,
                     overlap: false,
                     lines_added: added_count as u32,
                     lines_removed: removed_count as u32,
                     unchanged_sites,
                     glued_anchor_lines: Vec::new(),
+                    duplicate_insertions: Vec::new(),
                 }
             }
         }
@@ -1040,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_processor_overlap_counts_all_failed_edits() {
+    fn test_batch_processor_rejects_mixed_resolved_and_failed_edits_before_apply() {
         let task_id = "overlap_count_test";
         let anchor_mgr = AnchorStateManager::new();
         anchor_mgr.reset(Some(task_id));
@@ -1075,18 +1114,97 @@ mod tests {
             },
         ];
 
-        let mut prepared = processor
+        let error = processor
             .prepare_edits("/tmp/overlap.rs", "overlap.rs", content, &edits, &hashes)
+            .expect_err("one unresolved anchor must reject the entire file batch");
+
+        assert!(matches!(
+            error,
+            FileEditorError::AtomicBatchRejected {
+                failed_count: 1,
+                withheld_count: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_batch_processor_rejects_overlapping_resolved_edits() {
+        let task_id = "overlap_only_test";
+        let anchor_mgr = AnchorStateManager::new();
+        anchor_mgr.reset(Some(task_id));
+        let processor = BatchProcessor::new(DiffMode::Full);
+        let content = "line1\nline2\nline3";
+        let lines = split_content_lines(content);
+        let hashes = anchor_mgr.reconcile("/tmp/overlap-only.rs", &lines, Some(task_id));
+        let edits = vec![
+            Edit {
+                anchor: format!("{}§line1", hashes[0]),
+                end_anchor: Some(format!("{}§line2", hashes[1])),
+                edit_type: "replace".to_string(),
+                text: "alpha".to_string(),
+                content: None,
+            },
+            Edit {
+                anchor: format!("{}§line2", hashes[1]),
+                end_anchor: Some(format!("{}§line3", hashes[2])),
+                edit_type: "replace".to_string(),
+                text: "beta".to_string(),
+                content: None,
+            },
+        ];
+        let mut prepared = processor
+            .prepare_edits(
+                "/tmp/overlap-only.rs",
+                "overlap-only.rs",
+                content,
+                &edits,
+                &hashes,
+            )
             .unwrap();
-        assert_eq!(prepared.resolved_edits.len(), 2);
-        assert_eq!(prepared.failed_edits.len(), 1);
 
-        let result = processor.apply_batch(&mut prepared, "overlap.rs", "overlap.rs");
-
+        let result = processor.apply_batch(
+            &mut prepared,
+            "/tmp/overlap-only.rs",
+            "overlap-only.rs",
+        );
         assert!(!result.success);
         assert!(result.overlap);
         assert_eq!(result.resolved_count, 2);
-        assert_eq!(result.failed_count, 1);
+        assert_eq!(result.failed_count, 2);
+        assert_eq!(result.withheld_count, 0);
+    }
+
+    #[test]
+    fn test_validation_batch_rejection_does_not_require_reread() {
+        let processor = BatchProcessor::new(DiffMode::Full);
+        let edit = Edit {
+            anchor: "Anchor§line".to_string(),
+            end_anchor: None,
+            edit_type: "insert_after".to_string(),
+            text: "new line".to_string(),
+            content: Some(vec!["line".to_string()]),
+        };
+
+        let error = processor
+            .prepare_edits(
+                "/tmp/test.rs",
+                "test.rs",
+                "line",
+                &[edit],
+                &["Anchor".into()],
+            )
+            .expect_err("content fingerprints are invalid for insertions");
+
+        assert!(!error.requires_reread());
+        assert!(matches!(
+            error,
+            FileEditorError::AtomicBatchRejected {
+                failed_count: 1,
+                withheld_count: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -118,8 +118,60 @@ pub enum FileEditorError {
     #[error("Edit validation failed: {0}")]
     ValidationError(String),
 
+    #[error(
+        "File edit batch rejected: {message} {failed_count} edit(s) failed; {withheld_count} otherwise-valid edit(s) were withheld. No edits were applied to this file."
+    )]
+    AtomicBatchRejected {
+        message: String,
+        failed_count: usize,
+        withheld_count: usize,
+        requires_reread: bool,
+    },
+
     #[error("Overlapping edit ranges: {message}")]
     OverlappingEdits { message: String },
+}
+
+impl FileEditorError {
+    pub(crate) fn atomic_batch_rejected(
+        message: impl Into<String>,
+        failed_count: usize,
+        withheld_count: usize,
+    ) -> Self {
+        let message = message.into();
+        let requires_reread = EditFailureReason::from_diagnostics(&message)
+            .into_iter()
+            .any(EditFailureReason::requires_reread);
+        Self::AtomicBatchRejected {
+            message,
+            failed_count,
+            withheld_count,
+            requires_reread,
+        }
+    }
+
+    pub(crate) fn validation_batch_rejected(
+        message: impl Into<String>,
+        failed_count: usize,
+        withheld_count: usize,
+    ) -> Self {
+        Self::AtomicBatchRejected {
+            message: message.into(),
+            failed_count,
+            withheld_count,
+            requires_reread: false,
+        }
+    }
+
+    pub(crate) fn requires_reread(&self) -> bool {
+        matches!(
+            self,
+            Self::AtomicBatchRejected {
+                requires_reread: true,
+                ..
+            }
+        )
+    }
 }
 
 /// Classifies an edit failure so the tool can give the model a deterministic
@@ -132,6 +184,7 @@ pub(crate) enum EditFailureReason {
     WhitespaceMismatch,
     RangeOverlap,
     GluedAnchor,
+    DuplicateInsertion,
 }
 
 impl EditFailureReason {
@@ -143,7 +196,9 @@ impl EditFailureReason {
     /// should use [`Self::from_diagnostics`] so mixed failures are preserved.
     pub(crate) fn from_diagnostic(diagnostic: &str) -> Self {
         let lower = diagnostic.to_ascii_lowercase();
-        if lower.contains("overlap") {
+        if lower.contains("duplicate insertion") {
+            Self::DuplicateInsertion
+        } else if lower.contains("overlap") {
             Self::RangeOverlap
         } else if lower.contains("glued") || lower.contains("word§/hex§ fragments") {
             Self::GluedAnchor
@@ -175,6 +230,9 @@ impl EditFailureReason {
 
         if lower.contains("overlap") {
             add(Self::RangeOverlap);
+        }
+        if lower.contains("duplicate insertion") {
+            add(Self::DuplicateInsertion);
         }
         if lower.contains("glued") || lower.contains("word§/hex§ fragments") {
             add(Self::GluedAnchor);
@@ -212,13 +270,21 @@ impl EditFailureReason {
             Self::WhitespaceMismatch => "whitespace mismatch",
             Self::RangeOverlap => "overlapping edit ranges",
             Self::GluedAnchor => "glued anchor fragments",
+            Self::DuplicateInsertion => "duplicate insertion",
         }
+    }
+
+    pub(crate) const fn requires_reread(self) -> bool {
+        matches!(
+            self,
+            Self::MissingAnchor | Self::UnknownAnchor | Self::GluedAnchor
+        )
     }
 }
 
 #[cfg(test)]
 mod edit_failure_reason_tests {
-    use super::EditFailureReason;
+    use super::{EditFailureReason, FileEditorError};
 
     #[test]
     fn classifies_anchor_diagnostics_by_recovery_strategy() {
@@ -248,6 +314,10 @@ mod edit_failure_reason_tests {
             ),
             EditFailureReason::GluedAnchor
         );
+        assert_eq!(
+            EditFailureReason::from_diagnostic("duplicate insertion rejected"),
+            EditFailureReason::DuplicateInsertion
+        );
     }
 
     #[test]
@@ -262,6 +332,30 @@ mod edit_failure_reason_tests {
                 EditFailureReason::WhitespaceMismatch
             ]
         );
+    }
+
+    #[test]
+    fn atomic_rejection_reread_requirement_follows_diagnostics() {
+        let duplicate = FileEditorError::atomic_batch_rejected(
+            "anchor matches 2 lines with identical content",
+            1,
+            1,
+        );
+        assert!(!duplicate.requires_reread());
+
+        let whitespace = FileEditorError::atomic_batch_rejected(
+            "anchor matches only after trimming whitespace",
+            1,
+            1,
+        );
+        assert!(!whitespace.requires_reread());
+
+        let stale = FileEditorError::atomic_batch_rejected(
+            "anchor is stale and was not found in the file",
+            1,
+            1,
+        );
+        assert!(stale.requires_reread());
     }
 }
 
@@ -920,6 +1014,9 @@ pub struct AppliedEdit {
 /// `GluedAnchor { lines }` means the final assembled content still
 /// contained a `Word§` or `hex§` fragment. Caller should reject the
 /// whole batch and tell the model which lines to fix.
+///
+/// `DuplicateInsertion` means an insertion would repeat an exact adjacent
+/// line block or copy its anchored line. Caller should reject the whole batch.
 pub enum ApplyOutcome {
     Applied(
         Vec<String>,
@@ -930,6 +1027,7 @@ pub enum ApplyOutcome {
     ),
     Overlap,
     GluedAnchor(Vec<usize>),
+    DuplicateInsertion(Vec<FailedEdit>),
 }
 
 /// Executes hash-anchored edits.
@@ -1387,8 +1485,6 @@ impl EditExecutor {
     }
 
     /// Applies resolved edits to lines.
-    /// Returns None if edits have overlapping ranges (detected before application).
-    /// Applies resolved edits to lines.
     /// Returns the outcome — see [`ApplyOutcome`]. Overlap is detected
     /// before application; glued-anchor detection runs after assembly.
     pub fn apply_edits(&self, lines: &[String], resolved_edits: &[ResolvedEdit]) -> ApplyOutcome {
@@ -1435,6 +1531,60 @@ impl EditExecutor {
                 }
             })
             .collect();
+
+        let duplicate_insertions = effective_edits
+            .iter()
+            .filter_map(|resolved| {
+                let edit_type = resolved.edit.edit_type.as_str();
+                if !matches!(edit_type, "insert_before" | "insert_after") {
+                    return None;
+                }
+
+                let clean_text = strip_hashes(&resolved.edit.text);
+                if clean_text.is_empty() {
+                    return None;
+                }
+                let replacement_lines = split_content_lines(&clean_text);
+                let anchor_line = &lines[resolved.line_idx];
+                if replacement_lines.iter().any(|line| line == anchor_line) {
+                    return Some(FailedEdit {
+                        edit: resolved.edit.clone(),
+                        error: format!(
+                            "duplicate insertion rejected: insertion text contains the anchored line {:?}. {} preserves the anchor; use replace with anchor and end_anchor when wrapping existing code",
+                            anchor_line, edit_type
+                        ),
+                    });
+                }
+
+                let adjacent_matches = if edit_type == "insert_before" {
+                    resolved
+                        .line_idx
+                        .checked_sub(replacement_lines.len())
+                        .is_some_and(|start| {
+                            lines[start..resolved.line_idx] == replacement_lines[..]
+                        })
+                } else {
+                    let start = resolved.line_idx.saturating_add(1);
+                    start
+                        .checked_add(replacement_lines.len())
+                        .is_some_and(|end| {
+                            end <= lines.len() && lines[start..end] == replacement_lines[..]
+                        })
+                };
+
+                adjacent_matches.then(|| FailedEdit {
+                    edit: resolved.edit.clone(),
+                    error: format!(
+                        "duplicate insertion rejected: the exact {}-line insertion block is already immediately {} the anchor. Leading and trailing blank lines are part of this exact comparison; do not retry the same insertion",
+                        replacement_lines.len(),
+                        if edit_type == "insert_before" { "before" } else { "after" }
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !duplicate_insertions.is_empty() {
+            return ApplyOutcome::DuplicateInsertion(duplicate_insertions);
+        }
 
         for i in 0..effective_edits.len() {
             for j in (i + 1)..effective_edits.len() {
@@ -1637,7 +1787,7 @@ impl FileEditor {
         let (resolved_edits, failed_edits) =
             self.executor.resolve_edits(edits, &lines, &line_hashes);
 
-        if resolved_edits.is_empty() {
+        if !failed_edits.is_empty() {
             let failure_messages: Vec<String> = failed_edits
                 .iter()
                 .map(|f| {
@@ -1645,9 +1795,11 @@ impl FileEditor {
                         .format_failure_message(&f.edit, Some(&f.error))
                 })
                 .collect();
-            return Err(FileEditorError::AllEditsFailed {
-                message: failure_messages.join("\n\n"),
-            });
+            return Err(FileEditorError::atomic_batch_rejected(
+                failure_messages.join("\n\n"),
+                failed_edits.len(),
+                resolved_edits.len(),
+            ));
         }
 
         let outcome = self.executor.apply_edits(&lines, &resolved_edits);
@@ -1668,6 +1820,17 @@ impl FileEditor {
                         "Assembled content has Word§/hex§ fragments at {listing}; the model likely reconstructed content without a newline between anchored lines. Re-read the file with read_file and retry, preserving line breaks exactly."
                     ),
                 });
+            }
+            ApplyOutcome::DuplicateInsertion(failed) => {
+                return Err(FileEditorError::atomic_batch_rejected(
+                    failed
+                        .iter()
+                        .map(|failure| failure.error.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                    failed.len(),
+                    resolved_edits.len().saturating_sub(failed.len()),
+                ));
             }
             ApplyOutcome::Applied(final_lines, _added, _removed, applied_edits, _unchanged) => {
                 (final_lines, applied_edits)
@@ -2185,6 +2348,84 @@ mod tests {
         assert_eq!(final_lines[2], "    return 42");
         assert_eq!(applied[0].lines_added, 1);
         assert_eq!(applied[0].lines_deleted, 0);
+    }
+
+    #[test]
+    fn test_edit_executor_rejects_exact_adjacent_multiline_insertion_with_blank_lines() {
+        let executor = EditExecutor::new();
+        let lines = split_content_lines("#ifdef FLAG\n\n\nfn target() {}\n");
+        let hashes = vec!["Guard", "Blank1", "Blank2", "Target", "End"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let edits = vec![Edit {
+            anchor: "Target§fn target() {}".to_string(),
+            end_anchor: None,
+            edit_type: "insert_before".to_string(),
+            text: "#ifdef FLAG\n\n".to_string(),
+            content: None,
+        }];
+        let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
+        assert!(failed.is_empty());
+
+        let ApplyOutcome::DuplicateInsertion(duplicates) =
+            executor.apply_edits(&lines, &resolved)
+        else {
+            panic!("exact adjacent block must be rejected");
+        };
+        assert_eq!(duplicates.len(), 1);
+        assert!(duplicates[0].error.contains("Leading and trailing blank lines"));
+    }
+
+    #[test]
+    fn test_edit_executor_duplicate_detection_is_not_a_substring_match() {
+        let executor = EditExecutor::new();
+        let lines = split_content_lines("prefix with extra text\nfn target() {}\n");
+        let hashes = vec!["Prefix", "Target", "End"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let edits = vec![Edit {
+            anchor: "Target§fn target() {}".to_string(),
+            end_anchor: None,
+            edit_type: "insert_before".to_string(),
+            text: "prefix".to_string(),
+            content: None,
+        }];
+        let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
+        assert!(failed.is_empty());
+
+        let ApplyOutcome::Applied(final_lines, ..) = executor.apply_edits(&lines, &resolved)
+        else {
+            panic!("non-exact adjacent content must remain insertable");
+        };
+        assert_eq!(final_lines[1], "prefix");
+    }
+
+    #[test]
+    fn test_edit_executor_rejects_insertion_that_repeats_anchor_line() {
+        let executor = EditExecutor::new();
+        let lines = split_content_lines("fn target() {}\n");
+        let hashes = vec!["Target", "End"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let edits = vec![Edit {
+            anchor: "Target§fn target() {}".to_string(),
+            end_anchor: None,
+            edit_type: "insert_after".to_string(),
+            text: "// wrapper\nfn target() {}".to_string(),
+            content: None,
+        }];
+        let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
+        assert!(failed.is_empty());
+
+        let ApplyOutcome::DuplicateInsertion(duplicates) =
+            executor.apply_edits(&lines, &resolved)
+        else {
+            panic!("an insertion containing its anchor line must be rejected");
+        };
+        assert!(duplicates[0].error.contains("use replace"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use sned::core::edit_batch::BatchProcessor;
 use sned::core::file_editor::{
-    AnchorStateManager, ApplyOutcome, Edit, EditExecutor, split_content_lines,
+    AnchorStateManager, ApplyOutcome, Edit, EditExecutor, FileEditorError, split_content_lines,
 };
 
 fn lines(content: &str) -> Vec<String> {
@@ -142,7 +142,7 @@ fn edit_executor_validation_messages_documents_deliberate_divergence() {
 }
 
 #[test]
-fn file_editor_matches_ts_partial_success_flow() {
+fn file_editor_documents_atomic_divergence_from_ts_partial_success() {
     let task_id = "parity-file-editor";
     let path = "/tmp/sned-file-editor-parity.txt";
     let content = "line 1\nline 2\nline 3\nline 4\nline 5";
@@ -190,7 +190,7 @@ fn file_editor_matches_ts_partial_success_flow() {
     ];
 
     let processor = BatchProcessor::new(sned::core::edit_batch::DiffMode::Full);
-    let prepared = processor
+    let error = processor
         .prepare_edits(
             path,
             "sned-file-editor-parity.txt",
@@ -198,31 +198,20 @@ fn file_editor_matches_ts_partial_success_flow() {
             &edits,
             &anchor_mgr.reconcile(path, &lines(content), Some(task_id)),
         )
-        .unwrap();
-    let mut prepared = prepared;
-    let batch = processor.apply_batch(
-        &mut prepared,
-        "sned-file-editor-parity.txt",
-        "sned-file-editor-parity.txt",
-    );
+        .expect_err("one unresolved edit must reject the entire file batch");
 
-    assert!(batch.success);
-    assert!(prepared.diff.contains("<<<<<<< SEARCH"));
-    assert!(prepared.diff.contains(">>>>>>> REPLACE"));
-    assert!(
-        batch
-            .final_content
-            .as_deref()
-            .unwrap()
-            .contains("new line 2")
-    );
-    assert!(
-        batch
-            .final_content
-            .as_deref()
-            .unwrap()
-            .contains("new line 4")
-    );
+    let FileEditorError::AtomicBatchRejected {
+        message,
+        failed_count,
+        withheld_count,
+        ..
+    } = error
+    else {
+        panic!("expected an atomic batch rejection, got: {error}");
+    };
+    assert_eq!(failed_count, 1);
+    assert_eq!(withheld_count, 2);
+    assert!(message.contains("not found in the file"));
 }
 
 #[test]

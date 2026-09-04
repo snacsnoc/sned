@@ -16,7 +16,7 @@ use crate::core::edit_batch::{
     MAX_FINGERPRINT_CONTENT_LINES, PreparedEdits,
 };
 use crate::core::file_editor::{
-    AnchorStateManager, Edit, EditFailureReason, FileEditGuard, FileEditorError, FileTextFormat,
+    AnchorStateManager, Edit, EditFailureReason, FileEditGuard, FileTextFormat,
     normalize_file_content, restore_file_content,
 };
 use crate::core::hash_utils::{ANCHOR_DELIMITER, split_anchor, strip_hashes};
@@ -45,6 +45,12 @@ pub struct EditFileHandler {
     approval_manager: Option<Arc<Mutex<ApprovalManager>>>,
     /// Optional symbol index service for cache refresh after edits.
     symbol_index_service: Option<Arc<std::sync::Mutex<SymbolIndexService>>>,
+    #[cfg(test)]
+    external_change_before_write: Option<(String, String)>,
+    #[cfg(test)]
+    preserve_external_change_mtime: bool,
+    #[cfg(test)]
+    external_change_before_rollback: Option<(String, String)>,
 }
 
 impl EditFileHandler {
@@ -53,6 +59,12 @@ impl EditFileHandler {
         Self {
             approval_manager: None,
             symbol_index_service: None,
+            #[cfg(test)]
+            external_change_before_write: None,
+            #[cfg(test)]
+            preserve_external_change_mtime: false,
+            #[cfg(test)]
+            external_change_before_rollback: None,
         }
     }
 }
@@ -75,6 +87,29 @@ impl EditFileHandler {
     #[must_use]
     pub fn with_symbol_index(mut self, service: Arc<std::sync::Mutex<SymbolIndexService>>) -> Self {
         self.symbol_index_service = Some(service);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_external_change_before_write(mut self, path: String, content: String) -> Self {
+        self.external_change_before_write = Some((path, content));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_external_change_before_write_preserving_mtime(
+        mut self,
+        path: String,
+        content: String,
+    ) -> Self {
+        self.external_change_before_write = Some((path, content));
+        self.preserve_external_change_mtime = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_external_change_before_rollback(mut self, path: String, content: String) -> Self {
+        self.external_change_before_rollback = Some((path, content));
         self
     }
 
@@ -601,19 +636,6 @@ impl EditFileHandler {
         state.consecutive_reads.remove(path);
     }
 
-    fn failure_requires_reread(diagnostic: &str) -> bool {
-        EditFailureReason::from_diagnostics(diagnostic)
-            .into_iter()
-            .any(|reason| {
-                matches!(
-                    reason,
-                    EditFailureReason::MissingAnchor
-                        | EditFailureReason::UnknownAnchor
-                        | EditFailureReason::GluedAnchor
-                )
-            })
-    }
-
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
         ToolError::ExecutionFailedWithMetadata(
             format!(
@@ -655,6 +677,59 @@ impl EditFileHandler {
                 required_next_step: Some(ToolRequiredNextStep::ReadFile),
             },
         )
+    }
+
+    async fn rollback_written_files(
+        state: &Arc<Mutex<TaskState>>,
+        written_paths: &[String],
+        original_contents: &HashMap<String, String>,
+        final_contents: &HashMap<String, String>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut errors = Vec::new();
+        let mut stale_paths = Vec::new();
+        for path in written_paths.iter().rev() {
+            let Some(original) = original_contents.get(path) else {
+                errors.push(format!("Missing rollback content for {path}"));
+                stale_paths.push(path.clone());
+                continue;
+            };
+            let Some(expected) = final_contents.get(path) else {
+                errors.push(format!("Missing written content for {path}"));
+                stale_paths.push(path.clone());
+                continue;
+            };
+            // Compare the exact restored bytes we wrote so rollback cannot
+            // overwrite a concurrent update or depend on normalized content.
+            match tokio::fs::read(path).await {
+                Ok(current) if current == expected.as_bytes() => {}
+                Ok(_) => {
+                    errors.push(format!(
+                        "Skipped rollback for {path}: file changed after Sned wrote it"
+                    ));
+                    stale_paths.push(path.clone());
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("Failed to verify rollback for {path}: {error}"));
+                    stale_paths.push(path.clone());
+                    continue;
+                }
+            }
+            match crate::storage::disk::atomic_write_file_async(path, original).await {
+                Ok(()) => {
+                    let mut state = state.lock().await;
+                    state.insert_file_content(path.clone(), original.clone());
+                    state
+                        .file_context_tracker
+                        .mark_file_as_edited_by_sned(Path::new(path));
+                }
+                Err(error) => {
+                    errors.push(format!("Failed to rollback {path}: {error}"));
+                    stale_paths.push(path.clone());
+                }
+            }
+        }
+        (errors, stale_paths)
     }
 }
 
@@ -710,61 +785,142 @@ impl EditFileHandler {
             };
         }
 
-        self.validate_anchors(
-            &files,
-            workspace_root,
-            allowed_external_roots,
-            consecutive_failures,
-        )?;
-
-        let parsed = self.parse_edits(&files)?;
         let processor = BatchProcessor::new(DiffMode::AdditionsOnly);
+
+        struct PreflightRejection {
+            display_path: String,
+            absolute_path: String,
+            message: String,
+            requires_reread: bool,
+        }
+
+        let mut parsed = Vec::new();
+        let mut resolved_paths = HashMap::new();
+        let mut requested_edits_by_path: HashMap<String, usize> = HashMap::new();
+        let mut preflight_rejections = Vec::new();
+        let mut preflight_rejected_paths = HashSet::new();
+        let mut unresolved_rejected_edits = 0usize;
+        let mut unresolved_file_count = 0usize;
+
+        for (index, file) in files.iter().enumerate() {
+            let edit_count = file
+                .get("edits")
+                .and_then(serde_json::Value::as_array)
+                .map_or(1, Vec::len);
+            let display_path = match Self::file_entry_path(file) {
+                Ok(path) => path,
+                Err(message) => {
+                    let label = format!("entry #{} (missing path)", index + 1);
+                    unresolved_rejected_edits += edit_count;
+                    unresolved_file_count += 1;
+                    preflight_rejections.push(PreflightRejection {
+                        display_path: label.clone(),
+                        absolute_path: label,
+                        message,
+                        requires_reread: false,
+                    });
+                    continue;
+                }
+            };
+            let absolute_path = match self.resolve_path(
+                workspace_root,
+                allowed_external_roots,
+                display_path,
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    unresolved_rejected_edits += edit_count;
+                    unresolved_file_count += 1;
+                    preflight_rejections.push(PreflightRejection {
+                        display_path: display_path.to_string(),
+                        absolute_path: display_path.to_string(),
+                        message: error.to_string(),
+                        requires_reread: false,
+                    });
+                    continue;
+                }
+            };
+            *requested_edits_by_path
+                .entry(absolute_path.clone())
+                .or_default() += edit_count;
+            resolved_paths.insert(display_path.to_string(), absolute_path.clone());
+
+            let validation = self.validate_anchors(
+                std::slice::from_ref(file),
+                workspace_root,
+                allowed_external_roots,
+                consecutive_failures,
+            );
+            if let Err(error) = validation {
+                let requires_reread = error.metadata().is_some_and(|metadata| {
+                    metadata.required_next_step == Some(ToolRequiredNextStep::ReadFile)
+                });
+                preflight_rejected_paths.insert(absolute_path.clone());
+                preflight_rejections.push(PreflightRejection {
+                    display_path: display_path.to_string(),
+                    absolute_path,
+                    message: error.to_string(),
+                    requires_reread,
+                });
+                continue;
+            }
+
+            match self.parse_edits(std::slice::from_ref(file)) {
+                Ok(mut file_edits) if Path::new(&absolute_path).exists() => {
+                    parsed.append(&mut file_edits);
+                }
+                Ok(_) => {
+                    preflight_rejected_paths.insert(absolute_path.clone());
+                    preflight_rejections.push(PreflightRejection {
+                        display_path: display_path.to_string(),
+                        absolute_path,
+                        message: "edit_file only edits existing files. Use write_to_file to create this file."
+                            .to_string(),
+                        requires_reread: false,
+                    });
+                }
+                Err(error) => {
+                    preflight_rejected_paths.insert(absolute_path.clone());
+                    preflight_rejections.push(PreflightRejection {
+                        display_path: display_path.to_string(),
+                        absolute_path,
+                        message: error.to_string(),
+                        requires_reread: false,
+                    });
+                }
+            }
+        }
+
+        // Multiple entries for the same file form one atomic file batch. If
+        // any entry was invalid, withhold otherwise-valid entries for that file.
+        parsed.retain(|(path, _)| {
+            resolved_paths
+                .get(path)
+                .is_some_and(|absolute| !preflight_rejected_paths.contains(absolute))
+        });
 
         let silent = params
             .get("silent")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let resolved_paths: Result<HashMap<String, String>, ToolError> = parsed
-            .iter()
-            .map(|(path, _)| {
-                Ok((
-                    path.clone(),
-                    self.resolve_path(workspace_root, allowed_external_roots, path)?,
-                ))
-            })
-            .collect();
-        let resolved_paths = resolved_paths?;
-        let mut missing_paths: Vec<&str> = resolved_paths
-            .iter()
-            .filter_map(|(display_path, absolute_path)| {
-                (!Path::new(absolute_path).exists()).then_some(display_path.as_str())
-            })
-            .collect();
-        if !missing_paths.is_empty() {
-            missing_paths.sort_unstable();
-            missing_paths.dedup();
-            return Err(ToolError::InvalidInput(format!(
-                "edit_file only edits existing files and cannot create new files. Missing target(s): {}. Use write_to_file to create new files.",
-                missing_paths.join(", ")
-            )));
-        }
-
         let batches =
             processor.group_edits_by_path(&parsed, &|path| resolved_paths.get(path).cloned());
-        let unique_file_count = batches.len();
-        let affected_paths = batches
-            .iter()
-            .map(|batch| batch.absolute_path.clone())
-            .collect::<Vec<_>>();
+        let unique_file_count = requested_edits_by_path.len() + unresolved_file_count;
 
         let mut all_results: Vec<String> = Vec::new();
         let mut total_applied = 0usize;
         let mut total_unchanged = 0usize;
         let mut total_failed = 0usize;
+        let mut total_withheld = 0usize;
         let mut total_overlap = 0usize;
         let mut total_edits = 0usize;
         let mut total_glued_batches = 0usize;
+        let mut total_duplicate_batches = 0usize;
+        let mut rejected_paths: HashSet<String> = HashSet::new();
+        let mut reread_paths: HashSet<String> = HashSet::new();
+        let mut range_insufficient_paths: HashSet<String> = HashSet::new();
+        let mut write_failure = false;
         let mut diff_previews: Vec<String> = Vec::new();
         let mut prepared_batches: Vec<(
             crate::core::edit_batch::FileEditBatch,
@@ -773,24 +929,40 @@ impl EditFileHandler {
         )> = Vec::new();
         let mut file_text_formats: HashMap<String, FileTextFormat> = HashMap::new();
 
+        for rejection in preflight_rejections {
+            rejected_paths.insert(rejection.absolute_path.clone());
+            if rejection.requires_reread {
+                reread_paths.insert(rejection.absolute_path.clone());
+            }
+            all_results.push(format!(
+                "File {}: batch rejected before applying edits. No edits were applied to this file.\n\n{}",
+                rejection.display_path, rejection.message
+            ));
+        }
+        for path in &preflight_rejected_paths {
+            total_failed += requested_edits_by_path.get(path).copied().unwrap_or(1);
+        }
+        total_failed += unresolved_rejected_edits;
+
         // Phase 1: Prepare all batches and collect diff previews
         for batch in batches {
             if let Ok(metadata) = tokio::fs::metadata(&batch.absolute_path).await {
                 let max_file_size = max_edit_file_size();
                 if metadata.len() > max_file_size {
-                    return Err(ToolError::ExecutionFailedWithMetadata(
+                    rejected_paths.insert(batch.absolute_path.clone());
+                    range_insufficient_paths.insert(batch.absolute_path.clone());
+                    total_failed += batch.edits.len();
+                    all_results.push(format!(
+                        "File {}: batch rejected before applying edits. No edits were applied to this file.\n\n{}",
+                        batch.display_path,
                         format!(
                             "File {} is too large for edit_file ({}KB, max {}KB). A ranged read can inspect this file but cannot make an anchored edit safe. Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE for a targeted edit. Use write_to_file only if you have the complete replacement content; do not use shell, Python, sed, or another out-of-band writer to bypass this limit.",
                             batch.display_path,
                             metadata.len() / 1024,
                             max_file_size / 1024
-                        ),
-                        ToolFailureMetadata {
-                            class: ToolFailureClass::RangeInsufficient,
-                            affected_paths: vec![batch.absolute_path.clone()],
-                            required_next_step: Some(ToolRequiredNextStep::AskUser),
-                        },
+                        )
                     ));
+                    continue;
                 }
             }
 
@@ -800,10 +972,15 @@ impl EditFileHandler {
                 .must_reread_before_edit
                 .contains(&batch.absolute_path)
             {
-                return Err(Self::reread_required_error(
-                    &batch.display_path,
-                    &batch.absolute_path,
+                rejected_paths.insert(batch.absolute_path.clone());
+                reread_paths.insert(batch.absolute_path.clone());
+                total_failed += batch.edits.len();
+                all_results.push(format!(
+                    "File {}: batch rejected before applying edits. No edits were applied to this file.\n\n{}",
+                    batch.display_path,
+                    Self::reread_required_error(&batch.display_path, &batch.absolute_path)
                 ));
+                continue;
             }
 
             // Acquire exclusive file lock to prevent concurrent edits
@@ -835,10 +1012,15 @@ impl EditFileHandler {
             };
             if stale_warning.is_some() {
                 Self::mark_must_reread(state, &batch.absolute_path).await;
-                return Err(Self::external_modification_error(
-                    &batch.display_path,
-                    &batch.absolute_path,
+                rejected_paths.insert(batch.absolute_path.clone());
+                reread_paths.insert(batch.absolute_path.clone());
+                total_failed += batch.edits.len();
+                all_results.push(format!(
+                    "File {}: batch rejected before applying edits. No edits were applied to this file.\n\n{}",
+                    batch.display_path,
+                    Self::external_modification_error(&batch.display_path, &batch.absolute_path)
                 ));
+                continue;
             }
 
             // Warn if editing a file not read this session
@@ -878,7 +1060,8 @@ impl EditFileHandler {
                             "File {} is no longer a regular file (may be symlink)",
                             batch.display_path
                         ));
-                        total_failed += 1;
+                        rejected_paths.insert(batch.absolute_path.clone());
+                        total_failed += batch.edits.len();
                         continue;
                     }
                     Err(e) => {
@@ -886,7 +1069,8 @@ impl EditFileHandler {
                             "Error verifying file {}: {}",
                             batch.display_path, e
                         ));
-                        total_failed += 1;
+                        rejected_paths.insert(batch.absolute_path.clone());
+                        total_failed += batch.edits.len();
                         continue;
                     }
                 }
@@ -901,7 +1085,8 @@ impl EditFileHandler {
                         Err(e) => {
                             all_results
                                 .push(format!("Error reading file {}: {}", batch.display_path, e));
-                            total_failed += 1;
+                            rejected_paths.insert(batch.absolute_path.clone());
+                            total_failed += batch.edits.len();
                             continue;
                         }
                     }
@@ -911,6 +1096,7 @@ impl EditFileHandler {
                         "Error inspecting file {}: {}",
                         batch.display_path, e
                     ));
+                    rejected_paths.insert(batch.absolute_path.clone());
                     total_failed += batch.edits.len();
                     continue;
                 }
@@ -921,10 +1107,15 @@ impl EditFileHandler {
                 .is_some_and(|expected| expected != &raw_content)
             {
                 Self::mark_must_reread(state, &batch.absolute_path).await;
-                return Err(Self::external_modification_error(
-                    &batch.display_path,
-                    &batch.absolute_path,
+                rejected_paths.insert(batch.absolute_path.clone());
+                reread_paths.insert(batch.absolute_path.clone());
+                total_failed += batch.edits.len();
+                all_results.push(format!(
+                    "File {}: batch rejected before applying edits. No edits were applied to this file.\n\n{}",
+                    batch.display_path,
+                    Self::external_modification_error(&batch.display_path, &batch.absolute_path)
                 ));
+                continue;
             }
 
             let (content, text_format) = normalize_file_content(&raw_content);
@@ -965,6 +1156,8 @@ impl EditFileHandler {
                 }
                 if !stale_anchors.is_empty() {
                     Self::mark_must_reread(state, &batch.absolute_path).await;
+                    reread_paths.insert(batch.absolute_path.clone());
+                    rejected_paths.insert(batch.absolute_path.clone());
                     let mut msg = String::from(
                         "Stale anchor detected: this anchor is from a previous read_file call. \
                          The file has changed since then. Call read_file to refresh anchors.\n\n",
@@ -992,12 +1185,13 @@ impl EditFileHandler {
             ) {
                 Ok(p) => p,
                 Err(e) => {
+                    let requires_reread = e.requires_reread();
                     let error_message = e.to_string();
-                    if matches!(e, FileEditorError::AllEditsFailed { .. })
-                        && Self::failure_requires_reread(&error_message)
-                    {
+                    if requires_reread {
                         Self::mark_must_reread(state, &batch.absolute_path).await;
+                        reread_paths.insert(batch.absolute_path.clone());
                     }
+                    rejected_paths.insert(batch.absolute_path.clone());
                     let recovery = error_guidance::edit_failure_for_diagnostic(
                         &error_message,
                         consecutive_failures,
@@ -1148,6 +1342,7 @@ impl EditFileHandler {
             lines_removed: u32,
             unchanged_sites: Vec<crate::core::file_editor::UnchangedSite>,
             glued_anchor_lines: Vec<usize>,
+            duplicate_insertions: Vec<crate::core::file_editor::FailedEdit>,
         }
         let mut file_results: Vec<FileResult> = Vec::new();
 
@@ -1165,14 +1360,6 @@ impl EditFileHandler {
             let result =
                 processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
 
-            if prepared
-                .failed_edits
-                .iter()
-                .any(|failed| Self::failure_requires_reread(&failed.error))
-            {
-                Self::mark_must_reread(state, &batch.absolute_path).await;
-            }
-
             if result.success {
                 total_applied += result.resolved_count;
                 total_unchanged += prepared
@@ -1180,13 +1367,21 @@ impl EditFileHandler {
                     .len()
                     .saturating_sub(result.resolved_count);
             }
-            total_failed += result.failed_count;
-            if !result.glued_anchor_lines.is_empty() {
-                total_failed += result.resolved_count.max(1);
+            total_withheld += result.withheld_count;
+            if !result.duplicate_insertions.is_empty() {
+                total_failed += result.failed_count;
+                total_duplicate_batches += 1;
+                rejected_paths.insert(batch.absolute_path.clone());
+            } else if !result.glued_anchor_lines.is_empty() {
+                total_failed += result.failed_count;
                 total_glued_batches += 1;
+                rejected_paths.insert(batch.absolute_path.clone());
+            } else {
+                total_failed += result.failed_count;
             }
             if result.overlap {
                 total_overlap += result.resolved_count;
+                rejected_paths.insert(batch.absolute_path.clone());
             }
 
             if result.success && result.resolved_count > 0 {
@@ -1232,22 +1427,23 @@ impl EditFileHandler {
                 lines_removed: result.lines_removed,
                 unchanged_sites: result.unchanged_sites,
                 glued_anchor_lines: result.glued_anchor_lines,
+                duplicate_insertions: result.duplicate_insertions,
             });
         }
 
-        // Phase 4b: Write all files with rollback on failure
-        // If any file fails to write, restore all previously written files to original content
+        // Restore earlier files only while they still contain this request's output.
         let mut write_failed_paths: HashSet<String> = HashSet::new();
         if !write_items.is_empty() {
-            let original_contents: std::collections::HashMap<&str, &str> = write_items
+            let original_contents: HashMap<String, String> = write_items
                 .iter()
-                .map(|item| (item.absolute_path.as_str(), item.original_content.as_str()))
+                .map(|item| (item.absolute_path.clone(), item.original_content.clone()))
                 .collect();
-
-            // Track which files were successfully written for rollback
+            let final_contents: HashMap<String, String> = write_items
+                .iter()
+                .map(|item| (item.absolute_path.clone(), item.final_content.clone()))
+                .collect();
             let mut written_paths: Vec<String> = Vec::new();
-            // Collect rollback failures to report to user
-            let mut rollback_errors: Vec<String> = Vec::new();
+            let mut aborted_write: Option<(String, Option<String>)> = None;
 
             for item in &write_items {
                 let std_file = match std::fs::OpenOptions::new()
@@ -1256,56 +1452,42 @@ impl EditFileHandler {
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        // Rollback all previously written files
-                        // Note: previously written files were already unlocked after their atomic writes
-                        for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path.as_str())
-                                && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
-                            {
-                                rollback_errors.push(format!("Failed to rollback {path}: {re}"));
-                            }
-                        }
-                        if !rollback_errors.is_empty() {
-                            return Err(ToolError::ExecutionFailed(format!(
-                                "Failed to open file {} for locking: {}. Rollback incomplete: {}",
-                                item.display_path,
-                                e,
-                                rollback_errors.join(", ")
-                            )));
-                        }
-                        return Err(ToolError::ExecutionFailed(format!(
-                            "Failed to open file {} for locking: {}",
-                            item.display_path, e
-                        )));
+                        aborted_write = Some((
+                            format!("Failed to open file {} for locking: {e}", item.display_path),
+                            None,
+                        ));
+                        break;
                     }
                 };
 
                 if let Err(lock_error) = std_file.try_lock() {
-                    for path in written_paths.iter().rev() {
-                        if let Some(orig) = original_contents.get(path.as_str())
-                            && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
-                        {
-                            rollback_errors.push(format!("Failed to rollback {path}: {re}"));
-                        }
-                    }
-                    Self::mark_must_reread(state, &item.absolute_path).await;
-                    if !rollback_errors.is_empty() {
-                        return Err(ToolError::ExecutionFailed(format!(
-                            "Failed to lock file {}: {}. Rollback incomplete: {}",
-                            item.display_path,
-                            lock_error,
-                            rollback_errors.join(", ")
-                        )));
-                    }
-                    return Err(Self::file_lock_error(
-                        &item.display_path,
-                        &item.absolute_path,
-                        &lock_error,
+                    aborted_write = Some((
+                        Self::file_lock_error(
+                            &item.display_path,
+                            &item.absolute_path,
+                            &lock_error,
+                        )
+                        .to_string(),
+                        Some(item.absolute_path.clone()),
                     ));
+                    break;
                 }
 
-                // Re-check mtime immediately before write to close TOCTOU window
-                let mtime_ok = if let Some(initial_mtime) = &item.initial_mtime {
+                #[cfg(test)]
+                if let Some((path, content)) = &self.external_change_before_write
+                    && path == &item.absolute_path
+                {
+                    std::fs::write(path, content).expect("test external write should succeed");
+                    if self.preserve_external_change_mtime
+                        && let Some(initial_mtime) = item.initial_mtime
+                    {
+                        std_file
+                            .set_modified(initial_mtime)
+                            .expect("test external write mtime should be restored");
+                    }
+                }
+
+                let mtime_unchanged = if let Some(initial_mtime) = &item.initial_mtime {
                     match tokio::fs::metadata(&item.absolute_path).await {
                         Ok(current_metadata) => match current_metadata.modified() {
                             Ok(current_mtime) => &current_mtime == initial_mtime,
@@ -1316,14 +1498,21 @@ impl EditFileHandler {
                 } else {
                     true
                 };
+                let content_unchanged = tokio::fs::read_to_string(&item.absolute_path)
+                    .await
+                    .is_ok_and(|content| content == item.original_content);
 
-                if !mtime_ok {
+                if !mtime_unchanged || !content_unchanged {
                     let _ = std_file.unlock();
-                    Self::mark_must_reread(state, &item.absolute_path).await;
-                    return Err(Self::external_modification_error(
-                        &item.display_path,
-                        &item.absolute_path,
+                    aborted_write = Some((
+                        Self::external_modification_error(
+                            &item.display_path,
+                            &item.absolute_path,
+                        )
+                        .to_string(),
+                        Some(item.absolute_path.clone()),
                     ));
+                    break;
                 }
 
                 let write_result = crate::storage::disk::atomic_write_file_async(
@@ -1347,27 +1536,52 @@ impl EditFileHandler {
                         written_paths.push(item.absolute_path.clone());
                     }
                     Err(e) => {
-                        write_failed_paths.insert(item.absolute_path.clone());
-                        write_failed_paths.extend(written_paths.iter().cloned());
-                        for path in written_paths.iter().rev() {
-                            if let Some(orig) = original_contents.get(path.as_str())
-                                && let Err(re) = crate::storage::disk::atomic_write_file(path, orig)
-                            {
-                                rollback_errors.push(format!("Failed to rollback {path}: {re}"));
-                            }
-                        }
-                        if rollback_errors.is_empty() {
-                            all_results
-                                .push(format!("Error writing file {}: {}", item.display_path, e));
-                        } else {
-                            all_results.push(format!(
-                                "Error writing file {}: {}. Rollback incomplete: {}",
-                                item.display_path,
-                                e,
-                                rollback_errors.join(", ")
-                            ));
-                        }
+                        aborted_write = Some((
+                            format!("Error writing file {}: {e}", item.display_path),
+                            None,
+                        ));
+                        break;
                     }
+                }
+            }
+
+            if let Some((failure, reread_path)) = aborted_write {
+                write_failure = true;
+                write_failed_paths.extend(
+                    write_items
+                        .iter()
+                        .map(|item| item.absolute_path.clone()),
+                );
+                rejected_paths.extend(write_failed_paths.iter().cloned());
+                if let Some(path) = reread_path {
+                    Self::mark_must_reread(state, &path).await;
+                    reread_paths.insert(path);
+                }
+                #[cfg(test)]
+                if let Some((path, content)) = &self.external_change_before_rollback {
+                    std::fs::write(path, content)
+                        .expect("test external rollback write should succeed");
+                }
+                let (rollback_errors, rollback_stale_paths) = Self::rollback_written_files(
+                    state,
+                    &written_paths,
+                    &original_contents,
+                    &final_contents,
+                )
+                .await;
+                if rollback_errors.is_empty() {
+                    all_results.push(format!(
+                        "{failure}. Earlier writes from this request were rolled back; no prepared file writes were retained."
+                    ));
+                } else {
+                    for path in rollback_stale_paths {
+                        Self::mark_must_reread(state, &path).await;
+                        reread_paths.insert(path);
+                    }
+                    all_results.push(format!(
+                        "{failure}. Rollback incomplete: {}",
+                        rollback_errors.join(", ")
+                    ));
                 }
             }
         }
@@ -1414,9 +1628,6 @@ impl EditFileHandler {
             }
         }
 
-        for path in &write_failed_paths {
-            Self::mark_must_reread(state, path).await;
-        }
         {
             let mut state = state.lock().await;
             for item in &write_items {
@@ -1502,6 +1713,30 @@ impl EditFileHandler {
             all_unchanged_sites.extend(file_result.unchanged_sites.iter().cloned());
         }
         for file_result in file_results {
+            if !file_result.duplicate_insertions.is_empty() {
+                let diagnostics = file_result
+                    .duplicate_insertions
+                    .iter()
+                    .map(|failed| {
+                        format!(
+                            "Edit (anchor: '{}', end_anchor: '{}') failed. Diagnostics: {}\nRecovery: {}",
+                            failed.edit.anchor,
+                            failed.edit.end_anchor.as_deref().unwrap_or("none"),
+                            failed.error,
+                            error_guidance::edit_failure(
+                                EditFailureReason::DuplicateInsertion,
+                                consecutive_failures,
+                            )
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                all_results.push(format!(
+                    "File {}: batch rejected before writing because an insertion would duplicate existing content. No edits were applied to this file.\n\n{}",
+                    file_result.batch_display_path, diagnostics
+                ));
+                continue;
+            }
             if !file_result.glued_anchor_lines.is_empty() {
                 let lines_str = file_result
                     .glued_anchor_lines
@@ -1654,11 +1889,28 @@ impl EditFileHandler {
         } else {
             summary_counts.push(format!("{total_failed} edit(s) failed"));
         }
+        if total_withheld > 0 {
+            summary_counts.push(format!("{total_withheld} otherwise-valid edit(s) withheld"));
+        }
+        if total_duplicate_batches > 0 {
+            summary_counts.push(format!(
+                "{total_duplicate_batches} file batch(es) rejected for duplicate insertion"
+            ));
+        }
         if total_overlap > 0 {
             summary_counts.push(format!("{total_overlap} edit(s) overlapped"));
             summary_counts.push(error_guidance::edit_failure(
                 EditFailureReason::RangeOverlap,
                 consecutive_failures,
+            ));
+        }
+        if !rejected_paths.is_empty() {
+            let mut paths = rejected_paths.iter().cloned().collect::<Vec<_>>();
+            paths.sort();
+            summary_counts.push(format!(
+                "{} file batch(es) rejected ({})",
+                paths.len(),
+                paths.join(", ")
             ));
         }
         let summary = format!(
@@ -1668,15 +1920,13 @@ impl EditFileHandler {
 
         let output = format!("{}\n\n{}", summary, all_results.join("\n\n---\n\n"));
 
-        if total_applied == 0 && (total_failed > 0 || total_overlap > 0) {
-            let reread_paths = {
-                let state = state.lock().await;
-                affected_paths
-                    .iter()
-                    .filter(|path| state.must_reread_before_edit.contains(*path))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
+        if !rejected_paths.is_empty()
+            || write_failure
+            || total_failed > 0
+            || total_overlap > 0
+        {
+            let mut reread_paths = reread_paths.into_iter().collect::<Vec<_>>();
+            reread_paths.sort();
             if !reread_paths.is_empty() {
                 return Err(ToolError::ExecutionFailedWithMetadata(
                     output,
@@ -1684,6 +1934,19 @@ impl EditFileHandler {
                         class: ToolFailureClass::AnchorInvalid,
                         affected_paths: reread_paths,
                         required_next_step: Some(ToolRequiredNextStep::ReadFile),
+                    },
+                ));
+            }
+            let mut range_insufficient_paths =
+                range_insufficient_paths.into_iter().collect::<Vec<_>>();
+            range_insufficient_paths.sort();
+            if !range_insufficient_paths.is_empty() {
+                return Err(ToolError::ExecutionFailedWithMetadata(
+                    output,
+                    ToolFailureMetadata {
+                        class: ToolFailureClass::RangeInsufficient,
+                        affected_paths: range_insufficient_paths,
+                        required_next_step: Some(ToolRequiredNextStep::AskUser),
                     },
                 ));
             }
@@ -1751,6 +2014,7 @@ impl ToolHandler for EditFileHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::file_editor::split_content_lines;
     use crate::core::tools::{ToolContext, ToolHandler};
     use std::sync::Arc;
     use std::sync::LazyLock;
@@ -3900,8 +4164,59 @@ edition = "2021"
             .expect_err("overlap must be a tool failure")
             .to_string();
         assert!(output.contains("0 edit(s) applied"), "got: {}", output);
-        assert!(output.contains("0 edit(s) failed"), "got: {}", output);
+        assert!(output.contains("2 edit(s) failed"), "got: {}", output);
         assert!(output.contains("2 edit(s) overlapped"), "got: {}", output);
+    }
+
+    #[tokio::test]
+    async fn test_validation_rejection_does_not_require_reread() {
+        use tempfile::tempdir;
+
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let content = "line 1\nline 2\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(content);
+        let anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &lines,
+            Some("validation-rejection-task"),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            Arc::clone(&state),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "validation-rejection-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": [{
+                "path": file_path,
+                "edits": [{
+                    "anchor": format!("{}§line 1", anchors[0]),
+                    "edit_type": "insert_after",
+                    "text": "new line",
+                    "content": ["line 1"]
+                }]
+            }]
+        });
+
+        let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .expect_err("invalid field usage must reject the file batch");
+        assert!(error.to_string().contains("only valid for replace edits"));
+        assert!(
+            state.lock().await.must_reread_before_edit.is_empty(),
+            "validation mistakes must not invalidate fresh anchors"
+        );
     }
 
     #[tokio::test]
@@ -3957,7 +4272,7 @@ edition = "2021"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_atomic_write_failure_does_not_report_rolled_back_edits_as_applied() {
+    async fn test_atomic_write_failure_returns_error_and_rolls_back_all_files() {
         use tempfile::tempdir;
 
         let _guard = TEST_MUTEX.lock().await;
@@ -4040,8 +4355,8 @@ edition = "2021"
 
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
             .await
-            .expect("write failure should be returned in the tool result");
-        let output = result.as_str().unwrap();
+            .expect_err("any write failure must fail the tool request");
+        let output = result.to_string();
 
         assert_eq!(
             std::fs::read_to_string(&first_file_path).unwrap(),
@@ -4053,40 +4368,429 @@ edition = "2021"
         );
         assert_eq!(
             std::fs::read_to_string(&last_file_path).unwrap(),
-            "last line 1\nlast replacement\n"
+            last_content
         );
         assert!(output.contains("Error writing file"), "got: {output}");
-        assert!(output.contains("1 edit(s) applied"), "got: {output}");
-        assert!(output.contains("2 edit(s) failed"), "got: {output}");
+        assert!(output.contains("0 edit(s) applied"), "got: {output}");
+        assert!(output.contains("3 edit(s) failed"), "got: {output}");
+        assert!(output.contains("Earlier writes from this request were rolled back"));
         assert!(!output.contains("first replacement"), "got: {output}");
         assert!(!output.contains("failing replacement"), "got: {output}");
-        assert!(output.contains("last replacement"), "got: {output}");
+        assert!(!output.contains("last replacement"), "got: {output}");
         let state = state.lock().await;
-        assert_eq!(state.session_file_changes.len(), 1);
+        assert!(state.session_file_changes.is_empty());
+        assert!(state.must_reread_before_edit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_per_file_atomicity_applies_valid_file_and_rejects_other_files() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("good.txt");
+        let duplicate_path = dir.path().join("duplicate.txt");
+        let stale_path = dir.path().join("stale.txt");
+        std::fs::write(&good_path, "good\n").unwrap();
+        std::fs::write(&duplicate_path, "#ifdef FLAG\nfn target() {}\n").unwrap();
+        std::fs::write(&stale_path, "stale\n").unwrap();
+
+        let anchor_mgr = AnchorStateManager::new();
+        let good_anchors = anchor_mgr.reconcile(
+            good_path.to_str().unwrap(),
+            &split_content_lines("good\n"),
+            Some("mixed-file-failure"),
+        );
+        let duplicate_anchors = anchor_mgr.reconcile(
+            duplicate_path.to_str().unwrap(),
+            &split_content_lines("#ifdef FLAG\nfn target() {}\n"),
+            Some("mixed-file-failure"),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "mixed-file-failure".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({
+            "files": [
+                {"path": "good.txt", "edits": [{
+                    "anchor": format!("{}§good", good_anchors[0]),
+                    "text": "changed"
+                }]},
+                {"path": "duplicate.txt", "edits": [{
+                    "anchor": format!("{}§fn target() {{}}", duplicate_anchors[1]),
+                    "edit_type": "insert_before",
+                    "text": "#ifdef FLAG"
+                }]},
+                {"path": "stale.txt", "edits": [{
+                    "anchor": "Wrong§stale",
+                    "text": "changed stale"
+                }]}
+            ]
+        });
+
+        let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .expect_err("rejected files must make the overall result an error");
+        let metadata = error.metadata().expect("stale path needs recovery metadata");
+        let stale_absolute = std::fs::canonicalize(&stale_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(metadata.class, ToolFailureClass::AnchorInvalid);
+        assert_eq!(metadata.required_next_step, Some(ToolRequiredNextStep::ReadFile));
+        assert_eq!(metadata.affected_paths, vec![stale_absolute.clone()]);
+        let output = error.to_string();
+        assert!(output.contains("1 edit(s) applied"), "got: {output}");
+        assert!(output.contains("duplicate insertion"), "got: {output}");
+        assert!(output.contains("duplicate.txt"), "got: {output}");
+        assert!(output.contains("stale.txt"), "got: {output}");
+        assert_eq!(std::fs::read_to_string(&good_path).unwrap(), "changed\n");
+        assert_eq!(
+            std::fs::read_to_string(&duplicate_path).unwrap(),
+            "#ifdef FLAG\nfn target() {}\n"
+        );
+        assert_eq!(std::fs::read_to_string(&stale_path).unwrap(), "stale\n");
+        let duplicate_absolute = std::fs::canonicalize(&duplicate_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let state = state.lock().await;
+        assert!(state.must_reread_before_edit.contains(&stale_absolute));
+        assert!(!state.must_reread_before_edit.contains(&duplicate_absolute));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_and_unauthorized_entries_do_not_block_valid_file() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let valid_path = dir.path().join("valid.txt");
+        std::fs::write(&valid_path, "before\n").unwrap();
+        let valid_absolute = std::fs::canonicalize(&valid_path).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let anchors = anchor_mgr.reconcile(
+            valid_absolute.to_str().unwrap(),
+            &split_content_lines("before\n"),
+            Some("mixed-malformed-paths"),
+        );
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "mixed-malformed-paths".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({"files": [
+            {"path": "valid.txt", "edits": [{
+                "anchor": format!("{}§before", anchors[0]), "text": "after"
+            }]},
+            {"edits": [{"anchor": "Word§missing", "text": "ignored"}]},
+            {"path": "../outside.txt", "edits": [{
+                "anchor": "Word§outside", "text": "ignored"
+            }]}
+        ]});
+
+        let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .expect_err("rejected path entries must make the overall request fail");
+        let output = error.to_string();
+        assert_eq!(std::fs::read_to_string(valid_path).unwrap(), "after\n");
+        assert!(output.contains("1 edit(s) applied"), "got: {output}");
+        assert!(output.contains("2 edit(s) failed"), "got: {output}");
+        assert!(output.contains("entry #2 (missing path)"), "got: {output}");
+        assert!(output.contains("../outside.txt"), "got: {output}");
+        assert!(error.metadata().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_same_file_mixed_valid_and_stale_edits_apply_nothing() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("atomic.txt");
+        let original = "first\nsecond\n";
+        std::fs::write(&file_path, original).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &split_content_lines(original),
+            Some("same-file-atomic"),
+        );
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "same-file-atomic".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({"files": [{
+            "path": "atomic.txt",
+            "edits": [
+                {"anchor": format!("{}§first", anchors[0]), "text": "changed"},
+                {"anchor": "Wrong§second", "text": "also changed"}
+            ]
+        }]});
+
+        let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .expect_err("one stale anchor must reject its whole file batch");
+        assert!(error.to_string().contains("otherwise-valid edit(s) were withheld"));
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn test_replaying_partially_successful_request_does_not_duplicate_insertion() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let insert_path = dir.path().join("insert.txt");
+        let stale_path = dir.path().join("stale.txt");
+        std::fs::write(&insert_path, "target\n").unwrap();
+        std::fs::write(&stale_path, "stale\n").unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let anchors = anchor_mgr.reconcile(
+            insert_path.to_str().unwrap(),
+            &split_content_lines("target\n"),
+            Some("replay-partial"),
+        );
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "replay-partial".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({"files": [
+            {"path": "insert.txt", "edits": [{
+                "anchor": format!("{}§target", anchors[0]),
+                "edit_type": "insert_before",
+                "text": "added"
+            }]},
+            {"path": "stale.txt", "edits": [{
+                "anchor": "Wrong§stale",
+                "text": "changed"
+            }]}
+        ]});
+
+        ToolHandler::execute(&EditFileHandler::new(), &ctx, params.clone())
+            .await
+            .expect_err("the first request is partially successful");
+        assert_eq!(std::fs::read_to_string(&insert_path).unwrap(), "added\ntarget\n");
+        let replay = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .expect_err("unchanged replay must reject the adjacent duplicate");
+        assert!(replay.to_string().contains("duplicate insertion"));
+        assert_eq!(std::fs::read_to_string(&insert_path).unwrap(), "added\ntarget\n");
+    }
+
+    #[tokio::test]
+    async fn test_content_change_is_detected_when_mtime_is_unchanged() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("same-mtime.txt");
+        let original = "before\n";
+        std::fs::write(&file_path, original).unwrap();
+        let initial_mtime = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+        let absolute_path = std::fs::canonicalize(&file_path).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let anchors = anchor_mgr.reconcile(
+            absolute_path.to_str().unwrap(),
+            &split_content_lines(original),
+            Some("same-mtime-change"),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "same-mtime-change".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({"files": [{
+            "path": "same-mtime.txt",
+            "edits": [{"anchor": format!("{}§before", anchors[0]), "text": "ours"}]
+        }]});
+        let handler = EditFileHandler::new().with_external_change_before_write_preserving_mtime(
+            absolute_path.to_string_lossy().into_owned(),
+            "external\n".to_string(),
+        );
+
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("content changes must be detected independently of mtime");
+        assert!(error.to_string().contains("modified externally"));
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "external\n");
+        assert_eq!(
+            std::fs::metadata(file_path).unwrap().modified().unwrap(),
+            initial_mtime
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_modification_after_earlier_write_rolls_back_own_changes() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.txt");
+        let second_path = dir.path().join("second.txt");
+        let first_original = "first\n";
+        let second_original = "second\n";
+        std::fs::write(&first_path, first_original).unwrap();
+        std::fs::write(&second_path, second_original).unwrap();
+        let first_absolute = std::fs::canonicalize(&first_path).unwrap();
+        let second_absolute = std::fs::canonicalize(&second_path).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let first_anchors = anchor_mgr.reconcile(
+            first_absolute.to_str().unwrap(),
+            &split_content_lines(first_original),
+            Some("write-race"),
+        );
+        let second_anchors = anchor_mgr.reconcile(
+            second_absolute.to_str().unwrap(),
+            &split_content_lines(second_original),
+            Some("write-race"),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "write-race".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({"files": [
+            {"path": "first.txt", "edits": [{
+                "anchor": format!("{}§first", first_anchors[0]), "text": "ours first"
+            }]},
+            {"path": "second.txt", "edits": [{
+                "anchor": format!("{}§second", second_anchors[0]), "text": "ours second"
+            }]}
+        ]});
+        let handler = EditFileHandler::new().with_external_change_before_write(
+            second_absolute.to_string_lossy().into_owned(),
+            "external\n".to_string(),
+        );
+
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("write-time external modification must fail the request");
+        assert!(error.to_string().contains("modified externally"));
+        assert!(error.to_string().contains("0 edit(s) applied"));
+        assert_eq!(std::fs::read_to_string(&first_path).unwrap(), first_original);
+        assert_eq!(std::fs::read_to_string(&second_path).unwrap(), "external\n");
+        let metadata = error.metadata().expect("external change requires reread");
+        assert_eq!(
+            metadata.affected_paths,
+            vec![second_absolute.to_string_lossy().into_owned()]
+        );
+        let state = state.lock().await;
+        assert!(state.session_file_changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rollback_preserves_concurrent_change_to_earlier_written_file() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.txt");
+        let second_path = dir.path().join("second.txt");
+        let first_original = "first\n";
+        let second_original = "second\n";
+        std::fs::write(&first_path, first_original).unwrap();
+        std::fs::write(&second_path, second_original).unwrap();
+        let first_absolute = std::fs::canonicalize(&first_path).unwrap();
+        let second_absolute = std::fs::canonicalize(&second_path).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let first_anchors = anchor_mgr.reconcile(
+            first_absolute.to_str().unwrap(),
+            &split_content_lines(first_original),
+            Some("rollback-race"),
+        );
+        let second_anchors = anchor_mgr.reconcile(
+            second_absolute.to_str().unwrap(),
+            &split_content_lines(second_original),
+            Some("rollback-race"),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "rollback-race".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({"files": [
+            {"path": "first.txt", "edits": [{
+                "anchor": format!("{}§first", first_anchors[0]), "text": "ours first"
+            }]},
+            {"path": "second.txt", "edits": [{
+                "anchor": format!("{}§second", second_anchors[0]), "text": "ours second"
+            }]}
+        ]});
+        let handler = EditFileHandler::new()
+            .with_external_change_before_write(
+                second_absolute.to_string_lossy().into_owned(),
+                "external second\n".to_string(),
+            )
+            .with_external_change_before_rollback(
+                first_absolute.to_string_lossy().into_owned(),
+                "external first\n".to_string(),
+            );
+
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("a concurrent rollback change must fail without being overwritten");
+        let output = error.to_string();
+        assert!(output.contains("Rollback incomplete"), "got: {output}");
+        assert!(output.contains("changed after Sned wrote it"), "got: {output}");
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            "external first\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second_path).unwrap(),
+            "external second\n"
+        );
+        let metadata = error.metadata().expect("both concurrent paths need rereading");
+        assert_eq!(
+            metadata.affected_paths,
+            vec![
+                first_absolute.to_string_lossy().into_owned(),
+                second_absolute.to_string_lossy().into_owned(),
+            ]
+        );
+        let state = state.lock().await;
         assert!(
             state
-                .session_file_changes
-                .keys()
-                .any(|path| Path::new(path).file_name() == Some(last_file_name.as_ref()))
+                .must_reread_before_edit
+                .contains(first_absolute.to_str().unwrap())
         );
-        let first_absolute = first_file_path
-            .canonicalize()
-            .unwrap_or_else(|_| first_file_path.clone())
-            .to_string_lossy()
-            .into_owned();
-        let failing_absolute = failing_file_path
-            .canonicalize()
-            .unwrap_or_else(|_| failing_file_path.clone())
-            .to_string_lossy()
-            .into_owned();
-        let last_absolute = last_file_path
-            .canonicalize()
-            .unwrap_or_else(|_| last_file_path.clone())
-            .to_string_lossy()
-            .into_owned();
-        assert!(state.must_reread_before_edit.contains(&first_absolute));
-        assert!(state.must_reread_before_edit.contains(&failing_absolute));
-        assert!(!state.must_reread_before_edit.contains(&last_absolute));
+        assert!(state.session_file_changes.is_empty());
     }
 
     #[tokio::test]

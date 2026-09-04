@@ -104,6 +104,9 @@ pub(crate) fn edit_failure(reason: EditFailureReason, consecutive_failures: u32)
         EditFailureReason::GluedAnchor => {
             "The assembled replacement joined anchored lines together. Re-read the file and preserve each physical line break; do not paste multiple anchors into one line."
         }
+        EditFailureReason::DuplicateInsertion => {
+            "The insertion would duplicate content already beside its anchor or repeat the anchored line. Do not re-read or retry the same insertion; use replace with anchor and end_anchor when wrapping existing code."
+        }
     };
 
     match consecutive_failures {
@@ -165,11 +168,14 @@ mod tests {
         let whitespace = edit_failure(EditFailureReason::WhitespaceMismatch, 0);
         let overlap = edit_failure(EditFailureReason::RangeOverlap, 0);
         let glued = edit_failure(EditFailureReason::GluedAnchor, 3);
+        let duplicate = edit_failure(EditFailureReason::DuplicateInsertion, 0);
 
         assert!(whitespace.contains("re-reading is not required"));
         assert!(overlap.contains("Split them into separate tool calls"));
         assert!(glued.contains("physical line break"));
         assert!(glued.contains("Stop retrying the same edit arguments"));
+        assert!(duplicate.contains("Do not re-read"));
+        assert!(duplicate.contains("use replace"));
     }
 
     #[test]

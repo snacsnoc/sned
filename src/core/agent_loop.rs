@@ -5551,6 +5551,103 @@ mod tests {
         }
     }
 
+    struct StaticErrorHandler;
+
+    impl crate::core::tools::ToolHandler for StaticErrorHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                Err(crate::core::tools::ToolError::ExecutionFailed(
+                    "file batch rejected".to_string(),
+                ))
+            })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "static error".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_error_sets_tool_execution_error_flag() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let config = test_agent_config(provider, "handler-error-flag");
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        let context = Arc::new(ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "handler-error-flag".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        ));
+
+        let output = AgentLoop::execute_tool_with_hooks_internal(
+            &config,
+            None,
+            context,
+            "edit_file",
+            &serde_json::json!({}),
+            Arc::new(StaticErrorHandler),
+            None,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+
+        assert!(output.is_error);
+        assert!(output.text.contains("file batch rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_handler_error_increments_failure_counter() {
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_edit_error".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("edit_file".to_string()),
+                    arguments: Some(
+                        serde_json::json!({
+                            "files": [{"path": "file.rs", "edits": []}],
+                        })
+                        .to_string(),
+                    ),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::EditFile, Arc::new(StaticErrorHandler));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "edit-error-counter"))
+            .with_tools(Arc::new(registry));
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert_eq!(agent.state.lock().await.consecutive_mistakes, 1);
+    }
+
     #[test]
     fn test_parallel_tool_results_keep_hook_context_in_the_tool_turn() {
         let mut blocks = Vec::new();

@@ -215,7 +215,7 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit existing files by replacing or inserting lines; it does not create files. Workflow: call read_file, get_function, or get_file_skeleton first and copy one exact Word§line content anchor including its prefix. Never invent an anchor or use a line number alone. Put replacement text in text; optional content is only an exact interior-line array for duplicate-anchor disambiguation. Re-read after stale, unknown, malformed, or ambiguous-anchor errors. Files above SNED_MAX_FILE_READ_SIZE require restarting Sned with a higher limit; do not bypass that safety limit with execute_command. Use write_to_file for new files or complete rewrites only when you have all desired content.",
+        description: "Edit existing files with exact Word§line anchors: call read_file, get_function, or get_file_skeleton; does not create files. Each file is atomic: an invalid anchor, overlap, duplicate insertion, or assembly failure withholds that file. Other files may apply; any rejection returns an error summary. Re-read after anchor errors. For oversized files, raise SNED_MAX_FILE_READ_SIZE; do not bypass with execute_command. text replaces; content disambiguates anchors. Use write_to_file to create or fully rewrite files.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
@@ -237,7 +237,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                 "edit_type": {
                                     "type": "string",
                                     "enum": ["replace", "insert_after", "insert_before"],
-                                    "description": "The type of edit to perform. Defaults to 'replace'."
+                                    "description": "Defaults to replace. Inserts preserve the anchor; use a range replace to wrap code. Adjacent duplicates and insertion text repeating the anchor line are rejected."
                                 },
                                 "anchor": {
                                     "type": "string",
@@ -254,7 +254,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                 },
                                 "text": {
                                     "type": "string",
-                                    "description": "The new text content for the edit. Use \\n for new lines."
+                                    "description": "Replacement text; use \\n for new lines. In insertions, leading and trailing blank lines count in duplicate checks."
                                 }
                             },
                             "required": ["anchor", "text"]
