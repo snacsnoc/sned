@@ -59,6 +59,10 @@ for ((i = 0; i < ${#args[@]}; i++)); do
         --release)
             profile='release'
             ;;
+        --profile)
+            i=$((i + 1))
+            profile="${args[i]}"
+            ;;
     esac
 done
 
@@ -149,6 +153,7 @@ for suffix in macos-arm64 macos-x86_64 linux-amd64 linux-armv7l freebsd-amd64; d
 done
 assert_file "${AGGREGATE_TARGET}/release-artifacts/SHA256SUMS"
 [[ "$(wc -l < "${AGGREGATE_TARGET}/release-artifacts/SHA256SUMS" | tr -d ' ')" == 5 ]]
+assert_file "${AGGREGATE_TARGET}/aarch64-apple-darwin/dist/sned"
 if command -v sha256sum >/dev/null 2>&1; then
     (cd "${AGGREGATE_TARGET}/release-artifacts" && sha256sum -c SHA256SUMS >/dev/null)
 else
@@ -157,6 +162,7 @@ fi
 assert_not_exists "${AGGREGATE_TARGET}/dist"
 assert_log_contains 'cargo zigbuild'
 assert_log_contains '--target armv7-unknown-linux-gnueabihf'
+assert_log_contains '--profile dist'
 
 PATH="${FAKE_BIN_DIR}:${PATH}" \
     FAKE_LOG="${FAKE_LOG}" \

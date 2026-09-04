@@ -149,6 +149,12 @@ harness = false
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+
+# Keep shipped binaries on the slower, maximum-link-time optimization path.
+[profile.dist]
+inherits = "release"
 lto = true
 codegen-units = 1
-strip = true

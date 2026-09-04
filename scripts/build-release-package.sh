@@ -78,11 +78,10 @@ case "${TARGET_TRIPLE}" in
         ;;
 esac
 
-BUILD_FLAG=""
-if [[ "${BUILD_MODE}" == "release" ]]; then
-    BUILD_FLAG="--release"
-fi
 PROFILE_DIR="${BUILD_MODE}"
+if [[ "${BUILD_MODE}" == "release" ]]; then
+    PROFILE_DIR="dist"
+fi
 TARGET_BINARY="${TARGET_DIR}/${TARGET_TRIPLE}/${PROFILE_DIR}/sned"
 STAGING_DIR=""
 PACKAGE_DIR=""
@@ -129,8 +128,8 @@ BUILD_ARGS=(
     --manifest-path "${PROJECT_ROOT}/Cargo.toml"
     --bin sned
 )
-if [[ -n "${BUILD_FLAG}" ]]; then
-    BUILD_ARGS+=("${BUILD_FLAG}")
+if [[ "${BUILD_MODE}" == "release" ]]; then
+    BUILD_ARGS+=(--profile dist)
 fi
 
 if [[ "${BUILD_CMD[1]}" == "zigbuild" ]]; then
