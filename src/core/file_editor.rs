@@ -14,6 +14,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -423,6 +424,41 @@ struct AnchorStorage {
     cache_file: std::path::PathBuf,
 }
 
+struct AnchorCacheLock(std::fs::File);
+
+impl AnchorCacheLock {
+    fn acquire(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        Ok(Self(file))
+    }
+}
+
+impl Drop for AnchorCacheLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 impl AnchorStorage {
     /// Load anchor state from disk (~/.sned/data/cache/anchors.json)
     fn load(anchors_file: std::path::PathBuf) -> Self {
@@ -471,7 +507,18 @@ impl AnchorStorage {
             return;
         }
 
-        match serde_json::to_string_pretty(&self.tasks) {
+        let lock_file = anchors_file.with_extension("json.lock");
+        let Ok(_lock) = AnchorCacheLock::acquire(&lock_file) else {
+            tracing::warn!("Failed to lock anchor cache for writing");
+            return;
+        };
+
+        let mut tasks = Self::load(anchors_file.clone()).tasks;
+        for (task_id, documents) in &self.tasks {
+            tasks.insert(task_id.clone(), documents.clone());
+        }
+
+        match serde_json::to_string_pretty(&tasks) {
             Ok(json) => {
                 if let Err(e) = crate::storage::disk::atomic_write_file(&anchors_file, &json) {
                     tracing::warn!("Failed to save anchor cache: {}", e);
@@ -2908,5 +2955,20 @@ mod tests {
             "task_a (recently used) should remain"
         );
         assert!(storage.tasks.contains_key("task_c"), "task_c should remain");
+    }
+
+    #[test]
+    fn anchor_cache_save_merges_tasks_from_other_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_file = dir.path().join("anchors.json");
+        let first = AnchorStateManager::with_cache_file(cache_file.clone());
+        let second = AnchorStateManager::with_cache_file(cache_file.clone());
+
+        let _ = first.reconcile("first.rs", &["first".to_string()], Some("task-a"));
+        let _ = second.reconcile("second.rs", &["second".to_string()], Some("task-b"));
+
+        let reloaded = AnchorStateManager::with_cache_file(cache_file);
+        assert!(reloaded.is_tracking("first.rs", Some("task-a")));
+        assert!(reloaded.is_tracking("second.rs", Some("task-b")));
     }
 }
