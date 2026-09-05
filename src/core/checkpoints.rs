@@ -163,6 +163,20 @@ impl CheckpointTracker {
             )?;
         }
 
+        let excludes_file = shadow_dir.join("checkpoint-excludes");
+        std::fs::write(
+            &excludes_file,
+            ".git/\n.sned/\ntarget/\nnode_modules/\n.venv/\ndist/\n.DS_Store\n",
+        )?;
+        Self::run_git_cmd(
+            &self.shadow_git_path,
+            &[
+                "config",
+                "core.excludesFile",
+                excludes_file.to_str().unwrap_or(""),
+            ],
+        )?;
+
         // Set worktree to the actual workspace
         Self::run_git_cmd(
             &self.shadow_git_path,
@@ -304,7 +318,10 @@ impl CheckpointTracker {
 
         if status_output.status.success() {
             let status_text = String::from_utf8_lossy(&status_output.stdout).to_string();
-            let uncommitted: Vec<&str> = status_text.lines().filter(|s| !s.is_empty()).collect();
+            let uncommitted: Vec<&str> = status_text
+                .lines()
+                .filter(|s| !s.is_empty() && !s.starts_with("??"))
+                .collect();
 
             if !uncommitted.is_empty() {
                 return Err(CheckpointError::CommandFailed(format!(
@@ -774,7 +791,7 @@ impl TaskCheckpointManager {
         }
     }
 
-    /// Restore workspace to checkpoint by number (1 = oldest, N = newest).
+    /// Restore workspace by number in the order shown by `list_checkpoints`.
     pub async fn restore_by_number(&self, number: usize) -> Result<(), CheckpointError> {
         let checkpoints = self.list_checkpoints().await?;
 
@@ -786,8 +803,7 @@ impl TaskCheckpointManager {
             )));
         }
 
-        // Convert 1-based number to index (1 = oldest = first in log)
-        let checkpoint = &checkpoints[checkpoints.len() - number];
+        let checkpoint = &checkpoints[number - 1];
         self.restore_checkpoint(&checkpoint.hash).await
     }
 }
@@ -975,6 +991,100 @@ mod tests {
             files.contains(&"test.txt".to_string()),
             "test.txt should be in changed files"
         );
+    }
+
+    #[tokio::test]
+    async fn test_restore_by_number_uses_list_order_and_ignores_untracked_files() {
+        if !git_available() {
+            eprintln!("Skipping test: git not available");
+            return;
+        }
+
+        ensure_test_checkpoint_base_dir();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = temp_dir.path().join("restore-by-number");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("state.txt");
+        std::fs::write(&file, "v1").unwrap();
+
+        let manager = TaskCheckpointManager::new(
+            "test-task-restore-by-number".to_string(),
+            true,
+            workspace.to_str().unwrap(),
+        );
+        let mut manager = manager;
+        manager.save_checkpoint().await.expect("first checkpoint");
+        std::fs::write(&file, "v2").unwrap();
+        manager.save_checkpoint().await.expect("second checkpoint");
+
+        let build_output = workspace.join("target").join("build.log");
+        std::fs::create_dir_all(build_output.parent().unwrap()).unwrap();
+        std::fs::write(&build_output, "untracked build output").unwrap();
+
+        manager
+            .restore_by_number(1)
+            .await
+            .expect("newest listed checkpoint should restore");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
+        assert!(
+            build_output.exists(),
+            "untracked artifacts must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_excludes_workspace_artifacts() {
+        if !git_available() {
+            eprintln!("Skipping test: git not available");
+            return;
+        }
+
+        ensure_test_checkpoint_base_dir();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = temp_dir.path().join("checkpoint-excludes");
+        std::fs::create_dir_all(workspace.join("target")).unwrap();
+        std::fs::create_dir_all(workspace.join(".sned")).unwrap();
+        std::fs::create_dir_all(workspace.join("node_modules/pkg")).unwrap();
+        std::fs::write(workspace.join("target/build.bin"), "build").unwrap();
+        std::fs::write(workspace.join(".sned/cache"), "cache").unwrap();
+        std::fs::write(workspace.join("node_modules/pkg/index.js"), "module").unwrap();
+        std::fs::write(workspace.join("source.c"), "int main(void) { return 0; }\n").unwrap();
+
+        let mut manager = TaskCheckpointManager::new(
+            "test-task-checkpoint-excludes".to_string(),
+            true,
+            workspace.to_str().unwrap(),
+        );
+        manager.save_checkpoint().await.expect("checkpoint");
+        let tracker = manager.tracker.as_ref().unwrap();
+
+        let config = Command::new("git")
+            .args([
+                "--git-dir",
+                tracker.shadow_git_path.to_str().unwrap(),
+                "config",
+                "--get",
+                "core.excludesFile",
+            ])
+            .output()
+            .unwrap();
+        assert!(config.status.success());
+
+        let files = Command::new("git")
+            .args([
+                "--git-dir",
+                tracker.shadow_git_path.to_str().unwrap(),
+                "ls-files",
+            ])
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&files.stdout);
+        assert!(files.lines().any(|line| line == "source.c"));
+        assert!(!files.lines().any(|line| line.starts_with("target/")));
+        assert!(!files.lines().any(|line| line.starts_with(".sned/")));
+        assert!(!files.lines().any(|line| line.starts_with("node_modules/")));
     }
 
     #[tokio::test]
