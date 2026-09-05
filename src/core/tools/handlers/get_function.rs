@@ -1,4 +1,3 @@
-use crate::core::tools::handlers::read_file::record_complete_file_read;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::tree_sitter::{
     MAX_STRUCTURAL_FILE_READ_SIZE, get_functions, load_required_language_parsers,
@@ -77,16 +76,7 @@ impl GetFunctionHandler {
                     &language_parsers,
                     Some(ctx.task_id.as_str()),
                 ) {
-                    Ok(Some(result)) => {
-                        if !result.found_names.is_empty() {
-                            let mut state = ctx.state.lock().await;
-                            record_complete_file_read(&mut state, &canonical_path);
-                            state
-                                .consecutive_reads
-                                .remove(&canonical_path.to_string_lossy().into_owned());
-                        }
-                        Ok(result.formatted_content)
-                    }
+                    Ok(Some(result)) => Ok(result.formatted_content),
                     Ok(None) => Ok(format!("No functions found in {path}")),
                     Err(e) => Err(ToolError::ExecutionFailed(format!(
                         "Error getting functions: {e}"
@@ -133,7 +123,6 @@ mod tests {
     use super::*;
     use crate::core::agent_loop::TaskState;
     use crate::core::file_editor::AnchorStateManager;
-    use crate::core::tools::handlers::edit_file::EditFileHandler;
     use std::sync::Arc;
 
     fn test_context(
@@ -154,7 +143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_function_clears_reread_requirement_after_returning_anchors() {
+    async fn test_get_function_does_not_clear_reread_requirement_after_returning_anchors() {
         let workspace = tempfile::tempdir().unwrap();
         let file_path = workspace.path().join("example.rs");
         std::fs::write(&file_path, "fn target() {\n    println!(\"ok\");\n}\n").unwrap();
@@ -176,38 +165,12 @@ mod tests {
             .unwrap();
 
         assert!(output.contains("target"));
-        let anchor = output
-            .lines()
-            .find(|line| line.contains("fn target()"))
-            .expect("function output should contain an anchored definition")
-            .to_string();
         assert!(
-            !state
+            state
                 .lock()
                 .await
                 .must_reread_before_edit
                 .contains(&canonical_path.to_string_lossy().into_owned())
-        );
-        ToolHandler::execute(
-            &EditFileHandler::new(),
-            &ctx,
-            serde_json::json!({
-                "files": [{
-                    "path": "example.rs",
-                    "edits": [{
-                        "anchor": anchor,
-                        "edit_type": "replace",
-                        "text": "fn target() { println!(\"updated\"); }"
-                    }]
-                }]
-            }),
-        )
-        .await
-        .expect("edit_file should accept an anchor returned by get_function");
-        assert!(
-            std::fs::read_to_string(&file_path)
-                .unwrap()
-                .contains("updated")
         );
     }
 

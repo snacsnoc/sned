@@ -310,7 +310,10 @@ pub fn get_functions(
                 }
                 seen_ranges.insert(range_key);
 
-                let def_text = &file_content[range.start_index..range.end_index];
+                let line_start = file_content[..range.start_index]
+                    .rfind('\n')
+                    .map_or(0, |offset| offset + 1);
+                let def_text = &file_content[line_start..range.end_index];
                 let def_lines: Vec<&str> = def_text.lines().collect();
                 let start_line = range.start_line;
                 let end_line = start_line + def_lines.len();
@@ -618,6 +621,30 @@ mod tests {
         let after = anchors.reconcile("fixture.rs", &lines, Some("task"));
 
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn get_functions_preserves_indentation_in_editable_anchors() {
+        let parsers = load_required_language_parsers(&["fixture.rs"]).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let anchors = AnchorStateManager::with_cache_file(cache_dir.path().join("anchors.json"));
+        let content = "impl Foo {\n    fn bar(&self) {}\n}\n";
+        let lines = crate::core::file_editor::split_content_lines(content);
+        let _ = anchors.reconcile("fixture.rs", &lines, Some("task"));
+
+        let result = get_functions(
+            &anchors,
+            "fixture.rs",
+            "fixture.rs",
+            &["bar".to_string()],
+            content,
+            &parsers,
+            Some("task"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(result.formatted_content.contains("§    fn bar(&self) {}"));
     }
 
     #[test]

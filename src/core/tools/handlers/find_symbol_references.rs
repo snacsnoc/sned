@@ -1,5 +1,4 @@
 use crate::core::hash_utils::format_line_with_hash;
-use crate::core::tools::handlers::read_file::record_complete_file_read;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
 use crate::services::tree_sitter::load_required_language_parsers;
@@ -138,11 +137,6 @@ impl FindSymbolReferencesHandler {
 
             let (normalized, _) = crate::core::file_editor::normalize_file_content(&content);
             let lines = crate::core::file_editor::split_content_lines(&normalized);
-            {
-                let mut state = ctx.state.lock().await;
-                record_complete_file_read(&mut state, &canonical_path);
-                state.consecutive_reads.remove(abs_path_str.as_ref());
-            }
             file_data.insert(
                 display_path,
                 FileData {
@@ -160,7 +154,6 @@ impl FindSymbolReferencesHandler {
         if !indexed_locations.is_empty() {
             merge_index_locations(
                 &mut file_data,
-                ctx,
                 &indexed_paths,
                 indexed_locations,
                 &mut index_warnings,
@@ -341,7 +334,6 @@ impl ToolHandler for FindSymbolReferencesHandler {
 
 async fn merge_index_locations(
     file_data: &mut BTreeMap<String, FileData>,
-    ctx: &ToolContext,
     indexed_paths: &BTreeMap<String, std::path::PathBuf>,
     locations: Vec<SymbolLocation>,
     warnings: &mut Vec<String>,
@@ -363,11 +355,6 @@ async fn merge_index_locations(
                 }
             };
             let canonical_path = resolved_path.to_string_lossy().into_owned();
-            {
-                let mut state = ctx.state.lock().await;
-                record_complete_file_read(&mut state, &resolved_path);
-                state.consecutive_reads.remove(&canonical_path);
-            }
             file_data.insert(
                 display_path.clone(),
                 FileData {
@@ -592,7 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_returned_anchor_is_editable_and_records_complete_read() {
+    async fn test_returned_anchor_is_editable_without_clearing_context() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("test.rs");
         std::fs::write(&file_path, "fn foo() {}\n").unwrap();
@@ -633,11 +620,52 @@ mod tests {
             .await
             .expect("anchor emitted by find_symbol_references must work in edit_file");
 
-        assert!(!edit.as_str().unwrap().contains("not read this session"));
+        assert!(edit.as_str().unwrap().contains("not read this session"));
         assert!(
             std::fs::read_to_string(file_path)
                 .unwrap()
                 .contains("println!")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_does_not_clear_reread_requirement() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
+        let canonical_path = std::fs::canonicalize(&file_path).unwrap();
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(canonical_path.to_string_lossy().into_owned());
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            temp_dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        FindSymbolReferencesHandler::new()
+            .execute(
+                &ctx,
+                serde_json::json!({"path": "test.rs", "name": "missing"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&canonical_path.to_string_lossy().into_owned())
         );
     }
 
