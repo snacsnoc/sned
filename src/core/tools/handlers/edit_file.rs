@@ -16,8 +16,8 @@ use crate::core::edit_batch::{
     MAX_FINGERPRINT_CONTENT_LINES, PreparedEdits,
 };
 use crate::core::file_editor::{
-    AnchorStateManager, Edit, EditFailureReason, FileEditGuard, FileTextFormat,
-    normalize_file_content, restore_file_content,
+    AnchorStateManager, Edit, EditFailureReason, FileTextFormat, normalize_file_content,
+    restore_file_content,
 };
 use crate::core::hash_utils::{ANCHOR_DELIMITER, split_anchor, strip_hashes};
 use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
@@ -631,10 +631,11 @@ impl EditFileHandler {
     }
 
     async fn mark_must_reread(state: &Arc<Mutex<TaskState>>, path: &str) {
+        let key = crate::core::tools::canonical_path_key(Path::new(path));
         let mut state = state.lock().await;
-        state.must_reread_before_edit.insert(path.to_string());
-        state.file_content_cache.pop(path);
-        state.consecutive_reads.remove(path);
+        state.must_reread_before_edit.insert(key.clone());
+        state.file_content_cache.pop(&key);
+        state.consecutive_reads.remove(&key);
     }
 
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
@@ -964,11 +965,16 @@ impl EditFileHandler {
                 }
             }
 
+            let reread_key =
+                crate::core::tools::canonical_path_key(Path::new(&batch.absolute_path));
             if state
                 .lock()
                 .await
                 .must_reread_before_edit
-                .contains(&batch.absolute_path)
+                .iter()
+                .any(|key| {
+                    crate::core::tools::path_key_matches(key, Path::new(&batch.absolute_path))
+                })
             {
                 rejected_paths.insert(batch.absolute_path.clone());
                 reread_paths.insert(batch.absolute_path.clone());
@@ -980,9 +986,6 @@ impl EditFileHandler {
                 ));
                 continue;
             }
-
-            // Acquire exclusive file lock to prevent concurrent edits
-            let _file_guard = FileEditGuard::acquire(&batch.absolute_path).await;
 
             let stale_check = {
                 let mut state_guard = state.lock().await;
@@ -1048,7 +1051,7 @@ impl EditFileHandler {
                 .lock()
                 .await
                 .file_content_cache
-                .get(&batch.absolute_path)
+                .get(&reread_key)
                 .cloned();
             if expected_content.is_some() {
                 match tokio::fs::symlink_metadata(&batch.absolute_path).await {
@@ -1124,7 +1127,9 @@ impl EditFileHandler {
                 .lock()
                 .await
                 .file_context_tracker
-                .track_file_read(Path::new(&batch.absolute_path));
+                .track_file_read(Path::new(&crate::core::tools::canonical_path_key(
+                    Path::new(&batch.absolute_path),
+                )));
 
             // Stale-anchor preflight: capture the tracked anchor set BEFORE
             // reconcile mutates it, so we can detect anchors the model is
@@ -1527,7 +1532,7 @@ impl EditFileHandler {
                     Ok(()) => {
                         let mut state = state.lock().await;
                         state.insert_file_content(
-                            item.absolute_path.clone(),
+                            crate::core::tools::canonical_path_key(Path::new(&item.absolute_path)),
                             item.final_content.clone(),
                         );
                         state
@@ -1628,7 +1633,11 @@ impl EditFileHandler {
         {
             let mut state = state.lock().await;
             for item in &write_items {
-                state.consecutive_reads.remove(&item.absolute_path);
+                state
+                    .consecutive_reads
+                    .remove(&crate::core::tools::canonical_path_key(Path::new(
+                        &item.absolute_path,
+                    )));
             }
         }
 
@@ -5834,30 +5843,8 @@ edition = "2021"
         );
     }
 
-    /// Regression test for the key-mismatch bug in must_reread_before_edit
-    /// tracking. The original mark_must_reread stored the
-    /// workspace-joined path (from resolve_sanitized_path), but
-    /// read_file's track_read_files used the raw model-provided path.
-    /// The two keys never matched when the workspace had symlinks
-    /// (e.g. /tmp → /private/tmp on macOS), so must_reread_before_edit
-    /// was never cleared by a re-read, and the model got stuck in an
-    /// infinite re-read loop.
-    ///
-    /// The fix: mark_must_reread now canonicalizes the path via
-    /// std::fs::canonicalize before storing it. read_file's
-    /// track_read_files uses the canonical_path from
-    /// FileReadResult (computed by tokio::fs::canonicalize) to match.
-    /// Both sides now use the fully-canonicalized path as the key.
-    ///
-    /// This test exercises the full production flow through the
-    /// public ToolHandler::execute:
-    /// 1. EditFileHandler::execute performs a real edit, which calls
-    ///    mark_must_reread with batch.absolute_path (workspace-joined).
-    /// 2. The flag is stored in must_reread_before_edit.
-    /// 3. ReadFileHandler::execute is called to re-read the file.
-    /// 4. track_read_files uses the canonical_path from the result to
-    ///    remove the flag.
-    /// 5. Assert must_reread_before_edit is empty.
+    /// A rejection through a symlinked workspace must record the same key a
+    /// later read clears, otherwise the model cannot escape the reread loop.
     #[tokio::test]
     async fn test_read_file_clears_must_reread_with_canonical_path() {
         use crate::core::agent_types::TaskState;
@@ -5894,8 +5881,8 @@ edition = "2021"
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = Arc::new(AnchorStateManager::new());
 
-        // Step 1: Seed anchors from the initial file content so
-        // mark_must_reread fires after a successful edit.
+        // Seed a valid word, then quote it with different content to reach the
+        // production stale-anchor rejection path.
         let initial_anchors = anchor_mgr.reconcile(
             file_path.to_str().unwrap(),
             &raw_content
@@ -5905,10 +5892,6 @@ edition = "2021"
             Some("test-task"),
         );
 
-        // Step 2: Perform a real edit via the public path. This goes
-        // through resolve_path → resolve_sanitized_path (workspace-join,
-        // NOT canonicalize) → mark_must_reread. The fix in
-        // mark_must_reread canonicalizes the path before storing.
         let edit_handler = EditFileHandler::new();
         let edit_ctx = crate::core::tools::ToolContext::new(
             state.clone(),
@@ -5921,24 +5904,22 @@ edition = "2021"
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
         );
-        let anchor = format!("{}§fn main() {{}}", initial_anchors[0]);
+        let anchor = format!("{}§fn missing() {{}}", initial_anchors[0]);
         let edit_params = serde_json::json!({
             "files": [{
                 "path": file_path.to_string_lossy(),
                 "edits": [{
                     "anchor": anchor,
                     "edit_type": "replace",
-                    "text": "fn main() { println!(\"edited\"); }"
+                    "text": "fn missing() {}"
                 }]
             }]
         });
-        let _ = crate::core::tools::ToolHandler::execute(&edit_handler, &edit_ctx, edit_params)
+        crate::core::tools::ToolHandler::execute(&edit_handler, &edit_ctx, edit_params)
             .await
-            .expect("edit should succeed");
+            .expect_err("stale anchor must set the reread latch");
+        assert!(!state.lock().await.must_reread_before_edit.is_empty());
 
-        // Step 3: Re-read via the public path. track_read_files uses
-        // the canonical_path from FileReadResult to match. With the
-        // fix, this clears the flag.
         let read_handler = crate::core::tools::handlers::read_file::ReadFileHandler::new();
         let read_ctx = crate::core::tools::ToolContext::new(
             state.clone(),
@@ -5970,6 +5951,64 @@ edition = "2021"
              workspace-joined: {workspace_file:?}, canonical: {canonical_file:?}",
             state_guard.must_reread_before_edit
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_edit_file_blocks_raw_symlink_alias_reread_requirement() {
+        use std::os::unix::fs::symlink;
+
+        let real_workspace = tempfile::tempdir().unwrap();
+        let symlink_container = tempfile::tempdir().unwrap();
+        let symlink_workspace = symlink_container.path().join("workspace-link");
+        symlink(real_workspace.path(), &symlink_workspace).unwrap();
+        let symlink_file = symlink_workspace.join("source.txt");
+        std::fs::write(&symlink_file, "Hello, world!\n").unwrap();
+        let canonical_file = std::fs::canonicalize(&symlink_file).unwrap();
+
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(symlink_file.to_string_lossy().into_owned());
+        let anchor_mgr = AnchorStateManager::new();
+        let anchors = anchor_mgr.reconcile(
+            canonical_file.to_str().unwrap(),
+            &crate::core::file_editor::split_content_lines("Hello, world!\n"),
+            Some("test-task"),
+        );
+        let ctx = ToolContext::new(
+            state,
+            None,
+            symlink_workspace.clone(),
+            anchor_mgr,
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "files": [{
+                    "path": symlink_file.to_string_lossy(),
+                    "edits": [{
+                        "anchor": format!("{}§Hello, world!", anchors[0]),
+                        "edit_type": "replace",
+                        "text": "Changed"
+                    }]
+                }]
+            }),
+        )
+        .await
+        .expect_err("a raw symlink alias must honor the reread requirement");
+
+        assert!(result.to_string().contains("must re-read"));
+        assert_eq!(std::fs::read(&canonical_file).unwrap(), b"Hello, world!\n");
     }
 
     /// Stringified JSON parse error: when `files` is a string that fails to
@@ -6737,10 +6776,8 @@ edition = "2021"
         let output =
             result.expect("edit_file with content-ambiguous anchor must still return a result");
         let msg = output.as_str().unwrap_or("");
-        // Unique word from line 0 pins authoritatively; the edit
-        // succeeds against line 0 even though line 1 shares the
-        // content. The "matches 2 lines" listing is reserved for
-        // collisions where the supplied word itself is non-unique.
+        // A unique word pins the occurrence; this test exercises the
+        // separate case where the supplied word itself is not unique.
         assert!(
             msg.contains("1 edit(s) applied"),
             "unique anchor word must pin authoritatively to its line: {msg}"

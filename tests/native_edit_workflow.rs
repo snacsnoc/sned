@@ -13,6 +13,509 @@ struct Workflow {
     ctx: ToolContext,
 }
 
+#[tokio::test]
+async fn native_workflow_diff_context_exposes_usable_duplicate_anchors() {
+    let w = Workflow::new(b"head\n}\ntarget\n}\ntail\n");
+    let a = w.read(None).await;
+    let result = w
+        .edit(json!([{"anchor":a[2],"text":"changed"}]))
+        .await
+        .unwrap();
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    let output = ansi.replace_all(result.as_str().unwrap(), "");
+    let context = output
+        .lines()
+        .find_map(|line| line.strip_prefix(' ').filter(|line| line.ends_with("§}")))
+        .expect("diff must include the preceding brace");
+    w.edit(json!([{"anchor":context,"text":"} // first"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n} // first\nchanged\n}\ntail\n");
+}
+
+#[tokio::test]
+async fn native_workflow_reference_search_locks_requested_and_indexed_files_together() {
+    use sned::core::tools::handlers::find_symbol_references::FindSymbolReferencesHandler;
+    use sned::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
+    let w = Workflow::new(b"");
+    let other = Workflow::new(b"");
+    let mut second = other.ctx.clone();
+    second.workspace_root = w.dir.path().to_path_buf();
+    let mut index = SymbolIndexService::new(
+        w.dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    for path in ["a.rs", "b.rs"] {
+        std::fs::write(w.dir.path().join(path), "fn foo() {}\n").unwrap();
+        index.index_file(
+            path,
+            1,
+            12,
+            &[SymbolLocation {
+                path: None,
+                name: "foo".into(),
+                start_line: 0,
+                start_column: 3,
+                end_line: 0,
+                end_column: 6,
+                symbol_type: SymbolType::Definition,
+                kind: None,
+            }],
+        );
+    }
+    let index = Arc::new(std::sync::Mutex::new(index));
+    let one = FindSymbolReferencesHandler::new().with_symbol_index(index.clone());
+    let two = FindSymbolReferencesHandler::new().with_symbol_index(index);
+    let results = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            ToolHandler::execute(&one, &w.ctx, json!({"paths":["b.rs","b.rs"],"name":"foo"})),
+            ToolHandler::execute(&two, &second, json!({"paths":["a.rs"],"name":"foo"}))
+        )
+    })
+    .await
+    .expect("reference searches must not deadlock on duplicate or inverted paths");
+    for result in [results.0, results.1] {
+        let output = result.unwrap();
+        assert!(output.as_str().unwrap().contains("a.rs:"));
+        assert!(output.as_str().unwrap().contains("b.rs:"));
+    }
+}
+
+#[tokio::test]
+async fn native_workflow_structural_reads_keep_read_file_anchors() {
+    use sned::core::tools::handlers::{
+        find_symbol_references::FindSymbolReferencesHandler, get_function::GetFunctionHandler,
+    };
+    for newline in ["\n", "\r\n"] {
+        let w = Workflow::new(b"");
+        let source = ["fn foo() {", "}", "", "fn main() {", "    foo();", "}", ""].join(newline);
+        std::fs::write(w.dir.path().join("code.rs"), &source).unwrap();
+        let a = w.read_path("code.rs", None).await;
+        ToolHandler::execute(
+            &GetFunctionHandler,
+            &w.ctx,
+            json!({"path":"code.rs", "name":"foo"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a, w.read_path("code.rs", None).await);
+        ToolHandler::execute(
+            &FindSymbolReferencesHandler::new(),
+            &w.ctx,
+            json!({"paths":["code.rs"], "name":"foo"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a, w.read_path("code.rs", None).await);
+        EditFileHandler::new().execute(&w.ctx,json!({"files":[{"path":"code.rs","edits":[{"anchor":a[4],"text":"    foo(); // checked"}]}]})).await.unwrap();
+        let expected = [
+            "fn foo() {",
+            "}",
+            "",
+            "fn main() {",
+            "    foo(); // checked",
+            "}",
+            "",
+        ]
+        .join(newline);
+        assert_eq!(
+            std::fs::read(w.dir.path().join("code.rs")).unwrap(),
+            expected.as_bytes()
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_workflow_symbol_replace_then_native_edit() {
+    use sned::core::tools::handlers::replace_symbol::ReplaceSymbolHandler;
+    let w = Workflow::new(b"");
+    std::fs::write(
+        w.dir.path().join("code.rs"),
+        "const NAME: &str = \"雪\";\r\nfn foo() {}\r\nfn other() {}\r\n",
+    )
+    .unwrap();
+    w.read_path("code.rs", None).await;
+    ToolHandler::execute(&ReplaceSymbolHandler::new(), &w.ctx, json!({"replacements":[{"path":"code.rs","symbol":"foo","text":"fn foo() { /* fixed */ }"}]})).await.unwrap();
+    assert_eq!(
+        std::fs::read(w.dir.path().join("code.rs")).unwrap(),
+        "const NAME: &str = \"雪\";\r\nfn foo() { /* fixed */ }\r\nfn other() {}\r\n".as_bytes()
+    );
+    let a = w.read_path("code.rs", None).await;
+    EditFileHandler::new().execute(&w.ctx,json!({"files":[{"path":"code.rs","edits":[{"anchor":a[2],"text":"fn other() { /* checked */ }"}]}]})).await.unwrap();
+    assert_eq!(
+        std::fs::read(w.dir.path().join("code.rs")).unwrap(),
+        "const NAME: &str = \"雪\";\r\nfn foo() { /* fixed */ }\r\nfn other() { /* checked */ }\r\n".as_bytes()
+    );
+}
+
+#[tokio::test]
+async fn native_workflow_indexed_symbol_replace_uses_crlf_byte_offsets() {
+    use sned::core::tools::handlers::replace_symbol::ReplaceSymbolHandler;
+    use sned::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
+    let w = Workflow::new(b"");
+    let source = "const NAME: &str = \"雪\";\r\nfn foo() {}\r\nfn other() {}\r\n";
+    std::fs::write(w.dir.path().join("code.rs"), source).unwrap();
+    w.read_path("code.rs", None).await;
+    let mut index = SymbolIndexService::new(
+        w.dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    index.index_file(
+        "code.rs",
+        1,
+        source.len() as u64,
+        &[SymbolLocation {
+            path: None,
+            name: "foo".into(),
+            start_line: 1,
+            start_column: 0,
+            end_line: 1,
+            end_column: 11,
+            symbol_type: SymbolType::Definition,
+            kind: Some("function".into()),
+        }],
+    );
+    let handler =
+        ReplaceSymbolHandler::new().with_symbol_index(Arc::new(std::sync::Mutex::new(index)));
+    ToolHandler::execute(&handler, &w.ctx, json!({"replacements":[{"path":"code.rs","symbol":"foo","text":"fn foo() { /* fixed */ }"}]})).await.unwrap();
+    assert_eq!(
+        std::fs::read(w.dir.path().join("code.rs")).unwrap(),
+        "const NAME: &str = \"雪\";\r\nfn foo() { /* fixed */ }\r\nfn other() {}\r\n".as_bytes()
+    );
+}
+
+#[tokio::test]
+async fn native_workflow_locks_span_independent_contexts_and_helpers() {
+    let first = Workflow::new(b"source\n");
+    let second = Workflow::new(b"other\n");
+    let path = first.dir.path().join("fixture.txt").canonicalize().unwrap();
+    let held = first.ctx.lock_file_paths(std::slice::from_ref(&path)).await;
+    assert!(sned::core::file_editor::FileEditGuard::try_acquire(path.to_str().unwrap()).is_none());
+    let paths = [path.clone()];
+    let pending = second.ctx.lock_file_paths(&paths);
+    tokio::pin!(pending);
+    assert!(futures::poll!(&mut pending).is_pending());
+    drop(held);
+    let second_held = pending.await;
+    assert!(sned::core::file_editor::FileEditGuard::try_acquire(path.to_str().unwrap()).is_none());
+    drop(second_held);
+    assert!(sned::core::file_editor::FileEditGuard::try_acquire(path.to_str().unwrap()).is_some());
+}
+
+#[tokio::test]
+async fn native_workflow_insert_structural_lines_and_replay() {
+    for (before, text, after) in [
+        (
+            "top\n\nbottom",
+            "fn a() {}\n\nfn b() {}",
+            "top\nfn a() {}\n\nfn b() {}\n\nbottom",
+        ),
+        (
+            "top\n}\nbottom",
+            "if (ok) {\n    run();\n}",
+            "top\nif (ok) {\n    run();\n}\n}\nbottom",
+        ),
+        ("top\n);\nbottom", "call(\n);", "top\ncall(\n);\n);\nbottom"),
+    ] {
+        let w = Workflow::new(before.as_bytes());
+        let a = w.read(None).await;
+        w.edit(json!([{"anchor": a[1], "edit_type": "insert_before", "text": text}]))
+            .await
+            .unwrap();
+        w.assert_bytes(after.as_bytes());
+        let fresh = w.read(None).await;
+        let index = 1 + text.split('\n').count();
+        let error = w
+            .edit(json!([{"anchor": fresh[index], "edit_type": "insert_before", "text": text}]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate insertion"));
+        w.assert_reread(false).await;
+        w.assert_bytes(after.as_bytes());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_workflow_alias_write_requires_reread_then_recovers() {
+    use sned::core::tools::handlers::write_to_file::WriteToFileHandler;
+
+    let w = Workflow::new(b"first\nsecond\n");
+    std::os::unix::fs::symlink("fixture.txt", w.dir.path().join("alias.txt")).unwrap();
+    let original = w.read_path("alias.txt", None).await;
+
+    ToolHandler::execute(
+        &WriteToFileHandler::new(),
+        &w.ctx,
+        json!({"path": "alias.txt", "content": "first\nreplacement\n"}),
+    )
+    .await
+    .unwrap();
+
+    let error = w
+        .edit_path(
+            "alias.txt",
+            json!([{"anchor": original[1], "text": "unsafe"}]),
+        )
+        .await
+        .expect_err("a whole-file write must block stale alias anchors");
+    assert_eq!(
+        error.metadata().unwrap().required_next_step,
+        Some(ToolRequiredNextStep::ReadFile)
+    );
+    w.assert_bytes(b"first\nreplacement\n");
+
+    let fresh = w.read_path("alias.txt", None).await;
+    let output = w
+        .edit_path("alias.txt", json!([{"anchor": fresh[1], "text": "final"}]))
+        .await
+        .unwrap();
+    assert!(
+        !output.as_str().unwrap().contains("not read this session"),
+        "alias read must satisfy the edit-session check: {output:?}"
+    );
+    w.assert_bytes(b"first\nfinal\n");
+}
+
+#[tokio::test]
+async fn native_workflow_insertion_may_contain_a_guard_anchor_in_its_body() {
+    let w = Workflow::new(b"    return None;\nnext\n");
+    let anchors = w.read(None).await;
+    w.edit(json!([{
+        "anchor": anchors[0],
+        "edit_type": "insert_before",
+        "text": "    if missing {\n        return None;\n    }"
+    }]))
+    .await
+    .expect("a guard may legitimately contain the anchored return");
+    w.assert_bytes(b"    if missing {\n        return None;\n    }\n    return None;\nnext\n");
+}
+
+#[tokio::test]
+async fn native_workflow_diff_blocks_follow_source_order() {
+    let w = Workflow::new(b"first\nsecond\nthird\nfourth\n");
+    let anchors = w.read(None).await;
+    let output = w
+        .edit(json!([
+            {"anchor": anchors[3], "text": "fourth changed"},
+            {"anchor": anchors[0], "text": "first changed"}
+        ]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"first changed\nsecond\nthird\nfourth changed\n");
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    let output = ansi.replace_all(output.as_str().unwrap(), "");
+    assert!(
+        output.find("first changed").unwrap() < output.find("fourth changed").unwrap(),
+        "diff blocks must follow source order: {output}"
+    );
+}
+
+#[tokio::test]
+async fn native_workflow_failed_edit_reread_clears_canonical_freshness_latch() {
+    let w = Workflow::new(b"first\nsecond\n");
+    let anchors = w.read(None).await;
+    let stale = anchors[0].replacen('§', "§wrong ", 1);
+    assert!(
+        w.edit(json!([{"anchor": stale, "text": "broken"}]))
+            .await
+            .is_err()
+    );
+    w.assert_reread(true).await;
+    let fresh = w.read(None).await;
+    w.assert_reread(false).await;
+    w.edit(json!([{"anchor": fresh[1], "text": "second changed"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"first\nsecond changed\n");
+}
+
+#[tokio::test]
+async fn native_workflow_diff_marks_only_changed_lines() {
+    for (edit_type, text, expected, additions) in [
+        (
+            "insert_after",
+            "added",
+            "before\nanchor\nadded\nafter\n",
+            vec!["added"],
+        ),
+        (
+            "insert_after",
+            "one\ntwo",
+            "before\nanchor\none\ntwo\nafter\n",
+            vec!["one", "two"],
+        ),
+        ("replace", "", "before\nafter\n", vec![]),
+    ] {
+        let w = Workflow::new(b"before\nanchor\nafter\n");
+        let a = w.read(None).await;
+        let output = w
+            .edit(json!([{"anchor": a[1], "edit_type": edit_type, "text": text}]))
+            .await
+            .unwrap();
+        w.assert_bytes(expected.as_bytes());
+        let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+        let output = ansi.replace_all(output.as_str().unwrap(), "");
+        let added: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with('+'))
+            .filter_map(|line| line.split_once('§').map(|(_, text)| text))
+            .collect();
+        assert_eq!(added, additions, "{output}");
+        let removed_count = usize::from(edit_type == "replace");
+        assert!(
+            output.contains(&format!("(+{}, -{removed_count} lines)", additions.len())),
+            "{output}"
+        );
+        if edit_type == "insert_after" {
+            assert!(!output.contains("lines between"), "{output}");
+            assert!(
+                output
+                    .lines()
+                    .any(|line| line.starts_with(' ') && line.ends_with("§anchor")),
+                "{output}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_workflow_deleting_last_line_without_newline_has_valid_diff() {
+    let w = Workflow::new(b"first\nlast");
+    let a = w.read(None).await;
+    let output = w.edit(json!([{"anchor":a[1],"text":""}])).await.unwrap();
+    w.assert_bytes(b"first");
+    assert!(output.as_str().unwrap().contains("(+0, -1 lines)"));
+}
+
+#[tokio::test]
+async fn native_workflow_duplicate_identity_cannot_move_across_reads() {
+    let w = Workflow::new(b"first\nsame\nsame\nend\n");
+    let a = w.read(None).await;
+    std::fs::write(w.dir.path().join("fixture.txt"), b"first\nsame\nend\n").unwrap();
+    let fresh = w.read(None).await;
+    assert!(
+        w.edit(json!([{"anchor": a[1], "text": "wrong"}]))
+            .await
+            .is_err()
+    );
+    w.assert_bytes(b"first\nsame\nend\n");
+    let retry = w.read(None).await;
+    assert_eq!(fresh, retry);
+    w.edit(json!([{"anchor": retry[1], "text": "right"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"first\nright\nend\n");
+}
+
+#[tokio::test]
+async fn native_workflow_identical_duplicate_reread_keeps_copied_anchor_usable() {
+    let w = Workflow::new(b"head\n}\n}\ntail\n");
+    let first = w.read(None).await;
+    assert_eq!(first, w.read(None).await);
+    w.edit(json!([{"anchor": first[1], "text": "} // first"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n} // first\n}\ntail\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_workflow_read_clears_persisted_alias_latches() {
+    let w = Workflow::new(b"first\nsecond\n");
+    let alias = w.dir.path().join("alias.txt");
+    std::os::unix::fs::symlink("fixture.txt", &alias).unwrap();
+    {
+        let mut state = w.ctx.state.lock().await;
+        state
+            .must_reread_before_edit
+            .insert(alias.to_string_lossy().into_owned());
+        state.must_reread_before_edit.insert(
+            w.dir
+                .path()
+                .join("fixture.txt")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let a = w.read(None).await;
+    assert!(w.ctx.state.lock().await.must_reread_before_edit.is_empty());
+    w.edit(json!([{"anchor": a[1], "text": "changed"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"first\nchanged\n");
+}
+
+#[tokio::test]
+async fn native_workflow_whole_write_requires_and_recovers_fresh_anchors() {
+    use sned::core::tools::handlers::write_to_file::WriteToFileHandler;
+    let w = Workflow::new(b"first\nsecond\n");
+    let a = w.read(None).await;
+    ToolHandler::execute(
+        &WriteToFileHandler::new(),
+        &w.ctx,
+        json!({"path":"fixture.txt", "content":"first\nreplacement\n"}),
+    )
+    .await
+    .unwrap();
+    w.assert_reread(true).await;
+    assert!(
+        w.edit(json!([{"anchor":a[0], "text":"unsafe"}]))
+            .await
+            .is_err()
+    );
+    w.assert_bytes(b"first\nreplacement\n");
+    let fresh = w.read(None).await;
+    w.assert_reread(false).await;
+    w.edit(json!([{"anchor":fresh[1], "text":"final"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"first\nfinal\n");
+}
+
+#[tokio::test]
+async fn native_workflow_symbol_rename_preserves_unicode_crlf_and_occurrences() {
+    use sned::core::tools::handlers::rename_symbol::RenameSymbolHandler;
+    let w = Workflow::new(b"");
+    let before = "fn foo() {}\r\nfn main() { let s = \"雪\"; foo(); foo(); }\r\n";
+    std::fs::write(w.dir.path().join("code.rs"), before).unwrap();
+    let old = w.read_path("code.rs", None).await;
+    ToolHandler::execute(
+        &RenameSymbolHandler::new(),
+        &w.ctx,
+        json!({"paths":["code.rs"],"existing_symbol":"foo","new_symbol":"longer_name"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(w.dir.path().join("code.rs")).unwrap(),
+        "fn longer_name() {}\r\nfn main() { let s = \"雪\"; longer_name(); longer_name(); }\r\n"
+            .as_bytes()
+    );
+    assert!(
+        EditFileHandler::new()
+            .execute(
+                &w.ctx,
+                json!({"files":[{"path":"code.rs","edits":[{"anchor":old[0],"text":"unsafe"}]}]})
+            )
+            .await
+            .is_err()
+    );
+    let a = w.read_path("code.rs", None).await;
+    EditFileHandler::new().execute(&w.ctx,json!({"files":[{"path":"code.rs","edits":[{"anchor":a[0],"text":"fn longer_name() { /* edited */ }"}]}]})).await.unwrap();
+    assert_eq!(std::fs::read(w.dir.path().join("code.rs")).unwrap(), "fn longer_name() { /* edited */ }\r\nfn main() { let s = \"雪\"; longer_name(); longer_name(); }\r\n".as_bytes());
+}
+
 impl Workflow {
     fn new(bytes: &[u8]) -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -59,10 +562,14 @@ impl Workflow {
     }
 
     async fn edit(&self, edits: Value) -> Result<Value, ToolError> {
+        self.edit_path("fixture.txt", edits).await
+    }
+
+    async fn edit_path(&self, path: &str, edits: Value) -> Result<Value, ToolError> {
         EditFileHandler::new()
             .execute(
                 &self.ctx,
-                json!({"files": [{"path": "fixture.txt", "edits": edits}]}),
+                json!({"files": [{"path": path, "edits": edits}]}),
             )
             .await
     }
@@ -145,7 +652,9 @@ async fn native_workflow_duplicate_occurrences_outside_range() {
         let full = w.read(None).await;
         let selected = w.read(Some((index + 6, index + 6))).await;
         assert_eq!(selected[0], full[index + 5]);
-        assert!(selected[0].contains(&format!("lines {}", index + 1)));
+        if !selected[0].ends_with("§") {
+            assert!(selected[0].contains(&format!("lines {}", index + 1)));
+        }
         w.edit(json!([{"anchor": selected[0], "text": "changed"}]))
             .await
             .unwrap();

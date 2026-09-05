@@ -8,7 +8,7 @@ pub mod handlers;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -16,6 +16,26 @@ use tokio::sync::Mutex;
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::ApprovalManager;
 use crate::core::file_editor::AnchorStateManager;
+
+/// Use one key for filesystem state even when callers use a symlink alias.
+pub(crate) fn canonical_path_key(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn path_key_matches(path_key: &str, path: &Path) -> bool {
+    let key_path = Path::new(path_key);
+    if key_path == path {
+        return true;
+    }
+
+    match (std::fs::canonicalize(key_path), std::fs::canonicalize(path)) {
+        (Ok(canonical_key), Ok(canonical_path)) => canonical_key == canonical_path,
+        _ => false,
+    }
+}
 
 /// All available Sned tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -196,8 +216,6 @@ pub struct ToolContext {
     /// snapshot to make recovery guidance more specific without maintaining a
     /// competing retry counter.
     pub consecutive_failures: u32,
-    /// Per-task path locks prevent reads and writes of the same file from racing.
-    file_operation_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub approval_manager: Option<Arc<Mutex<ApprovalManager>>>,
     pub workspace_root: PathBuf,
     /// Canonical external directory roots authorized for this tool invocation.
@@ -232,7 +250,6 @@ impl ToolContext {
             state,
             cancellation_flag: None,
             consecutive_failures: 0,
-            file_operation_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             approval_manager,
             workspace_root,
             allowed_external_roots: Vec::new(),
@@ -270,34 +287,34 @@ impl ToolContext {
     pub async fn lock_file_paths(
         &self,
         paths: &[PathBuf],
-    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    ) -> Vec<crate::core::file_editor::FileEditGuard> {
         let mut keys: Vec<String> = paths
             .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|path| {
+                canonicalize_existing_parent(path)
+                    .unwrap_or_else(|_| path.clone())
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         keys.sort();
         keys.dedup();
 
-        let locks: Vec<Arc<tokio::sync::Mutex<()>>> = {
-            let mut registry = self
-                .file_operation_locks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            keys.into_iter()
-                .map(|key| {
-                    registry
-                        .entry(key)
-                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                        .clone()
-                })
-                .collect()
-        };
-
-        let mut guards = Vec::with_capacity(locks.len());
-        for lock in locks {
-            guards.push(lock.lock_owned().await);
+        let mut guards = Vec::with_capacity(keys.len());
+        for key in keys {
+            guards.push(crate::core::file_editor::acquire_file_operation_lock(&key).await);
         }
         guards
+    }
+
+    pub(crate) async fn invalidate_edit_context(&self, path: &std::path::Path) {
+        let key = canonical_path_key(path);
+        let mut state = self.state.lock().await;
+        state.file_content_cache.pop(&key);
+        state.consecutive_reads.remove(&key);
+        // A write does not deliver fresh anchors. Keep the old dictionary so the
+        // next read can retire old words, and require that read before editing.
+        state.must_reread_before_edit.insert(key);
     }
 
     /// Resolve a path under the workspace or an external directory that was
@@ -856,6 +873,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_key_matches_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let real_root = tempfile::tempdir().unwrap();
+        let alias_root = tempfile::tempdir().unwrap();
+        let alias = alias_root.path().join("workspace-link");
+        symlink(real_root.path(), &alias).unwrap();
+        let real_file = real_root.path().join("source.txt");
+        let alias_file = alias.join("source.txt");
+        std::fs::write(&real_file, "content\n").unwrap();
+
+        assert!(path_key_matches(&alias_file.to_string_lossy(), &real_file));
     }
 
     #[cfg(target_os = "macos")]

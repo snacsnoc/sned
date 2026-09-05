@@ -44,7 +44,7 @@ pub(crate) fn record_complete_file_read(state: &mut TaskState, canonical_path: &
     state.file_context_tracker.track_file_read(canonical_path);
     state
         .must_reread_before_edit
-        .remove(&canonical_path.to_string_lossy().into_owned());
+        .retain(|path| !crate::core::tools::path_key_matches(path, canonical_path));
 }
 
 /// Result of reading a single file.
@@ -895,11 +895,13 @@ impl ReadFileHandler {
             if res.success && res.refreshes_edit_context {
                 let canonical = res.canonical_path.as_deref().unwrap_or(path_str);
                 record_complete_file_read(state, Path::new(canonical));
-                // Track consecutive reads for read-loop detection.
-                // If the same file is read 3+ times in a row with no
-                // edit, warn the model. Use the canonical path so the
-                // counter matches what edit_file removes at
-                // src/core/tools/handlers/edit_file.rs:1136.
+                // A direct handler call can bypass AgentLoop's tool boundary,
+                // so a different read path must also break the sequence here.
+                if state.consecutive_reads.len() != 1
+                    || !state.consecutive_reads.contains_key(canonical)
+                {
+                    state.consecutive_reads.clear();
+                }
                 let count = state
                     .consecutive_reads
                     .entry(canonical.to_string())
@@ -2103,6 +2105,49 @@ mod tests {
                 i, i
             );
         }
+
+        let mut other_file = NamedTempFile::new().unwrap();
+        writeln!(other_file, "other").unwrap();
+        other_file.flush().unwrap();
+        let other_params = serde_json::json!({
+            "paths": [other_file.path().to_str().unwrap()]
+        });
+        handler
+            .execute(
+                &mut state,
+                other_params,
+                &anchor_mgr,
+                Some("test-task"),
+                None,
+            )
+            .await
+            .expect("different file read should succeed");
+        assert_eq!(state.consecutive_reads.len(), 1);
+        assert_eq!(
+            state
+                .consecutive_reads
+                .get(&canonical_path_str)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "reading another file must break the prior file's read sequence"
+        );
+
+        handler
+            .execute(
+                &mut state,
+                serde_json::json!({"paths": [temp_file.path().to_str().unwrap()]}),
+                &anchor_mgr,
+                Some("test-task"),
+                None,
+            )
+            .await
+            .expect("returning to the first file should succeed");
+        assert_eq!(
+            state.consecutive_reads.get(&canonical_path_str).copied(),
+            Some(1),
+            "a read after another file starts a new sequence"
+        );
     }
 
     #[tokio::test]

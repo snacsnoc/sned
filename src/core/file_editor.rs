@@ -14,7 +14,10 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::anchor_dictionary::ANCHOR_DICTIONARY;
@@ -517,7 +520,7 @@ impl FileLockManager {
         }
     }
 
-    async fn acquire(&self, path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    fn acquire(&'static self, path: &str) -> PendingFileLock {
         let lock = {
             let mut locks = self.locks.lock();
             locks
@@ -525,10 +528,15 @@ impl FileLockManager {
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone()
         };
-        lock.lock_owned().await
+        PendingFileLock {
+            pending: Some(Box::pin(lock.clone().lock_owned())),
+            lock: Some(lock),
+            path: path.to_string(),
+            manager: self,
+        }
     }
 
-    fn try_acquire(&self, path: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    fn try_acquire(&'static self, path: &str) -> Option<FileEditGuard> {
         let lock = {
             let mut locks = self.locks.lock();
             locks
@@ -536,7 +544,11 @@ impl FileLockManager {
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone()
         };
-        lock.try_lock_owned().ok()
+        lock.try_lock_owned().ok().map(|guard| FileEditGuard {
+            guard: Some(guard),
+            path: path.to_string(),
+            manager: self,
+        })
     }
 
     /// Removes a lock entry when the last guard is dropped.
@@ -549,36 +561,83 @@ impl FileLockManager {
             locks.remove(path);
         }
     }
+
+    #[cfg(test)]
+    fn contains(&self, path: &str) -> bool {
+        self.locks.lock().contains_key(path)
+    }
 }
 
 static FILE_LOCK_MANAGER: LazyLock<FileLockManager> = LazyLock::new(FileLockManager::new);
 
+pub(crate) async fn acquire_file_operation_lock(path: &str) -> FileEditGuard {
+    FILE_LOCK_MANAGER.acquire(path).await
+}
+
+struct PendingFileLock {
+    pending: Option<Pin<Box<dyn Future<Output = tokio::sync::OwnedMutexGuard<()>> + Send>>>,
+    lock: Option<Arc<AsyncMutex<()>>>,
+    path: String,
+    manager: &'static FileLockManager,
+}
+
+impl Future for PendingFileLock {
+    type Output = FileEditGuard;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self
+            .pending
+            .as_mut()
+            .expect("pending lock polled after completion")
+            .as_mut()
+            .poll(cx)
+        {
+            Poll::Ready(guard) => {
+                self.pending.take();
+                self.lock.take();
+                Poll::Ready(FileEditGuard {
+                    guard: Some(guard),
+                    path: self.path.clone(),
+                    manager: self.manager,
+                })
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for PendingFileLock {
+    fn drop(&mut self) {
+        if self.pending.is_some() {
+            self.pending.take();
+            self.lock.take();
+            self.manager.release(&self.path);
+        }
+    }
+}
+
 /// RAII guard for file editing. Holds lock for path duration.
 pub struct FileEditGuard {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     path: String,
+    manager: &'static FileLockManager,
 }
 
 impl FileEditGuard {
     pub async fn acquire(path: &str) -> Self {
-        let _guard = FILE_LOCK_MANAGER.acquire(path).await;
-        Self {
-            _guard,
-            path: path.to_string(),
-        }
+        FILE_LOCK_MANAGER.acquire(path).await
     }
 
     pub fn try_acquire(path: &str) -> Option<Self> {
-        FILE_LOCK_MANAGER.try_acquire(path).map(|_guard| Self {
-            _guard,
-            path: path.to_string(),
-        })
+        FILE_LOCK_MANAGER.try_acquire(path)
     }
 }
 
 impl Drop for FileEditGuard {
     fn drop(&mut self) {
-        FILE_LOCK_MANAGER.release(&self.path);
+        // Drop the owned lock before pruning so an idle entry has no hidden owner.
+        self.guard.take();
+        self.manager.release(&self.path);
     }
 }
 
@@ -655,8 +714,15 @@ impl AnchorStateManager {
             }
         }
 
-        // Final fallback: generate a unique word with hash suffix
-        format!("Word{line_hash:08x}")
+        // Retired words remain reserved, including exhausted dictionary candidates.
+        let mut suffix = used_words_set.len();
+        loop {
+            let word = format!("Word{line_hash:08x}N{suffix}");
+            if !used_words_set.contains(&word) {
+                return word;
+            }
+            suffix += 1;
+        }
     }
 
     fn get_task_state(&self, task_id: &str) -> IndexMap<String, TrackedDocument> {
@@ -797,6 +863,7 @@ impl AnchorStateManager {
         }
 
         let tracked = tracked.unwrap();
+        let document_changed = tracked.hashes != current_hashes;
 
         // Run diff on hashes
         let changes = diff_arrays(&tracked.hashes, &current_hashes);
@@ -813,6 +880,14 @@ impl AnchorStateManager {
 
         let mut old_idx = 0;
         let mut new_idx = 0;
+        let mut old_counts = HashMap::new();
+        let mut new_counts = HashMap::new();
+        for hash in &tracked.hashes {
+            *old_counts.entry(*hash).or_insert(0usize) += 1;
+        }
+        for hash in &current_hashes {
+            *new_counts.entry(*hash).or_insert(0usize) += 1;
+        }
 
         for change in changes {
             match change {
@@ -831,7 +906,17 @@ impl AnchorStateManager {
                 }
                 DiffChange::Unchanged(count) => {
                     for _ in 0..count {
-                        let preserved_word = tracked.anchors[old_idx].clone();
+                        let hash = tracked.hashes[old_idx];
+                        // A diff cannot establish identity between identical occurrences
+                        // across revisions. Retire those words instead of silently rebinding.
+                        let preserved_word = if document_changed
+                            && (old_counts[&hash] > 1
+                                || new_counts.get(&hash).copied().unwrap_or(0) > 1)
+                        {
+                            self.get_word_for_hash(hash, &new_used_words_set, &dict)
+                        } else {
+                            tracked.anchors[old_idx].clone()
+                        };
                         new_anchors.push(preserved_word.clone());
                         new_used_words_vec.push_back(preserved_word.clone());
                         new_used_words_set.insert(preserved_word);
@@ -1149,10 +1234,8 @@ impl EditExecutor {
                 diagnostics.push("Range error: anchor must refer to a line that precedes or is the same as end_anchor.".to_string());
             }
 
-            // Boundary words pin the span authoritatively (each word is globally
-            // unique), so no window-uniqueness scan is needed — the words ARE the
-            // unique window by construction. Escape hatch for content-ambiguous
-            // single-line anchors on mirrored classes.
+            // A unique generated word pins its line. Multi-line fingerprints
+            // remain the escape hatch when a supplied word is shared.
             if let (Some(fp_content), true) = (
                 edit.content.as_ref(),
                 line_idx != usize::MAX && end_idx != usize::MAX,
@@ -1207,14 +1290,12 @@ impl EditExecutor {
 
     /// Resolves an anchor to a line index.
     ///
-    /// Rejects content-ambiguous anchors: when `provided_content` matches
-    /// two or more lines in the file (regardless of which word each line
-    /// carries), resolution fails with an occurrence listing. The model's
-    /// `Word§content` quoting identifies a line by content, not by word —
-    /// and content is what can collide. Words are globally unique by
-    /// construction (`reconcile` salts `get_word_for_hash`), so an
-    /// earlier word-ambiguity branch was unreachable and silently landed
-    /// edits on the wrong occurrence.
+    /// Resolves a unique generated word authoritatively. If the supplied word
+    /// itself is shared, the matching content must identify one occurrence;
+    /// otherwise the returned diagnostic gives the model the available
+    /// occurrences and a fingerprint-based recovery path. Reconciliation
+    /// retires duplicate words after changed revisions because a line-content
+    /// diff cannot prove which identical occurrence retained its identity.
     pub fn resolve_anchor(
         &self,
         anchor_type: &str,
@@ -1578,11 +1659,16 @@ impl EditExecutor {
                 }
                 let replacement_lines = split_content_lines(&clean_text);
                 let anchor_line = &lines[resolved.line_idx];
-                if replacement_lines.iter().any(|line| line == anchor_line) {
+                // A boundary copy would duplicate the preserved anchor; an
+                // identical statement inside a newly inserted block is valid.
+                let repeats_anchor_at_boundary = replacement_lines.first() == Some(anchor_line)
+                    || replacement_lines.last() == Some(anchor_line);
+                if anchor_line.chars().any(char::is_alphanumeric) && repeats_anchor_at_boundary
+                {
                     return Some(FailedEdit {
                         edit: resolved.edit.clone(),
                         error: format!(
-                            "duplicate insertion rejected: insertion text contains the anchored line {:?}. {} preserves the anchor; use replace with anchor and end_anchor when wrapping existing code",
+                            "duplicate insertion rejected: insertion text repeats the anchored line {:?} at its boundary. {} preserves the anchor; use replace with anchor and end_anchor when wrapping existing code",
                             anchor_line, edit_type
                         ),
                     });
@@ -1697,7 +1783,7 @@ impl EditExecutor {
         }
 
         // Calculate applied edit metadata
-        let applied_edits: Vec<AppliedEdit> = changes
+        let mut applied_edits: Vec<AppliedEdit> = changes
             .iter()
             .map(|(change, replacement_count, removed_count)| {
                 let shift: isize = changes
@@ -1706,7 +1792,8 @@ impl EditExecutor {
                     .map(|(_, rep, rem)| *rep as isize - *rem as isize)
                     .sum();
 
-                let shifted_start = (change.line_idx as isize + shift) as usize;
+                let shifted_start = (change.line_idx as isize + shift) as usize
+                    + usize::from(change.edit.edit_type == "insert_after");
 
                 AppliedEdit {
                     start_idx: shifted_start,
@@ -1727,6 +1814,8 @@ impl EditExecutor {
                 }
             })
             .collect();
+
+        applied_edits.sort_by_key(|applied| applied.original_start_idx);
 
         // Defense-in-depth: refuse to write content that still has any
         // `Word§` or `hex§` fragment in touched or added lines. The model
@@ -1887,6 +1976,46 @@ impl FileEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn file_lock_registry_releases_idle_path_entries() {
+        let path = format!("/tmp/file-lock-cleanup-{}", std::process::id());
+        assert!(!FILE_LOCK_MANAGER.contains(&path));
+        let guard = FileEditGuard::acquire(&path).await;
+        assert!(FILE_LOCK_MANAGER.contains(&path));
+        drop(guard);
+        assert!(!FILE_LOCK_MANAGER.contains(&path));
+    }
+
+    #[tokio::test]
+    async fn cancelled_lock_wait_releases_its_registry_reference() {
+        let path = format!("/tmp/file-lock-cancel-{}", std::process::id());
+        let held = FileEditGuard::acquire(&path).await;
+        let waiting_path = path.clone();
+        let waiting = tokio::spawn(async move {
+            let _guard = FileEditGuard::acquire(&waiting_path).await;
+        });
+        tokio::task::yield_now().await;
+        waiting.abort();
+        let _ = waiting.await;
+        drop(held);
+        assert!(!FILE_LOCK_MANAGER.contains(&path));
+    }
+
+    #[test]
+    fn exhausted_dictionary_never_reuses_a_reserved_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        let dictionary = vec!["Only".to_string()];
+        let mut reserved: HashSet<String> = ["OnlyOnly", "OnlyOnlyOnly", "Word00000007"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for _ in 0..3 {
+            let word = mgr.get_word_for_hash(7, &reserved, &dictionary);
+            assert!(reserved.insert(word));
+        }
+    }
     use std::collections::HashSet;
 
     #[test]
@@ -2443,6 +2572,33 @@ mod tests {
             panic!("non-exact adjacent content must remain insertable");
         };
         assert_eq!(final_lines[1], "prefix");
+    }
+
+    #[test]
+    fn test_edit_executor_allows_anchor_statement_inside_insertion_body() {
+        let executor = EditExecutor::new();
+        let lines = split_content_lines("    return None;\n");
+        let hashes = vec!["Return", "End"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let edits = vec![Edit {
+            anchor: "Return§    return None;".to_string(),
+            end_anchor: None,
+            edit_type: "insert_before".to_string(),
+            text: "if should_retry {\n    return None;\n}".to_string(),
+            content: None,
+        }];
+        let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
+        assert!(failed.is_empty());
+
+        let ApplyOutcome::Applied(final_lines, ..) = executor.apply_edits(&lines, &resolved) else {
+            panic!("a repeated statement inside a new block must remain insertable");
+        };
+        assert_eq!(
+            final_lines,
+            split_content_lines("if should_retry {\n    return None;\n}\n    return None;\n")
+        );
     }
 
     #[test]

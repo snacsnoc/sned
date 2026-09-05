@@ -3203,6 +3203,14 @@ impl AgentLoop {
                     continue;
                 }
 
+                // A read-loop warning is meaningful only when read_file calls
+                // are adjacent tool actions; unrelated work resets that
+                // state before the next read can be counted.
+                if tool_name != "read_file" {
+                    let mut state = self.state.lock().await;
+                    state.consecutive_reads.clear();
+                }
+
                 let tool_id = prepared.tool_id.clone();
                 let tool_params = match &prepared.parsed_args {
                     Ok(params) => params.clone(),

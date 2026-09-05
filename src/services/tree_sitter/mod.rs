@@ -119,14 +119,13 @@ pub fn get_file_skeleton(
     language_parsers: &LanguageParserMap,
     task_id: Option<&str>,
 ) -> Result<Option<String>, LanguageParserError> {
-    let Some(definitions) = parse_file(absolute_path, file_content, language_parsers)? else {
+    let (normalized, _) = crate::core::file_editor::normalize_file_content(file_content);
+    let Some(definitions) = parse_file(absolute_path, &normalized, language_parsers)? else {
         return Ok(None);
     };
 
-    let lines: Vec<String> = file_content
-        .lines()
-        .map(std::string::ToString::to_string)
-        .collect();
+    // Anchor reconciliation must use the same trailing-line semantics as read_file/edit_file.
+    let lines = crate::core::file_editor::split_content_lines(&normalized);
     let anchors = anchor_mgr.reconcile(absolute_path, &lines, task_id);
 
     let mut formatted_output = String::new();
@@ -141,7 +140,10 @@ pub fn get_file_skeleton(
 
         if start_line as i32 > last_line_added {
             let anchor = anchors.get(start_line).cloned().unwrap_or_default();
-            formatted_output.push_str(&format!("│{}\n", format_line_with_hash(&def.text, &anchor, &[])));
+            formatted_output.push_str(&format!(
+                "│{}\n",
+                format_line_with_hash(&def.text, &anchor, &[])
+            ));
             last_line_added = start_line as i32;
         }
     }
@@ -192,10 +194,8 @@ pub fn get_functions(
         }));
     };
 
-    let all_lines: Vec<String> = file_content
-        .lines()
-        .map(std::string::ToString::to_string)
-        .collect();
+    let (normalized, _) = crate::core::file_editor::normalize_file_content(file_content);
+    let all_lines = crate::core::file_editor::split_content_lines(&normalized);
     let all_anchors = anchor_mgr.reconcile(absolute_path, &all_lines, task_id);
 
     let root_node = tree.root_node();
@@ -222,7 +222,9 @@ pub fn get_functions(
             if cap_name.starts_with("name.")
                 && let Ok(text) = cap.node.utf8_text(file_content.as_bytes())
             {
-                match_to_name_text.entry(mid).or_insert_with(|| text.to_string());
+                match_to_name_text
+                    .entry(mid)
+                    .or_insert_with(|| text.to_string());
             }
         }
     }
@@ -434,7 +436,9 @@ pub fn get_symbol_range(
             if cap_name.starts_with("name.")
                 && let Ok(t) = cap.node.utf8_text(file_content.as_bytes())
             {
-                match_to_name_text.entry(mid).or_insert_with(|| t.to_string());
+                match_to_name_text
+                    .entry(mid)
+                    .or_insert_with(|| t.to_string());
             }
         }
     }
@@ -567,6 +571,10 @@ pub fn get_extended_range(target_node: tree_sitter::Node) -> ExtendedRange {
     }
 
     while let Some(prev) = current_node.prev_named_sibling() {
+        // Comments separated by a blank line belong to the preceding declaration, not this one.
+        if prev.end_position().row + 1 < current_node.start_position().row {
+            break;
+        }
         let prev_type = prev.kind();
         if prev_type == "comment"
             || prev_type == "decorator"
@@ -596,5 +604,35 @@ mod tests {
     fn test_get_extension() {
         assert_eq!(get_extension("file.rs"), "rs");
         assert_eq!(get_extension("file.JS"), "js");
+    }
+
+    #[test]
+    fn skeleton_preserves_anchor_state_for_trailing_newline() {
+        let parsers = load_required_language_parsers(&["fixture.rs"]).unwrap();
+        let anchors = AnchorStateManager::new();
+        let content = "fn first() {}\nfn second() {}\n";
+        let lines = crate::core::file_editor::split_content_lines(content);
+        let before = anchors.reconcile("fixture.rs", &lines, Some("task"));
+
+        get_file_skeleton(&anchors, "fixture.rs", content, &parsers, Some("task")).unwrap();
+        let after = anchors.reconcile("fixture.rs", &lines, Some("task"));
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn symbol_range_keeps_separated_preceding_comments() {
+        let content = "// belongs to the prior declaration\n\n\nfn target() {}\n";
+        let parsers = load_required_language_parsers(&["fixture.rs"]).unwrap();
+
+        let range = get_symbol_range("fixture.rs", "target", Some("function"), content, &parsers)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            &content[range.start_index..range.end_index],
+            "fn target() {}"
+        );
+        assert_eq!(range.start_line, 3);
     }
 }

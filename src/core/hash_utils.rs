@@ -26,7 +26,10 @@ static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static DUPLICATE_ANCHOR_SUFFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r" \[identical content also at lines \d+(?:, \d+)*(?:, … \(\d+ more\))?\]$").unwrap()
+    Regex::new(
+        r"\s*\[identical content also at lines \d+(?:, \d+)*(?:, (?:…|\.\.\.) \(\d+ more\))?\]\s*$",
+    )
+    .unwrap()
 });
 
 const MAX_LISTED_DUPLICATE_LINES: usize = 8;
@@ -181,7 +184,7 @@ pub(crate) fn format_line_with_hash_and_count(
     identical_count: usize,
     line_number_offset: usize,
 ) -> String {
-    if identical_count == 0 {
+    if identical_count == 0 || content.trim().is_empty() {
         return format!("{anchor}{ANCHOR_DELIMITER}{content}");
     }
     let listed: Vec<String> = identical_at
@@ -442,6 +445,23 @@ mod tests {
         );
         assert_eq!(anchor, "Word");
         assert_eq!(content, "identical");
+
+        let (anchor, content) =
+            split_anchor("Word§identical [identical content also at lines 2, 3, ... (56 more)]");
+        assert_eq!(anchor, "Word");
+        assert_eq!(content, "identical");
+    }
+
+    #[test]
+    fn test_blank_duplicate_lines_are_not_annotated() {
+        assert_eq!(
+            format_line_with_hash_and_count("", "Blank", &[2, 4], 56, 0),
+            "Blank§"
+        );
+        assert_eq!(
+            format_line_with_hash_and_count("  ", "Blank", &[2, 4], 56, 0),
+            "Blank§  "
+        );
     }
 
     #[test]

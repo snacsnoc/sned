@@ -157,9 +157,9 @@ pub struct TaskState {
     pub last_executed_command: Option<String>,
     /// Exact file paths that must be re-read before the next edit attempt.
     pub must_reread_before_edit: HashSet<String>,
-    /// Consecutive read_file calls per file path with no intervening edit.
+    /// Consecutive read_file calls per file path with no intervening tool action.
     /// Used to detect the "read loop" pattern where the model reads the same
-    /// file repeatedly without taking action. Cleared on any edit_file call.
+    /// file repeatedly without taking action.
     pub consecutive_reads: std::collections::HashMap<String, u32>,
     /// Plan state for the interactive Plan -> Approve -> Act workflow.
     pub plan_state: Option<crate::core::plan_state::PlanState>,

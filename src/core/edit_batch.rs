@@ -246,12 +246,10 @@ impl BatchProcessor {
         let validation_failures = edits
             .iter()
             .filter_map(|edit| {
-                self.validate_edit(edit)
-                    .err()
-                    .map(|error| {
-                        self.executor
-                            .format_failure_message(edit, Some(&error.to_string()))
-                    })
+                self.validate_edit(edit).err().map(|error| {
+                    self.executor
+                        .format_failure_message(edit, Some(&error.to_string()))
+                })
             })
             .collect::<Vec<_>>();
         if !validation_failures.is_empty() {
@@ -502,8 +500,9 @@ impl BatchProcessor {
 
         for applied in &prepared.applied_edits {
             let (added, removed) = count_line_hash_changes(
-                &prepared.line_hashes[applied.original_start_idx..=applied.original_end_idx],
-                &final_hashes[applied.start_idx..=applied.end_idx],
+                &prepared.line_hashes[applied.original_start_idx
+                    ..applied.original_start_idx + applied.lines_deleted],
+                &final_hashes[applied.start_idx..applied.start_idx + applied.lines_added],
             );
             total_added += added;
             total_removed += removed;
@@ -613,23 +612,19 @@ impl BatchProcessor {
     ) -> String {
         let context_count = 3;
         let mut res: Vec<String> = Vec::new();
-        let final_range_end = if applied.start_idx < final_lines.len() {
+        let final_range_end = if applied.lines_added > 0 && applied.start_idx < final_lines.len() {
             Some(applied.end_idx.min(final_lines.len() - 1))
         } else {
             None
         };
 
-        // Context before (from original)
-        let before_start = applied.original_start_idx.saturating_sub(context_count);
-        for i in before_start..applied.original_start_idx {
+        // Surviving context must expose the current words, even for duplicate lines.
+        let before_end = applied.start_idx;
+        let before_start = before_end.saturating_sub(context_count);
+        for i in before_start..before_end {
             res.push(format!(
                 " {}",
-                highlighted_line_with_hash(
-                    &prepared.lines[i],
-                    &prepared.line_hashes[i],
-                    language,
-                    colored,
-                )
+                highlighted_line_with_hash(&final_lines[i], &final_hashes[i], language, colored,)
             ));
         }
 
@@ -638,7 +633,7 @@ impl BatchProcessor {
             .map(|end| final_hashes[applied.start_idx..=end].iter().collect())
             .unwrap_or_default();
         let mut truly_removed_count = 0;
-        for i in applied.original_start_idx..=applied.original_end_idx {
+        for i in applied.original_start_idx..applied.original_start_idx + applied.lines_deleted {
             if !final_hashes_set.contains(&prepared.line_hashes[i]) {
                 truly_removed_count += 1;
             }
@@ -667,7 +662,7 @@ impl BatchProcessor {
 
         // Added/neutral lines (from final)
         let original_hashes_set: std::collections::HashSet<&String> = prepared.line_hashes
-            [applied.original_start_idx..=applied.original_end_idx]
+            [applied.original_start_idx..applied.original_start_idx + applied.lines_deleted]
             .iter()
             .collect();
         if let Some(end) = final_range_end {
@@ -688,8 +683,8 @@ impl BatchProcessor {
 
         // Context after (from final)
         if let Some(last_idx) = final_lines.len().checked_sub(1) {
-            let after_start = applied.end_idx.saturating_add(1);
-            let after_end = last_idx.min(applied.end_idx.saturating_add(context_count));
+            let after_start = applied.start_idx + applied.lines_added;
+            let after_end = last_idx.min(after_start.saturating_add(context_count - 1));
             if after_start <= after_end {
                 for i in after_start..=after_end {
                     res.push(format!(
@@ -721,30 +716,24 @@ impl BatchProcessor {
         let context_before_count = 3;
         let context_after_count = 3;
         let mut res: Vec<String> = Vec::new();
-        let final_range_end = if applied.start_idx < final_lines.len() {
+        let final_range_end = if applied.lines_added > 0 && applied.start_idx < final_lines.len() {
             Some(applied.end_idx.min(final_lines.len() - 1))
         } else {
             None
         };
 
-        let before_start = applied
-            .original_start_idx
-            .saturating_sub(context_before_count);
-        for i in before_start..applied.original_start_idx {
+        let before_end = applied.start_idx;
+        let before_start = before_end.saturating_sub(context_before_count);
+        for i in before_start..before_end {
             res.push(crate::cli::colors::diff_context(
-                &highlighted_line_with_hash(
-                    &prepared.lines[i],
-                    &prepared.line_hashes[i],
-                    language,
-                    colored,
-                ),
+                &highlighted_line_with_hash(&final_lines[i], &final_hashes[i], language, colored),
             ));
         }
 
         let final_hashes_set: std::collections::HashSet<&String> = final_range_end
             .map(|end| final_hashes[applied.start_idx..=end].iter().collect())
             .unwrap_or_default();
-        for i in applied.original_start_idx..=applied.original_end_idx {
+        for i in applied.original_start_idx..applied.original_start_idx + applied.lines_deleted {
             if !final_hashes_set.contains(&prepared.line_hashes[i]) {
                 res.push(crate::cli::colors::diff_removal(
                     &highlighted_line_with_hash(
@@ -758,7 +747,7 @@ impl BatchProcessor {
         }
 
         let original_hashes_set: std::collections::HashSet<&String> = prepared.line_hashes
-            [applied.original_start_idx..=applied.original_end_idx]
+            [applied.original_start_idx..applied.original_start_idx + applied.lines_deleted]
             .iter()
             .collect();
         if let Some(end) = final_range_end {
@@ -774,8 +763,8 @@ impl BatchProcessor {
         }
 
         if let Some(last_idx) = final_lines.len().checked_sub(1) {
-            let after_start = applied.end_idx.saturating_add(1);
-            let after_end = last_idx.min(applied.end_idx.saturating_add(context_after_count));
+            let after_start = applied.start_idx + applied.lines_added;
+            let after_end = last_idx.min(after_start.saturating_add(context_after_count - 1));
             if after_start <= after_end {
                 for i in after_start..=after_end {
                     res.push(crate::cli::colors::diff_context(
@@ -1163,11 +1152,8 @@ mod tests {
             )
             .unwrap();
 
-        let result = processor.apply_batch(
-            &mut prepared,
-            "/tmp/overlap-only.rs",
-            "overlap-only.rs",
-        );
+        let result =
+            processor.apply_batch(&mut prepared, "/tmp/overlap-only.rs", "overlap-only.rs");
         assert!(!result.success);
         assert!(result.overlap);
         assert_eq!(result.resolved_count, 2);

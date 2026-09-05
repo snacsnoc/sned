@@ -1,4 +1,3 @@
-use crate::core::tools::handlers::read_file::record_complete_file_read;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::tree_sitter::{
     MAX_STRUCTURAL_FILE_READ_SIZE, get_file_skeleton, load_required_language_parsers,
@@ -83,14 +82,12 @@ impl GetFileSkeletonHandler {
         );
 
         let anchor_mgr = ctx.anchor_mgr.clone();
-        let state = ctx.state.clone();
         let task_id = ctx.task_id.clone();
         let futures = readable_paths
             .into_iter()
             .map(|(index, rel_path, abs_path)| {
                 let anchor_mgr = anchor_mgr.clone();
                 let language_parsers = Arc::clone(&language_parsers);
-                let state = state.clone();
                 let task_id = task_id.clone();
                 async move {
                     let abs_path_str = abs_path.to_string_lossy().into_owned();
@@ -103,9 +100,6 @@ impl GetFileSkeletonHandler {
                             Some(task_id.as_str()),
                         ) {
                             Ok(Some(skeleton)) => {
-                                let mut state = state.lock().await;
-                                record_complete_file_read(&mut state, &abs_path);
-                                state.consecutive_reads.remove(&abs_path_str);
                                 (
                                     index,
                                     format!(
@@ -174,7 +168,7 @@ mod tests {
     use crate::core::file_editor::AnchorStateManager;
 
     #[tokio::test]
-    async fn test_get_file_skeleton_clears_reread_requirement_after_returning_anchors() {
+    async fn test_get_file_skeleton_does_not_clear_full_read_requirement() {
         let workspace = tempfile::tempdir().unwrap();
         let file_path = workspace.path().join("example.rs");
         std::fs::write(&file_path, "struct Widget;\n").unwrap();
@@ -204,11 +198,64 @@ mod tests {
 
         assert!(output.contains("Stable Anchors"));
         assert!(
-            !state
+            state
                 .lock()
                 .await
                 .must_reread_before_edit
                 .contains(&canonical_path.to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_skeleton_anchor_excludes_utf8_bom() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("bom.rs");
+        std::fs::write(&file_path, b"\xef\xbb\xbfstruct Widget;\n").unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let output = GetFileSkeletonHandler
+            .run(&ctx, serde_json::json!({"path": "bom.rs"}))
+            .await
+            .unwrap();
+
+        assert!(output.contains("struct Widget;"));
+        assert!(!output.contains('\u{feff}'));
+        let anchor_line = output
+            .lines()
+            .find_map(|line| line.strip_prefix('│'))
+            .expect("skeleton should expose an anchored definition line");
+        let (_, anchored_content) = crate::core::hash_utils::split_anchor(anchor_line);
+        assert_eq!(anchored_content, "struct Widget;");
+
+        let edit_result = ToolHandler::execute(
+            &crate::core::tools::handlers::edit_file::EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "files": [{
+                    "path": "bom.rs",
+                    "edits": [{
+                        "anchor": anchor_line,
+                        "text": "struct Gadget;"
+                    }]
+                }]
+            }),
+        )
+        .await
+        .expect("a skeleton anchor must be accepted by edit_file");
+        assert!(!edit_result.to_string().is_empty());
+        assert_eq!(
+            std::fs::read(&file_path).unwrap(),
+            b"\xef\xbb\xbfstruct Gadget;\n"
         );
     }
 

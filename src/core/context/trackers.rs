@@ -269,12 +269,13 @@ impl FileContextTracker {
 
     #[must_use]
     pub fn was_read_this_session(&self, path: &str) -> bool {
-        let path = Path::new(path);
-        self.tracked_files.contains_key(path)
-            || self
-                .files_in_context
-                .iter()
-                .any(|entry| Path::new(&entry.path) == path && entry.sned_read_date.is_some())
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        self.tracked_files.contains_key(&canonical)
+            || self.files_in_context.iter().any(|entry| {
+                std::fs::canonicalize(&entry.path).unwrap_or_else(|_| PathBuf::from(&entry.path))
+                    == canonical
+                    && entry.sned_read_date.is_some()
+            })
     }
 
     /// Initialize the file watcher. Call this during agent loop startup.
@@ -432,17 +433,19 @@ impl FileContextTracker {
     /// Record that a file was read by Sned.
     /// Call this from the read_file handler after successfully reading.
     pub fn track_file_read(&mut self, path: &Path) {
-        if let Ok(metadata) = std::fs::metadata(path)
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(metadata) = std::fs::metadata(&path)
             && let Ok(mtime) = metadata.modified()
         {
-            self.tracked_files.insert(path.to_path_buf(), mtime);
+            self.tracked_files.insert(path, mtime);
         }
     }
 
     /// Mark a file as recently edited by Sned.
     /// Call this BEFORE editing to suppress the next mtime check.
     pub fn mark_file_as_edited_by_sned(&mut self, path: &Path) {
-        self.recently_edited_by_sned.insert(path.to_path_buf());
+        self.recently_edited_by_sned
+            .insert(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     }
 
     /// Check if a file has been modified externally since it was last read.
@@ -458,7 +461,7 @@ impl FileContextTracker {
 
     /// Begin a stale check while holding the tracker state briefly.
     pub(crate) fn begin_stale_check(&mut self, path: &Path) -> Option<StaleCheck> {
-        let path_buf = path.to_path_buf();
+        let path_buf = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if self.recently_edited_by_sned.remove(&path_buf) {
             return Some(StaleCheck::RecentlyEdited);
         }
@@ -480,7 +483,7 @@ impl FileContextTracker {
         check: StaleCheck,
         current_mtime: Option<SystemTime>,
     ) -> Option<String> {
-        let path_buf = path.to_path_buf();
+        let path_buf = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         match check {
             StaleCheck::RecentlyEdited => {
                 if let Some(mtime) = current_mtime {
@@ -736,7 +739,30 @@ mod tests {
         std::io::Write::write_all(&mut temp, b"hello\n").unwrap();
 
         tracker.track_file_read(temp.path());
-        assert!(tracker.tracked_files().contains_key(temp.path()));
+        assert!(
+            tracker
+                .tracked_files()
+                .contains_key(&temp.path().canonicalize().unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_was_read_this_session_matches_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let real_root = tempfile::tempdir().unwrap();
+        let alias_root = tempfile::tempdir().unwrap();
+        let alias = alias_root.path().join("workspace-link");
+        symlink(real_root.path(), &alias).unwrap();
+        let real_file = real_root.path().join("source.txt");
+        let alias_file = alias.join("source.txt");
+        std::fs::write(&real_file, "content\n").unwrap();
+
+        let mut tracker = FileContextTracker::new();
+        tracker.track_file_read(&real_file);
+
+        assert!(tracker.was_read_this_session(alias_file.to_str().unwrap()));
     }
 
     #[tokio::test]
@@ -973,7 +999,11 @@ mod tests {
 
         // Track again after file exists - should now populate tracked_files
         tracker.track_file_read(&new_file_path);
-        assert!(tracker.tracked_files().contains_key(&new_file_path));
+        assert!(
+            tracker
+                .tracked_files()
+                .contains_key(&new_file_path.canonicalize().unwrap())
+        );
     }
 
     #[tokio::test]
@@ -1004,7 +1034,11 @@ mod tests {
 
         // Track as read
         tracker.track_file_read(&new_file_path);
-        assert!(tracker.tracked_files().contains_key(&new_file_path));
+        assert!(
+            tracker
+                .tracked_files()
+                .contains_key(&new_file_path.canonicalize().unwrap())
+        );
 
         // Modify externally
         std::thread::sleep(std::time::Duration::from_millis(50));
