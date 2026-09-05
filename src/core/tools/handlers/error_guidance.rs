@@ -86,6 +86,9 @@ pub fn empty_content(path: &str, consecutive_failures: u32) -> String {
 #[must_use]
 pub(crate) fn edit_failure(reason: EditFailureReason, consecutive_failures: u32) -> String {
     let base = match reason {
+        EditFailureReason::InvalidEditInput => {
+            "Correct the edit parameters described in the validation error and retry. This is not a stale-anchor failure; re-reading is not required for this validation error."
+        }
         EditFailureReason::MissingAnchor => {
             "The edit anchor is missing or malformed. Use a complete single-line `Word§line content` anchor copied from the latest read_file output."
         }
@@ -140,7 +143,7 @@ pub(crate) fn edit_failure_for_diagnostic(diagnostic: &str, consecutive_failures
     match consecutive_failures {
         0 | 1 => base,
         2 => format!(
-            "{base} This is the second failed attempt. Re-read the affected file and split the corrections into focused edits before retrying."
+            "{base} This is the second failed attempt. Split the corrections into focused edits and follow each diagnostic's recovery instructions before retrying."
         ),
         _ => format!(
             "{base} This has failed {consecutive_failures} times in a row. Stop retrying the same edit arguments; switch to the stated alternatives or ask the user for clarification."

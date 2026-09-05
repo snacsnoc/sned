@@ -508,6 +508,12 @@ pub fn resolve_authorized_path(
     }
 
     let canonical_path = canonicalize_existing_parent(&normalized)?;
+    if let Ok(canonical_root) = std::fs::canonicalize(workspace_root)
+        && canonical_path.starts_with(&canonical_root)
+    {
+        return Ok(canonical_path);
+    }
+
     if external_roots
         .iter()
         .any(|root| canonical_path.starts_with(root))
@@ -850,6 +856,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_resolve_authorized_path_accepts_reverse_private_tmp_alias() {
+        let workspace = tempfile::tempdir_in("/tmp").unwrap();
+        let canonical_root = workspace.path().canonicalize().unwrap();
+        if canonical_root == workspace.path() {
+            return;
+        }
+
+        let target = workspace.path().join("source.c");
+        std::fs::write(&target, "int main(void) { return 0; }\n").unwrap();
+        let resolved =
+            resolve_authorized_path(&canonical_root, &[], target.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, canonical_root.join("source.c"));
     }
 
     #[cfg(unix)]

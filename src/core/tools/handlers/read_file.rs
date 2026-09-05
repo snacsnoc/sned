@@ -11,7 +11,9 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::{AnchorStateManager, normalize_file_content, split_content_lines};
-use crate::core::hash_utils::{content_hash, format_line_with_hash, identical_content_indices};
+use crate::core::hash_utils::{
+    content_hash, duplicate_content_info_for_range, format_line_with_hash_and_count,
+};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use futures::StreamExt;
 use std::future::Future;
@@ -292,6 +294,7 @@ impl ReadFileHandler {
             full_lines,
             range_start,
             range_end,
+            line_number_offset,
             refreshes_edit_context,
         ) = if has_line_range {
             let large_file_range = metadata.len() > max_read_size as u64;
@@ -320,6 +323,7 @@ impl ReadFileHandler {
                     full_lines,
                     range_start,
                     range_end,
+                    line_number_offset,
                 )) => (
                     content_for_hash,
                     sliced_lines,
@@ -327,6 +331,7 @@ impl ReadFileHandler {
                     full_lines,
                     range_start,
                     range_end,
+                    line_number_offset,
                     !large_file_range,
                 ),
                 Err(e) => return e.with_display_path(display_path),
@@ -348,6 +353,7 @@ impl ReadFileHandler {
                         Some(lines.clone()),
                         0,
                         lines.len(),
+                        0,
                         false,
                     )
                 }
@@ -365,6 +371,7 @@ impl ReadFileHandler {
                     Some(lines.clone()),
                     0,
                     lines.len(),
+                    0,
                     true,
                 ),
                 Err(e) => return e.with_display_path(display_path),
@@ -406,21 +413,53 @@ impl ReadFileHandler {
         }
 
         let anchored_content = {
-            let dupes = identical_content_indices(output_lines);
+            let (duplicate_start, duplicate_end) = if has_line_range && refreshes_edit_context {
+                (range_start, range_end)
+            } else {
+                (0, output_lines.len())
+            };
+            let duplicate_info = duplicate_content_info_for_range(
+                lines_for_reconcile,
+                duplicate_start,
+                duplicate_end,
+            );
             output_lines
                 .iter()
                 .zip(output_anchors.iter())
-                .zip(dupes.iter())
-                .map(|((line, anchor), identical_at)| {
-                    format_line_with_hash(line, anchor, identical_at)
+                .zip(duplicate_info.iter())
+                .map(|((line, anchor), info)| {
+                    format_line_with_hash_and_count(
+                        line,
+                        anchor,
+                        &info.other_indices,
+                        info.other_count,
+                        if refreshes_edit_context {
+                            0
+                        } else {
+                            line_number_offset
+                        },
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
 
-        let hash = content_hash(&content_for_hash);
+        let hash_content = if refreshes_edit_context {
+            full_lines
+                .as_ref()
+                .map(|lines| lines.join("\n"))
+                .unwrap_or(content_for_hash)
+        } else {
+            content_for_hash
+        };
+        let hash = content_hash(&hash_content);
 
         let mut content = format!("[File: {display_path}, Hash: {hash}]\n{anchored_content}");
+        if refreshes_edit_context
+            && lines_for_reconcile.len() > crate::core::file_editor::MAX_TRACKED_LINES
+        {
+            content.push_str("\n[Note: These large-file snapshot anchors are valid only for this file version. After any edit, use the newly returned anchors or read_file again; old anchors cannot be reused even for unchanged lines.]");
+        }
         if let Some(note) = clamping_note {
             content = format!("{note}\n{content}");
         }
@@ -452,6 +491,7 @@ impl ReadFileHandler {
             Vec<String>,
             Option<String>,
             Option<Vec<String>>,
+            usize,
             usize,
             usize,
         ),
@@ -578,6 +618,7 @@ impl ReadFileHandler {
             Some(all_lines),
             start_idx,
             end_exclusive,
+            start_idx,
         ))
     }
 
@@ -595,6 +636,7 @@ impl ReadFileHandler {
             Vec<String>,
             Option<String>,
             Option<Vec<String>>,
+            usize,
             usize,
             usize,
         ),
@@ -719,6 +761,7 @@ impl ReadFileHandler {
             Some(selected_lines),
             0,
             range_end,
+            requested_start.saturating_sub(1),
         ))
     }
 
@@ -1334,6 +1377,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_file_line_range_reports_full_file_hash() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let full_content = "line 1\nline 2\nline 3\n";
+        temp_file.write_all(full_content.as_bytes()).unwrap();
+
+        let result = ReadFileHandler::new()
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                Some(2),
+                Some(2),
+                &AnchorStateManager::new(),
+                Some("range-hash-task"),
+                None,
+            )
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.hash, content_hash(full_content));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_line_range_reports_absolute_duplicate_lines() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "same").unwrap();
+        writeln!(temp_file, "different").unwrap();
+        writeln!(temp_file, "same").unwrap();
+
+        let result = ReadFileHandler::new()
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                Some(3),
+                Some(3),
+                &AnchorStateManager::new(),
+                Some("range-duplicate-task"),
+                None,
+            )
+            .await;
+
+        assert!(result.success);
+        assert!(result.content.contains("identical content also at lines 1"));
+    }
+
+    #[tokio::test]
     async fn test_read_file_not_found() {
         let handler = ReadFileHandler::new();
         let anchor_mgr = AnchorStateManager::new();
@@ -1611,7 +1697,7 @@ mod tests {
             .write_all(b"\xEF\xBB\xBFfirst\r\nsecond\r\n")
             .unwrap();
 
-        let (_, sliced_lines, _, full_lines, range_start, range_end) = ReadFileHandler::new()
+        let (_, sliced_lines, _, full_lines, range_start, range_end, _) = ReadFileHandler::new()
             .read_lines_range(temp_file.path().to_str().unwrap(), Some(1), Some(3), 1024)
             .await
             .unwrap();

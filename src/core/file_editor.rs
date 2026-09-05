@@ -126,6 +126,7 @@ pub enum FileEditorError {
         failed_count: usize,
         withheld_count: usize,
         requires_reread: bool,
+        validation_only: bool,
     },
 
     #[error("Overlapping edit ranges: {message}")]
@@ -147,6 +148,7 @@ impl FileEditorError {
             failed_count,
             withheld_count,
             requires_reread,
+            validation_only: false,
         }
     }
 
@@ -160,7 +162,19 @@ impl FileEditorError {
             failed_count,
             withheld_count,
             requires_reread: false,
+            validation_only: true,
         }
+    }
+
+    pub(crate) fn is_validation_error(&self) -> bool {
+        matches!(
+            self,
+            Self::ValidationError(_)
+                | Self::AtomicBatchRejected {
+                    validation_only: true,
+                    ..
+                }
+        )
     }
 
     pub(crate) fn requires_reread(&self) -> bool {
@@ -178,6 +192,7 @@ impl FileEditorError {
 /// recovery strategy instead of another generic anchor error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditFailureReason {
+    InvalidEditInput,
     MissingAnchor,
     UnknownAnchor,
     DuplicateContent,
@@ -264,6 +279,7 @@ impl EditFailureReason {
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::InvalidEditInput => "invalid edit parameters",
             Self::MissingAnchor => "missing or malformed anchor",
             Self::UnknownAnchor => "unknown or stale anchor",
             Self::DuplicateContent => "duplicate anchor content",
@@ -378,10 +394,8 @@ impl FileEditorError {
 // Constants
 // ============================================================================
 
-pub(crate) static ANCHOR_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    // Allow word anchors (Apple) and line-number anchors (L1, L2, etc.) for large-file fallback
-    Regex::new(r"^[A-Z][a-zA-Z0-9]*$").unwrap()
-});
+pub(crate) static ANCHOR_NAME_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Z][a-zA-Z0-9]*$").unwrap());
 
 // ============================================================================
 // Anchor State Manager
@@ -403,14 +417,12 @@ struct TrackedDocument {
 struct AnchorStorage {
     tasks: IndexMap<String, IndexMap<String, TrackedDocument>>,
     dictionary: Vec<String>,
+    cache_file: std::path::PathBuf,
 }
 
 impl AnchorStorage {
     /// Load anchor state from disk (~/.sned/data/cache/anchors.json)
-    fn load() -> Self {
-        let cache_dir = crate::storage::disk::get_data_dir().join("cache");
-        let anchors_file = cache_dir.join("anchors.json");
-
+    fn load(anchors_file: std::path::PathBuf) -> Self {
         if let Ok(content) = std::fs::read_to_string(&anchors_file) {
             match serde_json::from_str::<IndexMap<String, IndexMap<String, TrackedDocument>>>(
                 &content,
@@ -420,6 +432,7 @@ impl AnchorStorage {
                     return Self {
                         tasks,
                         dictionary: Vec::new(),
+                        cache_file: anchors_file,
                     };
                 }
                 Err(e) => {
@@ -431,6 +444,7 @@ impl AnchorStorage {
         Self {
             tasks: IndexMap::new(),
             dictionary: Vec::new(),
+            cache_file: anchors_file,
         }
     }
 
@@ -439,13 +453,14 @@ impl AnchorStorage {
         Self {
             tasks: IndexMap::new(),
             dictionary: Vec::new(),
+            cache_file: crate::storage::disk::get_data_dir().join("cache/anchors.json"),
         }
     }
 
     /// Save anchor state to disk
     fn save(&self) {
-        let cache_dir = crate::storage::disk::get_data_dir().join("cache");
-        let anchors_file = cache_dir.join("anchors.json");
+        let anchors_file = &self.cache_file;
+        let cache_dir = anchors_file.parent().unwrap_or(std::path::Path::new("."));
 
         // Ensure cache directory exists
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
@@ -476,7 +491,7 @@ impl AnchorStorage {
     }
 }
 
-const MAX_TRACKED_LINES: usize = 5000;
+pub(crate) const MAX_TRACKED_LINES: usize = 5000;
 const MAX_TRACKED_FILES: usize = 1024;
 const MAX_TRACKED_TASKS: usize = 50;
 
@@ -577,8 +592,14 @@ pub struct AnchorStateManager {
 impl AnchorStateManager {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_cache_file(crate::storage::disk::get_data_dir().join("cache/anchors.json"))
+    }
+
+    /// Keeps independent sessions/tests from sharing a process-global cache location.
+    #[must_use]
+    pub fn with_cache_file(path: std::path::PathBuf) -> Self {
         Self {
-            storage: Arc::new(Mutex::new(AnchorStorage::load())),
+            storage: Arc::new(Mutex::new(AnchorStorage::load(path))),
         }
     }
 
@@ -703,9 +724,19 @@ impl AnchorStateManager {
     ) -> Vec<String> {
         let task_id = task_id.unwrap_or("default");
 
-        // Safeguard for massive files
         if current_lines.len() > MAX_TRACKED_LINES {
-            return (1..=current_lines.len()).map(|i| format!("L{i}")).collect();
+            use sha2::{Digest, Sha256};
+            // Without reconciliation, a bare line number can silently retarget
+            // an identical occurrence after insertion. Bind it to the snapshot.
+            let mut hash = Sha256::new();
+            for line in current_lines {
+                hash.update((line.len() as u64).to_le_bytes());
+                hash.update(line.as_bytes());
+            }
+            let revision = format!("{:x}", hash.finalize());
+            return (1..=current_lines.len())
+                .map(|i| format!("L{}N{i}", &revision[..32]))
+                .collect();
         }
 
         let current_hashes = compute_hashes(current_lines);
@@ -761,6 +792,7 @@ impl AnchorStateManager {
             };
             let anchors = tracked.anchors.clone();
             self.update_state(absolute_path, tracked, task_id);
+            self.save();
             return anchors;
         }
 
@@ -1208,7 +1240,7 @@ impl EditExecutor {
         lines: &[String],
         content_ambiguity_hint: Option<&str>,
     ) -> (usize, Option<String>) {
-        let anchor_raw = raw_anchor.trim();
+        let anchor_raw = raw_anchor.trim_start();
         if anchor_raw.is_empty() {
             return (usize::MAX, Some(format!("{anchor_type} is missing.")));
         }
@@ -2056,9 +2088,18 @@ mod tests {
         let anchors = anchor_mgr.reconcile("/tmp/large.py", &lines, Some(task_id));
         assert_eq!(anchors.len(), lines.len());
 
-        // Large files should use L1, L2, etc.
-        assert_eq!(anchors[0], "L1");
-        assert_eq!(anchors[1], "L2");
+        assert!(anchors[0].starts_with('L'));
+        assert!(anchors[0].ends_with("N1"));
+        assert!(anchors[1].ends_with("N2"));
+        assert_eq!(
+            anchor_mgr.reconcile("/tmp/large.py", &lines, Some(task_id)),
+            anchors
+        );
+        let mut changed = lines;
+        changed.insert(0, "inserted".into());
+        let next = anchor_mgr.reconcile("/tmp/large.py", &changed, Some(task_id));
+        let next: HashSet<_> = next.into_iter().collect();
+        assert!(anchors.iter().all(|anchor| !next.contains(anchor)));
     }
 
     #[test]
@@ -2368,13 +2409,16 @@ mod tests {
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
         assert!(failed.is_empty());
 
-        let ApplyOutcome::DuplicateInsertion(duplicates) =
-            executor.apply_edits(&lines, &resolved)
+        let ApplyOutcome::DuplicateInsertion(duplicates) = executor.apply_edits(&lines, &resolved)
         else {
             panic!("exact adjacent block must be rejected");
         };
         assert_eq!(duplicates.len(), 1);
-        assert!(duplicates[0].error.contains("Leading and trailing blank lines"));
+        assert!(
+            duplicates[0]
+                .error
+                .contains("Leading and trailing blank lines")
+        );
     }
 
     #[test]
@@ -2395,8 +2439,7 @@ mod tests {
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
         assert!(failed.is_empty());
 
-        let ApplyOutcome::Applied(final_lines, ..) = executor.apply_edits(&lines, &resolved)
-        else {
+        let ApplyOutcome::Applied(final_lines, ..) = executor.apply_edits(&lines, &resolved) else {
             panic!("non-exact adjacent content must remain insertable");
         };
         assert_eq!(final_lines[1], "prefix");
@@ -2420,8 +2463,7 @@ mod tests {
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
         assert!(failed.is_empty());
 
-        let ApplyOutcome::DuplicateInsertion(duplicates) =
-            executor.apply_edits(&lines, &resolved)
+        let ApplyOutcome::DuplicateInsertion(duplicates) = executor.apply_edits(&lines, &resolved)
         else {
             panic!("an insertion containing its anchor line must be rejected");
         };

@@ -29,6 +29,8 @@ static DUPLICATE_ANCHOR_SUFFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r" \[identical content also at lines \d+(?:, \d+)*(?:, … \(\d+ more\))?\]$").unwrap()
 });
 
+const MAX_LISTED_DUPLICATE_LINES: usize = 8;
+
 // ============================================================================
 // Line Hashing Utilities
 // ============================================================================
@@ -86,6 +88,57 @@ pub fn identical_content_indices(lines: &[String]) -> Vec<Vec<usize>> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DuplicateContentInfo {
+    pub(crate) other_indices: Vec<usize>,
+    pub(crate) other_count: usize,
+}
+
+/// Keeps exact overflow counts while retaining only the locations needed to
+/// render the selected lines; retaining every occurrence per line is
+/// quadratic for repetitive files.
+#[must_use]
+pub(crate) fn duplicate_content_info_for_range(
+    lines: &[String],
+    range_start: usize,
+    range_end: usize,
+) -> Vec<DuplicateContentInfo> {
+    const MAX_RETAINED_POSITIONS: usize = MAX_LISTED_DUPLICATE_LINES + 2;
+    let mut buckets: HashMap<&str, (usize, Vec<usize>)> = HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let entry = buckets
+            .entry(line.as_str())
+            .or_insert_with(|| (0, Vec::new()));
+        entry.0 += 1;
+        if entry.1.len() < MAX_RETAINED_POSITIONS {
+            entry.1.push(idx + 1);
+        }
+    }
+
+    let start = range_start.min(lines.len());
+    let end = range_end.min(lines.len()).max(start);
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            let line_number = start + offset + 1;
+            let (count, positions) = buckets
+                .get(line.as_str())
+                .expect("line was inserted into duplicate buckets");
+            let other_indices = positions
+                .iter()
+                .copied()
+                .filter(|&position| position != line_number)
+                .take(MAX_LISTED_DUPLICATE_LINES + 1)
+                .collect();
+            DuplicateContentInfo {
+                other_indices,
+                other_count: count.saturating_sub(1),
+            }
+        })
+        .collect()
+}
+
 /// Formats a line with its anchor prefix, appending a duplicate-content
 /// annotation when the line's content appears elsewhere in the slice.
 ///
@@ -97,16 +150,46 @@ pub fn identical_content_indices(lines: &[String]) -> Vec<Vec<usize>> {
 /// `{anchor}§{content}`. Line numbers are 1-based.
 #[must_use]
 pub fn format_line_with_hash(content: &str, anchor: &str, identical_at: &[usize]) -> String {
-    if identical_at.is_empty() {
+    format_line_with_hash_with_offset(content, anchor, identical_at, 0)
+}
+
+/// Formats an anchored line while translating duplicate locations to the
+/// file's 1-based line numbering.
+#[must_use]
+pub fn format_line_with_hash_with_offset(
+    content: &str,
+    anchor: &str,
+    identical_at: &[usize],
+    line_number_offset: usize,
+) -> String {
+    format_line_with_hash_and_count(
+        content,
+        anchor,
+        identical_at,
+        identical_at.len(),
+        line_number_offset,
+    )
+}
+
+/// Formats an anchored line when the displayed duplicate locations are
+/// bounded but the total duplicate count is known exactly.
+#[must_use]
+pub(crate) fn format_line_with_hash_and_count(
+    content: &str,
+    anchor: &str,
+    identical_at: &[usize],
+    identical_count: usize,
+    line_number_offset: usize,
+) -> String {
+    if identical_count == 0 {
         return format!("{anchor}{ANCHOR_DELIMITER}{content}");
     }
-    const MAX_LISTED: usize = 8;
     let listed: Vec<String> = identical_at
         .iter()
-        .take(MAX_LISTED)
-        .map(|n| n.to_string())
+        .take(MAX_LISTED_DUPLICATE_LINES)
+        .map(|n| n.saturating_add(line_number_offset).to_string())
         .collect();
-    let overflow = identical_at.len().saturating_sub(listed.len());
+    let overflow = identical_count.saturating_sub(listed.len());
     let listing = if overflow > 0 {
         format!("{}, … ({} more)", listed.join(", "), overflow)
     } else {
@@ -147,14 +230,33 @@ pub fn strip_hashes(content: &str) -> String {
         return String::new();
     }
 
-    let mut stripped = content.to_string();
-    loop {
-        let next = ANCHOR_STRIP_REGEX.replace_all(&stripped, "").into_owned();
-        if next == stripped {
-            return next;
-        }
-        stripped = next;
-    }
+    content
+        .split('\n')
+        .map(|line| {
+            let mut stripped = line.to_string();
+            let mut had_anchor = false;
+            loop {
+                let next = ANCHOR_STRIP_REGEX.replace_all(&stripped, "").into_owned();
+                if next == stripped {
+                    break;
+                }
+                had_anchor = true;
+                stripped = next;
+            }
+            // The suffix is display metadata only inside a copied anchor wrapper.
+            // Identical text in ordinary source must remain verbatim.
+            if had_anchor {
+                if let Some(body) = stripped.strip_suffix('\r') {
+                    format!("{}\r", strip_duplicate_anchor_suffix(body))
+                } else {
+                    strip_duplicate_anchor_suffix(&stripped).to_string()
+                }
+            } else {
+                stripped
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 static GLUED_ANCHOR_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -300,6 +402,10 @@ mod tests {
         assert_eq!(
             format_line_with_hash("dup", "Apple", &nine),
             "Apple§dup [identical content also at lines 2, 3, 4, 5, 6, 7, 8, 9, … (1 more)]"
+        );
+        assert_eq!(
+            format_line_with_hash_with_offset("dup", "Apple", &[1, 4], 10),
+            "Apple§dup [identical content also at lines 11, 14]"
         );
     }
 

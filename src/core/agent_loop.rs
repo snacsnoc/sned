@@ -5456,6 +5456,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_workflow_scripted_provider_recovers_without_fallback() {
+        use crate::core::tools::handlers::{
+            attempt_completion::AttemptCompletionHandler, edit_file::EditFileHandler,
+            read_file::ReadFileHandler,
+        };
+        use crate::providers::mock::MockProvider;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.txt");
+        std::fs::write(&path, "alpha  \nbeta\n").unwrap();
+        let provider = Arc::new(Providers::Mock(MockProvider::new(vec![])));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        registry.register(SnedTool::EditFile, Arc::new(EditFileHandler::new()));
+        registry.register(
+            SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+        let mut agent = AgentLoop::new(test_agent_config(provider, "native-workflow-loop"))
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        agent.anchor_mgr = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        agent.state.lock().await.double_check_completion_enabled = false;
+        let mut copied = String::new();
+        let mut stale = String::new();
+        for step in 0..7 {
+            let (name, params) = match step {
+                0 | 3 => ("read_file", json!({"paths": ["fixture.txt"]})),
+                1 => (
+                    "edit_file",
+                    json!({"files": [{"path": "fixture.txt", "edits": [{"anchor": copied, "text": "changed"}]}]}),
+                ),
+                2 => (
+                    "edit_file",
+                    json!({"files": [{"path": "fixture.txt", "edits": [{"anchor": stale, "text": "wrong"}]}]}),
+                ),
+                4 => (
+                    "edit_file",
+                    json!({"files": [{"path": "fixture.txt", "edits": [{"anchor": copied, "content": ["changed"], "text": "final"}]}]}),
+                ),
+                5 => (
+                    "edit_file",
+                    json!({"files": [{"path": "fixture.txt", "edits": [{"anchor": copied, "text": "final"}]}]}),
+                ),
+                _ => (
+                    "attempt_completion",
+                    json!({"result": "Verified native editing"}),
+                ),
+            };
+            agent
+                .set_provider(Arc::new(Providers::Mock(MockProvider::single_tool_call(
+                    &format!("workflow-{step}"),
+                    name,
+                    params,
+                ))))
+                .await;
+            let outcome = agent.execute_turn().await;
+            assert!(
+                !matches!(outcome, TurnResult::Error(_)),
+                "step {step}: {outcome:?}"
+            );
+            if step == 6 {
+                assert!(matches!(outcome, TurnResult::Complete));
+            } else {
+                assert!(matches!(outcome, TurnResult::Continue));
+            }
+            let state = agent.state.lock().await;
+            assert_eq!(
+                state.consecutive_mistakes,
+                if step == 2 || step == 4 { 1 } else { 0 },
+                "step {step}"
+            );
+            assert_eq!(
+                !state.must_reread_before_edit.is_empty(),
+                step == 2,
+                "step {step}"
+            );
+            drop(state);
+            let history = agent.conversation_history.lock().await;
+            let expected_id = history
+                .iter()
+                .rev()
+                .find_map(|message| match &message.content {
+                    MessageContent::AssistantBlocks(blocks) => {
+                        blocks.iter().find_map(|block| match block {
+                            AssistantContentBlock::ToolUse(call)
+                                if call.shared.call_id.as_deref()
+                                    == Some(format!("workflow-{step}").as_str()) =>
+                            {
+                                Some(call.id.clone())
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let text = history
+                .iter()
+                .rev()
+                .find_map(|message| match &message.content {
+                    MessageContent::UserBlocks(blocks) => {
+                        blocks.iter().find_map(|block| match block {
+                            UserContentBlock::ToolResult(result)
+                                if result.tool_use_id == expected_id =>
+                            {
+                                match &result.content {
+                                    ToolResultContent::Text(text) => Some(text.clone()),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("actual tool result must reach provider history: {history:?}")
+                });
+            if step == 0 || step == 3 {
+                copied = text
+                    .split('\n')
+                    .find(|line| {
+                        line.split_once('§')
+                            .is_some_and(|(word, _)| word.chars().all(char::is_alphanumeric))
+                    })
+                    .unwrap()
+                    .to_owned();
+                if step == 0 {
+                    stale = copied.clone();
+                }
+            }
+            if step == 4 {
+                assert!(text.contains("Correct the edit parameters"));
+                assert!(!text.contains("unknown or stale"));
+            }
+            if step == 2 {
+                assert!(text.contains("read_file"));
+                assert_eq!(std::fs::read(&path).unwrap(), b"changed\nbeta\n");
+                drop(history);
+                let context = Arc::new(ToolContext::new(
+                    agent.state.clone(),
+                    None,
+                    dir.path().to_path_buf(),
+                    agent.anchor_mgr.clone(),
+                    false,
+                    "native-workflow-loop".into(),
+                    None,
+                    true,
+                    agent.config.output_writer.clone(),
+                ));
+                let rejected = AgentLoop::execute_tool_with_hooks_internal(
+                    &agent.config, None, context, "edit_file",
+                    &json!({"files": [{"path": "fixture.txt", "edits": [{"anchor": stale, "text": "wrong"}]}]}),
+                    Arc::new(EditFileHandler::new()), None, agent.conversation_history.clone(),
+                ).await;
+                assert!(rejected.is_error);
+                assert_eq!(
+                    rejected.metadata.unwrap().required_next_step,
+                    Some(ToolRequiredNextStep::ReadFile)
+                );
+            }
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"final\nbeta\n");
+    }
+
+    #[tokio::test]
     async fn test_shadow_commit_failure_is_visible() {
         let (tx, mut rx) = mpsc::channel(4);
         let writer: crate::cli::output::OutputWriterArc =
@@ -9693,8 +9864,7 @@ Irrespective of whether additional information or instructions are given, you ar
         use std::net::TcpListener;
 
         let _openai_env_lock = crate::providers::openai::OPENAI_ENV_LOCK.lock().unwrap();
-        let old_cumulative_text_stream =
-            std::env::var_os("SNED_OPENAI_CUMULATIVE_TEXT_STREAM");
+        let old_cumulative_text_stream = std::env::var_os("SNED_OPENAI_CUMULATIVE_TEXT_STREAM");
         // SAFETY: this test holds the shared OpenAI environment lock.
         unsafe {
             std::env::set_var("SNED_OPENAI_CUMULATIVE_TEXT_STREAM", "1");
@@ -9747,20 +9917,18 @@ Irrespective of whether additional information or instructions are given, you ar
         });
 
         let provider = Arc::new(Providers::OpenAi(
-            crate::providers::openai::OpenAiProvider::new(
-                crate::providers::openai::OpenAiConfig {
-                    api_key: "test-key".to_string(),
-                    base_url: Some(format!("http://{address}")),
-                    model_id: "custom-model".to_string(),
-                    model_info: None,
-                    reasoning_effort: None,
-                    extra_body: None,
-                    custom_headers: None,
-                    endpoint_kind: crate::providers::openai::OpenAiEndpointKind::Compatible,
-                    stream: true,
-                    provider_name: None,
-                },
-            )
+            crate::providers::openai::OpenAiProvider::new(crate::providers::openai::OpenAiConfig {
+                api_key: "test-key".to_string(),
+                base_url: Some(format!("http://{address}")),
+                model_id: "custom-model".to_string(),
+                model_info: None,
+                reasoning_effort: None,
+                extra_body: None,
+                custom_headers: None,
+                endpoint_kind: crate::providers::openai::OpenAiEndpointKind::Compatible,
+                stream: true,
+                provider_name: None,
+            })
             .unwrap(),
         ));
         let (tx, mut rx) = mpsc::channel(32);

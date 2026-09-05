@@ -137,7 +137,8 @@ impl EditFileHandler {
     }
 
     fn normalized_anchor(field_name: &str, path: &str, raw: &str) -> Result<String, String> {
-        let anchor = raw.trim();
+        // Whitespace after § belongs to the source line, not the envelope.
+        let anchor = raw.trim_start();
         if anchor.is_empty() {
             return Err(format!(
                 "File '{path}': '{field_name}' is empty. Copy the exact 'Word§line content' string from read_file output."
@@ -155,7 +156,7 @@ impl EditFileHandler {
         //    The first line is incomplete (ends with `§` with no
         //    content after it). Reject with a clear error.
         if anchor.contains('\n') {
-            let first_line = anchor.lines().next().unwrap_or("").trim();
+            let first_line = anchor.lines().next().unwrap_or("");
             if first_line.ends_with(ANCHOR_DELIMITER) {
                 let preview = if first_line.chars().count() > 60 {
                     format!("{}...", first_line.chars().take(60).collect::<String>())
@@ -822,24 +823,21 @@ impl EditFileHandler {
                     continue;
                 }
             };
-            let absolute_path = match self.resolve_path(
-                workspace_root,
-                allowed_external_roots,
-                display_path,
-            ) {
-                Ok(path) => path,
-                Err(error) => {
-                    unresolved_rejected_edits += edit_count;
-                    unresolved_file_count += 1;
-                    preflight_rejections.push(PreflightRejection {
-                        display_path: display_path.to_string(),
-                        absolute_path: display_path.to_string(),
-                        message: error.to_string(),
-                        requires_reread: false,
-                    });
-                    continue;
-                }
-            };
+            let absolute_path =
+                match self.resolve_path(workspace_root, allowed_external_roots, display_path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        unresolved_rejected_edits += edit_count;
+                        unresolved_file_count += 1;
+                        preflight_rejections.push(PreflightRejection {
+                            display_path: display_path.to_string(),
+                            absolute_path: display_path.to_string(),
+                            message: error.to_string(),
+                            requires_reread: false,
+                        });
+                        continue;
+                    }
+                };
             *requested_edits_by_path
                 .entry(absolute_path.clone())
                 .or_default() += edit_count;
@@ -1192,10 +1190,19 @@ impl EditFileHandler {
                         reread_paths.insert(batch.absolute_path.clone());
                     }
                     rejected_paths.insert(batch.absolute_path.clone());
-                    let recovery = error_guidance::edit_failure_for_diagnostic(
-                        &error_message,
-                        consecutive_failures,
-                    );
+                    // Source text can contain words like "stale" or "missing";
+                    // validation recovery must follow its origin, not those words.
+                    let recovery = if e.is_validation_error() {
+                        error_guidance::edit_failure(
+                            EditFailureReason::InvalidEditInput,
+                            consecutive_failures,
+                        )
+                    } else {
+                        error_guidance::edit_failure_for_diagnostic(
+                            &error_message,
+                            consecutive_failures,
+                        )
+                    };
                     all_results.push(format!(
                         "Error preparing edits for {}: {}\n\nRecovery: {}",
                         batch.display_path, error_message, recovery,
@@ -1462,12 +1469,8 @@ impl EditFileHandler {
 
                 if let Err(lock_error) = std_file.try_lock() {
                     aborted_write = Some((
-                        Self::file_lock_error(
-                            &item.display_path,
-                            &item.absolute_path,
-                            &lock_error,
-                        )
-                        .to_string(),
+                        Self::file_lock_error(&item.display_path, &item.absolute_path, &lock_error)
+                            .to_string(),
                         Some(item.absolute_path.clone()),
                     ));
                     break;
@@ -1505,11 +1508,8 @@ impl EditFileHandler {
                 if !mtime_unchanged || !content_unchanged {
                     let _ = std_file.unlock();
                     aborted_write = Some((
-                        Self::external_modification_error(
-                            &item.display_path,
-                            &item.absolute_path,
-                        )
-                        .to_string(),
+                        Self::external_modification_error(&item.display_path, &item.absolute_path)
+                            .to_string(),
                         Some(item.absolute_path.clone()),
                     ));
                     break;
@@ -1547,11 +1547,8 @@ impl EditFileHandler {
 
             if let Some((failure, reread_path)) = aborted_write {
                 write_failure = true;
-                write_failed_paths.extend(
-                    write_items
-                        .iter()
-                        .map(|item| item.absolute_path.clone()),
-                );
+                write_failed_paths
+                    .extend(write_items.iter().map(|item| item.absolute_path.clone()));
                 rejected_paths.extend(write_failed_paths.iter().cloned());
                 if let Some(path) = reread_path {
                     Self::mark_must_reread(state, &path).await;
@@ -1920,11 +1917,7 @@ impl EditFileHandler {
 
         let output = format!("{}\n\n{}", summary, all_results.join("\n\n---\n\n"));
 
-        if !rejected_paths.is_empty()
-            || write_failure
-            || total_failed > 0
-            || total_overlap > 0
-        {
+        if !rejected_paths.is_empty() || write_failure || total_failed > 0 || total_overlap > 0 {
             let mut reread_paths = reread_paths.into_iter().collect::<Vec<_>>();
             reread_paths.sort();
             if !reread_paths.is_empty() {
@@ -4437,13 +4430,18 @@ edition = "2021"
         let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
             .await
             .expect_err("rejected files must make the overall result an error");
-        let metadata = error.metadata().expect("stale path needs recovery metadata");
+        let metadata = error
+            .metadata()
+            .expect("stale path needs recovery metadata");
         let stale_absolute = std::fs::canonicalize(&stale_path)
             .unwrap()
             .to_string_lossy()
             .into_owned();
         assert_eq!(metadata.class, ToolFailureClass::AnchorInvalid);
-        assert_eq!(metadata.required_next_step, Some(ToolRequiredNextStep::ReadFile));
+        assert_eq!(
+            metadata.required_next_step,
+            Some(ToolRequiredNextStep::ReadFile)
+        );
         assert_eq!(metadata.affected_paths, vec![stale_absolute.clone()]);
         let output = error.to_string();
         assert!(output.contains("1 edit(s) applied"), "got: {output}");
@@ -4546,7 +4544,11 @@ edition = "2021"
         let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
             .await
             .expect_err("one stale anchor must reject its whole file batch");
-        assert!(error.to_string().contains("otherwise-valid edit(s) were withheld"));
+        assert!(
+            error
+                .to_string()
+                .contains("otherwise-valid edit(s) were withheld")
+        );
         assert_eq!(std::fs::read_to_string(file_path).unwrap(), original);
     }
 
@@ -4590,12 +4592,18 @@ edition = "2021"
         ToolHandler::execute(&EditFileHandler::new(), &ctx, params.clone())
             .await
             .expect_err("the first request is partially successful");
-        assert_eq!(std::fs::read_to_string(&insert_path).unwrap(), "added\ntarget\n");
+        assert_eq!(
+            std::fs::read_to_string(&insert_path).unwrap(),
+            "added\ntarget\n"
+        );
         let replay = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
             .await
             .expect_err("unchanged replay must reject the adjacent duplicate");
         assert!(replay.to_string().contains("duplicate insertion"));
-        assert_eq!(std::fs::read_to_string(&insert_path).unwrap(), "added\ntarget\n");
+        assert_eq!(
+            std::fs::read_to_string(&insert_path).unwrap(),
+            "added\ntarget\n"
+        );
     }
 
     #[tokio::test]
@@ -4698,7 +4706,10 @@ edition = "2021"
             .expect_err("write-time external modification must fail the request");
         assert!(error.to_string().contains("modified externally"));
         assert!(error.to_string().contains("0 edit(s) applied"));
-        assert_eq!(std::fs::read_to_string(&first_path).unwrap(), first_original);
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            first_original
+        );
         assert_eq!(std::fs::read_to_string(&second_path).unwrap(), "external\n");
         let metadata = error.metadata().expect("external change requires reread");
         assert_eq!(
@@ -4767,7 +4778,10 @@ edition = "2021"
             .expect_err("a concurrent rollback change must fail without being overwritten");
         let output = error.to_string();
         assert!(output.contains("Rollback incomplete"), "got: {output}");
-        assert!(output.contains("changed after Sned wrote it"), "got: {output}");
+        assert!(
+            output.contains("changed after Sned wrote it"),
+            "got: {output}"
+        );
         assert_eq!(
             std::fs::read_to_string(&first_path).unwrap(),
             "external first\n"
@@ -4776,7 +4790,9 @@ edition = "2021"
             std::fs::read_to_string(&second_path).unwrap(),
             "external second\n"
         );
-        let metadata = error.metadata().expect("both concurrent paths need rereading");
+        let metadata = error
+            .metadata()
+            .expect("both concurrent paths need rereading");
         assert_eq!(
             metadata.affected_paths,
             vec![
